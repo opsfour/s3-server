@@ -1,0 +1,37 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Locate the autoloader: support both standalone and monorepo installs.
+$autoloadPaths = [
+    __DIR__ . '/../vendor/autoload.php',           // Standalone package install.
+    __DIR__ . '/../../../vendor/autoload.php',      // Monorepo (packages/s3-server/bin/).
+];
+
+$autoloaderFound = false;
+foreach ($autoloadPaths as $autoloadPath) {
+    if (file_exists($autoloadPath)) {
+        require $autoloadPath;
+        $autoloaderFound = true;
+        break;
+    }
+}
+
+if (!$autoloaderFound) {
+    fwrite(STDERR, "Error: Could not find Composer autoloader.\n");
+    fwrite(STDERR, "Run 'composer install' in the package or project root.\n");
+    exit(1);
+}
+
+use OpsFour\S3Server\Console\CredentialsCommand;
+use OpsFour\S3Server\Console\QuotaCommand;
+use OpsFour\S3Server\Console\ServeCommand;
+use Symfony\Component\Console\Application;
+
+$app = new Application('OpsFour S3 Server', '1.0.0');
+$app->addCommand(new ServeCommand());
+$app->addCommand(new CredentialsCommand());
+$app->addCommand(new QuotaCommand());
+$app->setDefaultCommand('serve');
+$app->run();

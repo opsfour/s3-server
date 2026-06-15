@@ -1,0 +1,11 @@
+includes:
+    - ../../vendor/larastan/larastan/extension.neon
+
+parameters:
+    level: 8
+    paths:
+        - src
+    ignoreErrors:
+        -
+            identifier: constructor.unusedParameter
+            path: src/S3Server.php
