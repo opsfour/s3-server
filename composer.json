@@ -3,6 +3,11 @@
     "description": "Production-grade S3-compatible server as a PHP 8.4+ Composer package",
     "type": "library",
     "license": "MIT",
+    "homepage": "https://twopeaks.digital",
+    "support": {
+        "source": "https://ops4.com",
+        "issues": "https://ops4.com"
+    },
     "require": {
         "php": "^8.4",
         "amphp/http-client": "^5.0",

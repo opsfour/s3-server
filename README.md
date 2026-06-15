@@ -105,6 +105,22 @@ Full documentation is in the [docs/](docs/) directory:
 | [Architecture](docs/architecture.md) | Internals, middleware stack, design decisions |
 | [Development](docs/development.md) | Running tests, contributing, extending |
 
+## Project & Support
+
+opsfour S3 Server is a [twopeaks.digital](https://twopeaks.digital) project.
+Related ops4 information is available at [ops4.com](https://ops4.com).
+
+This package and repository are provided **as is**, without warranty of any kind.
+No guarantee is made for fitness for a particular purpose, uninterrupted
+operation, data integrity, security, compatibility, or continued maintenance.
+To the maximum extent permitted by law, no liability is accepted for damages,
+data loss, business interruption, or other consequences arising from use of this
+software. By using this repository or package, you acknowledge and agree to this
+disclaimer and limitation of liability.
+
+Paid support, integration work, production hardening, and custom development are
+available on request.
+
 ## License
 
 MIT

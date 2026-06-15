@@ -1,4 +1,13 @@
-# OpsFour S3 Server Documentation
+# opsfour S3 Server Documentation
+
+opsfour S3 Server is a [twopeaks.digital](https://twopeaks.digital) project.
+Related ops4 information is available at [ops4.com](https://ops4.com).
+
+The package and repository are provided **as is**, without warranty or liability.
+By using this repository or package, you acknowledge and agree to this
+disclaimer and limitation of liability.
+Paid support, integration work, production hardening, and custom development are
+available on request.
 
 ## Getting Started
 
