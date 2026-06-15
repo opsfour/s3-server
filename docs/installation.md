@@ -9,6 +9,8 @@
   - `ext-pdo_mysql` (optional, for MySQL metadata)
   - `ext-pcntl` (recommended, for signal handling)
 - **Composer 2.x**
+- **Symfony 7 or 8** when using the Symfony Bundle
+- **Laravel 11+** when using the Laravel service provider
 
 ## Install via Composer
 
@@ -65,6 +67,9 @@ php vendor/bin/s3-server
 
 ## Laravel Installation
 
+The package is framework-optional and does not require Laravel directly. The
+service provider is designed for Laravel 11 and newer applications.
+
 ```bash
 composer require opsfour/s3-server
 ```
@@ -84,6 +89,10 @@ php artisan s3:serve
 ```
 
 ## Symfony Installation
+
+The Symfony Bundle supports Symfony 7 and 8. The package requires
+`symfony/console` for the standalone CLI and keeps the bundle-specific Symfony
+components optional so non-Symfony users do not install a full framework stack.
 
 ```bash
 composer require opsfour/s3-server

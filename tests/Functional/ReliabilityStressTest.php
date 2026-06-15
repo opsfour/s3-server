@@ -115,7 +115,9 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                         'ContentLength' => filesize($file),
                     ]);
                 } finally {
-                    fclose($partStream);
+                    if (is_resource($partStream)) {
+                        fclose($partStream);
+                    }
                 }
 
                 $parts[] = [

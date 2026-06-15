@@ -1,6 +1,7 @@
 # Laravel Integration
 
-OpsFour S3 Server integrates with Laravel via a service provider and Artisan command.
+OpsFour S3 Server integrates with Laravel 11 and newer applications via a
+service provider and Artisan command.
 
 ## Installation
 

@@ -19,16 +19,16 @@
         "amphp/pipeline": "^1.0",
         "revolt/event-loop": "^1.0",
         "psr/log": "^3.0",
-        "symfony/console": "^7.0",
+        "symfony/console": "^7.0 || ^8.0",
         "league/flysystem": "^3.0"
     },
     "require-dev": {
         "phpunit/phpunit": "^11.5",
-        "aws/aws-sdk-php": "^3.300",
-        "guzzlehttp/guzzle": "^7.0",
-        "symfony/dependency-injection": "^7.0",
-        "symfony/config": "^7.0",
-        "symfony/http-kernel": "^7.0",
+        "aws/aws-sdk-php": "^3.384.9",
+        "guzzlehttp/guzzle": "^7.11.1",
+        "symfony/dependency-injection": "^7.0 || ^8.0",
+        "symfony/config": "^7.0 || ^8.0",
+        "symfony/http-kernel": "^7.0 || ^8.0",
         "league/flysystem-aws-s3-v3": "^3.0"
     },
     "autoload": {

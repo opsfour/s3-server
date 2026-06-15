@@ -11,8 +11,8 @@ composer require opsfour/s3-server
 ```
 
 Symfony support uses optional Symfony components. In a normal Symfony
-application these are already present. If you embed the bundle into a custom
-application, install:
+7 or 8 application these are already present. If you embed the bundle into a
+custom application, install:
 
 ```bash
 composer require symfony/http-kernel symfony/dependency-injection symfony/config

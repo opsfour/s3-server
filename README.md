@@ -25,6 +25,8 @@ A production-grade, fully S3-compatible object storage server built as a PHP 8.4
 - Composer 2.x
 - ext-openssl (encryption)
 - ext-pdo_sqlite (default metadata) or ext-pdo_pgsql / ext-pdo_mysql
+- Symfony 7 or 8 when using the Symfony Bundle
+- Laravel 11+ when using the Laravel service provider
 
 ## Quick Start
 
