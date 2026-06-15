@@ -20,7 +20,7 @@ final class LifecycleRunner
     public function __construct(
         private readonly LifecycleExecutor $executor,
         private readonly float $intervalSeconds = 60.0,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
     ) {}
 
     /**

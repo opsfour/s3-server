@@ -34,7 +34,7 @@ final class GetBucketLocationHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Build the LocationConstraint XML response.
@@ -43,7 +43,7 @@ final class GetBucketLocationHandler implements RequestHandler
         $region = $bucketInfo->region;
         $locationValue = ($region === 'us-east-1') ? '' : $region;
 
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
 

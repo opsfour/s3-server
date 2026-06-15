@@ -43,6 +43,9 @@ final class CredentialManager
      * Create and persist a new credential. Auto-generates keys if not provided.
      *
      * Returns the credential with the plaintext secret key (only opportunity to read it).
+     *
+     * @param list<string> $policyNames
+     * @param list<string> $allowedPrefixes
      */
     public function createCredential(
         string $ownerId,

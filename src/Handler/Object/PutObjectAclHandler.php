@@ -39,12 +39,12 @@ final class PutObjectAclHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Verify the object exists.
         if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Check for canned ACL header first.
@@ -73,7 +73,7 @@ final class PutObjectAclHandler implements RequestHandler
             }
         }
 
-        $resourceName = $bucket.'/'.$key;
+        $resourceName = $bucket . '/' . $key;
         $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
 
         return new Response(status: 200);

@@ -49,7 +49,7 @@ final class NotificationProcessorTest extends TestCase
             '{}',
         );
         $item = $this->metadata->dequeueNotifications(1)[0];
-        $logger = new ProcessorArrayLogger;
+        $logger = new ProcessorArrayLogger();
 
         $this->process($item, $logger);
 
@@ -67,9 +67,9 @@ final class NotificationProcessorTest extends TestCase
 
     public function test_failed_delivery_logs_retry_then_dead_letter_and_circuit_breaker_state(): void
     {
-        $logger = new ProcessorArrayLogger;
+        $logger = new ProcessorArrayLogger();
         $httpClient = new HttpClient(new FixedStatusHttpClient(500), []);
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         for ($i = 1; $i <= 6; $i++) {
             $this->metadata->enqueueNotification(

@@ -87,7 +87,7 @@ final class ComprehensiveE2ETest extends S3FunctionalTestCase
         }
 
         // Clean up.
-        $deleteObjects = array_map(fn ($k) => ['Key' => $k], $keys);
+        $deleteObjects = array_map(fn($k) => ['Key' => $k], $keys);
         self::$s3->deleteObjects([
             'Bucket' => self::$bucket,
             'Delete' => ['Objects' => $deleteObjects],
@@ -216,7 +216,7 @@ final class ComprehensiveE2ETest extends S3FunctionalTestCase
         }
 
         // Clean up.
-        $deleteObjects = array_map(fn ($k) => ['Key' => $k], array_keys($types));
+        $deleteObjects = array_map(fn($k) => ['Key' => $k], array_keys($types));
         self::$s3->deleteObjects([
             'Bucket' => self::$bucket,
             'Delete' => ['Objects' => $deleteObjects],
@@ -372,7 +372,7 @@ final class ComprehensiveE2ETest extends S3FunctionalTestCase
         ]);
 
         // Check we get the common prefixes.
-        $prefixes = array_map(fn ($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
+        $prefixes = array_map(fn($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
         $this->assertContains('photos/', $prefixes);
         $this->assertContains('documents/', $prefixes);
 
@@ -383,12 +383,12 @@ final class ComprehensiveE2ETest extends S3FunctionalTestCase
             'Prefix' => 'photos/',
         ]);
 
-        $prefixes2 = array_map(fn ($p) => $p['Prefix'], $result2['CommonPrefixes'] ?? []);
+        $prefixes2 = array_map(fn($p) => $p['Prefix'], $result2['CommonPrefixes'] ?? []);
         $this->assertContains('photos/2024/', $prefixes2);
         $this->assertContains('photos/2025/', $prefixes2);
 
         // Clean up all objects.
-        $deleteObjects = array_map(fn ($k) => ['Key' => $k], $keys);
+        $deleteObjects = array_map(fn($k) => ['Key' => $k], $keys);
         self::$s3->deleteObjects([
             'Bucket' => self::$bucket,
             'Delete' => ['Objects' => $deleteObjects],

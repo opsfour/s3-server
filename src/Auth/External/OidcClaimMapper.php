@@ -63,7 +63,7 @@ final readonly class OidcClaimMapper
      */
     private function stringListClaim(array $claims, string $name): array
     {
-        $value = $claims[$name] ?? [];
+        $value = $claims[$name] ?? null;
         if ($value === null || $value === '') {
             return [];
         }

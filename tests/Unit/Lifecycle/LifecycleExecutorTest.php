@@ -342,7 +342,7 @@ final class LifecycleExecutorTest extends TestCase
         ]]);
 
         $this->assertTrue($this->metadata->acquireLock('lifecycle:global', 'node-a', 60));
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $executor = new LifecycleExecutor(
             $this->metadata,
@@ -382,7 +382,7 @@ final class LifecycleExecutorTest extends TestCase
             'abortIncompleteDays' => null,
         ]]);
 
-        $logger = new LifecycleArrayLogger;
+        $logger = new LifecycleArrayLogger();
         $executor = new LifecycleExecutor($this->metadata, $this->storage, $logger);
 
         $executor->processBucket('bucket');

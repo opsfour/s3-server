@@ -74,8 +74,8 @@ final class NotificationDispatcherTest extends TestCase
 
     public function test_failed_internal_listener_is_isolated_and_logged(): void
     {
-        $logger = new NotificationArrayLogger;
-        $metrics = new MetricsCollector;
+        $logger = new NotificationArrayLogger();
+        $metrics = new MetricsCollector();
         $dispatcher = new NotificationDispatcher($this->metadata, $logger, metrics: $metrics);
         $received = [];
 
@@ -107,7 +107,7 @@ final class NotificationDispatcherTest extends TestCase
 
     public function test_listener_queue_limit_drop_is_observable(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
         $dispatcher = new NotificationDispatcher(
             $this->metadata,
             maxConcurrentListeners: 1,
@@ -118,8 +118,7 @@ final class NotificationDispatcherTest extends TestCase
         $dispatcher->listen('s3:*', static function (): void {
             \Amp\delay(0.05);
         });
-        $dispatcher->listen('s3:*', static function (): void {
-        });
+        $dispatcher->listen('s3:*', static function (): void {});
 
         $dispatcher->dispatchEvent(new S3Event(
             name: 's3:ObjectCreated:Put',

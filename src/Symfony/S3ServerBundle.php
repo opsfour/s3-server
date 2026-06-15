@@ -10,8 +10,14 @@ use Symfony\Component\HttpKernel\Bundle\Bundle;
 
 final class S3ServerBundle extends Bundle
 {
-    public function getContainerExtension(): ?ExtensionInterface
+    public function getContainerExtension(): ExtensionInterface
     {
-        return $this->extension ??= new S3ServerExtension;
+        if ($this->extension instanceof ExtensionInterface) {
+            return $this->extension;
+        }
+
+        $this->extension = new S3ServerExtension();
+
+        return $this->extension;
     }
 }

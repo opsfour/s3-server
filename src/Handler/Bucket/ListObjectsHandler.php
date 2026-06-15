@@ -31,7 +31,7 @@ final class ListObjectsHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -81,7 +81,7 @@ final class ListObjectsHandler implements RequestHandler
             'encodingType' => $encodingType,
             'objects' => $result->objects,
             'commonPrefixes' => $result->commonPrefixes,
-        ], fn ($v) => $v !== null);
+        ], fn($v) => $v !== null);
 
         $credential = $request->getAttribute('credential');
         if ($credential !== null) {

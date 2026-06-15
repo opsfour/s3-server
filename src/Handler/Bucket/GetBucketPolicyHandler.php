@@ -32,13 +32,13 @@ final class GetBucketPolicyHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $policyJson = $this->metadata->getBucketPolicy($bucket);
 
         if ($policyJson === null) {
-            throw new NoSuchBucketPolicyException;
+            throw new NoSuchBucketPolicyException();
         }
 
         return new Response(

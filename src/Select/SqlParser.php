@@ -22,7 +22,7 @@ final class SqlParser
      */
     public static function parse(string $sql): array
     {
-        $parser = new self;
+        $parser = new self();
         $parser->tokenize($sql);
         return $parser->parseSelect();
     }
@@ -65,7 +65,9 @@ final class SqlParser
                 && (empty($this->tokens) || in_array(end($this->tokens)['type'], ['OP', 'KEYWORD'], true));
             if (ctype_digit($sql[$i]) || $isNegativeNumber) {
                 $j = $i;
-                if ($sql[$j] === '-') $j++;
+                if ($sql[$j] === '-') {
+                    $j++;
+                }
                 while ($j < $len && (ctype_digit($sql[$j]) || $sql[$j] === '.')) {
                     $j++;
                 }
@@ -114,6 +116,7 @@ final class SqlParser
         }
     }
 
+    /** @return array{columns: list<array{expr: string, alias: ?string}>, alias: string, where: ?array<string, mixed>} */
     private function parseSelect(): array
     {
         $this->expect('KEYWORD', 'SELECT');
@@ -124,7 +127,7 @@ final class SqlParser
         $this->expect('KEYWORD', 'FROM');
 
         // Parse table (S3Object).
-        $tableName = $this->consume('IDENT')['value'] ?? 'S3Object';
+        $tableName = $this->consume('IDENT')['value'];
 
         $alias = 's';
         if ($this->peek()['type'] === 'KEYWORD' && $this->peek()['value'] === 'AS') {
@@ -158,7 +161,7 @@ final class SqlParser
             return [['expr' => '*', 'alias' => null]];
         }
 
-        do {
+        while (true) {
             $expr = $this->parseColumnExpr();
             $alias = null;
             if ($this->pos < count($this->tokens) && $this->peek()['type'] === 'KEYWORD' && $this->peek()['value'] === 'AS') {
@@ -166,7 +169,11 @@ final class SqlParser
                 $alias = $this->consume('IDENT')['value'];
             }
             $columns[] = ['expr' => $expr, 'alias' => $alias];
-        } while ($this->pos < count($this->tokens) && $this->peek()['value'] === ',' && $this->consume('OP'));
+            if ($this->pos >= count($this->tokens) || $this->peek()['value'] !== ',') {
+                break;
+            }
+            $this->consume('OP');
+        }
 
         return $columns;
     }
@@ -177,15 +184,26 @@ final class SqlParser
         $depth = 0;
         while ($this->pos < count($this->tokens)) {
             $token = $this->peek();
-            if ($token['value'] === ',' && $depth === 0) break;
-            if ($token['type'] === 'KEYWORD' && in_array($token['value'], ['FROM', 'AS', 'WHERE'], true) && $depth === 0) break;
-            if ($token['value'] === '(') $depth++;
-            if ($token['value'] === ')') { if ($depth === 0) break; $depth--; }
+            if ($token['value'] === ',' && $depth === 0) {
+                break;
+            }
+            if ($token['type'] === 'KEYWORD' && in_array($token['value'], ['FROM', 'AS', 'WHERE'], true) && $depth === 0) {
+                break;
+            }
+            if ($token['value'] === '(') {
+                $depth++;
+            }
+            if ($token['value'] === ')') {
+                if ($depth === 0) {
+                    break;
+                } $depth--;
+            }
             $parts[] = $this->tokens[$this->pos++]['value'];
         }
         return implode(' ', $parts);
     }
 
+    /** @return array{tokens: list<array{type: string, value: string}>} */
     private function parseExpression(): array
     {
         // Simple expression parser — returns a structured array.
@@ -196,11 +214,13 @@ final class SqlParser
         return ['tokens' => $tokens];
     }
 
+    /** @return array{type: string, value: string} */
     private function peek(): array
     {
         return $this->tokens[$this->pos] ?? ['type' => 'EOF', 'value' => ''];
     }
 
+    /** @return array{type: string, value: string} */
     private function consume(string $type): array
     {
         $token = $this->peek();

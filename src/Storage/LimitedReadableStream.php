@@ -40,7 +40,7 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         int $limit,
     ) {
         if ($limit < 0) {
-            throw new \InvalidArgumentException('Limit must be non-negative, got '.$limit);
+            throw new \InvalidArgumentException('Limit must be non-negative, got ' . $limit);
         }
 
         $this->remaining = $limit;

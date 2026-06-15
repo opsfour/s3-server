@@ -25,16 +25,16 @@ final class GetBucketEncryptionHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $config = $this->metadata->getBucketEncryption($bucket);
         if ($config === null) {
-            throw new NoSuchEncryptionConfigurationException;
+            throw new NoSuchEncryptionConfigurationException();
         }
 
         /** @var array{sseAlgorithm: string, kmsMasterKeyId?: string, bucketKeyEnabled?: bool} $encConfig */
-        $encConfig = array_filter($config, fn ($v) => $v !== null);
+        $encConfig = array_filter($config, fn($v) => $v !== null);
 
         return new Response(
             status: 200,

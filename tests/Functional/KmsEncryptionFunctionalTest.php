@@ -17,7 +17,7 @@ final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
         $keys = [
             'test-kms-key' => base64_encode(str_repeat('K', 32)),
         ];
-        putenv('S3_ENCRYPTION_MASTER_KEYS='.json_encode($keys, JSON_THROW_ON_ERROR));
+        putenv('S3_ENCRYPTION_MASTER_KEYS=' . json_encode($keys, JSON_THROW_ON_ERROR));
 
         parent::setUpBeforeClass();
     }
@@ -29,7 +29,7 @@ final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
         if (self::$previousMasterKeys === false) {
             putenv('S3_ENCRYPTION_MASTER_KEYS');
         } else {
-            putenv('S3_ENCRYPTION_MASTER_KEYS='.self::$previousMasterKeys);
+            putenv('S3_ENCRYPTION_MASTER_KEYS=' . self::$previousMasterKeys);
         }
     }
 
@@ -41,7 +41,7 @@ final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
             return;
         }
 
-        self::$bucket = 'kms-default-'.bin2hex(random_bytes(4));
+        self::$bucket = 'kms-default-' . bin2hex(random_bytes(4));
         self::$s3->createBucket(['Bucket' => self::$bucket]);
     }
 
@@ -69,7 +69,7 @@ final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
         self::assertSame('alias/test-key', $defaults['KMSMasterKeyID']);
 
         $key = 'kms/default-object.txt';
-        $body = 'kms encrypted payload '.bin2hex(random_bytes(16));
+        $body = 'kms encrypted payload ' . bin2hex(random_bytes(16));
 
         self::$s3->putObject([
             'Bucket' => self::$bucket,

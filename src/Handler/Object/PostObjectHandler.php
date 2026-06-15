@@ -51,7 +51,7 @@ final class PostObjectHandler implements RequestHandler
         $fields = $this->parseMultipartFormData($request);
 
         // 3. Extract standard fields (case-insensitive per S3 spec).
-        $f = fn (string $name): ?string => $this->getFormField($fields, $name);
+        $f = fn(string $name): ?string => $this->getFormField($fields, $name);
         $key = $f('key');
         $file = $fields['file'] ?? null;
         $policy = $f('policy');
@@ -112,8 +112,11 @@ final class PostObjectHandler implements RequestHandler
         if ($checksumSha256 !== null && $checksumSha256 !== '') {
             $computedChecksum = base64_encode(hash('sha256', $body, true));
             if (!hash_equals($computedChecksum, $checksumSha256)) {
-                return $this->errorResponse(400, 'BadDigest',
-                    'The SHA-256 you specified did not match what we received.');
+                return $this->errorResponse(
+                    400,
+                    'BadDigest',
+                    'The SHA-256 you specified did not match what we received.',
+                );
             }
         }
 
@@ -121,8 +124,11 @@ final class PostObjectHandler implements RequestHandler
         if ($checksumCrc32 !== null && $checksumCrc32 !== '') {
             $computedCrc = base64_encode(pack('N', crc32($body)));
             if (!hash_equals($computedCrc, $checksumCrc32)) {
-                return $this->errorResponse(400, 'BadDigest',
-                    'The CRC32 you specified did not match what we received.');
+                return $this->errorResponse(
+                    400,
+                    'BadDigest',
+                    'The CRC32 you specified did not match what we received.',
+                );
             }
         }
 
@@ -272,7 +278,7 @@ final class PostObjectHandler implements RequestHandler
     /**
      * Authenticate using S3 V2 signature (HMAC-SHA1 of base64 policy).
      *
-     * @return array{0: string, 1: array}|null [ownerId, decodedPolicy] on success, null on failure.
+     * @return array{0: string, 1: array<string, mixed>}|null [ownerId, decodedPolicy] on success, null on failure.
      */
     private function authenticateV2(string $accessKeyId, string $policyBase64, string $signatureBase64, ?string $sessionToken): ?array
     {
@@ -311,6 +317,9 @@ final class PostObjectHandler implements RequestHandler
 
     /**
      * Validate policy conditions against the submitted form fields.
+     *
+     * @param array<string, mixed> $policy
+     * @param array<string, string> $fields
      */
     private function validatePolicyConditions(array $policy, array $fields, string $bucket): ?Response
     {
@@ -354,17 +363,21 @@ final class PostObjectHandler implements RequestHandler
         }
 
         foreach ($conditions as $condition) {
+            if ($condition === []) {
+                return $this->errorResponse(400, 'InvalidArgument', 'Invalid Policy: empty condition element.');
+            }
+
             if (is_array($condition) && !array_is_list($condition)) {
                 // Exact match: {"field": "value"} — empty objects are invalid.
-                if ($condition === []) {
-                    return $this->errorResponse(400, 'InvalidArgument', 'Invalid Policy: empty condition element.');
-                }
                 foreach ($condition as $field => $expectedValue) {
                     $fieldLower = strtolower($field);
                     $actualValue = $this->getFieldValue($fields, $field, $bucket);
                     if ($actualValue !== $expectedValue) {
-                        return $this->errorResponse(403, 'AccessDenied',
-                            "Invalid according to Policy: Policy Condition failed: [\"eq\", \"\${$field}\", \"{$expectedValue}\"]");
+                        return $this->errorResponse(
+                            403,
+                            'AccessDenied',
+                            "Invalid according to Policy: Policy Condition failed: [\"eq\", \"\${$field}\", \"{$expectedValue}\"]",
+                        );
                     }
                 }
             } elseif (is_array($condition) && array_is_list($condition)) {
@@ -380,8 +393,11 @@ final class PostObjectHandler implements RequestHandler
 
                     // Empty prefix means "any value is accepted".
                     if ($prefix !== '' && !str_starts_with($actualValue, $prefix)) {
-                        return $this->errorResponse(403, 'AccessDenied',
-                            "Invalid according to Policy: Policy Condition failed: [\"starts-with\", \"\${$field}\", \"{$prefix}\"]");
+                        return $this->errorResponse(
+                            403,
+                            'AccessDenied',
+                            "Invalid according to Policy: Policy Condition failed: [\"starts-with\", \"\${$field}\", \"{$prefix}\"]",
+                        );
                     }
                 } elseif ($operator === 'eq') {
                     $field = ltrim((string) $condition[1], '$');
@@ -389,8 +405,11 @@ final class PostObjectHandler implements RequestHandler
                     $actualValue = $this->getFieldValue($fields, $field, $bucket);
 
                     if ($actualValue !== $expectedValue) {
-                        return $this->errorResponse(403, 'AccessDenied',
-                            "Invalid according to Policy: Policy Condition failed: [\"eq\", \"\${$field}\", \"{$expectedValue}\"]");
+                        return $this->errorResponse(
+                            403,
+                            'AccessDenied',
+                            "Invalid according to Policy: Policy Condition failed: [\"eq\", \"\${$field}\", \"{$expectedValue}\"]",
+                        );
                     }
                 } elseif ($operator === 'content-length-range') {
                     $min = (int) $condition[1];
@@ -398,12 +417,18 @@ final class PostObjectHandler implements RequestHandler
                     $fileSize = strlen($fields['file'] ?? '');
 
                     if ($fileSize < $min) {
-                        return $this->errorResponse(400, 'EntityTooSmall',
-                            'Your proposed upload is smaller than the minimum allowed size.');
+                        return $this->errorResponse(
+                            400,
+                            'EntityTooSmall',
+                            'Your proposed upload is smaller than the minimum allowed size.',
+                        );
                     }
                     if ($fileSize > $max) {
-                        return $this->errorResponse(400, 'EntityTooLarge',
-                            'Your proposed upload exceeds the maximum allowed size.');
+                        return $this->errorResponse(
+                            400,
+                            'EntityTooLarge',
+                            'Your proposed upload exceeds the maximum allowed size.',
+                        );
                     }
                 }
             }
@@ -414,6 +439,8 @@ final class PostObjectHandler implements RequestHandler
 
     /**
      * Case-insensitive form field lookup.
+     *
+     * @param array<string, string> $fields
      */
     private function getFormField(array $fields, string $name): ?string
     {
@@ -428,6 +455,8 @@ final class PostObjectHandler implements RequestHandler
 
     /**
      * Get the value of a field, with special handling for 'bucket'.
+     *
+     * @param array<string, string> $fields
      */
     private function getFieldValue(array $fields, string $field, string $bucket): string
     {

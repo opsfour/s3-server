@@ -29,7 +29,7 @@ final class MetadataStoreFactory
         if ($driver === 'sqlite') {
             $logger?->warning(
                 'SQLite metadata driver is intended for development/testing only. '
-                .'Use Postgres or MySQL for production deployments.',
+                . 'Use Postgres or MySQL for production deployments.',
             );
         }
 

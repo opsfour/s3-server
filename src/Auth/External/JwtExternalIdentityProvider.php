@@ -96,7 +96,8 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
         }
 
         if (count($this->keys) === 1) {
-            return $this->keyToPem(reset($this->keys));
+            $keys = $this->keys;
+            return $this->keyToPem(reset($keys));
         }
 
         throw new ExternalIdentityAuthenticationException('JWT key ID is unknown.');
@@ -208,21 +209,21 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
     private function rsaJwkToPem(string $modulus, string $exponent): string
     {
         $rsaPublicKey = $this->derSequence(
-            $this->derInteger($this->base64UrlDecode($modulus)) .
-            $this->derInteger($this->base64UrlDecode($exponent)),
+            $this->derInteger($this->base64UrlDecode($modulus))
+            . $this->derInteger($this->base64UrlDecode($exponent)),
         );
 
         $subjectPublicKeyInfo = $this->derSequence(
             $this->derSequence(
-                $this->derObjectIdentifier(hex2bin('2a864886f70d010101') ?: '') .
-                $this->derNull(),
-            ) .
-            $this->derBitString($rsaPublicKey),
+                $this->derObjectIdentifier(hex2bin('2a864886f70d010101') ?: '')
+                . $this->derNull(),
+            )
+            . $this->derBitString($rsaPublicKey),
         );
 
-        return "-----BEGIN PUBLIC KEY-----\n" .
-            chunk_split(base64_encode($subjectPublicKeyInfo), 64, "\n") .
-            "-----END PUBLIC KEY-----\n";
+        return "-----BEGIN PUBLIC KEY-----\n"
+            . chunk_split(base64_encode($subjectPublicKeyInfo), 64, "\n")
+            . "-----END PUBLIC KEY-----\n";
     }
 
     private function derSequence(string $value): string

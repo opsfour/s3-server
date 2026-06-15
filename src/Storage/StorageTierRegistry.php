@@ -29,7 +29,7 @@ final class StorageTierRegistry
 
         $defaults = array_values(array_filter(
             $this->tiers,
-            static fn (StorageTier $tier): bool => $tier->defaultWriteTier,
+            static fn(StorageTier $tier): bool => $tier->defaultWriteTier,
         ));
 
         if (count($defaults) > 1) {

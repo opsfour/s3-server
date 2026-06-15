@@ -27,7 +27,7 @@ final readonly class ObjectInfo
      * @param  string|null  $versionId  The version ID if versioning is enabled.
      * @param  bool  $isDeleteMarker  Whether this is a delete marker.
      * @param  array<string, string>  $userMetadata  User-defined x-amz-meta-* headers.
-     * @param  array<string, string>  $systemMetadata  System metadata (checksums, encryption, etc.).
+     * @param  array<string, string>  $systemMetadata  System metadata (checksums, encryption, version flags, etc.).
      * @param  \DateTimeImmutable  $lastModified  The last modified timestamp.
      */
     public function __construct(
@@ -49,6 +49,6 @@ final readonly class ObjectInfo
         public bool $isDeleteMarker = false,
         public array $userMetadata = [],
         public array $systemMetadata = [],
-        public \DateTimeImmutable $lastModified = new \DateTimeImmutable,
+        public \DateTimeImmutable $lastModified = new \DateTimeImmutable(),
     ) {}
 }

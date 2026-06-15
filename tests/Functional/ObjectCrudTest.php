@@ -32,7 +32,7 @@ final class ObjectCrudTest extends S3FunctionalTestCase
         $result = self::$s3->listBuckets();
 
         $bucketNames = array_map(
-            fn ($b) => $b['Name'],
+            fn($b) => $b['Name'],
             $result['Buckets'] ?? [],
         );
 
@@ -184,7 +184,7 @@ final class ObjectCrudTest extends S3FunctionalTestCase
         // Deleting a non-existent object should still return 204.
         $result = self::$s3->deleteObject([
             'Bucket' => self::$testBucket,
-            'Key' => 'nonexistent-key-'.uniqid(),
+            'Key' => 'nonexistent-key-' . uniqid(),
         ]);
 
         $this->assertSame(204, $result['@metadata']['statusCode']);
@@ -196,7 +196,7 @@ final class ObjectCrudTest extends S3FunctionalTestCase
         try {
             self::$s3->getObject([
                 'Bucket' => self::$testBucket,
-                'Key' => 'no-such-key-'.uniqid(),
+                'Key' => 'no-such-key-' . uniqid(),
             ]);
             $this->fail('Expected NoSuchKey exception');
         } catch (S3Exception $e) {

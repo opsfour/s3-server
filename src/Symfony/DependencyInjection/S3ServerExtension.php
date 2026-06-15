@@ -34,7 +34,7 @@ final class S3ServerExtension extends Extension
      */
     public function load(array $configs, ContainerBuilder $container): void
     {
-        $configuration = new Configuration;
+        $configuration = new Configuration();
         $config = $this->processConfiguration($configuration, $configs);
 
         $metadataConfig = $config['metadata'];

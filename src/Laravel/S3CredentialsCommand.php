@@ -102,7 +102,7 @@ final class S3CredentialsCommand extends Command
 
         $this->table(
             ['Access Key ID', 'Owner ID', 'Display Name', 'Active'],
-            array_map(fn ($c) => [
+            array_map(fn($c) => [
                 $c->accessKeyId,
                 $c->ownerId,
                 $c->displayName ?: '(none)',

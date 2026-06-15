@@ -73,7 +73,7 @@ final class FilesystemBackend implements StorageBackend
         } catch (\Throwable $e) {
             self::closeAndRelease($tempFile);
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to write object: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to write object: ' . $e->getMessage(), $e);
         }
 
         $checksums = $calculator->finalize();
@@ -86,7 +86,7 @@ final class FilesystemBackend implements StorageBackend
             $this->atomicMove($tempPath, $finalPath);
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to finalize object: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to finalize object: ' . $e->getMessage(), $e);
         }
 
         return new StorageWriteResult(
@@ -106,7 +106,7 @@ final class FilesystemBackend implements StorageBackend
     public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
     {
         if (! $this->metadataFilesystem->exists($storagePath)) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $file = $this->fileFilesystem->openFile($storagePath, 'r');
@@ -140,14 +140,14 @@ final class FilesystemBackend implements StorageBackend
             $this->metadataFilesystem->deleteFile($storagePath);
         } catch (FilesystemException) {
             // TOCTOU: file was deleted between exists() and deleteFile() — idempotent success.
-            if ($this->metadataFilesystem->exists($storagePath)) {
+            if ($this->pathExists($storagePath)) {
                 throw new InternalErrorException('Failed to delete object file: ' . $storagePath);
             }
             return;
         }
 
         // Clean up empty parent directories (hash/hash level)
-        $bucketDir = $this->basePath.'/'.$bucket;
+        $bucketDir = $this->basePath . '/' . $bucket;
         $dir = dirname($storagePath);
 
         while ($dir !== $bucketDir && strlen($dir) > strlen($bucketDir)) {
@@ -175,7 +175,7 @@ final class FilesystemBackend implements StorageBackend
      */
     public function createBucket(string $bucket): void
     {
-        $bucketDir = $this->basePath.'/'.$bucket;
+        $bucketDir = $this->basePath . '/' . $bucket;
 
         $this->ensureDirectory($bucketDir);
     }
@@ -185,7 +185,7 @@ final class FilesystemBackend implements StorageBackend
      */
     public function deleteBucket(string $bucket): void
     {
-        $bucketDir = $this->basePath.'/'.$bucket;
+        $bucketDir = $this->basePath . '/' . $bucket;
 
         if ($this->metadataFilesystem->isDirectory($bucketDir)) {
             $this->metadataFilesystem->deleteDirectory($bucketDir);
@@ -197,7 +197,7 @@ final class FilesystemBackend implements StorageBackend
      */
     public function bucketExists(string $bucket): bool
     {
-        return $this->metadataFilesystem->isDirectory($this->basePath.'/'.$bucket);
+        return $this->metadataFilesystem->isDirectory($this->basePath . '/' . $bucket);
     }
 
     // ---------------------------------------------------------------
@@ -248,7 +248,7 @@ final class FilesystemBackend implements StorageBackend
         } catch (\Throwable $e) {
             self::closeAndRelease($tempFile);
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to write part: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to write part: ' . $e->getMessage(), $e);
         }
 
         $checksums = $calculator->finalize();
@@ -259,7 +259,7 @@ final class FilesystemBackend implements StorageBackend
             $this->atomicMove($tempPath, $partPath);
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to finalize part: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to finalize part: ' . $e->getMessage(), $e);
         }
 
         return new StorageWriteResult(
@@ -339,7 +339,7 @@ final class FilesystemBackend implements StorageBackend
                 throw $e;
             }
 
-            throw new InternalErrorException('Failed to assemble multipart upload: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to assemble multipart upload: ' . $e->getMessage(), $e);
         }
 
         $checksums = $calculator->finalize();
@@ -355,7 +355,7 @@ final class FilesystemBackend implements StorageBackend
             $this->atomicMove($tempPath, $finalPath);
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to finalize assembled object: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to finalize assembled object: ' . $e->getMessage(), $e);
         }
 
         // Clean up part files after successful assembly.
@@ -364,7 +364,7 @@ final class FilesystemBackend implements StorageBackend
         return new StorageWriteResult(
             path: $finalPath,
             size: $size,
-            md5Hex: $compositeMd5.'-'.count($parts),
+            md5Hex: $compositeMd5 . '-' . count($parts),
             crc32Base64: $checksums->crc32Base64(),
             crc32cBase64: $checksums->crc32cBase64(),
             sha1Base64: $checksums->sha1Base64(),
@@ -398,7 +398,7 @@ final class FilesystemBackend implements StorageBackend
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
         if (! $this->metadataFilesystem->exists($srcPath)) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $tempPath = StoragePath::forTemp($this->basePath);
@@ -427,7 +427,7 @@ final class FilesystemBackend implements StorageBackend
             self::closeAndRelease($srcFile);
             self::closeAndRelease($dstFile);
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to copy object: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to copy object: ' . $e->getMessage(), $e);
         }
 
         $checksums = $calculator->finalize();
@@ -440,7 +440,7 @@ final class FilesystemBackend implements StorageBackend
             $this->atomicMove($tempPath, $finalPath);
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
-            throw new InternalErrorException('Failed to finalize copied object: '.$e->getMessage(), $e);
+            throw new InternalErrorException('Failed to finalize copied object: ' . $e->getMessage(), $e);
         }
 
         return new StorageWriteResult(
@@ -475,11 +475,11 @@ final class FilesystemBackend implements StorageBackend
         try {
             $this->metadataFilesystem->createDirectoryRecursively($path, 0755);
         } catch (FilesystemException $e) {
-            if ($this->metadataFilesystem->isDirectory($path)) {
+            if ($this->isDirectoryPath($path)) {
                 return;
             }
 
-            throw new InternalErrorException('Failed to create directory: '.$path, $e);
+            throw new InternalErrorException('Failed to create directory: ' . $path, $e);
         }
     }
 
@@ -488,10 +488,11 @@ final class FilesystemBackend implements StorageBackend
         try {
             $this->metadataFilesystem->move($from, $to);
         } catch (FilesystemException $e) {
-            throw new InternalErrorException('Failed to move file: '.$from.' -> '.$to, $e);
+            throw new InternalErrorException('Failed to move file: ' . $from . ' -> ' . $to, $e);
         }
     }
 
+    /** @param-out null $file */
     private static function closeAndRelease(?\Amp\File\File &$file): void
     {
         if ($file === null) {
@@ -505,6 +506,16 @@ final class FilesystemBackend implements StorageBackend
             // ParallelFile object is destroyed, not merely when close() returns.
             $file = null;
         }
+    }
+
+    private function pathExists(string $path): bool
+    {
+        return $this->metadataFilesystem->exists($path);
+    }
+
+    private function isDirectoryPath(string $path): bool
+    {
+        return $this->metadataFilesystem->isDirectory($path);
     }
 
     /**
@@ -530,7 +541,7 @@ final class FilesystemBackend implements StorageBackend
      */
     private function cleanupParts(string $uploadId): void
     {
-        $partsDir = $this->basePath.'/.parts/'.$uploadId;
+        $partsDir = $this->basePath . '/.parts/' . $uploadId;
 
         if (! $this->metadataFilesystem->isDirectory($partsDir)) {
             return;
@@ -539,7 +550,7 @@ final class FilesystemBackend implements StorageBackend
         $files = $this->metadataFilesystem->listFiles($partsDir);
 
         foreach ($files as $file) {
-            $filePath = $partsDir.'/'.$file;
+            $filePath = $partsDir . '/' . $file;
 
             try {
                 $this->metadataFilesystem->deleteFile($filePath);
@@ -564,7 +575,7 @@ final class FilesystemBackend implements StorageBackend
      */
     public function cleanupStaleTempFiles(int $maxAgeSeconds = 3600): int
     {
-        $tmpDir = $this->basePath.'/.tmp';
+        $tmpDir = $this->basePath . '/.tmp';
 
         if (! $this->metadataFilesystem->isDirectory($tmpDir)) {
             return 0;
@@ -574,7 +585,7 @@ final class FilesystemBackend implements StorageBackend
         $cutoff = time() - $maxAgeSeconds;
 
         foreach ($this->metadataFilesystem->listFiles($tmpDir) as $file) {
-            $filePath = $tmpDir.'/'.$file;
+            $filePath = $tmpDir . '/' . $file;
 
             try {
                 $stat = $this->metadataFilesystem->getStatus($filePath);

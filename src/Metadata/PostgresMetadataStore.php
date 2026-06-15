@@ -27,7 +27,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  */
 final class PostgresMetadataStore implements MetadataStore
 {
-    /** @var \WeakMap<\Fiber, PostgresTransaction> */
+    /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
 
     public function __construct(
@@ -440,7 +440,7 @@ final class PostgresMetadataStore implements MetadataStore
 
         $quotas = [];
         while (($row = $result->fetchRow()) !== null) {
-            $quotas[(string) $row['owner_id']] = new QuotaConfig(
+            $quotas[self::str($row['owner_id'])] = new QuotaConfig(
                 maxBucketsPerOwner: (int) $row['max_buckets_per_owner'],
                 maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
                 maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
@@ -569,10 +569,10 @@ final class PostgresMetadataStore implements MetadataStore
         }
 
         $sql = 'SELECT bucket, key_name, version_id, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = $1 AND is_latest = TRUE AND is_delete_marker = FALSE';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = $1 AND is_latest = TRUE AND is_delete_marker = FALSE';
 
         $params = [$bucket];
         $paramIndex = 2;
@@ -580,7 +580,7 @@ final class PostgresMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
@@ -684,7 +684,7 @@ final class PostgresMetadataStore implements MetadataStore
             $delimPos = strpos($afterPrefix, $delimiter);
 
             if ($delimPos !== false) {
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
                     $commonPrefixes[] = $commonPrefix;
@@ -792,14 +792,14 @@ final class PostgresMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
         // Pagination via key-marker / upload-id-marker.
         if ($keyMarker !== null && $keyMarker !== '') {
             if ($uploadIdMarker !== null && $uploadIdMarker !== '') {
-                $sql .= " AND (key_name > \${$paramIndex} OR (key_name = \$".($paramIndex + 1)." AND upload_id > \$".($paramIndex + 2).'))';
+                $sql .= " AND (key_name > \${$paramIndex} OR (key_name = \$" . ($paramIndex + 1) . " AND upload_id > \$" . ($paramIndex + 2) . '))';
                 $params[] = $keyMarker;
                 $params[] = $keyMarker;
                 $params[] = $uploadIdMarker;
@@ -849,7 +849,7 @@ final class PostgresMetadataStore implements MetadataStore
                 $delimPos = strpos($afterPrefix, $delimiter);
 
                 if ($delimPos !== false) {
-                    $commonPrefix = ($prefix ?? '').substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                    $commonPrefix = ($prefix ?? '') . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                     if (! isset($seen[$commonPrefix])) {
                         $seen[$commonPrefix] = true;
                         $commonPrefixes[] = $commonPrefix;
@@ -1018,9 +1018,13 @@ final class PostgresMetadataStore implements MetadataStore
                 ],
             );
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1084,9 +1088,13 @@ final class PostgresMetadataStore implements MetadataStore
                 );
             }
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1161,9 +1169,13 @@ final class PostgresMetadataStore implements MetadataStore
                 [$bucket, $key, $effectiveVersionId],
             );
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1192,10 +1204,10 @@ final class PostgresMetadataStore implements MetadataStore
         }
 
         $sql = 'SELECT bucket, key_name, version_id, is_latest, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = $1';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = $1';
 
         $params = [$bucket];
         $paramIndex = 2;
@@ -1203,7 +1215,7 @@ final class PostgresMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
@@ -1221,7 +1233,7 @@ final class PostgresMetadataStore implements MetadataStore
                     break;
                 }
                 if ($markerRow !== null) {
-                    $sql .= " AND (key_name > \${$paramIndex} OR (key_name = \${$paramIndex} AND id < \$".($paramIndex + 1).'))';
+                    $sql .= " AND (key_name > \${$paramIndex} OR (key_name = \${$paramIndex} AND id < \$" . ($paramIndex + 1) . '))';
                     $params[] = $keyMarker;
                     $params[] = (int) $markerRow['id'];
                     $paramIndex += 2;
@@ -1335,7 +1347,7 @@ final class PostgresMetadataStore implements MetadataStore
             $delimPos = strpos($afterPrefix, $delimiter);
 
             if ($delimPos !== false) {
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
                     $commonPrefixes[] = $commonPrefix;
@@ -1913,8 +1925,8 @@ final class PostgresMetadataStore implements MetadataStore
             }
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
-                $placeholders = implode(',', array_map(fn (int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
                 $tx->execute(
                     "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
                     $ids,
@@ -2001,8 +2013,8 @@ final class PostgresMetadataStore implements MetadataStore
             }
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
-                $placeholders = implode(',', array_map(fn (int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
                 $tx->execute(
                     "UPDATE s3_restore_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
                     $ids,
@@ -2110,7 +2122,7 @@ final class PostgresMetadataStore implements MetadataStore
 
         $decoded = json_decode($raw, true);
         if (is_array($decoded)) {
-            return $decoded;
+            return array_values(array_filter($decoded, is_string(...)));
         }
 
         return [$raw];
@@ -2260,16 +2272,28 @@ final class PostgresMetadataStore implements MetadataStore
 
             if ($rows !== []) {
                 $ids = array_column($rows, 'id');
-                $placeholders = implode(',', array_map(fn (int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
                 $tx->execute(
                     "UPDATE s3_notification_queue SET status = 'processing' WHERE id IN ({$placeholders})",
-                    array_map(fn ($id) => (int) $id, $ids),
+                    array_map(fn($id) => (int) $id, $ids),
                 );
             }
 
             $tx->commit();
 
-            return $rows;
+            return array_map(
+                static fn(array $row): array => [
+                    'id' => (int) $row['id'],
+                    'bucket' => self::str($row['bucket']),
+                    'key_name' => self::str($row['key_name']),
+                    'event_name' => self::str($row['event_name']),
+                    'destination_url' => self::str($row['destination_url']),
+                    'payload_json' => self::str($row['payload_json']),
+                    'attempts' => (int) $row['attempts'],
+                    'max_attempts' => (int) $row['max_attempts'],
+                ],
+                $rows,
+            );
         } catch (\Throwable $e) {
             $tx->rollback();
             throw $e;
@@ -2320,6 +2344,7 @@ final class PostgresMetadataStore implements MetadataStore
         if ($fiber === null) {
             throw new \LogicException('beginTransaction() must be called from within a Fiber.');
         }
+        /** @var \Fiber<mixed, mixed, mixed, mixed> $fiber */
         if (isset($this->fiberTxMap[$fiber])) {
             return; // Already in a transaction on this fiber — nested call, no-op.
         }
@@ -2354,11 +2379,15 @@ final class PostgresMetadataStore implements MetadataStore
 
         try {
             $result = $callback();
-            if ($ownTx) { $this->commit(); }
+            if ($ownTx) {
+                $this->commit();
+            }
 
             return $result;
         } catch (\Throwable $e) {
-            if ($ownTx) { $this->rollback(); }
+            if ($ownTx) {
+                $this->rollback();
+            }
 
             throw $e;
         }
@@ -2429,15 +2458,15 @@ final class PostgresMetadataStore implements MetadataStore
             $systemMetadata['checksum-sha256'] = self::str($row['checksum_sha256']);
         }
         if (isset($row['is_latest'])) {
-            $systemMetadata['isLatest'] = (bool) $row['is_latest'];
+            $systemMetadata['isLatest'] = (bool) $row['is_latest'] ? '1' : '0';
         }
 
         $versionId = ($row['version_id'] ?? 'null') === 'null' ? null : self::str($row['version_id']);
 
         $lastModified = isset($row['updated_at'])
             ? new \DateTimeImmutable($this->formatTimestamp($row['updated_at']))
-            : new \DateTimeImmutable;
-        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== null && $row['restore_expires_at'] !== ''
+            : new \DateTimeImmutable();
+        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== ''
             ? new \DateTimeImmutable($this->formatTimestamp($row['restore_expires_at']))
             : null;
 
@@ -2464,7 +2493,10 @@ final class PostgresMetadataStore implements MetadataStore
         );
     }
 
-    /** @param array<string, mixed> $row */
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
     private function rowToTierTransitionJob(array $row): array
     {
         return [
@@ -2487,7 +2519,10 @@ final class PostgresMetadataStore implements MetadataStore
         ];
     }
 
-    /** @param array<string, mixed> $row */
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
     private function rowToRestoreJob(array $row): array
     {
         return [
@@ -2516,7 +2551,7 @@ final class PostgresMetadataStore implements MetadataStore
             : $this->getObjectMetadataByVersion($bucket, $key, $versionId);
 
         if ($object === null || $object->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
     }
 
@@ -2759,7 +2794,7 @@ final class PostgresMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
@@ -2796,7 +2831,7 @@ final class PostgresMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
@@ -2836,7 +2871,7 @@ final class PostgresMetadataStore implements MetadataStore
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE \${$paramIndex} ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 
@@ -2871,15 +2906,15 @@ final class PostgresMetadataStore implements MetadataStore
     public function listOrphanedDeleteMarkers(string $bucket, ?string $prefix, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array
     {
         $sql = 'SELECT dm.* FROM s3_objects dm '
-            .'WHERE dm.bucket = $1 AND dm.is_delete_marker = TRUE AND dm.is_latest = TRUE '
-            .'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = FALSE)';
+            . 'WHERE dm.bucket = $1 AND dm.is_delete_marker = TRUE AND dm.is_latest = TRUE '
+            . 'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = FALSE)';
         $params = [$bucket];
         $paramIndex = 2;
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND dm.key_name LIKE \${$paramIndex} ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
             $paramIndex++;
         }
 

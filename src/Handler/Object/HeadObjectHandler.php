@@ -42,7 +42,7 @@ final class HeadObjectHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Get object metadata (version-aware).
@@ -55,7 +55,7 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         if ($objectInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Delete markers: return error with x-amz-delete-marker header.
@@ -67,10 +67,10 @@ final class HeadObjectHandler implements RequestHandler
             }
 
             if ($versionId !== null) {
-                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException)->withExtraHeaders($dmHeaders);
+                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException())->withExtraHeaders($dmHeaders);
             }
 
-            throw (new NoSuchKeyException)->withExtraHeaders($dmHeaders);
+            throw (new NoSuchKeyException())->withExtraHeaders($dmHeaders);
         }
 
         // 3. Evaluate conditional headers.
@@ -156,7 +156,7 @@ final class HeadObjectHandler implements RequestHandler
         $start = (int) $parts[0];
 
         if ($start >= $objectSize) {
-            throw new InvalidRangeException;
+            throw new InvalidRangeException();
         }
 
         if ($parts[1] === '') {
@@ -170,7 +170,7 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         if ($start > $end) {
-            throw new \OpsFour\S3Server\Exception\InvalidRangeException;
+            throw new \OpsFour\S3Server\Exception\InvalidRangeException();
         }
 
         return ['start' => $start, 'end' => $end];

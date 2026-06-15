@@ -21,7 +21,7 @@ final class HealthCheckHandler implements RequestHandler
 {
     public function __construct(
         private readonly ?MetadataStore $metadata = null,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
     ) {}
 
     public function handleRequest(Request $request): Response

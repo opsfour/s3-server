@@ -35,7 +35,7 @@ final class ConditionalHeaderEvaluator
         // If-Match: request ETag must match object ETag.
         if ($ifMatch !== null) {
             if (! self::etagMatches($ifMatch, $objectInfo->etag)) {
-                throw new PreconditionFailedException;
+                throw new PreconditionFailedException();
             }
         }
 
@@ -43,14 +43,14 @@ final class ConditionalHeaderEvaluator
         if ($ifUnmodifiedSince !== null) {
             $sinceTime = self::parseHttpDate($ifUnmodifiedSince);
             if ($sinceTime !== null && $objectInfo->lastModified->getTimestamp() > $sinceTime) {
-                throw new PreconditionFailedException;
+                throw new PreconditionFailedException();
             }
         }
 
         // If-None-Match: return 304 if ETag matches.
         if ($ifNoneMatch !== null) {
             if (self::etagMatches($ifNoneMatch, $objectInfo->etag)) {
-                $e = new NotModifiedException;
+                $e = new NotModifiedException();
                 $e->setExtraHeaders([
                     'ETag' => $objectInfo->etag,
                     'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),
@@ -63,7 +63,7 @@ final class ConditionalHeaderEvaluator
         if ($ifModifiedSince !== null) {
             $sinceTime = self::parseHttpDate($ifModifiedSince);
             if ($sinceTime !== null && $objectInfo->lastModified->getTimestamp() <= $sinceTime) {
-                $e = new NotModifiedException;
+                $e = new NotModifiedException();
                 $e->setExtraHeaders([
                     'ETag' => $objectInfo->etag,
                     'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),

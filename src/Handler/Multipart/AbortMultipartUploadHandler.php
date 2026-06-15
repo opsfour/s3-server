@@ -30,7 +30,7 @@ final class AbortMultipartUploadHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -38,16 +38,19 @@ final class AbortMultipartUploadHandler implements RequestHandler
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
-            throw new NoSuchUploadException;
+            throw new NoSuchUploadException();
         }
-        if (($upload['owner_id'] ?? '') !== $ownerId) {
-            throw new NoSuchUploadException;
+        if ($upload['owner_id'] !== $ownerId) {
+            throw new NoSuchUploadException();
         }
 
         // Best-effort storage cleanup first, then unconditionally remove metadata.
         // If storage cleanup fails, the upload record must still be removed so the
         // upload doesn't become permanently stuck.
-        try { $this->storage->abortMultipartUpload($bucket, $key, $uploadId); } catch (\Throwable) {}
+        try {
+            $this->storage->abortMultipartUpload($bucket, $key, $uploadId);
+        } catch (\Throwable) {
+        }
 
         $this->metadata->deleteMultipartUpload($uploadId);
         $this->notifications?->dispatch('s3:MultipartUpload:Aborted', $bucket, $key, 0, '', $ownerId);

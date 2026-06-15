@@ -806,6 +806,9 @@ final class XmlRequestParser
             // Strip DTD to prevent entity expansion (billion laughs / XXE).
             // Handles inline DTD subsets including nested brackets: <!DOCTYPE root [<!ENTITY ...> [...]]>
             $xml = preg_replace('/<!DOCTYPE\b[^[>]*(?:\[(?:[^\]]*|\[[^\]]*\])*\])?[^>]*>/si', '', $xml);
+            if ($xml === null) {
+                throw new \RuntimeException('Failed to sanitize XML.');
+            }
             $element = new \SimpleXMLElement($xml, LIBXML_NONET);
         } catch (\Exception $e) {
             libxml_clear_errors();

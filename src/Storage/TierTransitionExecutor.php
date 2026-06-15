@@ -17,7 +17,7 @@ final class TierTransitionExecutor
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageTierRegistry $tiers,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
         private readonly bool $deleteSourceAfterCommit = true,
     ) {}
 
@@ -166,7 +166,10 @@ final class TierTransitionExecutor
             && ($object->systemMetadata['storagePath'] ?? null) === $sourcePath;
     }
 
-    /** @param array<string, mixed> $job */
+    /**
+     * @param array<string, mixed> $job
+     * @return 'completed'
+     */
     private function completeStaleJob(array $job, string $reason): string
     {
         $this->metadata->updateTierTransitionJobStatus(

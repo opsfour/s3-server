@@ -298,7 +298,7 @@ final class SchemaManager
 
         foreach ($columns as $definition) {
             $column = strtok($definition, ' ');
-            if ($column === false || $this->columnExists('s3_objects', $column)) {
+            if ($this->columnExists('s3_objects', $column)) {
                 continue;
             }
 

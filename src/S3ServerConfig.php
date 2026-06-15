@@ -33,6 +33,7 @@ final class S3ServerConfig
         get => $this->storagePath;
     }
 
+    /** @var array<string, mixed> */
     public array $storageTiers {
         get => $this->storageTiers;
     }
@@ -222,8 +223,8 @@ final class S3ServerConfig
 
         if (! in_array($metadataDriver, self::ALLOWED_METADATA_DRIVERS, true)) {
             throw new \InvalidArgumentException(
-                'metadataDriver must be one of: '.implode(', ', self::ALLOWED_METADATA_DRIVERS)
-                .", got '{$metadataDriver}'.",
+                'metadataDriver must be one of: ' . implode(', ', self::ALLOWED_METADATA_DRIVERS)
+                . ", got '{$metadataDriver}'.",
             );
         }
 
@@ -325,7 +326,7 @@ final class S3ServerConfig
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
         $this->encryptionParallelThreshold = $encryptionParallelThreshold;
-        $this->quota = $quota ?? new QuotaConfig;
+        $this->quota = $quota ?? new QuotaConfig();
         $this->lifecycleIntervalSeconds = $lifecycleIntervalSeconds;
         $this->lifecycleBatchSize = $lifecycleBatchSize;
         $this->lifecycleMaxActionsPerRun = $lifecycleMaxActionsPerRun;

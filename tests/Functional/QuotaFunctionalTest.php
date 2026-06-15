@@ -330,7 +330,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
 
         $list = self::$s3->listObjectsV2(['Bucket' => $bucket]);
         $this->assertSame(['source.txt'], array_map(
-            static fn (array $object): string => $object['Key'],
+            static fn(array $object): string => $object['Key'],
             $list['Contents'] ?? [],
         ));
     }
@@ -442,7 +442,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         $this->assertCount(15, $rejectedCodes, self::serverLogs());
         $this->assertSame(
             [],
-            array_values(array_filter($rejectedCodes, static fn (string $code): bool => $code !== 'QuotaExceeded')),
+            array_values(array_filter($rejectedCodes, static fn(string $code): bool => $code !== 'QuotaExceeded')),
             self::serverLogs(),
         );
     }

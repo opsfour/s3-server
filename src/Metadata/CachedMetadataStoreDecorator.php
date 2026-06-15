@@ -45,7 +45,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketOwner(string $bucket): ?string
     {
-        return $this->cached("owner:{$bucket}", fn () => $this->inner->getBucketOwner($bucket));
+        return $this->cached("owner:{$bucket}", fn() => $this->inner->getBucketOwner($bucket));
     }
 
     public function bucketExists(string $bucket): bool
@@ -55,32 +55,32 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketPolicy(string $bucket): ?string
     {
-        return $this->cached("policy:{$bucket}", fn () => $this->inner->getBucketPolicy($bucket));
+        return $this->cached("policy:{$bucket}", fn() => $this->inner->getBucketPolicy($bucket));
     }
 
     public function getAccountPolicy(string $ownerId): ?string
     {
-        return $this->cached("account-policy:{$ownerId}", fn () => $this->inner->getAccountPolicy($ownerId));
+        return $this->cached("account-policy:{$ownerId}", fn() => $this->inner->getAccountPolicy($ownerId));
     }
 
     public function getNamedPolicy(string $policyName): ?string
     {
-        return $this->cached("named-policy:{$policyName}", fn () => $this->inner->getNamedPolicy($policyName));
+        return $this->cached("named-policy:{$policyName}", fn() => $this->inner->getNamedPolicy($policyName));
     }
 
     public function getBucketCors(string $bucket): array
     {
-        return $this->cached("cors:{$bucket}", fn () => $this->inner->getBucketCors($bucket));
+        return $this->cached("cors:{$bucket}", fn() => $this->inner->getBucketCors($bucket));
     }
 
     public function getPublicAccessBlock(string $bucket): ?array
     {
-        return $this->cached("pab:{$bucket}", fn () => $this->inner->getPublicAccessBlock($bucket));
+        return $this->cached("pab:{$bucket}", fn() => $this->inner->getPublicAccessBlock($bucket));
     }
 
     public function getBucketEncryption(string $bucket): ?array
     {
-        return $this->cached("enc:{$bucket}", fn () => $this->inner->getBucketEncryption($bucket));
+        return $this->cached("enc:{$bucket}", fn() => $this->inner->getBucketEncryption($bucket));
     }
 
     // ---------------------------------------------------------------
@@ -345,7 +345,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketVersioning(string $bucket): string
     {
-        return $this->cached("ver:{$bucket}", fn () => $this->inner->getBucketVersioning($bucket));
+        return $this->cached("ver:{$bucket}", fn() => $this->inner->getBucketVersioning($bucket));
     }
 
     public function setBucketVersioning(string $bucket, string $status): void

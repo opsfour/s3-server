@@ -33,14 +33,14 @@ final class GetObjectLockConfigHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $config = $this->metadata->getObjectLockConfig($bucket);
 
         // If no config exists, Object Lock was never enabled for this bucket.
         if ($config === null) {
-            throw new ObjectLockConfigurationNotFoundException;
+            throw new ObjectLockConfigurationNotFoundException();
         }
 
         /** @var array{objectLockEnabled: string, rule?: array{defaultRetention: array{mode: string, days?: int, years?: int}}} $config */

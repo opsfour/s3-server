@@ -25,17 +25,17 @@ final class GetBucketPolicyStatusHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $policyJson = $this->metadata->getBucketPolicy($bucket);
         if ($policyJson === null) {
-            throw new NoSuchBucketPolicyException;
+            throw new NoSuchBucketPolicyException();
         }
 
         $isPublic = PolicyEvaluator::isPublicPolicy($policyJson);
 
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
         $writer->startElementNs(null, 'PolicyStatus', 'http://s3.amazonaws.com/doc/2006-03-01/');

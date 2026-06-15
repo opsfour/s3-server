@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  */
 final class MysqlMetadataStore implements MetadataStore
 {
-    /** @var \WeakMap<\Fiber, MysqlTransaction> */
+    /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, MysqlTransaction> */
     private \WeakMap $fiberTxMap;
 
     public function __construct(
@@ -574,17 +574,17 @@ final class MysqlMetadataStore implements MetadataStore
         }
 
         $sql = 'SELECT bucket, key_name, version_id, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($effectiveStartAfter !== null && $effectiveStartAfter !== '') {
@@ -686,7 +686,7 @@ final class MysqlMetadataStore implements MetadataStore
             $delimPos = strpos($afterPrefix, $delimiter);
 
             if ($delimPos !== false) {
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
                     $commonPrefixes[] = $commonPrefix;
@@ -792,7 +792,7 @@ final class MysqlMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         // Pagination via key-marker / upload-id-marker.
@@ -846,7 +846,7 @@ final class MysqlMetadataStore implements MetadataStore
                 $delimPos = strpos($afterPrefix, $delimiter);
 
                 if ($delimPos !== false) {
-                    $commonPrefix = ($prefix ?? '').substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                    $commonPrefix = ($prefix ?? '') . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                     if (! isset($seen[$commonPrefix])) {
                         $seen[$commonPrefix] = true;
                         $commonPrefixes[] = $commonPrefix;
@@ -1015,9 +1015,13 @@ final class MysqlMetadataStore implements MetadataStore
                 ],
             );
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1081,9 +1085,13 @@ final class MysqlMetadataStore implements MetadataStore
                 );
             }
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1163,9 +1171,13 @@ final class MysqlMetadataStore implements MetadataStore
                 [$bucket, $key, $effectiveVersionId],
             );
 
-            if ($ownTx) { $link->commit(); }
+            if ($ownTx) {
+                $link->commit();
+            }
         } catch (\Throwable $e) {
-            if ($ownTx) { $link->rollback(); }
+            if ($ownTx) {
+                $link->rollback();
+            }
             throw $e;
         }
 
@@ -1194,17 +1206,17 @@ final class MysqlMetadataStore implements MetadataStore
         }
 
         $sql = 'SELECT bucket, key_name, version_id, is_latest, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = ?';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($keyMarker !== null && $keyMarker !== '') {
@@ -1333,7 +1345,7 @@ final class MysqlMetadataStore implements MetadataStore
             $delimPos = strpos($afterPrefix, $delimiter);
 
             if ($delimPos !== false) {
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
                     $commonPrefixes[] = $commonPrefix;
@@ -1913,7 +1925,7 @@ final class MysqlMetadataStore implements MetadataStore
             }
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
                     "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
@@ -2003,7 +2015,7 @@ final class MysqlMetadataStore implements MetadataStore
             }
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
                     "UPDATE s3_restore_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
@@ -2112,7 +2124,7 @@ final class MysqlMetadataStore implements MetadataStore
 
         $decoded = json_decode($raw, true);
         if (is_array($decoded)) {
-            return $decoded;
+            return array_values(array_filter($decoded, is_string(...)));
         }
 
         return [$raw];
@@ -2269,13 +2281,25 @@ final class MysqlMetadataStore implements MetadataStore
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
                     "UPDATE s3_notification_queue SET status = 'processing' WHERE id IN ({$placeholders})",
-                    array_map(fn ($id) => (int) $id, $ids),
+                    array_map(fn($id) => (int) $id, $ids),
                 );
             }
 
             $tx->commit();
 
-            return $rows;
+            return array_map(
+                static fn(array $row): array => [
+                    'id' => (int) $row['id'],
+                    'bucket' => (string) $row['bucket'],
+                    'key_name' => (string) $row['key_name'],
+                    'event_name' => (string) $row['event_name'],
+                    'destination_url' => (string) $row['destination_url'],
+                    'payload_json' => (string) $row['payload_json'],
+                    'attempts' => (int) $row['attempts'],
+                    'max_attempts' => (int) $row['max_attempts'],
+                ],
+                $rows,
+            );
         } catch (\Throwable $e) {
             $tx->rollback();
             throw $e;
@@ -2326,6 +2350,7 @@ final class MysqlMetadataStore implements MetadataStore
         if ($fiber === null) {
             throw new \LogicException('beginTransaction() must be called from within a Fiber.');
         }
+        /** @var \Fiber<mixed, mixed, mixed, mixed> $fiber */
         if (isset($this->fiberTxMap[$fiber])) {
             return; // Already in a transaction on this fiber — nested call, no-op.
         }
@@ -2360,11 +2385,15 @@ final class MysqlMetadataStore implements MetadataStore
 
         try {
             $result = $callback();
-            if ($ownTx) { $this->commit(); }
+            if ($ownTx) {
+                $this->commit();
+            }
 
             return $result;
         } catch (\Throwable $e) {
-            if ($ownTx) { $this->rollback(); }
+            if ($ownTx) {
+                $this->rollback();
+            }
 
             throw $e;
         }
@@ -2434,7 +2463,7 @@ final class MysqlMetadataStore implements MetadataStore
             $systemMetadata['checksum-sha256'] = (string) $row['checksum_sha256'];
         }
         if (isset($row['is_latest'])) {
-            $systemMetadata['isLatest'] = (bool) (int) $row['is_latest'];
+            $systemMetadata['isLatest'] = (bool) (int) $row['is_latest'] ? '1' : '0';
         }
 
         $rawVersionId = (string) ($row['version_id'] ?? 'null');
@@ -2442,8 +2471,8 @@ final class MysqlMetadataStore implements MetadataStore
 
         $lastModified = isset($row['updated_at'])
             ? new \DateTimeImmutable($this->formatTimestamp($row['updated_at']))
-            : new \DateTimeImmutable;
-        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== null && $row['restore_expires_at'] !== ''
+            : new \DateTimeImmutable();
+        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== ''
             ? new \DateTimeImmutable($this->formatTimestamp($row['restore_expires_at']))
             : null;
 
@@ -2473,7 +2502,10 @@ final class MysqlMetadataStore implements MetadataStore
         );
     }
 
-    /** @param array<string, mixed> $row */
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
     private function rowToTierTransitionJob(array $row): array
     {
         return [
@@ -2496,7 +2528,10 @@ final class MysqlMetadataStore implements MetadataStore
         ];
     }
 
-    /** @param array<string, mixed> $row */
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
     private function rowToRestoreJob(array $row): array
     {
         return [
@@ -2525,7 +2560,7 @@ final class MysqlMetadataStore implements MetadataStore
             : $this->getObjectMetadataByVersion($bucket, $key, $versionId);
 
         if ($object === null || $object->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
     }
 
@@ -2547,7 +2582,7 @@ final class MysqlMetadataStore implements MetadataStore
         // MySQL TIMESTAMP format is "YYYY-MM-DD HH:MM:SS" — normalize to ISO 8601.
         $str = (string) $value;
         if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $str)) {
-            return str_replace(' ', 'T', $str).'Z';
+            return str_replace(' ', 'T', $str) . 'Z';
         }
 
         return $str;
@@ -2593,8 +2628,8 @@ final class MysqlMetadataStore implements MetadataStore
     {
         $this->conn()->execute(
             'INSERT INTO s3_public_access_blocks (bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets) '
-            .'VALUES (?, ?, ?, ?, ?) '
-            .'ON DUPLICATE KEY UPDATE block_public_acls = VALUES(block_public_acls), ignore_public_acls = VALUES(ignore_public_acls), block_public_policy = VALUES(block_public_policy), restrict_public_buckets = VALUES(restrict_public_buckets)',
+            . 'VALUES (?, ?, ?, ?, ?) '
+            . 'ON DUPLICATE KEY UPDATE block_public_acls = VALUES(block_public_acls), ignore_public_acls = VALUES(ignore_public_acls), block_public_policy = VALUES(block_public_policy), restrict_public_buckets = VALUES(restrict_public_buckets)',
             [$bucket, (int) $blockPublicAcls, (int) $ignorePublicAcls, (int) $blockPublicPolicy, (int) $restrictPublicBuckets],
         );
     }
@@ -2633,8 +2668,8 @@ final class MysqlMetadataStore implements MetadataStore
     {
         $this->conn()->execute(
             'INSERT INTO s3_bucket_logging (bucket, target_bucket, target_prefix) '
-            .'VALUES (?, ?, ?) '
-            .'ON DUPLICATE KEY UPDATE target_bucket = VALUES(target_bucket), target_prefix = VALUES(target_prefix)',
+            . 'VALUES (?, ?, ?) '
+            . 'ON DUPLICATE KEY UPDATE target_bucket = VALUES(target_bucket), target_prefix = VALUES(target_prefix)',
             [$bucket, $targetBucket, $targetPrefix],
         );
     }
@@ -2743,7 +2778,7 @@ final class MysqlMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2778,7 +2813,7 @@ final class MysqlMetadataStore implements MetadataStore
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2814,7 +2849,7 @@ final class MysqlMetadataStore implements MetadataStore
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2845,14 +2880,14 @@ final class MysqlMetadataStore implements MetadataStore
     {
         // Find delete markers where no other versions exist for the same key.
         $sql = 'SELECT dm.* FROM s3_objects dm '
-            .'WHERE dm.bucket = ? AND dm.is_delete_marker = 1 AND dm.is_latest = 1 '
-            .'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = 0)';
+            . 'WHERE dm.bucket = ? AND dm.is_delete_marker = 1 AND dm.is_latest = 1 '
+            . 'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = 0)';
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND dm.key_name LIKE ? ESCAPE '\\'";
 
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {

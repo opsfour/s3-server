@@ -36,7 +36,7 @@ final class PutObjectRetentionHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Object Lock must be enabled on the bucket.
@@ -56,7 +56,7 @@ final class PutObjectRetentionHandler implements RequestHandler
             ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
             : $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Parse the XML body.

@@ -25,12 +25,12 @@ final class GetBucketWebsiteHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $config = $this->metadata->getBucketWebsite($bucket);
         if ($config === null) {
-            throw new NoSuchWebsiteConfigurationException;
+            throw new NoSuchWebsiteConfigurationException();
         }
 
         return new Response(

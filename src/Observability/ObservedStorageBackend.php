@@ -19,52 +19,52 @@ final readonly class ObservedStorageBackend implements StorageBackend
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
     {
-        return $this->observe('putObject', fn () => $this->inner->putObject($bucket, $key, $body));
+        return $this->observe('putObject', fn() => $this->inner->putObject($bucket, $key, $body));
     }
 
     public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
     {
-        return $this->observe('getObjectByPath', fn () => $this->inner->getObjectByPath($storagePath, $offset, $length));
+        return $this->observe('getObjectByPath', fn() => $this->inner->getObjectByPath($storagePath, $offset, $length));
     }
 
     public function deleteObjectByPath(string $storagePath, string $bucket): void
     {
-        $this->observe('deleteObjectByPath', fn () => $this->inner->deleteObjectByPath($storagePath, $bucket));
+        $this->observe('deleteObjectByPath', fn() => $this->inner->deleteObjectByPath($storagePath, $bucket));
     }
 
     public function createBucket(string $bucket): void
     {
-        $this->observe('createBucket', fn () => $this->inner->createBucket($bucket));
+        $this->observe('createBucket', fn() => $this->inner->createBucket($bucket));
     }
 
     public function deleteBucket(string $bucket): void
     {
-        $this->observe('deleteBucket', fn () => $this->inner->deleteBucket($bucket));
+        $this->observe('deleteBucket', fn() => $this->inner->deleteBucket($bucket));
     }
 
     public function bucketExists(string $bucket): bool
     {
-        return $this->observe('bucketExists', fn () => $this->inner->bucketExists($bucket));
+        return $this->observe('bucketExists', fn() => $this->inner->bucketExists($bucket));
     }
 
     public function putPart(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data): StorageWriteResult
     {
-        return $this->observe('putPart', fn () => $this->inner->putPart($bucket, $key, $uploadId, $partNumber, $data));
+        return $this->observe('putPart', fn() => $this->inner->putPart($bucket, $key, $uploadId, $partNumber, $data));
     }
 
     public function assembleMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): StorageWriteResult
     {
-        return $this->observe('assembleMultipartUpload', fn () => $this->inner->assembleMultipartUpload($bucket, $key, $uploadId, $parts));
+        return $this->observe('assembleMultipartUpload', fn() => $this->inner->assembleMultipartUpload($bucket, $key, $uploadId, $parts));
     }
 
     public function abortMultipartUpload(string $bucket, string $key, string $uploadId): void
     {
-        $this->observe('abortMultipartUpload', fn () => $this->inner->abortMultipartUpload($bucket, $key, $uploadId));
+        $this->observe('abortMultipartUpload', fn() => $this->inner->abortMultipartUpload($bucket, $key, $uploadId));
     }
 
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
-        return $this->observe('copyObject', fn () => $this->inner->copyObject($srcPath, $dstBucket, $dstKey));
+        return $this->observe('copyObject', fn() => $this->inner->copyObject($srcPath, $dstBucket, $dstKey));
     }
 
     /**

@@ -14,7 +14,7 @@ final class S3ExceptionTest extends TestCase
 {
     public function test_no_such_bucket(): void
     {
-        $e = new NoSuchBucketException;
+        $e = new NoSuchBucketException();
         $this->assertSame('NoSuchBucket', $e->getErrorCode());
         $this->assertSame(404, $e->getHttpStatus());
         $this->assertInstanceOf(S3Exception::class, $e);

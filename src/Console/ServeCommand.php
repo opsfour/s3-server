@@ -76,7 +76,7 @@ final class ServeCommand extends Command
         $tlsCertPath = $input->getOption('tls-cert');
         $tlsKeyPath = $input->getOption('tls-key');
         $maxConnections = (int) $input->getOption('max-connections');
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         // Resolve storage path for filesystem driver.
         if ($storagePath !== null && $storagePath !== '') {
@@ -92,8 +92,8 @@ final class ServeCommand extends Command
 
         // Build logger.
         $logHandler = new StreamHandler(ByteStream\getStdout());
-        $logHandler->pushProcessor(new PsrLogMessageProcessor);
-        $logHandler->setFormatter(new ConsoleFormatter);
+        $logHandler->pushProcessor(new PsrLogMessageProcessor());
+        $logHandler->setFormatter(new ConsoleFormatter());
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
@@ -103,7 +103,7 @@ final class ServeCommand extends Command
             host: $host,
             port: $port,
             region: $region,
-            storagePath: $storagePath ?? sys_get_temp_dir().'/s3-server',
+            storagePath: $storagePath ?? sys_get_temp_dir() . '/s3-server',
             metadataDriver: $metadataDriver,
             metadataDsn: $metadataDsn,
             tlsCertPath: $tlsCertPath,
@@ -132,7 +132,7 @@ final class ServeCommand extends Command
         // Create metadata backend via factory.
         $metadataConfig = ['dsn' => $metadataDsn];
         if ($metadataDriver === 'sqlite') {
-            $metadataConfig['path'] = ($storagePath ?? sys_get_temp_dir().'/s3-server').'/metadata.sqlite';
+            $metadataConfig['path'] = ($storagePath ?? sys_get_temp_dir() . '/s3-server') . '/metadata.sqlite';
         }
         $metadata = MetadataStoreFactory::create($metadataDriver, $metadataConfig, metrics: $metrics);
         $metadata = new ObservedMetadataStore($metadata, $metrics, $metadataDriver);
@@ -144,7 +144,7 @@ final class ServeCommand extends Command
         }
 
         try {
-            $runtime = (new S3ServerRuntimeFactory)->create(
+            $runtime = (new S3ServerRuntimeFactory())->create(
                 config: $config,
                 metadata: $metadata,
                 storage: $storage,
@@ -162,7 +162,7 @@ final class ServeCommand extends Command
         }
 
         $logger->info('OpsFour S3 Server starting', [
-            'storage' => "{$storageDriver}".($storagePath ? ":{$storagePath}" : ''),
+            'storage' => "{$storageDriver}" . ($storagePath ? ":{$storagePath}" : ''),
             'region' => $region,
             'metadata' => $metadataDriver,
         ]);

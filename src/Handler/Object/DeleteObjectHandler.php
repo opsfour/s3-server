@@ -50,7 +50,7 @@ final class DeleteObjectHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Parse ?versionId from query params.
@@ -83,7 +83,10 @@ final class DeleteObjectHandler implements RequestHandler
 
             // Clean up old storage AFTER successful metadata write.
             if ($oldPathToClean !== null) {
-                try { $this->storage->deleteObjectByPath($oldPathToClean, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($oldPathToClean, $bucket);
+                } catch (\Throwable) {
+                }
             }
 
             // Only fire notification if a real object was superseded by the delete marker.
@@ -112,7 +115,10 @@ final class DeleteObjectHandler implements RequestHandler
             if ($deletedInfo !== null) {
                 // Delete the storage file if it's not a delete marker.
                 if (! $deletedInfo->isDeleteMarker && isset($deletedInfo->systemMetadata['storagePath']) && $deletedInfo->systemMetadata['storagePath'] !== '') {
-                    try { $this->storage->deleteObjectByPath($deletedInfo->systemMetadata['storagePath'], $bucket); } catch (\Throwable) {}
+                    try {
+                        $this->storage->deleteObjectByPath($deletedInfo->systemMetadata['storagePath'], $bucket);
+                    } catch (\Throwable) {
+                    }
                 }
 
                 $headers['x-amz-version-id'] = $versionId;
@@ -139,7 +145,10 @@ final class DeleteObjectHandler implements RequestHandler
             $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
             $this->metadata->deleteObjectMetadata($bucket, $key);
             if ($storagePath !== null && $storagePath !== '') {
-                try { $this->storage->deleteObjectByPath($storagePath, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($storagePath, $bucket);
+                } catch (\Throwable) {
+                }
             }
             $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
         }

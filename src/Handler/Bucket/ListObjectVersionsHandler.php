@@ -34,7 +34,7 @@ final class ListObjectVersionsHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Parse query parameters.
@@ -103,7 +103,7 @@ final class ListObjectVersionsHandler implements RequestHandler
             'deleteMarkers' => $deleteMarkers,
             'commonPrefixes' => $result['commonPrefixes'],
             'encodingType' => $encodingType,
-        ], fn ($v) => $v !== null);
+        ], fn($v) => $v !== null);
         $xml = XmlResponseBuilder::listObjectVersionsResult($xmlParams);
 
         return new Response(

@@ -25,13 +25,16 @@ final class PutBucketLoggingHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $body = ByteStream\buffer($request->getBody());
 
         try {
             $body = preg_replace('/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?[^>]*>/i', '', $body);
+            if ($body === null) {
+                throw new \RuntimeException('Failed to sanitize XML.');
+            }
             $element = new \SimpleXMLElement($body, LIBXML_NONET);
         } catch (\Exception) {
             throw new MalformedXmlException('Invalid BucketLoggingStatus XML.');
@@ -47,7 +50,7 @@ final class PutBucketLoggingHandler implements RequestHandler
 
             $targetBucketInfo = $this->metadata->getBucket($targetBucket);
             if ($targetBucketInfo === null || $targetBucketInfo->ownerId !== $ownerId) {
-                throw new NoSuchBucketException;
+                throw new NoSuchBucketException();
             }
 
             $this->metadata->putBucketLogging($bucket, $targetBucket, $targetPrefix);

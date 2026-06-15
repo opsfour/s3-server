@@ -30,9 +30,9 @@ class S3ServerServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__.'/../../config/s3-server.php', 's3-server');
+        $this->mergeConfigFrom(__DIR__ . '/../../config/s3-server.php', 's3-server');
 
-        $this->app->singleton(MetricsCollector::class, fn () => new MetricsCollector);
+        $this->app->singleton(MetricsCollector::class, fn() => new MetricsCollector());
 
         $this->app->singleton(S3ServerConfig::class, function ($app) {
             $config = $app['config']['s3-server'];
@@ -93,7 +93,7 @@ class S3ServerServiceProvider extends ServiceProvider
             // For SQLite, derive path from storage path if no DSN given.
             if (($metadataConfig['driver'] ?? 'sqlite') === 'sqlite' && empty($metadataConfig['path'])) {
                 $storagePath = $config['storage']['path'] ?? storage_path('s3');
-                $metadataConfig['path'] = $storagePath.'/metadata.sqlite';
+                $metadataConfig['path'] = $storagePath . '/metadata.sqlite';
             }
 
             $parallelConfig = $config['parallel'] ?? [];
@@ -128,7 +128,7 @@ class S3ServerServiceProvider extends ServiceProvider
     {
         if ($this->app->runningInConsole()) {
             $this->publishes([
-                __DIR__.'/../../config/s3-server.php' => config_path('s3-server.php'),
+                __DIR__ . '/../../config/s3-server.php' => config_path('s3-server.php'),
             ], 's3-server-config');
 
             $this->commands([

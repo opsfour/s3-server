@@ -31,7 +31,7 @@ final class GetObjectAttributesHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -41,7 +41,7 @@ final class GetObjectAttributesHandler implements RequestHandler
             ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
             : $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null || $objectInfo->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Parse requested attributes.
@@ -60,7 +60,7 @@ final class GetObjectAttributesHandler implements RequestHandler
             }
         }
 
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
         $writer->startElementNs(null, 'GetObjectAttributesResponse', 'http://s3.amazonaws.com/doc/2006-03-01/');

@@ -46,15 +46,25 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
         $client = new \Amp\Redis\RedisClient($dsn);
 
         // Try multi-key format first (HGETALL s3:master-keys).
+        /** @var array<string, string> $allKeys */
         $allKeys = [];
         try {
-            /** @var array<string, string> $allKeys */
-            $allKeys = $client->execute('HGETALL', 's3:master-keys');
-            // HGETALL returns flat [field, value, field, value, ...] — convert to assoc.
-            if (is_array($allKeys) && $allKeys !== []) {
+            $rawKeys = $client->execute('HGETALL', 's3:master-keys');
+            if (is_array($rawKeys) && $rawKeys !== []) {
                 $assoc = [];
-                for ($i = 0, $n = count($allKeys); $i < $n; $i += 2) {
-                    $assoc[$allKeys[$i]] = $allKeys[$i + 1];
+                $isList = array_is_list($rawKeys);
+                if ($isList) {
+                    for ($i = 0, $n = count($rawKeys); $i + 1 < $n; $i += 2) {
+                        if (is_string($rawKeys[$i]) && is_string($rawKeys[$i + 1])) {
+                            $assoc[$rawKeys[$i]] = $rawKeys[$i + 1];
+                        }
+                    }
+                } else {
+                    foreach ($rawKeys as $keyId => $b64) {
+                        if (is_string($keyId) && is_string($b64)) {
+                            $assoc[$keyId] = $b64;
+                        }
+                    }
                 }
                 $allKeys = $assoc;
             }
@@ -62,7 +72,7 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
             $allKeys = [];
         }
 
-        if ($allKeys !== null && $allKeys !== []) {
+        if ($allKeys !== []) {
             $keys = [];
             foreach ($allKeys as $keyId => $b64) {
                 $decoded = base64_decode($b64, true);

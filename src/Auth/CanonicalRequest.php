@@ -89,7 +89,7 @@ final class CanonicalRequest
 
         // Ensure leading slash.
         if (! str_starts_with($result, '/')) {
-            $result = '/'.$result;
+            $result = '/' . $result;
         }
 
         return $result;
@@ -139,7 +139,7 @@ final class CanonicalRequest
 
         $parts = [];
         foreach ($pairs as [$key, $value]) {
-            $parts[] = $key.'='.$value;
+            $parts[] = $key . '=' . $value;
         }
 
         return implode('&', $parts);
@@ -175,11 +175,11 @@ final class CanonicalRequest
                 sort($trimmed, SORT_STRING);
             }
 
-            $canonical[] = $name.':'.implode(',', $trimmed);
+            $canonical[] = $name . ':' . implode(',', $trimmed);
         }
 
         // Already sorted since $signedHeaders is sorted.
-        return implode("\n", $canonical)."\n";
+        return implode("\n", $canonical) . "\n";
     }
 
     /**

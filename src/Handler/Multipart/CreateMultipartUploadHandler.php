@@ -29,7 +29,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $uploadId = bin2hex(random_bytes(16));

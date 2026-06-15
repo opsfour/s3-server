@@ -48,8 +48,8 @@ final class AclEvaluator
 
         foreach ($grants as $grant) {
             // Skip public grants if ignorePublicAcls is set.
-            if ($ignorePublicAcls && $grant['granteeType'] === 'Group' &&
-                in_array($grant['granteeId'], [self::ALL_USERS, self::AUTH_USERS], true)) {
+            if ($ignorePublicAcls && $grant['granteeType'] === 'Group'
+                && in_array($grant['granteeId'], [self::ALL_USERS, self::AUTH_USERS], true)) {
                 continue;
             }
 
@@ -88,6 +88,7 @@ final class AclEvaluator
         };
     }
 
+    /** @param array<string, string> $grant */
     private static function grantMatchesRequester(array $grant, string $requesterId, bool $isAuthenticated): bool
     {
         if ($grant['granteeType'] === 'CanonicalUser') {

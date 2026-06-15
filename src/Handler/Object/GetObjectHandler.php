@@ -63,7 +63,7 @@ final class GetObjectHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Get object metadata (version-aware).
@@ -78,7 +78,7 @@ final class GetObjectHandler implements RequestHandler
         }
 
         if ($objectInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Delete markers: return error with x-amz-delete-marker header.
@@ -90,10 +90,10 @@ final class GetObjectHandler implements RequestHandler
             }
 
             if ($versionId !== null) {
-                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException)->withExtraHeaders($dmHeaders);
+                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException())->withExtraHeaders($dmHeaders);
             }
 
-            throw (new NoSuchKeyException)->withExtraHeaders($dmHeaders);
+            throw (new NoSuchKeyException())->withExtraHeaders($dmHeaders);
         }
 
         // 3. Evaluate conditional headers (must be done before range processing).
@@ -269,7 +269,7 @@ final class GetObjectHandler implements RequestHandler
             $suffix = (int) substr($rangeSpec, 1);
 
             if ($suffix <= 0) {
-                throw new InvalidRangeException;
+                throw new InvalidRangeException();
             }
 
             // If suffix is larger than the object, return the whole object.
@@ -300,7 +300,7 @@ final class GetObjectHandler implements RequestHandler
 
         // Range beyond object size.
         if ($start >= $objectSize) {
-            throw new InvalidRangeException;
+            throw new InvalidRangeException();
         }
 
         if ($endStr === '') {
@@ -317,7 +317,7 @@ final class GetObjectHandler implements RequestHandler
 
         // Start must not exceed end.
         if ($start > $end) {
-            throw new InvalidRangeException;
+            throw new InvalidRangeException();
         }
 
         return ['start' => $start, 'end' => $end];
@@ -342,7 +342,7 @@ final class GetObjectHandler implements RequestHandler
             return [$registry->defaultBackend(), $objectInfo->restoredStoragePath];
         }
 
-        throw new InvalidObjectStateException;
+        throw new InvalidObjectStateException();
     }
 
     private function hasReadableRestore(ObjectInfo $objectInfo): bool

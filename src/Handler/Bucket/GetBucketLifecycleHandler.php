@@ -25,12 +25,12 @@ final class GetBucketLifecycleHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $rules = $this->metadata->getBucketLifecycle($bucket);
         if (empty($rules)) {
-            throw new NoSuchLifecycleConfigurationException;
+            throw new NoSuchLifecycleConfigurationException();
         }
 
         return new Response(

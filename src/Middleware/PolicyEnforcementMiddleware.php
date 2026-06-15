@@ -46,7 +46,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         $request->setAttribute('s3.cachedBucketOwner', $bucketOwner);
         $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
         if ($credential instanceof Credential && !$this->credentialScopeAllows($credential, $key, $request)) {
-            throw new AccessDeniedException;
+            throw new AccessDeniedException();
         }
 
         $action = self::operationToAction($operation);
@@ -97,9 +97,7 @@ final class PolicyEnforcementMiddleware implements Middleware
 
         if ($key !== null) {
             foreach ($this->metadata->getObjectTagging($bucket, $key) as $tag) {
-                if (isset($tag['key'], $tag['value'])) {
-                    $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
-                }
+                $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
             }
         }
 
@@ -112,7 +110,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
         if ($credential instanceof Credential) {
             foreach ($credential->policyNames as $policyName) {
-                if (!is_string($policyName) || $policyName === '') {
+                if ($policyName === '') {
                     continue;
                 }
                 $namedPolicy = $this->metadata->getNamedPolicy($policyName);
@@ -125,7 +123,7 @@ final class PolicyEnforcementMiddleware implements Middleware
 
         $identityResult = self::evaluatePolicies($identityPolicies, $action, $resource, $ownerId, $conditions);
         if ($identityResult === 'Deny') {
-            throw new AccessDeniedException;
+            throw new AccessDeniedException();
         }
 
         // Bucket owner bypass applies only after account/named identity policies.
@@ -143,7 +141,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         $result = self::mergePolicyResults($identityResult, $resourceResult);
 
         if ($result === 'Deny') {
-            throw new AccessDeniedException;
+            throw new AccessDeniedException();
         }
 
         $request->setAttribute('s3.policyResult', $result);
@@ -207,7 +205,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         foreach ($credential->allowedPrefixes as $prefix) {
-            if (is_string($prefix) && str_starts_with($target, $prefix)) {
+            if (str_starts_with($target, $prefix)) {
                 return true;
             }
         }

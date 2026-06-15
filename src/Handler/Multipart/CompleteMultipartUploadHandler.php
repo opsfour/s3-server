@@ -44,7 +44,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -52,10 +52,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
-            throw new NoSuchUploadException;
+            throw new NoSuchUploadException();
         }
-        if (($upload['owner_id'] ?? '') !== $ownerId) {
-            throw new NoSuchUploadException;
+        if ($upload['owner_id'] !== $ownerId) {
+            throw new NoSuchUploadException();
         }
 
         // Parse XML body for parts list.
@@ -79,7 +79,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
             // Parts must be in ascending order.
             if ($partNumber <= $prevPartNumber) {
-                throw new InvalidPartOrderException;
+                throw new InvalidPartOrderException();
             }
             $prevPartNumber = $partNumber;
 
@@ -114,7 +114,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 if ($validatedParts[$i]['size'] < $minPartSize) {
                     throw new EntityTooSmallException(
                         'Your proposed upload is smaller than the minimum allowed object size. '
-                        .'Each part must be at least 5 MiB, except the last part.',
+                        . 'Each part must be at least 5 MiB, except the last part.',
                     );
                 }
             }
@@ -127,7 +127,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             // If assembly fails, check whether a concurrent AbortMultipartUpload
             // deleted the upload. Give the client a clear 404 instead of a 500.
             if ($this->metadata->getMultipartUpload($uploadId) === null) {
-                throw new NoSuchUploadException;
+                throw new NoSuchUploadException();
             }
             throw $e;
         }
@@ -151,76 +151,94 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $encMeta = [];
 
         try {
-        if ($this->encryption !== null) {
-            $uploadSseAlgo = $userMetadata['__sse-algorithm'] ?? null;
+            if ($this->encryption !== null) {
+                $uploadSseAlgo = $userMetadata['__sse-algorithm'] ?? null;
 
-            if ($uploadSseAlgo === 'SSE-C') {
-                // SSE-C: require customer key headers on complete.
-                $sseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
-                $sseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
-                $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+                if ($uploadSseAlgo === 'SSE-C') {
+                    // SSE-C: require customer key headers on complete.
+                    $sseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
+                    $sseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
+                    $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
 
-                if ($sseCAlgo === null || $sseCKey === null || $sseCKeyMd5 === null) {
-                    // Clean up assembled file since we can't encrypt it.
-                    try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
-                    throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
-                        'SSE-C headers are required to complete a multipart upload initiated with SSE-C encryption.',
-                    );
-                }
+                    if ($sseCAlgo === null || $sseCKey === null || $sseCKeyMd5 === null) {
+                        // Clean up assembled file since we can't encrypt it.
+                        try {
+                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+                        } catch (\Throwable) {
+                        }
+                        throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                            'SSE-C headers are required to complete a multipart upload initiated with SSE-C encryption.',
+                        );
+                    }
 
-                if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                    try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
-                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                        'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                    );
-                }
-                $customerKey = EncryptionService::validateSseCHeaders($sseCAlgo, $sseCKey, $sseCKeyMd5);
-                $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                $enc = $this->encryption->encryptSseC($plaintext, $customerKey);
-                $tempPath = $writeResult->path . '.enc.tmp';
-                try {
-                    \Amp\File\write($tempPath, $enc['ciphertext']);
-                    \Amp\File\move($tempPath, $writeResult->path);
-                } catch (\Throwable $e) {
-                    try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
-                    throw $e;
-                }
+                    if ($writeResult->size > $this->maxEncryptedObjectSize) {
+                        try {
+                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+                        } catch (\Throwable) {
+                        }
+                        throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                            'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                        );
+                    }
+                    $customerKey = EncryptionService::validateSseCHeaders($sseCAlgo, $sseCKey, $sseCKeyMd5);
+                    $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
+                    $enc = $this->encryption->encryptSseC($plaintext, $customerKey);
+                    $tempPath = $writeResult->path . '.enc.tmp';
+                    try {
+                        \Amp\File\write($tempPath, $enc['ciphertext']);
+                        \Amp\File\move($tempPath, $writeResult->path);
+                    } catch (\Throwable $e) {
+                        try {
+                            \Amp\File\deleteFile($tempPath);
+                        } catch (\Throwable) {
+                        }
+                        throw $e;
+                    }
 
-                $encMeta = [
-                    'sse-algorithm' => 'SSE-C',
-                    'sse-iv' => $enc['iv'],
-                    'sse-tag' => $enc['tag'],
-                ];
-            } elseif ($uploadSseAlgo === 'AES256') {
-                // SSE-S3.
-                if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                    try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
-                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                        'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                    );
-                }
-                $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                $enc = $this->encryption->encryptSseS3($plaintext);
-                $tempPath = $writeResult->path . '.enc.tmp';
-                try {
-                    \Amp\File\write($tempPath, $enc['ciphertext']);
-                    \Amp\File\move($tempPath, $writeResult->path);
-                } catch (\Throwable $e) {
-                    try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
-                    throw $e;
-                }
+                    $encMeta = [
+                        'sse-algorithm' => 'SSE-C',
+                        'sse-iv' => $enc['iv'],
+                        'sse-tag' => $enc['tag'],
+                    ];
+                } elseif ($uploadSseAlgo === 'AES256') {
+                    // SSE-S3.
+                    if ($writeResult->size > $this->maxEncryptedObjectSize) {
+                        try {
+                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+                        } catch (\Throwable) {
+                        }
+                        throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                            'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                        );
+                    }
+                    $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
+                    $enc = $this->encryption->encryptSseS3($plaintext);
+                    $tempPath = $writeResult->path . '.enc.tmp';
+                    try {
+                        \Amp\File\write($tempPath, $enc['ciphertext']);
+                        \Amp\File\move($tempPath, $writeResult->path);
+                    } catch (\Throwable $e) {
+                        try {
+                            \Amp\File\deleteFile($tempPath);
+                        } catch (\Throwable) {
+                        }
+                        throw $e;
+                    }
 
-                $encMeta = [
-                    'sse-algorithm' => 'AES256',
-                    'sse-key' => $enc['encryptedDataKey'],
-                    'sse-iv' => $enc['iv'],
-                    'sse-tag' => $enc['tag'],
-                ];
+                    $encMeta = [
+                        'sse-algorithm' => 'AES256',
+                        'sse-key' => $enc['encryptedDataKey'],
+                        'sse-iv' => $enc['iv'],
+                        'sse-tag' => $enc['tag'],
+                    ];
+                }
             }
-        }
         } catch (\Throwable $e) {
             // Clean up the assembled file if encryption fails.
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
@@ -232,7 +250,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
         }
         foreach ($encMeta as $k => $v) {
-            $userMetadata['__'.$k] = $v;
+            $userMetadata['__' . $k] = $v;
         }
 
         // Recover metadata fields stored during CreateMultipartUpload.
@@ -257,9 +275,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         try {
             if ($versioning === 'Enabled') {
                 $this->metadata->transaction(function () use (
-                    $bucket, $key, $ownerId, $writeResult, $etag, $upload,
-                    $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-                    $userMetadata, &$versionId,
+                    $bucket,
+                    $key,
+                    $ownerId,
+                    $writeResult,
+                    $etag,
+                    $upload,
+                    $storageClass,
+                    $contentEncoding,
+                    $contentDisposition,
+                    $cacheControl,
+                    $userMetadata,
+                    &$versionId,
                 ) {
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, null, $writeResult->size, true);
 
@@ -282,9 +309,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 // Wrap read-old + write-new in a transaction to prevent concurrent
                 // overwrites from orphaning storage files.
                 $this->metadata->transaction(function () use (
-                    $bucket, $key, $ownerId, $writeResult, $etag, $upload,
-                    $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-                    $userMetadata, &$oldStoragePath,
+                    $bucket,
+                    $key,
+                    $ownerId,
+                    $writeResult,
+                    $etag,
+                    $upload,
+                    $storageClass,
+                    $contentEncoding,
+                    $contentDisposition,
+                    $cacheControl,
+                    $userMetadata,
+                    &$oldStoragePath,
                 ) {
                     $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
                     $oldStoragePath = $existingObj?->systemMetadata['storagePath'] ?? null;
@@ -309,13 +345,19 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
         } catch (\Throwable $e) {
             // Clean up storage on metadata failure.
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
         if ($oldStoragePath !== null && $oldStoragePath !== $writeResult->path) {
-            try { $this->storage->deleteObjectByPath($oldStoragePath, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($oldStoragePath, $bucket);
+            } catch (\Throwable) {
+            }
         }
 
         // Clean up upload record and part files.

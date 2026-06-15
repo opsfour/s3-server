@@ -11,7 +11,7 @@ final class MetricsCollectorTest extends TestCase
 {
     public function test_request_histogram_and_backend_metrics_render(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->recordRequest('get', 'GetObject', 200, 120_000_000);
         $metrics->recordBackendOperation('storage', 'filesystem', 'putObject', 300_000_000);
@@ -31,7 +31,7 @@ final class MetricsCollectorTest extends TestCase
 
     public function test_lifecycle_metrics_render_as_prometheus_counters_and_gauges(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->startLifecycleSweep();
         self::assertStringContainsString('s3_server_lifecycle_running 1', $metrics->renderPrometheus());
@@ -58,7 +58,7 @@ final class MetricsCollectorTest extends TestCase
 
     public function test_tiering_worker_metrics_render(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->recordTieringWorkerResult('transition', 'completed');
         $metrics->recordTieringWorkerResult('transition', 'dead_letter', 2);
@@ -76,7 +76,7 @@ final class MetricsCollectorTest extends TestCase
 
     public function test_notification_metrics_render_queue_depth_and_delivery_counters(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->setNotificationQueueStats([
             'pending' => 3,
@@ -101,7 +101,7 @@ final class MetricsCollectorTest extends TestCase
 
     public function test_notification_event_metrics_render(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->recordNotificationEvent('listener', 'queued');
         $metrics->recordNotificationEvent('listener', 'failed');
@@ -117,7 +117,7 @@ final class MetricsCollectorTest extends TestCase
 
     public function test_worker_pool_metrics_render(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
 
         $metrics->registerWorkerPool('select', 4);
         $metrics->recordWorkerPoolTask('select', 'SelectObjectContent');

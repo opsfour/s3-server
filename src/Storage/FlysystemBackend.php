@@ -60,7 +60,7 @@ final class FlysystemBackend implements StorageBackend
             try {
                 $this->filesystem->writeStream($storagePath, $tmpStream);
             } catch (\Throwable $e) {
-                throw new InternalErrorException('Failed to write object to Flysystem backend: '.$e->getMessage(), $e);
+                throw new InternalErrorException('Failed to write object to Flysystem backend: ' . $e->getMessage(), $e);
             }
         } finally {
             if (is_resource($tmpStream)) {
@@ -84,7 +84,7 @@ final class FlysystemBackend implements StorageBackend
         try {
             $resource = $this->filesystem->readStream($storagePath);
         } catch (\Throwable) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         if ($offset !== null && $offset > 0) {
@@ -155,7 +155,7 @@ final class FlysystemBackend implements StorageBackend
             try {
                 $this->filesystem->writeStream($partPath, $tmpStream);
             } catch (\Throwable $e) {
-                throw new InternalErrorException('Failed to write multipart part to Flysystem backend: '.$e->getMessage(), $e);
+                throw new InternalErrorException('Failed to write multipart part to Flysystem backend: ' . $e->getMessage(), $e);
             }
         } finally {
             if (is_resource($tmpStream)) {
@@ -235,7 +235,7 @@ final class FlysystemBackend implements StorageBackend
                 try {
                     $this->filesystem->writeStream($storagePath, $resource);
                 } catch (\Throwable $e) {
-                    throw new InternalErrorException('Failed to write assembled multipart object to Flysystem backend: '.$e->getMessage(), $e);
+                    throw new InternalErrorException('Failed to write assembled multipart object to Flysystem backend: ' . $e->getMessage(), $e);
                 }
             } finally {
                 if (is_resource($resource)) {
@@ -258,7 +258,7 @@ final class FlysystemBackend implements StorageBackend
         return new StorageWriteResult(
             path: $storagePath,
             size: $size,
-            md5Hex: $compositeMd5.'-'.count($parts),
+            md5Hex: $compositeMd5 . '-' . count($parts),
             crc32Base64: $checksums->crc32Base64(),
             crc32cBase64: $checksums->crc32cBase64(),
             sha1Base64: $checksums->sha1Base64(),
@@ -280,7 +280,7 @@ final class FlysystemBackend implements StorageBackend
         try {
             $srcStream = $this->filesystem->readStream($srcPath);
         } catch (\Throwable) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $calculator = new ChecksumCalculator();
@@ -311,7 +311,7 @@ final class FlysystemBackend implements StorageBackend
             try {
                 $this->filesystem->writeStream($storagePath, $tmpStream);
             } catch (\Throwable $e) {
-                throw new InternalErrorException('Failed to write copied object to Flysystem backend: '.$e->getMessage(), $e);
+                throw new InternalErrorException('Failed to write copied object to Flysystem backend: ' . $e->getMessage(), $e);
             }
         } finally {
             if (is_resource($tmpStream)) {
@@ -353,7 +353,7 @@ final class FlysystemBackend implements StorageBackend
     private static function skipBytes($resource, int $bytes): void
     {
         $metadata = stream_get_meta_data($resource);
-        if (($metadata['seekable'] ?? false) === true) {
+        if ($metadata['seekable'] === true) {
             if (fseek($resource, $bytes) === 0) {
                 return;
             }

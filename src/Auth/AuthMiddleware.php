@@ -43,9 +43,9 @@ final class AuthMiddleware implements Middleware
         private readonly CredentialProvider $credentialProvider,
         private readonly string $region,
     ) {
-        $this->sigV4Verifier = new SignatureV4Verifier;
-        $this->presignedValidator = new PresignedUrlValidator;
-        $this->chunkedVerifier = new ChunkedSignatureVerifier;
+        $this->sigV4Verifier = new SignatureV4Verifier();
+        $this->presignedValidator = new PresignedUrlValidator();
+        $this->chunkedVerifier = new ChunkedSignatureVerifier();
     }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response

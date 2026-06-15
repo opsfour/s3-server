@@ -33,7 +33,7 @@ final class NotificationProcessor
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
         private readonly float $pollInterval = 2.0,
         ?HttpClient $httpClient = null,
         private readonly ?MetricsCollector $metrics = null,
@@ -82,7 +82,7 @@ final class NotificationProcessor
 
             $futures = [];
             foreach ($items as $item) {
-                $futures[] = \Amp\async(fn () => $this->process($item));
+                $futures[] = \Amp\async(fn() => $this->process($item));
             }
 
             try {
@@ -97,6 +97,7 @@ final class NotificationProcessor
         }
     }
 
+    /** @param array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int} $item */
     private function process(array $item): void
     {
         $id = (int) $item['id'];

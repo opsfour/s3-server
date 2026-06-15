@@ -49,7 +49,7 @@ final class BucketNameExtractor
                 // If the host is a subdomain of baseDomain, extract bucket from subdomain.
                 // e.g., host = "mybucket.s3.example.com", baseDomain = "s3.example.com"
                 // -> suffix = ".s3.example.com", bucket = "mybucket"
-                $suffix = '.'.$baseDomainLower;
+                $suffix = '.' . $baseDomainLower;
 
                 if ($hostLower !== $baseDomainLower && \str_ends_with($hostLower, $suffix)) {
                     $bucket = \substr($hostWithoutPort, 0, \strlen($hostWithoutPort) - \strlen($suffix));

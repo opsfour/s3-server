@@ -30,7 +30,7 @@ final readonly class S3ServerRuntimeFactory
 {
     /**
      * @param array<string, mixed> $externalIamConfig
-     * @param list<array{pattern: string, listener: callable}> $notificationListeners
+     * @param list<array{pattern?: mixed, listener?: mixed}> $notificationListeners
      */
     public function create(
         S3ServerConfig $config,

@@ -70,8 +70,8 @@ class S3ServerCommand extends Command
 
         // Build logger.
         $logHandler = new StreamHandler(ByteStream\getStdout());
-        $logHandler->pushProcessor(new PsrLogMessageProcessor);
-        $logHandler->setFormatter(new ConsoleFormatter);
+        $logHandler->pushProcessor(new PsrLogMessageProcessor());
+        $logHandler->setFormatter(new ConsoleFormatter());
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
@@ -95,7 +95,7 @@ class S3ServerCommand extends Command
 
         $adminToken = config('s3-server.admin.token')
             ?: config('s3-server.external_iam.admin_token');
-        $runtime = (new S3ServerRuntimeFactory)->create(
+        $runtime = (new S3ServerRuntimeFactory())->create(
             config: $config,
             metadata: $metadata,
             storage: $storage,

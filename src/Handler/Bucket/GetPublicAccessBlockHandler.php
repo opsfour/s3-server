@@ -24,15 +24,15 @@ final class GetPublicAccessBlockHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $config = $this->metadata->getPublicAccessBlock($bucket);
         if ($config === null) {
-            throw new NoSuchPublicAccessBlockConfigurationException;
+            throw new NoSuchPublicAccessBlockConfigurationException();
         }
 
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
         $writer->startElementNs(null, 'PublicAccessBlockConfiguration', 'http://s3.amazonaws.com/doc/2006-03-01/');

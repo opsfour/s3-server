@@ -41,7 +41,8 @@ final class DatabaseCredentialProvider implements CredentialProvider
 
     public function initialize(): void
     {
-        $this->pdo->exec(<<<'SQL'
+        $this->pdo->exec(
+            <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_credentials (
                 access_key_id VARCHAR(255) PRIMARY KEY,
                 secret_access_key TEXT NOT NULL,

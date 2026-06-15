@@ -60,7 +60,7 @@ final class InMemoryBackend implements StorageBackend
     public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
     {
         if (! isset($this->objects[$storagePath])) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $data = $this->objects[$storagePath];
@@ -155,7 +155,7 @@ final class InMemoryBackend implements StorageBackend
         return new StorageWriteResult(
             path: $path,
             size: strlen($assembled),
-            md5Hex: $compositeMd5.'-'.count($parts),
+            md5Hex: $compositeMd5 . '-' . count($parts),
             crc32Base64: $checksums->crc32Base64(),
             crc32cBase64: $checksums->crc32cBase64(),
             sha1Base64: $checksums->sha1Base64(),
@@ -171,7 +171,7 @@ final class InMemoryBackend implements StorageBackend
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
         if (! isset($this->objects[$srcPath])) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $data = $this->objects[$srcPath];

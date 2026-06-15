@@ -111,10 +111,12 @@ final class EncryptionService implements EncryptionServiceInterface
         // Detect blob format and extract master key + remainder.
         if (strlen($raw) > self::LEGACY_BLOB_SIZE && ord($raw[0]) === 0x01) {
             // V1 format: extract key ID to resolve the correct master key.
-            if (strlen($raw) < 3) {
-                throw new \RuntimeException('Corrupt V1 encrypted data key blob: too short for header.');
+            /** @var array{1: int}|false $unpacked */
+            $unpacked = unpack('v', substr($raw, 1, 2));
+            if ($unpacked === false) {
+                throw new \RuntimeException('Corrupt V1 encrypted data key blob: invalid key ID length.');
             }
-            $keyIdLen = unpack('v', substr($raw, 1, 2))[1];
+            $keyIdLen = $unpacked[1];
             if (strlen($raw) < 3 + $keyIdLen + self::IV_LENGTH + self::TAG_LENGTH + 1) {
                 throw new \RuntimeException('Corrupt V1 encrypted data key blob: truncated.');
             }

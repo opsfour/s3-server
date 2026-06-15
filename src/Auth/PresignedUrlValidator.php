@@ -155,7 +155,7 @@ final class PresignedUrlValidator
         if (! hash_equals($expectedSignature, $params['signature'])) {
             throw new SignatureDoesNotMatchException(
                 'The request signature we calculated does not match the signature you provided. '
-                .'Check your key and signing method.',
+                . 'Check your key and signing method.',
             );
         }
 

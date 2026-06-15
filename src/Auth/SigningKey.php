@@ -51,7 +51,7 @@ final class SigningKey
             return self::$cache[$cacheKey];
         }
 
-        $kDate = hash_hmac('sha256', $date, 'AWS4'.$secretKey, binary: true);
+        $kDate = hash_hmac('sha256', $date, 'AWS4' . $secretKey, binary: true);
         $kRegion = hash_hmac('sha256', $region, $kDate, binary: true);
         $kService = hash_hmac('sha256', $service, $kRegion, binary: true);
         $kSigning = hash_hmac('sha256', 'aws4_request', $kService, binary: true);

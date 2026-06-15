@@ -8,7 +8,7 @@ final class MetricsEndpointTest extends S3FunctionalTestCase
 {
     public function test_metrics_endpoint_exposes_prometheus_request_counters(): void
     {
-        $bucket = 'metrics-'.bin2hex(random_bytes(4));
+        $bucket = 'metrics-' . bin2hex(random_bytes(4));
 
         self::$s3->createBucket(['Bucket' => $bucket]);
         self::$s3->putObject([
@@ -43,7 +43,7 @@ final class MetricsEndpointTest extends S3FunctionalTestCase
 
     public function test_metrics_endpoint_exposes_notification_queue_depth(): void
     {
-        $bucket = 'metrics-notifications-'.bin2hex(random_bytes(4));
+        $bucket = 'metrics-notifications-' . bin2hex(random_bytes(4));
 
         self::$s3->createBucket(['Bucket' => $bucket]);
         self::$s3->putBucketNotificationConfiguration([

@@ -62,7 +62,7 @@ final class PutObjectHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Evaluate conditional PUT headers (If-Match, If-None-Match).
@@ -76,20 +76,20 @@ final class PutObjectHandler implements RequestHandler
                 // If-Match: succeed only if existing etag matches.
                 // If object doesn't exist, return 404 (not 412).
                 if ($existingObj === null) {
-                    throw new \OpsFour\S3Server\Exception\NoSuchKeyException;
+                    throw new \OpsFour\S3Server\Exception\NoSuchKeyException();
                 }
                 if (!$this->etagMatches($existingObj->etag, $ifMatch)) {
-                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException;
+                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
                 }
             }
 
             if ($ifNoneMatch !== null) {
                 // If-None-Match: * means "only create if doesn't exist".
                 if ($ifNoneMatch === '*' && $existingObj !== null) {
-                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException;
+                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
                 }
                 if ($ifNoneMatch !== '*' && $existingObj !== null && $this->etagMatches($existingObj->etag, $ifNoneMatch)) {
-                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException;
+                    throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
                 }
             }
         }
@@ -133,7 +133,10 @@ final class PutObjectHandler implements RequestHandler
         ]);
 
         if (count($clientChecksums) > 1) {
-            try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($result->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw new InvalidArgumentException('Only one x-amz-checksum-* header may be specified.');
         }
 
@@ -146,14 +149,20 @@ final class PutObjectHandler implements RequestHandler
             };
 
             if ($computedValue === null) {
-                try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($result->path, $bucket);
+                } catch (\Throwable) {
+                }
                 throw new \OpsFour\S3Server\Exception\InternalErrorException(
                     "Storage backend did not compute checksum for algorithm: {$algo}",
                 );
             }
 
             if (!hash_equals($computedValue, $clientValue)) {
-                try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($result->path, $bucket);
+                } catch (\Throwable) {
+                }
                 throw new BadDigestException(
                     "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
                 );
@@ -180,7 +189,10 @@ final class PutObjectHandler implements RequestHandler
             : $request->getHeader('content-length');
 
         if ($declaredLength !== null && (int) $declaredLength !== $result->size) {
-            try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($result->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
                 'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $result->size,
             );
@@ -200,19 +212,22 @@ final class PutObjectHandler implements RequestHandler
             );
         } catch (\Throwable $e) {
             // Clean up plaintext file on encryption failure (e.g. EntityTooLargeException).
-            try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($result->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
         // Merge encryption metadata into user metadata.
         if ($encMeta !== []) {
             foreach ($encMeta as $k => $v) {
-                $userMetadata['__'.$k] = $v;
+                $userMetadata['__' . $k] = $v;
             }
         }
 
         // 6. Build the quoted ETag (S3 ETags are always quoted MD5 hex).
-        $etag = '"'.$result->md5Hex.'"';
+        $etag = '"' . $result->md5Hex . '"';
 
         // 5b. Write metadata (versioning-aware) and handle old-object cleanup.
         $versioning = $this->metadata->getBucketVersioning($bucket);
@@ -223,9 +238,21 @@ final class PutObjectHandler implements RequestHandler
             if ($versioning === 'Enabled') {
                 // Versioning is enabled: create a new version.
                 $this->metadata->transaction(function () use (
-                    $bucket, $key, $ownerId, $result, $etag, $contentType,
-                    $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-                    $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256,
+                    $bucket,
+                    $key,
+                    $ownerId,
+                    $result,
+                    $etag,
+                    $contentType,
+                    $storageClass,
+                    $contentEncoding,
+                    $contentDisposition,
+                    $cacheControl,
+                    $userMetadata,
+                    $checksumCrc32,
+                    $checksumCrc32c,
+                    $checksumSha1,
+                    $checksumSha256,
                     &$versionId,
                 ) {
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, null, $result->size, true);
@@ -255,9 +282,21 @@ final class PutObjectHandler implements RequestHandler
                 // overwrites from orphaning storage files (SQLite single-writer
                 // serializes, Postgres/MySQL use row locks).
                 $this->metadata->transaction(function () use (
-                    $bucket, $key, $ownerId, $result, $etag, $contentType,
-                    $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-                    $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256,
+                    $bucket,
+                    $key,
+                    $ownerId,
+                    $result,
+                    $etag,
+                    $contentType,
+                    $storageClass,
+                    $contentEncoding,
+                    $contentDisposition,
+                    $cacheControl,
+                    $userMetadata,
+                    $checksumCrc32,
+                    $checksumCrc32c,
+                    $checksumSha1,
+                    $checksumSha256,
                     &$oldStoragePath,
                 ) {
                     $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
@@ -287,13 +326,19 @@ final class PutObjectHandler implements RequestHandler
             }
         } catch (\Throwable $e) {
             // Clean up storage on metadata failure.
-            try { $this->storage->deleteObjectByPath($result->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($result->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
         if ($oldStoragePath !== null && $oldStoragePath !== $result->path) {
-            try { $this->storage->deleteObjectByPath($oldStoragePath, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($oldStoragePath, $bucket);
+            } catch (\Throwable) {
+            }
         }
 
         // 7. Build response headers.
@@ -361,7 +406,9 @@ final class PutObjectHandler implements RequestHandler
             ];
             foreach ($headerMap as $header => $permission) {
                 $value = $request->getHeader($header);
-                if ($value === null || $value === '') continue;
+                if ($value === null || $value === '') {
+                    continue;
+                }
                 foreach (explode(',', $value) as $grantee) {
                     $grantee = trim($grantee);
                     if (preg_match('/^id\s*=\s*"([^"]+)"/i', $grantee, $m)) {
@@ -425,7 +472,10 @@ final class PutObjectHandler implements RequestHandler
                 \Amp\File\write($tempPath, $enc['ciphertext']);
                 \Amp\File\move($tempPath, $storagePath);
             } catch (\Throwable $e) {
-                try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
+                try {
+                    \Amp\File\deleteFile($tempPath);
+                } catch (\Throwable) {
+                }
                 throw $e;
             }
 
@@ -461,7 +511,10 @@ final class PutObjectHandler implements RequestHandler
                 \Amp\File\write($tempPath, $enc['ciphertext']);
                 \Amp\File\move($tempPath, $storagePath);
             } catch (\Throwable $e) {
-                try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
+                try {
+                    \Amp\File\deleteFile($tempPath);
+                } catch (\Throwable) {
+                }
                 throw $e;
             }
 

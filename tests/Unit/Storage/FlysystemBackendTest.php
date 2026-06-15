@@ -11,6 +11,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
+
 use function Amp\async;
 use function Amp\Future\await as awaitFutures;
 
@@ -25,7 +26,7 @@ final class FlysystemBackendTest extends TestCase
     protected function setUp(): void
     {
         $this->adapter = new InMemoryFlysystemAdapter();
-        $this->tempDir = sys_get_temp_dir().'/s3server-flysystem-'.bin2hex(random_bytes(8));
+        $this->tempDir = sys_get_temp_dir() . '/s3server-flysystem-' . bin2hex(random_bytes(8));
         mkdir($this->tempDir, 0755, true);
         $this->backend = new FlysystemBackend(new Filesystem($this->adapter), $this->tempDir);
     }
@@ -80,7 +81,7 @@ final class FlysystemBackendTest extends TestCase
         self::assertStringEndsWith('-2', $result->md5Hex);
         self::assertSame([], array_values(array_filter(
             $this->adapter->paths(),
-            static fn (string $path): bool => str_starts_with($path, ".parts/{$uploadId}/"),
+            static fn(string $path): bool => str_starts_with($path, ".parts/{$uploadId}/"),
         )));
     }
 

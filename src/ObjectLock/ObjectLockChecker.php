@@ -27,7 +27,7 @@ final class ObjectLockChecker
         // Check legal hold first.
         $legalHold = $this->metadata->getObjectLegalHold($bucket, $key, $versionId);
         if ($legalHold === 'ON') {
-            throw new ObjectLockedException;
+            throw new ObjectLockedException();
         }
 
         // Check retention.
@@ -40,7 +40,7 @@ final class ObjectLockChecker
                 $mode = $retention['mode'];
 
                 if ($mode === 'COMPLIANCE') {
-                    throw new ObjectLockedException;
+                    throw new ObjectLockedException();
                 }
 
                 if ($mode === 'GOVERNANCE') {
@@ -50,7 +50,7 @@ final class ObjectLockChecker
                     // Use COMPLIANCE mode for enforcement that cannot be bypassed.
                     $bypassHeader = $request->getHeader('x-amz-bypass-governance-retention');
                     if ($bypassHeader === null || strtolower($bypassHeader) !== 'true') {
-                        throw new ObjectLockedException;
+                        throw new ObjectLockedException();
                     }
                 }
             }

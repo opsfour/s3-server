@@ -52,7 +52,7 @@ final class DeleteObjectsHandler implements RequestHandler
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Read and parse the XML body.

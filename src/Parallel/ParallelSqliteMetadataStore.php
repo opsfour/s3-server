@@ -31,7 +31,7 @@ final class ParallelSqliteMetadataStore implements MetadataStore
 {
     private readonly WorkerPool $pool;
 
-    /** @var \WeakMap<\Fiber, array{worker: Worker, guard: TransactionGuard}> Pins fibers to workers for transaction affinity. */
+    /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, array{worker: Worker, guard: TransactionGuard}> Pins fibers to workers for transaction affinity. */
     private \WeakMap $fiberWorkerMap;
 
     public function __construct(
@@ -42,7 +42,6 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     ) {
         $this->pool = new ContextWorkerPool($workerLimit);
         $this->metrics?->registerWorkerPool($this->poolName, $workerLimit);
-        /** @var \WeakMap<\Fiber, array{worker: Worker, guard: TransactionGuard}> */
         $this->fiberWorkerMap = new \WeakMap();
     }
 
@@ -50,6 +49,7 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     // Internal dispatch
     // ---------------------------------------------------------------
 
+    /** @param list<mixed> $args */
     private function submit(string $method, array $args = []): mixed
     {
         $task = new SqliteMetadataTask($this->databasePath, $method, $args);
@@ -882,6 +882,7 @@ final class ParallelSqliteMetadataStore implements MetadataStore
                 . 'Transaction pinning requires a Fiber to track worker affinity.',
             );
         }
+        /** @var \Fiber<mixed, mixed, mixed, mixed> $fiber */
 
         if (isset($this->fiberWorkerMap[$fiber])) {
             // Already in a transaction on this fiber — no-op (nested call guard).

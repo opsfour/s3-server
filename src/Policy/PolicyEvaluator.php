@@ -171,6 +171,7 @@ final class PolicyEvaluator
         return false;
     }
 
+    /** @param array<string, mixed> $statement */
     private static function matchesPrincipal(array $statement, string $principal, bool $requirePrincipal): bool
     {
         if (isset($statement['Principal'])) {
@@ -229,6 +230,7 @@ final class PolicyEvaluator
         return false;
     }
 
+    /** @param array<string, mixed> $statement */
     private static function matchesAction(array $statement, string $action): bool
     {
         if (isset($statement['Action'])) {
@@ -267,6 +269,7 @@ final class PolicyEvaluator
         return false;
     }
 
+    /** @param array<string, mixed> $statement */
     private static function matchesResource(array $statement, string $resource): bool
     {
         if (isset($statement['Resource'])) {
@@ -305,10 +308,14 @@ final class PolicyEvaluator
         return false;
     }
 
+    /**
+     * @param array<string, mixed> $conditions
+     * @param array<string, mixed> $context
+     */
     private static function matchesCondition(array $conditions, array $context): bool
     {
         foreach ($conditions as $operator => $conditionBlock) {
-            if (!is_string($operator) || !is_array($conditionBlock)) {
+            if (!is_array($conditionBlock)) {
                 return false;
             }
 
@@ -418,16 +425,16 @@ final class PolicyEvaluator
      */
     private static function matchesValues(string $operator, array $actualValues, array $expectedValues, ?string $setModifier): bool
     {
-        $matcher = static fn (string $actual): bool => match ($operator) {
+        $matcher = static fn(string $actual): bool => match ($operator) {
             'Bool' => self::boolMatches($actual, $expectedValues),
-            'DateGreaterThan' => self::dateCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp > 0),
-            'DateGreaterThanEquals' => self::dateCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp >= 0),
-            'DateLessThan' => self::dateCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp < 0),
-            'DateLessThanEquals' => self::dateCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp <= 0),
-            'NumericGreaterThan' => self::numericCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp > 0),
-            'NumericGreaterThanEquals' => self::numericCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp >= 0),
-            'NumericLessThan' => self::numericCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp < 0),
-            'NumericLessThanEquals' => self::numericCompare($actual, $expectedValues, static fn (int $cmp): bool => $cmp <= 0),
+            'DateGreaterThan' => self::dateCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp > 0),
+            'DateGreaterThanEquals' => self::dateCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp >= 0),
+            'DateLessThan' => self::dateCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp < 0),
+            'DateLessThanEquals' => self::dateCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp <= 0),
+            'NumericGreaterThan' => self::numericCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp > 0),
+            'NumericGreaterThanEquals' => self::numericCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp >= 0),
+            'NumericLessThan' => self::numericCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp < 0),
+            'NumericLessThanEquals' => self::numericCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp <= 0),
             'StringEquals' => in_array($actual, $expectedValues, true),
             'StringNotEquals' => !in_array($actual, $expectedValues, true),
             'StringLike' => self::anyFnmatch($expectedValues, $actual),
@@ -489,6 +496,7 @@ final class PolicyEvaluator
         return in_array(strtolower($expectedValues[0]), ['true', '1'], true) ? !$exists : $exists;
     }
 
+    /** @param list<string> $expectedValues */
     private static function boolMatches(string $actual, array $expectedValues): bool
     {
         $actual = strtolower($actual);
@@ -503,6 +511,7 @@ final class PolicyEvaluator
 
     /**
      * @param callable(int): bool $compare
+     * @param list<string> $expectedValues
      */
     private static function numericCompare(string $actual, array $expectedValues, callable $compare): bool
     {
@@ -526,6 +535,7 @@ final class PolicyEvaluator
 
     /**
      * @param callable(int): bool $compare
+     * @param list<string> $expectedValues
      */
     private static function dateCompare(string $actual, array $expectedValues, callable $compare): bool
     {
@@ -549,23 +559,21 @@ final class PolicyEvaluator
         return false;
     }
 
+    /** @param list<string> $patterns */
     private static function anyFnmatch(array $patterns, string $value): bool
     {
         foreach ($patterns as $pattern) {
-            if (is_string($pattern) && fnmatch($pattern, $value)) {
+            if (fnmatch($pattern, $value)) {
                 return true;
             }
         }
         return false;
     }
 
+    /** @param list<string> $ranges */
     private static function ipInRanges(string $ip, array $ranges): bool
     {
         foreach ($ranges as $range) {
-            if (!is_string($range)) {
-                continue;
-            }
-
             if (str_contains($range, '/')) {
                 if (self::cidrMatch($ip, $range)) {
                     return true;

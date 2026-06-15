@@ -76,7 +76,7 @@ final class EventAdapterTest extends TestCase
             static function (mixed $job, S3Event $event) use (&$jobs): void {
                 $jobs[] = ['job' => $job, 'event' => $event];
             },
-            static fn (S3Event $event): array => ['type' => 'custom-job', 'key' => $event->key],
+            static fn(S3Event $event): array => ['type' => 'custom-job', 'key' => $event->key],
         ))($event);
 
         $this->assertSame('s3:ObjectCreated:Put', $jobs[0]['job']['name']);
@@ -119,7 +119,7 @@ final class EventAdapterTest extends TestCase
         $adapter = new RecordingDestinationAdapter(NotificationDeliveryResult::retryableFailure('broker unavailable', [
             'partition' => 3,
         ]));
-        $logger = new EventAdapterArrayLogger;
+        $logger = new EventAdapterArrayLogger();
         $event = $this->event();
 
         (new DestinationAdapterListener($adapter, $logger))($event);
@@ -146,10 +146,10 @@ final class EventAdapterTest extends TestCase
             $metadata = new SqliteMetadataStore($path . '/metadata.sqlite');
             $metadata->initialize();
             $metadata->createBucket('owner', 'bucket', 'us-east-1');
-            $logger = new EventAdapterArrayLogger;
+            $logger = new EventAdapterArrayLogger();
             $dispatcher = new NotificationDispatcher($metadata, $logger);
             $dispatcher->listen('s3:ObjectCreated:*', new DestinationAdapterListener(
-                new ThrowingDestinationAdapter,
+                new ThrowingDestinationAdapter(),
                 $logger,
             ));
 

@@ -34,7 +34,7 @@ final class UploadPartCopyHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -49,10 +49,10 @@ final class UploadPartCopyHandler implements RequestHandler
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
-            throw new NoSuchUploadException;
+            throw new NoSuchUploadException();
         }
-        if (($upload['owner_id'] ?? '') !== $ownerId) {
-            throw new NoSuchUploadException;
+        if ($upload['owner_id'] !== $ownerId) {
+            throw new NoSuchUploadException();
         }
 
         // Parse copy source.
@@ -61,14 +61,14 @@ final class UploadPartCopyHandler implements RequestHandler
 
         $srcBucketInfo = $this->metadata->getBucket($srcBucket);
         if ($srcBucketInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $srcObject = ($srcVersionId !== null)
             ? $this->metadata->getObjectMetadataByVersion($srcBucket, $srcKey, $srcVersionId)
             : $this->metadata->getObjectMetadata($srcBucket, $srcKey);
         if ($srcObject === null || $srcObject->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Parse optional range.
@@ -153,12 +153,15 @@ final class UploadPartCopyHandler implements RequestHandler
         // Write as a part.
         $writeResult = $this->storage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
 
-        $etag = '"'.$writeResult->md5Hex.'"';
+        $etag = '"' . $writeResult->md5Hex . '"';
 
         try {
             $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
         } catch (\Throwable $e) {
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
@@ -181,7 +184,9 @@ final class UploadPartCopyHandler implements RequestHandler
         $qPos = strpos($copySource, '?');
         if ($qPos !== false) {
             parse_str(substr($copySource, $qPos + 1), $queryParams);
-            $versionId = $queryParams['versionId'] ?? null;
+            $versionId = isset($queryParams['versionId']) && is_string($queryParams['versionId'])
+                ? $queryParams['versionId']
+                : null;
             $copySource = substr($copySource, 0, $qPos);
         }
         $copySource = rawurldecode(ltrim($copySource, '/'));

@@ -150,6 +150,9 @@ final class SqliteMetadataStore implements MetadataStore
         $stmt = $pdo->query(
             'SELECT name, owner_id, region, created_at FROM s3_buckets ORDER BY name ASC',
         );
+        if ($stmt === false) {
+            return [];
+        }
 
         $buckets = [];
 
@@ -205,7 +208,8 @@ final class SqliteMetadataStore implements MetadataStore
         // INSERT OR REPLACE: if the key already exists with version_id='null',
         // this atomically replaces the row. For versioned buckets (Phase 5),
         // the logic will differ.
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_objects (
                 bucket, key_name, version_id, is_latest, is_delete_marker,
                 owner_id, etag, size, content_type, content_encoding,
@@ -258,7 +262,8 @@ final class SqliteMetadataStore implements MetadataStore
 
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
     {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             SELECT
                 id, bucket, key_name, version_id, is_latest, is_delete_marker,
                 owner_id, etag, size, content_type, content_encoding,
@@ -587,16 +592,16 @@ final class SqliteMetadataStore implements MetadataStore
         // We fetch more than maxKeys because delimiter grouping can collapse
         // many rows into a single common prefix entry.
         $sql = 'SELECT bucket, key_name, version_id, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($effectiveStartAfter !== null && $effectiveStartAfter !== '') {
@@ -721,7 +726,7 @@ final class SqliteMetadataStore implements MetadataStore
             if ($delimPos !== false) {
                 // This key has the delimiter after the prefix.
                 // The common prefix is: prefix + everything up to and including the delimiter.
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
 
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
@@ -780,7 +785,8 @@ final class SqliteMetadataStore implements MetadataStore
         ?string $contentType = null,
         array $userMetadata = [],
     ): void {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_multipart_uploads (upload_id, bucket, key_name, owner_id, content_type, user_metadata)
             VALUES (?, ?, ?, ?, ?, ?)
             SQL,
@@ -800,7 +806,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT upload_id, bucket, key_name, owner_id, content_type, user_metadata, created_at '
-            .'FROM s3_multipart_uploads WHERE upload_id = ?',
+            . 'FROM s3_multipart_uploads WHERE upload_id = ?',
         );
         $stmt->execute([$uploadId]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -835,12 +841,12 @@ final class SqliteMetadataStore implements MetadataStore
         $pdo = $this->connection();
 
         $sql = 'SELECT upload_id, bucket, key_name, owner_id, content_type, created_at '
-            .'FROM s3_multipart_uploads WHERE bucket = ?';
+            . 'FROM s3_multipart_uploads WHERE bucket = ?';
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         // Pagination via key-marker / upload-id-marker.
@@ -885,7 +891,7 @@ final class SqliteMetadataStore implements MetadataStore
                 $delimPos = strpos($afterPrefix, $delimiter);
 
                 if ($delimPos !== false) {
-                    $commonPrefix = ($prefix ?? '').substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                    $commonPrefix = ($prefix ?? '') . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
                     if (! isset($seen[$commonPrefix])) {
                         $seen[$commonPrefix] = true;
                         $commonPrefixes[] = $commonPrefix;
@@ -931,7 +937,8 @@ final class SqliteMetadataStore implements MetadataStore
         }
 
         // INSERT OR REPLACE: uploading the same part number again replaces it.
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_parts (upload_id, part_number, etag, size, storage_path)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(upload_id, part_number) DO UPDATE SET
@@ -949,7 +956,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT part_number, etag, size, storage_path, created_at '
-            .'FROM s3_parts WHERE upload_id = ? ORDER BY part_number ASC',
+            . 'FROM s3_parts WHERE upload_id = ? ORDER BY part_number ASC',
         );
         $stmt->execute([$uploadId]);
 
@@ -1054,7 +1061,8 @@ final class SqliteMetadataStore implements MetadataStore
             $stmt->execute([$bucket, $key]);
 
             // Insert the new version as latest.
-            $stmt = $this->prepare(<<<'SQL'
+            $stmt = $this->prepare(
+                <<<'SQL'
                 INSERT INTO s3_objects (
                     bucket, key_name, version_id, is_latest, is_delete_marker,
                     owner_id, etag, size, content_type, content_encoding,
@@ -1114,7 +1122,8 @@ final class SqliteMetadataStore implements MetadataStore
 
             if ($suspended) {
                 // Suspended: upsert delete marker with version_id='null'.
-                $stmt = $this->prepare(<<<'SQL'
+                $stmt = $this->prepare(
+                    <<<'SQL'
                     INSERT INTO s3_objects (
                         bucket, key_name, version_id, is_latest, is_delete_marker,
                         owner_id, etag, size, content_type, storage_class, storage_path,
@@ -1137,7 +1146,8 @@ final class SqliteMetadataStore implements MetadataStore
                 $stmt->execute([$bucket, $key, $ownerId, $now, $now]);
             } else {
                 // Enabled: insert new delete marker with random version ID.
-                $stmt = $this->prepare(<<<'SQL'
+                $stmt = $this->prepare(
+                    <<<'SQL'
                     INSERT INTO s3_objects (
                         bucket, key_name, version_id, is_latest, is_delete_marker,
                         owner_id, etag, size, content_type, storage_class, storage_path,
@@ -1167,7 +1177,8 @@ final class SqliteMetadataStore implements MetadataStore
 
     public function getObjectMetadataByVersion(string $bucket, string $key, string $versionId): ?ObjectInfo
     {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             SELECT
                 id, bucket, key_name, version_id, is_latest, is_delete_marker,
                 owner_id, etag, size, content_type, content_encoding,
@@ -1215,7 +1226,8 @@ final class SqliteMetadataStore implements MetadataStore
 
             // If it was the latest, promote the next most recent version.
             if (!empty($objectInfo->systemMetadata['isLatest'])) {
-                $stmt = $this->prepare(<<<'SQL'
+                $stmt = $this->prepare(
+                    <<<'SQL'
                     UPDATE s3_objects
                     SET is_latest = 1
                     WHERE bucket = ? AND key_name = ?
@@ -1280,16 +1292,16 @@ final class SqliteMetadataStore implements MetadataStore
 
         // Build query: all versions (including delete markers).
         $sql = 'SELECT bucket, key_name, version_id, is_latest, is_delete_marker, owner_id, etag, size, '
-            .'content_type, content_encoding, content_disposition, cache_control, '
-            .'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            .'checksum_sha1, checksum_sha256, created_at, updated_at '
-            .'FROM s3_objects WHERE bucket = ?';
+            . 'content_type, content_encoding, content_disposition, cache_control, '
+            . 'storage_class, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
+            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($keyMarker !== null && $keyMarker !== '') {
@@ -1418,7 +1430,7 @@ final class SqliteMetadataStore implements MetadataStore
             $delimPos = strpos($afterPrefix, $delimiter);
 
             if ($delimPos !== false) {
-                $commonPrefix = $prefix.substr($afterPrefix, 0, $delimPos + strlen($delimiter));
+                $commonPrefix = $prefix . substr($afterPrefix, 0, $delimPos + strlen($delimiter));
 
                 if (! isset($seenPrefixes[$commonPrefix])) {
                     $seenPrefixes[$commonPrefix] = true;
@@ -1470,7 +1482,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT object_lock_enabled, default_retention_mode, default_retention_days, default_retention_years '
-            .'FROM s3_lock_configs WHERE bucket = ?',
+            . 'FROM s3_lock_configs WHERE bucket = ?',
         );
         $stmt->execute([$bucket]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -1509,7 +1521,8 @@ final class SqliteMetadataStore implements MetadataStore
         $retentionDays = $config['rule']['defaultRetention']['days'] ?? null;
         $retentionYears = $config['rule']['defaultRetention']['years'] ?? null;
 
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_lock_configs (bucket, object_lock_enabled, default_retention_mode, default_retention_days, default_retention_years)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(bucket) DO UPDATE SET
@@ -1534,7 +1547,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         $stmt = $this->prepare(
             'SELECT mode, retain_until_date FROM s3_object_retention '
-            .'WHERE bucket = ? AND key_name = ? AND version_id = ?',
+            . 'WHERE bucket = ? AND key_name = ? AND version_id = ?',
         );
         $stmt->execute([$bucket, $key, $effectiveVersionId]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -1553,7 +1566,8 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $effectiveVersionId = $versionId ?? 'null';
 
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_object_retention (bucket, key_name, version_id, mode, retain_until_date)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(bucket, key_name, version_id) DO UPDATE SET
@@ -1572,7 +1586,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         $stmt = $this->prepare(
             'SELECT status FROM s3_object_legal_holds '
-            .'WHERE bucket = ? AND key_name = ? AND version_id = ?',
+            . 'WHERE bucket = ? AND key_name = ? AND version_id = ?',
         );
         $stmt->execute([$bucket, $key, $effectiveVersionId]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -1588,7 +1602,8 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $effectiveVersionId = $versionId ?? 'null';
 
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_object_legal_holds (bucket, key_name, version_id, status)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(bucket, key_name, version_id) DO UPDATE SET
@@ -1608,7 +1623,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT grantee_type, grantee_id, permission FROM s3_acls '
-            .'WHERE resource_type = ? AND resource_name = ? ORDER BY id ASC',
+            . 'WHERE resource_type = ? AND resource_name = ? ORDER BY id ASC',
         );
         $stmt->execute([$resourceType, $resourceName]);
 
@@ -1644,7 +1659,7 @@ final class SqliteMetadataStore implements MetadataStore
             // Insert new grants.
             $stmt = $this->prepare(
                 'INSERT INTO s3_acls (resource_type, resource_name, grantee_type, grantee_id, permission) '
-                .'VALUES (?, ?, ?, ?, ?)',
+                . 'VALUES (?, ?, ?, ?, ?)',
             );
 
             foreach ($grants as $grant) {
@@ -1676,7 +1691,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT tag_key, tag_value FROM s3_tagging '
-            ."WHERE resource_type = 'bucket' AND bucket = ? AND key_name IS NULL ORDER BY id ASC",
+            . "WHERE resource_type = 'bucket' AND bucket = ? AND key_name IS NULL ORDER BY id ASC",
         );
         $stmt->execute([$bucket]);
 
@@ -1709,7 +1724,7 @@ final class SqliteMetadataStore implements MetadataStore
 
             $stmt = $this->prepare(
                 'INSERT INTO s3_tagging (resource_type, bucket, key_name, tag_key, tag_value) '
-                ."VALUES ('bucket', ?, NULL, ?, ?)",
+                . "VALUES ('bucket', ?, NULL, ?, ?)",
             );
 
             foreach ($tags as $tag) {
@@ -1739,7 +1754,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT tag_key, tag_value FROM s3_tagging '
-            ."WHERE resource_type = 'object' AND bucket = ? AND key_name = ? ORDER BY id ASC",
+            . "WHERE resource_type = 'object' AND bucket = ? AND key_name = ? ORDER BY id ASC",
         );
         $stmt->execute([$bucket, $key]);
 
@@ -1772,7 +1787,7 @@ final class SqliteMetadataStore implements MetadataStore
 
             $stmt = $this->prepare(
                 'INSERT INTO s3_tagging (resource_type, bucket, key_name, tag_key, tag_value) '
-                ."VALUES ('object', ?, ?, ?, ?)",
+                . "VALUES ('object', ?, ?, ?, ?)",
             );
 
             foreach ($tags as $tag) {
@@ -1817,7 +1832,8 @@ final class SqliteMetadataStore implements MetadataStore
 
     public function putBucketPolicy(string $bucket, string $policyJson): void
     {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_policies (bucket, policy_json)
             VALUES (?, ?)
             ON CONFLICT(bucket) DO UPDATE SET
@@ -1843,7 +1859,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT allowed_origins, allowed_methods, allowed_headers, expose_headers, max_age_seconds '
-            .'FROM s3_cors_rules WHERE bucket = ? ORDER BY rule_order ASC',
+            . 'FROM s3_cors_rules WHERE bucket = ? ORDER BY rule_order ASC',
         );
         $stmt->execute([$bucket]);
 
@@ -1877,7 +1893,7 @@ final class SqliteMetadataStore implements MetadataStore
 
             $stmt = $this->prepare(
                 'INSERT INTO s3_cors_rules (bucket, rule_order, allowed_origins, allowed_methods, allowed_headers, expose_headers, max_age_seconds) '
-                .'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                . 'VALUES (?, ?, ?, ?, ?, ?, ?)',
             );
 
             foreach ($rules as $index => $rule) {
@@ -1917,7 +1933,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT sse_algorithm, kms_master_key_id, bucket_key_enabled '
-            .'FROM s3_encryption_configs WHERE bucket = ?',
+            . 'FROM s3_encryption_configs WHERE bucket = ?',
         );
         $stmt->execute([$bucket]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -1935,7 +1951,8 @@ final class SqliteMetadataStore implements MetadataStore
 
     public function putBucketEncryption(string $bucket, string $sseAlgorithm, ?string $kmsMasterKeyId = null, bool $bucketKeyEnabled = false): void
     {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_encryption_configs (bucket, sse_algorithm, kms_master_key_id, bucket_key_enabled)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(bucket) DO UPDATE SET
@@ -1966,8 +1983,8 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT rule_id, status, prefix, filter_json, transitions_json, expiration_json, '
-            .'noncurrent_transitions_json, noncurrent_expiration_json, abort_incomplete_days '
-            .'FROM s3_lifecycle_rules WHERE bucket = ? ORDER BY rule_id ASC',
+            . 'noncurrent_transitions_json, noncurrent_expiration_json, abort_incomplete_days '
+            . 'FROM s3_lifecycle_rules WHERE bucket = ? ORDER BY rule_id ASC',
         );
         $stmt->execute([$bucket]);
 
@@ -2008,8 +2025,8 @@ final class SqliteMetadataStore implements MetadataStore
 
             $stmt = $this->prepare(
                 'INSERT INTO s3_lifecycle_rules (bucket, rule_id, status, prefix, filter_json, '
-                .'transitions_json, expiration_json, noncurrent_transitions_json, noncurrent_expiration_json, '
-                .'abort_incomplete_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                . 'transitions_json, expiration_json, noncurrent_transitions_json, noncurrent_expiration_json, '
+                . 'abort_incomplete_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             );
 
             foreach ($rules as $rule) {
@@ -2102,7 +2119,7 @@ final class SqliteMetadataStore implements MetadataStore
             $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $update = $this->prepare(
                     "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = ? WHERE id IN ({$placeholders})",
@@ -2120,7 +2137,7 @@ final class SqliteMetadataStore implements MetadataStore
             throw $e;
         }
 
-        return array_map($this->rowToTierTransitionJob(...), $rows);
+        return array_values(array_map($this->rowToTierTransitionJob(...), $rows));
     }
 
     public function updateTierTransitionJobStatus(
@@ -2210,7 +2227,7 @@ final class SqliteMetadataStore implements MetadataStore
             $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
             if ($rows !== []) {
-                $ids = array_map(static fn (array $row): int => (int) $row['id'], $rows);
+                $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $update = $this->prepare(
                     "UPDATE s3_restore_jobs SET status = 'processing', updated_at = ? WHERE id IN ({$placeholders})",
@@ -2228,7 +2245,7 @@ final class SqliteMetadataStore implements MetadataStore
             throw $e;
         }
 
-        return array_map($this->rowToRestoreJob(...), $rows);
+        return array_values(array_map($this->rowToRestoreJob(...), $rows));
     }
 
     public function updateRestoreJobStatus(
@@ -2273,7 +2290,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT config_id, event_type, destination_type, destination_arn, filter_rules_json '
-            .'FROM s3_notification_configs WHERE bucket = ? ORDER BY config_id ASC',
+            . 'FROM s3_notification_configs WHERE bucket = ? ORDER BY config_id ASC',
         );
         $stmt->execute([$bucket]);
 
@@ -2310,7 +2327,7 @@ final class SqliteMetadataStore implements MetadataStore
 
             $stmt = $this->prepare(
                 'INSERT INTO s3_notification_configs (bucket, config_id, event_type, destination_type, destination_arn, filter_rules_json) '
-                .'VALUES (?, ?, ?, ?, ?, ?)',
+                . 'VALUES (?, ?, ?, ?, ?, ?)',
             );
 
             foreach ($configs as $config) {
@@ -2349,7 +2366,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         $decoded = json_decode($raw, true);
         if (is_array($decoded)) {
-            return $decoded;
+            return array_values(array_filter($decoded, is_string(...)));
         }
 
         // Legacy format: plain event string (e.g., "s3:ObjectCreated:Put")
@@ -2367,7 +2384,7 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'SELECT index_document, error_document, redirect_all_host, redirect_all_protocol, routing_rules_json '
-            .'FROM s3_website_configs WHERE bucket = ?',
+            . 'FROM s3_website_configs WHERE bucket = ?',
         );
         $stmt->execute([$bucket]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -2390,7 +2407,8 @@ final class SqliteMetadataStore implements MetadataStore
      */
     public function putBucketWebsite(string $bucket, string $indexDocument, ?string $errorDocument = null, ?string $redirectAllHost = null, ?string $redirectAllProtocol = null, ?array $routingRules = null): void
     {
-        $stmt = $this->prepare(<<<'SQL'
+        $stmt = $this->prepare(
+            <<<'SQL'
             INSERT INTO s3_website_configs (bucket, index_document, error_document, redirect_all_host, redirect_all_protocol, routing_rules_json)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(bucket) DO UPDATE SET
@@ -2445,8 +2463,8 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'INSERT INTO s3_public_access_blocks (bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets) '
-            .'VALUES (?, ?, ?, ?, ?) '
-            .'ON CONFLICT(bucket) DO UPDATE SET block_public_acls = excluded.block_public_acls, ignore_public_acls = excluded.ignore_public_acls, block_public_policy = excluded.block_public_policy, restrict_public_buckets = excluded.restrict_public_buckets',
+            . 'VALUES (?, ?, ?, ?, ?) '
+            . 'ON CONFLICT(bucket) DO UPDATE SET block_public_acls = excluded.block_public_acls, ignore_public_acls = excluded.ignore_public_acls, block_public_policy = excluded.block_public_policy, restrict_public_buckets = excluded.restrict_public_buckets',
         );
         $stmt->execute([$bucket, (int) $blockPublicAcls, (int) $ignorePublicAcls, (int) $blockPublicPolicy, (int) $restrictPublicBuckets]);
     }
@@ -2481,8 +2499,8 @@ final class SqliteMetadataStore implements MetadataStore
     {
         $stmt = $this->prepare(
             'INSERT INTO s3_bucket_logging (bucket, target_bucket, target_prefix) '
-            .'VALUES (?, ?, ?) '
-            .'ON CONFLICT(bucket) DO UPDATE SET target_bucket = excluded.target_bucket, target_prefix = excluded.target_prefix',
+            . 'VALUES (?, ?, ?) '
+            . 'ON CONFLICT(bucket) DO UPDATE SET target_bucket = excluded.target_bucket, target_prefix = excluded.target_prefix',
         );
         $stmt->execute([$bucket, $targetBucket, $targetPrefix]);
     }
@@ -2598,7 +2616,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2614,7 +2632,7 @@ final class SqliteMetadataStore implements MetadataStore
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
 
-        return array_map(fn (array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC));
+        return array_values(array_map(fn(array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC)));
     }
 
     public function listExpiredNoncurrentVersions(string $bucket, ?string $prefix, int $noncurrentDays, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array
@@ -2630,7 +2648,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2648,7 +2666,7 @@ final class SqliteMetadataStore implements MetadataStore
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
 
-        return array_map(fn (array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC));
+        return array_values(array_map(fn(array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC)));
     }
 
     public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
@@ -2664,7 +2682,7 @@ final class SqliteMetadataStore implements MetadataStore
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2690,13 +2708,13 @@ final class SqliteMetadataStore implements MetadataStore
 
         // Find delete markers where no other versions exist for the same key.
         $sql = 'SELECT dm.* FROM s3_objects dm '
-            .'WHERE dm.bucket = ? AND dm.is_delete_marker = 1 AND dm.is_latest = 1 '
-            .'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = 0)';
+            . 'WHERE dm.bucket = ? AND dm.is_delete_marker = 1 AND dm.is_latest = 1 '
+            . 'AND NOT EXISTS (SELECT 1 FROM s3_objects o WHERE o.bucket = dm.bucket AND o.key_name = dm.key_name AND o.is_delete_marker = 0)';
         $params = [$bucket];
 
         if ($prefix !== null && $prefix !== '') {
             $sql .= " AND dm.key_name LIKE ? ESCAPE '\\'";
-            $params[] = $this->escapeLikePattern($prefix).'%';
+            $params[] = $this->escapeLikePattern($prefix) . '%';
         }
 
         if ($afterKey !== null) {
@@ -2714,7 +2732,7 @@ final class SqliteMetadataStore implements MetadataStore
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
 
-        return array_map(fn (array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC));
+        return array_values(array_map(fn(array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC)));
     }
 
     public function listExpiredRestoredObjects(\DateTimeImmutable $now, int $limit = 1000): array
@@ -2731,7 +2749,7 @@ final class SqliteMetadataStore implements MetadataStore
             max(1, min(10000, $limit)),
         ]);
 
-        return array_map(fn (array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC));
+        return array_values(array_map(fn(array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC)));
     }
 
     // ===============================================================
@@ -2815,7 +2833,7 @@ final class SqliteMetadataStore implements MetadataStore
             $stmt->execute([$now, $limit]);
             $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
-            if ($rows !== [] && $rows !== false) {
+            if ($rows !== []) {
                 $ids = array_column($rows, 'id');
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 // Use connection()->prepare() directly — dynamic IN clause would pollute the statement cache.
@@ -2828,7 +2846,19 @@ final class SqliteMetadataStore implements MetadataStore
                 $pdo->commit();
             }
 
-            return $rows ?: [];
+            return array_values(array_map(
+                static fn(array $row): array => [
+                    'id' => (int) $row['id'],
+                    'bucket' => (string) $row['bucket'],
+                    'key_name' => (string) $row['key_name'],
+                    'event_name' => (string) $row['event_name'],
+                    'destination_url' => (string) $row['destination_url'],
+                    'payload_json' => (string) $row['payload_json'],
+                    'attempts' => (int) $row['attempts'],
+                    'max_attempts' => (int) $row['max_attempts'],
+                ],
+                $rows,
+            ));
         } catch (\Throwable $e) {
             if ($ownTx && $pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -2942,7 +2972,7 @@ final class SqliteMetadataStore implements MetadataStore
             return;
         }
 
-        $dsn = 'sqlite:'.$this->databasePath;
+        $dsn = 'sqlite:' . $this->databasePath;
 
         $this->pdo = new \PDO($dsn, null, null, [
             \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
@@ -3086,19 +3116,18 @@ final class SqliteMetadataStore implements MetadataStore
 
         // Track is_latest for version listing responses.
         if (isset($row['is_latest'])) {
-            $systemMetadata['isLatest'] = (bool) $row['is_latest'];
+            $systemMetadata['isLatest'] = (bool) $row['is_latest'] ? '1' : '0';
         }
 
         $versionId = ($row['version_id'] ?? 'null') === 'null' ? null : $row['version_id'];
 
         $lastModified = isset($row['updated_at'])
             ? new \DateTimeImmutable($row['updated_at'])
-            : new \DateTimeImmutable;
-        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== null && $row['restore_expires_at'] !== ''
+            : new \DateTimeImmutable();
+        $restoreExpiresAt = isset($row['restore_expires_at']) && $row['restore_expires_at'] !== ''
             ? new \DateTimeImmutable($row['restore_expires_at'])
             : null;
 
-        /** @var array<string, string> $systemMetadata */
         return new ObjectInfo(
             bucket: $row['bucket'],
             key: $row['key_name'],
@@ -3122,7 +3151,10 @@ final class SqliteMetadataStore implements MetadataStore
         );
     }
 
-    /** @param array<string, int|float|string|null> $row */
+    /**
+     * @param array<string, int|float|string|null> $row
+     * @return array<string, mixed>
+     */
     private function rowToTierTransitionJob(array $row): array
     {
         return [
@@ -3145,7 +3177,10 @@ final class SqliteMetadataStore implements MetadataStore
         ];
     }
 
-    /** @param array<string, int|float|string|null> $row */
+    /**
+     * @param array<string, int|float|string|null> $row
+     * @return array<string, mixed>
+     */
     private function rowToRestoreJob(array $row): array
     {
         return [
@@ -3174,7 +3209,7 @@ final class SqliteMetadataStore implements MetadataStore
             : $this->getObjectMetadataByVersion($bucket, $key, $versionId);
 
         if ($object === null || $object->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
     }
 

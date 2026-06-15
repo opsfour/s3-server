@@ -29,7 +29,7 @@ final class SimpleEventDispatcher implements EventDispatcher
 
     public function __construct(int $maxConcurrentListeners = 500)
     {
-        $this->semaphore = new LocalSemaphore($maxConcurrentListeners);
+        $this->semaphore = new LocalSemaphore(max(1, $maxConcurrentListeners));
     }
 
     public function listen(string $eventName, callable $listener): void

@@ -42,7 +42,7 @@ final class HandlerRegistry
     {
         return $this->handlers[$operation->value]
             ?? throw new NotImplementedException(
-                "Operation {$operation->value} is not implemented"
+                "Operation {$operation->value} is not implemented",
             );
     }
 

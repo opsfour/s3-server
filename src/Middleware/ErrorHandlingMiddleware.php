@@ -45,8 +45,12 @@ final class ErrorHandlingMiddleware implements Middleware
 
             // 304 Not Modified must have no body per HTTP spec.
             if ($status === 304) {
-                $headers304 = ['x-amz-request-id' => $requestId];
+                /** @var array<non-empty-string, string> $headers304 */
+                $headers304 = ['x-amz-request-id' => (string) $requestId];
                 foreach ($e->getExtraHeaders() as $k => $v) {
+                    if ($k === '') {
+                        continue;
+                    }
                     $headers304[$k] = $v;
                 }
                 return new Response(
@@ -62,9 +66,10 @@ final class ErrorHandlingMiddleware implements Middleware
                 $requestId,
             );
 
+            /** @var array<non-empty-string, string> $headers */
             $headers = [
-                'Content-Type' => 'application/xml',
-                'x-amz-request-id' => $requestId,
+                'content-type' => 'application/xml',
+                'x-amz-request-id' => (string) $requestId,
                 ...$e->getExtraHeaders(),
             ];
 
@@ -94,8 +99,8 @@ final class ErrorHandlingMiddleware implements Middleware
             return new Response(
                 status: 500,
                 headers: [
-                    'Content-Type' => 'application/xml',
-                    'x-amz-request-id' => $requestId,
+                    'content-type' => 'application/xml',
+                    'x-amz-request-id' => (string) $requestId,
                 ],
                 body: $xml,
             );

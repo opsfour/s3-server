@@ -14,29 +14,41 @@ use OpsFour\S3Server\Event\S3Event;
  */
 final readonly class QueueJobListener
 {
-    /**
-     * @param callable(mixed, S3Event): void $enqueue
-     * @param (callable(S3Event): mixed)|null $jobFactory
-     */
     public function __construct(
         private mixed $enqueue,
         private mixed $jobFactory = null,
-    ) {
-        if (!is_callable($this->enqueue)) {
-            throw new \InvalidArgumentException('Queue job adapter requires a callable enqueue handler.');
-        }
-
-        if ($this->jobFactory !== null && !is_callable($this->jobFactory)) {
-            throw new \InvalidArgumentException('Queue job adapter factory must be callable.');
-        }
-    }
+    ) {}
 
     public function __invoke(S3Event $event): void
     {
         $job = $this->jobFactory !== null
-            ? ($this->jobFactory)($event)
+            ? ($this->callableJobFactory())($event)
             : $event->toArray();
 
-        ($this->enqueue)($job, $event);
+        ($this->callableEnqueue())($job, $event);
+    }
+
+    /**
+     * @return callable(mixed, S3Event): void
+     */
+    private function callableEnqueue(): callable
+    {
+        if (!is_callable($this->enqueue)) {
+            throw new \InvalidArgumentException('Queue job adapter requires a callable enqueue handler.');
+        }
+
+        return $this->enqueue;
+    }
+
+    /**
+     * @return callable(S3Event): mixed
+     */
+    private function callableJobFactory(): callable
+    {
+        if (!is_callable($this->jobFactory)) {
+            throw new \InvalidArgumentException('Queue job adapter factory must be callable.');
+        }
+
+        return $this->jobFactory;
     }
 }

@@ -32,7 +32,7 @@ final class ListObjectsV2Handler implements RequestHandler
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Parse query parameters.

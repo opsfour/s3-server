@@ -52,7 +52,7 @@ final class CopyObjectHandler implements RequestHandler
         // 1. Verify destination bucket exists and owner matches.
         $dstBucketInfo = $this->metadata->getBucket($dstBucket);
         if ($dstBucketInfo === null || $dstBucketInfo->ownerId !== $ownerId) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Parse the copy source header.
@@ -66,7 +66,7 @@ final class CopyObjectHandler implements RequestHandler
         // 3. Verify source bucket exists.
         $srcBucketInfo = $this->metadata->getBucket($srcBucket);
         if ($srcBucketInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // 4. Get source object metadata (optionally a specific version).
@@ -74,7 +74,7 @@ final class CopyObjectHandler implements RequestHandler
             ? $this->metadata->getObjectMetadataByVersion($srcBucket, $srcKey, $srcVersionId)
             : $this->metadata->getObjectMetadata($srcBucket, $srcKey);
         if ($srcObjectInfo === null || $srcObjectInfo->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // 5. Evaluate conditional copy headers.
@@ -107,141 +107,153 @@ final class CopyObjectHandler implements RequestHandler
             $writeResult = $this->storage->putObject($dstBucket, $dstKey, $stream);
         }
 
-        $etag = '"'.$writeResult->md5Hex.'"';
+        $etag = '"' . $writeResult->md5Hex . '"';
 
         // 8. Handle encryption: decrypt source if encrypted, re-encrypt for destination if needed.
         $encMeta = [];
         $objectSize = $writeResult->size;
 
         try {
-        if ($this->encryption !== null) {
-            $srcSseAlgo = $srcObjectInfo->userMetadata['__sse-algorithm'] ?? null;
+            if ($this->encryption !== null) {
+                $srcSseAlgo = $srcObjectInfo->userMetadata['__sse-algorithm'] ?? null;
 
-            // If the source is encrypted, decrypt the copied file back to plaintext first.
-            if ($srcSseAlgo !== null) {
-                if ($srcObjectInfo->size > $this->maxEncryptedObjectSize) {
-                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                        'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                // If the source is encrypted, decrypt the copied file back to plaintext first.
+                if ($srcSseAlgo !== null) {
+                    if ($srcObjectInfo->size > $this->maxEncryptedObjectSize) {
+                        throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                            'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                        );
+                    }
+                    $copiedCiphertext = \Amp\ByteStream\buffer(
+                        $this->storage->getObjectByPath($writeResult->path),
                     );
-                }
-                $copiedCiphertext = \Amp\ByteStream\buffer(
-                    $this->storage->getObjectByPath($writeResult->path),
-                );
 
-                if ($srcSseAlgo === 'SSE-C') {
-                    // Source SSE-C: require copy-source SSE-C headers.
-                    $copySrcAlgo = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-algorithm');
-                    $copySrcKey = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key');
-                    $copySrcKeyMd5 = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key-MD5');
+                    if ($srcSseAlgo === 'SSE-C') {
+                        // Source SSE-C: require copy-source SSE-C headers.
+                        $copySrcAlgo = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-algorithm');
+                        $copySrcKey = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key');
+                        $copySrcKeyMd5 = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key-MD5');
 
-                    if ($copySrcAlgo === null || $copySrcKey === null || $copySrcKeyMd5 === null) {
-                        throw new InvalidArgumentException(
-                            'SSE-C copy-source headers required for encrypted source object.',
+                        if ($copySrcAlgo === null || $copySrcKey === null || $copySrcKeyMd5 === null) {
+                            throw new InvalidArgumentException(
+                                'SSE-C copy-source headers required for encrypted source object.',
+                            );
+                        }
+
+                        $customerKey = EncryptionService::validateSseCHeaders($copySrcAlgo, $copySrcKey, $copySrcKeyMd5);
+                        $plaintext = $this->encryption->decryptSseC(
+                            $copiedCiphertext,
+                            $customerKey,
+                            $srcObjectInfo->userMetadata['__sse-iv'],
+                            $srcObjectInfo->userMetadata['__sse-tag'],
+                        );
+                    } else {
+                        // Source SSE-S3.
+                        $plaintext = $this->encryption->decryptSseS3(
+                            $copiedCiphertext,
+                            $srcObjectInfo->userMetadata['__sse-key'],
+                            $srcObjectInfo->userMetadata['__sse-iv'],
+                            $srcObjectInfo->userMetadata['__sse-tag'],
                         );
                     }
 
-                    $customerKey = EncryptionService::validateSseCHeaders($copySrcAlgo, $copySrcKey, $copySrcKeyMd5);
-                    $plaintext = $this->encryption->decryptSseC(
-                        $copiedCiphertext,
-                        $customerKey,
-                        $srcObjectInfo->userMetadata['__sse-iv'],
-                        $srcObjectInfo->userMetadata['__sse-tag'],
-                    );
-                } else {
-                    // Source SSE-S3.
-                    $plaintext = $this->encryption->decryptSseS3(
-                        $copiedCiphertext,
-                        $srcObjectInfo->userMetadata['__sse-key'],
-                        $srcObjectInfo->userMetadata['__sse-iv'],
-                        $srcObjectInfo->userMetadata['__sse-tag'],
-                    );
-                }
+                    // Recompute ETag and size from decrypted plaintext.
+                    $etag = '"' . md5($plaintext) . '"';
+                    $objectSize = strlen($plaintext);
 
-                // Recompute ETag and size from decrypted plaintext.
-                $etag = '"'.md5($plaintext).'"';
-                $objectSize = strlen($plaintext);
-
-                // Write back the plaintext (will be re-encrypted below if needed).
-                $tempPath = $writeResult->path . '.enc.tmp';
-                try {
-                    \Amp\File\write($tempPath, $plaintext);
-                    \Amp\File\move($tempPath, $writeResult->path);
-                } catch (\Throwable $e) {
-                    try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
-                    throw $e;
-                }
-            }
-
-            // Now apply destination encryption (SSE-C or SSE-S3).
-            $dstSseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
-            $dstSseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
-            $dstSseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
-
-            if ($dstSseCAlgo !== null && $dstSseCKey !== null && $dstSseCKeyMd5 !== null) {
-                // Destination SSE-C.
-                if ($objectSize > $this->maxEncryptedObjectSize) {
-                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                        'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                    );
-                }
-                $customerKey = EncryptionService::validateSseCHeaders($dstSseCAlgo, $dstSseCKey, $dstSseCKeyMd5);
-                $plain = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                $enc = $this->encryption->encryptSseC($plain, $customerKey);
-                $tempPath = $writeResult->path . '.enc.tmp';
-                try {
-                    \Amp\File\write($tempPath, $enc['ciphertext']);
-                    \Amp\File\move($tempPath, $writeResult->path);
-                } catch (\Throwable $e) {
-                    try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
-                    throw $e;
-                }
-
-                $encMeta = [
-                    'sse-algorithm' => 'SSE-C',
-                    'sse-iv' => $enc['iv'],
-                    'sse-tag' => $enc['tag'],
-                ];
-            } else {
-                // Check for SSE-S3 header or bucket default.
-                $sseHeader = $request->getHeader('x-amz-server-side-encryption');
-                $applySSE = ($sseHeader === 'AES256');
-
-                if (! $applySSE) {
-                    $bucketEnc = $this->metadata->getBucketEncryption($dstBucket);
-                    if ($bucketEnc !== null && ($bucketEnc['sseAlgorithm'] === 'AES256' || $bucketEnc['sseAlgorithm'] === 'aws:kms')) {
-                        $applySSE = true;
+                    // Write back the plaintext (will be re-encrypted below if needed).
+                    $tempPath = $writeResult->path . '.enc.tmp';
+                    try {
+                        \Amp\File\write($tempPath, $plaintext);
+                        \Amp\File\move($tempPath, $writeResult->path);
+                    } catch (\Throwable $e) {
+                        try {
+                            \Amp\File\deleteFile($tempPath);
+                        } catch (\Throwable) {
+                        }
+                        throw $e;
                     }
                 }
 
-                if ($applySSE) {
+                // Now apply destination encryption (SSE-C or SSE-S3).
+                $dstSseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
+                $dstSseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
+                $dstSseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+
+                if ($dstSseCAlgo !== null && $dstSseCKey !== null && $dstSseCKeyMd5 !== null) {
+                    // Destination SSE-C.
                     if ($objectSize > $this->maxEncryptedObjectSize) {
                         throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                             'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                         );
                     }
+                    $customerKey = EncryptionService::validateSseCHeaders($dstSseCAlgo, $dstSseCKey, $dstSseCKeyMd5);
                     $plain = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                    $enc = $this->encryption->encryptSseS3($plain);
+                    $enc = $this->encryption->encryptSseC($plain, $customerKey);
                     $tempPath = $writeResult->path . '.enc.tmp';
                     try {
                         \Amp\File\write($tempPath, $enc['ciphertext']);
                         \Amp\File\move($tempPath, $writeResult->path);
                     } catch (\Throwable $e) {
-                        try { \Amp\File\deleteFile($tempPath); } catch (\Throwable) {}
+                        try {
+                            \Amp\File\deleteFile($tempPath);
+                        } catch (\Throwable) {
+                        }
                         throw $e;
                     }
 
                     $encMeta = [
-                        'sse-algorithm' => 'AES256',
-                        'sse-key' => $enc['encryptedDataKey'],
+                        'sse-algorithm' => 'SSE-C',
                         'sse-iv' => $enc['iv'],
                         'sse-tag' => $enc['tag'],
                     ];
+                } else {
+                    // Check for SSE-S3 header or bucket default.
+                    $sseHeader = $request->getHeader('x-amz-server-side-encryption');
+                    $applySSE = ($sseHeader === 'AES256');
+
+                    if (! $applySSE) {
+                        $bucketEnc = $this->metadata->getBucketEncryption($dstBucket);
+                        if ($bucketEnc !== null && ($bucketEnc['sseAlgorithm'] === 'AES256' || $bucketEnc['sseAlgorithm'] === 'aws:kms')) {
+                            $applySSE = true;
+                        }
+                    }
+
+                    if ($applySSE) {
+                        if ($objectSize > $this->maxEncryptedObjectSize) {
+                            throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                                'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                            );
+                        }
+                        $plain = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
+                        $enc = $this->encryption->encryptSseS3($plain);
+                        $tempPath = $writeResult->path . '.enc.tmp';
+                        try {
+                            \Amp\File\write($tempPath, $enc['ciphertext']);
+                            \Amp\File\move($tempPath, $writeResult->path);
+                        } catch (\Throwable $e) {
+                            try {
+                                \Amp\File\deleteFile($tempPath);
+                            } catch (\Throwable) {
+                            }
+                            throw $e;
+                        }
+
+                        $encMeta = [
+                            'sse-algorithm' => 'AES256',
+                            'sse-key' => $enc['encryptedDataKey'],
+                            'sse-iv' => $enc['iv'],
+                            'sse-tag' => $enc['tag'],
+                        ];
+                    }
                 }
             }
-        }
         } catch (\Throwable $e) {
             // Clean up copied file on encryption/decryption failure.
-            try { $this->storage->deleteObjectByPath($writeResult->path, $dstBucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $dstBucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
@@ -269,7 +281,7 @@ final class CopyObjectHandler implements RequestHandler
 
         // Merge destination encryption metadata into user metadata.
         foreach ($encMeta as $k => $v) {
-            $userMetadata['__'.$k] = $v;
+            $userMetadata['__' . $k] = $v;
         }
 
         $storageClass = $request->getHeader('x-amz-storage-class') ?? $srcObjectInfo->storageClass;
@@ -347,13 +359,19 @@ final class CopyObjectHandler implements RequestHandler
                 });
             }
         } catch (\Throwable $e) {
-            try { $this->storage->deleteObjectByPath($writeResult->path, $dstBucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $dstBucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
         if ($oldStoragePath !== null && $oldStoragePath !== '' && $oldStoragePath !== $writeResult->path) {
-            try { $this->storage->deleteObjectByPath($oldStoragePath, $dstBucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($oldStoragePath, $dstBucket);
+            } catch (\Throwable) {
+            }
         }
 
         // 10. Build CopyObjectResult XML.
@@ -431,7 +449,9 @@ final class CopyObjectHandler implements RequestHandler
         $qPos = strpos($copySource, '?');
         if ($qPos !== false) {
             parse_str(substr($copySource, $qPos + 1), $queryParams);
-            $versionId = $queryParams['versionId'] ?? null;
+            $versionId = isset($queryParams['versionId']) && is_string($queryParams['versionId'])
+                ? $queryParams['versionId']
+                : null;
             $copySource = substr($copySource, 0, $qPos);
         }
 
@@ -475,14 +495,14 @@ final class CopyObjectHandler implements RequestHandler
             $normalizedEtag = trim($srcObject->etag, '"');
             $candidate = trim($ifMatch, '"');
             if ($candidate !== '*' && $candidate !== $normalizedEtag) {
-                throw new PreconditionFailedException;
+                throw new PreconditionFailedException();
             }
         }
 
         if ($ifUnmodifiedSince !== null && $ifMatch === null) {
             $sinceTime = strtotime($ifUnmodifiedSince);
             if ($sinceTime !== false && $srcObject->lastModified->getTimestamp() > $sinceTime) {
-                throw new PreconditionFailedException;
+                throw new PreconditionFailedException();
             }
         }
 

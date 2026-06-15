@@ -35,7 +35,7 @@ final class PutBucketTaggingHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Parse the XML body.
@@ -44,7 +44,7 @@ final class PutBucketTaggingHandler implements RequestHandler
 
         if (count($tags) > self::MAX_BUCKET_TAGS) {
             throw new InvalidArgumentException(
-                'Bucket tags cannot be greater than '.self::MAX_BUCKET_TAGS,
+                'Bucket tags cannot be greater than ' . self::MAX_BUCKET_TAGS,
             );
         }
 

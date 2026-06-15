@@ -14,7 +14,7 @@ final class StorageTierRegistryTest extends TestCase
 {
     public function test_single_backend_registry_uses_standard_default_tier(): void
     {
-        $backend = new InMemoryBackend;
+        $backend = new InMemoryBackend();
         $registry = StorageTierRegistry::single($backend);
 
         self::assertSame($backend, $registry->defaultBackend());
@@ -48,14 +48,14 @@ final class StorageTierRegistryTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
 
         new StorageTierRegistry([
-            new StorageTier('STANDARD', new InMemoryBackend, defaultWriteTier: true),
-            new StorageTier('STANDARD_IA', new InMemoryBackend, defaultWriteTier: true),
+            new StorageTier('STANDARD', new InMemoryBackend(), defaultWriteTier: true),
+            new StorageTier('STANDARD_IA', new InMemoryBackend(), defaultWriteTier: true),
         ]);
     }
 
     public function test_unknown_tier_is_rejected(): void
     {
-        $registry = StorageTierRegistry::single(new InMemoryBackend);
+        $registry = StorageTierRegistry::single(new InMemoryBackend());
 
         $this->expectException(\InvalidArgumentException::class);
         $registry->tier('MISSING');

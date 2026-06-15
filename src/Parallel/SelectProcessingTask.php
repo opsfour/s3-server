@@ -63,8 +63,10 @@ final class SelectProcessingTask implements Task
         };
 
         // Apply WHERE filter.
-        $filtered = array_filter($rows, fn(array $row) =>
-            ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias'])
+        $filtered = array_filter(
+            $rows,
+            fn(array $row)
+            => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
         );
         $filtered = array_values($filtered);
 

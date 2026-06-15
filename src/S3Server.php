@@ -96,9 +96,9 @@ final class S3Server
         ?LoggerInterface $logger = null,
         ?MetricsCollector $metrics = null,
     ) {
-        $this->logger = $logger ?? new NullLogger;
-        $this->handlerRegistry = new HandlerRegistry;
-        $this->metrics = $metrics ?? new MetricsCollector;
+        $this->logger = $logger ?? new NullLogger();
+        $this->handlerRegistry = new HandlerRegistry();
+        $this->metrics = $metrics ?? new MetricsCollector();
     }
 
     public function getMetricsCollector(): MetricsCollector
@@ -165,7 +165,7 @@ final class S3Server
         $stack = $this->buildMiddlewareStack($dispatchHandler);
 
         // 4. Wire Amp Router with three catch-all path patterns.
-        $errorHandler = new DefaultErrorHandler;
+        $errorHandler = new DefaultErrorHandler();
         $router = new Router($this->server, $this->logger, $errorHandler);
 
         // Health check endpoint (registered before S3 routes).
@@ -200,7 +200,7 @@ final class S3Server
         $router->setFallback($stack);
 
         // 5. Expose on the configured host:port.
-        $this->server->expose($this->config->host.':'.$this->config->port);
+        $this->server->expose($this->config->host . ':' . $this->config->port);
 
         // 6. Start the server.
         $this->server->start($router, $errorHandler);
@@ -235,9 +235,6 @@ final class S3Server
             \Amp\async(function (): void {
                 while ($this->cleanupRunning) {
                     \Amp\delay(300); // Every 5 minutes (reduced from 60s to minimize DB contention)
-                    if (!$this->cleanupRunning) {
-                        break;
-                    }
                     try {
                         $this->metadata->rateLimitCleanup(3600);
                         $this->metadata->cleanupOldNotifications(86400);
@@ -475,11 +472,11 @@ final class S3Server
         // stackMiddleware() makes the first middleware the outermost wrapper.
         // Order: outermost first → innermost last.
         $middlewares = [
-            new RequestIdMiddleware,
+            new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware(logger: $this->logger),
             new LoggingMiddleware(logger: $this->logger),
-            new ExpectContinueMiddleware,
+            new ExpectContinueMiddleware(),
             new RateLimitMiddleware($this->metadata, $this->config->perClientRateLimit),
             // S3AttributeMiddleware runs early to set s3.bucket, s3.key, s3.operation
             // so all downstream middleware can read them.
@@ -510,8 +507,8 @@ final class S3Server
         }
 
         // Innermost: integrity checks right before the handler.
-        $middlewares[] = new ContentMd5Middleware;
-        $middlewares[] = new ChecksumValidationMiddleware;
+        $middlewares[] = new ContentMd5Middleware();
+        $middlewares[] = new ChecksumValidationMiddleware();
 
         return Middleware\stackMiddleware($innerHandler, ...$middlewares);
     }

@@ -34,7 +34,7 @@ final class StorageBackendFactory
                 ),
                 $config['temp_dir'] ?? sys_get_temp_dir(),
             ),
-            'memory' => new InMemoryBackend,
+            'memory' => new InMemoryBackend(),
             default => throw new \InvalidArgumentException("Unknown storage driver: {$driver}"),
         };
     }

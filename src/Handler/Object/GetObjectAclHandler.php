@@ -35,15 +35,15 @@ final class GetObjectAclHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Verify the object exists.
         if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
-        $resourceName = $bucket.'/'.$key;
+        $resourceName = $bucket . '/' . $key;
         $grants = $this->metadata->getAcl('object', $resourceName);
 
         // Default: owner gets FULL_CONTROL if no ACL stored.

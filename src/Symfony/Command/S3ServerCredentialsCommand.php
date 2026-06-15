@@ -110,7 +110,7 @@ final class S3ServerCredentialsCommand extends Command
 
         $io->table(
             ['Access Key ID', 'Owner ID', 'Display Name', 'Active'],
-            array_map(static fn ($credential): array => [
+            array_map(static fn($credential): array => [
                 $credential->accessKeyId,
                 $credential->ownerId,
                 $credential->displayName ?: '(none)',

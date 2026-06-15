@@ -47,7 +47,7 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
             return true;
         }
 
-        $prefix = $path.'/';
+        $prefix = $path . '/';
         foreach ($this->files as $file => $_) {
             if (str_starts_with($file, $prefix)) {
                 return true;
@@ -123,7 +123,7 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
             return;
         }
 
-        $prefix = $path.'/';
+        $prefix = $path . '/';
         $deleted = false;
 
         foreach (array_keys($this->files) as $file) {
@@ -153,12 +153,10 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
         }
 
         $this->directories[$path] = true;
-        $this->rememberParentDirectories($path.'/placeholder');
+        $this->rememberParentDirectories($path . '/placeholder');
     }
 
-    public function setVisibility(string $path, string $visibility): void
-    {
-    }
+    public function setVisibility(string $path, string $visibility): void {}
 
     public function visibility(string $path): FileAttributes
     {
@@ -195,7 +193,7 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
     public function listContents(string $path, bool $deep): iterable
     {
         $path = trim($path, '/');
-        $prefix = $path === '' ? '' : $path.'/';
+        $prefix = $path === '' ? '' : $path . '/';
 
         foreach ($this->directories as $directory => $_) {
             if ($directory !== $path && str_starts_with($directory, $prefix)) {
@@ -249,7 +247,7 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
 
         $current = '';
         foreach ($parts as $part) {
-            $current = $current === '' ? $part : $current.'/'.$part;
+            $current = $current === '' ? $part : $current . '/' . $part;
             $this->directories[$current] = true;
         }
     }

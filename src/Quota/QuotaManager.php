@@ -56,7 +56,7 @@ final readonly class QuotaManager
         $objectCountDelta = ($versioningEnabled || $existingObject === null) ? 1 : 0;
         $bytesDelta = $versioningEnabled
             ? $newObjectSize
-            : $newObjectSize - ($existingObject?->size ?? 0);
+            : $newObjectSize - ($existingObject !== null ? $existingObject->size : 0);
 
         $newBucketObjectCount = $stats['objectCount'] + $objectCountDelta;
         $newBucketBytes = $stats['bytesUsed'] + $bytesDelta;

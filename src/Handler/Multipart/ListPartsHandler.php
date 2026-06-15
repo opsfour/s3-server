@@ -27,7 +27,7 @@ final class ListPartsHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -37,10 +37,10 @@ final class ListPartsHandler implements RequestHandler
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
-            throw new NoSuchUploadException;
+            throw new NoSuchUploadException();
         }
-        if (($upload['owner_id'] ?? '') !== $ownerId) {
-            throw new NoSuchUploadException;
+        if ($upload['owner_id'] !== $ownerId) {
+            throw new NoSuchUploadException();
         }
 
         $allParts = $this->metadata->getParts($uploadId);
@@ -48,7 +48,7 @@ final class ListPartsHandler implements RequestHandler
         // Filter by part number marker.
         $filteredParts = array_values(array_filter(
             $allParts,
-            fn ($p) => $p['part_number'] > $partNumberMarker,
+            fn($p) => $p['part_number'] > $partNumberMarker,
         ));
 
         $isTruncated = count($filteredParts) > $maxParts;
@@ -59,7 +59,7 @@ final class ListPartsHandler implements RequestHandler
             $nextPartNumberMarker = $parts[count($parts) - 1]['part_number'];
         }
 
-        $xmlParts = array_map(fn ($p) => [
+        $xmlParts = array_map(fn($p) => [
             'partNumber' => $p['part_number'],
             'lastModified' => rtrim(str_replace(' ', 'T', $p['created_at']), 'Z') . 'Z',
             'etag' => $p['etag'],

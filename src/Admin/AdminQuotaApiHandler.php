@@ -166,13 +166,13 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
 
     /**
      * @param array<string, mixed> $payload
-     * @param array<string, string> $headers
+     * @param array<non-empty-string, string> $headers
      */
     private function json(array $payload, int $status = 200, array $headers = []): Response
     {
         return new Response(
             status: $status,
-            headers: ['Content-Type' => 'application/json'] + $headers,
+            headers: ['content-type' => 'application/json'] + $headers,
             body: json_encode($payload, JSON_THROW_ON_ERROR),
         );
     }

@@ -59,7 +59,7 @@ final class CreateBucketHandler implements RequestHandler
                 // AWS S3: same-owner recreation returns 200 (idempotent).
                 return new Response(status: 200, headers: ['Location' => '/' . $bucket]);
             }
-            throw new BucketAlreadyExistsException;
+            throw new BucketAlreadyExistsException();
         }
 
         $this->quotas?->assertCanCreateBucket($ownerId);
@@ -72,7 +72,10 @@ final class CreateBucketHandler implements RequestHandler
             $this->storage->createBucket($bucket);
         } catch (\Throwable $e) {
             // Rollback metadata on storage failure to avoid orphaned records.
-            try { $this->metadata->deleteBucket($ownerId, $bucket); } catch (\Throwable) {}
+            try {
+                $this->metadata->deleteBucket($ownerId, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 
@@ -86,7 +89,7 @@ final class CreateBucketHandler implements RequestHandler
         // 7. Return 200 with Location header.
         return new Response(
             status: 200,
-            headers: ['Location' => '/'.$bucket],
+            headers: ['Location' => '/' . $bucket],
         );
     }
 

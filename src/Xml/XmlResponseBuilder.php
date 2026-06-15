@@ -193,6 +193,7 @@ final class XmlResponseBuilder
      *     encodingType?: string,
      *     objects: list<ObjectInfo>,
      *     commonPrefixes?: list<string>,
+     *     displayNameMap?: array<string, string>,
      * } $params
      */
     public static function listObjectsResult(array $params): string
@@ -621,11 +622,9 @@ final class XmlResponseBuilder
     /**
      * Build an AccessControlPolicy XML response.
      *
-     * @param  string  $ownerId  The bucket/object owner ID.
-     * @param  string  $displayName  The owner display name.
-     * @param  list<array{granteeType: string, granteeId: string, permission: string}>  $grants
-     */
-    /**
+     * @param string $ownerId The bucket/object owner ID.
+     * @param string $displayName The owner display name.
+     * @param list<array{granteeType: string, granteeId: string, permission: string}> $grants
      * @param array<string, string> $displayNameMap Owner ID → display name lookup.
      */
     public static function aclResult(string $ownerId, string $displayName, array $grants, array $displayNameMap = []): string
@@ -1045,7 +1044,7 @@ final class XmlResponseBuilder
      */
     private static function createWriter(): \XMLWriter
     {
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
 

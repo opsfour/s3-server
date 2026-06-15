@@ -128,8 +128,8 @@ final class S3ServerServeCommand extends Command
     private function logger(): Logger
     {
         $logHandler = new StreamHandler(ByteStream\getStdout());
-        $logHandler->pushProcessor(new PsrLogMessageProcessor);
-        $logHandler->setFormatter(new ConsoleFormatter);
+        $logHandler->pushProcessor(new PsrLogMessageProcessor());
+        $logHandler->setFormatter(new ConsoleFormatter());
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);

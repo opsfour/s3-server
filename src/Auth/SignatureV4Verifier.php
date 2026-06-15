@@ -35,9 +35,9 @@ final class SignatureV4Verifier
      *         SignedHeaders={signed-headers}, Signature={signature}
      */
     private const string AUTH_HEADER_PATTERN = '/^AWS4-HMAC-SHA256\s+'
-        .'Credential=(?P<accessKeyId>[A-Za-z0-9\/\-_]+)\/(?P<date>\d{8})\/(?P<region>[a-zA-Z0-9\-]+)\/(?P<service>[a-zA-Z0-9\-]+)\/aws4_request,\s*'
-        .'SignedHeaders=(?P<signedHeaders>[a-z0-9;.\-_]+),\s*'
-        .'Signature=(?P<signature>[a-f0-9]{64})$/';
+        . 'Credential=(?P<accessKeyId>[A-Za-z0-9\/\-_]+)\/(?P<date>\d{8})\/(?P<region>[a-zA-Z0-9\-]+)\/(?P<service>[a-zA-Z0-9\-]+)\/aws4_request,\s*'
+        . 'SignedHeaders=(?P<signedHeaders>[a-z0-9;.\-_]+),\s*'
+        . 'Signature=(?P<signature>[a-f0-9]{64})$/';
 
     /**
      * Verify an AWS SigV4 header-based authentication request.
@@ -138,7 +138,7 @@ final class SignatureV4Verifier
         if (! hash_equals($expectedSignature, $parsed['signature'])) {
             throw new SignatureDoesNotMatchException(
                 'The request signature we calculated does not match the signature you provided. '
-                .'Check your key and signing method.',
+                . 'Check your key and signing method.',
             );
         }
 
@@ -252,7 +252,7 @@ final class SignatureV4Verifier
             throw new AccessDeniedException(
                 sprintf(
                     'The difference between the request time and the current time is too large. '
-                    .'Server time: %s, Request time: %s.',
+                    . 'Server time: %s, Request time: %s.',
                     gmdate('Ymd\THis\Z'),
                     $timestamp,
                 ),

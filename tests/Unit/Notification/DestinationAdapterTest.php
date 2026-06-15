@@ -16,7 +16,7 @@ final class DestinationAdapterTest extends TestCase
 {
     public function test_redis_stream_adapter_publishes_normalized_payload(): void
     {
-        $client = new RecordingRedisStreamClient;
+        $client = new RecordingRedisStreamClient();
         $result = (new RedisStreamNotificationAdapter($client, 's3-events'))->deliver($this->event());
 
         $this->assertSame(NotificationDeliveryStatus::Sent, $result->status);
@@ -30,7 +30,7 @@ final class DestinationAdapterTest extends TestCase
 
     public function test_kafka_adapter_publishes_json_payload_with_object_key(): void
     {
-        $producer = new RecordingKafkaProducer;
+        $producer = new RecordingKafkaProducer();
         $result = (new KafkaNotificationAdapter($producer, 's3-events', partition: 2))->deliver($this->event());
 
         $this->assertSame(NotificationDeliveryStatus::Sent, $result->status);
@@ -42,7 +42,7 @@ final class DestinationAdapterTest extends TestCase
 
     public function test_amqp_adapter_publishes_json_payload(): void
     {
-        $publisher = new RecordingAmqpPublisher;
+        $publisher = new RecordingAmqpPublisher();
         $result = (new AmqpNotificationAdapter($publisher, 's3-exchange', 'bucket.created'))->deliver($this->event());
 
         $this->assertSame(NotificationDeliveryStatus::Sent, $result->status);
@@ -53,7 +53,7 @@ final class DestinationAdapterTest extends TestCase
 
     public function test_nats_adapter_publishes_json_payload(): void
     {
-        $publisher = new RecordingNatsPublisher;
+        $publisher = new RecordingNatsPublisher();
         $result = (new NatsNotificationAdapter($publisher, 's3.object.created'))->deliver($this->event());
 
         $this->assertSame(NotificationDeliveryStatus::Sent, $result->status);
@@ -64,7 +64,7 @@ final class DestinationAdapterTest extends TestCase
     public function test_adapter_publish_failure_is_retryable(): void
     {
         $result = (new NatsNotificationAdapter(
-            static fn (): never => throw new \RuntimeException('broker unavailable'),
+            static fn(): never => throw new \RuntimeException('broker unavailable'),
             's3.events',
         ))->deliver($this->event());
 

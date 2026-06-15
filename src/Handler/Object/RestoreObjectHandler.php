@@ -29,7 +29,7 @@ final class RestoreObjectHandler implements RequestHandler
         $key = (string) $request->getAttribute('s3.key');
 
         if ($this->metadata->getBucket($bucket) === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryString = $request->getUri()->getQuery();
@@ -40,7 +40,7 @@ final class RestoreObjectHandler implements RequestHandler
             : $this->metadata->getObjectMetadata($bucket, $key);
 
         if ($object === null || $object->isDeleteMarker) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $tier = $this->storageTiers->has($object->storageTier)

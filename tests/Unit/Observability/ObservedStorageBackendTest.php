@@ -17,8 +17,8 @@ final class ObservedStorageBackendTest extends TestCase
 {
     public function test_records_successful_storage_operations(): void
     {
-        $metrics = new MetricsCollector;
-        $storage = new ObservedStorageBackend(new InMemoryBackend, $metrics, 'memory', slowThresholdNs: 0);
+        $metrics = new MetricsCollector();
+        $storage = new ObservedStorageBackend(new InMemoryBackend(), $metrics, 'memory', slowThresholdNs: 0);
 
         $storage->createBucket('bucket');
         $write = $storage->putObject('bucket', 'key.txt', new ReadableBuffer('payload'));
@@ -32,8 +32,8 @@ final class ObservedStorageBackendTest extends TestCase
 
     public function test_records_failed_storage_operations_and_rethrows(): void
     {
-        $metrics = new MetricsCollector;
-        $storage = new ObservedStorageBackend(new ThrowingStorageBackend, $metrics, 'throwing');
+        $metrics = new MetricsCollector();
+        $storage = new ObservedStorageBackend(new ThrowingStorageBackend(), $metrics, 'throwing');
 
         $this->expectException(\RuntimeException::class);
 

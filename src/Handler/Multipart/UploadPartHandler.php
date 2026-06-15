@@ -30,7 +30,7 @@ final class UploadPartHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -46,10 +46,10 @@ final class UploadPartHandler implements RequestHandler
         // Verify upload exists and belongs to this owner.
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
-            throw new NoSuchUploadException;
+            throw new NoSuchUploadException();
         }
-        if (($upload['owner_id'] ?? '') !== $ownerId) {
-            throw new NoSuchUploadException;
+        if ($upload['owner_id'] !== $ownerId) {
+            throw new NoSuchUploadException();
         }
 
         // Write part to storage (computes all checksums during write).
@@ -69,7 +69,10 @@ final class UploadPartHandler implements RequestHandler
         ]);
 
         if (count($clientChecksums) > 1) {
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw new InvalidArgumentException('Only one x-amz-checksum-* header may be specified.');
         }
 
@@ -82,14 +85,20 @@ final class UploadPartHandler implements RequestHandler
             };
 
             if ($computedValue === null) {
-                try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+                } catch (\Throwable) {
+                }
                 throw new \OpsFour\S3Server\Exception\InternalErrorException(
                     "Storage backend did not compute checksum for algorithm: {$algo}",
                 );
             }
 
             if (!hash_equals($computedValue, $clientValue)) {
-                try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+                try {
+                    $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+                } catch (\Throwable) {
+                }
                 throw new BadDigestException(
                     "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
                 );
@@ -99,13 +108,16 @@ final class UploadPartHandler implements RequestHandler
         // Content-Length mismatch detection — truncated parts produce corrupt assembled objects.
         $declaredLength = $request->getHeader('content-length');
         if ($declaredLength !== null && (int) $declaredLength !== $writeResult->size) {
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
-                'Content-Length mismatch: declared '.$declaredLength.', received '.$writeResult->size,
+                'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $writeResult->size,
             );
         }
 
-        $etag = '"'.$writeResult->md5Hex.'"';
+        $etag = '"' . $writeResult->md5Hex . '"';
 
         // Build response headers — include verified checksum if client sent one.
         $responseHeaders = ['ETag' => $etag];
@@ -125,7 +137,10 @@ final class UploadPartHandler implements RequestHandler
         try {
             $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
         } catch (\Throwable $e) {
-            try { $this->storage->deleteObjectByPath($writeResult->path, $bucket); } catch (\Throwable) {}
+            try {
+                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
+            } catch (\Throwable) {
+            }
             throw $e;
         }
 

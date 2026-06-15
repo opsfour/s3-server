@@ -49,8 +49,12 @@ final class ExpressionEvaluator
         // Pass 1: scan for OR at depth 0 (lowest precedence — outermost split).
         $depth = 0;
         for ($i = 0; $i < $len; $i++) {
-            if ($tokens[$i]['value'] === '(') $depth++;
-            if ($tokens[$i]['value'] === ')') $depth--;
+            if ($tokens[$i]['value'] === '(') {
+                $depth++;
+            }
+            if ($tokens[$i]['value'] === ')') {
+                $depth--;
+            }
             if ($depth === 0 && $tokens[$i]['type'] === 'KEYWORD' && $tokens[$i]['value'] === 'OR') {
                 $left = array_slice($tokens, 0, $i);
                 $right = array_slice($tokens, $i + 1);
@@ -63,8 +67,12 @@ final class ExpressionEvaluator
         $depth = 0;
         $betweenCount = 0;
         for ($i = 0; $i < $len; $i++) {
-            if ($tokens[$i]['value'] === '(') $depth++;
-            if ($tokens[$i]['value'] === ')') $depth--;
+            if ($tokens[$i]['value'] === '(') {
+                $depth++;
+            }
+            if ($tokens[$i]['value'] === ')') {
+                $depth--;
+            }
             if ($depth === 0 && $tokens[$i]['type'] === 'KEYWORD') {
                 if ($tokens[$i]['value'] === 'BETWEEN') {
                     $betweenCount++;
@@ -96,6 +104,7 @@ final class ExpressionEvaluator
 
     /**
      * @param list<array{type: string, value: string}> $tokens
+     * @param array<string, mixed> $row
      */
     private static function evaluateComparison(array $tokens, array $row, string $alias): bool
     {
@@ -123,7 +132,9 @@ final class ExpressionEvaluator
                 $leftEnd = $negate ? $i - 1 : $i;
                 $leftVal = self::resolveValue(array_slice($tokens, 0, $leftEnd), $row, $alias);
                 $rightVal = self::resolveValue(array_slice($tokens, $i + 1), $row, $alias);
-                if ($leftVal === null || $rightVal === null) return false;
+                if ($leftVal === null || $rightVal === null) {
+                    return false;
+                }
                 $pattern = implode('.*', array_map(
                     fn(string $p) => implode('.', array_map(fn(string $q) => preg_quote($q, '/'), explode('_', $p))),
                     explode('%', (string) $rightVal),
@@ -179,8 +190,7 @@ final class ExpressionEvaluator
                     '<' => $leftVal < $rightVal,
                     '>' => $leftVal > $rightVal,
                     '<=' => $leftVal <= $rightVal,
-                    '>=' => $leftVal >= $rightVal,
-                    default => false,
+                    default => $leftVal >= $rightVal,
                 };
             }
         }
@@ -190,19 +200,32 @@ final class ExpressionEvaluator
 
     /**
      * @param list<array{type: string, value: string}> $tokens
+     * @param array<string, mixed> $row
      */
     private static function resolveValue(array $tokens, array $row, string $alias): mixed
     {
-        if (count($tokens) === 0) return null;
+        if (count($tokens) === 0) {
+            return null;
+        }
 
         // Single token.
         if (count($tokens) === 1) {
             $token = $tokens[0];
-            if ($token['type'] === 'STRING') return $token['value'];
-            if ($token['type'] === 'NUMBER') return is_numeric($token['value']) ? (str_contains($token['value'], '.') ? (float) $token['value'] : (int) $token['value']) : $token['value'];
-            if ($token['type'] === 'KEYWORD' && $token['value'] === 'NULL') return null;
-            if ($token['type'] === 'KEYWORD' && $token['value'] === 'TRUE') return true;
-            if ($token['type'] === 'KEYWORD' && $token['value'] === 'FALSE') return false;
+            if ($token['type'] === 'STRING') {
+                return $token['value'];
+            }
+            if ($token['type'] === 'NUMBER') {
+                return is_numeric($token['value']) ? (str_contains($token['value'], '.') ? (float) $token['value'] : (int) $token['value']) : $token['value'];
+            }
+            if ($token['type'] === 'KEYWORD' && $token['value'] === 'NULL') {
+                return null;
+            }
+            if ($token['type'] === 'KEYWORD' && $token['value'] === 'TRUE') {
+                return true;
+            }
+            if ($token['type'] === 'KEYWORD' && $token['value'] === 'FALSE') {
+                return false;
+            }
             if ($token['type'] === 'IDENT') {
                 return $row[$token['value']] ?? null;
             }
@@ -240,9 +263,21 @@ final class ExpressionEvaluator
             $innerTokens = [];
             $depth = 0;
             for ($i = 1; $i < count($tokens); $i++) {
-                if ($tokens[$i]['value'] === '(') { $depth++; if ($depth === 1) continue; }
-                if ($tokens[$i]['value'] === ')') { $depth--; if ($depth === 0) continue; }
-                if ($depth > 0) $innerTokens[] = $tokens[$i];
+                if ($tokens[$i]['value'] === '(') {
+                    $depth++;
+                    if ($depth === 1) {
+                        continue;
+                    }
+                }
+                if ($tokens[$i]['value'] === ')') {
+                    $depth--;
+                    if ($depth === 0) {
+                        continue;
+                    }
+                }
+                if ($depth > 0) {
+                    $innerTokens[] = $tokens[$i];
+                }
             }
 
             // SUBSTRING(str, pos[, len]) — SQL standard, 1-based position.
@@ -287,7 +322,7 @@ final class ExpressionEvaluator
             };
         }
 
-        return $tokens[0]['value'] ?? null;
+        return $tokens[0]['value'];
     }
 
     /**
@@ -303,8 +338,12 @@ final class ExpressionEvaluator
         $depth = 0;
 
         foreach ($tokens as $token) {
-            if ($token['value'] === '(') $depth++;
-            if ($token['value'] === ')') $depth--;
+            if ($token['value'] === '(') {
+                $depth++;
+            }
+            if ($token['value'] === ')') {
+                $depth--;
+            }
             if ($depth === 0 && $token['type'] === 'OP' && $token['value'] === ',') {
                 $args[] = $current;
                 $current = [];
@@ -324,6 +363,7 @@ final class ExpressionEvaluator
      * Evaluate CAST(expr AS type).
      *
      * @param list<array{type: string, value: string}> $innerTokens Tokens between the parentheses.
+     * @param array<string, mixed> $row
      */
     private static function evaluateCast(array $innerTokens, array $row, string $alias): mixed
     {
@@ -331,8 +371,12 @@ final class ExpressionEvaluator
         $asIndex = null;
         $depth = 0;
         for ($i = 0; $i < count($innerTokens); $i++) {
-            if ($innerTokens[$i]['value'] === '(') $depth++;
-            if ($innerTokens[$i]['value'] === ')') $depth--;
+            if ($innerTokens[$i]['value'] === '(') {
+                $depth++;
+            }
+            if ($innerTokens[$i]['value'] === ')') {
+                $depth--;
+            }
             if ($depth === 0 && $innerTokens[$i]['type'] === 'KEYWORD' && $innerTokens[$i]['value'] === 'AS') {
                 $asIndex = $i;
                 break;
@@ -456,10 +500,8 @@ final class ExpressionEvaluator
 
         return match ($func) {
             'COUNT' => count($values),
-            'SUM' => array_sum(array_map(fn ($v) => is_numeric($v) ? (float) $v : 0, $values)),
-            'AVG' => count($values) > 0
-                ? array_sum(array_map(fn ($v) => is_numeric($v) ? (float) $v : 0, $values)) / count($values)
-                : 0,
+            'SUM' => array_sum(array_map(fn($v) => is_numeric($v) ? (float) $v : 0, $values)),
+            'AVG' => array_sum(array_map(fn($v) => is_numeric($v) ? (float) $v : 0, $values)) / count($values),
             'MIN' => self::aggregateMin($values),
             'MAX' => self::aggregateMax($values),
             default => '',
@@ -482,11 +524,17 @@ final class ExpressionEvaluator
         }
 
         if ($allNumeric) {
-            $nums = array_map(fn ($v) => str_contains((string) $v, '.') ? (float) $v : (int) $v, $values);
+            $nums = array_map(fn($v) => str_contains((string) $v, '.') ? (float) $v : (int) $v, $values);
+            if ($nums === []) {
+                return '';
+            }
             return min($nums);
         }
 
-        $strings = array_map(fn ($v) => (string) $v, $values);
+        $strings = array_map(fn($v) => (string) $v, $values);
+        if ($strings === []) {
+            return '';
+        }
         return min($strings);
     }
 
@@ -506,11 +554,17 @@ final class ExpressionEvaluator
         }
 
         if ($allNumeric) {
-            $nums = array_map(fn ($v) => str_contains((string) $v, '.') ? (float) $v : (int) $v, $values);
+            $nums = array_map(fn($v) => str_contains((string) $v, '.') ? (float) $v : (int) $v, $values);
+            if ($nums === []) {
+                return '';
+            }
             return max($nums);
         }
 
-        $strings = array_map(fn ($v) => (string) $v, $values);
+        $strings = array_map(fn($v) => (string) $v, $values);
+        if ($strings === []) {
+            return '';
+        }
         return max($strings);
     }
 }

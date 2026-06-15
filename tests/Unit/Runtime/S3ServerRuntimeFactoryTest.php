@@ -86,7 +86,7 @@ final class S3ServerRuntimeFactoryTest extends TestCase
 
     public function test_runtime_stop_shuts_down_encryption_service_when_supported(): void
     {
-        $encryption = new RuntimeFactoryRecordingEncryptionService;
+        $encryption = new RuntimeFactoryRecordingEncryptionService();
         $runtime = $this->createRuntime(encryption: $encryption);
 
         $runtime->stop();
@@ -100,20 +100,19 @@ final class S3ServerRuntimeFactoryTest extends TestCase
     private function createRuntime(
         array $notificationListeners = [],
         ?EncryptionServiceInterface $encryption = null,
-    ): \OpsFour\S3Server\Runtime\S3ServerRuntime
-    {
+    ): \OpsFour\S3Server\Runtime\S3ServerRuntime {
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
 
-        return (new S3ServerRuntimeFactory)->create(
+        return (new S3ServerRuntimeFactory())->create(
             config: new S3ServerConfig(storagePath: $this->storagePath),
             metadata: $metadata,
-            storage: new InMemoryBackend,
+            storage: new InMemoryBackend(),
             credentialProvider: new InMemoryCredentialProvider(
                 new Credential('test-key', 'test-secret', 'test-owner'),
             ),
-            logger: new NullLogger,
-            metrics: new MetricsCollector,
+            logger: new NullLogger(),
+            metrics: new MetricsCollector(),
             encryption: $encryption,
             notificationListeners: $notificationListeners,
         );

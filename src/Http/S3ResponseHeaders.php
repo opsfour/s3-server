@@ -91,7 +91,7 @@ final class S3ResponseHeaders
             if (str_starts_with($metaKey, '__')) {
                 continue;
             }
-            $headers['x-amz-meta-'.$metaKey] = $metaValue;
+            $headers['x-amz-meta-' . $metaKey] = $metaValue;
         }
 
         return $headers;

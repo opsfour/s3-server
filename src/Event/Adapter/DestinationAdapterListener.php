@@ -17,7 +17,7 @@ final readonly class DestinationAdapterListener
 {
     public function __construct(
         private NotificationDestinationAdapter $adapter,
-        private LoggerInterface $logger = new NullLogger,
+        private LoggerInterface $logger = new NullLogger(),
     ) {}
 
     public function __invoke(S3Event $event): void

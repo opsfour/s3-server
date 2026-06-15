@@ -25,7 +25,7 @@ final class ListMultipartUploadsHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
@@ -45,31 +45,41 @@ final class ListMultipartUploadsHandler implements RequestHandler
             $uploadIdMarker,
         );
 
-        $xmlUploads = array_map(fn ($u) => [
+        $xmlUploads = array_map(fn($u) => [
             'key' => $u['key_name'],
             'uploadId' => $u['upload_id'],
             'initiated' => rtrim(str_replace(' ', 'T', $u['created_at']), 'Z') . 'Z',
             'ownerId' => $u['owner_id'],
         ], $result['uploads']);
 
-        $xml = XmlResponseBuilder::listMultipartUploadsResult([
+        $params = [
             'bucket' => $bucket,
             'prefix' => $prefix ?? '',
-            'delimiter' => $delimiter,
             'keyMarker' => $keyMarker ?? '',
             'uploadIdMarker' => $uploadIdMarker ?? '',
-            'nextKeyMarker' => $result['nextKeyMarker'],
-            'nextUploadIdMarker' => $result['nextUploadIdMarker'],
             'maxUploads' => $maxUploads,
             'isTruncated' => $result['isTruncated'],
             'uploads' => $xmlUploads,
             'commonPrefixes' => $result['commonPrefixes'],
-            'encodingType' => $encodingType,
-        ]);
+        ];
+        if ($delimiter !== null) {
+            $params['delimiter'] = $delimiter;
+        }
+        if ($result['nextKeyMarker'] !== null) {
+            $params['nextKeyMarker'] = $result['nextKeyMarker'];
+        }
+        if ($result['nextUploadIdMarker'] !== null) {
+            $params['nextUploadIdMarker'] = $result['nextUploadIdMarker'];
+        }
+        if ($encodingType !== null) {
+            $params['encodingType'] = $encodingType;
+        }
+
+        $xml = XmlResponseBuilder::listMultipartUploadsResult($params);
 
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'application/xml'],
+            headers: ['content-type' => 'application/xml'],
             body: $xml,
         );
     }

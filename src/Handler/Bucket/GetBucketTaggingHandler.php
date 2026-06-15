@@ -33,14 +33,14 @@ final class GetBucketTaggingHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $tags = $this->metadata->getBucketTagging($bucket);
 
         // Real S3 throws NoSuchTagSet for bucket tagging when no tags exist.
         if ($tags === []) {
-            throw new NoSuchTagSetException;
+            throw new NoSuchTagSetException();
         }
 
         $xml = XmlResponseBuilder::taggingResult($tags);

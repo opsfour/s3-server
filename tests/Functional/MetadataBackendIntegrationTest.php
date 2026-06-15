@@ -32,7 +32,7 @@ final class MetadataBackendIntegrationTest extends TestCase
             self::markTestSkipped("Set {$dsnEnv} to run {$driver} metadata backend integration tests.");
         }
 
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
         $metadata = new ObservedMetadataStore(
             MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]),
             $metrics,

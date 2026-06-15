@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableBuffer;
 use Amp\TimeoutCancellation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use PHPUnit\Framework\TestCase;
+
 use function Amp\async;
 use function Amp\Future\await as awaitFutures;
 
@@ -17,7 +18,7 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->basePath = sys_get_temp_dir().'/s3server-amp-file-regression-'.bin2hex(random_bytes(8));
+        $this->basePath = sys_get_temp_dir() . '/s3server-amp-file-regression-' . bin2hex(random_bytes(8));
         mkdir($this->basePath, 0755, true);
     }
 

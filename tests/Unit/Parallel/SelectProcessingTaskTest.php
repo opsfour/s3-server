@@ -88,13 +88,18 @@ final class SelectProcessingTaskTest extends TestCase
         // Process inline (same logic as SelectObjectContentHandler).
         $parsed = SqlParser::parse($expression);
         $rows = CsvProcessor::parse($csv, ',', "\n", '"', 'USE')['rows'];
-        $filtered = array_values(array_filter($rows, fn(array $row) =>
-            ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias'])
+        $filtered = array_values(array_filter(
+            $rows,
+            fn(array $row)
+            => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
         ));
 
         $outputData = CsvProcessor::format($filtered, null, ',', "\n", '"');
         $inlineEventStream = EventStreamEncoder::encode(
-            $outputData, strlen($csv), strlen($csv), strlen($outputData),
+            $outputData,
+            strlen($csv),
+            strlen($csv),
+            strlen($outputData),
         );
 
         $this->assertSame($inlineEventStream, $taskResult['eventStream']);

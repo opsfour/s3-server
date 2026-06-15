@@ -99,7 +99,7 @@ final class QuotaCommandTest extends TestCase
 
     private function tester(): CommandTester
     {
-        return new CommandTester(new QuotaCommand);
+        return new CommandTester(new QuotaCommand());
     }
 
     private function recursiveDelete(string $path): void

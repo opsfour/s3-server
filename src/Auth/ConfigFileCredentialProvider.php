@@ -71,7 +71,7 @@ final class ConfigFileCredentialProvider implements CredentialProvider
             return;
         }
 
-        /** @var list<array{accessKeyId: string, secretAccessKey: string, ownerId: string, displayName?: string}> $entries */
+        /** @var list<array{accessKeyId: string, secretAccessKey: string, ownerId: string, displayName?: string, isActive?: mixed, sessionToken?: mixed, expiresAt?: mixed, policyNames?: mixed, allowedPrefixes?: mixed}> $entries */
         $entries = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
 
         foreach ($entries as $entry) {
@@ -80,8 +80,8 @@ final class ConfigFileCredentialProvider implements CredentialProvider
                 secretAccessKey: $entry['secretAccessKey'],
                 ownerId: $entry['ownerId'],
                 displayName: $entry['displayName'] ?? '',
-                isActive: $entry['isActive'] ?? true,
-                sessionToken: $entry['sessionToken'] ?? null,
+                isActive: is_bool($entry['isActive'] ?? null) ? $entry['isActive'] : true,
+                sessionToken: is_string($entry['sessionToken'] ?? null) ? $entry['sessionToken'] : null,
                 expiresAt: isset($entry['expiresAt']) && is_string($entry['expiresAt'])
                     ? new \DateTimeImmutable($entry['expiresAt'])
                     : null,

@@ -54,13 +54,13 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_bundle_exposes_container_extension(): void
     {
-        self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle)->getContainerExtension());
+        self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle())->getContainerExtension());
     }
 
     public function test_container_compiles_and_resolves_core_services(): void
     {
-        $container = new ContainerBuilder;
-        $extension = new S3ServerExtension;
+        $container = new ContainerBuilder();
+        $extension = new S3ServerExtension();
         $extension->load([[
             'storage' => [
                 'driver' => 'memory',
@@ -99,8 +99,8 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_config_overrides_are_applied_to_server_config(): void
     {
-        $container = new ContainerBuilder;
-        (new S3ServerExtension)->load([[
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
             'server' => [
                 'host' => '127.0.0.1',
                 'port' => 9444,
@@ -149,8 +149,8 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_serve_command_is_registered_with_expected_name_and_options(): void
     {
-        $container = new ContainerBuilder;
-        (new S3ServerExtension)->load([[
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -250,14 +250,14 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_flysystem_storage_can_reference_symfony_service(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.flysystem.adapter', new Definition(InMemoryFlysystemAdapter::class));
         $container->setDefinition('test.flysystem', (new Definition(Filesystem::class))
             ->setArguments([
                 new \Symfony\Component\DependencyInjection\Reference('test.flysystem.adapter'),
             ]));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'flysystem',
                 'filesystem_service' => 'test.flysystem',
@@ -275,7 +275,7 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_tiered_flysystem_storage_can_reference_symfony_services(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.standard.adapter', new Definition(InMemoryFlysystemAdapter::class));
         $container->setDefinition('test.standard.flysystem', (new Definition(Filesystem::class))
             ->setArguments([
@@ -287,7 +287,7 @@ final class S3ServerBundleTest extends TestCase
                 new \Symfony\Component\DependencyInjection\Reference('test.cold.adapter'),
             ]));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'flysystem',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -318,11 +318,11 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_notification_listener_services_are_injected_into_serve_command(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.s3_listener', (new Definition(RecordingSymfonyS3Listener::class))
             ->setPublic(true));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -349,11 +349,11 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_symfony_event_dispatcher_can_be_registered_as_notification_listener(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.event_dispatcher', (new Definition(EventDispatcher::class))
             ->setPublic(true));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -390,11 +390,11 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_encryption_service_can_be_referenced_from_symfony_service(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.encryption', (new Definition(RecordingEncryptionService::class))
             ->setPublic(true));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -417,12 +417,12 @@ final class S3ServerBundleTest extends TestCase
 
     public function test_master_key_provider_service_builds_symfony_encryption_service(): void
     {
-        $container = new ContainerBuilder;
+        $container = new ContainerBuilder();
         $container->setDefinition('test.master_key_provider', (new Definition(ConfigMasterKeyProvider::class))
             ->setArguments([base64_encode(str_repeat('k', 32))])
             ->setPublic(true));
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -444,11 +444,11 @@ final class S3ServerBundleTest extends TestCase
     {
         $this->expectException(InvalidConfigurationException::class);
 
-        (new S3ServerExtension)->load([[
+        (new S3ServerExtension())->load([[
             'server' => [
                 'port' => 0,
             ],
-        ]], new ContainerBuilder);
+        ]], new ContainerBuilder());
     }
 
     /**
@@ -474,8 +474,8 @@ final class S3ServerBundleTest extends TestCase
             ],
         ], $overrides);
 
-        $container = new ContainerBuilder;
-        (new S3ServerExtension)->load([$config], $container);
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([$config], $container);
         $container->compile();
 
         return $container;

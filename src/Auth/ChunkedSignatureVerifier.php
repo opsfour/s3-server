@@ -138,8 +138,6 @@ final class ChunkedSignatureVerifier
                         }
                     }
                 }
-
-                $queue->complete();
             } catch (\Throwable $e) {
                 $queue->error($e);
             }

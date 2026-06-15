@@ -27,7 +27,7 @@ final class LifecycleExecutor
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
         private readonly int $batchSize = 1000,
         private readonly int $maxActionsPerRun = 1000,
         private readonly int $lockTtlSeconds = 300,
@@ -167,7 +167,7 @@ final class LifecycleExecutor
                 break;
             }
 
-            if (($rule['status'] ?? '') !== 'Enabled') {
+            if ($rule['status'] !== 'Enabled') {
                 continue;
             }
 
@@ -217,6 +217,7 @@ final class LifecycleExecutor
         ]));
     }
 
+    /** @param array<string, mixed> $rule */
     private function processRule(string $bucket, array $rule, ?string $prefix, int $actionBudget): int
     {
         $actions = 0;
@@ -263,7 +264,7 @@ final class LifecycleExecutor
                     if (count($objects) < $limit) {
                         $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                     }
-                } while ($objects !== [] && count($objects) === $limit && $actions < $actionBudget);
+                } while (count($objects) === $limit && $actions < $actionBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $queued, [
                     'target_storage_class' => (string) $transition['storageClass'],
@@ -316,7 +317,7 @@ final class LifecycleExecutor
                     if (count($objects) < $limit) {
                         $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                     }
-                } while ($objects !== [] && count($objects) === $limit && $actions < $actionBudget);
+                } while (count($objects) === $limit && $actions < $actionBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $queued, [
                     'target_storage_class' => (string) $transition['storageClass'],
@@ -359,7 +360,7 @@ final class LifecycleExecutor
                 if (count($expired) < $limit) {
                     $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                 }
-            } while ($expired !== [] && count($expired) === $limit && $actions < $actionBudget);
+            } while (count($expired) === $limit && $actions < $actionBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted, [
                 'expiration_mode' => 'days',
@@ -401,7 +402,7 @@ final class LifecycleExecutor
                     if (count($expired) < $limit) {
                         $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                     }
-                } while ($expired !== [] && count($expired) === $limit && $actions < $actionBudget);
+                } while (count($expired) === $limit && $actions < $actionBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $deleted, [
                     'expiration_mode' => 'date',
@@ -469,7 +470,7 @@ final class LifecycleExecutor
                 if (count($expired) < $limit) {
                     $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                 }
-            } while ($expired !== [] && count($expired) === $limit && $actions < $actionBudget);
+            } while (count($expired) === $limit && $actions < $actionBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted);
         }
@@ -533,7 +534,7 @@ final class LifecycleExecutor
                     if (count($expired) < $limit) {
                         $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                     }
-                } while ($expired !== [] && count($expired) === $limit && $actions < $actionBudget);
+                } while (count($expired) === $limit && $actions < $actionBudget);
             }
 
             $this->logActionCompleted($bucket, $rule, $action, $aborted);
@@ -580,7 +581,7 @@ final class LifecycleExecutor
                 if (count($orphaned) < $limit) {
                     $this->clearCheckpointIfPresent($bucket, $rule, $action, $checkpoint);
                 }
-            } while ($orphaned !== [] && count($orphaned) === $limit && $actions < $actionBudget);
+            } while (count($orphaned) === $limit && $actions < $actionBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted);
         }
@@ -692,6 +693,7 @@ final class LifecycleExecutor
 
     /**
      * @param array<string, mixed> $context
+     * @param array<string, mixed> $rule
      */
     private function logActionCompleted(string $bucket, array $rule, string $action, int $count, array $context = []): void
     {
@@ -718,6 +720,7 @@ final class LifecycleExecutor
         ), enqueueWebhooks: false);
     }
 
+    /** @param array<string, mixed> $rule */
     private function rulePrefix(array $rule): ?string
     {
         $prefix = $rule['prefix'] ?? $rule['filter']['prefix'] ?? $rule['filter']['and']['prefix'] ?? null;
@@ -725,6 +728,7 @@ final class LifecycleExecutor
         return is_string($prefix) ? $prefix : null;
     }
 
+    /** @param array<string, mixed> $rule */
     private function objectMatchesRule(string $bucket, ObjectInfo $object, array $rule): bool
     {
         $requiredTags = $this->ruleTags($rule);
@@ -734,9 +738,7 @@ final class LifecycleExecutor
 
         $objectTags = [];
         foreach ($this->metadata->getObjectTagging($bucket, $object->key) as $tag) {
-            if (isset($tag['key'], $tag['value'])) {
-                $objectTags[(string) $tag['key']] = (string) $tag['value'];
-            }
+            $objectTags[$tag['key']] = $tag['value'];
         }
 
         foreach ($requiredTags as $key => $value) {
@@ -750,12 +752,14 @@ final class LifecycleExecutor
 
     /**
      * @return array{cursorKey: string|null, cursorVersionId: string|null, cursorUploadId: string|null}|null
+     * @param array<string, mixed> $rule
      */
     private function checkpoint(string $bucket, array $rule, string $action): ?array
     {
         return $this->metadata->getLifecycleCheckpoint($bucket, $this->ruleId($rule), $action);
     }
 
+    /** @param array<string, mixed> $rule */
     private function saveObjectCheckpoint(string $bucket, array $rule, string $action, ObjectInfo $object): void
     {
         $this->metadata->putLifecycleCheckpoint(
@@ -767,6 +771,7 @@ final class LifecycleExecutor
         );
     }
 
+    /** @param array<string, mixed> $rule */
     private function saveMultipartCheckpoint(string $bucket, array $rule, string $action, string $key, string $uploadId): void
     {
         $this->metadata->putLifecycleCheckpoint(
@@ -780,6 +785,7 @@ final class LifecycleExecutor
 
     /**
      * @param array{cursorKey: string|null, cursorVersionId: string|null, cursorUploadId: string|null}|null $checkpoint
+     * @param array<string, mixed> $rule
      */
     private function clearCheckpointIfPresent(string $bucket, array $rule, string $action, ?array $checkpoint): void
     {
@@ -788,6 +794,7 @@ final class LifecycleExecutor
         }
     }
 
+    /** @param array<string, mixed> $rule */
     private function ruleId(array $rule): string
     {
         return (string) ($rule['id'] ?? 'default');
@@ -795,6 +802,7 @@ final class LifecycleExecutor
 
     /**
      * @return array<string, string>
+     * @param array<string, mixed> $rule
      */
     private function ruleTags(array $rule): array
     {

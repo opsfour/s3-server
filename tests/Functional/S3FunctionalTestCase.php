@@ -42,7 +42,7 @@ abstract class S3FunctionalTestCase extends TestCase
         parent::setUpBeforeClass();
 
         // Create a temporary storage directory.
-        self::$storagePath = sys_get_temp_dir().'/s3-test-'.uniqid();
+        self::$storagePath = sys_get_temp_dir() . '/s3-test-' . uniqid();
         mkdir(self::$storagePath, 0o755, true);
 
         // Find a free port.
@@ -174,7 +174,7 @@ abstract class S3FunctionalTestCase extends TestCase
 
     private static function startServer(): void
     {
-        $binPath = realpath(__DIR__.'/../../bin/s3-server');
+        $binPath = realpath(__DIR__ . '/../../bin/s3-server');
 
         self::$serverStdoutPath = tempnam(sys_get_temp_dir(), 's3-server-stdout-') ?: '';
         self::$serverStderrPath = tempnam(sys_get_temp_dir(), 's3-server-stderr-') ?: '';
@@ -272,7 +272,7 @@ abstract class S3FunctionalTestCase extends TestCase
                     continue;
                 }
 
-                self::recursiveDelete($path.'/'.$item);
+                self::recursiveDelete($path . '/' . $item);
             }
 
             rmdir($path);

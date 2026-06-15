@@ -39,12 +39,12 @@ final class JsonProcessor
         return $output;
     }
 
-    /**
-     * @return list<array<string, mixed>>
-     */
     /** Maximum number of parsed rows to prevent memory exhaustion. */
     private const int MAX_ROWS = 1_000_000;
 
+    /**
+     * @return list<array<string, mixed>>
+     */
     private static function parseLines(string $data): array
     {
         $rows = [];
@@ -72,7 +72,7 @@ final class JsonProcessor
                 );
             }
             $decoded = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-            if (is_array($decoded)) {
+            if (is_array($decoded) && !array_is_list($decoded)) {
                 $rows[] = $decoded;
             }
         }
@@ -97,7 +97,7 @@ final class JsonProcessor
                     'S3 Select: JSON document exceeds maximum row count (' . self::MAX_ROWS . ').',
                 );
             }
-            return $decoded;
+            return array_values(array_filter($decoded, static fn(mixed $row): bool => is_array($row) && !array_is_list($row)));
         }
 
         // Single object — wrap in a list.

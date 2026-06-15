@@ -9,6 +9,9 @@ namespace OpsFour\S3Server\Select;
  */
 final class CsvProcessor
 {
+    /** Maximum number of parsed rows to prevent memory exhaustion. */
+    private const int MAX_ROWS = 1_000_000;
+
     /**
      * Parse CSV data into rows.
      *
@@ -16,12 +19,9 @@ final class CsvProcessor
      * @param string $fieldDelimiter Column delimiter.
      * @param string $recordDelimiter Row delimiter.
      * @param string $quoteCharacter Quote character.
-     * @param bool $fileHeaderInfo Whether first row is header (USE/IGNORE/NONE).
+     * @param string $fileHeaderInfo Whether first row is header (USE/IGNORE/NONE).
      * @return array{headers: ?list<string>, rows: list<array<string, string>>}
      */
-    /** Maximum number of parsed rows to prevent memory exhaustion. */
-    private const int MAX_ROWS = 1_000_000;
-
     public static function parse(
         string $data,
         string $fieldDelimiter = ',',
@@ -55,7 +55,7 @@ final class CsvProcessor
             $fields = str_getcsv($line, $fieldDelimiter, $quoteCharacter, '');
 
             if ($firstDataLine && $fileHeaderInfo === 'USE') {
-                $headers = $fields;
+                $headers = array_map(static fn(?string $field): string => $field ?? '', $fields);
                 $firstDataLine = false;
                 continue;
             }

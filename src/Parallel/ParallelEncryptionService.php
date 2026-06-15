@@ -88,6 +88,7 @@ final class ParallelEncryptionService implements EncryptionServiceInterface
         }
     }
 
+    /** @param list<mixed> $args */
     private function submitTask(string $method, array $args): mixed
     {
         $task = new EncryptionTask($method, $args);

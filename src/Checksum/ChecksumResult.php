@@ -77,6 +77,6 @@ final readonly class ChecksumResult
      */
     public function etag(): string
     {
-        return '"'.$this->md5Hex.'"';
+        return '"' . $this->md5Hex . '"';
     }
 }

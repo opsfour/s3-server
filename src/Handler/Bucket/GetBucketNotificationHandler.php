@@ -24,7 +24,7 @@ final class GetBucketNotificationHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // S3 always returns 200 for notification config, even when empty.

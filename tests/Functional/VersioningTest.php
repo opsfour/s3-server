@@ -201,7 +201,7 @@ final class VersioningTest extends S3FunctionalTestCase
         $this->assertGreaterThanOrEqual(2, count($versions));
 
         // Verify the latest version is marked as latest.
-        $latestVersions = array_filter($versions, fn ($v) => ($v['IsLatest'] ?? false) && $v['Key'] === $key);
+        $latestVersions = array_filter($versions, fn($v) => ($v['IsLatest'] ?? false) && $v['Key'] === $key);
         $this->assertCount(1, $latestVersions);
     }
 

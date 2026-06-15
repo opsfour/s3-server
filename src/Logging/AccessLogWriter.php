@@ -27,7 +27,7 @@ final class AccessLogWriter
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
     ) {}
 
     /**

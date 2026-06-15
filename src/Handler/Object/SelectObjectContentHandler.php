@@ -46,12 +46,12 @@ final class SelectObjectContentHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Size guard: S3 Select buffers the entire object.
@@ -68,20 +68,23 @@ final class SelectObjectContentHandler implements RequestHandler
         // Fetch object data.
         $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
         if ($storagePath === null || $storagePath === '') {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         $objectData = ByteStream\buffer($this->storage->getObjectByPath($storagePath));
 
         // Offload to worker if pool is available.
         if ($this->workerPool !== null) {
-            return $this->processInWorker($objectData, $config);
+            return $this->processInWorker($this->workerPool, $objectData, $config);
         }
 
         return $this->processInline($objectData, $config);
     }
 
-    private function processInWorker(string $objectData, array $config): Response
+    /**
+     * @param array{expression: string, inputSerialization: array<string, mixed>, outputSerialization: array<string, mixed>} $config
+     */
+    private function processInWorker(WorkerPool $workerPool, string $objectData, array $config): Response
     {
         $task = new SelectProcessingTask(
             $objectData,
@@ -91,7 +94,7 @@ final class SelectObjectContentHandler implements RequestHandler
         );
 
         try {
-            $result = $this->workerPool->submit($task)->await();
+            $result = $workerPool->submit($task)->await();
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent');
         } catch (TaskFailureThrowable $e) {
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent', false, $e->getOriginalClassName());
@@ -109,11 +112,14 @@ final class SelectObjectContentHandler implements RequestHandler
 
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'application/octet-stream'],
+            headers: ['content-type' => 'application/octet-stream'],
             body: $result['eventStream'],
         );
     }
 
+    /**
+     * @param array{expression: string, inputSerialization: array<string, mixed>, outputSerialization: array<string, mixed>} $config
+     */
     private function processInline(string $objectData, array $config): Response
     {
         $bytesScanned = strlen($objectData);
@@ -150,8 +156,10 @@ final class SelectObjectContentHandler implements RequestHandler
         unset($objectData);
 
         // Apply WHERE filter.
-        $filtered = array_filter($rows, fn (array $row) =>
-            ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias'])
+        $filtered = array_filter(
+            $rows,
+            fn(array $row)
+            => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
         );
         $filtered = array_values($filtered);
 
@@ -245,6 +253,9 @@ final class SelectObjectContentHandler implements RequestHandler
     {
         try {
             $xml = preg_replace('/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?[^>]*>/i', '', $xml);
+            if ($xml === null) {
+                throw new \RuntimeException('Failed to sanitize XML.');
+            }
             $element = new \SimpleXMLElement($xml, LIBXML_NONET);
         } catch (\Exception) {
             throw new \OpsFour\S3Server\Exception\MalformedXmlException('Invalid SelectObjectContent request XML.');
@@ -257,10 +268,18 @@ final class SelectObjectContentHandler implements RequestHandler
             if (isset($element->InputSerialization->CSV)) {
                 $csv = $element->InputSerialization->CSV;
                 $inputSerialization['format'] = 'CSV';
-                if (isset($csv->FileHeaderInfo)) $inputSerialization['fileHeaderInfo'] = (string) $csv->FileHeaderInfo;
-                if (isset($csv->FieldDelimiter)) $inputSerialization['fieldDelimiter'] = (string) $csv->FieldDelimiter;
-                if (isset($csv->RecordDelimiter)) $inputSerialization['recordDelimiter'] = (string) $csv->RecordDelimiter;
-                if (isset($csv->QuoteCharacter)) $inputSerialization['quoteCharacter'] = (string) $csv->QuoteCharacter;
+                if (isset($csv->FileHeaderInfo)) {
+                    $inputSerialization['fileHeaderInfo'] = (string) $csv->FileHeaderInfo;
+                }
+                if (isset($csv->FieldDelimiter)) {
+                    $inputSerialization['fieldDelimiter'] = (string) $csv->FieldDelimiter;
+                }
+                if (isset($csv->RecordDelimiter)) {
+                    $inputSerialization['recordDelimiter'] = (string) $csv->RecordDelimiter;
+                }
+                if (isset($csv->QuoteCharacter)) {
+                    $inputSerialization['quoteCharacter'] = (string) $csv->QuoteCharacter;
+                }
             } elseif (isset($element->InputSerialization->JSON)) {
                 $inputSerialization['format'] = 'JSON';
                 if (isset($element->InputSerialization->JSON->Type)) {
@@ -274,9 +293,15 @@ final class SelectObjectContentHandler implements RequestHandler
             if (isset($element->OutputSerialization->CSV)) {
                 $outputSerialization['format'] = 'CSV';
                 $csv = $element->OutputSerialization->CSV;
-                if (isset($csv->FieldDelimiter)) $outputSerialization['fieldDelimiter'] = (string) $csv->FieldDelimiter;
-                if (isset($csv->RecordDelimiter)) $outputSerialization['recordDelimiter'] = (string) $csv->RecordDelimiter;
-                if (isset($csv->QuoteCharacter)) $outputSerialization['quoteCharacter'] = (string) $csv->QuoteCharacter;
+                if (isset($csv->FieldDelimiter)) {
+                    $outputSerialization['fieldDelimiter'] = (string) $csv->FieldDelimiter;
+                }
+                if (isset($csv->RecordDelimiter)) {
+                    $outputSerialization['recordDelimiter'] = (string) $csv->RecordDelimiter;
+                }
+                if (isset($csv->QuoteCharacter)) {
+                    $outputSerialization['quoteCharacter'] = (string) $csv->QuoteCharacter;
+                }
             } elseif (isset($element->OutputSerialization->JSON)) {
                 $outputSerialization['format'] = 'JSON';
             }

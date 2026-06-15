@@ -40,7 +40,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         $accessKey = self::requiredEnv('S3_INTEGRATION_ACCESS_KEY');
         $secretKey = self::requiredEnv('S3_INTEGRATION_SECRET_KEY');
         $this->bucket = self::integrationBucket();
-        $this->logicalBucket = self::prefix().'-'.bin2hex(random_bytes(4));
+        $this->logicalBucket = self::prefix() . '-' . bin2hex(random_bytes(4));
 
         $this->client = new S3Client([
             'version' => 'latest',
@@ -72,7 +72,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         }
 
         foreach ($this->createdStoragePaths as $path) {
-            $key = self::prefix().'/'.$path;
+            $key = self::prefix() . '/' . $path;
             try {
                 $this->client->deleteObject([
                     'Bucket' => $this->bucket,
@@ -110,7 +110,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         $this->backend->deleteObjectByPath($write->path, $this->logicalBucket);
         $this->createdStoragePaths = array_values(array_filter(
             $this->createdStoragePaths,
-            static fn (string $path): bool => $path !== $write->path,
+            static fn(string $path): bool => $path !== $write->path,
         ));
 
         $this->expectException(\OpsFour\S3Server\Exception\NoSuchKeyException::class);
@@ -120,7 +120,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
     public function test_external_s3_backend_multipart_assembly_cleans_up_parts(): void
     {
         $this->backend->createBucket($this->logicalBucket);
-        $uploadId = 'integration-'.bin2hex(random_bytes(8));
+        $uploadId = 'integration-' . bin2hex(random_bytes(8));
         $partBytes = self::envInt('S3_INTEGRATION_MULTIPART_PART_BYTES', 1024 * 1024);
         $expected = '';
         $parts = [];
@@ -152,7 +152,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
 
         $list = $this->client->listObjectsV2([
             'Bucket' => $this->bucket,
-            'Prefix' => self::prefix().'/.parts/'.$uploadId.'/',
+            'Prefix' => self::prefix() . '/.parts/' . $uploadId . '/',
         ]);
 
         self::assertSame(0, count($list['Contents'] ?? []));
@@ -160,7 +160,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
 
     private static function loadIntegrationEnv(): void
     {
-        $path = __DIR__.'/../../.env.integration';
+        $path = __DIR__ . '/../../.env.integration';
         if (! is_file($path)) {
             return;
         }
@@ -177,7 +177,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             $value = trim($value, "\"'");
 
             if ($key !== '' && getenv($key) === false) {
-                putenv($key.'='.$value);
+                putenv($key . '=' . $value);
                 $_ENV[$key] = $value;
             }
         }
@@ -217,7 +217,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
 
         $fallback = getenv('S3_INTEGRATION_BUCKET_PREFIX');
         if ($fallback !== false && $fallback !== '') {
-            return trim($fallback, '/').'/opsfour-s3server-integration';
+            return trim($fallback, '/') . '/opsfour-s3server-integration';
         }
 
         return 'opsfour-s3server-integration';

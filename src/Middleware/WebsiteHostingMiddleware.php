@@ -51,7 +51,7 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         // Handle redirectAllHost.
-        if (isset($websiteConfig['redirectAllHost']) && $websiteConfig['redirectAllHost'] !== null) {
+        if (isset($websiteConfig['redirectAllHost'])) {
             $protocol = $websiteConfig['redirectAllProtocol'] ?? 'http';
             // Sanitize protocol to prevent arbitrary scheme injection (e.g., javascript:).
             if (!in_array($protocol, ['http', 'https'], true)) {
@@ -85,7 +85,8 @@ final class WebsiteHostingMiddleware implements Middleware
         $objectInfo = null;
         try {
             $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
-        } catch (\Throwable) {}
+        } catch (\Throwable) {
+        }
 
         if ($objectInfo !== null && !$objectInfo->isDeleteMarker) {
             // Serve the object.
@@ -167,11 +168,12 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         // Try error document.
-        if (isset($websiteConfig['errorDocument']) && $websiteConfig['errorDocument'] !== null) {
+        if (isset($websiteConfig['errorDocument'])) {
             $errorObjectInfo = null;
             try {
                 $errorObjectInfo = $this->metadata->getObjectMetadata($bucket, $websiteConfig['errorDocument']);
-            } catch (\Throwable) {}
+            } catch (\Throwable) {
+            }
 
             if ($errorObjectInfo !== null && !$errorObjectInfo->isDeleteMarker) {
                 $storagePath = $errorObjectInfo->systemMetadata['storagePath'] ?? null;

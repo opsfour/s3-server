@@ -25,7 +25,7 @@ final class PutPublicAccessBlockHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $body = ByteStream\buffer($request->getBody());
@@ -53,6 +53,9 @@ final class PutPublicAccessBlockHandler implements RequestHandler
 
         try {
             $xml = preg_replace('/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?[^>]*>/i', '', $xml);
+            if ($xml === null) {
+                throw new \RuntimeException('Failed to sanitize XML.');
+            }
             $element = new \SimpleXMLElement($xml, LIBXML_NONET);
         } catch (\Exception) {
             throw new MalformedXmlException('Invalid XML.');

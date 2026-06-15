@@ -64,12 +64,13 @@ final class S3AttributeMiddleware implements Middleware
         // Validate key length (S3 limit: 1024 bytes).
         // Set attributes BEFORE throwing so error handler can read them.
         if ($key !== null && strlen($key) > 1024) {
-            throw new \OpsFour\S3Server\Exception\KeyTooLongException;
+            throw new \OpsFour\S3Server\Exception\KeyTooLongException();
         }
 
         return $requestHandler->handleRequest($request);
     }
 
+    /** @param array<string, string> $routeArgs */
     private function extractBucket(Request $request, array $routeArgs): ?string
     {
         $virtualBucket = BucketNameExtractor::extract($request, $this->baseDomain);

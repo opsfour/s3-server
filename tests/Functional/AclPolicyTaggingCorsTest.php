@@ -68,7 +68,7 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
         $grants = $acl['Grants'] ?? [];
         $this->assertCount(2, $grants);
 
-        $permissions = array_map(fn ($g) => $g['Permission'], $grants);
+        $permissions = array_map(fn($g) => $g['Permission'], $grants);
         $this->assertContains('FULL_CONTROL', $permissions);
         $this->assertContains('READ', $permissions);
 
@@ -132,7 +132,7 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
                     'Effect' => 'Allow',
                     'Principal' => '*',
                     'Action' => 's3:GetObject',
-                    'Resource' => 'arn:aws:s3:::'.self::$bucket.'/*',
+                    'Resource' => 'arn:aws:s3:::' . self::$bucket . '/*',
                 ],
             ],
         ]);

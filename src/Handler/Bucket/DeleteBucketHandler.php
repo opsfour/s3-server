@@ -39,7 +39,7 @@ final class DeleteBucketHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // 2. Delete from metadata store first — it performs the authoritative

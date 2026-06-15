@@ -136,7 +136,7 @@ final class CredentialsCommand extends Command
             return Command::SUCCESS;
         }
 
-        $rows = array_map(fn ($c) => [
+        $rows = array_map(fn($c) => [
             $c->accessKeyId,
             $c->ownerId,
             $c->displayName ?: '(none)',

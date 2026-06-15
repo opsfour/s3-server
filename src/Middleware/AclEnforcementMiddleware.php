@@ -102,7 +102,7 @@ final class AclEnforcementMiddleware implements Middleware
         }
 
         // Use cached bucket owner.
-        $resourceOwner = $cachedBucketOwner ?? '';
+        $resourceOwner = $cachedBucketOwner;
 
         if (!AclEvaluator::isAllowed(
             operation: $operation,
@@ -112,7 +112,7 @@ final class AclEnforcementMiddleware implements Middleware
             isAuthenticated: $ownerId !== '',
             ignorePublicAcls: $ignorePublicAcls,
         )) {
-            throw new AccessDeniedException;
+            throw new AccessDeniedException();
         }
 
         return $requestHandler->handleRequest($request);

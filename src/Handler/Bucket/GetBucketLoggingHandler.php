@@ -23,12 +23,12 @@ final class GetBucketLoggingHandler implements RequestHandler
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $config = $this->metadata->getBucketLogging($bucket);
 
-        $writer = new \XMLWriter;
+        $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
         $writer->startElementNs(null, 'BucketLoggingStatus', 'http://s3.amazonaws.com/doc/2006-03-01/');

@@ -85,7 +85,7 @@ final class MultipartUploadTest extends S3FunctionalTestCase
         ]);
 
         $this->assertCount(3, $listParts['Parts']);
-        $partNumbers = array_map(fn ($p) => $p['PartNumber'], $listParts['Parts']);
+        $partNumbers = array_map(fn($p) => $p['PartNumber'], $listParts['Parts']);
         $this->assertSame([1, 2, 3], $partNumbers);
 
         // 4. Complete the upload.
@@ -113,7 +113,7 @@ final class MultipartUploadTest extends S3FunctionalTestCase
             'Key' => $key,
         ]);
 
-        $expectedBody = $part1Data.$part2Data.$part3Data;
+        $expectedBody = $part1Data . $part2Data . $part3Data;
         $this->assertSame($expectedBody, (string) $get['Body']);
         $this->assertSame(strlen($expectedBody), $get['ContentLength']);
     }
@@ -185,7 +185,7 @@ final class MultipartUploadTest extends S3FunctionalTestCase
         $this->assertSame(200, $list['@metadata']['statusCode']);
         $this->assertGreaterThanOrEqual(2, count($list['Uploads'] ?? []));
 
-        $keys = array_map(fn ($u) => $u['Key'], $list['Uploads']);
+        $keys = array_map(fn($u) => $u['Key'], $list['Uploads']);
         $this->assertContains($key1, $keys);
         $this->assertContains($key2, $keys);
 

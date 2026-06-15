@@ -23,7 +23,7 @@ final class ObservedMetadataStoreTest extends TestCase
 
     public function test_records_successful_metadata_operations(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
         $metadata = $this->metadata($metrics, slowThresholdNs: 0);
 
         $metadata->initialize();
@@ -41,7 +41,7 @@ final class ObservedMetadataStoreTest extends TestCase
 
     public function test_records_failed_metadata_operations_and_rethrows(): void
     {
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
         $metadata = $this->metadata($metrics);
 
         $metadata->initialize();
@@ -53,7 +53,7 @@ final class ObservedMetadataStoreTest extends TestCase
             $metadata->createBucket('owner', 'observed-metadata-failure', 'us-east-1');
         } finally {
             self::assertStringContainsString(
-                's3_server_backend_errors_total{backend="metadata",driver="sqlite",exception="'.str_replace('\\', '\\\\', BucketAlreadyExistsException::class).'",operation="createBucket"} 1',
+                's3_server_backend_errors_total{backend="metadata",driver="sqlite",exception="' . str_replace('\\', '\\\\', BucketAlreadyExistsException::class) . '",operation="createBucket"} 1',
                 $metrics->renderPrometheus(),
             );
         }

@@ -21,7 +21,7 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
     protected function setUp(): void
     {
         $this->dbPath = tempnam(sys_get_temp_dir(), 's3meta_') . '.sqlite';
-        $this->metrics = new MetricsCollector;
+        $this->metrics = new MetricsCollector();
         $this->store = new ParallelSqliteMetadataStore($this->dbPath, 2, $this->metrics);
         $this->store->initialize();
     }
@@ -114,7 +114,13 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
     {
         $this->store->createBucket('owner1', 'test-bucket', 'us-east-1');
         $this->store->putObjectMetadata(
-            'test-bucket', 'key1', 'owner1', 100, '"abc"', 'text/plain', '/data/key1',
+            'test-bucket',
+            'key1',
+            'owner1',
+            100,
+            '"abc"',
+            'text/plain',
+            '/data/key1',
         );
 
         $this->expectException(\Throwable::class);
@@ -127,7 +133,13 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
         $this->assertSame(0, $this->store->countObjects('test-bucket'));
 
         $this->store->putObjectMetadata(
-            'test-bucket', 'key1', 'owner1', 100, '"abc"', 'text/plain', '/data/key1',
+            'test-bucket',
+            'key1',
+            'owner1',
+            100,
+            '"abc"',
+            'text/plain',
+            '/data/key1',
         );
         $this->assertSame(1, $this->store->countObjects('test-bucket'));
     }
@@ -140,7 +152,13 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
         $fiber = new \Fiber(function () {
             $this->store->transaction(function () {
                 $this->store->putObjectMetadata(
-                    'tx-bucket', 'tx-key', 'owner1', 50, '"tx"', 'text/plain', '/tx',
+                    'tx-bucket',
+                    'tx-key',
+                    'owner1',
+                    50,
+                    '"tx"',
+                    'text/plain',
+                    '/tx',
                 );
             });
         });
@@ -158,7 +176,13 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
             try {
                 $this->store->transaction(function () {
                     $this->store->putObjectMetadata(
-                        'tx-bucket', 'rollback-key', 'owner1', 50, '"rb"', 'text/plain', '/rb',
+                        'tx-bucket',
+                        'rollback-key',
+                        'owner1',
+                        50,
+                        '"rb"',
+                        'text/plain',
+                        '/rb',
                     );
                     throw new \RuntimeException('Force rollback');
                 });

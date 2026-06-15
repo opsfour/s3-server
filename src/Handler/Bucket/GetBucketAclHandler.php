@@ -33,7 +33,7 @@ final class GetBucketAclHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         $grants = $this->metadata->getAcl('bucket', $bucket);

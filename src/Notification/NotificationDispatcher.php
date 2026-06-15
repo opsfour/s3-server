@@ -34,7 +34,7 @@ final class NotificationDispatcher
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly LoggerInterface $logger = new NullLogger,
+        private readonly LoggerInterface $logger = new NullLogger(),
         private readonly string $region = 'us-east-1',
         private readonly int $maxConcurrentListeners = 100,
         private readonly int $maxQueuedListenerTasks = 10_000,
@@ -141,7 +141,7 @@ final class NotificationDispatcher
                 continue;
             }
 
-            if (!$this->keyMatchesFilters($event->key, $config['filterRules'] ?? [])) {
+            if (!$this->keyMatchesFilters($event->key, array_values($config['filterRules'] ?? []))) {
                 continue;
             }
 
@@ -155,7 +155,7 @@ final class NotificationDispatcher
                     'bucket' => $event->bucket,
                     'key' => $event->key,
                     'event_name' => $event->name,
-                    'destination_type' => $config['destinationType'] ?? null,
+                    'destination_type' => $config['destinationType'],
                 ]);
                 $this->metrics?->recordNotificationEvent('webhook_destination', 'skipped');
                 continue;

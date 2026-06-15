@@ -37,12 +37,12 @@ final class PutObjectTaggingHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Verify the object exists.
         if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException;
+            throw new NoSuchKeyException();
         }
 
         // Parse the XML body.
@@ -51,7 +51,7 @@ final class PutObjectTaggingHandler implements RequestHandler
 
         if (count($tags) > self::MAX_OBJECT_TAGS) {
             throw new InvalidArgumentException(
-                'Object tags cannot be greater than '.self::MAX_OBJECT_TAGS,
+                'Object tags cannot be greater than ' . self::MAX_OBJECT_TAGS,
             );
         }
 

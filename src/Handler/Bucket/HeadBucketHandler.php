@@ -35,7 +35,7 @@ final class HeadBucketHandler implements RequestHandler
         $bucketInfo = $this->metadata->getBucket($bucket);
 
         if ($bucketInfo === null) {
-            throw new NoSuchBucketException;
+            throw new NoSuchBucketException();
         }
 
         // Compute object stats for RGW-compatible extended headers.

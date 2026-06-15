@@ -26,7 +26,7 @@ interface CredentialProvider
     /**
      * List all credentials in the store.
      *
-     * @return array<Credential> All stored credentials.
+     * @return list<Credential> All stored credentials.
      */
     public function listCredentials(): array;
 

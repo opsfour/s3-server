@@ -63,7 +63,7 @@ final class ParallelEncryptionServiceTest extends TestCase
     public function test_large_payload_offloaded_sse_s3(): void
     {
         $provider = new ConfigMasterKeyProvider($this->masterKeyB64);
-        $metrics = new MetricsCollector;
+        $metrics = new MetricsCollector();
         // Threshold of 64 bytes — anything larger goes to worker.
         $service = new ParallelEncryptionService($provider, 2, 64, $metrics);
 

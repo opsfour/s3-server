@@ -198,7 +198,7 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
         ]);
 
         $this->assertSame(200, $list['@metadata']['statusCode']);
-        $keys = array_map(fn ($u) => $u['Key'], $list['Uploads'] ?? []);
+        $keys = array_map(fn($u) => $u['Key'], $list['Uploads'] ?? []);
         $this->assertContains($key1, $keys);
         $this->assertContains($key2, $keys);
         $this->assertNotContains($key3, $keys);

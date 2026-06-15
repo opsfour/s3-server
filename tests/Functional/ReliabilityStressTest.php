@@ -293,7 +293,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $allowedGrowth = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_RSS_GROWTH_BYTES', 256 * 1024 * 1024);
 
         $rssBefore = self::serverRssBytes();
-        $tmpBefore = self::countFiles(self::$storagePath.'/.tmp');
+        $tmpBefore = self::countFiles(self::$storagePath . '/.tmp');
         $deadline = microtime(true) + $durationSeconds;
         $iteration = 0;
 
@@ -304,7 +304,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             $deleteObjects = [];
 
             for ($i = 0; $i < $batchSize; $i++) {
-                $key = $prefix.$i.'.bin';
+                $key = $prefix . $i . '.bin';
                 $putCommands[] = self::$s3->getCommand('PutObject', [
                     'Bucket' => self::$bucket,
                     'Key' => $key,
@@ -329,7 +329,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             ]);
         }
 
-        $tmpAfter = self::countFiles(self::$storagePath.'/.tmp');
+        $tmpAfter = self::countFiles(self::$storagePath . '/.tmp');
         $this->assertLessThanOrEqual($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
 
         $rssAfter = self::serverRssBytes();

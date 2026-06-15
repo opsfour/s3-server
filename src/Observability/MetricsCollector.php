@@ -274,138 +274,138 @@ final class MetricsCollector
             's3_server_up 1',
             '# HELP s3_server_started_at_seconds Unix timestamp when this S3 server instance started.',
             '# TYPE s3_server_started_at_seconds gauge',
-            's3_server_started_at_seconds '.$this->startedAt,
+            's3_server_started_at_seconds ' . $this->startedAt,
             '# HELP s3_server_requests_total Total S3 HTTP requests by method, operation, and status.',
             '# TYPE s3_server_requests_total counter',
         ];
 
         foreach ($this->requestTotals as $key => $value) {
-            $lines[] = 's3_server_requests_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_requests_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_request_duration_seconds Request duration histogram by method, operation, and status.';
         $lines[] = '# TYPE s3_server_request_duration_seconds histogram';
         foreach ($this->requestDurationBuckets as $key => $value) {
-            $lines[] = 's3_server_request_duration_seconds_bucket{'.$key.'} '.$value;
+            $lines[] = 's3_server_request_duration_seconds_bucket{' . $key . '} ' . $value;
         }
         foreach ($this->requestDurationNs as $key => $value) {
-            $lines[] = 's3_server_request_duration_seconds_sum{'.$key.'} '.self::formatFloat($value / 1_000_000_000);
+            $lines[] = 's3_server_request_duration_seconds_sum{' . $key . '} ' . self::formatFloat($value / 1_000_000_000);
         }
         foreach ($this->requestTotals as $key => $value) {
-            $lines[] = 's3_server_request_duration_seconds_count{'.$key.'} '.$value;
+            $lines[] = 's3_server_request_duration_seconds_count{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_backend_operations_total Total backend operations by backend type, driver, and operation.';
         $lines[] = '# TYPE s3_server_backend_operations_total counter';
         foreach ($this->backendOperationTotals as $key => $value) {
-            $lines[] = 's3_server_backend_operations_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_backend_operations_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_backend_operation_duration_seconds_sum Total backend operation duration seconds by backend type, driver, and operation.';
         $lines[] = '# TYPE s3_server_backend_operation_duration_seconds_sum counter';
         foreach ($this->backendOperationDurationNs as $key => $value) {
-            $lines[] = 's3_server_backend_operation_duration_seconds_sum{'.$key.'} '.self::formatFloat($value / 1_000_000_000);
+            $lines[] = 's3_server_backend_operation_duration_seconds_sum{' . $key . '} ' . self::formatFloat($value / 1_000_000_000);
         }
 
         $lines[] = '# HELP s3_server_backend_operation_duration_seconds_count Backend operation duration sample count by backend type, driver, and operation.';
         $lines[] = '# TYPE s3_server_backend_operation_duration_seconds_count counter';
         foreach ($this->backendOperationTotals as $key => $value) {
-            $lines[] = 's3_server_backend_operation_duration_seconds_count{'.$key.'} '.$value;
+            $lines[] = 's3_server_backend_operation_duration_seconds_count{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_backend_errors_total Total backend operation failures by backend type, driver, operation, and exception.';
         $lines[] = '# TYPE s3_server_backend_errors_total counter';
         foreach ($this->backendErrorTotals as $key => $value) {
-            $lines[] = 's3_server_backend_errors_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_backend_errors_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_backend_slow_operations_total Total backend operations exceeding the configured slow-operation threshold.';
         $lines[] = '# TYPE s3_server_backend_slow_operations_total counter';
         foreach ($this->backendSlowOperationTotals as $key => $value) {
-            $lines[] = 's3_server_backend_slow_operations_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_backend_slow_operations_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_lifecycle_running Whether a lifecycle sweep is currently running in this process.';
         $lines[] = '# TYPE s3_server_lifecycle_running gauge';
-        $lines[] = 's3_server_lifecycle_running '.$this->lifecycleRunning;
+        $lines[] = 's3_server_lifecycle_running ' . $this->lifecycleRunning;
 
         $lines[] = '# HELP s3_server_lifecycle_last_success_at_seconds Unix timestamp of the last completed lifecycle sweep.';
         $lines[] = '# TYPE s3_server_lifecycle_last_success_at_seconds gauge';
-        $lines[] = 's3_server_lifecycle_last_success_at_seconds '.($this->lifecycleLastSuccessAt ?? 0);
+        $lines[] = 's3_server_lifecycle_last_success_at_seconds ' . ($this->lifecycleLastSuccessAt ?? 0);
 
         $lines[] = '# HELP s3_server_lifecycle_sweeps_total Total lifecycle sweeps by status.';
         $lines[] = '# TYPE s3_server_lifecycle_sweeps_total counter';
         foreach ($this->lifecycleSweepTotals as $key => $value) {
-            $lines[] = 's3_server_lifecycle_sweeps_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_lifecycle_sweeps_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_lifecycle_sweep_duration_seconds_sum Total lifecycle sweep duration seconds by status.';
         $lines[] = '# TYPE s3_server_lifecycle_sweep_duration_seconds_sum counter';
         foreach ($this->lifecycleSweepDurationNs as $key => $value) {
-            $lines[] = 's3_server_lifecycle_sweep_duration_seconds_sum{'.$key.'} '.self::formatFloat($value / 1_000_000_000);
+            $lines[] = 's3_server_lifecycle_sweep_duration_seconds_sum{' . $key . '} ' . self::formatFloat($value / 1_000_000_000);
         }
 
         $lines[] = '# HELP s3_server_lifecycle_sweep_duration_seconds_count Lifecycle sweep duration sample count by status.';
         $lines[] = '# TYPE s3_server_lifecycle_sweep_duration_seconds_count counter';
         foreach ($this->lifecycleSweepTotals as $key => $value) {
-            $lines[] = 's3_server_lifecycle_sweep_duration_seconds_count{'.$key.'} '.$value;
+            $lines[] = 's3_server_lifecycle_sweep_duration_seconds_count{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_lifecycle_actions_total Total lifecycle actions applied by action type.';
         $lines[] = '# TYPE s3_server_lifecycle_actions_total counter';
         foreach ($this->lifecycleActionTotals as $key => $value) {
-            $lines[] = 's3_server_lifecycle_actions_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_lifecycle_actions_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_tiering_worker_results_total Total physical tiering, restore, and restore-GC worker outcomes.';
         $lines[] = '# TYPE s3_server_tiering_worker_results_total counter';
         foreach ($this->tieringWorkerTotals as $key => $value) {
-            $lines[] = 's3_server_tiering_worker_results_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_tiering_worker_results_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_notification_queue_depth Current notification queue items by status.';
         $lines[] = '# TYPE s3_server_notification_queue_depth gauge';
         foreach ($this->notificationQueueDepth as $key => $value) {
-            $lines[] = 's3_server_notification_queue_depth{'.$key.'} '.$value;
+            $lines[] = 's3_server_notification_queue_depth{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_notification_deliveries_total Total notification delivery outcomes by status.';
         $lines[] = '# TYPE s3_server_notification_deliveries_total counter';
         foreach ($this->notificationDeliveryTotals as $key => $value) {
-            $lines[] = 's3_server_notification_deliveries_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_notification_deliveries_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_notification_events_total Total notification dispatcher and processor events by stage and status.';
         $lines[] = '# TYPE s3_server_notification_events_total counter';
         foreach ($this->notificationEventTotals as $key => $value) {
-            $lines[] = 's3_server_notification_events_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_notification_events_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_worker_pool_configured_workers Configured worker processes by pool.';
         $lines[] = '# TYPE s3_server_worker_pool_configured_workers gauge';
         foreach ($this->workerPoolConfiguredWorkers as $key => $value) {
-            $lines[] = 's3_server_worker_pool_configured_workers{'.$key.'} '.$value;
+            $lines[] = 's3_server_worker_pool_configured_workers{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_worker_pool_tasks_total Total worker pool tasks by pool, operation, and status.';
         $lines[] = '# TYPE s3_server_worker_pool_tasks_total counter';
         foreach ($this->workerPoolTaskTotals as $key => $value) {
-            $lines[] = 's3_server_worker_pool_tasks_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_worker_pool_tasks_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_worker_pool_task_failures_total Total worker pool task failures by pool, operation, and exception.';
         $lines[] = '# TYPE s3_server_worker_pool_task_failures_total counter';
         foreach ($this->workerPoolTaskFailures as $key => $value) {
-            $lines[] = 's3_server_worker_pool_task_failures_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_worker_pool_task_failures_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_worker_pool_shutdown_failures_total Total worker pool shutdown failures by pool and exception.';
         $lines[] = '# TYPE s3_server_worker_pool_shutdown_failures_total counter';
         foreach ($this->workerPoolShutdownFailures as $key => $value) {
-            $lines[] = 's3_server_worker_pool_shutdown_failures_total{'.$key.'} '.$value;
+            $lines[] = 's3_server_worker_pool_shutdown_failures_total{' . $key . '} ' . $value;
         }
 
-        return implode("\n", $lines)."\n";
+        return implode("\n", $lines) . "\n";
     }
 
     /**
@@ -417,7 +417,7 @@ final class MetricsCollector
 
         $pairs = [];
         foreach ($labels as $name => $value) {
-            $pairs[] = $name.'="'.self::escapeLabelValue($value).'"';
+            $pairs[] = $name . '="' . self::escapeLabelValue($value) . '"';
         }
 
         return implode(',', $pairs);

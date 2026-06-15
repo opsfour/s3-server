@@ -7,7 +7,6 @@ namespace OpsFour\S3Server\Tests\Functional;
 use Aws\S3\Exception\S3Exception;
 use GuzzleHttp\Client;
 
-
 /**
  * Functional tests for presigned URL edge cases and error conditions.
  *

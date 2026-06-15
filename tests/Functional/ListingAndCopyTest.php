@@ -75,7 +75,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
 
         $this->assertSame(3, $result['KeyCount']);
 
-        $keys = array_map(fn ($c) => $c['Key'], $result['Contents']);
+        $keys = array_map(fn($c) => $c['Key'], $result['Contents']);
         sort($keys);
         $this->assertSame(['dir1/file3.txt', 'dir1/file4.txt', 'dir1/sub/file5.txt'], $keys);
     }
@@ -88,12 +88,12 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         ]);
 
         // Top-level files: file1.txt, file2.txt
-        $keys = array_map(fn ($c) => $c['Key'], $result['Contents'] ?? []);
+        $keys = array_map(fn($c) => $c['Key'], $result['Contents'] ?? []);
         sort($keys);
         $this->assertSame(['file1.txt', 'file2.txt'], $keys);
 
         // Common prefixes: dir1/, dir2/, photos/
-        $prefixes = array_map(fn ($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
+        $prefixes = array_map(fn($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
         sort($prefixes);
         $this->assertSame(['dir1/', 'dir2/', 'photos/'], $prefixes);
     }
@@ -110,7 +110,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $this->assertEmpty($result['Contents'] ?? []);
 
         // Common prefixes: photos/2024/, photos/2025/
-        $prefixes = array_map(fn ($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
+        $prefixes = array_map(fn($p) => $p['Prefix'], $result['CommonPrefixes'] ?? []);
         sort($prefixes);
         $this->assertSame(['photos/2024/', 'photos/2025/'], $prefixes);
     }
@@ -136,8 +136,8 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $this->assertSame(3, $result2['KeyCount']);
 
         // Keys from page 1 and page 2 should not overlap.
-        $keys1 = array_map(fn ($c) => $c['Key'], $result1['Contents']);
-        $keys2 = array_map(fn ($c) => $c['Key'], $result2['Contents']);
+        $keys1 = array_map(fn($c) => $c['Key'], $result1['Contents']);
+        $keys2 = array_map(fn($c) => $c['Key'], $result2['Contents']);
         $this->assertEmpty(array_intersect($keys1, $keys2));
 
         // Collect all keys across all pages.
@@ -153,7 +153,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             ]);
             $allKeys = array_merge(
                 $allKeys,
-                array_map(fn ($c) => $c['Key'], $page['Contents'] ?? []),
+                array_map(fn($c) => $c['Key'], $page['Contents'] ?? []),
             );
             $token = $page['NextContinuationToken'] ?? null;
         }
@@ -199,8 +199,8 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $this->assertLessThanOrEqual(5, count($result2['Contents']));
 
         // Ensure no overlap.
-        $keys1 = array_map(fn ($c) => $c['Key'], $result1['Contents']);
-        $keys2 = array_map(fn ($c) => $c['Key'], $result2['Contents']);
+        $keys1 = array_map(fn($c) => $c['Key'], $result1['Contents']);
+        $keys2 = array_map(fn($c) => $c['Key'], $result2['Contents']);
         $this->assertEmpty(array_intersect($keys1, $keys2));
     }
 
@@ -213,12 +213,12 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         // Create objects to delete.
         $keysToDelete = [];
         for ($i = 0; $i < 5; $i++) {
-            $key = 'batch-delete-'.$i.'.txt';
+            $key = 'batch-delete-' . $i . '.txt';
             $keysToDelete[] = $key;
             self::$s3->putObject([
                 'Bucket' => self::$bucket,
                 'Key' => $key,
-                'Body' => 'delete me '.$i,
+                'Body' => 'delete me ' . $i,
             ]);
         }
 
@@ -226,14 +226,14 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $result = self::$s3->deleteObjects([
             'Bucket' => self::$bucket,
             'Delete' => [
-                'Objects' => array_map(fn ($k) => ['Key' => $k], $keysToDelete),
+                'Objects' => array_map(fn($k) => ['Key' => $k], $keysToDelete),
             ],
         ]);
 
         $this->assertSame(200, $result['@metadata']['statusCode']);
         $this->assertCount(5, $result['Deleted']);
 
-        $deletedKeys = array_map(fn ($d) => $d['Key'], $result['Deleted']);
+        $deletedKeys = array_map(fn($d) => $d['Key'], $result['Deleted']);
         sort($deletedKeys);
         sort($keysToDelete);
         $this->assertSame($keysToDelete, $deletedKeys);
@@ -281,8 +281,8 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             'Bucket' => self::$bucket,
             'Delete' => [
                 'Objects' => [
-                    ['Key' => 'nonexistent-1-'.uniqid()],
-                    ['Key' => 'nonexistent-2-'.uniqid()],
+                    ['Key' => 'nonexistent-1-' . uniqid()],
+                    ['Key' => 'nonexistent-2-' . uniqid()],
                 ],
             ],
         ]);
@@ -302,7 +302,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $result = self::$s3->copyObject([
             'Bucket' => self::$bucket,
             'Key' => 'file1-copy.txt',
-            'CopySource' => self::$bucket.'/file1.txt',
+            'CopySource' => self::$bucket . '/file1.txt',
         ]);
 
         $this->assertSame(200, $result['@metadata']['statusCode']);
@@ -324,7 +324,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $result = self::$s3->copyObject([
             'Bucket' => $dstBucket,
             'Key' => 'copied-file.txt',
-            'CopySource' => self::$bucket.'/dir1/file3.txt',
+            'CopySource' => self::$bucket . '/dir1/file3.txt',
         ]);
 
         $this->assertSame(200, $result['@metadata']['statusCode']);
@@ -346,7 +346,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $result = self::$s3->copyObject([
             'Bucket' => self::$bucket,
             'Key' => 'file1-replace.txt',
-            'CopySource' => self::$bucket.'/file1.txt',
+            'CopySource' => self::$bucket . '/file1.txt',
             'MetadataDirective' => 'REPLACE',
             'ContentType' => 'text/html',
             'Metadata' => [
@@ -382,7 +382,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         self::$s3->copyObject([
             'Bucket' => self::$bucket,
             'Key' => 'meta-copy.txt',
-            'CopySource' => self::$bucket.'/meta-source.txt',
+            'CopySource' => self::$bucket . '/meta-source.txt',
         ]);
 
         $headResult = self::$s3->headObject([
