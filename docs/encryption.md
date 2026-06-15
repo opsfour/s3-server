@@ -133,6 +133,23 @@ S3_VAULT_PATH=secret/data/s3-server/master-key
 
 Multi-key: store a `keys` field in the Vault secret containing a JSON map `{"keyId": "base64Key", ...}`.
 
+### Symfony Key Services
+
+Symfony applications can keep the built-in encryption service and provide a
+custom `MasterKeyProvider` service:
+
+```yaml
+services:
+  App\S3\Encryption\SymfonyVaultMasterKeyProvider: ~
+
+opsfour_s3_server:
+  encryption:
+    master_key_provider_service: 'App\S3\Encryption\SymfonyVaultMasterKeyProvider'
+```
+
+They can also replace the complete encryption service with
+`encryption.service`. See [Symfony Integration](symfony-integration.md#encryption-services).
+
 ## SSE-C (Customer-Provided Keys)
 
 The client provides the encryption key with each request. The server never stores the key.

@@ -106,6 +106,26 @@ The adapters return `sent`, `retryable_failure`, or `dead_letter` results to the
 listener bridge. Transport-specific retry, buffering, acknowledgements, and
 broker setup stay inside the injected producer/client.
 
+### Symfony Listeners
+
+Symfony applications can reference listener services directly from
+`opsfour_s3_server.notifications.listeners`:
+
+```yaml
+services:
+  App\S3\AuditS3EventListener: ~
+
+opsfour_s3_server:
+  notifications:
+    listeners:
+      - event: 's3:ObjectCreated:*'
+        service: 'App\S3\AuditS3EventListener'
+```
+
+The bundle can also bridge matching events into Symfony's EventDispatcher with
+`notifications.symfony_event_dispatcher`. See
+[Symfony Integration](symfony-integration.md#symfony-event-listeners).
+
 ## Delivery Guarantees
 
 ### Persistent Queue

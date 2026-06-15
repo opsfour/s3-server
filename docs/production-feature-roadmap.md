@@ -41,7 +41,7 @@ Supported production-grade scope for this roadmap:
 
 ### 1. Metrics and Health for 24/7 Operation
 
-Status: In progress.
+Status: Implemented.
 
 Need:
 
@@ -63,7 +63,7 @@ Acceptance:
 
 ### 2. Quotas
 
-Status: In progress.
+Status: Implemented.
 
 Need:
 

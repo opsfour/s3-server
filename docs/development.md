@@ -88,7 +88,7 @@ src/
 ├── Event/                # Event objects
 ├── Exception/            # S3Exception hierarchy (maps to HTTP status codes)
 ├── Factory/              # MetadataStore, Storage, Credential factories
-├── Handler/              # 65 S3 operation handlers
+├── Handler/              # 66 S3 operation handlers
 ├── Http/                 # HTTP utilities
 ├── Laravel/              # Service provider, Artisan command
 ├── Lifecycle/            # Lifecycle rule evaluation and execution
@@ -102,6 +102,8 @@ src/
 ├── Routing/              # Router, S3 operation resolver, handler registry
 ├── Select/               # S3 Select SQL parser, evaluator, CSV/JSON processors
 ├── Storage/              # Filesystem, Flysystem, in-memory backends
+├── Symfony/              # Bundle, DI extension, console commands, service adapters
+├── Runtime/              # Shared runtime factory used by standalone, Laravel, Symfony
 ├── Xml/                  # XML request parsing and response building
 ├── S3Server.php          # Main server class
 └── S3ServerConfig.php    # Configuration DTO with validation
@@ -191,5 +193,5 @@ vendor/bin/phpstan analyse
 ## Current Test Baseline
 
 ```
-330 tests, 854 assertions, 0 failures, 0 deprecations
+538 tests, 2259 assertions, 5 skipped, 0 failures
 ```

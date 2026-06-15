@@ -46,6 +46,30 @@ $storage = StorageBackendFactory::create('flysystem', [
 ]);
 ```
 
+### Framework Configuration
+
+Laravel users can bind a configured `League\Flysystem\FilesystemOperator` and
+pass it through the package config. Symfony users can register the filesystem as
+a service and reference it with `filesystem_service`:
+
+```yaml
+opsfour_s3_server:
+  storage:
+    driver: flysystem
+    filesystem_service: 'app.s3_backing_filesystem'
+    temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
+```
+
+The same service-reference pattern works inside `storage.tiers` for hot/cold
+physical tiering.
+
+### Temporary Local Files
+
+Remote Flysystem backends are the durable object store. The server may still use
+local temp files or temp streams for multipart assembly, copy/restore bridges,
+and streaming transformations. Configure `temp_dir` on Flysystem backends and
+tiers for deployments where `/tmp` is small or ephemeral.
+
 ### Use Cases
 
 - **S3 → S3 proxy**: Front an existing S3 bucket with custom auth, rate limiting, or policies
@@ -75,3 +99,27 @@ S3_STORAGE_DRIVER=memory
 | Memory | None | Fastest | No | Testing only |
 
 For production single-node deployments, use `filesystem`. For multi-node or cloud-native deployments, use `flysystem` with a shared storage adapter.
+
+## Physical Storage Tiers
+
+Lifecycle transitions and `RestoreObject` can move object data between named
+storage tiers. Each tier has its own backend and optional `restore_required`
+flag:
+
+```yaml
+opsfour_s3_server:
+  storage:
+    tiers:
+      STANDARD:
+        driver: flysystem
+        filesystem_service: 'app.hot_filesystem'
+        default: true
+
+      GLACIER:
+        driver: flysystem
+        filesystem_service: 'app.cold_filesystem'
+        restore_required: true
+```
+
+Reads from restore-required tiers return `InvalidObjectState` until a temporary
+hot copy exists through the restore workflow.

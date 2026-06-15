@@ -25,7 +25,11 @@
     "require-dev": {
         "phpunit/phpunit": "^11.5",
         "aws/aws-sdk-php": "^3.300",
-        "guzzlehttp/guzzle": "^7.0"
+        "guzzlehttp/guzzle": "^7.0",
+        "symfony/dependency-injection": "^7.0",
+        "symfony/config": "^7.0",
+        "symfony/http-kernel": "^7.0",
+        "league/flysystem-aws-s3-v3": "^3.0"
     },
     "autoload": {
         "psr-4": {
@@ -39,6 +43,9 @@
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
+    "suggest": {
+        "symfony/http-kernel": "Required when using OpsFour S3 Server as a Symfony Bundle."
+    },
     "extra": {
         "laravel": {
             "providers": [

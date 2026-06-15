@@ -83,6 +83,22 @@ Start the server:
 php artisan s3:serve
 ```
 
+## Symfony Installation
+
+```bash
+composer require opsfour/s3-server
+```
+
+Register `OpsFour\S3Server\Symfony\S3ServerBundle` in `config/bundles.php`,
+configure `config/packages/opsfour_s3_server.yaml`, and start the server:
+
+```bash
+php bin/console opsfour:s3:serve
+```
+
+See [Symfony Integration](symfony-integration.md) for configuration, commands,
+and production examples.
+
 ## Programmatic Usage
 
 Embed the S3 server in your own PHP application:

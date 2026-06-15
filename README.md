@@ -4,18 +4,20 @@ A production-grade, fully S3-compatible object storage server built as a PHP 8.4
 
 ## Features
 
-- **Full S3 API compatibility** — 65 operations including multipart uploads, versioning, object lock, lifecycle rules, S3 Select, and website hosting
+- **Full S3 API compatibility** — 66 S3 operations including multipart uploads, versioning, object lock, lifecycle rules, S3 Select, restore, and website hosting
 - **AWS SDK compatible** — Works with any S3 client (AWS CLI, aws-sdk-php, boto3, MinIO client, etc.)
 - **Multiple metadata backends** — SQLite (single-node), PostgreSQL or MySQL (multi-node HA)
 - **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory
 - **Server-side encryption** — SSE-S3 with key rotation support, SSE-C (customer-provided keys), AES-256-GCM
 - **Authentication** — AWS Signature V4, presigned URLs, chunked streaming signatures
 - **Multi-tenant** — Owner ID scopes all operations; multiple credential providers (memory, database, file, chain)
+- **Framework integrations** — Standalone CLI, Laravel service provider, and Symfony Bundle
+- **Quotas and tiering** — Per-owner and per-bucket quotas, physical storage tiers, cold-tier restore workflow
 - **Event notifications** — Persistent queue with retry, exponential backoff, dead-letter, and SSRF protection
 - **S3 Select** — SQL queries over CSV, JSON, and Parquet objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Production hardened** — 330 tests, 854 assertions, 9 review rounds, security audit complete
+- **Production hardened** — 500+ PHPUnit tests covering AWS SDK flows, large objects, concurrency, metadata backends, remote storage, and reliability profiles
 
 ## Requirements
 
@@ -53,6 +55,16 @@ S3_SECRET_KEY=mySecretKey
 php artisan s3:serve
 ```
 
+### Symfony
+
+```bash
+composer require opsfour/s3-server
+
+# Register OpsFour\S3Server\Symfony\S3ServerBundle in config/bundles.php
+# Configure config/packages/opsfour_s3_server.yaml
+php bin/console opsfour:s3:serve
+```
+
 ### Connect with AWS CLI
 
 ```bash
@@ -71,18 +83,22 @@ Full documentation is in the [docs/](docs/) directory:
 | Guide | Description |
 |-------|-------------|
 | [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
-| [Installation](docs/installation.md) | Standalone and Laravel installation |
+| [Installation](docs/installation.md) | Standalone, Laravel, and Symfony installation |
 | [Configuration](docs/configuration.md) | All environment variables and options |
 | [Laravel Integration](docs/laravel-integration.md) | Service provider, Artisan commands, config |
+| [Symfony Integration](docs/symfony-integration.md) | Bundle registration, console commands, services, config |
 | [Authentication](docs/authentication.md) | SigV4, presigned URLs, credential providers |
 | [Storage Backends](docs/storage-backends.md) | Filesystem, Flysystem, in-memory |
 | [Metadata Backends](docs/metadata-backends.md) | SQLite, PostgreSQL, MySQL |
 | [Encryption](docs/encryption.md) | SSE-S3 key rotation, SSE-C, configuration |
-| [API Operations](docs/api-operations.md) | All 65 supported S3 operations |
+| [API Operations](docs/api-operations.md) | All 66 supported S3 operations |
 | [Versioning & Object Lock](docs/versioning.md) | Bucket versioning, retention, legal holds |
 | [Notifications](docs/notifications.md) | Event notifications and webhook delivery |
 | [Lifecycle Rules](docs/lifecycle.md) | Object expiration and cleanup |
 | [S3 Select](docs/s3-select.md) | SQL queries over stored objects |
+| [Policy Compatibility](docs/policy-compatibility.md) | Supported IAM-style actions and condition keys |
+| [Production Feature Roadmap](docs/production-feature-roadmap.md) | Implemented production features and deferred AWS scope |
+| [Release Checklist](docs/release-checklist.md) | Production readiness checks before tagging |
 | [Production Deployment](docs/deployment.md) | TLS, scaling, monitoring, backups |
 | [Architecture](docs/architecture.md) | Internals, middleware stack, design decisions |
 | [Development](docs/development.md) | Running tests, contributing, extending |

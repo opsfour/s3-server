@@ -3,12 +3,14 @@
 ## Getting Started
 
 - [Quick Start](quickstart.md) — Get a working S3 server in 5 minutes
-- [Installation](installation.md) — Standalone and Laravel installation guides
+- [Installation](installation.md) — Standalone, Laravel, and Symfony installation guides
 
 ## Configuration
 
 - [Configuration Reference](configuration.md) — All environment variables, defaults, and validation rules
 - [Laravel Integration](laravel-integration.md) — Service provider, Artisan commands, publishing config
+- [Symfony Integration](symfony-integration.md) — Bundle registration, console commands, config, and production setup
+- [Symfony Integration Plan](symfony-integration-plan.md) — Completed Symfony Bundle checklist and optional follow-ups
 
 ## Core Concepts
 
@@ -19,7 +21,7 @@
 
 ## S3 API
 
-- [API Operations](api-operations.md) — All 65 supported S3 operations
+- [API Operations](api-operations.md) — All 66 supported S3 operations
 - [Versioning & Object Lock](versioning.md) — Bucket versioning, retention, legal holds
 - [Notifications](notifications.md) — Event notifications and webhook delivery
 - [Lifecycle Rules](lifecycle.md) — Object expiration and automated cleanup
@@ -30,5 +32,6 @@
 ## Operations
 
 - [Production Deployment](deployment.md) — TLS, scaling, monitoring, health checks, backups
+- [Release Checklist](release-checklist.md) — Production readiness checks before tagging
 - [Architecture](architecture.md) — Internals, middleware stack, async design
 - [Development](development.md) — Running tests, extending handlers, contributing

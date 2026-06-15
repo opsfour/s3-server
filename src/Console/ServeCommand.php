@@ -9,18 +9,14 @@ use Amp\Log\ConsoleFormatter;
 use Amp\Log\StreamHandler;
 use Monolog\Logger;
 use Monolog\Processor\PsrLogMessageProcessor;
-use OpsFour\S3Server\Admin\AdminQuotaApiHandler;
-use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
-use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
-use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Quota\QuotaConfig;
-use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -147,64 +143,23 @@ final class ServeCommand extends Command
             return Command::FAILURE;
         }
 
-        // Create and configure the server.
-        $server = new S3Server(
-            config: $config,
-            metadata: $metadata,
-            storage: $storage,
-            logger: $logger,
-            metrics: $metrics,
-        );
-        $server->setStorageTierRegistry($storageTierRegistry);
-
-        $server->addMiddleware(new AuthMiddleware(
-            credentialProvider: $credentialProvider,
-            region: $region,
-        ));
-
         try {
-            $adminCredentialApi = AdminCredentialApiFactory::create($this->externalIamConfigFromEnv(), $credentialProvider);
+            $runtime = (new S3ServerRuntimeFactory)->create(
+                config: $config,
+                metadata: $metadata,
+                storage: $storage,
+                credentialProvider: $credentialProvider,
+                logger: $logger,
+                metrics: $metrics,
+                storageTiers: $storageTierRegistry,
+                externalIamConfig: $this->externalIamConfigFromEnv(),
+                adminToken: $this->adminApiTokenFromEnv(),
+            );
         } catch (\InvalidArgumentException $e) {
             $output->writeln("<error>Error: {$e->getMessage()}</error>");
 
             return Command::FAILURE;
         }
-
-        if ($adminCredentialApi !== null) {
-            $server->setAdminCredentialApiHandler($adminCredentialApi);
-        }
-
-        $adminToken = $this->adminApiTokenFromEnv();
-        if ($adminToken !== null) {
-            $server->setAdminQuotaApiHandler(new AdminQuotaApiHandler($metadata, $adminToken));
-        }
-
-        // Build encryption service if master key is configured.
-        $encryption = null;
-        $masterKeyEnv = getenv('S3_ENCRYPTION_MASTER_KEY');
-        $masterKeysEnv = getenv('S3_ENCRYPTION_MASTER_KEYS');
-        if (($masterKeyEnv !== false && $masterKeyEnv !== '') || ($masterKeysEnv !== false && $masterKeysEnv !== '')) {
-            $masterKeyProvider = new \OpsFour\S3Server\Encryption\ConfigMasterKeyProvider(
-                $masterKeyEnv !== false && $masterKeyEnv !== '' ? $masterKeyEnv : null,
-            );
-            $encryption = new \OpsFour\S3Server\Encryption\EncryptionService($masterKeyProvider);
-        }
-
-        // Build notification dispatcher.
-        $notifications = new \OpsFour\S3Server\Notification\NotificationDispatcher($metadata, $logger, $region, metrics: $metrics);
-        $server->setNotificationDispatcher($notifications);
-
-        HandlerRegistrar::registerAll(
-            $server->getHandlerRegistry(),
-            $metadata,
-            $storage,
-            $config,
-            $encryption,
-            $notifications,
-            credentialProvider: $credentialProvider,
-            metrics: $metrics,
-            storageTiers: $storageTierRegistry,
-        );
 
         $logger->info('OpsFour S3 Server starting', [
             'storage' => "{$storageDriver}".($storagePath ? ":{$storagePath}" : ''),
@@ -212,7 +167,7 @@ final class ServeCommand extends Command
             'metadata' => $metadataDriver,
         ]);
 
-        $server->start();
+        $runtime->server->start();
 
         // Wait for termination signal.
         $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
@@ -221,7 +176,7 @@ final class ServeCommand extends Command
             'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
         ]);
 
-        $server->stop();
+        $runtime->stop();
 
         $logger->info('Server stopped gracefully.');
 

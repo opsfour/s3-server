@@ -1,6 +1,10 @@
 # Configuration Reference
 
-All settings can be configured via environment variables. In Laravel, they map to `config/s3-server.php`.
+Portable runtime settings can be configured via environment variables. In
+Laravel, they map to `config/s3-server.php`. In Symfony, they can be mirrored in
+`config/packages/opsfour_s3_server.yaml` with `%env(...)%` processors; Symfony
+service references such as Flysystem filesystems, event listeners, and custom
+encryption services are configured in YAML rather than environment variables.
 
 ## Network
 
@@ -31,6 +35,8 @@ When both are set, the server listens on HTTPS. Required for presigned URLs in p
 | `S3_STORAGE_PATH` | - | Root directory for object data (required for `filesystem`) |
 
 See [Storage Backends](storage-backends.md) for driver-specific configuration.
+Physical storage tiers are configured as arrays in Laravel config or Symfony
+YAML, because each tier needs a named backend and optional service references.
 
 ## Metadata
 
@@ -65,6 +71,44 @@ S3_METADATA_DSN="host=localhost;port=3306;dbname=s3server;user=s3;password=secre
 | `S3_CREDENTIALS_PATH` | - | JSON file path (file driver) |
 
 See [Authentication](authentication.md) for multi-user setup.
+
+## Admin APIs and External IAM
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_ADMIN_API_TOKEN` | - | Bearer token for protected quota runtime APIs under `/.admin/quotas` |
+| `S3_EXTERNAL_IAM_ENABLED` | `false` | Enable external OIDC/JWT credential issuing API |
+| `S3_EXTERNAL_IAM_ADMIN_TOKEN` | - | Bearer token for external credential issuing API; also used as quota admin fallback when `S3_ADMIN_API_TOKEN` is unset |
+| `S3_EXTERNAL_IAM_ISSUER` | - | Expected JWT issuer |
+| `S3_EXTERNAL_IAM_AUDIENCE` | - | Expected JWT audience |
+| `S3_EXTERNAL_IAM_JWKS_PATH` | - | Local JWKS file used to verify RS256 JWTs |
+| `S3_EXTERNAL_IAM_PUBLIC_KEY_PATH` | - | PEM public key file used to verify RS256 JWTs |
+| `S3_EXTERNAL_IAM_PUBLIC_KEY` | - | Inline PEM public key used to verify RS256 JWTs |
+| `S3_EXTERNAL_IAM_OWNER_CLAIM` | `sub` | JWT claim mapped to S3 owner ID |
+| `S3_EXTERNAL_IAM_DISPLAY_NAME_CLAIM` | `preferred_username` | JWT claim mapped to credential display name |
+| `S3_EXTERNAL_IAM_GROUPS_CLAIM` | `groups` | JWT groups claim |
+| `S3_EXTERNAL_IAM_POLICY_NAMES_CLAIM` | - | JWT claim listing policy names to attach |
+| `S3_EXTERNAL_IAM_ALLOWED_PREFIXES_CLAIM` | - | JWT claim listing allowed object prefixes |
+| `S3_EXTERNAL_IAM_OWNER_PREFIX` | - | Prefix prepended to mapped owner IDs |
+| `S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS` | `60` | Allowed JWT clock skew |
+
+See [Authentication](authentication.md) for credential provider setup, runtime
+quota admin APIs, and external IAM/OIDC examples.
+
+## Quotas
+
+Quota values are hard limits enforced before metadata commits. Set a value to
+`0` to disable that limit.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_QUOTA_MAX_BUCKETS_PER_OWNER` | `0` | Maximum buckets per owner/account |
+| `S3_QUOTA_MAX_OBJECTS_PER_BUCKET` | `0` | Maximum current objects per bucket |
+| `S3_QUOTA_MAX_BYTES_PER_BUCKET` | `0` | Maximum current object bytes per bucket |
+| `S3_QUOTA_MAX_BYTES_PER_OWNER` | `0` | Maximum current object bytes across all buckets for one owner/account |
+
+Per-account overrides are stored in metadata and can be managed through the
+admin API, Laravel Artisan command, or Symfony console command.
 
 ## Encryption
 
@@ -117,6 +161,23 @@ Rate limit state is persisted in the metadata database and survives server resta
 | `S3_WRITE_TIMEOUT` | `300` | Write timeout (seconds) |
 | `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Graceful shutdown drain time (seconds) |
 
+## Lifecycle Processing
+
+The lifecycle runner is wired into the runtime for standalone, Laravel, and
+Symfony entry points. Work is bounded per sweep so large buckets are cleaned or
+transitioned incrementally.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_LIFECYCLE_INTERVAL_SECONDS` | `60` | Seconds between lifecycle sweeps |
+| `S3_LIFECYCLE_BATCH_SIZE` | `1000` | Maximum rows fetched per lifecycle query |
+| `S3_LIFECYCLE_MAX_ACTIONS_PER_RUN` | `1000` | Maximum destructive or mutating actions per sweep |
+| `S3_LIFECYCLE_LOCK_TTL_SECONDS` | `300` | Metadata-backed lease TTL for multi-node runners |
+
+Lifecycle rules can expire objects, clean noncurrent versions, abort incomplete
+multipart uploads, and move data between configured physical storage tiers. See
+[Lifecycle Rules](lifecycle.md) and [Storage Backends](storage-backends.md).
+
 ## S3 Select
 
 | Variable | Default | Description |
@@ -158,6 +219,21 @@ S3_METADATA_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=sec
 # Credentials
 S3_CREDENTIALS_DRIVER=database
 S3_CREDENTIALS_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=secret"
+
+# Admin APIs
+S3_ADMIN_API_TOKEN=change-me
+
+# Quotas
+S3_QUOTA_MAX_BUCKETS_PER_OWNER=0
+S3_QUOTA_MAX_OBJECTS_PER_BUCKET=0
+S3_QUOTA_MAX_BYTES_PER_BUCKET=0
+S3_QUOTA_MAX_BYTES_PER_OWNER=0
+
+# Lifecycle
+S3_LIFECYCLE_INTERVAL_SECONDS=60
+S3_LIFECYCLE_BATCH_SIZE=1000
+S3_LIFECYCLE_MAX_ACTIONS_PER_RUN=1000
+S3_LIFECYCLE_LOCK_TTL_SECONDS=300
 
 # Encryption
 S3_ENCRYPTION_MASTER_KEYS='{"key-2025":"BASE64_ENCODED_32_BYTE_KEY"}'

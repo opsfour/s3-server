@@ -1,6 +1,6 @@
 # API Operations
 
-OpsFour S3 Server implements 65 S3 API operations. All operations use standard AWS S3 request/response formats and work with any S3-compatible client.
+OpsFour S3 Server implements 66 S3 API operations. All operations use standard AWS S3 request/response formats and work with any S3-compatible client.
 
 ## Bucket Operations
 
@@ -21,6 +21,7 @@ OpsFour S3 Server implements 65 S3 API operations. All operations use standard A
 | HeadObject | `HEAD` | `/{bucket}/{key}` | Get object metadata without body |
 | DeleteObject | `DELETE` | `/{bucket}/{key}` | Delete an object (or create delete marker) |
 | DeleteObjects | `POST` | `/{bucket}?delete` | Batch delete up to 1000 objects |
+| PostObject | `POST` | `/{bucket}` | Browser-style form upload |
 | CopyObject | `PUT` | `/{bucket}/{key}` | Copy object (with `x-amz-copy-source` header) |
 
 ## Listing
@@ -56,8 +57,8 @@ See [Versioning & Object Lock](versioning.md) for details.
 
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
-| GetObjectLockConfiguration | `GET` | `/{bucket}?object-lock` | Get lock configuration |
-| PutObjectLockConfiguration | `PUT` | `/{bucket}?object-lock` | Set lock configuration |
+| GetObjectLockConfig | `GET` | `/{bucket}?object-lock` | Get lock configuration |
+| PutObjectLockConfig | `PUT` | `/{bucket}?object-lock` | Set lock configuration |
 | GetObjectRetention | `GET` | `/{bucket}/{key}?retention` | Get retention policy |
 | PutObjectRetention | `PUT` | `/{bucket}/{key}?retention` | Set retention (Governance/Compliance) |
 | GetObjectLegalHold | `GET` | `/{bucket}/{key}?legal-hold` | Get legal hold status |
@@ -79,6 +80,7 @@ See [Versioning & Object Lock](versioning.md) for details.
 | GetBucketPolicy | `GET` | `/{bucket}?policy` | Get bucket policy JSON |
 | PutBucketPolicy | `PUT` | `/{bucket}?policy` | Set bucket policy |
 | DeleteBucketPolicy | `DELETE` | `/{bucket}?policy` | Remove bucket policy |
+| GetBucketPolicyStatus | `GET` | `/{bucket}?policyStatus` | Report whether policy grants public access |
 
 ## CORS
 
@@ -124,6 +126,7 @@ CORS preflight (OPTIONS) is handled automatically by the CorsMiddleware.
 | GetBucketLifecycle | `GET` | `/{bucket}?lifecycle` | Get lifecycle rules |
 | PutBucketLifecycle | `PUT` | `/{bucket}?lifecycle` | Set lifecycle rules |
 | DeleteBucketLifecycle | `DELETE` | `/{bucket}?lifecycle` | Remove lifecycle rules |
+| RestoreObject | `POST` | `/{bucket}/{key}?restore` | Restore a temporary hot copy from a cold tier |
 
 See [Lifecycle Rules](lifecycle.md) for rule configuration.
 
@@ -164,7 +167,7 @@ See [S3 Select](s3-select.md) for SQL syntax.
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
 | GetObjectAttributes | `GET` | `/{bucket}/{key}?attributes` | Get checksum and part info |
-| HealthCheck | `GET` | `/.health` | Server health probe |
+| HealthCheck | `GET` | `/.health` | Server health probe, not counted as an S3 API operation |
 
 ## Error Responses
 

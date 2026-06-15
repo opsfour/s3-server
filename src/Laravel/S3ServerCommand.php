@@ -10,24 +10,14 @@ use Amp\Log\StreamHandler;
 use Illuminate\Console\Command;
 use Monolog\Logger;
 use Monolog\Processor\PsrLogMessageProcessor;
-use Amp\Parallel\Worker\ContextWorkerPool;
-use OpsFour\S3Server\Admin\AdminQuotaApiHandler;
-use OpsFour\S3Server\Auth\AuthMiddleware;
-use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
 use OpsFour\S3Server\Contracts\CredentialProvider;
-use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
-use OpsFour\S3Server\Encryption\EncryptionService;
-use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
-use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Metadata\MetadataStore;
-use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
-use OpsFour\S3Server\Parallel\ParallelEncryptionService;
-use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -103,61 +93,18 @@ class S3ServerCommand extends Command
         );
         $credentialProvider = $this->resolveCredentials();
 
-        // Build server.
-        $server = new S3Server(
+        $adminToken = config('s3-server.admin.token')
+            ?: config('s3-server.external_iam.admin_token');
+        $runtime = (new S3ServerRuntimeFactory)->create(
             config: $config,
             metadata: $metadata,
             storage: $storage,
+            credentialProvider: $credentialProvider,
             logger: $logger,
             metrics: $metrics,
-        );
-        $server->setStorageTierRegistry($storageTierRegistry);
-
-        // Wire auth middleware.
-        $server->addMiddleware(new AuthMiddleware(
-            credentialProvider: $credentialProvider,
-            region: $config->region,
-        ));
-
-        $adminCredentialApi = AdminCredentialApiFactory::create(
-            config('s3-server.external_iam', []),
-            $credentialProvider,
-        );
-        if ($adminCredentialApi !== null) {
-            $server->setAdminCredentialApiHandler($adminCredentialApi);
-        }
-
-        $adminToken = config('s3-server.admin.token')
-            ?: config('s3-server.external_iam.admin_token');
-        if (is_string($adminToken) && trim($adminToken) !== '') {
-            $server->setAdminQuotaApiHandler(new AdminQuotaApiHandler($metadata, trim($adminToken)));
-        }
-
-        // Build encryption service (parallel if configured).
-        $encryption = $this->resolveEncryption($config);
-
-        // Build S3 Select worker pool (reuses encryption pool size config).
-        $selectWorkerPool = null;
-        if ($config->encryptionWorkerPoolSize > 0) {
-            $selectWorkerPool = new ContextWorkerPool($config->encryptionWorkerPoolSize);
-            $server->addWorkerPool($selectWorkerPool, 'select', $config->encryptionWorkerPoolSize);
-        }
-
-        // Build notification dispatcher.
-        $notifications = new NotificationDispatcher($metadata, $logger, $config->region, metrics: $metrics);
-        $server->setNotificationDispatcher($notifications);
-
-        HandlerRegistrar::registerAll(
-            $server->getHandlerRegistry(),
-            $metadata,
-            $storage,
-            $config,
-            $encryption,
-            $notifications,
-            $selectWorkerPool,
-            $credentialProvider,
-            $metrics,
-            $storageTierRegistry,
+            storageTiers: $storageTierRegistry,
+            externalIamConfig: config('s3-server.external_iam', []),
+            adminToken: is_string($adminToken) ? $adminToken : null,
         );
 
         $this->info("OpsFour S3 Server starting on {$config->host}:{$config->port}");
@@ -170,7 +117,7 @@ class S3ServerCommand extends Command
         }
         $this->info('Press Ctrl+C to stop.');
 
-        $server->start();
+        $runtime->server->start();
 
         // Wait for termination signal.
         $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
@@ -179,7 +126,7 @@ class S3ServerCommand extends Command
             'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
         ]);
 
-        $server->stop();
+        $runtime->stop();
 
         $this->info('Server stopped.');
 
@@ -200,33 +147,6 @@ class S3ServerCommand extends Command
         }
 
         return app(StorageBackend::class);
-    }
-
-    /**
-     * Resolve encryption service, using parallel workers if configured.
-     */
-    private function resolveEncryption(S3ServerConfig $config): ?EncryptionServiceInterface
-    {
-        $masterKeyEnv = getenv('S3_ENCRYPTION_MASTER_KEY');
-        $masterKeysEnv = getenv('S3_ENCRYPTION_MASTER_KEYS');
-        if (($masterKeyEnv === false || $masterKeyEnv === '') && ($masterKeysEnv === false || $masterKeysEnv === '')) {
-            return null;
-        }
-
-        $masterKeyProvider = new ConfigMasterKeyProvider(
-            $masterKeyEnv !== false && $masterKeyEnv !== '' ? $masterKeyEnv : null,
-        );
-
-        if ($config->encryptionWorkerPoolSize > 0) {
-            return new ParallelEncryptionService(
-                $masterKeyProvider,
-                $config->encryptionWorkerPoolSize,
-                $config->encryptionParallelThreshold,
-                app(MetricsCollector::class),
-            );
-        }
-
-        return new EncryptionService($masterKeyProvider);
     }
 
     /**

@@ -26,6 +26,30 @@ php vendor/bin/s3-server \
 php artisan s3:serve --storage-path=./storage/s3 --access-key=myAccessKey --secret-key=mySecretKey
 ```
 
+### Symfony
+
+Register `OpsFour\S3Server\Symfony\S3ServerBundle` in `config/bundles.php`,
+then create `config/packages/opsfour_s3_server.yaml`:
+
+```yaml
+opsfour_s3_server:
+  storage:
+    driver: filesystem
+    path: '%kernel.project_dir%/var/s3'
+  credentials:
+    driver: memory
+    access_key: myAccessKey
+    secret_key: mySecretKey
+    owner_id: default-owner
+    display_name: Default User
+```
+
+Start it:
+
+```bash
+php bin/console opsfour:s3:serve
+```
+
 The server is now listening on `http://localhost:9000`.
 
 ## 3. Use It
@@ -138,4 +162,5 @@ curl http://localhost:9000/.health
 
 - [Configuration Reference](configuration.md) — Tune storage paths, rate limits, TLS, and more
 - [Authentication](authentication.md) — Set up multi-user credential providers
+- [Symfony Integration](symfony-integration.md) — Bundle config, services, and console commands
 - [Production Deployment](deployment.md) — TLS, PostgreSQL, monitoring
