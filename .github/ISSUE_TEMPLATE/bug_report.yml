@@ -1,0 +1,134 @@
+name: Bug report
+description: Report a reproducible defect in opsfour S3 Server.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do not include secrets, credentials,
+        private bucket names, access keys, tokens, production URLs, or customer data.
+
+        This repository is provided as is. GitHub Issues are for reproducible
+        defects only and do not include guaranteed response times or free support.
+        Paid support, integration work, production hardening, and custom
+        development are available on request.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I have searched existing issues and documentation.
+          required: true
+        - label: I can reproduce this with the latest tagged release or current main branch.
+          required: true
+        - label: I have removed all secrets, credentials, tokens, and private data from this report.
+          required: true
+        - label: This is a reproducible bug report, not a general support request.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the defect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest reproducible example, command, SDK call, or test case.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include relevant sanitized logs, stack traces, or response bodies.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Runtime mode
+      options:
+        - Standalone CLI
+        - Laravel
+        - Symfony
+        - Test suite
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version or commit
+      placeholder: v1.1.0 or commit hash
+    validations:
+      required: true
+
+  - type: input
+    id: php
+    attributes:
+      label: PHP version
+      placeholder: "8.4.x"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: metadata
+    attributes:
+      label: Metadata backend
+      options:
+        - SQLite
+        - MySQL
+        - PostgreSQL
+        - In-memory/test double
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage backend
+      options:
+        - Filesystem
+        - Flysystem S3-compatible
+        - Flysystem other
+        - In-memory
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: client
+    attributes:
+      label: Client details
+      description: AWS SDK/CLI/client version and relevant sanitized request details.
+      placeholder: aws-sdk-php 3.x, AWS CLI 2.x, boto3, MinIO client, etc.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that helps reproduce or triage the issue.
+

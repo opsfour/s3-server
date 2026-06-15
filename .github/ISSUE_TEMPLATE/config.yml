@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Paid support and production assistance
+    url: https://ops4.com
+    about: Request paid support, integration work, production hardening, or custom development.
+  - name: Project information
+    url: https://twopeaks.digital
+    about: Learn more about twopeaks.digital.
