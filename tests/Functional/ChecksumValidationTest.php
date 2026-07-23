@@ -70,6 +70,55 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_put_object_over_16_mib_with_content_md5_is_validated_and_round_trips(): void
+    {
+        $body = str_repeat('large-md5-block-', 1_400_000);
+        $key = 'md5-large-valid.bin';
+
+        try {
+            self::$s3->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Body' => $body,
+                'ContentMD5' => base64_encode(md5($body, true)),
+            ]);
+        } catch (S3Exception $e) {
+            $this->fail($e->getMessage() . "\n" . self::serverLogs());
+        }
+
+        $result = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        $this->assertSame(strlen($body), $result['ContentLength']);
+        $this->assertSame(md5($body), md5((string) $result['Body']));
+
+        self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+    }
+
+    public function test_put_object_over_16_mib_with_wrong_content_md5_is_rejected_before_write(): void
+    {
+        $body = str_repeat('large-invalid-md5-', 1_100_000);
+        $key = 'md5-large-invalid.bin';
+
+        try {
+            self::$s3->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Body' => $body,
+                'ContentMD5' => base64_encode(md5('wrong', true)),
+            ]);
+            $this->fail('Expected BadDigest for large object.');
+        } catch (S3Exception $e) {
+            $this->assertSame(400, $e->getStatusCode());
+            $this->assertSame('BadDigest', $e->getAwsErrorCode());
+        }
+
+        try {
+            self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            $this->fail('Large object with invalid Content-MD5 must not be persisted.');
+        } catch (S3Exception $e) {
+            $this->assertSame(404, $e->getStatusCode());
+        }
+    }
+
     // -----------------------------------------------------------------
     // ETag matches MD5 for non-multipart uploads
     // -----------------------------------------------------------------

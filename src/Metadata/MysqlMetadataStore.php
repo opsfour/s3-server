@@ -66,12 +66,15 @@ final class MysqlMetadataStore implements MetadataStore
             $this->pool->execute($sql);
         }
 
-        // Run migration statements (e.g., CREATE INDEX) that may fail on duplicates.
+        // MySQL DDL auto-commits. Duplicate schema objects are safe on a
+        // partially applied retry; every other error must stop versioning.
         foreach (MysqlSchema::getMigrationStatements($currentVersion) as $sql) {
             try {
                 $this->pool->execute($sql);
-            } catch (\Throwable) {
-                // Silently ignore — index may already exist (duplicate key name).
+            } catch (\Throwable $e) {
+                if (! self::isDuplicateSchemaObject($e)) {
+                    throw $e;
+                }
             }
         }
 
@@ -2375,8 +2378,33 @@ final class MysqlMetadataStore implements MetadataStore
         }
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        $transaction = $this->fiberTransaction();
+        if ($transaction === null) {
+            throw new \LogicException('lockOwnerForUpdate() requires an active transaction.');
+        }
+
+        $transaction->execute(
+            <<<'SQL'
+            INSERT INTO s3_owner_write_locks (owner_id)
+            VALUES (?)
+            ON DUPLICATE KEY UPDATE owner_id = VALUES(owner_id)
+            SQL,
+            [$ownerId],
+        );
+        $transaction->execute(
+            'SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = ? FOR UPDATE',
+            [$ownerId],
+        )->fetchRow();
+    }
+
     public function transaction(callable $callback): mixed
     {
+        if (\Fiber::getCurrent() === null) {
+            return \Amp\async(fn(): mixed => $this->transaction($callback))->await();
+        }
+
         $existingTx = $this->fiberTransaction();
         $ownTx = ($existingTx === null);
         if ($ownTx) {
@@ -2416,6 +2444,15 @@ final class MysqlMetadataStore implements MetadataStore
     {
         $fiber = \Fiber::getCurrent();
         return ($fiber !== null && isset($this->fiberTxMap[$fiber])) ? $this->fiberTxMap[$fiber] : null;
+    }
+
+    private static function isDuplicateSchemaObject(\Throwable $error): bool
+    {
+        $message = strtolower($error->getMessage());
+
+        return str_contains($message, 'duplicate key name')
+            || str_contains($message, 'duplicate column name')
+            || str_contains($message, 'already exists');
     }
 
     /** @param array<string, int|float|string|null> $row */

@@ -49,6 +49,9 @@ final class TierTransitionExecutor
     public function processDequeuedJob(array $job): string
     {
         $id = (int) $job['id'];
+        $targetBackend = null;
+        $writeResult = null;
+        $metadataCommitted = false;
 
         try {
             $object = $this->objectForJob($job);
@@ -88,13 +91,27 @@ final class TierTransitionExecutor
 
             $sourceBackend = $this->tiers->tier($this->stringJobValue($job, 'sourceTier'))->backend;
             $targetBackend = $this->tiers->tier($targetTier)->backend;
+            $sourceSize = 0;
+            $sourceMd5 = hash_init('md5');
+            $sourceStream = new TeeReadableStream(
+                $sourceBackend->getObjectByPath($sourcePath),
+                static function (string $chunk) use (&$sourceSize, $sourceMd5): void {
+                    $sourceSize += strlen($chunk);
+                    hash_update($sourceMd5, $chunk);
+                },
+            );
             $writeResult = $targetBackend->putObject(
                 $object->bucket,
                 $object->key,
-                $sourceBackend->getObjectByPath($sourcePath),
+                $sourceStream,
             );
 
-            $this->verifyCopy($object, $writeResult);
+            $this->verifyCopy(
+                $object,
+                $writeResult,
+                $sourceSize,
+                hash_final($sourceMd5),
+            );
 
             $this->metadata->transaction(function () use ($id, $object, $targetStorageClass, $targetTier, $writeResult): void {
                 $this->metadata->updateObjectPlacement(
@@ -112,6 +129,7 @@ final class TierTransitionExecutor
                     targetStoragePath: $writeResult->path,
                 );
             });
+            $metadataCommitted = true;
 
             if (
                 $this->deleteSourceAfterCommit
@@ -133,6 +151,16 @@ final class TierTransitionExecutor
 
             return 'completed';
         } catch (\Throwable $e) {
+            if (! $metadataCommitted && $targetBackend !== null && $writeResult !== null) {
+                try {
+                    $targetBackend->deleteObjectByPath(
+                        $writeResult->path,
+                        $this->stringJobValue($job, 'bucket'),
+                    );
+                } catch (\Throwable) {
+                }
+            }
+
             return $this->retryOrDeadLetter($job, $e);
         }
     }
@@ -190,14 +218,27 @@ final class TierTransitionExecutor
         return 'completed';
     }
 
-    private function verifyCopy(ObjectInfo $object, StorageWriteResult $writeResult): void
-    {
-        if ($writeResult->size !== $object->size) {
-            throw new \RuntimeException("Tier transition copy size mismatch: expected {$object->size}, got {$writeResult->size}.");
+    private function verifyCopy(
+        ObjectInfo $object,
+        StorageWriteResult $writeResult,
+        int $sourceSize,
+        string $sourceMd5,
+    ): void {
+        if ($writeResult->size !== $sourceSize) {
+            throw new \RuntimeException("Tier transition physical copy size mismatch: expected {$sourceSize}, got {$writeResult->size}.");
         }
 
-        $simpleMd5 = $this->simpleEtagMd5($object->etag);
-        if ($simpleMd5 !== null && strtolower($writeResult->md5Hex) !== $simpleMd5) {
+        if (strtolower($writeResult->md5Hex) !== strtolower($sourceMd5)) {
+            throw new \RuntimeException('Tier transition physical copy MD5 mismatch.');
+        }
+
+        $encrypted = isset($object->userMetadata['__sse-algorithm']);
+        if (! $encrypted && $sourceSize !== $object->size) {
+            throw new \RuntimeException("Tier transition source size mismatch: expected {$object->size}, got {$sourceSize}.");
+        }
+
+        $simpleMd5 = $encrypted ? null : $this->simpleEtagMd5($object->etag);
+        if ($simpleMd5 !== null && strtolower($sourceMd5) !== $simpleMd5) {
             throw new \RuntimeException('Tier transition copy MD5 mismatch.');
         }
     }

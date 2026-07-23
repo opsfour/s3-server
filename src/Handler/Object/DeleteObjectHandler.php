@@ -8,11 +8,12 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
-use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
  * Handles DeleteObject (DELETE /{bucket}/{key}).
@@ -34,7 +35,7 @@ final class DeleteObjectHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        private readonly StorageTierRegistry $storageTiers,
         private readonly ?NotificationDispatcher $notifications = null,
     ) {
         $this->lockChecker = new ObjectLockChecker($metadata);
@@ -63,7 +64,7 @@ final class DeleteObjectHandler implements RequestHandler
         // 4. Handle versioning-aware delete.
         if (($versioning === 'Enabled' || $versioning === 'Suspended') && $versionId === null) {
             $isSuspended = ($versioning === 'Suspended');
-            $oldPathToClean = null;
+            $oldObjectToClean = null;
 
             // Check if a real (non-delete-marker) object exists before creating the delete marker.
             // Used to decide whether to fire a notification (no notification for phantom deletes).
@@ -72,21 +73,15 @@ final class DeleteObjectHandler implements RequestHandler
 
             // Suspended versioning: collect storage path for existing null version before overwriting.
             if ($isSuspended && $hadRealObject) {
-                $oldPathToClean = $existingObj->systemMetadata['storagePath'] ?? null;
-                if ($oldPathToClean === '') {
-                    $oldPathToClean = null;
-                }
+                $oldObjectToClean = $existingObj;
             }
 
             // Insert a delete marker (soft delete).
             $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
 
             // Clean up old storage AFTER successful metadata write.
-            if ($oldPathToClean !== null) {
-                try {
-                    $this->storage->deleteObjectByPath($oldPathToClean, $bucket);
-                } catch (\Throwable) {
-                }
+            if ($oldObjectToClean !== null) {
+                $this->deleteStoredData($oldObjectToClean);
             }
 
             // Only fire notification if a real object was superseded by the delete marker.
@@ -114,11 +109,8 @@ final class DeleteObjectHandler implements RequestHandler
 
             if ($deletedInfo !== null) {
                 // Delete the storage file if it's not a delete marker.
-                if (! $deletedInfo->isDeleteMarker && isset($deletedInfo->systemMetadata['storagePath']) && $deletedInfo->systemMetadata['storagePath'] !== '') {
-                    try {
-                        $this->storage->deleteObjectByPath($deletedInfo->systemMetadata['storagePath'], $bucket);
-                    } catch (\Throwable) {
-                    }
+                if (! $deletedInfo->isDeleteMarker) {
+                    $this->deleteStoredData($deletedInfo);
                 }
 
                 $headers['x-amz-version-id'] = $versionId;
@@ -142,18 +134,32 @@ final class DeleteObjectHandler implements RequestHandler
         $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
 
         if ($objectInfo !== null) {
-            $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
             $this->metadata->deleteObjectMetadata($bucket, $key);
-            if ($storagePath !== null && $storagePath !== '') {
-                try {
-                    $this->storage->deleteObjectByPath($storagePath, $bucket);
-                } catch (\Throwable) {
-                }
-            }
+            $this->deleteStoredData($objectInfo);
             $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
         }
 
         return new Response(status: 204);
+    }
+
+    private function deleteStoredData(ObjectInfo $object): void
+    {
+        $storagePath = $object->systemMetadata['storagePath'] ?? null;
+        if ($storagePath !== null && $storagePath !== '') {
+            try {
+                $this->storageTiers->tier($object->storageTier)->backend
+                    ->deleteObjectByPath($storagePath, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            try {
+                $this->storageTiers->defaultBackend()
+                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
     }
 
 }

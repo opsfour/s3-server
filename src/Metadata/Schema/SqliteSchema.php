@@ -8,7 +8,8 @@ namespace OpsFour\S3Server\Metadata\Schema;
  * Contains all SQLite DDL statements for the S3 metadata store.
  *
  * All tables use the `s3_` prefix to avoid collisions when sharing a database.
- * Schema version: 1
+ * The complete schema represents VERSION; incremental migrations remain in
+ * SchemaManager for existing databases.
  */
 final class SqliteSchema
 {

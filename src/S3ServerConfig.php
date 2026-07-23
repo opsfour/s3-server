@@ -58,7 +58,6 @@ final class S3ServerConfig
         get => $this->maxConcurrentConnections;
     }
 
-    /** @internal Reserved for future use. */
     public int $connectionIdleTimeout {
         get => $this->connectionIdleTimeout;
     }
@@ -67,12 +66,10 @@ final class S3ServerConfig
         get => $this->requestBodySizeLimit;
     }
 
-    /** @internal Reserved for future use. */
     public int $readTimeout {
         get => $this->readTimeout;
     }
 
-    /** @internal Reserved for future use. */
     public int $writeTimeout {
         get => $this->writeTimeout;
     }
@@ -114,12 +111,20 @@ final class S3ServerConfig
         get => $this->shutdownDrainTimeout;
     }
 
+    public bool $notificationRequireHttps {
+        get => $this->notificationRequireHttps;
+    }
+
     public int $sqliteWorkerPoolSize {
         get => $this->sqliteWorkerPoolSize;
     }
 
     public int $encryptionWorkerPoolSize {
         get => $this->encryptionWorkerPoolSize;
+    }
+
+    public int $requestBodySpoolWorkerPoolSize {
+        get => $this->requestBodySpoolWorkerPoolSize;
     }
 
     public int $encryptionParallelThreshold {
@@ -170,8 +175,10 @@ final class S3ServerConfig
      * @param  int  $maxEncryptedObjectSize  Maximum size in bytes for objects encrypted with SSE (default 256 MiB).
      * @param  int  $maxSelectObjectSize  Maximum size in bytes for S3 Select queries (default 256 MiB).
      * @param  int  $shutdownDrainTimeout  Seconds to wait for in-flight requests on shutdown (default 30).
+     * @param  bool  $notificationRequireHttps  Reject non-HTTPS webhook destinations.
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
      * @param  int  $encryptionWorkerPoolSize  Number of amphp/parallel workers for encryption (0 = disable).
+     * @param  int  $requestBodySpoolWorkerPoolSize  Number of workers for request-body checksum spooling.
      * @param  int  $encryptionParallelThreshold  Payloads below this size run inline (bytes).
      * @param  float  $lifecycleIntervalSeconds  Seconds between lifecycle sweeps.
      * @param  int  $lifecycleBatchSize  Maximum rows fetched per lifecycle query.
@@ -202,8 +209,10 @@ final class S3ServerConfig
         int $maxEncryptedObjectSize = 268_435_456,
         int $maxSelectObjectSize = 268_435_456,
         int $shutdownDrainTimeout = 30,
+        bool $notificationRequireHttps = true,
         int $sqliteWorkerPoolSize = 0,
         int $encryptionWorkerPoolSize = 0,
+        int $requestBodySpoolWorkerPoolSize = 8,
         int $encryptionParallelThreshold = 65_536,
         ?QuotaConfig $quota = null,
         float $lifecycleIntervalSeconds = 60.0,
@@ -266,6 +275,18 @@ final class S3ServerConfig
             );
         }
 
+        if ($shutdownDrainTimeout < 1) {
+            throw new \InvalidArgumentException(
+                "shutdownDrainTimeout must be >= 1, got {$shutdownDrainTimeout}.",
+            );
+        }
+
+        if ($requestBodySpoolWorkerPoolSize < 1) {
+            throw new \InvalidArgumentException(
+                "requestBodySpoolWorkerPoolSize must be >= 1, got {$requestBodySpoolWorkerPoolSize}.",
+            );
+        }
+
         if ($perClientRateLimit < 0) {
             throw new \InvalidArgumentException(
                 "perClientRateLimit must be >= 0, got {$perClientRateLimit}.",
@@ -323,8 +344,10 @@ final class S3ServerConfig
         $this->maxEncryptedObjectSize = $maxEncryptedObjectSize;
         $this->maxSelectObjectSize = $maxSelectObjectSize;
         $this->shutdownDrainTimeout = $shutdownDrainTimeout;
+        $this->notificationRequireHttps = $notificationRequireHttps;
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
+        $this->requestBodySpoolWorkerPoolSize = $requestBodySpoolWorkerPoolSize;
         $this->encryptionParallelThreshold = $encryptionParallelThreshold;
         $this->quota = $quota ?? new QuotaConfig();
         $this->lifecycleIntervalSeconds = $lifecycleIntervalSeconds;
@@ -381,8 +404,10 @@ final class S3ServerConfig
             'maxEncryptedObjectSize' => $this->maxEncryptedObjectSize,
             'maxSelectObjectSize' => $this->maxSelectObjectSize,
             'shutdownDrainTimeout' => $this->shutdownDrainTimeout,
+            'notificationRequireHttps' => $this->notificationRequireHttps,
             'sqliteWorkerPoolSize' => $this->sqliteWorkerPoolSize,
             'encryptionWorkerPoolSize' => $this->encryptionWorkerPoolSize,
+            'requestBodySpoolWorkerPoolSize' => $this->requestBodySpoolWorkerPoolSize,
             'encryptionParallelThreshold' => $this->encryptionParallelThreshold,
             'quota' => $this->quota,
             'lifecycleIntervalSeconds' => $this->lifecycleIntervalSeconds,

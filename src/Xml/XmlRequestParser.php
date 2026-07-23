@@ -381,8 +381,11 @@ final class XmlRequestParser
                         if ($type === 'Group') {
                             $granteeType = 'Group';
                             $granteeId = isset($grantee->URI) ? (string) $grantee->URI : '';
+                        } elseif ($type === 'AmazonCustomerByEmail') {
+                            $granteeType = 'AmazonCustomerByEmail';
+                            $granteeId = isset($grantee->EmailAddress) ? (string) $grantee->EmailAddress : '';
                         } else {
-                            $granteeType = 'CanonicalUser';
+                            $granteeType = $type;
                             $granteeId = isset($grantee->ID) ? (string) $grantee->ID : '';
                         }
                     } else {

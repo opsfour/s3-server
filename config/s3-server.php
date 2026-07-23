@@ -58,6 +58,11 @@ return [
     // Write timeout in seconds.
     'write_timeout' => (int) env('S3_WRITE_TIMEOUT', 300),
 
+    'notifications' => [
+        // Reject plaintext HTTP webhook destinations by default.
+        'require_https' => (bool) env('S3_NOTIFICATION_REQUIRE_HTTPS', true),
+    ],
+
     // Master key provider for SSE-S3: 'config', 'vault'.
     'master_key_provider' => env('S3_MASTER_KEY_PROVIDER', 'config'),
 
@@ -76,6 +81,9 @@ return [
 
         // Number of worker processes for encryption/decryption.
         'encryption_workers' => (int) env('S3_ENCRYPTION_WORKERS', 0),
+
+        // Stateless workers for request-body checksum spooling.
+        'request_body_spool_workers' => (int) env('S3_REQUEST_BODY_SPOOL_WORKERS', 8),
 
         // Objects smaller than this (bytes) are encrypted inline.
         'encryption_threshold' => (int) env('S3_ENCRYPTION_THRESHOLD', 65536),
@@ -124,6 +132,10 @@ return [
     'storage' => [
         'driver' => env('S3_STORAGE_DRIVER', 'filesystem'),
         'path' => env('S3_STORAGE_PATH', function_exists('storage_path') ? storage_path('s3') : ''),
+        'temp_dir' => env('S3_STORAGE_TEMP_DIR', sys_get_temp_dir()),
+        // Remote Flysystem adapters should use a serializable factory and workers.
+        'worker_pool_size' => (int) env('S3_FLYSYSTEM_WORKERS', 0),
+        'filesystem_factory_service' => env('S3_FLYSYSTEM_FACTORY_SERVICE', null),
         /*
         | Optional physical tier registry. When empty, the single backend above is
         | exposed as the STANDARD tier. Restore-required tiers are not read

@@ -20,6 +20,7 @@ final class S3ServerConfigFactory
         $parallel = $config['parallel'];
         $quotas = $config['quotas'];
         $lifecycle = $config['lifecycle'];
+        $notifications = $config['notifications'];
 
         return new S3ServerConfig(
             host: $server['host'],
@@ -45,8 +46,10 @@ final class S3ServerConfigFactory
             maxEncryptedObjectSize: $server['max_encrypted_object_size'],
             maxSelectObjectSize: $server['max_select_object_size'],
             shutdownDrainTimeout: $server['shutdown_drain_timeout'],
+            notificationRequireHttps: $notifications['require_https'],
             sqliteWorkerPoolSize: $parallel['sqlite_workers'],
             encryptionWorkerPoolSize: $parallel['encryption_workers'],
+            requestBodySpoolWorkerPoolSize: $parallel['request_body_spool_workers'],
             encryptionParallelThreshold: $parallel['encryption_threshold'],
             quota: new QuotaConfig(
                 maxBucketsPerOwner: $quotas['max_buckets_per_owner'],

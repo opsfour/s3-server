@@ -12,6 +12,7 @@ use Amp\Parallel\Worker\TaskFailureThrowable;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Parallel\SelectProcessingTask;
@@ -21,6 +22,7 @@ use OpsFour\S3Server\Select\ExpressionEvaluator;
 use OpsFour\S3Server\Select\JsonProcessor;
 use OpsFour\S3Server\Select\SqlParser;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
  * Handles SelectObjectContent (POST /{bucket}/{key}?select&select-type=2).
@@ -30,13 +32,18 @@ use OpsFour\S3Server\Storage\StorageBackend;
  */
 final class SelectObjectContentHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        StorageBackend $storage,
         private readonly int $maxSelectObjectSize = 268_435_456,
         private readonly ?WorkerPool $workerPool = null,
         private readonly ?MetricsCollector $metrics = null,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -71,7 +78,26 @@ final class SelectObjectContentHandler implements RequestHandler
             throw new NoSuchKeyException();
         }
 
-        $objectData = ByteStream\buffer($this->storage->getObjectByPath($storagePath));
+        $tier = $this->storageTiers->tier($objectInfo->storageTier);
+        $readStorage = $tier->backend;
+        if ($tier->restoreRequired) {
+            if (
+                $objectInfo->restoreStatus !== 'restored'
+                || $objectInfo->restoredStoragePath === null
+                || $objectInfo->restoreExpiresAt === null
+                || $objectInfo->restoreExpiresAt <= new \DateTimeImmutable('now', new \DateTimeZone('UTC'))
+            ) {
+                throw new InvalidObjectStateException();
+            }
+            $readStorage = $this->storageTiers->defaultBackend();
+            $storagePath = $objectInfo->restoredStoragePath;
+        }
+
+        if (isset($objectInfo->userMetadata['__sse-algorithm'])) {
+            throw new InvalidObjectStateException('S3 Select does not support encrypted objects.');
+        }
+
+        $objectData = ByteStream\buffer($readStorage->getObjectByPath($storagePath));
 
         // Offload to worker if pool is available.
         if ($this->workerPool !== null) {

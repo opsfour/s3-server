@@ -748,9 +748,7 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
         $result = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $key]);
         $this->assertCount(2, $result['Grants']);
 
-        // Overwrite object with putObject.
-        // Note: server preserves existing ACL rows on overwrite (PutObject does not
-        // reset the ACL table). This differs from AWS which resets to default.
+        // Overwrite without ACL headers resets the object to private.
         self::$s3->putObject([
             'Bucket' => self::$bucket,
             'Key' => $key,
@@ -758,10 +756,8 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
         ]);
 
         $result = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $key]);
-        // ACL persists: still 2 grants (owner FC + AllUsers READ).
-        $this->assertCount(2, $result['Grants']);
+        $this->assertCount(1, $result['Grants']);
         $this->assertOwnerFullControl($result['Grants'][0]);
-        $this->assertGroupGrant($result['Grants'][1], self::ALL_USERS_URI, 'READ');
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
     }
@@ -794,14 +790,11 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
             'Body' => 'recreated',
         ]);
 
-        // Note: ACL rows persist in the s3_acls table after deletion — the server
-        // does not clean up ACL entries on object delete. After recreation, the old
-        // ACL rows are still present.
+        // Recreating without ACL headers receives the default private ACL.
         $result = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $key]);
         $this->assertOwnerIdInResult($result);
-        $this->assertCount(2, $result['Grants']);
+        $this->assertCount(1, $result['Grants']);
         $this->assertOwnerFullControl($result['Grants'][0]);
-        $this->assertGroupGrant($result['Grants'][1], self::ALL_USERS_URI, 'READ');
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
     }
@@ -825,6 +818,72 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
             $this->assertOwnerIdInResult($result);
             $this->assertCount(1, $result['Grants']);
             $this->assertOwnerFullControl($result['Grants'][0]);
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
+    public function test_copy_object_applies_requested_acl_and_resets_it_when_omitted(): void
+    {
+        $source = 'acl-copy-source-' . uniqid() . '.txt';
+        $destination = 'acl-copy-destination-' . uniqid() . '.txt';
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $source, 'Body' => 'copy acl']);
+
+        try {
+            self::$s3->copyObject([
+                'Bucket' => self::$bucket,
+                'Key' => $destination,
+                'CopySource' => self::$bucket . '/' . $source,
+                'ACL' => 'public-read',
+            ]);
+            $public = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $destination]);
+            $this->assertCount(2, $public['Grants']);
+
+            self::$s3->copyObject([
+                'Bucket' => self::$bucket,
+                'Key' => $destination,
+                'CopySource' => self::$bucket . '/' . $source,
+            ]);
+            $private = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $destination]);
+            $this->assertCount(1, $private['Grants']);
+            $this->assertOwnerFullControl($private['Grants'][0]);
+        } finally {
+            self::$s3->deleteObjects([
+                'Bucket' => self::$bucket,
+                'Delete' => ['Objects' => [['Key' => $source], ['Key' => $destination]]],
+            ]);
+        }
+    }
+
+    public function test_multipart_upload_preserves_initiation_acl(): void
+    {
+        $key = 'acl-multipart-' . uniqid() . '.txt';
+        $upload = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'ACL' => 'public-read',
+        ]);
+
+        try {
+            $part = self::$s3->uploadPart([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $upload['UploadId'],
+                'PartNumber' => 1,
+                'Body' => 'multipart acl',
+            ]);
+            self::$s3->completeMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $upload['UploadId'],
+                'MultipartUpload' => [
+                    'Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]],
+                ],
+            ]);
+
+            $acl = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $key]);
+            $this->assertCount(2, $acl['Grants']);
+            $this->assertGroupGrant($acl['Grants'][1], self::ALL_USERS_URI, 'READ');
         } finally {
             self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
         }

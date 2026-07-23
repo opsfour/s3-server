@@ -10,21 +10,28 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class UploadPartCopyHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
         private readonly ?EncryptionServiceInterface $encryption = null,
         private readonly int $maxEncryptedObjectSize = 268_435_456,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -97,6 +104,20 @@ final class UploadPartCopyHandler implements RequestHandler
         if ($srcPath === null || $srcPath === '') {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Source object storage path missing.');
         }
+        $sourceTier = $this->storageTiers->tier($srcObject->storageTier);
+        $sourceStorage = $sourceTier->backend;
+        if ($sourceTier->restoreRequired) {
+            if (
+                $srcObject->restoreStatus !== 'restored'
+                || $srcObject->restoredStoragePath === null
+                || $srcObject->restoreExpiresAt === null
+                || $srcObject->restoreExpiresAt <= new \DateTimeImmutable('now', new \DateTimeZone('UTC'))
+            ) {
+                throw new InvalidObjectStateException('The source object must be restored before it can be copied.');
+            }
+            $sourceStorage = $this->storageTiers->defaultBackend();
+            $srcPath = $srcObject->restoredStoragePath;
+        }
         $srcSseAlgo = $srcObject->userMetadata['__sse-algorithm'] ?? null;
 
         if ($srcSseAlgo !== null && $this->encryption !== null) {
@@ -108,7 +129,7 @@ final class UploadPartCopyHandler implements RequestHandler
             }
 
             // Source is encrypted: read ciphertext, decrypt, then write plaintext as part.
-            $ciphertext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($srcPath));
+            $ciphertext = \Amp\ByteStream\buffer($sourceStorage->getObjectByPath($srcPath));
 
             if ($srcSseAlgo === 'SSE-C') {
                 $copySrcAlgo = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-algorithm');
@@ -147,7 +168,7 @@ final class UploadPartCopyHandler implements RequestHandler
 
             $stream = new \Amp\ByteStream\ReadableBuffer($plaintext);
         } else {
-            $stream = $this->storage->getObjectByPath($srcPath, $offset, $length);
+            $stream = $sourceStorage->getObjectByPath($srcPath, $offset, $length);
         }
 
         // Write as a part.

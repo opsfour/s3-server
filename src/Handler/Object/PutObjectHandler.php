@@ -7,8 +7,10 @@ namespace OpsFour\S3Server\Handler\Object;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
@@ -17,6 +19,8 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageWriteResult;
 
 /**
  * Handles PutObject (PUT /{bucket}/{key}).
@@ -31,6 +35,8 @@ use OpsFour\S3Server\Storage\StorageBackend;
  */
 final class PutObjectHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     /** @var list<string> Valid S3 storage class values. */
     private const array VALID_STORAGE_CLASSES = [
         'STANDARD',
@@ -50,7 +56,10 @@ final class PutObjectHandler implements RequestHandler
         private readonly ?NotificationDispatcher $notifications = null,
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         private readonly ?QuotaManager $quotas = null,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -64,6 +73,9 @@ final class PutObjectHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
+
+        $aclGrants = $this->resolveObjectAclGrants($request, $ownerId, $bucketInfo->ownerId);
+        $tagging = $this->parseObjectTagging($request->getHeader('x-amz-tagging'));
 
         // 2. Evaluate conditional PUT headers (If-Match, If-None-Match).
         $ifMatch = $request->getHeader('if-match');
@@ -200,9 +212,10 @@ final class PutObjectHandler implements RequestHandler
 
         // 5. Encryption: encrypt data at rest if SSE-C or SSE-S3 is requested.
         try {
-            $encMeta = self::applyEncryption(
+            [$encMeta, $encryptedWrite] = self::applyEncryption(
                 $request,
-                $result->path,
+                $result,
+                $key,
                 $bucket,
                 $this->metadata,
                 $this->encryption,
@@ -210,6 +223,17 @@ final class PutObjectHandler implements RequestHandler
                 $result->size,
                 $this->maxEncryptedObjectSize,
             );
+            if ($encryptedWrite !== null) {
+                $result = new StorageWriteResult(
+                    path: $encryptedWrite->path,
+                    size: $result->size,
+                    md5Hex: $result->md5Hex,
+                    crc32Base64: $result->crc32Base64,
+                    crc32cBase64: $result->crc32cBase64,
+                    sha1Base64: $result->sha1Base64,
+                    sha256Base64: $result->sha256Base64,
+                );
+            }
         } catch (\Throwable $e) {
             // Clean up plaintext file on encryption failure (e.g. EntityTooLargeException).
             try {
@@ -232,7 +256,7 @@ final class PutObjectHandler implements RequestHandler
         // 5b. Write metadata (versioning-aware) and handle old-object cleanup.
         $versioning = $this->metadata->getBucketVersioning($bucket);
         $versionId = null;
-        $oldStoragePath = null;
+        $oldObjectToClean = null;
 
         try {
             if ($versioning === 'Enabled') {
@@ -253,8 +277,11 @@ final class PutObjectHandler implements RequestHandler
                     $checksumCrc32c,
                     $checksumSha1,
                     $checksumSha256,
+                    $aclGrants,
+                    $tagging,
                     &$versionId,
                 ) {
+                    $this->metadata->lockOwnerForUpdate($ownerId);
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, null, $result->size, true);
 
                     $versionId = $this->metadata->putObjectVersioned(
@@ -275,6 +302,10 @@ final class PutObjectHandler implements RequestHandler
                         checksumSha1: $checksumSha1,
                         checksumSha256: $checksumSha256,
                     );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, $aclGrants);
+                    if ($tagging !== null) {
+                        $this->metadata->putObjectTagging($bucket, $key, $tagging);
+                    }
                 });
             } else {
                 // Versioning suspended or never enabled: overwrite with version_id='null'.
@@ -297,10 +328,13 @@ final class PutObjectHandler implements RequestHandler
                     $checksumCrc32c,
                     $checksumSha1,
                     $checksumSha256,
-                    &$oldStoragePath,
+                    $aclGrants,
+                    $tagging,
+                    &$oldObjectToClean,
                 ) {
+                    $this->metadata->lockOwnerForUpdate($ownerId);
                     $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-                    $oldStoragePath = $existingObj?->systemMetadata['storagePath'] ?? null;
+                    $oldObjectToClean = $existingObj;
 
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, $existingObj, $result->size, false);
 
@@ -322,6 +356,10 @@ final class PutObjectHandler implements RequestHandler
                         checksumSha1: $checksumSha1,
                         checksumSha256: $checksumSha256,
                     );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, $aclGrants);
+                    if ($tagging !== null) {
+                        $this->metadata->putObjectTagging($bucket, $key, $tagging);
+                    }
                 });
             }
         } catch (\Throwable $e) {
@@ -334,11 +372,8 @@ final class PutObjectHandler implements RequestHandler
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
-        if ($oldStoragePath !== null && $oldStoragePath !== $result->path) {
-            try {
-                $this->storage->deleteObjectByPath($oldStoragePath, $bucket);
-            } catch (\Throwable) {
-            }
+        if ($oldObjectToClean !== null) {
+            $this->deleteStoredData($oldObjectToClean, $result->path);
         }
 
         // 7. Build response headers.
@@ -374,60 +409,99 @@ final class PutObjectHandler implements RequestHandler
             $headers['x-amz-checksum-sha256'] = $checksumSha256;
         }
 
-        // 8. Apply ACL from headers (canned x-amz-acl or x-amz-grant-* headers).
-        $cannedAcl = $request->getHeader('x-amz-acl');
-        $hasGrantHeaders = $request->hasHeader('x-amz-grant-read') || $request->hasHeader('x-amz-grant-write')
-            || $request->hasHeader('x-amz-grant-read-acp') || $request->hasHeader('x-amz-grant-write-acp')
-            || $request->hasHeader('x-amz-grant-full-control');
-
-        if ($cannedAcl !== null && $cannedAcl !== '') {
-            $resourceName = $bucket . '/' . $key;
-            $allUsersUri = 'http://acs.amazonaws.com/groups/global/AllUsers';
-            $authUsersUri = 'http://acs.amazonaws.com/groups/global/AuthenticatedUsers';
-            $ownerGrant = ['granteeType' => 'CanonicalUser', 'granteeId' => $ownerId, 'permission' => 'FULL_CONTROL'];
-
-            $grants = match ($cannedAcl) {
-                'public-read' => [$ownerGrant, ['granteeType' => 'Group', 'granteeId' => $allUsersUri, 'permission' => 'READ']],
-                'public-read-write' => [$ownerGrant, ['granteeType' => 'Group', 'granteeId' => $allUsersUri, 'permission' => 'READ'], ['granteeType' => 'Group', 'granteeId' => $allUsersUri, 'permission' => 'WRITE']],
-                'authenticated-read' => [$ownerGrant, ['granteeType' => 'Group', 'granteeId' => $authUsersUri, 'permission' => 'READ']],
-                'bucket-owner-read' => [$ownerGrant, ['granteeType' => 'CanonicalUser', 'granteeId' => $bucketInfo->ownerId, 'permission' => 'READ']],
-                'bucket-owner-full-control' => [$ownerGrant, ['granteeType' => 'CanonicalUser', 'granteeId' => $bucketInfo->ownerId, 'permission' => 'FULL_CONTROL']],
-                default => [$ownerGrant],
-            };
-
-            $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
-        } elseif ($hasGrantHeaders) {
-            $resourceName = $bucket . '/' . $key;
-            $grants = [['granteeType' => 'CanonicalUser', 'granteeId' => $ownerId, 'permission' => 'FULL_CONTROL']];
-            $headerMap = [
-                'x-amz-grant-read' => 'READ', 'x-amz-grant-write' => 'WRITE',
-                'x-amz-grant-read-acp' => 'READ_ACP', 'x-amz-grant-write-acp' => 'WRITE_ACP',
-                'x-amz-grant-full-control' => 'FULL_CONTROL',
-            ];
-            foreach ($headerMap as $header => $permission) {
-                $value = $request->getHeader($header);
-                if ($value === null || $value === '') {
-                    continue;
-                }
-                foreach (explode(',', $value) as $grantee) {
-                    $grantee = trim($grantee);
-                    if (preg_match('/^id\s*=\s*"([^"]+)"/i', $grantee, $m)) {
-                        $grants[] = ['granteeType' => 'CanonicalUser', 'granteeId' => $m[1], 'permission' => $permission];
-                    } elseif (preg_match('/^uri\s*=\s*"([^"]+)"/i', $grantee, $m)) {
-                        $grants[] = ['granteeType' => 'Group', 'granteeId' => $m[1], 'permission' => $permission];
-                    }
-                }
-            }
-            $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
-        }
-
-        // 9. Dispatch event notification.
-        $this->notifications?->dispatch('s3:ObjectCreated:Put', $bucket, $key, $result->size, $etag, $ownerId);
+        // 8. Dispatch event notification.
+        $eventName = $request->getAttribute('s3.operation') === \OpsFour\S3Server\Routing\S3Operation::PostObject
+            ? 's3:ObjectCreated:Post'
+            : 's3:ObjectCreated:Put';
+        $this->notifications?->dispatch($eventName, $bucket, $key, $result->size, $etag, $ownerId);
 
         return new Response(
             status: 200,
             headers: $headers,
         );
+    }
+
+    private function deleteStoredData(ObjectInfo $object, string $preservePath): void
+    {
+        $path = $object->systemMetadata['storagePath'] ?? null;
+        if ($path !== null && $path !== '' && $path !== $preservePath) {
+            try {
+                $this->storageTiers->tier($object->storageTier)->backend
+                    ->deleteObjectByPath($path, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '' && $object->restoredStoragePath !== $preservePath) {
+            try {
+                $this->storageTiers->defaultBackend()
+                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+    }
+
+    /**
+     * Every successful replacement receives a fresh ACL. This matches S3,
+     * where omitting ACL headers means private instead of preserving the old
+     * object's grants.
+     *
+     * @return list<array{granteeType: string, granteeId: string, permission: string}>
+     */
+    private function resolveObjectAclGrants(Request $request, string $ownerId, string $bucketOwnerId): array
+    {
+        $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketOwnerId)
+            ?? AclGrantResolver::privateAcl($ownerId);
+
+        $pab = $this->metadata->getPublicAccessBlock($request->getAttribute('s3.bucket'));
+        if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
+            throw new \OpsFour\S3Server\Exception\AccessDeniedException(
+                'Public ACLs are blocked by the bucket Public Access Block configuration.',
+            );
+        }
+
+        return $grants;
+    }
+
+    /**
+     * @return list<array{key: string, value: string}>|null
+     */
+    private function parseObjectTagging(?string $tagging): ?array
+    {
+        if ($tagging === null) {
+            return null;
+        }
+
+        $tags = [];
+        if (str_starts_with(ltrim($tagging), '<')) {
+            try {
+                $xml = new \SimpleXMLElement($tagging);
+            } catch (\Throwable) {
+                throw new InvalidArgumentException('x-amz-tagging contains invalid XML.');
+            }
+            foreach ($xml->TagSet->Tag ?? [] as $tag) {
+                $tags[] = ['key' => (string) $tag->Key, 'value' => (string) $tag->Value];
+            }
+        } else {
+            parse_str($tagging, $parsed);
+            foreach ($parsed as $key => $value) {
+                if (!is_string($key) || !is_string($value)) {
+                    throw new InvalidArgumentException('x-amz-tagging must contain scalar key/value pairs.');
+                }
+                $tags[] = ['key' => $key, 'value' => $value];
+            }
+        }
+
+        if (count($tags) > 10) {
+            throw new InvalidArgumentException('An object may have at most 10 tags.');
+        }
+        foreach ($tags as $tag) {
+            if ($tag['key'] === '' || strlen($tag['key']) > 128 || strlen($tag['value']) > 256) {
+                throw new InvalidArgumentException('Object tag key or value exceeds the S3 limits.');
+            }
+        }
+
+        return $tags;
     }
 
     /**
@@ -436,11 +510,12 @@ final class PutObjectHandler implements RequestHandler
      * Reads the stored plaintext from storage, encrypts it in-place,
      * and returns encryption metadata to be stored with the object.
      *
-     * @return array<string, string> Encryption metadata (empty if no encryption).
+     * @return array{0: array<string, string>, 1: StorageWriteResult|null}
      */
     private static function applyEncryption(
         Request $request,
-        string $storagePath,
+        StorageWriteResult $originalWrite,
+        string $key,
         string $bucket,
         MetadataStore $metadata,
         ?EncryptionServiceInterface $encryption,
@@ -449,7 +524,7 @@ final class PutObjectHandler implements RequestHandler
         int $maxEncryptedObjectSize = 268_435_456,
     ): array {
         if ($encryption === null) {
-            return [];
+            return [[], null];
         }
 
         // Check for SSE-C headers.
@@ -465,26 +540,22 @@ final class PutObjectHandler implements RequestHandler
                 );
             }
             $customerKey = EncryptionService::validateSseCHeaders($sseCAlgorithm, $sseCKey, $sseCKeyMd5);
-            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($storagePath));
+            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($originalWrite->path));
             $enc = $encryption->encryptSseC($plaintext, $customerKey);
-            $tempPath = $storagePath . '.enc.tmp';
-            try {
-                \Amp\File\write($tempPath, $enc['ciphertext']);
-                \Amp\File\move($tempPath, $storagePath);
-            } catch (\Throwable $e) {
-                try {
-                    \Amp\File\deleteFile($tempPath);
-                } catch (\Throwable) {
-                }
-                throw $e;
-            }
+            $encryptedWrite = self::replaceStoredPayload(
+                $storage,
+                $bucket,
+                $key,
+                $originalWrite->path,
+                $enc['ciphertext'],
+            );
 
-            return [
+            return [[
                 'sse-algorithm' => 'SSE-C',
                 'sse-iv' => $enc['iv'],
                 'sse-tag' => $enc['tag'],
                 'sse-customer-key-md5' => $sseCKeyMd5,
-            ];
+            ], $encryptedWrite];
         }
 
         // Check for explicit SSE-S3 header or bucket default encryption.
@@ -504,29 +575,51 @@ final class PutObjectHandler implements RequestHandler
                     'Object exceeds max size for server-side encryption (' . $maxEncryptedObjectSize . ' bytes).',
                 );
             }
-            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($storagePath));
+            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($originalWrite->path));
             $enc = $encryption->encryptSseS3($plaintext);
-            $tempPath = $storagePath . '.enc.tmp';
-            try {
-                \Amp\File\write($tempPath, $enc['ciphertext']);
-                \Amp\File\move($tempPath, $storagePath);
-            } catch (\Throwable $e) {
-                try {
-                    \Amp\File\deleteFile($tempPath);
-                } catch (\Throwable) {
-                }
-                throw $e;
-            }
+            $encryptedWrite = self::replaceStoredPayload(
+                $storage,
+                $bucket,
+                $key,
+                $originalWrite->path,
+                $enc['ciphertext'],
+            );
 
-            return [
+            return [[
                 'sse-algorithm' => 'AES256',
                 'sse-key' => $enc['encryptedDataKey'],
                 'sse-iv' => $enc['iv'],
                 'sse-tag' => $enc['tag'],
-            ];
+            ], $encryptedWrite];
         }
 
-        return [];
+        return [[], null];
+    }
+
+    private static function replaceStoredPayload(
+        StorageBackend $storage,
+        string $bucket,
+        string $key,
+        string $oldPath,
+        string $payload,
+    ): StorageWriteResult {
+        $replacement = $storage->putObject(
+            $bucket,
+            $key,
+            new \Amp\ByteStream\ReadableBuffer($payload),
+        );
+
+        try {
+            $storage->deleteObjectByPath($oldPath, $bucket);
+        } catch (\Throwable $e) {
+            try {
+                $storage->deleteObjectByPath($replacement->path, $bucket);
+            } catch (\Throwable) {
+            }
+            throw $e;
+        }
+
+        return $replacement;
     }
 
     /**

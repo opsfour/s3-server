@@ -4,9 +4,17 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Notification;
 
+use Amp\Cancellation;
+use Amp\DeferredCancellation;
+use Amp\Future;
+use Amp\Http\Client\Connection\DefaultConnectionFactory;
+use Amp\Http\Client\Connection\UnlimitedConnectionPool;
 use Amp\Http\Client\HttpClient;
 use Amp\Http\Client\HttpClientBuilder;
 use Amp\Http\Client\Request as HttpRequest;
+use Amp\Socket\DnsSocketConnector;
+use Amp\Socket\StaticSocketConnector;
+use League\Uri\BaseUri;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use Psr\Log\LoggerInterface;
@@ -22,7 +30,14 @@ final class NotificationProcessor
 {
     private bool $running = false;
 
-    private readonly HttpClient $httpClient;
+    private const int MAX_REDIRECTS = 3;
+
+    private readonly ?HttpClient $httpClient;
+
+    private ?DeferredCancellation $deferredCancellation = null;
+
+    /** @var Future<void>|null */
+    private ?Future $loopFuture = null;
 
     /** @var array<string, array{failures: int, cooldownUntil: float}> Per-destination circuit breakers. */
     private array $circuitBreakers = [];
@@ -37,68 +52,100 @@ final class NotificationProcessor
         private readonly float $pollInterval = 2.0,
         ?HttpClient $httpClient = null,
         private readonly ?MetricsCollector $metrics = null,
+        private readonly bool $requireHttps = true,
     ) {
-        $this->httpClient = $httpClient ?? HttpClientBuilder::buildDefault();
+        $this->httpClient = $httpClient;
     }
 
     public function start(): void
     {
+        if ($this->running) {
+            return;
+        }
+
         $this->running = true;
-        \Amp\async($this->loop(...));
+        $this->deferredCancellation = new DeferredCancellation();
+        $this->loopFuture = \Amp\async(
+            $this->loop(...),
+            $this->deferredCancellation->getCancellation(),
+        );
     }
 
     public function stop(): void
     {
         $this->running = false;
+        $this->deferredCancellation?->cancel();
+
+        try {
+            $this->loopFuture?->await(new \Amp\TimeoutCancellation(10));
+        } catch (\Amp\CancelledException) {
+            // Cancellation is the expected loop exit path.
+        } catch (\Throwable $e) {
+            $this->logger->error('Notification processor did not stop cleanly.', $this->logContext([
+                'event' => 'processor_stop_failed',
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]));
+        } finally {
+            $this->loopFuture = null;
+            $this->deferredCancellation = null;
+        }
     }
 
-    private function loop(): void
+    private function loop(Cancellation $cancellation): void
     {
         $idleCount = 0;
 
-        while ($this->running) {
-            try {
-                $items = $this->metadata->dequeueNotifications(50);
-            } catch (\Throwable $e) {
-                $this->metrics?->recordNotificationEvent('dequeue', 'failed');
-                $this->logger->error('Notification dequeue failed.', $this->logContext([
-                    'event' => 'dequeue_failed',
-                    'exception' => $e::class,
-                    'error' => $e->getMessage(),
-                ]));
-                \Amp\delay($this->pollInterval * 5);
-                continue;
-            }
+        try {
+            while ($this->running) {
+                $cancellation->throwIfRequested();
+                try {
+                    $items = $this->metadata->dequeueNotifications(50);
+                } catch (\Throwable $e) {
+                    $this->metrics?->recordNotificationEvent('dequeue', 'failed');
+                    $this->logger->error('Notification dequeue failed.', $this->logContext([
+                        'event' => 'dequeue_failed',
+                        'exception' => $e::class,
+                        'error' => $e->getMessage(),
+                    ]));
+                    \Amp\delay($this->pollInterval * 5, cancellation: $cancellation);
+                    continue;
+                }
 
-            if ($items === []) {
-                // Exponential backoff when idle: 2s → 4s → 8s → max 30s
-                $idleCount = min($idleCount + 1, 10);
-                $delay = min(30.0, $this->pollInterval * (2 ** min($idleCount - 1, 4)));
-                \Amp\delay($delay);
-                continue;
-            }
+                if ($items === []) {
+                    // Exponential backoff when idle: 2s → 4s → 8s → max 30s.
+                    $idleCount = min($idleCount + 1, 10);
+                    $delay = min(30.0, $this->pollInterval * (2 ** min($idleCount - 1, 4)));
+                    \Amp\delay($delay, cancellation: $cancellation);
+                    continue;
+                }
 
-            $idleCount = 0; // Reset on activity
+                $idleCount = 0;
 
-            $futures = [];
-            foreach ($items as $item) {
-                $futures[] = \Amp\async(fn() => $this->process($item));
-            }
+                $futures = [];
+                foreach ($items as $item) {
+                    $futures[] = \Amp\async(fn() => $this->process($item, $cancellation));
+                }
 
-            try {
-                \Amp\Future\await($futures);
-            } catch (\Throwable $e) {
-                $this->logger->error('Notification batch processing failed.', $this->logContext([
-                    'event' => 'batch_failed',
-                    'exception' => $e::class,
-                    'error' => $e->getMessage(),
-                ]));
+                try {
+                    \Amp\Future\await($futures, $cancellation);
+                } catch (\Amp\CancelledException $e) {
+                    throw $e;
+                } catch (\Throwable $e) {
+                    $this->logger->error('Notification batch processing failed.', $this->logContext([
+                        'event' => 'batch_failed',
+                        'exception' => $e::class,
+                        'error' => $e->getMessage(),
+                    ]));
+                }
             }
+        } catch (\Amp\CancelledException) {
+            // Normal shutdown.
         }
     }
 
     /** @param array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int} $item */
-    private function process(array $item): void
+    private function process(array $item, ?Cancellation $cancellation = null): void
     {
         $id = (int) $item['id'];
         $destination = $item['destination_url'];
@@ -121,24 +168,7 @@ final class NotificationProcessor
         }
 
         try {
-            // SSRF protection: resolve DNS and validate.
-            $resolvedIp = $this->resolveAndValidateUrl($destination);
-            if ($resolvedIp === null) {
-                $this->recordFailure($destination);
-                $this->metadata->updateNotificationStatus($id, 'dead_letter', 'SSRF: private/reserved IP');
-                $this->metrics?->recordNotificationDelivery('blocked');
-                $this->metrics?->recordNotificationDelivery('dead_letter');
-                $this->logger->warning('Notification delivery blocked by destination safety policy.', $this->itemLogContext($item, [
-                    'event' => 'delivery_blocked',
-                    'reason' => 'private_or_reserved_destination',
-                    'status' => 'dead_letter',
-                ]));
-                return;
-            }
-
-            // Pin URL to resolved IP.
-            $pinnedUrl = $this->pinUrlToIp($destination, $resolvedIp);
-            $success = $this->sendWebhook($pinnedUrl, $item['payload_json'], $destination);
+            $success = $this->sendWebhook($destination, $item['payload_json'], cancellation: $cancellation);
 
             if ($success) {
                 $this->metadata->updateNotificationStatus($id, 'sent');
@@ -184,6 +214,17 @@ final class NotificationProcessor
                     ]));
                 }
             }
+        } catch (UnsafeNotificationDestination $e) {
+            $this->recordFailure($destination);
+            $this->metadata->updateNotificationStatus($id, 'dead_letter', $e->getMessage());
+            $this->metrics?->recordNotificationDelivery('blocked');
+            $this->metrics?->recordNotificationDelivery('dead_letter');
+            $this->logger->warning('Notification delivery blocked by destination safety policy.', $this->itemLogContext($item, [
+                'event' => 'delivery_blocked',
+                'reason' => 'unsafe_destination',
+                'status' => 'dead_letter',
+                'error' => $e->getMessage(),
+            ]));
         } catch (\Throwable $e) {
             $nextAttempts = $attempts + 1;
             if ($nextAttempts >= $maxAttempts) {
@@ -218,88 +259,139 @@ final class NotificationProcessor
         }
     }
 
-    private function sendWebhook(string $url, string $payload, ?string $originalUrl = null): bool
-    {
-        try {
-            $request = new HttpRequest($url, 'POST');
-            $request->setBody($payload);
-            $request->setHeader('Content-Type', 'application/json');
-            $request->setTransferTimeout(10);
+    private function sendWebhook(
+        string $url,
+        string $payload,
+        ?Cancellation $cancellation = null,
+    ): bool {
+        $currentUrl = $url;
+        $method = 'POST';
 
-            if ($originalUrl !== null) {
-                $originalHost = parse_url($originalUrl, PHP_URL_HOST);
-                if ($originalHost !== null && $originalHost !== false) {
-                    $request->setHeader('Host', $originalHost);
+        try {
+            for ($redirects = 0; $redirects <= self::MAX_REDIRECTS; $redirects++) {
+                $resolvedIp = $this->resolveAndValidateUrl($currentUrl, $cancellation);
+                $request = new HttpRequest($currentUrl, $method);
+                if ($method === 'POST') {
+                    $request->setBody($payload);
+                    $request->setHeader('Content-Type', 'application/json');
+                }
+                $request->setTransferTimeout(10);
+                $request->setTcpConnectTimeout(5);
+                $request->setTlsHandshakeTimeout(5);
+
+                $client = $this->httpClient ?? $this->createPinnedHttpClient($currentUrl, $resolvedIp);
+                $response = $client->request($request, $cancellation);
+                $status = $response->getStatus();
+
+                if ($status >= 200 && $status < 300) {
+                    $response->getBody()->close();
+
+                    return true;
+                }
+
+                if (! in_array($status, [301, 302, 303, 307, 308], true)) {
+                    $response->getBody()->close();
+
+                    return false;
+                }
+
+                $locations = $response->getHeaderArray('location');
+                $response->getBody()->close();
+                if (count($locations) !== 1 || $redirects === self::MAX_REDIRECTS) {
+                    return false;
+                }
+
+                $currentUrl = BaseUri::from($currentUrl)->resolve($locations[0])->getUriString();
+                if (in_array($status, [301, 302, 303], true)) {
+                    $method = 'GET';
                 }
             }
-
-            $response = $this->httpClient->request($request);
-
-            return $response->getStatus() < 400;
+        } catch (UnsafeNotificationDestination $e) {
+            throw $e;
         } catch (\Throwable $e) {
             $this->logger->warning('Webhook request failed.', $this->logContext([
                 'event' => 'webhook_request_failed',
-                'destination' => $this->sanitizeUrlForLog($originalUrl ?? $url),
+                'destination' => $this->sanitizeUrlForLog($currentUrl),
                 'exception' => $e::class,
                 'error' => $e->getMessage(),
             ]));
-            return false;
         }
+
+        return false;
     }
 
-    private function resolveAndValidateUrl(string $url): ?string
+    private function resolveAndValidateUrl(string $url, ?Cancellation $cancellation = null): string
     {
-        $host = parse_url($url, PHP_URL_HOST);
-        if ($host === null || $host === false) {
-            return null;
+        $parts = parse_url($url);
+        if ($parts === false || ! isset($parts['scheme'], $parts['host'])) {
+            throw new UnsafeNotificationDestination('Notification destination must be an absolute HTTP(S) URL.');
+        }
+
+        $scheme = strtolower($parts['scheme']);
+        if (! in_array($scheme, ['http', 'https'], true)) {
+            throw new UnsafeNotificationDestination('Notification destination URL scheme must be HTTP or HTTPS.');
+        }
+
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            throw new UnsafeNotificationDestination('Notification destination must not contain user information.');
+        }
+
+        if ($this->requireHttps && $scheme !== 'https') {
+            throw new UnsafeNotificationDestination('Notification destination must use HTTPS.');
+        }
+
+        $host = $parts['host'];
+        if ($host === '') {
+            throw new UnsafeNotificationDestination('Notification destination host is empty.');
         }
 
         if (filter_var($host, FILTER_VALIDATE_IP)) {
             if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
-                return null;
+                throw new UnsafeNotificationDestination('Notification destination resolves to a private or reserved IP address.');
             }
+
             return $host;
         }
 
         try {
-            $records = \Amp\Dns\resolve($host);
-        } catch (\Throwable) {
-            return null;
+            $records = \Amp\Dns\resolve($host, cancellation: $cancellation);
+        } catch (\Throwable $e) {
+            throw new \RuntimeException('Notification destination DNS resolution failed.', 0, $e);
         }
 
         if (empty($records)) {
-            return null;
+            throw new \RuntimeException('Notification destination DNS resolution returned no addresses.');
         }
 
         foreach ($records as $record) {
             $ip = $record->getValue();
             if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
-                return null;
+                throw new UnsafeNotificationDestination('Notification destination resolves to a private or reserved IP address.');
             }
         }
 
         return $records[0]->getValue();
     }
 
-    private function pinUrlToIp(string $url, string $ip): string
+    private function createPinnedHttpClient(string $url, string $ip): HttpClient
     {
         $parts = parse_url($url);
-        if ($parts === false || !isset($parts['host'])) {
-            return $url;
+        if ($parts === false || ! isset($parts['scheme'])) {
+            throw new UnsafeNotificationDestination('Notification destination URL is invalid.');
         }
 
-        $replacement = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? "[$ip]" : $ip;
-        $scheme = $parts['scheme'] ?? 'https';
-        $port = isset($parts['port']) ? ':' . $parts['port'] : '';
-        $path = $parts['path'] ?? '';
-        $query = isset($parts['query']) ? '?' . $parts['query'] : '';
-        $fragment = isset($parts['fragment']) ? '#' . $parts['fragment'] : '';
-        $userInfo = '';
-        if (isset($parts['user'])) {
-            $userInfo = $parts['user'] . (isset($parts['pass']) ? ':' . $parts['pass'] : '') . '@';
-        }
+        $port = $parts['port'] ?? ($parts['scheme'] === 'https' ? 443 : 80);
+        $address = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)
+            ? "tcp://[{$ip}]:{$port}"
+            : "tcp://{$ip}:{$port}";
+        $connector = new StaticSocketConnector($address, new DnsSocketConnector());
+        $pool = new UnlimitedConnectionPool(new DefaultConnectionFactory($connector));
 
-        return $scheme . '://' . $userInfo . $replacement . $port . $path . $query . $fragment;
+        return (new HttpClientBuilder())
+            ->usingPool($pool)
+            ->followRedirects(0)
+            ->retry(0)
+            ->build();
     }
 
     private function sanitizeUrlForLog(string $url): string

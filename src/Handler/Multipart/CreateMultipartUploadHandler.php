@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Handler\Multipart;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
@@ -31,10 +32,23 @@ final class CreateMultipartUploadHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
+        $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId)
+            ?? AclGrantResolver::privateAcl($ownerId);
+        $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
+        if (
+            $publicAccessBlock !== null
+            && $publicAccessBlock['blockPublicAcls']
+            && AclGrantResolver::isPublic($aclGrants)
+        ) {
+            throw new \OpsFour\S3Server\Exception\AccessDeniedException(
+                'Public ACLs are blocked by the bucket Public Access Block configuration.',
+            );
+        }
 
         $uploadId = bin2hex(random_bytes(16));
         $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
         $userMetadata = UserMetadataExtractor::extract($request);
+        $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
 
         // Preserve standard HTTP metadata for CompleteMultipartUpload.
         $contentEncoding = $request->getHeader('content-encoding');

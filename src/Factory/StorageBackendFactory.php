@@ -8,6 +8,8 @@ use League\Flysystem\FilesystemOperator;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -19,7 +21,7 @@ final class StorageBackendFactory
 {
     /**
      * @param  string  $driver  One of: filesystem, flysystem, memory.
-     * @param  array{path?: string, filesystem?: FilesystemOperator, temp_dir?: string}  $config
+     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, worker_pool_size?: int} $config
      */
     public static function create(string $driver, array $config = []): StorageBackend
     {
@@ -27,16 +29,36 @@ final class StorageBackendFactory
             'filesystem' => new FilesystemBackend(
                 $config['path'] ?? throw new \InvalidArgumentException('Filesystem requires "path"'),
             ),
-            'flysystem' => new FlysystemBackend(
-                $config['filesystem'] ?? throw new \InvalidArgumentException(
-                    'Flysystem driver requires a "filesystem" key containing a League\Flysystem\FilesystemOperator instance. '
-                    . 'Register it in your service provider: $this->app->when(StorageBackendFactory::class)->give(["filesystem" => $operator]);',
-                ),
-                $config['temp_dir'] ?? sys_get_temp_dir(),
-            ),
+            'flysystem' => self::createFlysystem($config),
             'memory' => new InMemoryBackend(),
             default => throw new \InvalidArgumentException("Unknown storage driver: {$driver}"),
         };
+    }
+
+    /**
+     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, worker_pool_size?: int} $config
+     */
+    private static function createFlysystem(array $config): StorageBackend
+    {
+        $tempDir = $config['temp_dir'] ?? sys_get_temp_dir();
+        $workerPoolSize = (int) ($config['worker_pool_size'] ?? 0);
+        if ($workerPoolSize > 0) {
+            return new ParallelFlysystemBackend(
+                $config['filesystem_factory'] ?? throw new \InvalidArgumentException(
+                    'Flysystem worker mode requires a serializable "filesystem_factory".',
+                ),
+                $tempDir,
+                $workerPoolSize,
+            );
+        }
+
+        return new FlysystemBackend(
+            $config['filesystem'] ?? throw new \InvalidArgumentException(
+                'Flysystem driver requires a "filesystem" key containing a League\Flysystem\FilesystemOperator instance. '
+                . 'Register it in your service provider: $this->app->when(StorageBackendFactory::class)->give(["filesystem" => $operator]);',
+            ),
+            $tempDir,
+        );
     }
 
     /**

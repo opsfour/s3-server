@@ -149,9 +149,6 @@ final class InMemoryBackend implements StorageBackend
 
         $this->objects[$path] = $assembled;
 
-        // Clean up part data after successful assembly.
-        unset($this->parts[$uploadId]);
-
         return new StorageWriteResult(
             path: $path,
             size: strlen($assembled),

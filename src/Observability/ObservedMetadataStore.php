@@ -578,6 +578,11 @@ final readonly class ObservedMetadataStore implements MetadataStore
         $this->observe(__FUNCTION__, fn() => $this->inner->rollback());
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        $this->observe(__FUNCTION__, fn() => $this->inner->lockOwnerForUpdate($ownerId));
+    }
+
     public function transaction(callable $callback): mixed
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->transaction($callback));

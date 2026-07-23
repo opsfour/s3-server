@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Handler\Bucket;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
 use OpsFour\S3Server\Exception\BucketAlreadyOwnedByYouException;
 use OpsFour\S3Server\Exception\InvalidBucketNameException;
@@ -51,23 +52,34 @@ final class CreateBucketHandler implements RequestHandler
                 $region = $parsed['locationConstraint'];
             }
         }
+        $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'bucket')
+            ?? AclGrantResolver::privateAcl($ownerId);
 
-        // 3. Check if bucket already exists.
-        $existingOwner = $this->metadata->getBucketOwner($bucket);
-        if ($existingOwner !== null) {
-            if ($existingOwner === $ownerId) {
-                // AWS S3: same-owner recreation returns 200 (idempotent).
-                return new Response(status: 200, headers: ['Location' => '/' . $bucket]);
+        // 3. Serialize same-account quota checks and metadata creation.
+        $alreadyOwned = false;
+        $this->metadata->transaction(function () use ($ownerId, $bucket, $region, $aclGrants, &$alreadyOwned): void {
+            $this->metadata->lockOwnerForUpdate($ownerId);
+
+            $existingOwner = $this->metadata->getBucketOwner($bucket);
+            if ($existingOwner !== null) {
+                if ($existingOwner === $ownerId) {
+                    $alreadyOwned = true;
+
+                    return;
+                }
+                throw new BucketAlreadyExistsException();
             }
-            throw new BucketAlreadyExistsException();
+
+            $this->quotas?->assertCanCreateBucket($ownerId);
+            $this->metadata->createBucket($ownerId, $bucket, $region);
+            $this->metadata->putAcl('bucket', $bucket, $ownerId, $aclGrants);
+        });
+
+        if ($alreadyOwned) {
+            return new Response(status: 200, headers: ['Location' => '/' . $bucket]);
         }
 
-        $this->quotas?->assertCanCreateBucket($ownerId);
-
-        // 4. Create in metadata store.
-        $this->metadata->createBucket($ownerId, $bucket, $region);
-
-        // 5. Create in storage backend.
+        // 4. Create in storage backend.
         try {
             $this->storage->createBucket($bucket);
         } catch (\Throwable $e) {
@@ -79,49 +91,11 @@ final class CreateBucketHandler implements RequestHandler
             throw $e;
         }
 
-        // 6. Apply canned ACL if x-amz-acl header is present.
-        $cannedAcl = $request->getHeader('x-amz-acl');
-        if ($cannedAcl !== null && $cannedAcl !== '' && $cannedAcl !== 'private') {
-            $grants = self::expandCannedAcl($cannedAcl, $ownerId);
-            $this->metadata->putAcl('bucket', $bucket, $ownerId, $grants);
-        }
-
-        // 7. Return 200 with Location header.
+        // 5. Return 200 with Location header.
         return new Response(
             status: 200,
             headers: ['Location' => '/' . $bucket],
         );
-    }
-
-    private const string ALL_USERS_URI = 'http://acs.amazonaws.com/groups/global/AllUsers';
-    private const string AUTH_USERS_URI = 'http://acs.amazonaws.com/groups/global/AuthenticatedUsers';
-
-    /**
-     * Expand a canned ACL name into grants.
-     *
-     * @return list<array{granteeType: string, granteeId: string, permission: string}>
-     */
-    private static function expandCannedAcl(string $cannedAcl, string $ownerId): array
-    {
-        $ownerGrant = ['granteeType' => 'CanonicalUser', 'granteeId' => $ownerId, 'permission' => 'FULL_CONTROL'];
-
-        return match ($cannedAcl) {
-            'private' => [$ownerGrant],
-            'public-read' => [
-                $ownerGrant,
-                ['granteeType' => 'Group', 'granteeId' => self::ALL_USERS_URI, 'permission' => 'READ'],
-            ],
-            'public-read-write' => [
-                $ownerGrant,
-                ['granteeType' => 'Group', 'granteeId' => self::ALL_USERS_URI, 'permission' => 'READ'],
-                ['granteeType' => 'Group', 'granteeId' => self::ALL_USERS_URI, 'permission' => 'WRITE'],
-            ],
-            'authenticated-read' => [
-                $ownerGrant,
-                ['granteeType' => 'Group', 'granteeId' => self::AUTH_USERS_URI, 'permission' => 'READ'],
-            ],
-            default => [$ownerGrant],
-        };
     }
 
     /**

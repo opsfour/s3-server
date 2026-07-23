@@ -9,10 +9,11 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
-use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -38,7 +39,7 @@ final class DeleteObjectsHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        private readonly StorageTierRegistry $storageTiers,
         private readonly ?NotificationDispatcher $notifications = null,
     ) {
         $this->lockChecker = new ObjectLockChecker($metadata);
@@ -71,11 +72,12 @@ final class DeleteObjectsHandler implements RequestHandler
         $versioning = $this->metadata->getBucketVersioning($bucket);
 
         // Collect storage paths and notifications to process after commit.
-        $pathsToDelete = [];
+        /** @var list<ObjectInfo> $objectsToClean */
+        $objectsToClean = [];
         $notificationKeys = [];
 
         // Wrap all metadata deletions in a transaction for atomicity.
-        $this->metadata->transaction(function () use ($parsed, $bucket, $ownerId, $versioning, $quiet, $request, &$deleted, &$errors, &$pathsToDelete, &$notificationKeys): void {
+        $this->metadata->transaction(function () use ($parsed, $bucket, $ownerId, $versioning, $quiet, $request, &$deleted, &$errors, &$objectsToClean, &$notificationKeys): void {
             foreach ($parsed['objects'] as $obj) {
                 $key = $obj['key'];
                 $versionId = $obj['versionId'] ?? null;
@@ -90,8 +92,8 @@ final class DeleteObjectsHandler implements RequestHandler
 
                         if ($deletedInfo !== null) {
                             // Collect storage path for deferred deletion (after commit).
-                            if (! $deletedInfo->isDeleteMarker && isset($deletedInfo->systemMetadata['storagePath']) && $deletedInfo->systemMetadata['storagePath'] !== '') {
-                                $pathsToDelete[] = $deletedInfo->systemMetadata['storagePath'];
+                            if (! $deletedInfo->isDeleteMarker) {
+                                $objectsToClean[] = $deletedInfo;
                             }
 
                             $notificationKeys[] = $key;
@@ -114,14 +116,11 @@ final class DeleteObjectsHandler implements RequestHandler
                         $isSuspended = ($versioning === 'Suspended');
 
                         // Suspended: fetch existing null version for cleanup after metadata write.
-                        $oldSuspendedPath = null;
+                        $oldSuspendedObject = null;
                         if ($isSuspended) {
                             $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
                             if ($existingObj !== null && !$existingObj->isDeleteMarker) {
-                                $oldSuspendedPath = $existingObj->systemMetadata['storagePath'] ?? null;
-                                if ($oldSuspendedPath === '') {
-                                    $oldSuspendedPath = null;
-                                }
+                                $oldSuspendedObject = $existingObj;
                             }
                         }
 
@@ -129,8 +128,8 @@ final class DeleteObjectsHandler implements RequestHandler
                         $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
 
                         // Only queue path for deletion after successful metadata write.
-                        if ($oldSuspendedPath !== null) {
-                            $pathsToDelete[] = $oldSuspendedPath;
+                        if ($oldSuspendedObject !== null) {
+                            $objectsToClean[] = $oldSuspendedObject;
                         }
                         $notificationKeys[] = $key;
 
@@ -146,15 +145,11 @@ final class DeleteObjectsHandler implements RequestHandler
                         $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
 
                         if ($objectInfo !== null) {
-                            $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
-
                             $this->metadata->deleteObjectMetadata($bucket, $key);
 
                             // Collect path AFTER metadata delete succeeds to avoid
                             // deleting storage for objects whose metadata wasn't removed.
-                            if ($storagePath !== null && $storagePath !== '') {
-                                $pathsToDelete[] = $storagePath;
-                            }
+                            $objectsToClean[] = $objectInfo;
                             $notificationKeys[] = $key;
                         }
 
@@ -181,12 +176,8 @@ final class DeleteObjectsHandler implements RequestHandler
         });
 
         // Delete storage files AFTER successful metadata commit.
-        foreach ($pathsToDelete as $path) {
-            try {
-                $this->storage->deleteObjectByPath($path, $bucket);
-            } catch (\Throwable) {
-                // Log but don't fail — metadata is already committed.
-            }
+        foreach ($objectsToClean as $object) {
+            $this->deleteStoredData($object);
         }
 
         // Dispatch notifications after commit.
@@ -201,6 +192,26 @@ final class DeleteObjectsHandler implements RequestHandler
             headers: ['Content-Type' => 'application/xml'],
             body: $xml,
         );
+    }
+
+    private function deleteStoredData(ObjectInfo $object): void
+    {
+        $path = $object->systemMetadata['storagePath'] ?? null;
+        if ($path !== null && $path !== '') {
+            try {
+                $this->storageTiers->tier($object->storageTier)->backend
+                    ->deleteObjectByPath($path, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            try {
+                $this->storageTiers->defaultBackend()
+                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
     }
 
 }

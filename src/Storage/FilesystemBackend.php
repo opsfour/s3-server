@@ -6,7 +6,9 @@ namespace OpsFour\S3Server\Storage;
 
 use Amp\ByteStream\ReadableStream;
 use Amp\File;
+use Amp\File\Driver\ParallelFilesystemDriver;
 use Amp\File\FilesystemException;
+use Amp\Parallel\Worker\ContextWorkerPool;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
@@ -22,11 +24,16 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
  * Write strategy: data is first written to a temp file, then atomically
  * moved to the final path. This prevents partial reads on concurrent access.
  */
-final class FilesystemBackend implements StorageBackend
+final class FilesystemBackend implements ShutdownAwareStorageBackend, StorageBackend
 {
+    private const int IO_CHUNK_SIZE = 1_048_576;
+
     private readonly File\Filesystem $fileFilesystem;
 
     private readonly File\Filesystem $metadataFilesystem;
+
+    /** @var list<ContextWorkerPool> */
+    private array $ownedWorkerPools = [];
 
     /**
      * @param  string  $basePath  Root directory for all storage operations.
@@ -37,8 +44,36 @@ final class FilesystemBackend implements StorageBackend
         ?File\Filesystem $fileFilesystem = null,
         ?File\Filesystem $metadataFilesystem = null,
     ) {
-        $this->fileFilesystem = $fileFilesystem ?? File\filesystem();
-        $this->metadataFilesystem = $metadataFilesystem ?? new File\Filesystem(File\createDefaultDriver());
+        if ($fileFilesystem === null) {
+            $dataPool = new ContextWorkerPool(8);
+            $this->ownedWorkerPools[] = $dataPool;
+            $fileFilesystem = new File\Filesystem(new ParallelFilesystemDriver($dataPool));
+        }
+        $this->fileFilesystem = $fileFilesystem;
+
+        if ($metadataFilesystem === null) {
+            $metadataPool = new ContextWorkerPool(8);
+            $this->ownedWorkerPools[] = $metadataPool;
+            $metadataFilesystem = new File\Filesystem(new ParallelFilesystemDriver($metadataPool));
+        }
+        $this->metadataFilesystem = $metadataFilesystem;
+    }
+
+    public function shutdown(): void
+    {
+        foreach ($this->ownedWorkerPools as $pool) {
+            $pool->shutdown();
+        }
+        $this->ownedWorkerPools = [];
+    }
+
+    public function __destruct()
+    {
+        try {
+            $this->shutdown();
+        } catch (\Throwable) {
+            // Process shutdown remains best-effort if the event loop is gone.
+        }
     }
 
     /**
@@ -63,11 +98,10 @@ final class FilesystemBackend implements StorageBackend
         $tempFile = $this->fileFilesystem->openFile($tempPath, 'w');
 
         try {
-            while (($chunk = $body->read()) !== null) {
+            $this->copyStreamToFile($body, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                $tempFile->write($chunk);
-            }
+            });
 
             self::closeAndRelease($tempFile);
         } catch (\Throwable $e) {
@@ -120,11 +154,13 @@ final class FilesystemBackend implements StorageBackend
             throw new InternalErrorException('Failed to seek in object file: ' . $e->getMessage(), $e);
         }
 
+        $stream = new FileReadableStream($file, self::IO_CHUNK_SIZE);
+
         if ($length !== null) {
-            return new LimitedReadableStream($file, $length);
+            return new LimitedReadableStream($stream, $length);
         }
 
-        return $file;
+        return $stream;
     }
 
     /**
@@ -238,11 +274,10 @@ final class FilesystemBackend implements StorageBackend
         $tempFile = $this->fileFilesystem->openFile($tempPath, 'w');
 
         try {
-            while (($chunk = $data->read()) !== null) {
+            $this->copyStreamToFile($data, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                $tempFile->write($chunk);
-            }
+            });
 
             self::closeAndRelease($tempFile);
         } catch (\Throwable $e) {
@@ -315,14 +350,18 @@ final class FilesystemBackend implements StorageBackend
                 }
 
                 $partFile = $this->fileFilesystem->openFile($partPath, 'r');
+                $partStream = new FileReadableStream($partFile, self::IO_CHUNK_SIZE);
                 $partMd5Context = hash_init('md5');
 
-                while (($chunk = $partFile->read()) !== null) {
+                $this->copyStreamToFile($partStream, $outFile, static function (string $chunk) use (
+                    $calculator,
+                    $partMd5Context,
+                    &$size,
+                ): void {
                     $calculator->update($chunk);
                     hash_update($partMd5Context, $chunk);
                     $size += strlen($chunk);
-                    $outFile->write($chunk);
-                }
+                });
 
                 self::closeAndRelease($partFile);
 
@@ -357,9 +396,6 @@ final class FilesystemBackend implements StorageBackend
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize assembled object: ' . $e->getMessage(), $e);
         }
-
-        // Clean up part files after successful assembly.
-        $this->cleanupParts($uploadId);
 
         return new StorageWriteResult(
             path: $finalPath,
@@ -412,14 +448,14 @@ final class FilesystemBackend implements StorageBackend
         $size = 0;
 
         $srcFile = $this->fileFilesystem->openFile($srcPath, 'r');
+        $srcStream = new FileReadableStream($srcFile, self::IO_CHUNK_SIZE);
         $dstFile = $this->fileFilesystem->openFile($tempPath, 'w');
 
         try {
-            while (($chunk = $srcFile->read()) !== null) {
+            $this->copyStreamToFile($srcStream, $dstFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                $dstFile->write($chunk);
-            }
+            });
 
             self::closeAndRelease($srcFile);
             self::closeAndRelease($dstFile);
@@ -465,6 +501,28 @@ final class FilesystemBackend implements StorageBackend
     // ---------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------
+
+    /**
+     * @param callable(string): void $onChunk
+     */
+    private function copyStreamToFile(ReadableStream $source, File\File $target, callable $onChunk): void
+    {
+        $buffer = '';
+
+        while (($chunk = $source->read()) !== null) {
+            $onChunk($chunk);
+            $buffer .= $chunk;
+
+            if (strlen($buffer) >= self::IO_CHUNK_SIZE) {
+                $target->write($buffer);
+                $buffer = '';
+            }
+        }
+
+        if ($buffer !== '') {
+            $target->write($buffer);
+        }
+    }
 
     private function ensureDirectory(string $path): void
     {

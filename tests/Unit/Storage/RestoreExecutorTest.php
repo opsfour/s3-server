@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
@@ -44,13 +46,19 @@ final class RestoreExecutorTest extends TestCase
         $this->metadata->putObjectMetadata('bucket', 'archive.bin', 'owner', $coldWrite->size, '"' . $coldWrite->md5Hex . '"', 'application/octet-stream', $coldWrite->path);
         $this->metadata->updateObjectPlacement('bucket', 'archive.bin', null, 'GLACIER', 'GLACIER', $coldWrite->path);
         $jobId = $this->metadata->enqueueRestoreJob('bucket', 'archive.bin', null, 'GLACIER', $coldWrite->path, 2);
+        $event = null;
+        $notifications = new NotificationDispatcher($this->metadata);
+        $notifications->listen('s3:ObjectRestore:Completed', static function (S3Event $received) use (&$event): void {
+            $event = $received;
+        });
 
         $executor = new RestoreExecutor($this->metadata, new StorageTierRegistry([
             new StorageTier('STANDARD', $hot, defaultWriteTier: true),
             new StorageTier('GLACIER', $cold, restoreRequired: true),
-        ]));
+        ]), notifications: $notifications);
 
         $stats = $executor->processNext(10);
+        \Amp\delay(0.01);
 
         $job = $this->metadata->getRestoreJob($jobId);
         $object = $this->metadata->getObjectMetadata('bucket', 'archive.bin');
@@ -67,6 +75,49 @@ final class RestoreExecutorTest extends TestCase
             'objectCount' => 1,
             'bytesUsed' => $coldWrite->size,
         ], $this->metadata->getBucketStorageStats('bucket'));
+        self::assertInstanceOf(S3Event::class, $event);
+        self::assertSame('s3:ObjectRestore:Completed', $event->name);
+        self::assertSame('archive.bin', $event->key);
+        self::assertSame('GLACIER', $event->attributes['sourceTier']);
+        self::assertSame(2, $event->attributes['restoreDays']);
+    }
+
+    public function test_restores_encrypted_ciphertext_when_physical_size_differs_from_plaintext_metadata(): void
+    {
+        $hot = new InMemoryBackend();
+        $cold = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $cold->createBucket('bucket');
+
+        $ciphertext = 'encrypted-payload-plus-authentication-tag';
+        $coldWrite = $cold->putObject('bucket', 'encrypted.bin', new ReadableBuffer($ciphertext));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'encrypted.bin',
+            'owner',
+            5,
+            '"' . md5('plain') . '"',
+            'application/octet-stream',
+            $coldWrite->path,
+            userMetadata: ['__sse-algorithm' => 'AES256'],
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'encrypted.bin', null, 'GLACIER', 'GLACIER', $coldWrite->path);
+        $this->metadata->enqueueRestoreJob('bucket', 'encrypted.bin', null, 'GLACIER', $coldWrite->path, 2);
+
+        $executor = new RestoreExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+            new StorageTier('GLACIER', $cold, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+        $object = $this->metadata->getObjectMetadata('bucket', 'encrypted.bin');
+        self::assertNotNull($object);
+        self::assertNotNull($object->restoredStoragePath);
+        self::assertSame($ciphertext, \Amp\ByteStream\buffer($hot->getObjectByPath($object->restoredStoragePath)));
+        self::assertSame(5, $object->size);
     }
 
     public function test_stale_restore_job_after_overwrite_is_completed_without_restoring_old_data(): void

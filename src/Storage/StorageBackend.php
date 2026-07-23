@@ -9,8 +9,9 @@ use Amp\ByteStream\ReadableStream;
 /**
  * Abstraction over object data storage.
  *
- * All I/O is non-blocking via Amp streams. Implementations must
- * never buffer entire objects in memory.
+ * Production implementations must keep memory bounded and avoid blocking the
+ * Amp event loop. Synchronous adapters must be isolated behind a worker-backed
+ * implementation.
  */
 interface StorageBackend
 {

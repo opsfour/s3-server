@@ -64,10 +64,14 @@ final class AclEvaluatorTest extends TestCase
         $this->assertSame('READ', AclEvaluator::operationToPermission($operation));
     }
 
+    /** @return iterable<string, array{S3Operation}> */
     public static function readOperationsProvider(): iterable
     {
         yield 'GetObject' => [S3Operation::GetObject];
         yield 'HeadObject' => [S3Operation::HeadObject];
+        yield 'SelectObjectContent' => [S3Operation::SelectObjectContent];
+        yield 'GetObjectAttributes' => [S3Operation::GetObjectAttributes];
+        yield 'HeadBucket' => [S3Operation::HeadBucket];
         yield 'ListObjectsV2' => [S3Operation::ListObjectsV2];
         yield 'ListObjects' => [S3Operation::ListObjects];
         yield 'ListObjectVersions' => [S3Operation::ListObjectVersions];
@@ -79,9 +83,11 @@ final class AclEvaluatorTest extends TestCase
         $this->assertSame('WRITE', AclEvaluator::operationToPermission($operation));
     }
 
+    /** @return iterable<string, array{S3Operation}> */
     public static function writeOperationsProvider(): iterable
     {
         yield 'PutObject' => [S3Operation::PutObject];
+        yield 'PostObject' => [S3Operation::PostObject];
         yield 'DeleteObject' => [S3Operation::DeleteObject];
         yield 'DeleteObjects' => [S3Operation::DeleteObjects];
         yield 'CopyObject' => [S3Operation::CopyObject];
@@ -98,6 +104,7 @@ final class AclEvaluatorTest extends TestCase
         $this->assertSame('READ_ACP', AclEvaluator::operationToPermission($operation));
     }
 
+    /** @return iterable<string, array{S3Operation}> */
     public static function readAcpOperationsProvider(): iterable
     {
         yield 'GetBucketAcl' => [S3Operation::GetBucketAcl];
@@ -110,6 +117,7 @@ final class AclEvaluatorTest extends TestCase
         $this->assertSame('WRITE_ACP', AclEvaluator::operationToPermission($operation));
     }
 
+    /** @return iterable<string, array{S3Operation}> */
     public static function writeAcpOperationsProvider(): iterable
     {
         yield 'PutBucketAcl' => [S3Operation::PutBucketAcl];
@@ -122,6 +130,7 @@ final class AclEvaluatorTest extends TestCase
         $this->assertNull(AclEvaluator::operationToPermission($operation));
     }
 
+    /** @return iterable<string, array{S3Operation}> */
     public static function configOperationsProvider(): iterable
     {
         yield 'CreateBucket' => [S3Operation::CreateBucket];
@@ -129,6 +138,88 @@ final class AclEvaluatorTest extends TestCase
         yield 'PutBucketPolicy' => [S3Operation::PutBucketPolicy];
         yield 'PutBucketVersioning' => [S3Operation::PutBucketVersioning];
         yield 'ListBuckets' => [S3Operation::ListBuckets];
+    }
+
+    public function test_non_owner_is_denied_for_owner_policy_only_operation(): void
+    {
+        $this->assertFalse(AclEvaluator::isAllowed(
+            operation: S3Operation::PutBucketVersioning,
+            requesterId: 'foreign-account',
+            ownerId: 'bucket-owner',
+            grants: [],
+        ));
+    }
+
+    public function test_every_operation_has_an_explicit_acl_classification(): void
+    {
+        $classified = [];
+
+        foreach (S3Operation::cases() as $operation) {
+            $permission = AclEvaluator::operationToPermission($operation);
+            $this->assertContains($permission, ['READ', 'WRITE', 'READ_ACP', 'WRITE_ACP', null]);
+            $classified[] = $operation->value;
+        }
+
+        $this->assertCount(66, $classified);
+        $this->assertSame(
+            array_map(static fn(S3Operation $operation): string => $operation->value, S3Operation::cases()),
+            $classified,
+        );
+    }
+
+    public function test_every_operation_follows_owner_foreign_and_anonymous_matrix(): void
+    {
+        foreach (S3Operation::cases() as $operation) {
+            $permission = AclEvaluator::operationToPermission($operation);
+            $privateGrants = [
+                ['granteeType' => 'CanonicalUser', 'granteeId' => 'bucket-owner', 'permission' => 'FULL_CONTROL'],
+            ];
+
+            $this->assertTrue(AclEvaluator::isAllowed(
+                $operation,
+                'bucket-owner',
+                'bucket-owner',
+                $privateGrants,
+            ), $operation->value . ': owner');
+            $this->assertFalse(AclEvaluator::isAllowed(
+                $operation,
+                'foreign-account',
+                'bucket-owner',
+                $privateGrants,
+            ), $operation->value . ': foreign private');
+            $this->assertFalse(AclEvaluator::isAllowed(
+                $operation,
+                '',
+                'bucket-owner',
+                $privateGrants,
+                isAuthenticated: false,
+            ), $operation->value . ': anonymous private');
+
+            $foreignGrant = $permission === null ? [] : [[
+                'granteeType' => 'CanonicalUser',
+                'granteeId' => 'foreign-account',
+                'permission' => $permission,
+            ]];
+            $this->assertSame($permission !== null, AclEvaluator::isAllowed(
+                $operation,
+                'foreign-account',
+                'bucket-owner',
+                $foreignGrant,
+            ), $operation->value . ': foreign explicit ACL');
+
+            $publicGrant = $permission === null ? [] : [[
+                'granteeType' => 'Group',
+                'granteeId' => self::ALL_USERS,
+                'permission' => $permission,
+            ]];
+            $this->assertSame($permission !== null, AclEvaluator::isAllowed(
+                $operation,
+                '',
+                'bucket-owner',
+                $publicGrant,
+                isAuthenticated: false,
+            ), $operation->value . ': anonymous public ACL');
+        }
     }
 
     // -----------------------------------------------------------------
@@ -465,9 +556,9 @@ final class AclEvaluatorTest extends TestCase
         ));
     }
 
-    public function test_null_returning_operation_always_allowed(): void
+    public function test_owner_policy_only_operation_denies_non_owner_without_policy_allow(): void
     {
-        $this->assertTrue(AclEvaluator::isAllowed(
+        $this->assertFalse(AclEvaluator::isAllowed(
             operation: S3Operation::CreateBucket,
             requesterId: 'user-a',
             ownerId: 'owner-1',

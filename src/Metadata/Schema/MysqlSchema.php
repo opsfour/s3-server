@@ -9,12 +9,13 @@ namespace OpsFour\S3Server\Metadata\Schema;
  *
  * All tables use the `s3_` prefix to avoid collisions when sharing a database.
  * Engine: InnoDB with utf8mb4_unicode_ci collation.
- * Schema version: 1
+ * The complete schema represents VERSION; incremental migrations are returned
+ * by getMigrationStatements().
  */
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 11;
+    public const int VERSION = 12;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -79,6 +80,13 @@ final class MysqlSchema
                 max_bytes_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
+            // Transactional owner write locks for quotas and replacement serialization.
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
+                owner_id VARCHAR(255) NOT NULL PRIMARY KEY
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -583,6 +591,14 @@ final class MysqlSchema
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 KEY idx_s3_restore_jobs_status_next (status, next_attempt_at),
                 KEY idx_s3_restore_jobs_object (bucket, key_name(255), version_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL;
+        }
+
+        if ($fromVersion < 12) {
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
+                owner_id VARCHAR(255) NOT NULL PRIMARY KEY
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL;
         }

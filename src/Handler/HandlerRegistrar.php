@@ -150,9 +150,18 @@ final class HandlerRegistrar
         );
 
         // Object operations.
+        $putObjectHandler = new PutObjectHandler(
+            $metadata,
+            $storage,
+            $encryption,
+            $notifications,
+            $config->maxEncryptedObjectSize,
+            $quotas,
+            $storageTiers,
+        );
         $registry->register(
             S3Operation::PutObject,
-            new PutObjectHandler($metadata, $storage, $encryption, $notifications, $config->maxEncryptedObjectSize, $quotas),
+            $putObjectHandler,
         );
 
         $registry->register(
@@ -172,7 +181,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::DeleteObject,
-            new DeleteObjectHandler($metadata, $storage, $notifications),
+            new DeleteObjectHandler($metadata, $storageTiers, $notifications),
         );
 
         // Phase 3: Listing, batch, and copy operations.
@@ -188,17 +197,25 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::DeleteObjects,
-            new DeleteObjectsHandler($metadata, $storage, $notifications),
+            new DeleteObjectsHandler($metadata, $storageTiers, $notifications),
         );
 
         $registry->register(
             S3Operation::PostObject,
-            new PostObjectHandler($metadata, $storage, $credentialProvider),
+            new PostObjectHandler($metadata, $putObjectHandler),
         );
 
         $registry->register(
             S3Operation::CopyObject,
-            new CopyObjectHandler($metadata, $storage, $encryption, $notifications, $config->maxEncryptedObjectSize, $quotas),
+            new CopyObjectHandler(
+                $metadata,
+                $storage,
+                $encryption,
+                $notifications,
+                $config->maxEncryptedObjectSize,
+                $quotas,
+                $storageTiers,
+            ),
         );
 
         // Phase 4: Multipart upload operations.
@@ -214,12 +231,21 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers),
         );
 
         $registry->register(
             S3Operation::CompleteMultipartUpload,
-            new CompleteMultipartUploadHandler($metadata, $storage, $encryption, $notifications, $config->enforceMinPartSize, $config->maxEncryptedObjectSize, $quotas),
+            new CompleteMultipartUploadHandler(
+                $metadata,
+                $storage,
+                $encryption,
+                $notifications,
+                $config->enforceMinPartSize,
+                $config->maxEncryptedObjectSize,
+                $quotas,
+                $storageTiers,
+            ),
         );
 
         $registry->register(
@@ -454,7 +480,14 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::SelectObjectContent,
-            new SelectObjectContentHandler($metadata, $storage, $config->maxSelectObjectSize, $selectWorkerPool, $metrics),
+            new SelectObjectContentHandler(
+                $metadata,
+                $storage,
+                $config->maxSelectObjectSize,
+                $selectWorkerPool,
+                $metrics,
+                $storageTiers,
+            ),
         );
 
         $registry->register(

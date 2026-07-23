@@ -11,6 +11,7 @@ use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -24,6 +25,8 @@ final class LifecycleExecutor
 {
     private readonly string $lockOwnerId;
 
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -34,6 +37,7 @@ final class LifecycleExecutor
         ?string $lockOwnerId = null,
         private readonly ?MetricsCollector $metrics = null,
         private readonly ?NotificationDispatcher $notifications = null,
+        ?StorageTierRegistry $storageTiers = null,
     ) {
         if ($this->batchSize < 1) {
             throw new \InvalidArgumentException('Lifecycle batch size must be >= 1.');
@@ -48,6 +52,7 @@ final class LifecycleExecutor
         }
 
         $this->lockOwnerId = $lockOwnerId ?? 'lifecycle-' . bin2hex(random_bytes(8));
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
     }
 
     /**
@@ -445,22 +450,7 @@ final class LifecycleExecutor
 
                     if ($obj->versionId !== null) {
                         $this->metadata->deleteObjectVersion($bucket, $obj->key, $obj->versionId);
-                        $storagePath = $obj->systemMetadata['storagePath'] ?? null;
-                        if ($storagePath !== null && $storagePath !== '') {
-                            try {
-                                $this->storage->deleteObjectByPath($storagePath, $bucket);
-                            } catch (\Throwable $e) {
-                                $this->logger->warning('Lifecycle failed to delete noncurrent version storage.', $this->lifecycleContext([
-                                    'event' => 'storage_delete_failed',
-                                    'bucket' => $bucket,
-                                    'key' => $obj->key,
-                                    'version_id' => $obj->versionId,
-                                    'action' => $action,
-                                    'exception' => $e::class,
-                                    'error' => $e->getMessage(),
-                                ]));
-                            }
-                        }
+                        $this->deleteStoredData($obj, $action);
                         $deleted++;
                         $actions++;
                         $this->metrics?->recordLifecycleAction($action);
@@ -666,27 +656,43 @@ final class LifecycleExecutor
         } elseif ($versioning === 'Suspended') {
             // Suspended: create delete marker at version_id='null' to preserve existing versions.
             $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId, suspended: true);
+            $this->deleteStoredData($obj, 'expire_current');
         } else {
             // Delete metadata first, then best-effort storage cleanup.
             // If metadata delete succeeds but storage fails, the file is orphaned
             // (cleaned up by lifecycle temp-file sweep). The reverse order risks
             // metadata pointing to a missing file — causing 500 on reads.
-            $storagePath = $obj->systemMetadata['storagePath'] ?? null;
             $this->metadata->deleteObjectMetadata($bucket, $obj->key);
-            if ($storagePath !== null && $storagePath !== '') {
-                try {
-                    $this->storage->deleteObjectByPath($storagePath, $bucket);
-                } catch (\Throwable $e) {
-                    $this->logger->warning('Lifecycle failed to delete object storage.', $this->lifecycleContext([
-                        'event' => 'storage_delete_failed',
-                        'bucket' => $bucket,
-                        'key' => $obj->key,
-                        'version_id' => $obj->versionId,
-                        'action' => 'expire_current',
-                        'exception' => $e::class,
-                        'error' => $e->getMessage(),
-                    ]));
-                }
+            $this->deleteStoredData($obj, 'expire_current');
+        }
+    }
+
+    private function deleteStoredData(ObjectInfo $object, string $action): void
+    {
+        $locations = [];
+        $storagePath = $object->systemMetadata['storagePath'] ?? null;
+        if ($storagePath !== null && $storagePath !== '') {
+            $locations[] = [$this->storageTiers->tier($object->storageTier)->backend, $storagePath];
+        }
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            $locations[] = [$this->storageTiers->defaultBackend(), $object->restoredStoragePath];
+        }
+
+        foreach ($locations as [$backend, $path]) {
+            try {
+                $backend->deleteObjectByPath($path, $object->bucket);
+            } catch (\Throwable $e) {
+                $this->logger->warning('Lifecycle failed to delete object storage.', $this->lifecycleContext([
+                    'event' => 'storage_delete_failed',
+                    'bucket' => $object->bucket,
+                    'key' => $object->key,
+                    'version_id' => $object->versionId,
+                    'storage_tier' => $object->storageTier,
+                    'storage_path' => $path,
+                    'action' => $action,
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]));
             }
         }
     }

@@ -61,8 +61,9 @@ final class NotificationProcessorTest extends TestCase
         $this->assertSame('key.txt', $context['key']);
         $this->assertSame('s3:ObjectCreated:Put', $context['event_name']);
         $this->assertSame('http://127.0.0.1/private', $context['destination']);
-        $this->assertSame('private_or_reserved_destination', $context['reason']);
+        $this->assertSame('unsafe_destination', $context['reason']);
         $this->assertSame('dead_letter', $context['status']);
+        $this->assertSame('Notification destination must not contain user information.', $context['error']);
     }
 
     public function test_failed_delivery_logs_retry_then_dead_letter_and_circuit_breaker_state(): void
@@ -83,7 +84,13 @@ final class NotificationProcessorTest extends TestCase
         }
 
         $items = $this->metadata->dequeueNotifications(6);
-        $processor = new NotificationProcessor($this->metadata, $logger, httpClient: $httpClient, metrics: $metrics);
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            $logger,
+            httpClient: $httpClient,
+            metrics: $metrics,
+            requireHttps: false,
+        );
 
         foreach ($items as $item) {
             $this->invokeProcess($processor, $item);
@@ -122,6 +129,83 @@ final class NotificationProcessorTest extends TestCase
         $this->assertStringContainsString('s3_server_notification_deliveries_total{status="circuit_open"} 1', $rendered);
     }
 
+    public function test_redirect_to_private_address_is_blocked_before_second_request(): void
+    {
+        $this->metadata->enqueueNotification(
+            'bucket',
+            'key.txt',
+            's3:ObjectCreated:Put',
+            'https://93.184.216.34/webhook',
+            '{}',
+        );
+        $item = $this->metadata->dequeueNotifications(1)[0];
+        $delegate = new SequenceHttpClient([
+            [302, ['location' => 'https://127.0.0.1/internal']],
+        ]);
+        $logger = new ProcessorArrayLogger();
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            $logger,
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        $this->invokeProcess($processor, $item);
+
+        $this->assertCount(1, $delegate->requests);
+        $this->assertSame(['dead_letter' => 1], $this->metadata->getNotificationQueueStats());
+        $this->assertNotNull($logger->findContext('delivery_blocked', ['reason' => 'unsafe_destination']));
+    }
+
+    public function test_safe_relative_redirect_is_revalidated_and_delivered_as_get(): void
+    {
+        $this->metadata->enqueueNotification(
+            'bucket',
+            'key.txt',
+            's3:ObjectCreated:Put',
+            'https://93.184.216.34/webhook',
+            '{}',
+        );
+        $item = $this->metadata->dequeueNotifications(1)[0];
+        $delegate = new SequenceHttpClient([
+            [303, ['location' => '/accepted']],
+            [204, []],
+        ]);
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        $this->invokeProcess($processor, $item);
+
+        $this->assertSame([
+            ['POST', 'https://93.184.216.34/webhook'],
+            ['GET', 'https://93.184.216.34/accepted'],
+        ], $delegate->requests);
+        $this->assertSame(['sent' => 1], $this->metadata->getNotificationQueueStats());
+    }
+
+    public function test_plain_http_destination_is_rejected_by_default(): void
+    {
+        $this->metadata->enqueueNotification(
+            'bucket',
+            'key.txt',
+            's3:ObjectCreated:Put',
+            'http://93.184.216.34/webhook',
+            '{}',
+        );
+        $item = $this->metadata->dequeueNotifications(1)[0];
+        $delegate = new SequenceHttpClient([[204, []]]);
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        $this->invokeProcess($processor, $item);
+
+        $this->assertSame([], $delegate->requests);
+        $this->assertSame(['dead_letter' => 1], $this->metadata->getNotificationQueueStats());
+    }
+
     /**
      * @param array<string, mixed> $item
      */
@@ -151,6 +235,29 @@ final class FixedStatusHttpClient implements DelegateHttpClient
     public function request(Request $request, Cancellation $cancellation): Response
     {
         return new Response('1.1', $this->status, null, [], '', $request);
+    }
+}
+
+final class SequenceHttpClient implements DelegateHttpClient
+{
+    /** @var list<array{0: int, 1: array<non-empty-string, string>}> */
+    private array $responses;
+
+    /** @var list<array{0: string, 1: string}> */
+    public array $requests = [];
+
+    /** @param list<array{0: int, 1: array<non-empty-string, string>}> $responses */
+    public function __construct(array $responses)
+    {
+        $this->responses = $responses;
+    }
+
+    public function request(Request $request, Cancellation $cancellation): Response
+    {
+        $this->requests[] = [$request->getMethod(), (string) $request->getUri()];
+        [$status, $headers] = array_shift($this->responses) ?? [500, []];
+
+        return new Response('1.1', $status, null, $headers, '', $request);
     }
 }
 

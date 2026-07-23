@@ -211,6 +211,51 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
     }
 
+    public function test_bucket_policy_explicit_deny_applies_to_bucket_owner(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([
+            [
+                'Effect' => 'Deny',
+                'Principal' => '*',
+                'Action' => 's3:DeleteObject',
+                'Resource' => 'arn:aws:s3:::bucket/public/*',
+            ],
+        ]));
+
+        $request = $this->request('DELETE', '/bucket/public/readme.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'public/readme.txt');
+        $request->setAttribute('s3.operation', S3Operation::DeleteObject);
+        $request->setAttribute('ownerId', 'owner');
+
+        $this->expectException(AccessDeniedException::class);
+
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+    }
+
+    public function test_restrict_public_buckets_blocks_public_policy_for_foreign_account(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([
+            [
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::bucket/public/*',
+            ],
+        ]));
+        $this->metadata->putPublicAccessBlock('bucket', false, false, false, true);
+
+        $request = $this->request('GET', '/bucket/public/readme.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'public/readme.txt');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $request->setAttribute('ownerId', 'foreign-account');
+
+        $this->expectException(AccessDeniedException::class);
+
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+    }
+
     public function test_named_policy_attached_to_credential_can_allow_request(): void
     {
         $this->metadata->putNamedPolicy('readonly-public', $this->policy([
@@ -260,8 +305,106 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
     }
 
+    public function test_every_operation_maps_to_the_expected_iam_action(): void
+    {
+        $expectedGroups = [
+            's3:ListAllMyBuckets' => [S3Operation::ListBuckets],
+            's3:CreateBucket' => [S3Operation::CreateBucket],
+            's3:DeleteBucket' => [S3Operation::DeleteBucket],
+            's3:ListBucket' => [
+                S3Operation::HeadBucket,
+                S3Operation::ListObjects,
+                S3Operation::ListObjectsV2,
+            ],
+            's3:ListBucketVersions' => [S3Operation::ListObjectVersions],
+            's3:GetBucketLocation' => [S3Operation::GetBucketLocation],
+            's3:GetBucketVersioning' => [S3Operation::GetBucketVersioning],
+            's3:PutBucketVersioning' => [S3Operation::PutBucketVersioning],
+            's3:GetBucketAcl' => [S3Operation::GetBucketAcl],
+            's3:PutBucketAcl' => [S3Operation::PutBucketAcl],
+            's3:GetBucketPolicy' => [S3Operation::GetBucketPolicy],
+            's3:PutBucketPolicy' => [S3Operation::PutBucketPolicy],
+            's3:DeleteBucketPolicy' => [S3Operation::DeleteBucketPolicy],
+            's3:GetBucketCORS' => [S3Operation::GetBucketCors],
+            's3:PutBucketCORS' => [S3Operation::PutBucketCors, S3Operation::DeleteBucketCors],
+            's3:GetBucketTagging' => [S3Operation::GetBucketTagging],
+            's3:PutBucketTagging' => [S3Operation::PutBucketTagging, S3Operation::DeleteBucketTagging],
+            's3:GetLifecycleConfiguration' => [S3Operation::GetBucketLifecycle],
+            's3:PutLifecycleConfiguration' => [
+                S3Operation::PutBucketLifecycle,
+                S3Operation::DeleteBucketLifecycle,
+            ],
+            's3:GetBucketNotification' => [S3Operation::GetBucketNotification],
+            's3:PutBucketNotification' => [S3Operation::PutBucketNotification],
+            's3:GetEncryptionConfiguration' => [S3Operation::GetBucketEncryption],
+            's3:PutEncryptionConfiguration' => [
+                S3Operation::PutBucketEncryption,
+                S3Operation::DeleteBucketEncryption,
+            ],
+            's3:GetObjectLockConfiguration' => [S3Operation::GetObjectLockConfig],
+            's3:PutObjectLockConfiguration' => [S3Operation::PutObjectLockConfig],
+            's3:ListBucketMultipartUploads' => [S3Operation::ListMultipartUploads],
+            's3:DeleteObject' => [S3Operation::DeleteObject, S3Operation::DeleteObjects],
+            's3:PutObject' => [
+                S3Operation::PostObject,
+                S3Operation::PutObject,
+                S3Operation::CopyObject,
+                S3Operation::CreateMultipartUpload,
+                S3Operation::UploadPart,
+                S3Operation::UploadPartCopy,
+                S3Operation::CompleteMultipartUpload,
+            ],
+            's3:GetBucketWebsite' => [S3Operation::GetBucketWebsite],
+            's3:PutBucketWebsite' => [S3Operation::PutBucketWebsite],
+            's3:DeleteBucketWebsite' => [S3Operation::DeleteBucketWebsite],
+            's3:GetBucketPublicAccessBlock' => [S3Operation::GetPublicAccessBlock],
+            's3:PutBucketPublicAccessBlock' => [S3Operation::PutPublicAccessBlock],
+            's3:DeleteBucketPublicAccessBlock' => [S3Operation::DeletePublicAccessBlock],
+            's3:GetBucketPolicyStatus' => [S3Operation::GetBucketPolicyStatus],
+            's3:GetBucketLogging' => [S3Operation::GetBucketLogging],
+            's3:PutBucketLogging' => [S3Operation::PutBucketLogging],
+            's3:GetObject' => [
+                S3Operation::GetObject,
+                S3Operation::HeadObject,
+                S3Operation::SelectObjectContent,
+            ],
+            's3:GetObjectAttributes' => [S3Operation::GetObjectAttributes],
+            's3:GetObjectAcl' => [S3Operation::GetObjectAcl],
+            's3:PutObjectAcl' => [S3Operation::PutObjectAcl],
+            's3:GetObjectTagging' => [S3Operation::GetObjectTagging],
+            's3:PutObjectTagging' => [S3Operation::PutObjectTagging],
+            's3:DeleteObjectTagging' => [S3Operation::DeleteObjectTagging],
+            's3:GetObjectRetention' => [S3Operation::GetObjectRetention],
+            's3:PutObjectRetention' => [S3Operation::PutObjectRetention],
+            's3:GetObjectLegalHold' => [S3Operation::GetObjectLegalHold],
+            's3:PutObjectLegalHold' => [S3Operation::PutObjectLegalHold],
+            's3:RestoreObject' => [S3Operation::RestoreObject],
+            's3:AbortMultipartUpload' => [S3Operation::AbortMultipartUpload],
+            's3:ListMultipartUploadParts' => [S3Operation::ListParts],
+        ];
+
+        $seen = [];
+        foreach ($expectedGroups as $action => $operations) {
+            foreach ($operations as $operation) {
+                $this->assertSame($action, PolicyEnforcementMiddleware::operationToAction($operation));
+                $seen[] = $operation->value;
+            }
+        }
+
+        sort($seen);
+        $allOperations = array_map(
+            static fn(S3Operation $operation): string => $operation->value,
+            S3Operation::cases(),
+        );
+        sort($allOperations);
+
+        $this->assertCount(66, $seen);
+        $this->assertSame($allOperations, $seen);
+    }
+
     /**
-     * @param array<string, string> $headers
+     * @param non-empty-string $method
+     * @param array<non-empty-string, string|list<string>> $headers
      */
     private function request(string $method, string $path, array $headers = []): Request
     {

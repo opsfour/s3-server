@@ -50,8 +50,24 @@ final class AclEnforcementMiddleware implements Middleware
             ? $request->getAttribute('s3.cachedBucketOwner')
             : $this->metadata->getBucketOwner($bucket);
 
-        // Skip ACL check for non-existent buckets — the handler will throw NoSuchBucketException.
+        // Bucket creation has no existing owner or ACL. It is allowed only for
+        // authenticated callers after identity-policy evaluation.
         if ($cachedBucketOwner === null) {
+            if ($operation === S3Operation::CreateBucket) {
+                if ($ownerId === '') {
+                    throw new AccessDeniedException();
+                }
+
+                return $requestHandler->handleRequest($request);
+            }
+
+            // Do not reveal bucket existence to anonymous callers.
+            if ($ownerId === '') {
+                throw new AccessDeniedException();
+            }
+
+            // Authenticated callers receive the operation-specific not-found
+            // response from the handler.
             return $requestHandler->handleRequest($request);
         }
 

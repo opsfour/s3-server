@@ -126,17 +126,38 @@ final class PolicyEnforcementMiddleware implements Middleware
             throw new AccessDeniedException();
         }
 
-        // Bucket owner bypass applies only after account/named identity policies.
-        // Guard: ownerId must be non-empty to prevent anonymous users matching empty owner.
-        if ($ownerId !== '' && $bucketOwner !== null && $bucketOwner === $ownerId) {
-            $request->setAttribute('s3.policyResult', $identityResult === 'Allow' ? 'Allow' : 'OwnerBypass');
-            return $requestHandler->handleRequest($request);
-        }
-
         $policyJson = $this->metadata->getBucketPolicy($bucket);
         $resourceResult = $policyJson !== null
             ? PolicyEvaluator::evaluate($policyJson, $action, $resource, $ownerId, $conditions)
             : 'Neutral';
+
+        // Explicit resource-policy deny also applies to the bucket owner.
+        if ($resourceResult === 'Deny') {
+            throw new AccessDeniedException();
+        }
+
+        // RestrictPublicBuckets blocks public-policy access from anonymous and
+        // foreign accounts while preserving access for the bucket owner.
+        if ($resourceResult === 'Allow' && $policyJson !== null) {
+            $pab = $this->metadata->getPublicAccessBlock($bucket);
+            if ($pab !== null
+                && $pab['restrictPublicBuckets']
+                && PolicyEvaluator::isPublicPolicy($policyJson)
+                && ($ownerId === '' || $bucketOwner !== $ownerId)) {
+                throw new AccessDeniedException();
+            }
+        }
+
+        // Bucket owner bypass applies only after every explicit deny has been
+        // evaluated. Guard the empty ID so anonymous never matches.
+        if ($ownerId !== '' && $bucketOwner !== null && $bucketOwner === $ownerId) {
+            $request->setAttribute(
+                's3.policyResult',
+                $identityResult === 'Allow' || $resourceResult === 'Allow' ? 'Allow' : 'OwnerBypass',
+            );
+
+            return $requestHandler->handleRequest($request);
+        }
 
         $result = self::mergePolicyResults($identityResult, $resourceResult);
 
@@ -271,11 +292,11 @@ final class PolicyEnforcementMiddleware implements Middleware
     /**
      * Map an S3Operation enum to the IAM action string.
      */
-    private static function operationToAction(S3Operation $operation): string
+    public static function operationToAction(S3Operation $operation): string
     {
         return match ($operation) {
             S3Operation::GetObject, S3Operation::HeadObject => 's3:GetObject',
-            S3Operation::PutObject => 's3:PutObject',
+            S3Operation::PutObject, S3Operation::PostObject => 's3:PutObject',
             S3Operation::DeleteObject => 's3:DeleteObject',
             S3Operation::DeleteObjects => 's3:DeleteObject',
             S3Operation::CopyObject => 's3:PutObject',
@@ -332,7 +353,10 @@ final class PolicyEnforcementMiddleware implements Middleware
             S3Operation::DeletePublicAccessBlock => 's3:DeleteBucketPublicAccessBlock',
             S3Operation::RestoreObject => 's3:RestoreObject',
             S3Operation::SelectObjectContent => 's3:GetObject',
-            default => 's3:' . $operation->value,
+            S3Operation::GetObjectAttributes => 's3:GetObjectAttributes',
+            S3Operation::GetBucketPolicyStatus => 's3:GetBucketPolicyStatus',
+            S3Operation::GetBucketLogging => 's3:GetBucketLogging',
+            S3Operation::PutBucketLogging => 's3:PutBucketLogging',
         };
     }
 }

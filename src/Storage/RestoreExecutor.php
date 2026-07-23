@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Notification\NotificationDispatcher;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -15,6 +17,7 @@ final class RestoreExecutor
         private readonly MetadataStore $metadata,
         private readonly StorageTierRegistry $tiers,
         private readonly LoggerInterface $logger = new NullLogger(),
+        private readonly ?NotificationDispatcher $notifications = null,
     ) {}
 
     /**
@@ -39,6 +42,8 @@ final class RestoreExecutor
     public function processDequeuedJob(array $job): string
     {
         $id = (int) $job['id'];
+        $targetBackend = null;
+        $write = null;
 
         try {
             $object = $this->objectForJob($job);
@@ -54,14 +59,23 @@ final class RestoreExecutor
 
             $sourceBackend = $this->tiers->tier($sourceTier)->backend;
             $targetBackend = $this->tiers->defaultBackend();
+            $sourceSize = 0;
+            $sourceMd5 = hash_init('md5');
+            $sourceStream = new TeeReadableStream(
+                $sourceBackend->getObjectByPath($sourceStoragePath),
+                static function (string $chunk) use (&$sourceSize, $sourceMd5): void {
+                    $sourceSize += strlen($chunk);
+                    hash_update($sourceMd5, $chunk);
+                },
+            );
             $write = $targetBackend->putObject(
                 $object->bucket,
                 $object->key,
-                $sourceBackend->getObjectByPath($sourceStoragePath),
+                $sourceStream,
             );
 
-            if ($write->size !== $object->size) {
-                throw new \RuntimeException("Restore copy size mismatch: expected {$object->size}, got {$write->size}.");
+            if ($write->size !== $sourceSize || strtolower($write->md5Hex) !== strtolower(hash_final($sourceMd5))) {
+                throw new \RuntimeException('Restore physical copy verification failed.');
             }
 
             $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
@@ -84,8 +98,30 @@ final class RestoreExecutor
                 );
             });
 
+            $this->notifications?->dispatchEvent(new S3Event(
+                name: 's3:ObjectRestore:Completed',
+                bucket: $object->bucket,
+                key: $object->key,
+                size: $object->size,
+                etag: $object->etag,
+                ownerId: $object->ownerId,
+                attributes: [
+                    'versionId' => $object->versionId,
+                    'sourceTier' => (string) $job['sourceTier'],
+                    'restoreDays' => max(1, (int) $job['restoreDays']),
+                    'restoreExpiresAt' => $expiresAt->format(\DateTimeInterface::ATOM),
+                ],
+            ));
+
             return 'completed';
         } catch (\Throwable $e) {
+            if ($targetBackend !== null && $write !== null) {
+                try {
+                    $targetBackend->deleteObjectByPath($write->path, (string) ($job['bucket'] ?? ''));
+                } catch (\Throwable) {
+                }
+            }
+
             return $this->retryOrDeadLetter($job, $e);
         }
     }

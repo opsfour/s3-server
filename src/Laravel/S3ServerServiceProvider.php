@@ -60,8 +60,10 @@ class S3ServerServiceProvider extends ServiceProvider
                 maxEncryptedObjectSize: $config['max_encrypted_object_size'] ?? 268_435_456,
                 maxSelectObjectSize: $config['max_select_object_size'] ?? 268_435_456,
                 shutdownDrainTimeout: $config['shutdown_drain_timeout'] ?? 30,
+                notificationRequireHttps: $config['notifications']['require_https'] ?? true,
                 sqliteWorkerPoolSize: $config['parallel']['sqlite_workers'] ?? 0,
                 encryptionWorkerPoolSize: $config['parallel']['encryption_workers'] ?? 0,
+                requestBodySpoolWorkerPoolSize: $config['parallel']['request_body_spool_workers'] ?? 8,
                 encryptionParallelThreshold: $config['parallel']['encryption_threshold'] ?? 65_536,
                 quota: new QuotaConfig(
                     maxBucketsPerOwner: $config['quotas']['max_buckets_per_owner'] ?? 0,
@@ -82,8 +84,10 @@ class S3ServerServiceProvider extends ServiceProvider
 
         $this->app->singleton(StorageTierRegistry::class, function ($app) {
             $config = $app['config']['s3-server'];
+            $storageConfig = $config['storage'] ?? [];
+            self::resolveLaravelStorageServices($storageConfig, $app);
 
-            return StorageBackendFactory::createTierRegistry($config['storage'] ?? []);
+            return StorageBackendFactory::createTierRegistry($storageConfig);
         });
 
         $this->app->singleton(MetadataStore::class, function ($app) {
@@ -136,5 +140,27 @@ class S3ServerServiceProvider extends ServiceProvider
                 S3CredentialsCommand::class,
             ]);
         }
+    }
+
+    /**
+     * @param array<string, mixed> $storageConfig
+     */
+    private static function resolveLaravelStorageServices(array &$storageConfig, mixed $app): void
+    {
+        $factoryService = $storageConfig['filesystem_factory_service'] ?? null;
+        if (is_string($factoryService) && $factoryService !== '') {
+            $storageConfig['filesystem_factory'] = $app->make($factoryService);
+        }
+
+        if (! isset($storageConfig['tiers']) || ! is_array($storageConfig['tiers'])) {
+            return;
+        }
+
+        foreach ($storageConfig['tiers'] as &$tierConfig) {
+            if (is_array($tierConfig)) {
+                self::resolveLaravelStorageServices($tierConfig, $app);
+            }
+        }
+        unset($tierConfig);
     }
 }

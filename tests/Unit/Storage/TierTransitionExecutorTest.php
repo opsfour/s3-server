@@ -94,6 +94,56 @@ final class TierTransitionExecutorTest extends TestCase
         $hot->getObjectByPath($source->path)->read();
     }
 
+    public function test_transition_verifies_encrypted_physical_payload_instead_of_plaintext_metadata(): void
+    {
+        $hot = new InMemoryBackend();
+        $archive = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $archive->createBucket('bucket');
+
+        $ciphertext = 'ciphertext-with-authentication-tag';
+        $source = $hot->putObject('bucket', 'encrypted.bin', new ReadableBuffer($ciphertext));
+        $plaintext = 'plain';
+        $this->metadata->putObjectMetadata(
+            bucket: 'bucket',
+            key: 'encrypted.bin',
+            ownerId: 'owner',
+            size: strlen($plaintext),
+            etag: '"' . md5($plaintext) . '"',
+            contentType: 'application/octet-stream',
+            storagePath: $source->path,
+            userMetadata: ['__sse-algorithm' => 'AES256'],
+        );
+        $this->metadata->enqueueTierTransitionJob(
+            'bucket',
+            'encrypted.bin',
+            null,
+            'STANDARD',
+            'GLACIER',
+            'GLACIER',
+            $source->path,
+        );
+
+        $executor = new TierTransitionExecutor(
+            $this->metadata,
+            new StorageTierRegistry([
+                new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+                new StorageTier('GLACIER', $archive, restoreRequired: true),
+            ]),
+        );
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+        $object = $this->metadata->getObjectMetadata('bucket', 'encrypted.bin');
+        self::assertNotNull($object);
+        self::assertSame('GLACIER', $object->storageTier);
+        self::assertSame($ciphertext, $archive->getObjectByPath($object->systemMetadata['storagePath'])->read());
+        self::assertSame(strlen($plaintext), $object->size);
+        self::assertSame('"' . md5($plaintext) . '"', $object->etag);
+    }
+
     public function test_retries_failed_transition_without_switching_metadata(): void
     {
         $hot = new InMemoryBackend();

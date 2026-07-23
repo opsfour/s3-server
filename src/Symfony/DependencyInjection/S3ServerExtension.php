@@ -147,6 +147,9 @@ final class S3ServerExtension extends Extension
         if (isset($storageConfig['filesystem_service']) && is_string($storageConfig['filesystem_service']) && $storageConfig['filesystem_service'] !== '') {
             $storageConfig['filesystem'] = new Reference($storageConfig['filesystem_service']);
         }
+        if (isset($storageConfig['filesystem_factory_service']) && is_string($storageConfig['filesystem_factory_service']) && $storageConfig['filesystem_factory_service'] !== '') {
+            $storageConfig['filesystem_factory'] = new Reference($storageConfig['filesystem_factory_service']);
+        }
 
         if (isset($storageConfig['tiers']) && is_array($storageConfig['tiers'])) {
             foreach ($storageConfig['tiers'] as $name => $tierConfig) {
@@ -156,6 +159,9 @@ final class S3ServerExtension extends Extension
 
                 if (isset($tierConfig['filesystem_service']) && is_string($tierConfig['filesystem_service']) && $tierConfig['filesystem_service'] !== '') {
                     $tierConfig['filesystem'] = new Reference($tierConfig['filesystem_service']);
+                }
+                if (isset($tierConfig['filesystem_factory_service']) && is_string($tierConfig['filesystem_factory_service']) && $tierConfig['filesystem_factory_service'] !== '') {
+                    $tierConfig['filesystem_factory'] = new Reference($tierConfig['filesystem_factory_service']);
                 }
 
                 $storageConfig['tiers'][$name] = $tierConfig;

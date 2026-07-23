@@ -59,6 +59,7 @@ final readonly class S3ServerRuntimeFactory
         $server->addMiddleware(new AuthMiddleware(
             credentialProvider: $credentialProvider,
             region: $config->region,
+            requestBodySizeLimit: $config->requestBodySizeLimit,
         ));
 
         $adminCredentialApi = AdminCredentialApiFactory::create($externalIamConfig, $credentialProvider);

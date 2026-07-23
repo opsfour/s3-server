@@ -8,8 +8,10 @@ use Amp\ByteStream;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\EntityTooSmallException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -21,11 +23,15 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class CompleteMultipartUploadHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -34,7 +40,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         private readonly bool $enforceMinPartSize = false,
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         private readonly ?QuotaManager $quotas = null,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -161,21 +170,12 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
 
                     if ($sseCAlgo === null || $sseCKey === null || $sseCKeyMd5 === null) {
-                        // Clean up assembled file since we can't encrypt it.
-                        try {
-                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-                        } catch (\Throwable) {
-                        }
                         throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                             'SSE-C headers are required to complete a multipart upload initiated with SSE-C encryption.',
                         );
                     }
 
                     if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                        try {
-                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-                        } catch (\Throwable) {
-                        }
                         throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                             'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                         );
@@ -183,17 +183,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $customerKey = EncryptionService::validateSseCHeaders($sseCAlgo, $sseCKey, $sseCKeyMd5);
                     $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
                     $enc = $this->encryption->encryptSseC($plaintext, $customerKey);
-                    $tempPath = $writeResult->path . '.enc.tmp';
-                    try {
-                        \Amp\File\write($tempPath, $enc['ciphertext']);
-                        \Amp\File\move($tempPath, $writeResult->path);
-                    } catch (\Throwable $e) {
-                        try {
-                            \Amp\File\deleteFile($tempPath);
-                        } catch (\Throwable) {
-                        }
-                        throw $e;
-                    }
+                    $writeResult = $this->replaceStoredPayload($bucket, $key, $writeResult, $enc['ciphertext']);
 
                     $encMeta = [
                         'sse-algorithm' => 'SSE-C',
@@ -203,27 +193,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 } elseif ($uploadSseAlgo === 'AES256') {
                     // SSE-S3.
                     if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                        try {
-                            $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-                        } catch (\Throwable) {
-                        }
                         throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                             'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                         );
                     }
                     $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
                     $enc = $this->encryption->encryptSseS3($plaintext);
-                    $tempPath = $writeResult->path . '.enc.tmp';
-                    try {
-                        \Amp\File\write($tempPath, $enc['ciphertext']);
-                        \Amp\File\move($tempPath, $writeResult->path);
-                    } catch (\Throwable $e) {
-                        try {
-                            \Amp\File\deleteFile($tempPath);
-                        } catch (\Throwable) {
-                        }
-                        throw $e;
-                    }
+                    $writeResult = $this->replaceStoredPayload($bucket, $key, $writeResult, $enc['ciphertext']);
 
                     $encMeta = [
                         'sse-algorithm' => 'AES256',
@@ -258,6 +234,17 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $contentDisposition = $userMetadata['__mpu-content-disposition'] ?? null;
         $cacheControl = $userMetadata['__mpu-cache-control'] ?? null;
         $storageClass = $userMetadata['__mpu-storage-class'] ?? 'STANDARD';
+        $aclGrants = AclGrantResolver::privateAcl($ownerId);
+        $encodedAclGrants = $userMetadata['__mpu-acl-grants'] ?? null;
+        if ($encodedAclGrants !== null) {
+            try {
+                /** @var list<array{granteeType: string, granteeId: string, permission: string}> $decodedAclGrants */
+                $decodedAclGrants = json_decode($encodedAclGrants, true, 16, JSON_THROW_ON_ERROR);
+                $aclGrants = AclGrantResolver::validateGrants($decodedAclGrants);
+            } catch (\Throwable $e) {
+                throw new InternalErrorException('Multipart upload ACL metadata is invalid.', $e);
+            }
+        }
 
         // Remove internal __mpu-* keys from persisted user metadata.
         unset(
@@ -265,12 +252,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $userMetadata['__mpu-content-disposition'],
             $userMetadata['__mpu-cache-control'],
             $userMetadata['__mpu-storage-class'],
+            $userMetadata['__mpu-acl-grants'],
         );
 
         // Store final object metadata (versioning-aware).
         $versioning = $this->metadata->getBucketVersioning($bucket);
         $versionId = null;
-        $oldStoragePath = null;
+        $oldObjectToClean = null;
 
         try {
             if ($versioning === 'Enabled') {
@@ -286,8 +274,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $contentDisposition,
                     $cacheControl,
                     $userMetadata,
+                    $aclGrants,
                     &$versionId,
                 ) {
+                    $this->metadata->lockOwnerForUpdate($ownerId);
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, null, $writeResult->size, true);
 
                     $versionId = $this->metadata->putObjectVersioned(
@@ -304,6 +294,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, $aclGrants);
                 });
             } else {
                 // Wrap read-old + write-new in a transaction to prevent concurrent
@@ -320,10 +311,12 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $contentDisposition,
                     $cacheControl,
                     $userMetadata,
-                    &$oldStoragePath,
+                    $aclGrants,
+                    &$oldObjectToClean,
                 ) {
+                    $this->metadata->lockOwnerForUpdate($ownerId);
                     $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-                    $oldStoragePath = $existingObj?->systemMetadata['storagePath'] ?? null;
+                    $oldObjectToClean = $existingObj;
 
                     $this->quotas?->assertCanWriteObject($ownerId, $bucket, $existingObj, $writeResult->size, false);
 
@@ -341,6 +334,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, $aclGrants);
                 });
             }
         } catch (\Throwable $e) {
@@ -353,11 +347,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
-        if ($oldStoragePath !== null && $oldStoragePath !== $writeResult->path) {
-            try {
-                $this->storage->deleteObjectByPath($oldStoragePath, $bucket);
-            } catch (\Throwable) {
-            }
+        if ($oldObjectToClean !== null) {
+            $this->deleteStoredData($oldObjectToClean, $writeResult->path);
         }
 
         // Clean up upload record and part files.
@@ -401,6 +392,59 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             status: 200,
             headers: $responseHeaders,
             body: $xml,
+        );
+    }
+
+    private function deleteStoredData(ObjectInfo $object, string $preservePath): void
+    {
+        $path = $object->systemMetadata['storagePath'] ?? null;
+        if ($path !== null && $path !== '' && $path !== $preservePath) {
+            try {
+                $this->storageTiers->tier($object->storageTier)->backend
+                    ->deleteObjectByPath($path, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '' && $object->restoredStoragePath !== $preservePath) {
+            try {
+                $this->storageTiers->defaultBackend()
+                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
+            } catch (\Throwable) {
+            }
+        }
+    }
+
+    private function replaceStoredPayload(
+        string $bucket,
+        string $key,
+        StorageWriteResult $original,
+        string $payload,
+    ): StorageWriteResult {
+        $replacement = $this->storage->putObject(
+            $bucket,
+            $key,
+            new \Amp\ByteStream\ReadableBuffer($payload),
+        );
+
+        try {
+            $this->storage->deleteObjectByPath($original->path, $bucket);
+        } catch (\Throwable $e) {
+            try {
+                $this->storage->deleteObjectByPath($replacement->path, $bucket);
+            } catch (\Throwable) {
+            }
+            throw $e;
+        }
+
+        return new StorageWriteResult(
+            path: $replacement->path,
+            size: $original->size,
+            md5Hex: $original->md5Hex,
+            crc32Base64: $original->crc32Base64,
+            crc32cBase64: $original->crc32cBase64,
+            sha1Base64: $original->sha1Base64,
+            sha256Base64: $original->sha256Base64,
         );
     }
 }

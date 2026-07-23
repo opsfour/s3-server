@@ -6,16 +6,15 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Amp\ByteStream\ReadableBuffer;
 use Aws\S3\S3Client;
-use League\Flysystem\AwsS3V3\AwsS3V3Adapter;
-use League\Flysystem\Filesystem;
-use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use PHPUnit\Framework\TestCase;
 
 final class ExternalS3StorageIntegrationTest extends TestCase
 {
     private S3Client $client;
 
-    private FlysystemBackend $backend;
+    private ParallelFlysystemBackend $backend;
 
     private string $bucket;
 
@@ -57,12 +56,19 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             ],
         ]);
 
-        $adapter = new AwsS3V3Adapter(
-            $this->client,
-            $this->bucket,
-            self::prefix(),
+        $this->backend = new ParallelFlysystemBackend(
+            new AwsS3FlysystemFilesystemFactory(
+                remoteBucket: $this->bucket,
+                region: $region,
+                accessKeyId: $accessKey,
+                secretAccessKey: $secretKey,
+                endpoint: $endpoint,
+                pathStyle: self::envBool('S3_INTEGRATION_PATH_STYLE', true),
+                prefix: self::prefix(),
+            ),
+            sys_get_temp_dir(),
+            self::envInt('S3_INTEGRATION_FLYSYSTEM_WORKERS', 4),
         );
-        $this->backend = new FlysystemBackend(new Filesystem($adapter), sys_get_temp_dir());
     }
 
     protected function tearDown(): void
@@ -86,6 +92,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             $this->backend->deleteBucket($this->logicalBucket);
         } catch (\Throwable) {
         }
+        $this->backend->shutdown();
     }
 
     public function test_external_s3_backend_round_trips_large_object_copy_and_delete(): void
@@ -117,7 +124,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         $this->backend->getObjectByPath($write->path);
     }
 
-    public function test_external_s3_backend_multipart_assembly_cleans_up_parts(): void
+    public function test_external_s3_backend_multipart_parts_survive_assembly_until_commit_cleanup(): void
     {
         $this->backend->createBucket($this->logicalBucket);
         $uploadId = 'integration-' . bin2hex(random_bytes(8));
@@ -155,7 +162,18 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             'Prefix' => self::prefix() . '/.parts/' . $uploadId . '/',
         ]);
 
-        self::assertSame(0, count($list['Contents'] ?? []));
+        self::assertSame(3, count($list['Contents'] ?? []));
+
+        $this->backend->abortMultipartUpload(
+            $this->logicalBucket,
+            'multipart/assembled.bin',
+            $uploadId,
+        );
+        $afterAbort = $this->client->listObjectsV2([
+            'Bucket' => $this->bucket,
+            'Prefix' => self::prefix() . '/.parts/' . $uploadId . '/',
+        ]);
+        self::assertSame(0, count($afterAbort['Contents'] ?? []));
     }
 
     private static function loadIntegrationEnv(): void

@@ -17,6 +17,8 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\LocalFlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
@@ -115,6 +117,9 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'parallel' => [
+                'request_body_spool_workers' => 3,
+            ],
         ]], $container);
         $container->compile();
 
@@ -124,6 +129,7 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame('eu-central-1', $config->region);
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456789, $config->requestBodySizeLimit);
+        self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
     }
 
     public function test_metadata_cache_ttl_wraps_metadata_store_by_default(): void
@@ -271,6 +277,34 @@ final class S3ServerBundleTest extends TestCase
         $container->compile();
 
         self::assertInstanceOf(FlysystemBackend::class, $container->get(StorageBackend::class));
+    }
+
+    public function test_flysystem_worker_factory_can_reference_symfony_service(): void
+    {
+        $root = sys_get_temp_dir() . '/opsfour-s3-symfony-worker-' . bin2hex(random_bytes(4));
+        mkdir($root, 0o755, true);
+        $this->cleanupPaths[] = $root;
+        $container = new ContainerBuilder();
+        $container->setDefinition('test.flysystem.factory', (new Definition(LocalFlysystemFilesystemFactory::class))
+            ->setArguments([$root]));
+
+        (new S3ServerExtension())->load([[
+            'storage' => [
+                'driver' => 'flysystem',
+                'filesystem_factory_service' => 'test.flysystem.factory',
+                'worker_pool_size' => 1,
+                'temp_dir' => sys_get_temp_dir(),
+                'path' => $root,
+            ],
+            'metadata' => [
+                'path' => ':memory:',
+            ],
+        ]], $container);
+        $container->compile();
+
+        $storage = $container->get(StorageBackend::class);
+        self::assertInstanceOf(ParallelFlysystemBackend::class, $storage);
+        $storage->shutdown();
     }
 
     public function test_tiered_flysystem_storage_can_reference_symfony_services(): void

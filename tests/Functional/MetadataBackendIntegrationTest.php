@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use Amp\Mysql\MysqlConfig;
+use Amp\Mysql\MysqlConnectionPool;
+use Amp\Postgres\PostgresConfig;
+use Amp\Postgres\PostgresConnectionPool;
 use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -12,6 +16,7 @@ use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Process\Process;
 
 final class MetadataBackendIntegrationTest extends TestCase
 {
@@ -70,7 +75,9 @@ final class MetadataBackendIntegrationTest extends TestCase
 
             $policy = '{"Version":"2012-10-17","Statement":[]}';
             $metadata->putNamedPolicy($namedPolicy, $policy);
-            self::assertSame($policy, $metadata->getNamedPolicy($namedPolicy));
+            $storedPolicy = $metadata->getNamedPolicy($namedPolicy);
+            self::assertNotNull($storedPolicy);
+            self::assertJsonStringEqualsJsonString($policy, $storedPolicy);
 
             try {
                 $metadata->createBucket($ownerId, $bucket, 'us-east-1');
@@ -90,6 +97,108 @@ final class MetadataBackendIntegrationTest extends TestCase
             );
         } finally {
             $this->cleanup($metadata, $ownerId, $bucket, $namedPolicy);
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_backend_serializes_concurrent_account_quota_writes(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} metadata backend concurrency tests.");
+        }
+
+        $dsn = trim($dsn);
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        $ownerId = 'metadata-quota-' . bin2hex(random_bytes(4));
+        $bucket = 'metadata-quota-' . bin2hex(random_bytes(8));
+        $keys = ['first.bin', 'second.bin'];
+
+        try {
+            $metadata->createBucket($ownerId, $bucket, 'us-east-1');
+            $metadata->putAccountQuota($ownerId, new QuotaConfig(maxBytesPerOwner: 100));
+
+            $worker = dirname(__DIR__) . '/Support/metadata-quota-worker.php';
+            $processes = [];
+            foreach ($keys as $key) {
+                $process = new Process(
+                    [PHP_BINARY, $worker, $driver, $ownerId, $bucket, $key],
+                    dirname(__DIR__, 2),
+                    ['S3_TEST_WORKER_DSN' => $dsn],
+                );
+                $process->setTimeout(20);
+                $process->start();
+                $processes[] = $process;
+            }
+
+            $results = [];
+            foreach ($processes as $process) {
+                $process->wait();
+                self::assertTrue($process->isSuccessful(), $process->getErrorOutput());
+                $results[] = trim($process->getOutput());
+            }
+            sort($results);
+
+            self::assertSame(['ok', 'quota'], $results);
+            self::assertSame(1, $metadata->countObjects($bucket));
+            self::assertSame(60, $metadata->getBucketStorageStats($bucket)['bytesUsed']);
+        } finally {
+            foreach ($keys as $key) {
+                try {
+                    $metadata->deleteObjectMetadata($bucket, $key);
+                } catch (\Throwable) {
+                }
+            }
+            try {
+                $metadata->deleteBucket($ownerId, $bucket);
+            } catch (\Throwable) {
+            }
+            try {
+                $metadata->deleteAccountQuota($ownerId);
+            } catch (\Throwable) {
+            }
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_backend_migrates_v11_owner_lock_schema(string $driver, string $dsnEnv): void
+    {
+        if (getenv('S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS') !== '1') {
+            self::markTestSkipped('Set S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS=1 only for a disposable metadata database.');
+        }
+
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} metadata migration tests.");
+        }
+
+        $dsn = trim($dsn);
+        $pool = $driver === 'mysql'
+            ? new MysqlConnectionPool(MysqlConfig::fromString($dsn))
+            : new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+
+        try {
+            $pool->execute('DROP TABLE IF EXISTS s3_owner_write_locks');
+            $pool->execute('DELETE FROM s3_schema_version WHERE version >= 11');
+            $pool->execute("INSERT INTO s3_schema_version (version, description) VALUES (11, 'Pre-v12 integration fixture')");
+
+            $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+            $metadata->transaction(function () use ($metadata): void {
+                $metadata->lockOwnerForUpdate('metadata-migration-owner');
+            });
+
+            $row = $pool->execute('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
+            self::assertNotNull($row);
+            self::assertSame(12, (int) $row['version']);
+            self::assertNotNull(
+                $pool->execute(
+                    "SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = 'metadata-migration-owner'",
+                )->fetchRow(),
+            );
+        } finally {
+            // Restore a usable v12 schema even if an assertion above fails.
+            MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+            $pool->close();
         }
     }
 

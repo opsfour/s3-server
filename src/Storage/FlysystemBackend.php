@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
-use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\ReadableStream;
 use League\Flysystem\FilesystemOperator;
@@ -16,9 +15,9 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 /**
  * Storage backend wrapping League Flysystem for access to any adapter.
  *
- * Bridges Amp async streams with Flysystem's synchronous API. Suitable
- * for remote backends (S3, SFTP, Azure, GCS) where latency is inherent.
- * For local filesystem, prefer FilesystemBackend (native Amp async I/O).
+ * Bridges Amp streams with Flysystem's synchronous API. This direct adapter
+ * mode blocks the calling event loop and is retained for compatibility and
+ * development. Use ParallelFlysystemBackend for production remote storage.
  *
  * Storage layout mirrors FilesystemBackend:
  *   Objects: {bucket}/{hash[0:2]}/{hash[2:4]}/{uuid}
@@ -39,9 +38,10 @@ final class FlysystemBackend implements StorageBackend
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        // Write stream data to a PHP temp stream for Flysystem.
-        $tmpStream = fopen('php://temp', 'r+');
+        $tmpFile = $this->createTempFile('s3put_');
+        $tmpStream = fopen($tmpFile, 'w+b');
         if ($tmpStream === false) {
+            @unlink($tmpFile);
             throw new InternalErrorException('Failed to open temp stream.');
         }
 
@@ -49,7 +49,7 @@ final class FlysystemBackend implements StorageBackend
             while (($chunk = $body->read()) !== null) {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                fwrite($tmpStream, $chunk);
+                self::writeAll($tmpStream, $chunk);
             }
 
             rewind($tmpStream);
@@ -66,6 +66,7 @@ final class FlysystemBackend implements StorageBackend
             if (is_resource($tmpStream)) {
                 fclose($tmpStream);
             }
+            @unlink($tmpFile);
         }
 
         return new StorageWriteResult(
@@ -92,11 +93,7 @@ final class FlysystemBackend implements StorageBackend
         }
 
         if ($length !== null) {
-            // Read exactly $length bytes into a buffer.
-            $data = stream_get_contents($resource, $length);
-            fclose($resource);
-
-            return new ReadableBuffer($data !== false ? $data : '');
+            return new LimitedReadableStream(new ReadableResourceStream($resource), $length);
         }
 
         return new ReadableResourceStream($resource);
@@ -135,8 +132,10 @@ final class FlysystemBackend implements StorageBackend
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        $tmpStream = fopen('php://temp', 'r+');
+        $tmpFile = $this->createTempFile('s3part_');
+        $tmpStream = fopen($tmpFile, 'w+b');
         if ($tmpStream === false) {
+            @unlink($tmpFile);
             throw new InternalErrorException('Failed to open temp stream.');
         }
 
@@ -144,7 +143,7 @@ final class FlysystemBackend implements StorageBackend
             while (($chunk = $data->read()) !== null) {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                fwrite($tmpStream, $chunk);
+                self::writeAll($tmpStream, $chunk);
             }
 
             rewind($tmpStream);
@@ -161,6 +160,7 @@ final class FlysystemBackend implements StorageBackend
             if (is_resource($tmpStream)) {
                 fclose($tmpStream);
             }
+            @unlink($tmpFile);
         }
 
         return new StorageWriteResult(
@@ -176,10 +176,7 @@ final class FlysystemBackend implements StorageBackend
 
     public function assembleMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): StorageWriteResult
     {
-        $tmpFile = tempnam($this->tempDir, 's3mpu_');
-        if ($tmpFile === false) {
-            throw new InternalErrorException('Failed to create temp file for multipart assembly.');
-        }
+        $tmpFile = $this->createTempFile('s3mpu_');
 
         $outHandle = fopen($tmpFile, 'w');
         if ($outHandle === false) {
@@ -213,7 +210,7 @@ final class FlysystemBackend implements StorageBackend
                     $calculator->update($chunk);
                     hash_update($partMd5Context, $chunk);
                     $size += strlen($chunk);
-                    fwrite($outHandle, $chunk);
+                    self::writeAll($outHandle, $chunk);
                 }
                 fclose($partStream);
 
@@ -248,13 +245,6 @@ final class FlysystemBackend implements StorageBackend
             }
         }
 
-        // Clean up part files after successful assembly.
-        try {
-            $this->filesystem->deleteDirectory(".parts/{$uploadId}");
-        } catch (\Throwable) {
-            // Best-effort cleanup.
-        }
-
         return new StorageWriteResult(
             path: $storagePath,
             size: $size,
@@ -286,9 +276,11 @@ final class FlysystemBackend implements StorageBackend
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        $tmpStream = fopen('php://temp', 'r+');
+        $tmpFile = $this->createTempFile('s3copy_');
+        $tmpStream = fopen($tmpFile, 'w+b');
         if ($tmpStream === false) {
             fclose($srcStream);
+            @unlink($tmpFile);
             throw new InternalErrorException('Failed to open temp stream.');
         }
 
@@ -300,7 +292,7 @@ final class FlysystemBackend implements StorageBackend
                 }
                 $calculator->update($chunk);
                 $size += strlen($chunk);
-                fwrite($tmpStream, $chunk);
+                self::writeAll($tmpStream, $chunk);
             }
             fclose($srcStream);
             rewind($tmpStream);
@@ -317,6 +309,7 @@ final class FlysystemBackend implements StorageBackend
             if (is_resource($tmpStream)) {
                 fclose($tmpStream);
             }
+            @unlink($tmpFile);
         }
 
         return new StorageWriteResult(
@@ -367,6 +360,34 @@ final class FlysystemBackend implements StorageBackend
             }
 
             $remaining -= strlen($chunk);
+        }
+    }
+
+    private function createTempFile(string $prefix): string
+    {
+        $tmpFile = tempnam($this->tempDir, $prefix);
+        if ($tmpFile === false) {
+            throw new InternalErrorException("Failed to create temporary file in {$this->tempDir}.");
+        }
+
+        return $tmpFile;
+    }
+
+    /**
+     * @param resource $resource
+     */
+    private static function writeAll($resource, string $data): void
+    {
+        $offset = 0;
+        $length = strlen($data);
+
+        while ($offset < $length) {
+            $written = fwrite($resource, substr($data, $offset));
+            if ($written === false || $written === 0) {
+                throw new InternalErrorException('Failed to write temporary object data.');
+            }
+
+            $offset += $written;
         }
     }
 

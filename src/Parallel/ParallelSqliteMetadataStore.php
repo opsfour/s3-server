@@ -908,6 +908,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->unpinFiber();
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        // The pinned SQLite worker transaction already serializes metadata writes.
+    }
+
     public function transaction(callable $callback): mixed
     {
         $this->beginTransaction();

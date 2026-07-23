@@ -37,9 +37,16 @@ final class ServeCommand extends Command
             ->addOption('region', null, InputOption::VALUE_REQUIRED, 'AWS region identifier', getenv('S3_REGION') ?: 'us-east-1')
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('tls-cert', null, InputOption::VALUE_REQUIRED, 'Path to TLS certificate file')
-            ->addOption('tls-key', null, InputOption::VALUE_REQUIRED, 'Path to TLS private key file')
-            ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum concurrent connections', '10000')
+            ->addOption('tls-cert', null, InputOption::VALUE_REQUIRED, 'Path to TLS certificate file', getenv('S3_TLS_CERT') ?: null)
+            ->addOption('tls-key', null, InputOption::VALUE_REQUIRED, 'Path to TLS private key file', getenv('S3_TLS_KEY') ?: null)
+            ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum concurrent connections', getenv('S3_MAX_CONNECTIONS') ?: '10000')
+            ->addOption('connection-idle-timeout', null, InputOption::VALUE_REQUIRED, 'Idle connection timeout in seconds', getenv('S3_CONNECTION_IDLE_TIMEOUT') ?: '60')
+            ->addOption('body-size-limit', null, InputOption::VALUE_REQUIRED, 'Maximum request body size in bytes', getenv('S3_BODY_SIZE_LIMIT') ?: '5368709120')
+            ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', getenv('S3_READ_TIMEOUT') ?: '300')
+            ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', getenv('S3_WRITE_TIMEOUT') ?: '300')
+            ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Graceful shutdown drain timeout in seconds', getenv('S3_SHUTDOWN_DRAIN_TIMEOUT') ?: '30')
+            ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', getenv('S3_REQUEST_BODY_SPOOL_WORKERS') ?: '8')
+            ->addOption('notification-require-https', null, InputOption::VALUE_REQUIRED, 'Require HTTPS webhook destinations (true|false)', getenv('S3_NOTIFICATION_REQUIRE_HTTPS') === false ? 'true' : getenv('S3_NOTIFICATION_REQUIRE_HTTPS'))
             ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: memory|database|file', getenv('S3_CREDENTIALS_DRIVER') ?: 'memory')
             ->addOption('access-key', null, InputOption::VALUE_REQUIRED, 'Access key ID (memory driver)', getenv('S3_ACCESS_KEY') ?: null)
             ->addOption('secret-key', null, InputOption::VALUE_REQUIRED, 'Secret access key (memory driver)', getenv('S3_SECRET_KEY') ?: null)
@@ -109,6 +116,17 @@ final class ServeCommand extends Command
             tlsCertPath: $tlsCertPath,
             tlsKeyPath: $tlsKeyPath,
             maxConcurrentConnections: $maxConnections,
+            connectionIdleTimeout: (int) $input->getOption('connection-idle-timeout'),
+            requestBodySizeLimit: (int) $input->getOption('body-size-limit'),
+            readTimeout: (int) $input->getOption('read-timeout'),
+            writeTimeout: (int) $input->getOption('write-timeout'),
+            shutdownDrainTimeout: (int) $input->getOption('shutdown-drain-timeout'),
+            requestBodySpoolWorkerPoolSize: (int) $input->getOption('request-body-spool-workers'),
+            notificationRequireHttps: filter_var(
+                $input->getOption('notification-require-https'),
+                FILTER_VALIDATE_BOOLEAN,
+                FILTER_NULL_ON_FAILURE,
+            ) ?? true,
             quota: new QuotaConfig(
                 maxBucketsPerOwner: (int) $input->getOption('quota-max-buckets-per-owner'),
                 maxObjectsPerBucket: (int) $input->getOption('quota-max-objects-per-bucket'),

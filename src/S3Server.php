@@ -10,6 +10,11 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Router;
 use Amp\Http\Server\SocketHttpServer;
+use Amp\DeferredCancellation;
+use Amp\Future;
+use Amp\Socket\BindContext;
+use Amp\Socket\Certificate;
+use Amp\Socket\ServerTlsContext;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
 use OpsFour\S3Server\Handler\MetricsHandler;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
@@ -27,9 +32,11 @@ use OpsFour\S3Server\Middleware\LoggingMiddleware;
 use OpsFour\S3Server\Middleware\MetricsMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\RateLimitMiddleware;
+use OpsFour\S3Server\Middleware\RequestBodySpool;
 use OpsFour\S3Server\Middleware\RequestIdMiddleware;
 use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Parallel\ParallelSqliteMetadataStore;
 use OpsFour\S3Server\Routing\HandlerRegistry;
@@ -38,6 +45,7 @@ use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\RestoreGarbageCollector;
+use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
@@ -74,6 +82,11 @@ final class S3Server
     private bool $cleanupRunning = false;
 
     private bool $tieringRunning = false;
+
+    private ?DeferredCancellation $backgroundCancellation = null;
+
+    /** @var list<Future<void>> */
+    private array $backgroundFutures = [];
 
     private ?StorageTierRegistry $storageTiers = null;
 
@@ -115,8 +128,12 @@ final class S3Server
      */
     public function start(): void
     {
+        if ($this->server !== null) {
+            throw new \LogicException('S3 server is already started.');
+        }
+
         if ($this->extraMiddleware === []) {
-            $this->logger->warning('No auth middleware registered. Server is unauthenticated.');
+            throw new \LogicException('Refusing to start without authentication middleware.');
         }
 
         $this->logger->info('Starting S3 server on {host}:{port}', [
@@ -130,8 +147,10 @@ final class S3Server
         $httpDriverFactory = new DefaultHttpDriverFactory(
             logger: $this->logger,
             bodySizeLimit: $this->config->requestBodySizeLimit,
-            connectionTimeout: 30, // Shorter than default 60s to prevent connection accumulation.
-            streamTimeout: 120, // Allow 2 min for large uploads.
+            connectionTimeout: self::timeoutValue($this->config->connectionIdleTimeout),
+            // Amp exposes one stream inactivity timeout for request reads and
+            // response writes, so use the more permissive configured value.
+            streamTimeout: self::timeoutValue(max($this->config->readTimeout, $this->config->writeTimeout)),
         );
 
         /** @var int<1, max> $connectionLimit */
@@ -199,8 +218,28 @@ final class S3Server
         // still produce proper S3 error responses.
         $router->setFallback($stack);
 
-        // 5. Expose on the configured host:port.
-        $this->server->expose($this->config->host . ':' . $this->config->port);
+        // 5. Expose on the configured host:port, with TLS when configured.
+        $bindContext = (new BindContext())->withTcpNoDelay();
+        if ($this->config->isTlsEnabled()) {
+            $certPath = $this->config->tlsCertPath;
+            $keyPath = $this->config->tlsKeyPath;
+            \assert($certPath !== null && $keyPath !== null);
+            if (!is_file($certPath) || !is_readable($certPath)) {
+                throw new \InvalidArgumentException("TLS certificate is not readable: {$certPath}");
+            }
+            if (!is_file($keyPath) || !is_readable($keyPath)) {
+                throw new \InvalidArgumentException("TLS private key is not readable: {$keyPath}");
+            }
+
+            $tlsContext = (new ServerTlsContext())
+                ->withMinimumVersion(ServerTlsContext::TLSv1_2)
+                ->withDefaultCertificate(new Certificate($certPath, $keyPath));
+            $bindContext = $bindContext->withTlsContext($tlsContext);
+        }
+        $this->server->expose(
+            $this->config->host . ':' . $this->config->port,
+            $bindContext,
+        );
 
         // 6. Start the server.
         $this->server->start($router, $errorHandler);
@@ -216,6 +255,7 @@ final class S3Server
                 $this->config->lifecycleLockTtlSeconds,
                 metrics: $this->metrics,
                 notifications: $this->notifications,
+                storageTiers: $this->storageTiers ?? StorageTierRegistry::single($this->storage),
             );
             $this->lifecycleRunner = new LifecycleRunner($executor, $this->config->lifecycleIntervalSeconds, $this->logger);
             $this->lifecycleRunner->start();
@@ -224,23 +264,37 @@ final class S3Server
 
         // 8. Start notification queue processor.
         if ($this->metadata !== null) {
-            $this->notificationProcessor = new NotificationProcessor($this->metadata, $this->logger, metrics: $this->metrics);
+            $this->notificationProcessor = new NotificationProcessor(
+                $this->metadata,
+                $this->logger,
+                metrics: $this->metrics,
+                requireHttps: $this->config->notificationRequireHttps,
+            );
             $this->notificationProcessor->start();
             $this->logger->info('Notification processor started.');
         }
 
         // 9. Start background cleanup fiber for rate limit + notification queue.
+        $this->backgroundCancellation = new DeferredCancellation();
+        $backgroundCancellation = $this->backgroundCancellation->getCancellation();
         if ($this->metadata !== null) {
             $this->cleanupRunning = true;
-            \Amp\async(function (): void {
-                while ($this->cleanupRunning) {
-                    \Amp\delay(300); // Every 5 minutes (reduced from 60s to minimize DB contention)
-                    try {
-                        $this->metadata->rateLimitCleanup(3600);
-                        $this->metadata->cleanupOldNotifications(86400);
-                    } catch (\Throwable $e) {
-                        $this->logger->warning('Background cleanup error: {error}', ['error' => $e->getMessage()]);
+            $this->backgroundFutures[] = \Amp\async(function () use ($backgroundCancellation): void {
+                try {
+                    while ($this->cleanupRunning) {
+                        // Every 5 minutes (reduced from 60s to minimize DB contention).
+                        \Amp\delay(300, cancellation: $backgroundCancellation);
+                        $backgroundCancellation->throwIfRequested();
+
+                        try {
+                            $this->metadata->rateLimitCleanup(3600);
+                            $this->metadata->cleanupOldNotifications(86400);
+                        } catch (\Throwable $e) {
+                            $this->logger->warning('Background cleanup error: {error}', ['error' => $e->getMessage()]);
+                        }
                     }
+                } catch (\Amp\CancelledException) {
+                    // Normal shutdown.
                 }
             });
         }
@@ -249,32 +303,44 @@ final class S3Server
         if ($this->metadata !== null && $this->storage !== null) {
             $tiers = $this->storageTiers ?? StorageTierRegistry::single($this->storage);
             $transitionExecutor = new TierTransitionExecutor($this->metadata, $tiers, $this->logger);
-            $restoreExecutor = new RestoreExecutor($this->metadata, $tiers, $this->logger);
+            $restoreExecutor = new RestoreExecutor($this->metadata, $tiers, $this->logger, $this->notifications);
             $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers->defaultBackend(), $this->logger);
             $this->tieringRunning = true;
-            \Amp\async(function () use ($transitionExecutor, $restoreExecutor, $restoreGc): void {
-                while ($this->tieringRunning) {
-                    try {
-                        $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize);
-                        $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize);
-                        $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
+            $this->backgroundFutures[] = \Amp\async(function () use (
+                $transitionExecutor,
+                $restoreExecutor,
+                $restoreGc,
+                $backgroundCancellation,
+            ): void {
+                try {
+                    while ($this->tieringRunning) {
+                        try {
+                            $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize);
+                            $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize);
+                            $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
 
-                        $this->recordTieringWorkerStats('transition', $transitionStats);
-                        $this->recordTieringWorkerStats('restore', $restoreStats);
-                        $this->recordTieringWorkerStats('restore_gc', $gcStats);
+                            $this->recordTieringWorkerStats('transition', $transitionStats);
+                            $this->recordTieringWorkerStats('restore', $restoreStats);
+                            $this->recordTieringWorkerStats('restore_gc', $gcStats);
 
-                        if ($transitionStats['processed'] > 0 || $restoreStats['processed'] > 0 || $gcStats['scanned'] > 0) {
-                            $this->logger->debug('Tiering background tick completed.', [
-                                'transition' => $transitionStats,
-                                'restore' => $restoreStats,
-                                'restore_gc' => $gcStats,
-                            ]);
+                            if ($transitionStats['processed'] > 0 || $restoreStats['processed'] > 0 || $gcStats['scanned'] > 0) {
+                                $this->logger->debug('Tiering background tick completed.', [
+                                    'transition' => $transitionStats,
+                                    'restore' => $restoreStats,
+                                    'restore_gc' => $gcStats,
+                                ]);
+                            }
+                        } catch (\Throwable $e) {
+                            $this->logger->warning('Tiering background processing error: {error}', ['error' => $e->getMessage()]);
                         }
-                    } catch (\Throwable $e) {
-                        $this->logger->warning('Tiering background processing error: {error}', ['error' => $e->getMessage()]);
-                    }
 
-                    \Amp\delay($this->config->lifecycleIntervalSeconds);
+                        \Amp\delay(
+                            $this->config->lifecycleIntervalSeconds,
+                            cancellation: $backgroundCancellation,
+                        );
+                    }
+                } catch (\Amp\CancelledException) {
+                    // Normal shutdown.
                 }
             });
             $this->logger->info('Tiering background processor started.');
@@ -324,27 +390,52 @@ final class S3Server
 
         $this->cleanupRunning = false;
         $this->tieringRunning = false;
+        $this->backgroundCancellation?->cancel();
         $this->notificationProcessor?->stop();
         $this->notificationProcessor = null;
         $this->lifecycleRunner?->stop();
         $this->lifecycleRunner = null;
 
-        // Amp's stop() waits for in-flight requests. Wrap with a timeout
-        // to prevent hanging indefinitely on slow connections.
+        // Stop accepting new connections and drain in-flight requests before
+        // shutting down worker pools or metadata services they may still use.
         $timeout = $this->config->shutdownDrainTimeout;
-        $stopped = false;
-
-        $stopFuture = \Amp\async(function () use (&$stopped): void {
+        $stopFuture = \Amp\async(function (): void {
             $this->server?->stop();
-            $stopped = true;
         });
 
         try {
-            \Amp\Future\await([$stopFuture], new \Amp\TimeoutCancellation($timeout));
+            $stopFuture->await(new \Amp\TimeoutCancellation($timeout));
         } catch (\Amp\CancelledException) {
-            $this->logger->warning('Shutdown drain timeout exceeded ({timeout}s), forcing stop.', [
+            $this->logger->warning('Shutdown drain timeout exceeded ({timeout}s); waiting for Amp to close active streams.', [
                 'timeout' => $timeout,
             ]);
+            // Amp has already closed all listening sockets. Do not tear down
+            // dependencies while request fibers are still active.
+            $stopFuture->await();
+        }
+
+        $this->awaitBackgroundFutures($timeout);
+
+        $shutdownStorage = [];
+        $storageTiers = $this->storageTiers?->all() ?? [];
+        if ($storageTiers === [] && $this->storage !== null) {
+            $storageTiers = [StorageTierRegistry::single($this->storage)->defaultTier()];
+        }
+        foreach ($storageTiers as $tier) {
+            $backend = $tier->backend;
+            if (! $backend instanceof ShutdownAwareStorageBackend) {
+                continue;
+            }
+            $id = spl_object_id($backend);
+            if (isset($shutdownStorage[$id])) {
+                continue;
+            }
+            $shutdownStorage[$id] = true;
+            try {
+                $backend->shutdown();
+            } catch (\Throwable $e) {
+                $this->logger->warning('Storage worker shutdown error: {error}', ['error' => $e->getMessage()]);
+            }
         }
 
         // Shut down worker pools.
@@ -368,7 +459,34 @@ final class S3Server
         }
 
         $this->server = null;
+        $this->backgroundCancellation = null;
+        $this->backgroundFutures = [];
         $this->logger->info('S3 server stopped.');
+    }
+
+    private function awaitBackgroundFutures(int $timeout): void
+    {
+        if ($this->backgroundFutures === []) {
+            return;
+        }
+
+        $cancellation = new \Amp\TimeoutCancellation(max(1, $timeout));
+        foreach ($this->backgroundFutures as $future) {
+            try {
+                $future->await($cancellation);
+            } catch (\Amp\CancelledException) {
+                $this->logger->warning('Background task did not stop within {timeout}s.', ['timeout' => $timeout]);
+            } catch (\Throwable $e) {
+                $this->logger->warning('Background task shutdown error: {error}', ['error' => $e->getMessage()]);
+            }
+        }
+    }
+
+    private static function timeoutValue(int $seconds): int
+    {
+        // Amp treats zero as an immediate timeout. Configuration uses zero to
+        // disable a timeout, represented here by a practical 68-year value.
+        return $seconds === 0 ? 2_147_483_647 : $seconds;
     }
 
     /**
@@ -456,7 +574,7 @@ final class S3Server
      * 3. LoggingMiddleware            - Logs request/response pairs with timing.
      * 4. ExpectContinueMiddleware     - Handles Expect: 100-continue for large uploads.
      * 5. S3AttributeMiddleware        - Sets s3.bucket, s3.key, s3.operation attributes.
-     * 6. WebsiteHostingMiddleware     - Serves static website content (before auth).
+     * 6. WebsiteHostingMiddleware     - Authorizes anonymous static website reads.
      * 7. CorsMiddleware               - Handles CORS preflight and response headers.
      * 8. [extra middleware]            - User-supplied middleware (auth, rate-limiting, etc.)
      * 9. PolicyEnforcementMiddleware  - Evaluates bucket policies.
@@ -483,12 +601,13 @@ final class S3Server
             new S3AttributeMiddleware($this->config->baseDomain),
         ];
 
-        // Website hosting: before auth (website content is public).
+        // Website hosting runs before credential auth and performs its own
+        // anonymous policy, ACL, and Public Access Block evaluation.
         // Now has s3.bucket available from S3AttributeMiddleware.
         if ($this->metadata !== null && $this->storage !== null) {
             $middlewares[] = new WebsiteHostingMiddleware(
                 $this->metadata,
-                $this->storage,
+                $this->storageTiers ?? StorageTierRegistry::single($this->storage),
                 $this->config->websiteHostPattern,
             );
         }
@@ -506,9 +625,14 @@ final class S3Server
             $middlewares[] = new AclEnforcementMiddleware($this->metadata);
         }
 
-        // Innermost: integrity checks right before the handler.
-        $middlewares[] = new ContentMd5Middleware();
-        $middlewares[] = new ChecksumValidationMiddleware();
+        // Innermost: integrity checks right before the handler. Stateless
+        // spool tasks avoid reserving amphp/file workers for request lifetime.
+        $spoolWorkers = $this->config->requestBodySpoolWorkerPoolSize;
+        $spoolPool = new ContextWorkerPool($spoolWorkers);
+        $this->addWorkerPool($spoolPool, 'request_body_spool', $spoolWorkers);
+        $spool = new RequestBodySpool($spoolPool);
+        $middlewares[] = new ContentMd5Middleware($spool);
+        $middlewares[] = new ChecksumValidationMiddleware($spool);
 
         return Middleware\stackMiddleware($innerHandler, ...$middlewares);
     }

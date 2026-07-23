@@ -2933,6 +2933,11 @@ final class SqliteMetadataStore implements MetadataStore
         $this->stmtCache = [];
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        // SQLite write transactions already serialize metadata mutations.
+    }
+
     public function transaction(callable $callback): mixed
     {
         $pdo = $this->connection();

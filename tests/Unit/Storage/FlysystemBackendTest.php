@@ -5,9 +5,21 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\Http\Server\Driver\Client;
+use Amp\Http\Server\Request;
+use Amp\Socket\InternetAddress;
+use Amp\Socket\SocketAddress;
+use Amp\Socket\TlsInfo;
 use League\Flysystem\Filesystem;
+use League\Uri\Http;
+use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
+use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Handler\Object\GetObjectHandler;
+use OpsFour\S3Server\Handler\Object\PutObjectHandler;
+use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
@@ -34,6 +46,11 @@ final class FlysystemBackendTest extends TestCase
     protected function tearDown(): void
     {
         if (is_dir($this->tempDir)) {
+            foreach (glob($this->tempDir . '/*') ?: [] as $file) {
+                if (is_file($file)) {
+                    @unlink($file);
+                }
+            }
             rmdir($this->tempDir);
         }
     }
@@ -44,6 +61,7 @@ final class FlysystemBackendTest extends TestCase
 
         $result = $this->backend->putObject('bucket', 'path/object.txt', new ReadableBuffer('hello remote'));
 
+        self::assertSame([], self::temporaryFiles($this->tempDir));
         self::assertSame(1, $this->adapter->writeStreamCalls);
         self::assertSame(0, $this->adapter->writeCalls);
         self::assertSame(12, $result->size);
@@ -79,6 +97,12 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame('abcdef', self::readAll($this->backend->getObjectByPath($result->path)));
         self::assertSame(6, $result->size);
         self::assertStringEndsWith('-2', $result->md5Hex);
+        self::assertNotSame([], array_values(array_filter(
+            $this->adapter->paths(),
+            static fn(string $path): bool => str_starts_with($path, ".parts/{$uploadId}/"),
+        )));
+
+        $this->backend->abortMultipartUpload('bucket', 'large.bin', $uploadId);
         self::assertSame([], array_values(array_filter(
             $this->adapter->paths(),
             static fn(string $path): bool => str_starts_with($path, ".parts/{$uploadId}/"),
@@ -92,6 +116,7 @@ final class FlysystemBackendTest extends TestCase
 
         $copy = $this->backend->copyObject($source->path, 'bucket', 'copy.txt');
 
+        self::assertSame([], self::temporaryFiles($this->tempDir));
         self::assertSame('copy me', self::readAll($this->backend->getObjectByPath($copy->path)));
         self::assertSame(2, $this->adapter->writeStreamCalls);
     }
@@ -108,6 +133,21 @@ final class FlysystemBackendTest extends TestCase
         } finally {
             self::assertSame([], $this->adapter->paths());
         }
+    }
+
+    /** @return list<string> */
+    private static function temporaryFiles(string $directory): array
+    {
+        $entries = scandir($directory);
+        self::assertIsArray($entries);
+
+        return array_values(array_filter(
+            $entries,
+            static fn(string $entry): bool => str_starts_with($entry, 's3put_')
+                || str_starts_with($entry, 's3part_')
+                || str_starts_with($entry, 's3copy_')
+                || str_starts_with($entry, 's3mpu_'),
+        ));
     }
 
     public function test_concurrent_stream_uploads_stay_isolated(): void
@@ -135,6 +175,58 @@ final class FlysystemBackendTest extends TestCase
         }
     }
 
+    public function test_sse_s3_round_trip_uses_opaque_flysystem_paths(): void
+    {
+        $databasePath = $this->tempDir . '/metadata.sqlite';
+        $metadata = new SqliteMetadataStore($databasePath);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $this->backend->createBucket('bucket');
+        $encryption = new EncryptionService(
+            new ConfigMasterKeyProvider(base64_encode(random_bytes(32))),
+        );
+        $plaintext = str_repeat('remote encrypted payload ', 128);
+        $putRequest = new Request(
+            new FlysystemBackendTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/encrypted.bin'),
+            ['x-amz-server-side-encryption' => 'AES256'],
+            $plaintext,
+        );
+        $putRequest->setAttribute('s3.bucket', 'bucket');
+        $putRequest->setAttribute('s3.key', 'encrypted.bin');
+        $putRequest->setAttribute('s3.operation', S3Operation::PutObject);
+        $putRequest->setAttribute('ownerId', 'owner');
+
+        $putResponse = (new PutObjectHandler($metadata, $this->backend, $encryption))
+            ->handleRequest($putRequest);
+
+        self::assertSame(200, $putResponse->getStatus());
+        $object = $metadata->getObjectMetadata('bucket', 'encrypted.bin');
+        self::assertNotNull($object);
+        $storagePath = $object->systemMetadata['storagePath'] ?? null;
+        self::assertIsString($storagePath);
+        self::assertNotSame($plaintext, $this->adapter->contents($storagePath));
+
+        $getRequest = new Request(
+            new FlysystemBackendTestClient(),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/encrypted.bin'),
+        );
+        $getRequest->setAttribute('s3.bucket', 'bucket');
+        $getRequest->setAttribute('s3.key', 'encrypted.bin');
+        $getRequest->setAttribute('ownerId', 'owner');
+        $getResponse = (new GetObjectHandler($metadata, $this->backend, $encryption))
+            ->handleRequest($getRequest);
+
+        self::assertSame(200, $getResponse->getStatus());
+        self::assertSame($plaintext, self::readAll($getResponse->getBody()));
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+        @unlink($databasePath);
+        @unlink($databasePath . '-wal');
+        @unlink($databasePath . '-shm');
+    }
+
     private static function readAll(\Amp\ByteStream\ReadableStream $stream): string
     {
         $buffer = '';
@@ -144,4 +236,36 @@ final class FlysystemBackendTest extends TestCase
 
         return $buffer;
     }
+}
+
+final class FlysystemBackendTestClient implements Client
+{
+    public function getId(): int
+    {
+        return 1;
+    }
+
+    public function getRemoteAddress(): SocketAddress
+    {
+        return new InternetAddress('127.0.0.1', 12345);
+    }
+
+    public function getLocalAddress(): SocketAddress
+    {
+        return new InternetAddress('127.0.0.1', 9000);
+    }
+
+    public function getTlsInfo(): ?TlsInfo
+    {
+        return null;
+    }
+
+    public function close(): void {}
+
+    public function isClosed(): bool
+    {
+        return false;
+    }
+
+    public function onClose(\Closure $onClose): void {}
 }

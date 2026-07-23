@@ -719,6 +719,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->rollback();
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        $this->inner->lockOwnerForUpdate($ownerId);
+    }
+
     public function transaction(callable $callback): mixed
     {
         return $this->inner->transaction($callback);

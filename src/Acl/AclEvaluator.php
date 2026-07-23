@@ -43,7 +43,10 @@ final class AclEvaluator
 
         $requiredPermission = self::operationToPermission($operation);
         if ($requiredPermission === null) {
-            return true; // Operation doesn't have an ACL-level check.
+            // Operations without an ACL permission are owner/policy-only.
+            // The owner bypass and explicit policy allow are handled before
+            // this evaluator is called.
+            return false;
         }
 
         foreach ($grants as $grant) {
@@ -72,10 +75,13 @@ final class AclEvaluator
     {
         return match ($operation) {
             S3Operation::GetObject, S3Operation::HeadObject,
+            S3Operation::SelectObjectContent, S3Operation::GetObjectAttributes,
+            S3Operation::HeadBucket,
             S3Operation::ListObjectsV2, S3Operation::ListObjects,
             S3Operation::ListObjectVersions => 'READ',
 
-            S3Operation::PutObject, S3Operation::DeleteObject,
+            S3Operation::PutObject, S3Operation::PostObject,
+            S3Operation::DeleteObject,
             S3Operation::DeleteObjects, S3Operation::CopyObject,
             S3Operation::CreateMultipartUpload, S3Operation::UploadPart,
             S3Operation::UploadPartCopy, S3Operation::CompleteMultipartUpload,
@@ -84,7 +90,54 @@ final class AclEvaluator
             S3Operation::GetBucketAcl, S3Operation::GetObjectAcl => 'READ_ACP',
             S3Operation::PutBucketAcl, S3Operation::PutObjectAcl => 'WRITE_ACP',
 
-            default => null, // No ACL check for config operations.
+            // Service, bucket configuration, object subresource, restore, and
+            // multipart-listing operations require owner access or an explicit
+            // identity/resource policy allow. Listing every case makes a newly
+            // added operation fail loudly until its authorization is defined.
+            S3Operation::ListBuckets,
+            S3Operation::CreateBucket,
+            S3Operation::DeleteBucket,
+            S3Operation::GetBucketLocation,
+            S3Operation::GetBucketVersioning,
+            S3Operation::PutBucketVersioning,
+            S3Operation::GetBucketPolicy,
+            S3Operation::PutBucketPolicy,
+            S3Operation::DeleteBucketPolicy,
+            S3Operation::GetBucketCors,
+            S3Operation::PutBucketCors,
+            S3Operation::DeleteBucketCors,
+            S3Operation::GetBucketTagging,
+            S3Operation::PutBucketTagging,
+            S3Operation::DeleteBucketTagging,
+            S3Operation::GetBucketLifecycle,
+            S3Operation::PutBucketLifecycle,
+            S3Operation::DeleteBucketLifecycle,
+            S3Operation::GetBucketNotification,
+            S3Operation::PutBucketNotification,
+            S3Operation::GetBucketEncryption,
+            S3Operation::PutBucketEncryption,
+            S3Operation::DeleteBucketEncryption,
+            S3Operation::GetObjectLockConfig,
+            S3Operation::PutObjectLockConfig,
+            S3Operation::ListMultipartUploads,
+            S3Operation::GetBucketWebsite,
+            S3Operation::PutBucketWebsite,
+            S3Operation::DeleteBucketWebsite,
+            S3Operation::GetPublicAccessBlock,
+            S3Operation::PutPublicAccessBlock,
+            S3Operation::DeletePublicAccessBlock,
+            S3Operation::GetBucketPolicyStatus,
+            S3Operation::GetBucketLogging,
+            S3Operation::PutBucketLogging,
+            S3Operation::GetObjectTagging,
+            S3Operation::PutObjectTagging,
+            S3Operation::DeleteObjectTagging,
+            S3Operation::GetObjectRetention,
+            S3Operation::PutObjectRetention,
+            S3Operation::GetObjectLegalHold,
+            S3Operation::PutObjectLegalHold,
+            S3Operation::RestoreObject,
+            S3Operation::ListParts => null,
         };
     }
 

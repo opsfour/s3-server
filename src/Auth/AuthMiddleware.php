@@ -11,6 +11,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\S3Exception;
+use OpsFour\S3Server\Routing\S3Operation;
 
 /**
  * Amp HTTP Server middleware for S3 authentication.
@@ -39,13 +40,21 @@ final class AuthMiddleware implements Middleware
 
     private readonly ChunkedSignatureVerifier $chunkedVerifier;
 
+    private readonly PostObjectFormParser $postObjectFormParser;
+
     public function __construct(
         private readonly CredentialProvider $credentialProvider,
         private readonly string $region,
+        int $requestBodySizeLimit = 5_368_709_120,
     ) {
         $this->sigV4Verifier = new SignatureV4Verifier();
         $this->presignedValidator = new PresignedUrlValidator();
         $this->chunkedVerifier = new ChunkedSignatureVerifier();
+        $this->postObjectFormParser = new PostObjectFormParser(
+            $credentialProvider,
+            $region,
+            $requestBodySizeLimit,
+        );
     }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
@@ -53,15 +62,32 @@ final class AuthMiddleware implements Middleware
         // POST Object (HTML form upload) uses its own authentication via form fields.
         // Skip normal SigV4 auth — the PostObjectHandler handles V2 signature verification.
         // Set empty defaults so downstream middleware doesn't crash on missing attributes.
-        $contentType = $request->getHeader('content-type') ?? '';
-        if ($request->getMethod() === 'POST' && str_contains($contentType, 'multipart/form-data')) {
-            $request->setAttribute('credential', null);
-            $request->setAttribute('ownerId', '');
+        $operation = $request->hasAttribute('s3.operation')
+            ? $request->getAttribute('s3.operation')
+            : null;
+        if ($operation === S3Operation::PostObject) {
+            $form = $this->postObjectFormParser->parse($request);
+            $request->setAttribute(PostObjectForm::class, $form);
+            $request->setAttribute('credential', $form->credential);
+            $request->setAttribute(
+                'ownerId',
+                $form->credential === null ? '' : $form->credential->ownerId,
+            );
             $request->setAttribute('signedHeaders', []);
-            return $requestHandler->handleRequest($request);
+            try {
+                return $requestHandler->handleRequest($request);
+            } finally {
+                $form->cleanup();
+            }
         }
 
         $authResult = $this->authenticate($request);
+
+        if ($operation === S3Operation::CreateBucket && $authResult->ownerId === '') {
+            throw new AccessDeniedException(
+                'Access Denied. Bucket creation requires authentication.',
+            );
+        }
 
         // Set request attributes for downstream handlers.
         $request->setAttribute('credential', $authResult->credential);

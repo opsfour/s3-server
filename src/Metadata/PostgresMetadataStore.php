@@ -2369,8 +2369,29 @@ final class PostgresMetadataStore implements MetadataStore
         }
     }
 
+    public function lockOwnerForUpdate(string $ownerId): void
+    {
+        $transaction = $this->fiberTransaction();
+        if ($transaction === null) {
+            throw new \LogicException('lockOwnerForUpdate() requires an active transaction.');
+        }
+
+        $transaction->execute(
+            'INSERT INTO s3_owner_write_locks (owner_id) VALUES ($1) ON CONFLICT (owner_id) DO NOTHING',
+            [$ownerId],
+        );
+        $transaction->execute(
+            'SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = $1 FOR UPDATE',
+            [$ownerId],
+        )->fetchRow();
+    }
+
     public function transaction(callable $callback): mixed
     {
+        if (\Fiber::getCurrent() === null) {
+            return \Amp\async(fn(): mixed => $this->transaction($callback))->await();
+        }
+
         $existingTx = $this->fiberTransaction();
         $ownTx = ($existingTx === null);
         if ($ownTx) {

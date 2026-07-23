@@ -8,12 +8,13 @@ namespace OpsFour\S3Server\Metadata\Schema;
  * Contains all PostgreSQL DDL statements for the S3 metadata store.
  *
  * All tables use the `s3_` prefix to avoid collisions when sharing a database.
- * Schema version: 1
+ * The complete schema represents VERSION; incremental migrations are returned
+ * by getMigrationStatements().
  */
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 11;
+    public const int VERSION = 12;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -55,6 +56,13 @@ final class PostgresSchema
                 max_bytes_per_owner BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL,
+
+            // Transactional owner write locks for quotas and replacement serialization.
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
+                owner_id TEXT PRIMARY KEY
             )
             SQL,
 
@@ -590,6 +598,14 @@ final class PostgresSchema
             SQL;
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_restore_jobs_status_next ON s3_restore_jobs(status, next_attempt_at)';
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_restore_jobs_object ON s3_restore_jobs(bucket, key_name, version_id)';
+        }
+
+        if ($fromVersion < 12) {
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
+                owner_id TEXT PRIMARY KEY
+            )
+            SQL;
         }
 
         return $statements;

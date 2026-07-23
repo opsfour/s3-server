@@ -8,7 +8,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
  * Tracks and applies schema migrations for the S3 metadata store.
  *
  * Uses the `s3_schema_version` table to track which schema version
- * has been applied. Currently supports only version 1 (initial schema).
+ * has been applied.
  */
 final class SchemaManager
 {

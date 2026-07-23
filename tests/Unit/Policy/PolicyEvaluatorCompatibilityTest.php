@@ -187,6 +187,25 @@ final class PolicyEvaluatorCompatibilityTest extends TestCase
         ));
     }
 
+    public function test_public_policy_detection_includes_not_principal_anonymous_access(): void
+    {
+        $public = $this->policy([[
+            'Effect' => 'Allow',
+            'NotPrincipal' => ['AWS' => 'tenant:owner'],
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/*',
+        ]]);
+        $matchesNobody = $this->policy([[
+            'Effect' => 'Allow',
+            'NotPrincipal' => '*',
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/*',
+        ]]);
+
+        self::assertTrue(PolicyEvaluator::isPublicPolicy($public));
+        self::assertFalse(PolicyEvaluator::isPublicPolicy($matchesNobody));
+    }
+
     public function test_request_tags_headers_null_numeric_and_date_conditions(): void
     {
         $policy = $this->policy([

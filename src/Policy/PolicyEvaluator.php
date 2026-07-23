@@ -156,19 +156,39 @@ final class PolicyEvaluator
                 continue;
             }
 
-            $principal = $statement['Principal'] ?? null;
-            if ($principal === '*') {
+            if (isset($statement['Principal']) && self::principalValueIncludesWildcard($statement['Principal'])) {
                 return true;
             }
-            if (is_array($principal)) {
-                $aws = $principal['AWS'] ?? null;
-                if ($aws === '*' || (is_array($aws) && in_array('*', $aws, true))) {
-                    return true;
-                }
+
+            // Any Allow with NotPrincipal can include anonymous callers unless
+            // the exclusion itself is the wildcard (which matches nobody).
+            if (
+                isset($statement['NotPrincipal'])
+                && ! self::principalValueIncludesWildcard($statement['NotPrincipal'])
+            ) {
+                return true;
             }
         }
 
         return false;
+    }
+
+    private static function principalValueIncludesWildcard(mixed $principal): bool
+    {
+        if ($principal === '*') {
+            return true;
+        }
+
+        if (! is_array($principal)) {
+            return false;
+        }
+
+        $aws = $principal['AWS'] ?? null;
+        if ($aws === '*') {
+            return true;
+        }
+
+        return is_array($aws) && in_array('*', $aws, true);
     }
 
     /** @param array<string, mixed> $statement */

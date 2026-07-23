@@ -1023,6 +1023,11 @@ interface MetadataStore
     public function rollback(): void;
 
     /**
+     * Serialize quota-sensitive writes for one owner within the current transaction.
+     */
+    public function lockOwnerForUpdate(string $ownerId): void;
+
+    /**
      * Execute a callback within a database transaction.
      *
      * Automatically commits on success or rolls back on exception.
