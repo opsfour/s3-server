@@ -46,7 +46,8 @@ OpsFour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concu
    - `ExpectContinueMiddleware` — sends 100 Continue for large uploads
    - `RateLimitMiddleware` — per-IP token bucket check (database-backed)
    - `S3AttributeMiddleware` — parses bucket/key from path, resolves S3 operation name
-   - `WebsiteHostingMiddleware` — serves static website content (before auth)
+   - `WebsiteHostingMiddleware` — authorizes and serves anonymous static
+     website content before credential authentication
    - `CorsMiddleware` — handles CORS preflight and response headers
    - **[Auth middleware]** — SigV4 verification, sets ownerId
    - `PolicyEnforcementMiddleware` — evaluates IAM-style bucket policies
@@ -76,13 +77,17 @@ The `S3AttributeMiddleware` sets the resolved operation as a request attribute, 
 
 ## Async I/O Model
 
-All I/O is non-blocking via PHP Fibers:
+Request-path I/O uses PHP Fibers:
 
 - **HTTP** — Amp HTTP Server (event-loop driven)
-- **File I/O** — `amphp/file` (uses `uv_fs_*` or thread pool)
+- **File I/O** — `amphp/file` with separate bounded pools for open data
+  handles and stateless `mkdir`/rename/stat/delete operations; active uploads
+  therefore cannot starve atomic finalization, and both pools shut down explicitly
 - **PostgreSQL** — `amphp/postgres` (non-blocking protocol, connection pool)
 - **MySQL** — `amphp/mysql` (non-blocking protocol, connection pool)
 - **SQLite** — PDO (blocking, optionally offloaded to `amphp/parallel` worker pool)
+- **Flysystem** — synchronous adapters; production worker mode offloads every
+  adapter call to a bounded `amphp/parallel` process pool
 - **DNS** — `amphp/dns` (async resolution for webhook SSRF checks)
 - **HTTP client** — `amphp/http-client` (for webhook delivery)
 

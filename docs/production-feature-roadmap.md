@@ -271,7 +271,7 @@ Need:
 - Event coverage:
   - [x] object created
   - [x] object removed
-  - object restored if restore is ever implemented
+  - [x] object restore completed
   - [x] multipart completed/aborted
   - [x] lifecycle action applied
 - [x] Dispatch event objects after metadata commit for object, multipart, and
@@ -344,7 +344,7 @@ Recommendation:
 - Keep unsupported for now. Operational metrics should be implemented as server
   observability, not AWS inventory/analytics compatibility.
 
-### 11. S3 Express, Metadata Tables, Object Lambda, Torrent, Restore
+### 11. S3 Express, Metadata Tables, Object Lambda, Torrent
 
 Status: Unsupported.
 
@@ -352,6 +352,8 @@ Recommendation:
 
 - Keep unsupported. These are AWS-specific control-plane or specialized
   features and are not required for a production S3-compatible object server.
+- `RestoreObject` is supported for configured restore-required storage tiers
+  and is documented in the Tiering section above.
 
 ## Suggested Implementation Order
 

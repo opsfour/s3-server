@@ -29,7 +29,8 @@ S3_STORAGE_DRIVER=flysystem
 
 ### Programmatic Setup
 
-Flysystem requires passing a configured `FilesystemOperator` instance:
+For development and low-concurrency use, Flysystem accepts a configured
+`FilesystemOperator` instance:
 
 ```php
 use League\Flysystem\Filesystem;
@@ -46,6 +47,34 @@ $storage = StorageBackendFactory::create('flysystem', [
 ]);
 ```
 
+`FilesystemOperator` is synchronous. Calling it directly blocks the Amp event
+loop for the duration of each adapter call. Production remote storage must use
+the bounded worker mode instead:
+
+```php
+use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
+
+$factory = new AwsS3FlysystemFilesystemFactory(
+    remoteBucket: $_ENV['S3_BACKING_BUCKET'],
+    region: $_ENV['S3_BACKING_REGION'],
+    accessKeyId: $_ENV['S3_BACKING_ACCESS_KEY'],
+    secretAccessKey: $_ENV['S3_BACKING_SECRET_KEY'],
+    endpoint: $_ENV['S3_BACKING_ENDPOINT'],
+    pathStyle: true,
+);
+
+$storage = StorageBackendFactory::create('flysystem', [
+    'filesystem_factory' => $factory,
+    'worker_pool_size' => 8,
+    'temp_dir' => '/var/lib/opsfour-s3/tmp',
+]);
+```
+
+The factory is serialized to local worker processes. Use a dedicated backing
+credential and protect process memory and local IPC with normal host-level
+controls. `AwsS3FlysystemFilesystemFactory` requires
+`aws/aws-sdk-php` and `league/flysystem-aws-s3-v3`.
+
 ### Framework Configuration
 
 Laravel users can bind a configured `League\Flysystem\FilesystemOperator` and
@@ -56,7 +85,8 @@ a service and reference it with `filesystem_service`:
 opsfour_s3_server:
   storage:
     driver: flysystem
-    filesystem_service: 'app.s3_backing_filesystem'
+    filesystem_factory_service: 'app.s3_backing_filesystem_factory'
+    worker_pool_size: 8
     temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
 ```
 
@@ -66,9 +96,11 @@ physical tiering.
 ### Temporary Local Files
 
 Remote Flysystem backends are the durable object store. The server may still use
-local temp files or temp streams for multipart assembly, copy/restore bridges,
-and streaming transformations. Configure `temp_dir` on Flysystem backends and
-tiers for deployments where `/tmp` is small or ephemeral.
+local temp files for uploads, downloads, multipart assembly, copy/restore
+bridges, and streaming transformations. Memory use stays bounded, but local
+disk capacity must cover concurrent in-flight transfers. Configure `temp_dir`
+on every Flysystem tier, monitor free space, and size the worker pool against
+both remote-provider limits and local staging capacity.
 
 ### Use Cases
 
@@ -95,10 +127,13 @@ S3_STORAGE_DRIVER=memory
 | Backend | Persistence | Speed | Multi-Node | Use Case |
 |---------|-------------|-------|------------|----------|
 | Filesystem | Disk | Fast | No | Production (single node) |
-| Flysystem | Depends on adapter | Varies | Yes (S3/GCS) | Multi-cloud, proxying |
+| Flysystem workers | Depends on adapter | Bounded worker pool | Yes (S3/GCS) | Multi-cloud, proxying |
 | Memory | None | Fastest | No | Testing only |
 
-For production single-node deployments, use `filesystem`. For multi-node or cloud-native deployments, use `flysystem` with a shared storage adapter.
+For production single-node deployments, use `filesystem`. For multi-node or
+cloud-native deployments, use Flysystem worker mode with a shared storage
+adapter. Direct `FilesystemOperator` mode is not suitable for a 24/7 Amp
+process because synchronous remote I/O can stall unrelated requests.
 
 ## Physical Storage Tiers
 

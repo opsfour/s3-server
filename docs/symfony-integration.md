@@ -207,6 +207,7 @@ opsfour_s3_server:
   parallel:
     sqlite_workers: 0
     encryption_workers: 0
+    request_body_spool_workers: 8
     encryption_threshold: 65536
 ```
 
@@ -236,8 +237,10 @@ runtime.
 
 ## Remote Storage Backends
 
-For remote storage, register a `League\Flysystem\FilesystemOperator` as a
-Symfony service and reference it through `filesystem_service`.
+For remote production storage, register a serializable
+`FlysystemFilesystemFactory` as a Symfony service and run the adapter through a
+bounded worker pool. A direct `FilesystemOperator` service remains available
+for development, but its synchronous calls block the Amp event loop.
 
 Install the adapter required by your backing storage. For an S3-compatible
 backing bucket:
@@ -246,32 +249,19 @@ backing bucket:
 composer require league/flysystem-aws-s3-v3
 ```
 
-Example `config/services.yaml`:
+Example `config/services.yaml` for an S3-compatible provider:
 
 ```yaml
 services:
-  app.s3_backing_client:
-    class: Aws\S3\S3Client
+  app.s3_backing_filesystem_factory:
+    class: OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory
     arguments:
-      -
-        version: 'latest'
-        region: '%env(S3_BACKING_REGION)%'
-        endpoint: '%env(S3_BACKING_ENDPOINT)%'
-        use_path_style_endpoint: true
-        credentials:
-          key: '%env(S3_BACKING_ACCESS_KEY)%'
-          secret: '%env(S3_BACKING_SECRET_KEY)%'
-
-  app.s3_backing_adapter:
-    class: League\Flysystem\AwsS3V3\AwsS3V3Adapter
-    arguments:
-      - '@app.s3_backing_client'
-      - '%env(S3_BACKING_BUCKET)%'
-
-  app.s3_backing_filesystem:
-    class: League\Flysystem\Filesystem
-    arguments:
-      - '@app.s3_backing_adapter'
+      $remoteBucket: '%env(S3_BACKING_BUCKET)%'
+      $region: '%env(S3_BACKING_REGION)%'
+      $accessKeyId: '%env(S3_BACKING_ACCESS_KEY)%'
+      $secretAccessKey: '%env(S3_BACKING_SECRET_KEY)%'
+      $endpoint: '%env(S3_BACKING_ENDPOINT)%'
+      $pathStyle: true
 ```
 
 Then reference the service from `config/packages/opsfour_s3_server.yaml`:
@@ -280,7 +270,8 @@ Then reference the service from `config/packages/opsfour_s3_server.yaml`:
 opsfour_s3_server:
   storage:
     driver: flysystem
-    filesystem_service: 'app.s3_backing_filesystem'
+    filesystem_factory_service: 'app.s3_backing_filesystem_factory'
+    worker_pool_size: 8
     temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
 ```
 
@@ -294,18 +285,22 @@ opsfour_s3_server:
     tiers:
       STANDARD:
         driver: flysystem
-        filesystem_service: 'app.hot_filesystem'
+        filesystem_factory_service: 'app.hot_filesystem_factory'
+        worker_pool_size: 8
+        temp_dir: '%kernel.cache_dir%/opsfour-s3-hot'
         default: true
 
       GLACIER:
         driver: flysystem
-        filesystem_service: 'app.cold_filesystem'
+        filesystem_factory_service: 'app.cold_filesystem_factory'
+        worker_pool_size: 4
+        temp_dir: '%kernel.cache_dir%/opsfour-s3-cold'
         restore_required: true
 ```
 
-The server still uses local temporary files or temp streams for multipart
-assembly and streaming bridges. Object data is persisted in the configured
-remote backend.
+The server uses local temporary files for bounded-memory staging. Object data
+is persisted in the configured remote backend. Size and monitor each
+`temp_dir` for the maximum number of concurrent worker transfers.
 
 ## Symfony Event Listeners
 

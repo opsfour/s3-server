@@ -32,7 +32,11 @@ When both are set, the server listens on HTTPS. Required for presigned URLs in p
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3_STORAGE_DRIVER` | `filesystem` | Storage backend: `filesystem`, `flysystem`, or `memory` |
+| `S3_STORAGE_TEMP_DIR` | system temp directory | Local staging directory for Flysystem transfers |
+| `S3_FLYSYSTEM_WORKERS` | `0` | Bounded Flysystem process workers; required for non-blocking remote production I/O |
+| `S3_FLYSYSTEM_FACTORY_SERVICE` | none | Laravel service ID of a serializable `FlysystemFilesystemFactory` |
 | `S3_STORAGE_PATH` | - | Root directory for object data (required for `filesystem`) |
+| `S3_REQUEST_BODY_SPOOL_WORKERS` | `8` | Stateless process workers for checksum validation and request-body replay |
 
 See [Storage Backends](storage-backends.md) for driver-specific configuration.
 Physical storage tiers are configured as arrays in Laravel config or Symfony
@@ -189,6 +193,13 @@ multipart uploads, and move data between configured physical storage tiers. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3_WEBSITE_HOST_PATTERN` | - | Host pattern for website-enabled buckets (e.g., `{bucket}.s3-website.example.com`) |
+
+Website configuration activates routing for the dedicated website host, but it
+does not make a private object public. Anonymous website `GET` and `HEAD`
+requests require either an `AllUsers` object ACL with `READ` or a matching
+bucket-policy `Allow` for `s3:GetObject`. Explicit policy denies and
+`IgnorePublicAcls`/`RestrictPublicBuckets` are enforced. This matches the
+permission model used by Amazon S3 and Linode website hosting.
 
 ## Parallelism
 

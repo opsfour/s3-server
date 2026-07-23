@@ -55,7 +55,9 @@ The Postgres backend uses `amphp/postgres` connection pooling. All queries are n
 
 ### HA Setup
 
-Use PostgreSQL streaming replication or a managed service (RDS, Cloud SQL, etc.):
+The supported baseline is PostgreSQL 14 or newer with the default
+`READ COMMITTED` isolation level. Use PostgreSQL streaming replication or a
+managed service (RDS, Cloud SQL, etc.):
 
 ```bash
 # Primary + read replicas behind a connection pooler (PgBouncer)
@@ -79,12 +81,21 @@ S3_METADATA_DRIVER=mysql
 S3_METADATA_DSN="host=db.internal;port=3306;dbname=s3server;user=s3;password=secret"
 ```
 
-Uses `amphp/mysql` connection pooling with the same non-blocking Fiber-based execution as Postgres.
+Uses `amphp/mysql` connection pooling with the same non-blocking Fiber-based
+execution as Postgres. The supported baseline is MySQL 8.0 or newer with
+InnoDB. The default `REPEATABLE READ` isolation level is supported; owner-scoped
+write-lock rows serialize quota-sensitive writes across nodes. MariaDB and
+distributed MySQL variants are not part of the tested compatibility matrix.
+
+The `transaction()` convenience method can be called from normal synchronous
+CLI code or from an Amp Fiber. Direct `beginTransaction()`, `commit()`, and
+`rollback()` calls require an Amp Fiber so the connection remains bound to the
+calling request.
 
 ### When to Use MySQL
 
 - Teams already operating MySQL infrastructure
-- MySQL-managed services (RDS MySQL, PlanetScale, etc.)
+- MySQL-managed services that preserve InnoDB transactions and row locks
 - Same capabilities as PostgreSQL backend
 
 ## Schema Migrations
@@ -97,8 +108,22 @@ All backends use automatic schema versioning. Tables are created on first start 
 | 2 | Lifecycle and noncurrent indexes |
 | 3 | Foreign key constraint tracking |
 | 4 | Rate limit buckets and notification queue tables |
+| 5 | Per-account quotas |
+| 6 | Distributed lease locks |
+| 7 | Lifecycle checkpoints |
+| 8 | Account and named IAM policies |
+| 9 | Physical tier placement and restore state |
+| 10 | Durable tier-transition jobs |
+| 11 | Durable restore jobs |
+| 12 | PostgreSQL/MySQL owner-scoped write locks |
 
-Migrations are idempotent (`CREATE TABLE IF NOT EXISTS`) and run inside transactions. Existing data is never modified by schema upgrades.
+SQLite currently uses schema version `11`; PostgreSQL and MySQL use version
+`12`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+retry-safe and records the new version only after every statement succeeds.
+MySQL DDL auto-commits, so partially applied migrations are retried
+idempotently; duplicate schema objects are tolerated, while every other error
+stops startup before the version is recorded. Schema upgrades may add tables,
+indexes, and columns with defaults, but do not delete application data.
 
 ## Metadata Caching
 

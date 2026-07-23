@@ -1,11 +1,13 @@
 # opsfour S3 Server
 
-A production-grade, fully S3-compatible object storage server built as a PHP 8.4+ Composer package. Powered by [Amp v3](https://amphp.org/) for true async I/O with PHP Fibers.
+A production-oriented S3-compatible object storage server built as a PHP 8.4+
+Composer package. Powered by [Amp v3](https://amphp.org/) for async I/O with
+PHP Fibers.
 
 ## Features
 
-- **Full S3 API compatibility** — 66 S3 operations including multipart uploads, versioning, object lock, lifecycle rules, S3 Select, restore, and website hosting
-- **AWS SDK compatible** — Works with any S3 client (AWS CLI, aws-sdk-php, boto3, MinIO client, etc.)
+- **Broad S3 API coverage** — 66 routed S3 operations including multipart uploads, versioning, object lock, lifecycle rules, S3 Select, restore, and website hosting
+- **AWS SDK compatible** — Tested with the AWS SDK for PHP; standard S3 clients can use the documented operation subset
 - **Multiple metadata backends** — SQLite (single-node), PostgreSQL or MySQL (multi-node HA)
 - **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory
 - **Server-side encryption** — SSE-S3 with key rotation support, SSE-C (customer-provided keys), AES-256-GCM
@@ -17,7 +19,7 @@ A production-grade, fully S3-compatible object storage server built as a PHP 8.4
 - **S3 Select** — SQL queries over CSV, JSON, and Parquet objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Production hardened** — 500+ PHPUnit tests covering AWS SDK flows, large objects, concurrency, metadata backends, remote storage, and reliability profiles
+- **Production hardened** — 590+ PHPUnit tests plus opt-in large-object, high-concurrency, remote-storage, and five-minute soak profiles
 
 ## Requirements
 
