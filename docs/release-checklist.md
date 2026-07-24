@@ -24,7 +24,7 @@ Validated on 2026-07-24 with PHP 8.4.8:
 
 | Profile | Result |
 |---------|--------|
-| Complete default suite | 745 tests, 3,287 assertions, 9 expected skips, 0 failures; 1:44.904; 80.50 MB |
+| Complete default suite | 745 tests, 3,288 assertions, 9 expected skips, 0 failures; 1:52.369; 74.50 MB |
 | Lowest supported dependency set | Composer audit clean; PHPStan 2.1 clean; complete suite passed without deprecations |
 | Highest supported dependency set | Laravel 13.21, Symfony 8.1, AWS SDK 3.389, PHPStan 2.2, and PHPUnit 11.5 passed |
 | AWS SDK operation guard | Every S3 operation exposed by AWS SDK 3.389 is routed or explicitly documented as unsupported |
@@ -35,6 +35,7 @@ Validated on 2026-07-24 with PHP 8.4.8:
 | 128 MiB multipart upload, 4 x 32 MiB | Passed; 35.238 seconds; 30 MB |
 | 200 objects / 100 concurrent requests | Passed; 204 assertions; 8.592 seconds; 62 MB |
 | Five-minute production soak | Passed; 598 assertions; 5:20.138; 44 MB |
+| Full-stack soak harness smoke | Passed against Linode Flysystem plus PostgreSQL; 75 batches, 1,265 assertions; 1:03.040; 28 MB |
 | External Linode Flysystem backend | Passed; 64 MiB object plus 3 x 8 MiB multipart; 2 tests, 11 assertions; 50.830 seconds; 86.05 MB; Path-Style |
 | PostgreSQL 16 + MySQL 8.0 metadata integration | Passed; 6 tests, 82 assertions, 2 expected migration-profile skips; fresh schema, queues, stale-lease recovery, long-key tags, and quota concurrency |
 | PostgreSQL 16 + MySQL 8.0 destructive migration | Passed; 2 tests, 6 assertions; v11-to-v15 |
@@ -114,6 +115,37 @@ S3_TEST_PRODUCTION_SOAK_CONCURRENCY=25 \
 vendor/bin/phpunit tests/Functional/ReliabilityStressTest.php \
   --filter test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable
 ```
+
+Before a major production release, run the same soak against remote storage and
+an external metadata database for at least 12 hours. Use a unique backing prefix
+and a disposable database. Backing credentials are inherited through the
+environment and are not placed in the process command line:
+
+```bash
+S3_TEST_SERVER_STORAGE_DRIVER=flysystem \
+S3_FLYSYSTEM_WORKERS=8 \
+S3_BACKING_BUCKET='...' \
+S3_BACKING_REGION='...' \
+S3_BACKING_ACCESS_KEY='...' \
+S3_BACKING_SECRET_KEY='...' \
+S3_BACKING_ENDPOINT='...' \
+S3_BACKING_PATH_STYLE=true \
+S3_BACKING_PREFIX='release-soak-unique-id' \
+S3_METADATA_DRIVER=postgres \
+S3_METADATA_DSN='host=... port=5432 dbname=... user=... password=...' \
+S3_TEST_PRODUCTION_SOAK=1 \
+S3_TEST_PRODUCTION_SOAK_SECONDS=43200 \
+S3_TEST_PRODUCTION_SOAK_BATCH=10 \
+S3_TEST_PRODUCTION_SOAK_OBJECT_BYTES=65536 \
+S3_TEST_PRODUCTION_SOAK_CONCURRENCY=10 \
+S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS=5000 \
+vendor/bin/phpunit tests/Functional/ReliabilityStressTest.php \
+  --filter test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable
+```
+
+The full-stack profile verifies every returned object body, both health probes,
+temporary-file cleanup, and process RSS growth while exercising the complete
+server path through Flysystem and the selected metadata backend.
 
 ## Upgrade Notes
 

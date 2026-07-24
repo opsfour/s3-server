@@ -193,13 +193,28 @@ abstract class S3FunctionalTestCase extends TestCase
             2 => ['file', self::$serverStderrPath, 'a'],
         ];
 
+        $storageDriver = getenv('S3_TEST_SERVER_STORAGE_DRIVER') ?: 'filesystem';
+        $storageArguments = match ($storageDriver) {
+            'filesystem' => sprintf(
+                '--storage-driver=filesystem --storage-path=%s',
+                escapeshellarg(self::$storagePath),
+            ),
+            'flysystem' => sprintf(
+                '--storage-driver=flysystem --storage-temp-dir=%s --flysystem-workers=%d',
+                escapeshellarg(self::$storagePath . '/.tmp'),
+                max(1, (int) (getenv('S3_FLYSYSTEM_WORKERS') ?: 4)),
+            ),
+            'memory' => '--storage-driver=memory',
+            default => self::fail("Unsupported S3_TEST_SERVER_STORAGE_DRIVER: {$storageDriver}"),
+        };
+
         // Use exec to replace the shell process so we can terminate the PHP process directly.
         $cmd = sprintf(
-            'exec php %s --host=%s --port=%d --storage-path=%s --access-key=%s --secret-key=%s --enforce-min-part-size=false',
+            'exec php %s --host=%s --port=%d %s --access-key=%s --secret-key=%s --enforce-min-part-size=false',
             escapeshellarg($binPath),
             escapeshellarg(self::$host),
             self::$port,
-            escapeshellarg(self::$storagePath),
+            $storageArguments,
             escapeshellarg(self::$accessKey),
             escapeshellarg(self::$secretKey),
         );

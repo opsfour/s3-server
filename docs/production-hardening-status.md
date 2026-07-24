@@ -164,7 +164,7 @@ Status: **Complete**
 - [x] AWS STS Query API is explicitly optional and unsupported.
 - [x] PHPStan passes over the complete package.
 - [x] PHP CS Fixer reports no changes across 395 files.
-- [x] The complete default suite passes: 745 tests, 3,287 assertions, 9 expected
+- [x] The complete default suite passes: 745 tests, 3,288 assertions, 9 expected
   skips, 0 failures.
 - [x] A 256 MiB streamed PUT/GET and 128 MiB multipart upload pass.
 - [x] A 200-object workload at 100 concurrent requests passes.

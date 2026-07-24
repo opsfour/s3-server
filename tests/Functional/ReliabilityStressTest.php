@@ -293,27 +293,36 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $objectBytes = self::envInt('S3_TEST_PRODUCTION_SOAK_OBJECT_BYTES', 256 * 1024);
         $concurrency = self::envInt('S3_TEST_PRODUCTION_SOAK_CONCURRENCY', 25);
         $allowedGrowth = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_RSS_GROWTH_BYTES', 256 * 1024 * 1024);
+        $pauseMilliseconds = self::envNonNegativeInt('S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS', 0);
+        $progressSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS', 60);
 
         $rssBefore = self::serverRssBytes();
         $tmpBefore = self::countFiles(self::$storagePath . '/.tmp');
         $deadline = microtime(true) + $durationSeconds;
         $iteration = 0;
+        $nextProgress = microtime(true) + $progressSeconds;
 
         while (microtime(true) < $deadline) {
             $prefix = sprintf('production-soak/%06d/', $iteration++);
             $putCommands = [];
             $headCommands = [];
+            $getCommands = [];
             $deleteObjects = [];
 
             for ($i = 0; $i < $batchSize; $i++) {
                 $key = $prefix . $i . '.bin';
+                $payload = str_repeat(chr(65 + ($i % 26)), $objectBytes);
                 $putCommands[] = self::$s3->getCommand('PutObject', [
                     'Bucket' => self::$bucket,
                     'Key' => $key,
-                    'Body' => str_repeat(chr(65 + ($i % 26)), $objectBytes),
+                    'Body' => $payload,
                     'ContentSHA256' => 'UNSIGNED-PAYLOAD',
                 ]);
                 $headCommands[] = self::$s3->getCommand('HeadObject', [
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                ]);
+                $getCommands[$i] = self::$s3->getCommand('GetObject', [
                     'Bucket' => self::$bucket,
                     'Key' => $key,
                 ]);
@@ -324,13 +333,42 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             $this->runCommandPool($headCommands, $concurrency, function (ResultInterface $result) use ($objectBytes): void {
                 $this->assertSame($objectBytes, $result['ContentLength']);
             });
+            $this->runCommandPool(
+                $getCommands,
+                $concurrency,
+                function (ResultInterface $result, int|string $index) use ($objectBytes): void {
+                    $expected = str_repeat(chr(65 + (((int) $index) % 26)), $objectBytes);
+                    $this->assertSame($expected, (string) $result['Body'], 'GET returned stale or corrupt data.');
+                },
+            );
 
             self::$s3->deleteObjects([
                 'Bucket' => self::$bucket,
                 'Delete' => ['Objects' => $deleteObjects],
             ]);
+
+            foreach (['.live', '.health'] as $probe) {
+                $response = file_get_contents(sprintf('http://%s:%d/%s', self::$host, self::$port, $probe));
+                $this->assertIsString($response, "The {$probe} probe became unavailable.");
+                $this->assertStringContainsString('ok', strtolower($response));
+            }
+
+            $now = microtime(true);
+            if ($now >= $nextProgress) {
+                fwrite(STDOUT, sprintf(
+                    "\nSoak progress: %d seconds remaining, %d batches completed.\n",
+                    max(0, (int) ceil($deadline - $now)),
+                    $iteration,
+                ));
+                $nextProgress = $now + $progressSeconds;
+            }
+
+            if ($pauseMilliseconds > 0) {
+                usleep($pauseMilliseconds * 1000);
+            }
         }
 
+        $this->assertGreaterThan(0, $iteration, 'Production soak did not complete a workload batch.');
         $tmpAfter = self::countFiles(self::$storagePath . '/.tmp');
         $this->assertLessThanOrEqual($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
 
@@ -345,16 +383,16 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
     }
 
     /**
-     * @param list<\Aws\CommandInterface> $commands
+     * @param array<int|string, \Aws\CommandInterface> $commands
      */
     private function runCommandPool(array $commands, int $concurrency, ?callable $fulfilled = null): void
     {
         $errors = [];
         $pool = new CommandPool(self::$s3, $commands, [
             'concurrency' => $concurrency,
-            'fulfilled' => function (ResultInterface $result) use ($fulfilled): void {
+            'fulfilled' => function (ResultInterface $result, int|string $index) use ($fulfilled): void {
                 if ($fulfilled !== null) {
-                    $fulfilled($result);
+                    $fulfilled($result, $index);
                 }
             },
             'rejected' => static function ($reason) use (&$errors): void {
@@ -402,6 +440,16 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         }
 
         return max(1, (int) $value);
+    }
+
+    private static function envNonNegativeInt(string $name, int $default): int
+    {
+        $value = getenv($name);
+        if ($value === false || $value === '') {
+            return $default;
+        }
+
+        return max(0, (int) $value);
     }
 
     private static function envBool(string $name): bool

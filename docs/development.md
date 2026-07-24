@@ -197,5 +197,5 @@ and Laravel 13 with Symfony 8.1 or newer.
 ## Current Test Baseline
 
 ```
-745 tests, 3287 assertions, 9 skipped, 0 failures
+745 tests, 3288 assertions, 9 skipped, 0 failures
 ```
