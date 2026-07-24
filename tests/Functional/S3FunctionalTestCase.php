@@ -114,12 +114,43 @@ abstract class S3FunctionalTestCase extends TestCase
             return null;
         }
 
-        $rssKb = trim((string) shell_exec('ps -o rss= -p ' . (int) $pid));
-        if ($rssKb === '' || !ctype_digit($rssKb)) {
+        $processes = shell_exec('ps -axo pid=,ppid=,rss=');
+        if ($processes === null || $processes === false || trim($processes) === '') {
             return null;
         }
 
-        return (int) $rssKb * 1024;
+        /** @var array<int, array{parent: int, rss: int}> $rows */
+        $rows = [];
+        foreach (preg_split('/\R/', trim($processes)) ?: [] as $line) {
+            if (preg_match('/^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/', $line, $matches) !== 1) {
+                continue;
+            }
+            $rows[(int) $matches[1]] = [
+                'parent' => (int) $matches[2],
+                'rss' => (int) $matches[3],
+            ];
+        }
+        if (! isset($rows[$pid])) {
+            return null;
+        }
+
+        $processIds = [$pid => true];
+        do {
+            $changed = false;
+            foreach ($rows as $processId => $row) {
+                if (! isset($processIds[$processId]) && isset($processIds[$row['parent']])) {
+                    $processIds[$processId] = true;
+                    $changed = true;
+                }
+            }
+        } while ($changed);
+
+        $rssKb = 0;
+        foreach (array_keys($processIds) as $processId) {
+            $rssKb += $rows[$processId]['rss'] ?? 0;
+        }
+
+        return $rssKb * 1024;
     }
 
     private static function stopServer(): void
@@ -209,8 +240,10 @@ abstract class S3FunctionalTestCase extends TestCase
         };
 
         // Use exec to replace the shell process so we can terminate the PHP process directly.
+        $memoryLimit = getenv('S3_TEST_SERVER_MEMORY_LIMIT') ?: '-1';
         $cmd = sprintf(
-            'exec php %s --host=%s --port=%d %s --access-key=%s --secret-key=%s --enforce-min-part-size=false',
+            'exec php -d memory_limit=%s %s --host=%s --port=%d %s --access-key=%s --secret-key=%s --enforce-min-part-size=false',
+            escapeshellarg($memoryLimit),
             escapeshellarg($binPath),
             escapeshellarg(self::$host),
             self::$port,

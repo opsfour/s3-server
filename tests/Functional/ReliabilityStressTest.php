@@ -293,10 +293,11 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $objectBytes = self::envInt('S3_TEST_PRODUCTION_SOAK_OBJECT_BYTES', 256 * 1024);
         $concurrency = self::envInt('S3_TEST_PRODUCTION_SOAK_CONCURRENCY', 25);
         $allowedGrowth = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_RSS_GROWTH_BYTES', 256 * 1024 * 1024);
+        $maximumTotalRss = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_TOTAL_RSS_BYTES', 768 * 1024 * 1024);
         $pauseMilliseconds = self::envNonNegativeInt('S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS', 0);
         $progressSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS', 60);
 
-        $rssBefore = self::serverRssBytes();
+        $rssBaseline = null;
         $tmpBefore = self::countFiles(self::$storagePath . '/.tmp');
         $deadline = microtime(true) + $durationSeconds;
         $iteration = 0;
@@ -353,6 +354,26 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 $this->assertStringContainsString('ok', strtolower($response));
             }
 
+            $currentRss = self::serverRssBytes();
+            if ($currentRss !== null) {
+                $this->assertLessThanOrEqual(
+                    $maximumTotalRss,
+                    $currentRss,
+                    'Server process-tree RSS exceeded the production soak hard limit.',
+                );
+
+                // Flysystem workers are started lazily by the first storage batch.
+                if ($rssBaseline === null) {
+                    $rssBaseline = $currentRss;
+                } else {
+                    $this->assertLessThanOrEqual(
+                        $allowedGrowth,
+                        max(0, $currentRss - $rssBaseline),
+                        'Server process-tree RSS grew too much after worker warm-up.',
+                    );
+                }
+            }
+
             $now = microtime(true);
             if ($now >= $nextProgress) {
                 fwrite(STDOUT, sprintf(
@@ -373,11 +394,11 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $this->assertLessThanOrEqual($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
 
         $rssAfter = self::serverRssBytes();
-        if ($rssBefore !== null && $rssAfter !== null) {
+        if ($rssBaseline !== null && $rssAfter !== null) {
             $this->assertLessThanOrEqual(
                 $allowedGrowth,
-                max(0, $rssAfter - $rssBefore),
-                'Server RSS grew too much during production soak.',
+                max(0, $rssAfter - $rssBaseline),
+                'Server process-tree RSS grew too much after worker warm-up.',
             );
         }
     }

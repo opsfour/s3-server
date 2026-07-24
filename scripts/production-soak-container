@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -eu
+
+status=0
+cleanup_status=0
+
+php -d memory_limit=768M vendor/bin/phpunit \
+    tests/Functional/ReliabilityStressTest.php \
+    --filter test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable \
+    --do-not-cache-result || status=$?
+
+php scripts/cleanup-production-soak.php || cleanup_status=$?
+if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    status=$cleanup_status
+fi
+
+printf 'exit=%d finished=%s commit=%s\n' \
+    "$status" \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$S3_SOAK_COMMIT" > /soak-state/result
+
+exit "$status"

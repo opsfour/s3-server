@@ -6,3 +6,4 @@ parameters:
     paths:
         - src
         - tests
+        - scripts/cleanup-production-soak.php

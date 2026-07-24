@@ -29,13 +29,14 @@ Validated on 2026-07-24 with PHP 8.4.8:
 | Highest supported dependency set | Laravel 13.21, Symfony 8.1, AWS SDK 3.389, PHPStan 2.2, and PHPUnit 11.5 passed |
 | AWS SDK operation guard | Every S3 operation exposed by AWS SDK 3.389 is routed or explicitly documented as unsupported |
 | PHPStan, complete package | No errors |
-| PHP CS Fixer, 395 files | No changes required |
+| PHP CS Fixer, 396 files | No changes required |
 | Composer locked dependency audit | No known security advisories |
 | 256 MiB streamed PUT/GET | Passed; 58.816 seconds; 32 MB |
 | 128 MiB multipart upload, 4 x 32 MiB | Passed; 35.238 seconds; 30 MB |
 | 200 objects / 100 concurrent requests | Passed; 204 assertions; 8.592 seconds; 62 MB |
 | Five-minute production soak | Passed; 598 assertions; 5:20.138; 44 MB |
 | Full-stack soak harness smoke | Passed against Linode Flysystem plus PostgreSQL; 75 batches, 1,265 assertions; 1:03.040; 28 MB |
+| Docker-isolated full-stack smoke | Passed against Linode Flysystem plus PostgreSQL; 1,675 assertions; 1:01.406; 30 MB PHPUnit; 1 GiB cgroup; no swap; no OOM; remote cleanup passed |
 | External Linode Flysystem backend | Passed; 64 MiB object plus 3 x 8 MiB multipart; 2 tests, 11 assertions; 50.830 seconds; 86.05 MB; Path-Style |
 | PostgreSQL 16 + MySQL 8.0 metadata integration | Passed; 6 tests, 82 assertions, 2 expected migration-profile skips; fresh schema, queues, stale-lease recovery, long-key tags, and quota concurrency |
 | PostgreSQL 16 + MySQL 8.0 destructive migration | Passed; 2 tests, 6 assertions; v11-to-v15 |
@@ -117,35 +118,23 @@ vendor/bin/phpunit tests/Functional/ReliabilityStressTest.php \
 ```
 
 Before a major production release, run the same soak against remote storage and
-an external metadata database for at least 12 hours. Use a unique backing prefix
-and a disposable database. Backing credentials are inherited through the
-environment and are not placed in the process command line:
+an external metadata database for at least 12 hours. The repository Docker
+runner caps the complete PHP/S3 process tree at 1 GiB without swap and
+PostgreSQL at 512 MiB, mounts the package read-only, uses a unique backing
+prefix, and performs remote cleanup even after an OOM kill:
 
 ```bash
-S3_TEST_SERVER_STORAGE_DRIVER=flysystem \
-S3_FLYSYSTEM_WORKERS=8 \
-S3_BACKING_BUCKET='...' \
-S3_BACKING_REGION='...' \
-S3_BACKING_ACCESS_KEY='...' \
-S3_BACKING_SECRET_KEY='...' \
-S3_BACKING_ENDPOINT='...' \
-S3_BACKING_PATH_STYLE=true \
-S3_BACKING_PREFIX='release-soak-unique-id' \
-S3_METADATA_DRIVER=postgres \
-S3_METADATA_DSN='host=... port=5432 dbname=... user=... password=...' \
-S3_TEST_PRODUCTION_SOAK=1 \
-S3_TEST_PRODUCTION_SOAK_SECONDS=43200 \
-S3_TEST_PRODUCTION_SOAK_BATCH=10 \
-S3_TEST_PRODUCTION_SOAK_OBJECT_BYTES=65536 \
-S3_TEST_PRODUCTION_SOAK_CONCURRENCY=10 \
-S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS=5000 \
-vendor/bin/phpunit tests/Functional/ReliabilityStressTest.php \
-  --filter test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable
+scripts/run-production-soak start
+scripts/run-production-soak status
 ```
 
-The full-stack profile verifies every returned object body, both health probes,
-temporary-file cleanup, and process RSS growth while exercising the complete
-server path through Flysystem and the selected metadata backend.
+The runner reads the ignored `.env.integration` file. Duration, batch size,
+object size, concurrency, pacing, worker count, and RSS thresholds can be
+overridden with the `S3_SOAK_*` environment variables in
+`docker/production-soak/compose.yml`. The full-stack profile verifies every
+returned object body, both health probes, temporary-file cleanup, an absolute
+process-tree RSS ceiling from the first batch, and RSS growth after lazy worker
+startup while exercising Flysystem and PostgreSQL.
 
 ## Upgrade Notes
 

@@ -39,6 +39,27 @@ jobs:
       - run: composer analyse
       - run: composer cs:check
       - run: composer test
+      - name: Validate production soak runner
+        env:
+          S3_INTEGRATION_BUCKET: ci-bucket
+          S3_INTEGRATION_REGION: us-east-1
+          S3_INTEGRATION_ACCESS_KEY: ci-access-key
+          S3_INTEGRATION_SECRET_KEY: ci-secret-key
+          S3_INTEGRATION_ENDPOINT: https://s3.example.com
+          S3_SOAK_BACKING_PREFIX: s3-server/release-soak-ci
+          S3_SOAK_COMMIT: ci
+          S3_SOAK_STATE_DIR: /tmp/opsfour-s3-production-soak
+        run: |
+          shellcheck scripts/run-production-soak \
+            scripts/production-soak-container \
+            scripts/production-soak-watchdog
+          sh -n scripts/run-production-soak \
+            scripts/production-soak-container \
+            scripts/production-soak-watchdog
+          docker compose \
+            --project-name opsfour-s3-production-soak \
+            --file docker/production-soak/compose.yml \
+            config --quiet
 
   dependency-compatibility:
     name: Dependencies (${{ matrix.name }})

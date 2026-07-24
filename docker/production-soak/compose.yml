@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: postgres@sha256:2586e2a95d1c9b31cb2967feb562948f7d364854453d703039b6efa45fe48417
+    environment:
+      POSTGRES_DB: s3server
+      POSTGRES_USER: s3
+      POSTGRES_PASSWORD: s3audit
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U s3 -d s3server"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    tmpfs:
+      - /var/lib/postgresql/data:size=268435456
+
+  soak:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    command: ["/bin/sh", "scripts/production-soak-container"]
+    environment:
+      S3_TEST_SERVER_STORAGE_DRIVER: flysystem
+      S3_FLYSYSTEM_WORKERS: ${S3_SOAK_FLYSYSTEM_WORKERS:-4}
+      S3_BACKING_BUCKET: ${S3_INTEGRATION_BUCKET:?missing S3_INTEGRATION_BUCKET}
+      S3_BACKING_REGION: ${S3_INTEGRATION_REGION:?missing S3_INTEGRATION_REGION}
+      S3_BACKING_ACCESS_KEY: ${S3_INTEGRATION_ACCESS_KEY:?missing S3_INTEGRATION_ACCESS_KEY}
+      S3_BACKING_SECRET_KEY: ${S3_INTEGRATION_SECRET_KEY:?missing S3_INTEGRATION_SECRET_KEY}
+      S3_BACKING_ENDPOINT: ${S3_INTEGRATION_ENDPOINT:?missing S3_INTEGRATION_ENDPOINT}
+      S3_BACKING_PATH_STYLE: ${S3_INTEGRATION_PATH_STYLE:-true}
+      S3_BACKING_PREFIX: ${S3_SOAK_BACKING_PREFIX:?missing S3_SOAK_BACKING_PREFIX}
+      S3_METADATA_DRIVER: postgres
+      S3_METADATA_DSN: host=postgres port=5432 dbname=s3server user=s3 password=s3audit
+      S3_TEST_PRODUCTION_SOAK: "1"
+      S3_TEST_PRODUCTION_SOAK_SECONDS: ${S3_SOAK_DURATION_SECONDS:-43200}
+      S3_TEST_PRODUCTION_SOAK_BATCH: ${S3_SOAK_BATCH:-10}
+      S3_TEST_PRODUCTION_SOAK_OBJECT_BYTES: ${S3_SOAK_OBJECT_BYTES:-65536}
+      S3_TEST_PRODUCTION_SOAK_CONCURRENCY: ${S3_SOAK_CONCURRENCY:-10}
+      S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS: ${S3_SOAK_PAUSE_MILLISECONDS:-5000}
+      S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS: ${S3_SOAK_PROGRESS_SECONDS:-300}
+      S3_TEST_PRODUCTION_SOAK_MAX_RSS_GROWTH_BYTES: ${S3_SOAK_MAX_RSS_GROWTH_BYTES:-268435456}
+      S3_TEST_PRODUCTION_SOAK_MAX_TOTAL_RSS_BYTES: ${S3_SOAK_MAX_TOTAL_RSS_BYTES:-805306368}
+      S3_TEST_SERVER_MEMORY_LIMIT: ${S3_SOAK_SERVER_MEMORY_LIMIT:-256M}
+      S3_SOAK_COMMIT: ${S3_SOAK_COMMIT:?missing S3_SOAK_COMMIT}
+    volumes:
+      - ../..:/app:ro
+      - ${S3_SOAK_STATE_DIR:?missing S3_SOAK_STATE_DIR}:/soak-state
+    tmpfs:
+      - /tmp:size=268435456
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    pids_limit: 256
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  cleanup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command: ["/bin/sh", "scripts/production-soak-watchdog"]
+    environment:
+      S3_BACKING_BUCKET: ${S3_INTEGRATION_BUCKET:?missing S3_INTEGRATION_BUCKET}
+      S3_BACKING_REGION: ${S3_INTEGRATION_REGION:?missing S3_INTEGRATION_REGION}
+      S3_BACKING_ACCESS_KEY: ${S3_INTEGRATION_ACCESS_KEY:?missing S3_INTEGRATION_ACCESS_KEY}
+      S3_BACKING_SECRET_KEY: ${S3_INTEGRATION_SECRET_KEY:?missing S3_INTEGRATION_SECRET_KEY}
+      S3_BACKING_ENDPOINT: ${S3_INTEGRATION_ENDPOINT:?missing S3_INTEGRATION_ENDPOINT}
+      S3_BACKING_PATH_STYLE: ${S3_INTEGRATION_PATH_STYLE:-true}
+      S3_BACKING_PREFIX: ${S3_SOAK_BACKING_PREFIX:?missing S3_SOAK_BACKING_PREFIX}
+      S3_TEST_PRODUCTION_SOAK_SECONDS: ${S3_SOAK_DURATION_SECONDS:-43200}
+    volumes:
+      - ../..:/app:ro
+      - ${S3_SOAK_STATE_DIR:?missing S3_SOAK_STATE_DIR}:/soak-state
+    tmpfs:
+      - /tmp:size=67108864
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

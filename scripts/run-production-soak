@@ -1,0 +1,150 @@
+#!/bin/sh
+
+set -eu
+
+PACKAGE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+COMPOSE_FILE="$PACKAGE_DIR/docker/production-soak/compose.yml"
+STATE_DIR=${S3_SOAK_STATE_DIR:-/tmp/opsfour-s3-production-soak}
+RUNTIME_FILE="$STATE_DIR/runtime.env"
+RESULT_FILE="$STATE_DIR/result"
+PROJECT_NAME=opsfour-s3-production-soak
+
+load_environment()
+{
+    if [ ! -f "$PACKAGE_DIR/.env.integration" ]; then
+        printf 'Missing %s/.env.integration\n' "$PACKAGE_DIR" >&2
+        exit 1
+    fi
+
+    set -a
+    # shellcheck disable=SC1091
+    . "$PACKAGE_DIR/.env.integration"
+    set +a
+
+    for name in \
+        S3_INTEGRATION_BUCKET \
+        S3_INTEGRATION_REGION \
+        S3_INTEGRATION_ACCESS_KEY \
+        S3_INTEGRATION_SECRET_KEY \
+        S3_INTEGRATION_ENDPOINT
+    do
+        eval "value=\${$name:-}"
+        if [ -z "$value" ]; then
+            printf 'Missing %s in .env.integration\n' "$name" >&2
+            exit 1
+        fi
+    done
+}
+
+compose()
+{
+    docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
+}
+
+load_runtime()
+{
+    if [ ! -f "$RUNTIME_FILE" ]; then
+        printf 'No production soak runtime state exists.\n' >&2
+        exit 1
+    fi
+
+    set -a
+    # shellcheck disable=SC1090
+    . "$RUNTIME_FILE"
+    set +a
+}
+
+start_soak()
+{
+    mkdir -p "$STATE_DIR"
+    chmod 0777 "$STATE_DIR"
+    if docker ps \
+        --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+        --quiet | grep -q .; then
+        printf 'A production soak stack is already running; stop it before starting another.\n' >&2
+        exit 1
+    fi
+
+    load_environment
+    export S3_SOAK_DURATION_SECONDS="${S3_SOAK_DURATION_SECONDS:-43200}"
+    export S3_SOAK_BACKING_PREFIX="${S3_SOAK_BACKING_PREFIX:-s3-server/release-soak-$(git -C "$PACKAGE_DIR" rev-parse --short HEAD)-$(date -u '+%Y%m%dT%H%M%SZ')}"
+    export S3_SOAK_COMMIT
+    S3_SOAK_COMMIT=$(git -C "$PACKAGE_DIR" rev-parse --short HEAD)
+    export S3_SOAK_STATE_DIR="$STATE_DIR"
+
+    rm -f "$RESULT_FILE"
+    rm -f "$STATE_DIR/watchdog-result"
+    printf 'S3_SOAK_DURATION_SECONDS=%s\nS3_SOAK_BACKING_PREFIX=%s\nS3_SOAK_COMMIT=%s\nS3_SOAK_STATE_DIR=%s\n' \
+        "$S3_SOAK_DURATION_SECONDS" \
+        "$S3_SOAK_BACKING_PREFIX" \
+        "$S3_SOAK_COMMIT" \
+        "$S3_SOAK_STATE_DIR" > "$RUNTIME_FILE"
+
+    compose up --detach --build --wait --wait-timeout 90
+    printf 'Production soak started in Docker: duration %ss, prefix %s\n' \
+        "$S3_SOAK_DURATION_SECONDS" \
+        "$S3_SOAK_BACKING_PREFIX"
+}
+
+show_status()
+{
+    load_environment
+    load_runtime
+
+    container_id=$(compose ps --all --quiet soak)
+    if [ -n "$container_id" ]; then
+        docker inspect --format 'container={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} memory=1g' "$container_id"
+    elif [ ! -f "$RESULT_FILE" ]; then
+        printf 'not running\n'
+    fi
+
+    if [ -f "$RESULT_FILE" ]; then
+        cat "$RESULT_FILE"
+    fi
+    compose logs --tail 20 soak
+}
+
+stop_soak()
+{
+    load_environment
+    load_runtime
+
+    status=0
+    cleanup_status=0
+    down_status=0
+
+    compose stop --timeout 30 soak cleanup || status=$?
+    compose run --rm --no-deps soak php scripts/cleanup-production-soak.php || cleanup_status=$?
+    compose down --volumes --remove-orphans || down_status=$?
+
+    if [ "$cleanup_status" -ne 0 ]; then
+        status=$cleanup_status
+    elif [ "$down_status" -ne 0 ]; then
+        status=$down_status
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        printf 'Production soak stopped and remote prefix cleaned.\n'
+    else
+        printf 'Production soak stopped with cleanup errors; inspect the remote prefix in %s.\n' \
+            "$RUNTIME_FILE" >&2
+    fi
+
+    return "$status"
+}
+
+case "${1:-}" in
+    start)
+        start_soak
+        ;;
+    status)
+        show_status
+        ;;
+    stop)
+        stop_soak
+        ;;
+    *)
+        printf 'Usage: %s start|status|stop\n' "$0" >&2
+        exit 2
+        ;;
+esac

@@ -163,7 +163,7 @@ Status: **Complete**
   compatibility matrices.
 - [x] AWS STS Query API is explicitly optional and unsupported.
 - [x] PHPStan passes over the complete package.
-- [x] PHP CS Fixer reports no changes across 395 files.
+- [x] PHP CS Fixer reports no changes across 396 files.
 - [x] The complete default suite passes: 745 tests, 3,288 assertions, 9 expected
   skips, 0 failures.
 - [x] A 256 MiB streamed PUT/GET and 128 MiB multipart upload pass.
@@ -176,6 +176,9 @@ Status: **Complete**
 - [x] PostgreSQL 16 and MySQL 8.0 fresh-schema, round-trip, observability,
   long-key tag identity, two-process quota, and v11-to-v15 migration profiles
   pass.
+- [x] The detached Docker soak runner enforces a 1 GiB no-swap cgroup for the
+  complete PHP/S3 process tree, uses a separate bounded PostgreSQL container,
+  and retains an independent remote-cleanup watchdog for OOM failures.
 
 ## 9. Re-Audit Closure
 
