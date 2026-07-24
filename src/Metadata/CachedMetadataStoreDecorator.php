@@ -32,7 +32,15 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function __construct(
         private readonly MetadataStore $inner,
         private readonly float $ttlSeconds = 5.0,
-    ) {}
+        private readonly int $maxCacheEntries = self::MAX_CACHE_ENTRIES,
+    ) {
+        if ($ttlSeconds < 0.0) {
+            throw new \InvalidArgumentException('Metadata cache TTL must be >= 0 seconds.');
+        }
+        if ($maxCacheEntries < 1) {
+            throw new \InvalidArgumentException('Metadata cache entry limit must be >= 1.');
+        }
+    }
 
     public function innerStore(): MetadataStore
     {
@@ -328,6 +336,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->listMultipartUploads($bucket, $prefix, $delimiter, $maxUploads, $keyMarker, $uploadIdMarker);
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        return $this->inner->getMultipartStorageStats($ownerId, $bucket);
+    }
+
     public function putPart(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath): void
     {
         $this->inner->putPart($uploadId, $partNumber, $etag, $size, $storagePath);
@@ -456,19 +469,19 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->deleteBucketTagging($bucket);
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
-        return $this->inner->getObjectTagging($bucket, $key);
+        return $this->inner->getObjectTagging($bucket, $key, $versionId);
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
-        $this->inner->putObjectTagging($bucket, $key, $tags);
+        $this->inner->putObjectTagging($bucket, $key, $tags, $versionId);
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
-        $this->inner->deleteObjectTagging($bucket, $key);
+        $this->inner->deleteObjectTagging($bucket, $key, $versionId);
     }
 
     public function getBucketLifecycle(string $bucket): array
@@ -524,6 +537,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->updateTierTransitionJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath);
     }
 
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->inner->renewTierTransitionJobLease($id, $leaseExpiresAt);
+    }
+
     public function getTierTransitionJob(int $id): ?array
     {
         return $this->inner->getTierTransitionJob($id);
@@ -555,6 +573,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         ?string $restoredStoragePath = null,
     ): void {
         $this->inner->updateRestoreJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath);
+    }
+
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->inner->renewRestoreJobLease($id, $leaseExpiresAt);
     }
 
     public function getRestoreJob(int $id): ?array
@@ -628,9 +651,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->listExpiredNoncurrentVersions($bucket, $prefix, $noncurrentDays, $limit, $tags, $afterKey, $afterVersionId);
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
-        return $this->inner->listExpiredMultipartUploads($bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId);
+        return $this->inner->listExpiredMultipartUploads($bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId, $createdBefore);
     }
 
     public function listOrphanedDeleteMarkers(string $bucket, ?string $prefix, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array
@@ -704,6 +727,31 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->cleanupOldNotifications($maxAgeSeconds);
     }
 
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath);
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->inner->discardStorageGarbage($bucket, $storageTier, $storagePath);
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->inner->dequeueStorageGarbage($limit);
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->inner->completeStorageGarbage($id);
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->inner->retryStorageGarbage($id, $error, $nextAttemptAt);
+    }
+
     public function beginTransaction(): void
     {
         $this->inner->beginTransaction();
@@ -716,7 +764,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function rollback(): void
     {
-        $this->inner->rollback();
+        try {
+            $this->inner->rollback();
+        } finally {
+            $this->clearCache();
+        }
     }
 
     public function lockOwnerForUpdate(string $ownerId): void
@@ -726,7 +778,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function transaction(callable $callback): mixed
     {
-        return $this->inner->transaction($callback);
+        try {
+            return $this->inner->transaction($callback);
+        } catch (\Throwable $e) {
+            // Reads performed by the callback may have cached uncommitted values.
+            $this->clearCache();
+
+            throw $e;
+        }
     }
 
     // ---------------------------------------------------------------
@@ -750,8 +809,15 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $value = $loader();
 
         // Enforce hard cap to prevent memory exhaustion.
-        if ($this->cacheSize >= self::MAX_CACHE_ENTRIES && !isset($this->cache[$key])) {
+        if ($this->cacheSize >= $this->maxCacheEntries && !isset($this->cache[$key])) {
             $this->evictExpired($now);
+            if ($this->cacheSize >= $this->maxCacheEntries) {
+                $oldest = array_key_first($this->cache);
+                if ($oldest !== null) {
+                    unset($this->cache[$oldest]);
+                    $this->cacheSize--;
+                }
+            }
         }
 
         if (!isset($this->cache[$key])) {
@@ -791,5 +857,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
                 $this->cacheSize--;
             }
         }
+    }
+
+    private function clearCache(): void
+    {
+        $this->cache = [];
+        $this->cacheSize = 0;
     }
 }

@@ -8,19 +8,28 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\BadDigestException;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 final class UploadPartHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
-    ) {}
+        private readonly ?QuotaManager $quotas = null,
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -51,6 +60,15 @@ final class UploadPartHandler implements RequestHandler
         if ($upload['owner_id'] !== $ownerId) {
             throw new NoSuchUploadException();
         }
+        $uploadSseAlgorithm = $upload['user_metadata']['__sse-algorithm'] ?? null;
+        $customerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $uploadSseAlgorithm === 'SSE-C',
+            $upload['user_metadata']['__sse-customer-key-md5'] ?? null,
+        );
+        if ($uploadSseAlgorithm !== 'SSE-C' && $customerKey !== null) {
+            throw new InvalidArgumentException('SSE-C headers are not valid for this multipart upload.');
+        }
 
         // Write part to storage (computes all checksums during write).
         $writeResult = $this->storage->putPart($bucket, $key, $uploadId, $partNumber, $request->getBody());
@@ -69,10 +87,7 @@ final class UploadPartHandler implements RequestHandler
         ]);
 
         if (count($clientChecksums) > 1) {
-            try {
-                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-            } catch (\Throwable) {
-            }
+            $this->deleteUncommittedPart($bucket, $writeResult->path);
             throw new InvalidArgumentException('Only one x-amz-checksum-* header may be specified.');
         }
 
@@ -85,20 +100,14 @@ final class UploadPartHandler implements RequestHandler
             };
 
             if ($computedValue === null) {
-                try {
-                    $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-                } catch (\Throwable) {
-                }
+                $this->deleteUncommittedPart($bucket, $writeResult->path);
                 throw new \OpsFour\S3Server\Exception\InternalErrorException(
                     "Storage backend did not compute checksum for algorithm: {$algo}",
                 );
             }
 
             if (!hash_equals($computedValue, $clientValue)) {
-                try {
-                    $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-                } catch (\Throwable) {
-                }
+                $this->deleteUncommittedPart($bucket, $writeResult->path);
                 throw new BadDigestException(
                     "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
                 );
@@ -106,12 +115,17 @@ final class UploadPartHandler implements RequestHandler
         }
 
         // Content-Length mismatch detection — truncated parts produce corrupt assembled objects.
-        $declaredLength = $request->getHeader('content-length');
+        $contentSha = $request->getHeader('x-amz-content-sha256');
+        $isAwsChunked = in_array($contentSha, [
+            'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+            'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+        ], true);
+        $declaredLength = $isAwsChunked
+            ? $request->getHeader('x-amz-decoded-content-length')
+            : $request->getHeader('content-length');
         if ($declaredLength !== null && (int) $declaredLength !== $writeResult->size) {
-            try {
-                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-            } catch (\Throwable) {
-            }
+            $this->deleteUncommittedPart($bucket, $writeResult->path);
             throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
                 'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $writeResult->size,
             );
@@ -134,19 +148,63 @@ final class UploadPartHandler implements RequestHandler
         }
 
         // Store part metadata.
+        $previousPartPath = null;
         try {
-            $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+            $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, &$previousPartPath): void {
+                \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                $activeUpload = $this->metadata->getMultipartUpload($uploadId);
+                if (
+                    $activeUpload === null
+                    || $activeUpload['bucket'] !== $bucket
+                    || $activeUpload['key_name'] !== $key
+                    || $activeUpload['owner_id'] !== $ownerId
+                ) {
+                    throw new NoSuchUploadException();
+                }
+                foreach ($this->metadata->getParts($uploadId) as $part) {
+                    if ($part['part_number'] === $partNumber) {
+                        $previousPartPath = $part['storage_path'];
+                        break;
+                    }
+                }
+                $this->quotas?->assertCanWritePart(
+                    $ownerId,
+                    $bucket,
+                    $uploadId,
+                    $partNumber,
+                    $writeResult->size,
+                );
+                $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+            });
         } catch (\Throwable $e) {
-            try {
-                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-            } catch (\Throwable) {
-            }
+            $this->deleteUncommittedPart($bucket, $writeResult->path);
             throw $e;
+        }
+
+        if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $this->storage,
+                $bucket,
+                $this->storageTiers->defaultTier()->name,
+                $previousPartPath,
+            );
         }
 
         return new Response(
             status: 200,
             headers: $responseHeaders,
+        );
+    }
+
+    private function deleteUncommittedPart(string $bucket, string $path): void
+    {
+        \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+            $this->metadata,
+            $this->storage,
+            $bucket,
+            $this->storageTiers->defaultTier()->name,
+            $path,
         );
     }
 }

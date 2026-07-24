@@ -335,7 +335,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         ));
     }
 
-    public function test_multipart_complete_respects_bucket_byte_quota(): void
+    public function test_multipart_staging_respects_bucket_byte_quota(): void
     {
         self::restartWithFreshStorageAndQuota([
             'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
@@ -352,34 +352,23 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         ]);
         $uploadId = $create['UploadId'];
 
-        $partOne = self::$s3->uploadPart([
+        self::$s3->uploadPart([
             'Bucket' => $bucket,
             'Key' => 'multipart.bin',
             'UploadId' => $uploadId,
             'PartNumber' => 1,
             'Body' => 'abc',
         ]);
-        $partTwo = self::$s3->uploadPart([
-            'Bucket' => $bucket,
-            'Key' => 'multipart.bin',
-            'UploadId' => $uploadId,
-            'PartNumber' => 2,
-            'Body' => 'def',
-        ]);
 
         try {
-            self::$s3->completeMultipartUpload([
+            self::$s3->uploadPart([
                 'Bucket' => $bucket,
                 'Key' => 'multipart.bin',
                 'UploadId' => $uploadId,
-                'MultipartUpload' => [
-                    'Parts' => [
-                        ['PartNumber' => 1, 'ETag' => $partOne['ETag']],
-                        ['PartNumber' => 2, 'ETag' => $partTwo['ETag']],
-                    ],
-                ],
+                'PartNumber' => 2,
+                'Body' => 'def',
             ]);
-            $this->fail('Expected CompleteMultipartUpload to respect bucket byte quota.');
+            $this->fail('Expected multipart staging to respect bucket byte quota.');
         } catch (S3Exception $e) {
             $this->assertSame('QuotaExceeded', $e->getAwsErrorCode());
         }
@@ -442,7 +431,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         $this->assertCount(15, $rejectedCodes, self::serverLogs());
         $this->assertSame(
             [],
-            array_values(array_filter($rejectedCodes, static fn(string $code): bool => $code !== 'QuotaExceeded')),
+            array_values(array_filter($rejectedCodes, static fn(?string $code): bool => $code !== 'QuotaExceeded')),
             self::serverLogs(),
         );
     }
@@ -511,12 +500,203 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_multipart_upload_count_quota_is_enforced_per_bucket(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET' => '1',
+        ]);
+
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        $first = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'first.bin']);
+
+        try {
+            self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'second.bin']);
+            self::fail('Expected multipart upload count quota.');
+        } catch (S3Exception $e) {
+            self::assertSame('QuotaExceeded', $e->getAwsErrorCode());
+        }
+
+        self::$s3->abortMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => 'first.bin',
+            'UploadId' => $first['UploadId'],
+        ]);
+        $second = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'second.bin']);
+        self::assertNotEmpty($second['UploadId']);
+    }
+
+    public function test_multipart_upload_count_quota_is_enforced_across_owner_buckets(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER' => '1',
+        ]);
+
+        $firstBucket = 'quota-' . bin2hex(random_bytes(4));
+        $secondBucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $firstBucket]);
+        self::$s3->createBucket(['Bucket' => $secondBucket]);
+        self::$s3->createMultipartUpload(['Bucket' => $firstBucket, 'Key' => 'first.bin']);
+
+        try {
+            self::$s3->createMultipartUpload(['Bucket' => $secondBucket, 'Key' => 'second.bin']);
+            self::fail('Expected owner multipart upload count quota.');
+        } catch (S3Exception $e) {
+            self::assertSame('QuotaExceeded', $e->getAwsErrorCode());
+        }
+    }
+
+    public function test_multipart_staging_byte_quota_counts_part_replacement_delta(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET' => '5',
+        ]);
+
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        $upload = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'staging.bin']);
+
+        self::$s3->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => 'staging.bin',
+            'UploadId' => $upload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => '12345',
+        ]);
+        self::$s3->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => 'staging.bin',
+            'UploadId' => $upload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => '1234',
+        ]);
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => 'staging.bin',
+                'UploadId' => $upload['UploadId'],
+                'PartNumber' => 2,
+                'Body' => '12',
+            ]);
+            self::fail('Expected multipart staging byte quota.');
+        } catch (S3Exception $e) {
+            self::assertSame('QuotaExceeded', $e->getAwsErrorCode());
+        }
+    }
+
+    public function test_rejected_multipart_part_replacement_preserves_previous_committed_part(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET' => '5',
+        ]);
+
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        $upload = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'rollback.bin']);
+        $previous = self::$s3->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => 'rollback.bin',
+            'UploadId' => $upload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => '1234',
+        ]);
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => 'rollback.bin',
+                'UploadId' => $upload['UploadId'],
+                'PartNumber' => 1,
+                'Body' => '123456',
+            ]);
+            self::fail('Expected multipart staging byte quota.');
+        } catch (S3Exception $e) {
+            self::assertSame('QuotaExceeded', $e->getAwsErrorCode());
+        }
+
+        self::$s3->completeMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => 'rollback.bin',
+            'UploadId' => $upload['UploadId'],
+            'MultipartUpload' => [
+                'Parts' => [[
+                    'PartNumber' => 1,
+                    'ETag' => $previous['ETag'],
+                ]],
+            ],
+        ]);
+
+        $object = self::$s3->getObject(['Bucket' => $bucket, 'Key' => 'rollback.bin']);
+        self::assertSame('1234', (string) $object['Body']);
+    }
+
+    public function test_multipart_staging_byte_quota_is_enforced_across_owner_buckets(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER' => '5',
+        ]);
+
+        $firstBucket = 'quota-' . bin2hex(random_bytes(4));
+        $secondBucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $firstBucket]);
+        self::$s3->createBucket(['Bucket' => $secondBucket]);
+        $first = self::$s3->createMultipartUpload(['Bucket' => $firstBucket, 'Key' => 'first.bin']);
+        $second = self::$s3->createMultipartUpload(['Bucket' => $secondBucket, 'Key' => 'second.bin']);
+        self::$s3->uploadPart([
+            'Bucket' => $firstBucket,
+            'Key' => 'first.bin',
+            'UploadId' => $first['UploadId'],
+            'PartNumber' => 1,
+            'Body' => '1234',
+        ]);
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => $secondBucket,
+                'Key' => 'second.bin',
+                'UploadId' => $second['UploadId'],
+                'PartNumber' => 1,
+                'Body' => '12',
+            ]);
+            self::fail('Expected owner multipart staging byte quota.');
+        } catch (S3Exception $e) {
+            self::assertSame('QuotaExceeded', $e->getAwsErrorCode());
+        }
+    }
+
     /**
      * @param array<string, string> $env
      * @param array<string, QuotaConfig> $accountQuotas
      */
     private static function restartWithFreshStorageAndQuota(array $env, array $accountQuotas = []): void
     {
+        $env += [
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER' => '0',
+        ];
         self::setQuotaEnv($env);
         $oldStoragePath = self::$storagePath;
         self::$storagePath = sys_get_temp_dir() . '/s3-test-' . uniqid();
@@ -534,6 +714,9 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         }
     }
 
+    /**
+     * @param array<string, QuotaConfig> $quotas
+     */
     private static function putAccountQuotas(array $quotas): void
     {
         $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');

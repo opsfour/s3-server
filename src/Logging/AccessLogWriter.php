@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Logging;
 
 use Amp\ByteStream\ReadableBuffer;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Storage\DurableStorageDelete;
 use OpsFour\S3Server\Storage\StorageBackend;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -28,6 +29,7 @@ final class AccessLogWriter
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
         private readonly LoggerInterface $logger = new NullLogger(),
+        private readonly string $storageTier = 'STANDARD',
     ) {}
 
     /**
@@ -47,15 +49,20 @@ final class AccessLogWriter
         // Sanitize user-controlled values to prevent log injection via embedded newlines.
         $safeBucket = str_replace(["\r", "\n"], ['\\r', '\\n'], $bucket);
         $safeKey = $key !== '' ? str_replace(["\r", "\n"], ['\\r', '\\n'], $key) : '-';
+        $safeRemoteIp = $remoteIp !== '' ? str_replace(["\r", "\n"], ['\\r', '\\n'], $remoteIp) : '-';
+        $safeRequesterId = $requesterId !== ''
+            ? str_replace(["\r", "\n"], ['\\r', '\\n'], $requesterId)
+            : '-';
+        $safeOperation = str_replace(["\r", "\n"], ['\\r', '\\n'], $operation);
 
         $line = sprintf(
             '%s %s %s %s %s %s %s %d - %d -',
-            $remoteIp ?: '-',
+            $safeRemoteIp,
             $safeBucket,
             $timestamp,
-            $remoteIp ?: '-',
-            $requesterId ?: '-',
-            $operation,
+            $safeRemoteIp,
+            $safeRequesterId,
+            $safeOperation,
             $safeKey,
             $httpStatus,
             $bytesTransferred,
@@ -94,6 +101,8 @@ final class AccessLogWriter
         $totalFlushed = 0;
 
         foreach ($grouped as $sourceBucket => $lines) {
+            $targetBucket = null;
+            $writeResult = null;
             try {
                 $loggingConfig = $this->metadata->getBucketLogging($sourceBucket);
 
@@ -133,6 +142,32 @@ final class AccessLogWriter
 
                 $totalFlushed += count($lines);
             } catch (\Throwable $e) {
+                if ($targetBucket !== null && $writeResult !== null) {
+                    try {
+                        DurableStorageDelete::run(
+                            $this->metadata,
+                            $this->storage,
+                            $targetBucket,
+                            $this->storageTier,
+                            $writeResult->path,
+                        );
+                    } catch (\Throwable $cleanupError) {
+                        $this->logger->critical(
+                            'Access log object cleanup failed and could not be queued.',
+                            [
+                                'bucket' => $targetBucket,
+                                'storage_path' => $writeResult->path,
+                                'error' => $cleanupError->getMessage(),
+                            ],
+                        );
+                    }
+                }
+                foreach ($lines as $line) {
+                    $this->buffer[] = ['bucket' => $sourceBucket, 'line' => $line];
+                }
+                if (count($this->buffer) > self::MAX_BUFFER_SIZE) {
+                    $this->buffer = array_slice($this->buffer, -self::MAX_BUFFER_SIZE);
+                }
                 $this->logger->error(
                     "Failed to flush access logs for bucket '{$sourceBucket}': {$e->getMessage()}",
                 );

@@ -33,7 +33,7 @@ final class PhysicalTieringMetadataStoreTest extends TestCase
     public function test_schema_migrates_to_physical_tiering_version(): void
     {
         self::assertSame(SqliteSchema::VERSION, $this->schemaVersion());
-        self::assertSame(11, SqliteSchema::VERSION);
+        self::assertSame(14, SqliteSchema::VERSION);
     }
 
     public function test_updates_latest_object_placement_and_restore_state(): void

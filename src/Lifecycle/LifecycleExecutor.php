@@ -6,9 +6,13 @@ namespace OpsFour\S3Server\Lifecycle;
 
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Event\S3Event;
+use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Multipart\MultipartCleanup;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -27,6 +31,14 @@ final class LifecycleExecutor
 
     private readonly StorageTierRegistry $storageTiers;
 
+    private readonly ObjectLockChecker $objectLockChecker;
+
+    private bool $leaseHeld = false;
+
+    private float $lastLeaseRenewal = 0.0;
+
+    private bool $stopRequested = false;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -38,6 +50,7 @@ final class LifecycleExecutor
         private readonly ?MetricsCollector $metrics = null,
         private readonly ?NotificationDispatcher $notifications = null,
         ?StorageTierRegistry $storageTiers = null,
+        private readonly int $multipartMaxAgeSeconds = 604_800,
     ) {
         if ($this->batchSize < 1) {
             throw new \InvalidArgumentException('Lifecycle batch size must be >= 1.');
@@ -50,9 +63,13 @@ final class LifecycleExecutor
         if ($this->lockTtlSeconds < 1) {
             throw new \InvalidArgumentException('Lifecycle lock TTL must be >= 1.');
         }
+        if ($this->multipartMaxAgeSeconds < 0) {
+            throw new \InvalidArgumentException('Multipart maximum age must be >= 0.');
+        }
 
         $this->lockOwnerId = $lockOwnerId ?? 'lifecycle-' . bin2hex(random_bytes(8));
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+        $this->objectLockChecker = new ObjectLockChecker($metadata);
     }
 
     /**
@@ -76,6 +93,7 @@ final class LifecycleExecutor
         // For simplicity, we'll process rules for buckets that have lifecycle configs.
         // This requires iterating all buckets. We'll use a simple approach.
         try {
+            $this->renewLeaseIfNeeded();
             $lockAcquired = $this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds);
             if (!$lockAcquired) {
                 $status = 'skipped_lock';
@@ -86,17 +104,28 @@ final class LifecycleExecutor
                 ]));
 
             } else {
+                $this->leaseHeld = true;
+                $this->lastLeaseRenewal = hrtime(true) / 1_000_000_000;
                 $this->processAllBuckets();
             }
         } catch (\Throwable $e) {
-            $status = 'error';
-            $this->logger->error('Lifecycle sweep failed.', $this->lifecycleContext([
-                'event' => 'sweep_failed',
-                'status' => $status,
-                'exception' => $e::class,
-                'error' => $e->getMessage(),
-            ]));
+            if ($this->stopRequested && $e instanceof \OpsFour\S3Server\Exception\OperationAbortedException) {
+                $status = 'cancelled';
+                $this->logger->info('Lifecycle sweep cancelled for shutdown.', $this->lifecycleContext([
+                    'event' => 'sweep_cancelled',
+                    'status' => $status,
+                ]));
+            } else {
+                $status = 'error';
+                $this->logger->error('Lifecycle sweep failed.', $this->lifecycleContext([
+                    'event' => 'sweep_failed',
+                    'status' => $status,
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]));
+            }
         } finally {
+            $this->leaseHeld = false;
             if ($lockAcquired) {
                 try {
                     $this->metadata->releaseLock('lifecycle:global', $this->lockOwnerId);
@@ -144,14 +173,16 @@ final class LifecycleExecutor
      */
     public function processBucket(string $bucket): void
     {
+        $this->renewLeaseIfNeeded();
         $startedAt = hrtime(true);
+        $staleMultipartActions = $this->cleanupStaleMultipartUploads($bucket);
         $rules = $this->metadata->getBucketLifecycle($bucket);
         if ($rules === []) {
             return;
         }
 
-        $remainingActions = $this->maxActionsPerRun;
-        $appliedActions = 0;
+        $remainingActions = max(0, $this->maxActionsPerRun - $staleMultipartActions);
+        $appliedActions = $staleMultipartActions;
 
         $this->logger->debug('Lifecycle bucket processing started.', $this->lifecycleContext([
             'event' => 'bucket_started',
@@ -201,6 +232,9 @@ final class LifecycleExecutor
                     'duration_ms' => $this->durationMs($ruleStartedAt),
                 ]));
             } catch (\Throwable $e) {
+                if ($e instanceof \OpsFour\S3Server\Exception\OperationAbortedException) {
+                    throw $e;
+                }
                 $this->logger->warning('Lifecycle rule processing failed.', $this->lifecycleContext([
                     'event' => 'rule_failed',
                     'bucket' => $bucket,
@@ -225,6 +259,7 @@ final class LifecycleExecutor
     /** @param array<string, mixed> $rule */
     private function processRule(string $bucket, array $rule, ?string $prefix, int $actionBudget): int
     {
+        $this->renewLeaseIfNeeded();
         $actions = 0;
         $tags = $this->ruleTags($rule);
 
@@ -356,10 +391,11 @@ final class LifecycleExecutor
                         continue;
                     }
 
-                    $this->deleteObject($bucket, $obj);
-                    $deleted++;
-                    $actions++;
-                    $this->metrics?->recordLifecycleAction($action);
+                    if ($this->deleteObject($bucket, $obj, $rule)) {
+                        $deleted++;
+                        $actions++;
+                        $this->metrics?->recordLifecycleAction($action);
+                    }
                 }
 
                 if (count($expired) < $limit) {
@@ -398,10 +434,11 @@ final class LifecycleExecutor
                             continue;
                         }
 
-                        $this->deleteObject($bucket, $obj);
-                        $deleted++;
-                        $actions++;
-                        $this->metrics?->recordLifecycleAction($action);
+                        if ($this->deleteObject($bucket, $obj, $rule)) {
+                            $deleted++;
+                            $actions++;
+                            $this->metrics?->recordLifecycleAction($action);
+                        }
                     }
 
                     if (count($expired) < $limit) {
@@ -449,11 +486,19 @@ final class LifecycleExecutor
                     }
 
                     if ($obj->versionId !== null) {
-                        $this->metadata->deleteObjectVersion($bucket, $obj->key, $obj->versionId);
-                        $this->deleteStoredData($obj, $action);
-                        $deleted++;
-                        $actions++;
-                        $this->metrics?->recordLifecycleAction($action);
+                        try {
+                            if ($this->deleteNoncurrentVersion($bucket, $obj, $rule)) {
+                                $deleted++;
+                                $actions++;
+                                $this->metrics?->recordLifecycleAction($action);
+                            }
+                        } catch (\OpsFour\S3Server\Exception\ObjectLockedException) {
+                            $this->logger->info('Lifecycle retained an Object Lock protected version.', [
+                                'bucket' => $bucket,
+                                'key' => $obj->key,
+                                'version_id' => $obj->versionId,
+                            ]);
+                        }
                     }
                 }
 
@@ -502,12 +547,11 @@ final class LifecycleExecutor
                         $checkpoint = ['cursorKey' => $upload['key_name'], 'cursorVersionId' => null, 'cursorUploadId' => $upload['upload_id']];
 
                         try {
-                            $this->storage->abortMultipartUpload($bucket, $upload['key_name'], $upload['upload_id']);
-                            $this->metadata->deleteParts($upload['upload_id']);
-                            $this->metadata->deleteMultipartUpload($upload['upload_id']);
-                            $aborted++;
-                            $actions++;
-                            $this->metrics?->recordLifecycleAction($action);
+                            if ($this->abortMultipartUploadDurably($bucket, $upload['key_name'], $upload['upload_id'])) {
+                                $aborted++;
+                                $actions++;
+                                $this->metrics?->recordLifecycleAction($action);
+                            }
                         } catch (\Throwable $e) {
                             $this->logger->warning('Lifecycle failed to abort multipart upload.', $this->lifecycleContext([
                                 'event' => 'multipart_abort_failed',
@@ -561,10 +605,11 @@ final class LifecycleExecutor
                     }
 
                     if ($dm->versionId !== null) {
-                        $this->metadata->deleteObjectVersion($bucket, $dm->key, $dm->versionId);
-                        $deleted++;
-                        $actions++;
-                        $this->metrics?->recordLifecycleAction($action);
+                        if ($this->deleteOrphanedMarker($bucket, $dm, $rule)) {
+                            $deleted++;
+                            $actions++;
+                            $this->metrics?->recordLifecycleAction($action);
+                        }
                     }
                 }
 
@@ -600,71 +645,171 @@ final class LifecycleExecutor
 
     private function enqueueTransitionIfNeeded(ObjectInfo $object, string $targetStorageClass): bool
     {
-        $sourceStoragePath = $object->systemMetadata['storagePath'] ?? null;
-        if ($sourceStoragePath === null || $sourceStoragePath === '') {
-            return false;
-        }
-
         $targetTier = $targetStorageClass;
-        if (
-            $object->storageClass === $targetStorageClass
-            && $object->storageTier === $targetTier
-            && $object->transitionStatus === 'available'
-        ) {
-            return false;
-        }
+        $bucketOwner = $this->metadata->getBucketOwner($object->bucket);
 
-        if (
-            in_array($object->transitionStatus, ['pending', 'processing'], true)
-            && $object->transitionTargetTier === $targetTier
-        ) {
-            return false;
-        }
+        return $this->metadata->transaction(function () use ($object, $targetStorageClass, $targetTier, $bucketOwner): bool {
+            if ($bucketOwner === null) {
+                return false;
+            }
+            OwnerWriteLock::acquire($this->metadata, $bucketOwner);
+            $current = $object->versionId !== null
+                ? $this->metadata->getObjectMetadataByVersion($object->bucket, $object->key, $object->versionId)
+                : $this->metadata->getObjectMetadata($object->bucket, $object->key);
+            if ($current === null || ! self::sameObject($current, $object)) {
+                return false;
+            }
 
-        $this->metadata->transaction(function () use ($object, $targetStorageClass, $targetTier, $sourceStoragePath): void {
+            $sourceStoragePath = $current->systemMetadata['storagePath'] ?? null;
+            if ($sourceStoragePath === null || $sourceStoragePath === '') {
+                return false;
+            }
+            if (
+                $current->storageClass === $targetStorageClass
+                && $current->storageTier === $targetTier
+                && $current->transitionStatus === 'available'
+            ) {
+                return false;
+            }
+            if (
+                in_array($current->transitionStatus, ['pending', 'processing'], true)
+                && $current->transitionTargetTier === $targetTier
+            ) {
+                return false;
+            }
+
             $this->metadata->enqueueTierTransitionJob(
-                bucket: $object->bucket,
-                key: $object->key,
-                versionId: $object->versionId,
-                sourceTier: $object->storageTier,
+                bucket: $current->bucket,
+                key: $current->key,
+                versionId: $current->versionId,
+                sourceTier: $current->storageTier,
                 targetTier: $targetTier,
                 targetStorageClass: $targetStorageClass,
                 sourceStoragePath: $sourceStoragePath,
             );
             $this->metadata->updateObjectPlacement(
-                bucket: $object->bucket,
-                key: $object->key,
-                versionId: $object->versionId,
-                storageClass: $object->storageClass,
-                storageTier: $object->storageTier,
+                bucket: $current->bucket,
+                key: $current->key,
+                versionId: $current->versionId,
+                storageClass: $current->storageClass,
+                storageTier: $current->storageTier,
                 storagePath: $sourceStoragePath,
                 transitionStatus: 'pending',
                 transitionTargetTier: $targetTier,
             );
+
+            return true;
         });
+    }
+
+    /**
+     * @param array<string, mixed> $rule
+     */
+    private function deleteObject(string $bucket, ObjectInfo $obj, array $rule): bool
+    {
+        $bucketOwner = $this->metadata->getBucketOwner($bucket);
+        if ($bucketOwner === null) {
+            return false;
+        }
+
+        $objectToClean = $this->metadata->transaction(function () use ($bucketOwner, $bucket, $obj, $rule): ObjectInfo|false|null {
+            OwnerWriteLock::acquire($this->metadata, $bucketOwner, $obj->ownerId);
+            $current = $this->metadata->getObjectMetadata($bucket, $obj->key);
+            if ($current === null || ! self::sameObject($current, $obj) || ! $this->objectMatchesRule($bucket, $current, $rule)) {
+                return false;
+            }
+
+            $versioning = $this->metadata->getBucketVersioning($bucket);
+            if ($versioning === 'Enabled') {
+                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId);
+
+                return null;
+            }
+            if ($versioning === 'Suspended') {
+                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId, suspended: true);
+
+                return $current;
+            }
+
+            $this->metadata->deleteObjectMetadata($bucket, $obj->key);
+
+            return $current;
+        });
+
+        if ($objectToClean === false) {
+            return false;
+        }
+        if ($objectToClean instanceof ObjectInfo) {
+            $this->deleteStoredData($objectToClean, 'expire_current');
+        }
 
         return true;
     }
 
-    private function deleteObject(string $bucket, ObjectInfo $obj): void
+    /**
+     * @param array<string, mixed> $rule
+     *
+     * @throws \OpsFour\S3Server\Exception\ObjectLockedException
+     */
+    private function deleteNoncurrentVersion(string $bucket, ObjectInfo $object, array $rule): bool
     {
-        $versioning = $this->metadata->getBucketVersioning($bucket);
-
-        if ($versioning === 'Enabled') {
-            // Create a delete marker instead of permanent delete.
-            $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId);
-        } elseif ($versioning === 'Suspended') {
-            // Suspended: create delete marker at version_id='null' to preserve existing versions.
-            $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId, suspended: true);
-            $this->deleteStoredData($obj, 'expire_current');
-        } else {
-            // Delete metadata first, then best-effort storage cleanup.
-            // If metadata delete succeeds but storage fails, the file is orphaned
-            // (cleaned up by lifecycle temp-file sweep). The reverse order risks
-            // metadata pointing to a missing file — causing 500 on reads.
-            $this->metadata->deleteObjectMetadata($bucket, $obj->key);
-            $this->deleteStoredData($obj, 'expire_current');
+        $bucketOwner = $this->metadata->getBucketOwner($bucket);
+        if ($bucketOwner === null || $object->versionId === null) {
+            return false;
         }
+
+        $deleted = $this->metadata->transaction(function () use ($bucketOwner, $bucket, $object, $rule): ObjectInfo|false|null {
+            OwnerWriteLock::acquire($this->metadata, $bucketOwner, $object->ownerId);
+            $current = $this->metadata->getObjectMetadataByVersion($bucket, $object->key, $object->versionId);
+            if ($current === null || ! self::sameObject($current, $object) || ! $this->objectMatchesRule($bucket, $current, $rule)) {
+                return false;
+            }
+            $this->objectLockChecker->checkProtection($bucket, $object->key, $object->versionId);
+
+            return $this->metadata->deleteObjectVersion($bucket, $object->key, $object->versionId);
+        });
+
+        if (! $deleted instanceof ObjectInfo) {
+            return false;
+        }
+        $this->deleteStoredData($deleted, 'expire_noncurrent');
+
+        return true;
+    }
+
+    /**
+     * @param array<string, mixed> $rule
+     */
+    private function deleteOrphanedMarker(string $bucket, ObjectInfo $marker, array $rule): bool
+    {
+        $bucketOwner = $this->metadata->getBucketOwner($bucket);
+        if ($bucketOwner === null || $marker->versionId === null) {
+            return false;
+        }
+
+        return $this->metadata->transaction(function () use ($bucketOwner, $bucket, $marker, $rule): bool {
+            OwnerWriteLock::acquire($this->metadata, $bucketOwner, $marker->ownerId);
+            $current = $this->metadata->getObjectMetadataByVersion($bucket, $marker->key, $marker->versionId);
+            if (
+                $current === null
+                || ! $current->isDeleteMarker
+                || ($current->systemMetadata['isLatest'] ?? null) !== '1'
+                || ! self::sameObject($current, $marker)
+                || ! $this->objectMatchesRule($bucket, $current, $rule)
+            ) {
+                return false;
+            }
+
+            return $this->metadata->deleteObjectVersion($bucket, $marker->key, $marker->versionId) !== null;
+        });
+    }
+
+    private static function sameObject(ObjectInfo $left, ObjectInfo $right): bool
+    {
+        return $left->versionId === $right->versionId
+            && $left->etag === $right->etag
+            && ($left->systemMetadata['storagePath'] ?? null) === ($right->systemMetadata['storagePath'] ?? null)
+            && $left->isDeleteMarker === $right->isDeleteMarker;
     }
 
     private function deleteStoredData(ObjectInfo $object, string $action): void
@@ -682,6 +827,18 @@ final class LifecycleExecutor
             try {
                 $backend->deleteObjectByPath($path, $object->bucket);
             } catch (\Throwable $e) {
+                try {
+                    $tier = $backend === $this->storageTiers->defaultBackend()
+                        ? $this->storageTiers->defaultTier()->name
+                        : $object->storageTier;
+                    $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path);
+                } catch (\Throwable $queueError) {
+                    throw new \RuntimeException(
+                        'Lifecycle physical delete failed and could not be queued for retry.',
+                        0,
+                        $queueError,
+                    );
+                }
                 $this->logger->warning('Lifecycle failed to delete object storage.', $this->lifecycleContext([
                     'event' => 'storage_delete_failed',
                     'bucket' => $object->bucket,
@@ -743,7 +900,7 @@ final class LifecycleExecutor
         }
 
         $objectTags = [];
-        foreach ($this->metadata->getObjectTagging($bucket, $object->key) as $tag) {
+        foreach ($this->metadata->getObjectTagging($bucket, $object->key, $object->versionId) as $tag) {
             $objectTags[$tag['key']] = $tag['value'];
         }
 
@@ -768,6 +925,7 @@ final class LifecycleExecutor
     /** @param array<string, mixed> $rule */
     private function saveObjectCheckpoint(string $bucket, array $rule, string $action, ObjectInfo $object): void
     {
+        $this->renewLeaseIfNeeded();
         $this->metadata->putLifecycleCheckpoint(
             $bucket,
             $this->ruleId($rule),
@@ -780,6 +938,7 @@ final class LifecycleExecutor
     /** @param array<string, mixed> $rule */
     private function saveMultipartCheckpoint(string $bucket, array $rule, string $action, string $key, string $uploadId): void
     {
+        $this->renewLeaseIfNeeded();
         $this->metadata->putLifecycleCheckpoint(
             $bucket,
             $this->ruleId($rule),
@@ -838,10 +997,14 @@ final class LifecycleExecutor
 
         $processed = 0;
         foreach ($buckets as $bucket) {
+            $this->renewLeaseIfNeeded();
             try {
                 $this->processBucket($bucket->name);
                 $processed++;
             } catch (\Throwable $e) {
+                if ($e instanceof \OpsFour\S3Server\Exception\OperationAbortedException) {
+                    throw $e;
+                }
                 $this->logger->warning(
                     'Lifecycle bucket processing failed.',
                     $this->lifecycleContext([
@@ -859,6 +1022,116 @@ final class LifecycleExecutor
             'processed_buckets' => $processed,
             'total_buckets' => count($buckets),
         ]));
+    }
+
+    private function renewLeaseIfNeeded(): void
+    {
+        if ($this->stopRequested) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Lifecycle shutdown was requested.',
+            );
+        }
+
+        if (! $this->leaseHeld) {
+            return;
+        }
+
+        $now = hrtime(true) / 1_000_000_000;
+        if ($now - $this->lastLeaseRenewal < max(1.0, $this->lockTtlSeconds / 3)) {
+            return;
+        }
+
+        if (! $this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Lifecycle lease was lost while processing.',
+            );
+        }
+
+        $this->lastLeaseRenewal = $now;
+    }
+
+    public function requestStop(): void
+    {
+        $this->stopRequested = true;
+    }
+
+    private function cleanupStaleMultipartUploads(string $bucket): int
+    {
+        if ($this->multipartMaxAgeSeconds === 0) {
+            return 0;
+        }
+
+        $uploads = $this->metadata->listExpiredMultipartUploads(
+            $bucket,
+            0,
+            $this->maxActionsPerRun,
+            createdBefore: (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+                ->modify("-{$this->multipartMaxAgeSeconds} seconds"),
+        );
+        $aborted = 0;
+        foreach ($uploads as $upload) {
+            $this->renewLeaseIfNeeded();
+            try {
+                if ($this->abortMultipartUploadDurably($bucket, $upload['key_name'], $upload['upload_id'])) {
+                    $aborted++;
+                    $this->metrics?->recordLifecycleAction('abort_stale_multipart');
+                }
+            } catch (\Throwable $error) {
+                $this->logger->warning('Stale multipart upload cleanup failed.', [
+                    'bucket' => $bucket,
+                    'key' => $upload['key_name'],
+                    'upload_id' => $upload['upload_id'],
+                    'error' => $error->getMessage(),
+                ]);
+            }
+        }
+
+        return $aborted;
+    }
+
+    private function abortMultipartUploadDurably(
+        string $bucket,
+        string $key,
+        string $uploadId,
+    ): bool {
+        $upload = $this->metadata->getMultipartUpload($uploadId);
+        if ($upload === null) {
+            return false;
+        }
+
+        try {
+            $bucketOwner = $this->metadata->getBucketOwner($bucket);
+            $parts = $this->metadata->transaction(function () use ($bucket, $key, $uploadId, $upload, $bucketOwner): array {
+                OwnerWriteLock::acquire(
+                    $this->metadata,
+                    $bucketOwner ?? '',
+                    $upload['owner_id'],
+                );
+
+                return MultipartCleanup::stage(
+                    $this->metadata,
+                    $bucket,
+                    $key,
+                    $uploadId,
+                    $upload['owner_id'],
+                    $this->storageTiers->defaultTier()->name,
+                );
+            });
+        } catch (NoSuchUploadException) {
+            return false;
+        }
+
+        MultipartCleanup::clean(
+            $this->metadata,
+            $this->storage,
+            $bucket,
+            $key,
+            $uploadId,
+            $this->storageTiers->defaultTier()->name,
+            $parts,
+        );
+
+        return true;
     }
 
     /**

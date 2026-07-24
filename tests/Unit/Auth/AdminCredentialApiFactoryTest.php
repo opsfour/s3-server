@@ -27,6 +27,8 @@ final class AdminCredentialApiFactoryTest extends TestCase
         AdminCredentialApiFactory::create([
             'enabled' => true,
             'public_key' => $this->publicKey(),
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
         ], $this->credentialProvider());
     }
 
@@ -38,6 +40,31 @@ final class AdminCredentialApiFactoryTest extends TestCase
         AdminCredentialApiFactory::create([
             'enabled' => true,
             'admin_token' => 'admin-secret',
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
+        ], $this->credentialProvider());
+    }
+
+    public function test_requires_expected_issuer_when_enabled(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('requires at least one expected JWT issuer');
+
+        AdminCredentialApiFactory::create([
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+        ], $this->credentialProvider());
+    }
+
+    public function test_requires_expected_audience_when_enabled(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('requires at least one expected JWT audience');
+
+        AdminCredentialApiFactory::create([
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+            'issuer' => 'https://issuer.example.test',
         ], $this->credentialProvider());
     }
 
@@ -74,12 +101,35 @@ final class AdminCredentialApiFactoryTest extends TestCase
                 'enabled' => true,
                 'admin_token' => 'admin-secret',
                 'jwks_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
             ], $this->credentialProvider());
         } finally {
             @unlink($path);
         }
 
         $this->assertInstanceOf(AdminCredentialApiHandler::class, $handler);
+    }
+
+    public function test_rejects_oversized_jwks_file(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-large-' . bin2hex(random_bytes(4)) . '.json';
+        file_put_contents($path, str_repeat('x', 1_048_577));
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('External IAM JWKS file exceeds 1048576 bytes');
+
+            AdminCredentialApiFactory::create([
+                'enabled' => true,
+                'admin_token' => 'admin-secret',
+                'jwks_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
+            ], $this->credentialProvider());
+        } finally {
+            @unlink($path);
+        }
     }
 
     private function credentialProvider(): InMemoryCredentialProvider

@@ -9,6 +9,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreGarbageCollector;
+use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class RestoreGarbageCollectorTest extends TestCase
@@ -88,5 +89,45 @@ final class RestoreGarbageCollectorTest extends TestCase
         self::assertNotNull($object);
         self::assertSame('restored', $object->restoreStatus);
         self::assertSame('restored-data', \Amp\ByteStream\buffer($hot->getObjectByPath($restored->path)));
+    }
+
+    public function test_new_restore_created_during_old_copy_cleanup_is_preserved(): void
+    {
+        $hot = new InMemoryBackend();
+        $hot->createBucket('bucket');
+
+        $original = $hot->putObject('bucket', 'archive.bin', new ReadableBuffer('cold-placeholder'));
+        $expired = $hot->putObject('bucket', 'archive.bin', new ReadableBuffer('expired-copy'));
+        $this->metadata->putObjectMetadata('bucket', 'archive.bin', 'owner', $original->size, '"' . $original->md5Hex . '"', 'application/octet-stream', $original->path);
+        $this->metadata->updateObjectRestoreState(
+            'bucket',
+            'archive.bin',
+            null,
+            'restored',
+            $expired->path,
+            new \DateTimeImmutable('2020-01-01T00:00:00Z'),
+        );
+
+        $backend = new CallbackStorageBackend($hot, afterDelete: function () use ($hot): void {
+            $new = $hot->putObject('bucket', 'archive.bin', new ReadableBuffer('new-restore'));
+            $this->metadata->updateObjectRestoreState(
+                'bucket',
+                'archive.bin',
+                null,
+                'restored',
+                $new->path,
+                new \DateTimeImmutable('2020-02-01T00:00:00Z'),
+            );
+        });
+
+        $stats = (new RestoreGarbageCollector($this->metadata, $backend))
+            ->collect(now: new \DateTimeImmutable('2020-01-02T00:00:00Z'));
+
+        $object = $this->metadata->getObjectMetadata('bucket', 'archive.bin');
+        self::assertSame(['scanned' => 1, 'expired' => 1, 'failed' => 0], $stats);
+        self::assertNotNull($object);
+        self::assertSame('restored', $object->restoreStatus);
+        self::assertNotNull($object->restoredStoragePath);
+        self::assertSame('new-restore', \Amp\ByteStream\buffer($hot->getObjectByPath($object->restoredStoragePath)));
     }
 }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Notification;
 
 use Amp\Sync\LocalSemaphore;
+use Amp\Future;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -31,6 +32,11 @@ final class NotificationDispatcher
     private readonly LocalSemaphore $listenerSemaphore;
 
     private int $queuedListenerTasks = 0;
+
+    /** @var array<int, Future<void>> */
+    private array $listenerFutures = [];
+
+    private int $nextListenerTaskId = 0;
 
     public function __construct(
         private readonly MetadataStore $metadata,
@@ -95,42 +101,50 @@ final class NotificationDispatcher
         string $etag = '',
         string $ownerId = '',
     ): void {
-        $event = new S3Event(
+        $event = $this->createEvent(
             name: $eventName,
             bucket: $bucket,
             key: $key,
             size: $size,
             etag: $etag,
             ownerId: $ownerId,
-            region: $this->region,
         );
         $this->dispatchEvent($event);
     }
 
+    /** @param array<string, mixed> $attributes */
+    public function createEvent(
+        string $name,
+        string $bucket,
+        string $key,
+        int $size = 0,
+        string $etag = '',
+        string $ownerId = '',
+        array $attributes = [],
+    ): S3Event {
+        return new S3Event(
+            name: $name,
+            bucket: $bucket,
+            key: $key,
+            size: $size,
+            etag: $etag,
+            ownerId: $ownerId,
+            region: $this->region,
+            attributes: $attributes,
+        );
+    }
+
     public function dispatchEvent(S3Event $event, bool $enqueueWebhooks = true): void
     {
-        $this->dispatchInternal($event);
-
-        if (!$enqueueWebhooks) {
-            return;
+        if ($enqueueWebhooks) {
+            $this->enqueueWebhooks($event);
         }
+        $this->dispatchInternalEvent($event);
+    }
 
-        try {
-            $configs = $this->metadata->getBucketNotification($event->bucket);
-        } catch (\Throwable $e) {
-            $this->metrics?->recordNotificationEvent('config_lookup', 'failed');
-            $this->logger->warning('Notification config lookup failed.', [
-                'component' => 'notification',
-                'event' => 'config_lookup_failed',
-                'bucket' => $event->bucket,
-                'key' => $event->key,
-                'event_name' => $event->name,
-                'exception' => $e::class,
-                'error' => $e->getMessage(),
-            ]);
-
-            return;
-        }
+    public function enqueueWebhooks(S3Event $event): void
+    {
+        $configs = $this->metadata->getBucketNotification($event->bucket);
 
         if ($configs === []) {
             return;
@@ -171,25 +185,12 @@ final class NotificationDispatcher
                 $event->region,
             );
 
-            try {
-                $this->metadata->enqueueNotification($event->bucket, $event->key, $event->name, $destination, $payload);
-                $this->metrics?->recordNotificationEvent('webhook_enqueue', 'success');
-            } catch (\Throwable $e) {
-                $this->metrics?->recordNotificationEvent('webhook_enqueue', 'failed');
-                $this->logger->error('Notification enqueue failed.', [
-                    'component' => 'notification',
-                    'event' => 'enqueue_failed',
-                    'bucket' => $event->bucket,
-                    'key' => $event->key,
-                    'event_name' => $event->name,
-                    'exception' => $e::class,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+            $this->metadata->enqueueNotification($event->bucket, $event->key, $event->name, $destination, $payload);
+            $this->metrics?->recordNotificationEvent('webhook_enqueue', 'success');
         }
     }
 
-    private function dispatchInternal(S3Event $event): void
+    public function dispatchInternalEvent(S3Event $event): void
     {
         foreach ($this->matchingListeners($event->name) as $pattern => $listener) {
             if ($this->queuedListenerTasks >= $this->maxQueuedListenerTasks) {
@@ -210,7 +211,8 @@ final class NotificationDispatcher
 
             $this->queuedListenerTasks++;
             $this->metrics?->recordNotificationEvent('listener', 'queued');
-            async(function () use ($event, $listener, $pattern): void {
+            $taskId = ++$this->nextListenerTaskId;
+            $this->listenerFutures[$taskId] = async(function () use ($event, $listener, $pattern, $taskId): void {
                 $lock = null;
                 try {
                     $lock = $this->listenerSemaphore->acquire();
@@ -231,8 +233,52 @@ final class NotificationDispatcher
                 } finally {
                     $lock?->release();
                     $this->queuedListenerTasks--;
+                    unset($this->listenerFutures[$taskId]);
                 }
             });
+        }
+    }
+
+    public function shutdown(float $timeoutSeconds = 30): void
+    {
+        if ($this->listenerFutures === []) {
+            return;
+        }
+
+        $cancellation = new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds));
+        $timedOut = false;
+        foreach ($this->listenerFutures as $future) {
+            try {
+                $future->await($timedOut ? null : $cancellation);
+            } catch (\Amp\CancelledException) {
+                $timedOut = true;
+                $this->logger->warning('Notification listeners did not drain before shutdown timeout.', [
+                    'component' => 'notification',
+                    'event' => 'listener_shutdown_timeout',
+                    'queued_listener_tasks' => $this->queuedListenerTasks,
+                ]);
+
+                // Listener callbacks cannot be cancelled safely. Keep runtime
+                // dependencies alive until they return; the process supervisor
+                // remains responsible for enforcing a hard shutdown deadline.
+                try {
+                    $future->await();
+                } catch (\Throwable $e) {
+                    $this->logger->error('Notification listener failed during shutdown.', [
+                        'component' => 'notification',
+                        'event' => 'listener_shutdown_failed',
+                        'exception' => $e::class,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->error('Notification listener failed during shutdown.', [
+                    'component' => 'notification',
+                    'event' => 'listener_shutdown_failed',
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
     }
 

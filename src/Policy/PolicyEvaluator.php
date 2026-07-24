@@ -459,8 +459,8 @@ final class PolicyEvaluator
             'StringNotEquals' => !in_array($actual, $expectedValues, true),
             'StringLike' => self::anyFnmatch($expectedValues, $actual),
             'StringNotLike' => !self::anyFnmatch($expectedValues, $actual),
-            'IpAddress' => self::ipInRanges($actual, $expectedValues),
-            'NotIpAddress' => !self::ipInRanges($actual, $expectedValues),
+            'IpAddress' => self::ipConditionMatches($actual, $expectedValues),
+            'NotIpAddress' => self::ipConditionMatches($actual, $expectedValues, true),
             default => false,
         };
 
@@ -591,20 +591,50 @@ final class PolicyEvaluator
     }
 
     /** @param list<string> $ranges */
-    private static function ipInRanges(string $ip, array $ranges): bool
+    private static function ipConditionMatches(string $ip, array $ranges, bool $negate = false): bool
     {
+        $ipBin = @inet_pton($ip);
+        if ($ipBin === false || $ranges === []) {
+            return false;
+        }
+
+        $matched = false;
         foreach ($ranges as $range) {
             if (str_contains($range, '/')) {
+                if (! self::validCidr($range)) {
+                    return false;
+                }
                 if (self::cidrMatch($ip, $range)) {
-                    return true;
+                    $matched = true;
                 }
-            } else {
-                if ($ip === $range) {
-                    return true;
-                }
+                continue;
+            }
+
+            $rangeBin = @inet_pton($range);
+            if ($rangeBin === false) {
+                return false;
+            }
+            if ($rangeBin === $ipBin) {
+                $matched = true;
             }
         }
-        return false;
+
+        return $negate ? ! $matched : $matched;
+    }
+
+    private static function validCidr(string $cidr): bool
+    {
+        $parts = explode('/', $cidr);
+        if (count($parts) !== 2 || $parts[0] === '' || $parts[1] === '' || ! ctype_digit($parts[1])) {
+            return false;
+        }
+
+        $subnetBin = @inet_pton($parts[0]);
+        if ($subnetBin === false) {
+            return false;
+        }
+
+        return (int) $parts[1] <= strlen($subnetBin) * 8;
     }
 
     /**
@@ -612,6 +642,10 @@ final class PolicyEvaluator
      */
     private static function cidrMatch(string $ip, string $cidr): bool
     {
+        if (! self::validCidr($cidr)) {
+            return false;
+        }
+
         [$subnet, $bits] = explode('/', $cidr, 2);
         $bits = (int) $bits;
         $ipBin = @inet_pton($ip);

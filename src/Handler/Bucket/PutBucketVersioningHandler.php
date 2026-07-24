@@ -10,6 +10,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -27,7 +28,7 @@ final class PutBucketVersioningHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -37,14 +38,22 @@ final class PutBucketVersioningHandler implements RequestHandler
         }
 
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseVersioningConfiguration($body);
 
         if ($config['status'] !== '') {
             if (!in_array($config['status'], ['Enabled', 'Suspended'], true)) {
                 throw new MalformedXmlException('Invalid versioning status. Must be "Enabled" or "Suspended".');
             }
-            $this->metadata->setBucketVersioning($bucket, $config['status']);
+            $this->metadata->transaction(function () use ($bucketInfo, $bucket, $ownerId, $config): void {
+                OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                if ($config['status'] === 'Suspended' && $this->metadata->getObjectLockConfig($bucket) !== null) {
+                    throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                        'Versioning cannot be suspended while Object Lock is enabled.',
+                    );
+                }
+                $this->metadata->setBucketVersioning($bucket, $config['status']);
+            });
         }
 
         return new Response(status: 200);

@@ -20,6 +20,7 @@ final class ChecksumValidationMiddleware implements Middleware
         'UNSIGNED-PAYLOAD',
         'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
         'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+        'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
     ];
 
     public function __construct(private readonly RequestBodySpool $spool) {}

@@ -13,6 +13,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
@@ -28,7 +29,8 @@ final class RestoreObjectHandler implements RequestHandler
         $bucket = (string) $request->getAttribute('s3.bucket');
         $key = (string) $request->getAttribute('s3.key');
 
-        if ($this->metadata->getBucket($bucket) === null) {
+        $bucketInfo = $this->metadata->getBucket($bucket);
+        if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
 
@@ -50,38 +52,57 @@ final class RestoreObjectHandler implements RequestHandler
             throw new InvalidObjectStateException('RestoreObject is only valid for objects in restore-required storage tiers.');
         }
 
-        if ($object->restoreStatus === 'pending') {
-            throw new OperationAbortedException('Restore is already in progress for this object.');
-        }
-
-        if ($object->restoreStatus === 'restored' && $object->restoreExpiresAt !== null && $object->restoreExpiresAt > new \DateTimeImmutable('now', new \DateTimeZone('UTC'))) {
-            return new Response(status: 200);
-        }
-
-        $body = \Amp\ByteStream\buffer($request->getBody());
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 65_536);
         $restore = XmlRequestParser::parseRestoreRequest($body);
-        $sourceStoragePath = $object->systemMetadata['storagePath'] ?? null;
-        if ($sourceStoragePath === null || $sourceStoragePath === '') {
-            throw new InvalidObjectStateException('Object storage path is missing.');
-        }
+        $alreadyRestored = $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $versionId, $object, $restore): bool {
+            OwnerWriteLock::acquire($this->metadata, $bucketInfo->ownerId, $object->ownerId);
+            $current = $versionId !== null
+                ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
+                : $this->metadata->getObjectMetadata($bucket, $key);
+            if ($current === null || $current->isDeleteMarker) {
+                throw new NoSuchKeyException();
+            }
 
-        $this->metadata->transaction(function () use ($object, $sourceStoragePath, $restore): void {
+            $tier = $this->storageTiers->has($current->storageTier)
+                ? $this->storageTiers->tier($current->storageTier)
+                : null;
+            if ($tier === null || ! $tier->restoreRequired) {
+                throw new InvalidObjectStateException('RestoreObject is only valid for objects in restore-required storage tiers.');
+            }
+            if ($current->restoreStatus === 'pending') {
+                throw new OperationAbortedException('Restore is already in progress for this object.');
+            }
+            if (
+                $current->restoreStatus === 'restored'
+                && $current->restoreExpiresAt !== null
+                && $current->restoreExpiresAt > new \DateTimeImmutable('now', new \DateTimeZone('UTC'))
+            ) {
+                return true;
+            }
+
+            $sourceStoragePath = $current->systemMetadata['storagePath'] ?? null;
+            if ($sourceStoragePath === null || $sourceStoragePath === '') {
+                throw new InvalidObjectStateException('Object storage path is missing.');
+            }
+
             $this->metadata->enqueueRestoreJob(
-                bucket: $object->bucket,
-                key: $object->key,
-                versionId: $object->versionId,
-                sourceTier: $object->storageTier,
+                bucket: $current->bucket,
+                key: $current->key,
+                versionId: $current->versionId,
+                sourceTier: $current->storageTier,
                 sourceStoragePath: $sourceStoragePath,
                 restoreDays: $restore['days'],
             );
             $this->metadata->updateObjectRestoreState(
-                bucket: $object->bucket,
-                key: $object->key,
-                versionId: $object->versionId,
+                bucket: $current->bucket,
+                key: $current->key,
+                versionId: $current->versionId,
                 restoreStatus: 'pending',
             );
+
+            return false;
         });
 
-        return new Response(status: 202);
+        return new Response(status: $alreadyRestored ? 200 : 202);
     }
 }

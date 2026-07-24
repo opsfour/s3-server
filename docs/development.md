@@ -90,7 +90,7 @@ src/
 ├── Factory/              # MetadataStore, Storage, Credential factories
 ├── Handler/              # 66 S3 operation handlers
 ├── Http/                 # HTTP utilities
-├── Laravel/              # Service provider, Artisan command
+├── Laravel/              # Service provider and Artisan commands
 ├── Lifecycle/            # Lifecycle rule evaluation and execution
 ├── Logging/              # Access log writer
 ├── Metadata/             # SQLite, Postgres, MySQL backends + schema
@@ -190,8 +190,12 @@ Custom middleware is inserted between the built-in middleware and the policy/ACL
 vendor/bin/phpstan analyse
 ```
 
+PHPStan level 8 covers both `src/` and `tests/`. CI also installs the lowest
+and highest allowed Composer dependency sets: Laravel 12 with Symfony 7.4 LTS,
+and Laravel 13 with Symfony 8.1 or newer.
+
 ## Current Test Baseline
 
 ```
-538 tests, 2259 assertions, 5 skipped, 0 failures
+745 tests, 3287 assertions, 9 skipped, 0 failures
 ```

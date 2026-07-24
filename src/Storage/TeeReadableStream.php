@@ -45,9 +45,12 @@ final class TeeReadableStream implements \IteratorAggregate, ReadableStream
 
         $chunk = $this->source->read($cancellation);
 
-        if ($chunk !== null) {
-            ($this->onChunk)($chunk);
+        if ($chunk === null) {
+            $this->close();
+
+            return null;
         }
+        ($this->onChunk)($chunk);
 
         return $chunk;
     }
@@ -91,5 +94,13 @@ final class TeeReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $this->onCloseCallbacks[] = $onClose;
+    }
+
+    public function __destruct()
+    {
+        try {
+            $this->close();
+        } catch (\Throwable) {
+        }
     }
 }

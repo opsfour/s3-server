@@ -1,7 +1,10 @@
 # Laravel Integration
 
-OpsFour S3 Server integrates with Laravel 11 and newer applications via a
-service provider and Artisan command.
+OpsFour S3 Server integrates with Laravel 12 and 13 via a service provider and
+Artisan commands.
+
+Laravel 11 reached the end of security support on March 12, 2026 and is not a
+production-supported target.
 
 ## Installation
 
@@ -55,6 +58,26 @@ php artisan s3:serve \
 ```
 
 CLI options override `.env` values.
+
+## Manage Per-Account Quotas
+
+The quota command writes account-specific overrides to the configured metadata
+backend:
+
+```bash
+php artisan s3:quotas set account-a \
+  --max-buckets=10 \
+  --max-objects-per-bucket=100000 \
+  --max-bytes-per-bucket=107374182400 \
+  --max-bytes=1099511627776
+
+php artisan s3:quotas show account-a
+php artisan s3:quotas list
+php artisan s3:quotas delete account-a
+```
+
+All limit options accept integers greater than or equal to zero. A value of
+`0` disables that limit.
 
 ## Service Container Bindings
 
@@ -115,7 +138,7 @@ autorestart=true
 user=www-data
 redirect_stderr=true
 stdout_logfile=/var/log/s3-server.log
-stopwaitsecs=35
+stopwaitsecs=60
 stopsignal=SIGTERM
 ```
 
@@ -126,7 +149,10 @@ stopsignal=SIGTERM
 S3_METADATA_DRIVER=postgres
 S3_METADATA_DSN="host=127.0.0.1 port=5432 dbname=s3server user=s3 password=secret"
 S3_CREDENTIALS_DRIVER=database
-S3_CREDENTIALS_DSN="host=127.0.0.1 port=5432 dbname=s3server user=s3 password=secret"
+S3_CREDENTIALS_DSN="pgsql:host=127.0.0.1;port=5432;dbname=s3server"
+S3_CREDENTIALS_USERNAME=s3
+S3_CREDENTIALS_PASSWORD=secret
+S3_CREDENTIALS_CACHE_TTL=1
 ```
 
 Tables are auto-created on first start via the built-in schema manager.

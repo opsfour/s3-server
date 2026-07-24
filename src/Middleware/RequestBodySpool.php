@@ -17,7 +17,17 @@ use OpsFour\S3Server\Parallel\TemporaryFileTask;
  */
 final class RequestBodySpool
 {
+    private const int DELETE_ATTEMPTS = 3;
+
+    private const int STALE_AFTER_SECONDS = 86_400;
+
+    private const int SWEEP_INTERVAL_SECONDS = 300;
+
+    private const int SWEEP_LIMIT = 1_000;
+
     private readonly string $tempDir;
+
+    private int $lastSweepAt = 0;
 
     public function __construct(
         private readonly WorkerPool $pool,
@@ -31,6 +41,8 @@ final class RequestBodySpool
 
     public function create(string $prefix): string
     {
+        $this->sweepStaleFilesIfDue();
+
         for ($attempt = 0; $attempt < 3; $attempt++) {
             $path = $this->tempDir . DIRECTORY_SEPARATOR . $prefix . bin2hex(random_bytes(16)) . '.tmp';
 
@@ -64,6 +76,38 @@ final class RequestBodySpool
 
     public function delete(string $path): void
     {
-        $this->pool->submit(new TemporaryFileTask('delete', $path))->await();
+        for ($attempt = 1; $attempt <= self::DELETE_ATTEMPTS; $attempt++) {
+            try {
+                $this->pool->submit(new TemporaryFileTask('delete', $path))->await();
+
+                return;
+            } catch (\Throwable $e) {
+                if ($attempt === self::DELETE_ATTEMPTS) {
+                    throw $e;
+                }
+            }
+        }
+    }
+
+    private function sweepStaleFilesIfDue(): void
+    {
+        $now = time();
+        if ($now - $this->lastSweepAt < self::SWEEP_INTERVAL_SECONDS) {
+            return;
+        }
+        $this->lastSweepAt = $now;
+
+        try {
+            $this->pool->submit(new TemporaryFileTask(
+                'sweep',
+                $this->tempDir,
+                data: 's3-md5-,s3-sha256-',
+                offset: $now - self::STALE_AFTER_SECONDS,
+                length: self::SWEEP_LIMIT,
+            ))->await();
+        } catch (\Throwable) {
+            // Request processing can continue; failed cleanup is retried by a
+            // later sweep and individual deletes still have their own retries.
+        }
     }
 }

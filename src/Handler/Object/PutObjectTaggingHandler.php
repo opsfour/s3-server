@@ -10,7 +10,10 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -31,7 +34,7 @@ final class PutObjectTaggingHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -40,23 +43,22 @@ final class PutObjectTaggingHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Verify the object exists.
-        if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException();
-        }
-
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $tags = XmlRequestParser::parseTagging($body);
 
-        if (count($tags) > self::MAX_OBJECT_TAGS) {
-            throw new InvalidArgumentException(
-                'Object tags cannot be greater than ' . self::MAX_OBJECT_TAGS,
-            );
-        }
+        $tags = ObjectTagValidator::validate($tags, self::MAX_OBJECT_TAGS);
 
-        $this->metadata->putObjectTagging($bucket, $key, $tags);
+        $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $tags): ?string {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $this->metadata->putObjectTagging($bucket, $key, $tags, $object->versionId);
 
-        return new Response(status: 200);
+            return $object->versionId;
+        });
+        return new Response(
+            status: 200,
+            headers: array_filter(['x-amz-version-id' => $versionId]),
+        );
     }
 }

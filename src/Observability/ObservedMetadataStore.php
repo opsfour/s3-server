@@ -180,6 +180,11 @@ final readonly class ObservedMetadataStore implements MetadataStore
         return $this->observe(__FUNCTION__, fn() => $this->inner->listMultipartUploads($bucket, $prefix, $delimiter, $maxUploads, $keyMarker, $uploadIdMarker));
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        return $this->observe(__FUNCTION__, fn() => $this->inner->getMultipartStorageStats($ownerId, $bucket));
+    }
+
     public function putPart(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath): void
     {
         $this->observe(__FUNCTION__, fn() => $this->inner->putPart($uploadId, $partNumber, $etag, $size, $storagePath));
@@ -285,19 +290,19 @@ final readonly class ObservedMetadataStore implements MetadataStore
         $this->observe(__FUNCTION__, fn() => $this->inner->deleteBucketTagging($bucket));
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
-        return $this->observe(__FUNCTION__, fn() => $this->inner->getObjectTagging($bucket, $key));
+        return $this->observe(__FUNCTION__, fn() => $this->inner->getObjectTagging($bucket, $key, $versionId));
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
-        $this->observe(__FUNCTION__, fn() => $this->inner->putObjectTagging($bucket, $key, $tags));
+        $this->observe(__FUNCTION__, fn() => $this->inner->putObjectTagging($bucket, $key, $tags, $versionId));
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
-        $this->observe(__FUNCTION__, fn() => $this->inner->deleteObjectTagging($bucket, $key));
+        $this->observe(__FUNCTION__, fn() => $this->inner->deleteObjectTagging($bucket, $key, $versionId));
     }
 
     public function getBucketPolicy(string $bucket): ?string
@@ -463,6 +468,11 @@ final readonly class ObservedMetadataStore implements MetadataStore
         $this->observe(__FUNCTION__, fn() => $this->inner->updateTierTransitionJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath));
     }
 
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->observe(__FUNCTION__, fn() => $this->inner->renewTierTransitionJobLease($id, $leaseExpiresAt));
+    }
+
     public function getTierTransitionJob(int $id): ?array
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->getTierTransitionJob($id));
@@ -483,6 +493,11 @@ final readonly class ObservedMetadataStore implements MetadataStore
         $this->observe(__FUNCTION__, fn() => $this->inner->updateRestoreJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath));
     }
 
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->observe(__FUNCTION__, fn() => $this->inner->renewRestoreJobLease($id, $leaseExpiresAt));
+    }
+
     public function getRestoreJob(int $id): ?array
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->getRestoreJob($id));
@@ -498,9 +513,9 @@ final readonly class ObservedMetadataStore implements MetadataStore
         return $this->observe(__FUNCTION__, fn() => $this->inner->listExpiredNoncurrentVersions($bucket, $prefix, $noncurrentDays, $limit, $tags, $afterKey, $afterVersionId));
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
-        return $this->observe(__FUNCTION__, fn() => $this->inner->listExpiredMultipartUploads($bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId));
+        return $this->observe(__FUNCTION__, fn() => $this->inner->listExpiredMultipartUploads($bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId, $createdBefore));
     }
 
     public function listOrphanedDeleteMarkers(string $bucket, ?string $prefix, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array
@@ -561,6 +576,31 @@ final readonly class ObservedMetadataStore implements MetadataStore
     public function cleanupOldNotifications(int $maxAgeSeconds): void
     {
         $this->observe(__FUNCTION__, fn() => $this->inner->cleanupOldNotifications($maxAgeSeconds));
+    }
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->observe(__FUNCTION__, fn() => $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath));
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->observe(__FUNCTION__, fn() => $this->inner->discardStorageGarbage($bucket, $storageTier, $storagePath));
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->observe(__FUNCTION__, fn() => $this->inner->dequeueStorageGarbage($limit));
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->observe(__FUNCTION__, fn() => $this->inner->completeStorageGarbage($id));
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->observe(__FUNCTION__, fn() => $this->inner->retryStorageGarbage($id, $error, $nextAttemptAt));
     }
 
     public function beginTransaction(): void

@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
+
 /**
  * Registry of physical storage tiers used by tier transition and restore jobs.
  */
@@ -72,6 +75,42 @@ final class StorageTierRegistry
     public function all(): array
     {
         return $this->tiers;
+    }
+
+    public function withObservability(MetricsCollector $metrics): self
+    {
+        $multipleTiers = count($this->tiers) > 1;
+        $tiers = [];
+        foreach ($this->tiers as $tier) {
+            $backend = $tier->backend;
+            if (! $backend instanceof ObservedStorageBackend) {
+                $driver = self::metricsDriver($backend);
+                if ($multipleTiers) {
+                    $driver .= ':' . $tier->name;
+                }
+                $backend = new ObservedStorageBackend($backend, $metrics, $driver);
+            }
+
+            $tiers[] = new StorageTier(
+                name: $tier->name,
+                backend: $backend,
+                restoreRequired: $tier->restoreRequired,
+                defaultWriteTier: $tier->defaultWriteTier,
+            );
+        }
+
+        return new self($tiers);
+    }
+
+    private static function metricsDriver(StorageBackend $backend): string
+    {
+        return match (true) {
+            $backend instanceof FilesystemBackend => 'filesystem',
+            $backend instanceof ParallelFlysystemBackend,
+            $backend instanceof FlysystemBackend => 'flysystem',
+            $backend instanceof InMemoryBackend => 'memory',
+            default => strtolower((new \ReflectionClass($backend))->getShortName()),
+        };
     }
 
     private function add(StorageTier $tier): void

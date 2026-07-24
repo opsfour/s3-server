@@ -8,9 +8,9 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
-use OpsFour\S3Server\Exception\NoSuchKeyException;
-use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Http\Iso8601Timestamp;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
@@ -47,49 +47,59 @@ final class PutObjectRetentionHandler implements RequestHandler
             );
         }
 
-        // Parse versionId from query params.
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $versionId = $queryParams['versionId'] ?? null;
-
-        // Verify the object (or specific version) exists.
-        $objectInfo = ($versionId !== null)
-            ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
-            : $this->metadata->getObjectMetadata($bucket, $key);
-        if ($objectInfo === null) {
-            throw new NoSuchKeyException();
-        }
-
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $retention = XmlRequestParser::parseRetention($body);
 
-        // Validate that RetainUntilDate is a parseable date.
-        try {
-            $newDate = new \DateTimeImmutable($retention['retainUntilDate']);
-        } catch (\Exception) {
+        $newDate = Iso8601Timestamp::parse($retention['retainUntilDate']);
+        if ($newDate === null) {
             throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                 'Invalid RetainUntilDate format.',
             );
         }
-
-        // Enforce COMPLIANCE immutability: can only extend, never shorten or change mode.
-        $existing = $this->metadata->getObjectRetention($bucket, $key, $versionId);
-        if ($existing !== null && $existing['mode'] === 'COMPLIANCE') {
-            $existingDate = new \DateTimeImmutable($existing['retainUntilDate']);
-            if ($retention['mode'] !== 'COMPLIANCE' || $newDate < $existingDate) {
-                throw new AccessDeniedException(
-                    'Object protected by COMPLIANCE retention. Can only extend retention period.',
-                );
-            }
+        if ($newDate <= new \DateTimeImmutable('now', new \DateTimeZone('UTC'))) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'RetainUntilDate must be in the future.',
+            );
         }
 
-        $this->metadata->putObjectRetention(
-            $bucket,
-            $key,
-            $retention['mode'],
-            $retention['retainUntilDate'],
-            $versionId,
-        );
+        $this->metadata->transaction(function () use ($bucketInfo, $request, $bucket, $key, $retention, $newDate): void {
+            $this->metadata->lockOwnerForUpdate($bucketInfo->ownerId);
+            $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $versionId = $objectInfo->versionId;
+
+            // Enforce COMPLIANCE immutability: can only extend, never shorten or change mode.
+            $existing = $this->metadata->getObjectRetention($bucket, $key, $versionId);
+            if ($existing !== null && $existing['mode'] === 'COMPLIANCE') {
+                $existingDate = new \DateTimeImmutable($existing['retainUntilDate']);
+                if ($retention['mode'] !== 'COMPLIANCE' || $newDate < $existingDate) {
+                    throw new AccessDeniedException(
+                        'Object protected by COMPLIANCE retention. Can only extend retention period.',
+                    );
+                }
+            }
+            if ($existing !== null && $existing['mode'] === 'GOVERNANCE') {
+                $existingDate = new \DateTimeImmutable($existing['retainUntilDate']);
+                $weakensRetention = $retention['mode'] !== 'GOVERNANCE' || $newDate < $existingDate;
+                $bypassRequested = strtolower(
+                    $request->getHeader('x-amz-bypass-governance-retention') ?? '',
+                ) === 'true';
+                $canBypass = $request->getAttribute('s3.canBypassGovernanceRetention') === true;
+                if ($weakensRetention && (! $bypassRequested || ! $canBypass)) {
+                    throw new AccessDeniedException(
+                        'Shortening or changing GOVERNANCE retention requires s3:BypassGovernanceRetention.',
+                    );
+                }
+            }
+
+            $this->metadata->putObjectRetention(
+                $bucket,
+                $key,
+                $retention['mode'],
+                $retention['retainUntilDate'],
+                $versionId,
+            );
+        });
 
         return new Response(status: 200);
     }

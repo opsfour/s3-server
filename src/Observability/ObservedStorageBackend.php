@@ -6,9 +6,10 @@ namespace OpsFour\S3Server\Observability;
 
 use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
-final readonly class ObservedStorageBackend implements StorageBackend
+final readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, StorageBackend
 {
     public function __construct(
         private StorageBackend $inner,
@@ -65,6 +66,18 @@ final readonly class ObservedStorageBackend implements StorageBackend
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
         return $this->observe('copyObject', fn() => $this->inner->copyObject($srcPath, $dstBucket, $dstKey));
+    }
+
+    public function innerBackend(): StorageBackend
+    {
+        return $this->inner;
+    }
+
+    public function shutdown(): void
+    {
+        if ($this->inner instanceof ShutdownAwareStorageBackend) {
+            $this->inner->shutdown();
+        }
     }
 
     /**

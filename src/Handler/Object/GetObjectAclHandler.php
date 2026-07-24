@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -38,13 +39,12 @@ final class GetObjectAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Verify the object exists.
-        if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException();
-        }
-
-        $resourceName = $bucket . '/' . $key;
+        $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $object->versionId);
         $grants = $this->metadata->getAcl('object', $resourceName);
+        if ($grants === [] && ($object->versionId === null || $object->versionId === 'null')) {
+            $grants = $this->metadata->getAcl('object', $bucket . '/' . $key);
+        }
 
         // Default: owner gets FULL_CONTROL if no ACL stored.
         if ($grants === []) {
@@ -69,7 +69,10 @@ final class GetObjectAclHandler implements RequestHandler
 
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'application/xml'],
+            headers: array_filter([
+                'Content-Type' => 'application/xml',
+                'x-amz-version-id' => $object->versionId,
+            ]),
             body: $xml,
         );
     }

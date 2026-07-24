@@ -10,10 +10,12 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
  * Enforces bucket policies on incoming requests.
@@ -96,7 +98,9 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         if ($key !== null) {
-            foreach ($this->metadata->getObjectTagging($bucket, $key) as $tag) {
+            $tagVersionId = $queryParams['versionId']
+                ?? $this->metadata->getObjectMetadata($bucket, $key)?->versionId;
+            foreach ($this->metadata->getObjectTagging($bucket, $key, $tagVersionId) as $tag) {
                 $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
             }
         }
@@ -135,6 +139,31 @@ final class PolicyEnforcementMiddleware implements Middleware
         if ($resourceResult === 'Deny') {
             throw new AccessDeniedException();
         }
+
+        $canBypassGovernance = false;
+        if (strtolower($request->getHeader('x-amz-bypass-governance-retention') ?? '') === 'true') {
+            $bypassIdentityResult = self::evaluatePolicies(
+                $identityPolicies,
+                's3:BypassGovernanceRetention',
+                $resource,
+                $ownerId,
+                $conditions,
+            );
+            $bypassResourceResult = $policyJson !== null
+                ? PolicyEvaluator::evaluate(
+                    $policyJson,
+                    's3:BypassGovernanceRetention',
+                    $resource,
+                    $ownerId,
+                    $conditions,
+                )
+                : 'Neutral';
+            $isBucketOwner = $ownerId !== '' && $bucketOwner === $ownerId;
+            $canBypassGovernance = $bypassIdentityResult !== 'Deny'
+                && $bypassResourceResult !== 'Deny'
+                && ($isBucketOwner || $bypassIdentityResult === 'Allow' || $bypassResourceResult === 'Allow');
+        }
+        $request->setAttribute('s3.canBypassGovernanceRetention', $canBypassGovernance);
 
         // RestrictPublicBuckets blocks public-policy access from anonymous and
         // foreign accounts while preserving access for the bucket owner.
@@ -243,46 +272,16 @@ final class PolicyEnforcementMiddleware implements Middleware
 
         $taggingHeader = $request->getHeader('x-amz-tagging');
         if ($taggingHeader !== null && $taggingHeader !== '') {
-            parse_str($taggingHeader, $parsed);
-            foreach ($parsed as $key => $value) {
-                if (is_string($key) && is_string($value)) {
-                    $tags[$key] = $value;
-                }
+            foreach (ObjectTagValidator::parseHeader($taggingHeader) as $tag) {
+                $tags[$tag['key']] = $tag['value'];
             }
         }
 
         if ($operation === S3Operation::PutObjectTagging) {
-            $body = $request->getBody()->buffer();
+            $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 262_144);
             $request->setBody($body);
-            foreach (self::parseTaggingXml($body) as $key => $value) {
-                $tags[$key] = $value;
-            }
-        }
-
-        return $tags;
-    }
-
-    /**
-     * @return array<string, string>
-     */
-    private static function parseTaggingXml(string $body): array
-    {
-        if ($body === '') {
-            return [];
-        }
-
-        try {
-            $xml = new \SimpleXMLElement($body);
-        } catch (\Throwable) {
-            return [];
-        }
-
-        $tags = [];
-        foreach ($xml->TagSet->Tag ?? [] as $tag) {
-            $key = trim((string) ($tag->Key ?? ''));
-            $value = (string) ($tag->Value ?? '');
-            if ($key !== '') {
-                $tags[$key] = $value;
+            foreach (ObjectTagValidator::validate(XmlRequestParser::parseTagging($body), 10) as $tag) {
+                $tags[$tag['key']] = $tag['value'];
             }
         }
 

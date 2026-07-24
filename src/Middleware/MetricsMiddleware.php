@@ -21,7 +21,9 @@ final class MetricsMiddleware implements Middleware
         $startedAt = hrtime(true);
         $response = $requestHandler->handleRequest($request);
 
-        $operation = $request->getAttribute('s3.operation');
+        $operation = $request->hasAttribute('s3.operation')
+            ? $request->getAttribute('s3.operation')
+            : null;
         if ($operation instanceof \BackedEnum) {
             $operation = (string) $operation->value;
         }

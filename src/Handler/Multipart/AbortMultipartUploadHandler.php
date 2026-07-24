@@ -11,16 +11,24 @@ use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Multipart\MultipartCleanup;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Event\S3Event;
 
 final class AbortMultipartUploadHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
         private readonly ?NotificationDispatcher $notifications = null,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -44,16 +52,32 @@ final class AbortMultipartUploadHandler implements RequestHandler
             throw new NoSuchUploadException();
         }
 
-        // Best-effort storage cleanup first, then unconditionally remove metadata.
-        // If storage cleanup fails, the upload record must still be removed so the
-        // upload doesn't become permanently stuck.
-        try {
-            $this->storage->abortMultipartUpload($bucket, $key, $uploadId);
-        } catch (\Throwable) {
-        }
+        $event = $this->notifications?->createEvent('s3:MultipartUpload:Aborted', $bucket, $key, ownerId: $ownerId)
+            ?? new S3Event('s3:MultipartUpload:Aborted', $bucket, $key, ownerId: $ownerId);
+        $parts = $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $event): array {
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $parts = MultipartCleanup::stage(
+                $this->metadata,
+                $bucket,
+                $key,
+                $uploadId,
+                $ownerId,
+                $this->storageTiers->defaultTier()->name,
+            );
+            $this->notifications?->enqueueWebhooks($event);
 
-        $this->metadata->deleteMultipartUpload($uploadId);
-        $this->notifications?->dispatch('s3:MultipartUpload:Aborted', $bucket, $key, 0, '', $ownerId);
+            return $parts;
+        });
+        MultipartCleanup::clean(
+            $this->metadata,
+            $this->storage,
+            $bucket,
+            $key,
+            $uploadId,
+            $this->storageTiers->defaultTier()->name,
+            $parts,
+        );
+        $this->notifications?->dispatchInternalEvent($event);
 
         return new Response(status: 204);
     }

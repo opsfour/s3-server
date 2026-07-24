@@ -48,7 +48,12 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
 
     public function read(?Cancellation $cancellation = null): ?string
     {
-        if ($this->closed || $this->remaining <= 0) {
+        if ($this->closed) {
+            return null;
+        }
+        if ($this->remaining <= 0) {
+            $this->close();
+
             return null;
         }
 
@@ -71,6 +76,9 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $this->remaining -= $chunkLen;
+        if ($this->remaining === 0) {
+            $this->close();
+        }
 
         return $chunk;
     }
@@ -114,5 +122,13 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $this->onCloseCallbacks[] = $onClose;
+    }
+
+    public function __destruct()
+    {
+        try {
+            $this->close();
+        } catch (\Throwable) {
+        }
     }
 }

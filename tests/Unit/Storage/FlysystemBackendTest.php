@@ -88,8 +88,8 @@ final class FlysystemBackendTest extends TestCase
 
         $before = scandir($this->tempDir);
         $result = $this->backend->assembleMultipartUpload('bucket', 'large.bin', $uploadId, [
-            ['partNumber' => 1, 'etag' => $part1->md5Hex],
-            ['partNumber' => 2, 'etag' => $part2->md5Hex],
+            ['partNumber' => 1, 'etag' => $part1->md5Hex, 'storagePath' => $part1->path],
+            ['partNumber' => 2, 'etag' => $part2->md5Hex, 'storagePath' => $part2->path],
         ]);
         $after = scandir($this->tempDir);
 
@@ -109,6 +109,36 @@ final class FlysystemBackendTest extends TestCase
         )));
     }
 
+    public function test_failed_part_replacement_can_delete_new_attempt_without_losing_previous_part(): void
+    {
+        $uploadId = 'upload-' . bin2hex(random_bytes(4));
+        $previous = $this->backend->putPart(
+            'bucket',
+            'object.bin',
+            $uploadId,
+            1,
+            new ReadableBuffer('previous'),
+        );
+        $replacement = $this->backend->putPart(
+            'bucket',
+            'object.bin',
+            $uploadId,
+            1,
+            new ReadableBuffer('replacement'),
+        );
+
+        self::assertNotSame($previous->path, $replacement->path);
+        $this->backend->deleteObjectByPath($replacement->path, 'bucket');
+
+        $assembled = $this->backend->assembleMultipartUpload('bucket', 'object.bin', $uploadId, [[
+            'partNumber' => 1,
+            'etag' => $previous->md5Hex,
+            'storagePath' => $previous->path,
+        ]]);
+
+        self::assertSame('previous', self::readAll($this->backend->getObjectByPath($assembled->path)));
+    }
+
     public function test_copy_object_reads_and_writes_through_flysystem(): void
     {
         $this->backend->createBucket('bucket');
@@ -118,7 +148,10 @@ final class FlysystemBackendTest extends TestCase
 
         self::assertSame([], self::temporaryFiles($this->tempDir));
         self::assertSame('copy me', self::readAll($this->backend->getObjectByPath($copy->path)));
-        self::assertSame(2, $this->adapter->writeStreamCalls);
+        self::assertSame(1, $this->adapter->writeStreamCalls);
+        self::assertSame(1, $this->adapter->copyCalls);
+        self::assertSame(7, $copy->size);
+        self::assertSame(hash('md5', 'copy me'), $copy->md5Hex);
     }
 
     public function test_remote_write_failure_is_reported_and_does_not_leave_partial_file(): void

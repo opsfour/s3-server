@@ -31,7 +31,7 @@ return [
     // Base domain for virtual-hosted-style bucket addressing.
     'base_domain' => env('S3_BASE_DOMAIN'),
 
-    // Enforce strict S3 bucket naming rules.
+    // Reject AWS-reserved bucket name prefixes and suffixes.
     'strict_bucket_naming' => (bool) env('S3_STRICT_BUCKET_NAMING', true),
 
     // Per-client rate limit (requests per second, 0 = unlimited).
@@ -46,7 +46,7 @@ return [
     // Maximum object size for S3 Select queries (bytes, default 256 MiB).
     'max_select_object_size' => (int) env('S3_MAX_SELECT_OBJECT_SIZE', 268_435_456),
 
-    // Graceful shutdown drain timeout in seconds.
+    // Seconds before warning that graceful shutdown is still draining.
     'shutdown_drain_timeout' => (int) env('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
 
     // Connection idle timeout in seconds (0 = no timeout).
@@ -58,12 +58,17 @@ return [
     // Write timeout in seconds.
     'write_timeout' => (int) env('S3_WRITE_TIMEOUT', 300),
 
+    // Enforce the S3 5 MiB minimum for every non-final multipart part.
+    'enforce_min_part_size' => (bool) env('S3_ENFORCE_MIN_PART_SIZE', true),
+
     'notifications' => [
         // Reject plaintext HTTP webhook destinations by default.
         'require_https' => (bool) env('S3_NOTIFICATION_REQUIRE_HTTPS', true),
     ],
 
-    // Master key provider for SSE-S3: 'config', 'vault'.
+    'metrics_bearer_token' => env('S3_METRICS_BEARER_TOKEN'),
+
+    // Master key provider for SSE-S3: 'config', 'redis', or 'vault'.
     'master_key_provider' => env('S3_MASTER_KEY_PROVIDER', 'config'),
 
     /*
@@ -81,6 +86,9 @@ return [
 
         // Number of worker processes for encryption/decryption.
         'encryption_workers' => (int) env('S3_ENCRYPTION_WORKERS', 0),
+
+        // Number of worker processes for S3 Select.
+        'select_workers' => (int) env('S3_SELECT_WORKERS', env('S3_ENCRYPTION_WORKERS', 0)),
 
         // Stateless workers for request-body checksum spooling.
         'request_body_spool_workers' => (int) env('S3_REQUEST_BODY_SPOOL_WORKERS', 8),
@@ -103,6 +111,10 @@ return [
         'max_objects_per_bucket' => (int) env('S3_QUOTA_MAX_OBJECTS_PER_BUCKET', 0),
         'max_bytes_per_bucket' => (int) env('S3_QUOTA_MAX_BYTES_PER_BUCKET', 0),
         'max_bytes_per_owner' => (int) env('S3_QUOTA_MAX_BYTES_PER_OWNER', 0),
+        'max_multipart_uploads_per_bucket' => (int) env('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET', 0),
+        'max_multipart_uploads_per_owner' => (int) env('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER', 0),
+        'max_multipart_bytes_per_bucket' => (int) env('S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET', 0),
+        'max_multipart_bytes_per_owner' => (int) env('S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER', 0),
     ],
 
     /*
@@ -119,6 +131,7 @@ return [
         'batch_size' => (int) env('S3_LIFECYCLE_BATCH_SIZE', 1000),
         'max_actions_per_run' => (int) env('S3_LIFECYCLE_MAX_ACTIONS_PER_RUN', 1000),
         'lock_ttl_seconds' => (int) env('S3_LIFECYCLE_LOCK_TTL_SECONDS', 300),
+        'multipart_max_age_seconds' => (int) env('S3_MULTIPART_MAX_AGE_SECONDS', 604800),
     ],
 
     /*
@@ -193,6 +206,11 @@ return [
         'display_name' => env('S3_DISPLAY_NAME'),
         // For 'database' driver:
         'dsn' => env('S3_CREDENTIALS_DSN'),
+        'username' => env('S3_CREDENTIALS_USERNAME'),
+        'password' => env('S3_CREDENTIALS_PASSWORD'),
+        // Positive credential lookups are refreshed after this many seconds.
+        // Set to 0 to disable caching and observe revocations on every request.
+        'cache_ttl' => (float) env('S3_CREDENTIALS_CACHE_TTL', 1.0),
         // For 'file' driver:
         'path' => env('S3_CREDENTIALS_PATH'),
     ],

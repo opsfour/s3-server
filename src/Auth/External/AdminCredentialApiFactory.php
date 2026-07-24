@@ -9,6 +9,8 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 
 final class AdminCredentialApiFactory
 {
+    private const int MAX_KEY_FILE_BYTES = 1_048_576;
+
     /**
      * @param array<string, mixed> $config
      */
@@ -23,6 +25,15 @@ final class AdminCredentialApiFactory
             throw new \InvalidArgumentException('External IAM admin API requires "admin_token".');
         }
 
+        $allowedIssuers = self::stringList($config['allowed_issuers'] ?? $config['issuer'] ?? []);
+        if ($allowedIssuers === []) {
+            throw new \InvalidArgumentException('External IAM admin API requires at least one expected JWT issuer.');
+        }
+        $allowedAudiences = self::stringList($config['allowed_audiences'] ?? $config['audience'] ?? []);
+        if ($allowedAudiences === []) {
+            throw new \InvalidArgumentException('External IAM admin API requires at least one expected JWT audience.');
+        }
+
         $mapper = new OidcClaimMapper(
             ownerClaim: self::string($config['owner_claim'] ?? null) ?? 'sub',
             displayNameClaim: self::string($config['display_name_claim'] ?? null) ?? 'preferred_username',
@@ -35,8 +46,8 @@ final class AdminCredentialApiFactory
         $identityProvider = new JwtExternalIdentityProvider(
             mapper: $mapper,
             keys: self::loadKeys($config),
-            allowedIssuers: self::stringList($config['allowed_issuers'] ?? $config['issuer'] ?? []),
-            allowedAudiences: self::stringList($config['allowed_audiences'] ?? $config['audience'] ?? []),
+            allowedIssuers: $allowedIssuers,
+            allowedAudiences: $allowedAudiences,
             clockSkewSeconds: self::positiveOrZeroInt($config['clock_skew_seconds'] ?? 60),
         );
 
@@ -66,12 +77,7 @@ final class AdminCredentialApiFactory
 
         $publicKeyPath = self::string($config['public_key_path'] ?? null);
         if ($publicKeyPath !== null) {
-            $publicKey = @file_get_contents($publicKeyPath);
-            if ($publicKey === false || $publicKey === '') {
-                throw new \InvalidArgumentException("External IAM public key file is not readable: {$publicKeyPath}");
-            }
-
-            return ['default' => $publicKey];
+            return ['default' => self::readKeyFile($publicKeyPath, 'public key')];
         }
 
         $publicKey = self::string($config['public_key'] ?? null);
@@ -87,10 +93,7 @@ final class AdminCredentialApiFactory
      */
     private static function loadJwksFile(string $path): array
     {
-        $raw = @file_get_contents($path);
-        if ($raw === false || $raw === '') {
-            throw new \InvalidArgumentException("External IAM JWKS file is not readable: {$path}");
-        }
+        $raw = self::readKeyFile($path, 'JWKS');
 
         $decoded = json_decode($raw, true);
         if (!is_array($decoded) || !isset($decoded['keys']) || !is_array($decoded['keys'])) {
@@ -113,6 +116,21 @@ final class AdminCredentialApiFactory
         }
 
         return $keys;
+    }
+
+    private static function readKeyFile(string $path, string $description): string
+    {
+        $contents = @file_get_contents($path, false, null, 0, self::MAX_KEY_FILE_BYTES + 1);
+        if ($contents === false || $contents === '') {
+            throw new \InvalidArgumentException("External IAM {$description} file is not readable: {$path}");
+        }
+        if (strlen($contents) > self::MAX_KEY_FILE_BYTES) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file exceeds " . self::MAX_KEY_FILE_BYTES . " bytes: {$path}",
+            );
+        }
+
+        return $contents;
     }
 
     private static function bool(mixed $value): bool

@@ -56,15 +56,15 @@ final class S3ServerServeCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $config = $this->configWithOverrides($input);
-        $adminToken = $input->getOption('admin-token');
-        $adminToken = is_string($adminToken) && trim($adminToken) !== ''
-            ? trim($adminToken)
-            : $this->adminToken;
-
         $logger = $this->logger();
 
         try {
+            $config = $this->configWithOverrides($input);
+            $adminToken = $input->getOption('admin-token');
+            $adminToken = is_string($adminToken) && trim($adminToken) !== ''
+                ? trim($adminToken)
+                : $this->adminToken;
+
             $runtime = $this->runtimeFactory->create(
                 config: $config,
                 metadata: $this->metadata,
@@ -78,7 +78,7 @@ final class S3ServerServeCommand extends Command
                 encryption: $this->encryption,
                 notificationListeners: $this->notificationListeners,
             );
-        } catch (\InvalidArgumentException|\RuntimeException $e) {
+        } catch (\Throwable $e) {
             $output->writeln("<error>Error: {$e->getMessage()}</error>");
 
             return Command::FAILURE;
@@ -92,16 +92,26 @@ final class S3ServerServeCommand extends Command
         if ($config->encryptionWorkerPoolSize > 0) {
             $output->writeln("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers");
         }
+        if ($config->selectWorkerPoolSize > 0) {
+            $output->writeln("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
+        }
         $output->writeln('Press Ctrl+C to stop.');
 
-        $runtime->server->start();
+        try {
+            $runtime->server->start();
 
-        $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
-        $logger->info('Received signal {signal}, shutting down...', [
-            'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
-        ]);
+            $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            $logger->info('Received signal {signal}, shutting down...', [
+                'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
+            ]);
+        } catch (\Throwable $e) {
+            $logger->error('S3 server runtime failed: {error}', ['error' => $e->getMessage()]);
+            $output->writeln("<error>Error: {$e->getMessage()}</error>");
 
-        $runtime->stop();
+            return Command::FAILURE;
+        } finally {
+            $runtime->stop();
+        }
 
         $output->writeln('Server stopped.');
 

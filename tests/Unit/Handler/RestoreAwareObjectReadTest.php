@@ -14,8 +14,10 @@ use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
+use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Handler\Object\RestoreObjectHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectHandler;
@@ -25,6 +27,7 @@ use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class RestoreAwareObjectReadTest extends TestCase
@@ -392,6 +395,61 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame('tier-source', \Amp\ByteStream\buffer($this->hot->getObjectByPath($copied->systemMetadata['storagePath'])));
     }
 
+    public function test_copy_uses_native_copy_when_source_and_destination_share_backend(): void
+    {
+        $source = $this->hot->putObject('bucket', 'source.bin', new ReadableBuffer('native-copy'));
+        $this->putMetadata('source.bin', $source->path, $source->size, $source->md5Hex);
+        $storage = new CallbackStorageBackend($this->hot);
+        $tiers = new StorageTierRegistry([
+            new StorageTier('STANDARD', $storage, defaultWriteTier: true),
+        ]);
+        $request = new Request(
+            new RestoreReadTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/copied.bin'),
+            ['x-amz-copy-source' => '/bucket/source.bin'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'copied.bin');
+        $request->setAttribute('ownerId', 'owner');
+
+        $response = (new CopyObjectHandler($this->metadata, $storage, storageTiers: $tiers))
+            ->handleRequest($request);
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame(1, $storage->copyCalls);
+        self::assertSame(0, $storage->putCalls);
+    }
+
+    public function test_copy_cannot_read_private_source_from_another_account(): void
+    {
+        $this->metadata->createBucket('foreign-owner', 'foreign-bucket', 'us-east-1');
+        $this->hot->createBucket('foreign-bucket');
+        $source = $this->hot->putObject('foreign-bucket', 'private.bin', new ReadableBuffer('private'));
+        $this->metadata->putObjectMetadata(
+            'foreign-bucket',
+            'private.bin',
+            'foreign-owner',
+            $source->size,
+            '"' . $source->md5Hex . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $request = new Request(
+            new RestoreReadTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/copied.bin'),
+            ['x-amz-copy-source' => '/foreign-bucket/private.bin'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'copied.bin');
+        $request->setAttribute('ownerId', 'owner');
+
+        $this->expectException(AccessDeniedException::class);
+        (new CopyObjectHandler($this->metadata, $this->hot, storageTiers: $this->tiers))
+            ->handleRequest($request);
+    }
+
     public function test_head_cold_object_reports_pending_restore_header(): void
     {
         $coldWrite = $this->cold->putObject('bucket', 'archive.bin', new ReadableBuffer('cold-data'));
@@ -404,6 +462,30 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame(200, $response->getStatus());
         self::assertSame('ongoing-request="true"', $response->getHeader('x-amz-restore'));
         self::assertSame('GLACIER', $response->getHeader('x-amz-storage-class'));
+    }
+
+    public function test_get_object_attributes_requires_matching_sse_customer_key(): void
+    {
+        $rawKey = str_repeat('k', 32);
+        $keyMd5 = base64_encode(md5($rawKey, true));
+        $write = $this->hot->putObject('bucket', 'encrypted.bin', new ReadableBuffer('ciphertext'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'encrypted.bin',
+            'owner',
+            $write->size,
+            '"' . $write->md5Hex . '"',
+            'application/octet-stream',
+            $write->path,
+            userMetadata: [
+                '__sse-algorithm' => 'SSE-C',
+                '__sse-customer-key-md5' => $keyMd5,
+            ],
+        );
+
+        $this->expectException(\OpsFour\S3Server\Exception\InvalidArgumentException::class);
+        (new GetObjectAttributesHandler($this->metadata))
+            ->handleRequest($this->request('GET', '/bucket/encrypted.bin?attributes'));
     }
 
     public function test_restore_object_enqueues_restore_job_and_marks_object_pending(): void
@@ -458,6 +540,9 @@ final class RestoreAwareObjectReadTest extends TestCase
         );
     }
 
+    /**
+     * @param non-empty-string $method
+     */
     private function request(string $method, string $path, string $body = ''): Request
     {
         $request = new Request(
@@ -475,6 +560,9 @@ final class RestoreAwareObjectReadTest extends TestCase
         return $request;
     }
 
+    /**
+     * @param non-empty-string $method
+     */
     private function websiteRequest(string $method, string $path, string $host): Request
     {
         return new Request(
@@ -520,7 +608,6 @@ final class RestoreAwareObjectReadTest extends TestCase
             $storage->getObjectByPath($path);
             self::fail("Expected storage path to be deleted: {$path}");
         } catch (\OpsFour\S3Server\Exception\NoSuchKeyException) {
-            self::assertTrue(true);
         }
     }
 }

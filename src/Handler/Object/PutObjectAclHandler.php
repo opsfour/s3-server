@@ -11,7 +11,9 @@ use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -30,7 +32,7 @@ final class PutObjectAclHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -39,28 +41,32 @@ final class PutObjectAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Verify the object exists.
-        if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException();
-        }
-
         $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId);
         if ($grants === null) {
             // Parse XML body.
-            $body = $request->getBody()->buffer();
+            $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
             $parsed = XmlRequestParser::parseAccessControlPolicy($body);
             $grants = AclGrantResolver::validateGrants($parsed['grants']);
         }
 
-        // Check Public Access Block — reject public ACLs if blockPublicAcls is set.
-        $pab = $this->metadata->getPublicAccessBlock($bucket);
-        if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
-            throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
-        }
+        $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $grants): ?string {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $pab = $this->metadata->getPublicAccessBlock($bucket);
+            if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
+                throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
+            }
 
-        $resourceName = $bucket . '/' . $key;
-        $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $object->versionId);
+            $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
+            $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
 
-        return new Response(status: 200);
+            return $object->versionId;
+        });
+
+        return new Response(
+            status: 200,
+            headers: array_filter(['x-amz-version-id' => $versionId]),
+        );
     }
 }

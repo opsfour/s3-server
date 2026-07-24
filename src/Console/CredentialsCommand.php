@@ -32,6 +32,8 @@ final class CredentialsCommand extends Command
             ->addOption('secret-key', null, InputOption::VALUE_REQUIRED, 'Custom secret key (auto-generated if omitted)')
             ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: database|file', getenv('S3_CREDENTIALS_DRIVER') ?: 'file')
             ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'Database DSN (database driver)', getenv('S3_CREDENTIALS_DSN') ?: null)
+            ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Username for credentials database', getenv('S3_CREDENTIALS_USERNAME') ?: null)
+            ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Password for credentials database', getenv('S3_CREDENTIALS_PASSWORD') === false ? null : getenv('S3_CREDENTIALS_PASSWORD'))
             ->addOption('credentials-file', null, InputOption::VALUE_REQUIRED, 'Path to credentials JSON file (file driver)', getenv('S3_CREDENTIALS_PATH') ?: null);
     }
 
@@ -78,6 +80,9 @@ final class CredentialsCommand extends Command
             'database' => [
                 'dsn' => $input->getOption('credentials-dsn')
                     ?? throw new \RuntimeException('--credentials-dsn is required for the database driver.'),
+                'username' => $input->getOption('credentials-username'),
+                'password' => $input->getOption('credentials-password'),
+                'cache_ttl' => 0,
             ],
             'file' => [
                 'path' => $input->getOption('credentials-file')

@@ -11,9 +11,11 @@ use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Event\S3Event;
 
 /**
  * Handles DeleteObject (DELETE /{bucket}/{key}).
@@ -45,7 +47,7 @@ final class DeleteObjectHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // 1. Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -68,16 +70,37 @@ final class DeleteObjectHandler implements RequestHandler
 
             // Check if a real (non-delete-marker) object exists before creating the delete marker.
             // Used to decide whether to fire a notification (no notification for phantom deletes).
-            $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-            $hadRealObject = ($existingObj !== null && !$existingObj->isDeleteMarker);
-
-            // Suspended versioning: collect storage path for existing null version before overwriting.
-            if ($isSuspended && $hadRealObject) {
-                $oldObjectToClean = $existingObj;
-            }
-
-            // Insert a delete marker (soft delete).
-            $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
+            $hadRealObject = false;
+            $deleteMarkerVersionId = '';
+            $event = $this->removalEvent($bucket, $key, $ownerId);
+            $this->metadata->transaction(function () use (
+                $bucket,
+                $key,
+                $ownerId,
+                $isSuspended,
+                $event,
+                $versioning,
+                $bucketInfo,
+                &$hadRealObject,
+                &$oldObjectToClean,
+                &$deleteMarkerVersionId,
+            ): void {
+                OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                        'Bucket versioning changed while the delete was being committed.',
+                    );
+                }
+                $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
+                $hadRealObject = ($existingObj !== null && ! $existingObj->isDeleteMarker);
+                if ($isSuspended && $hadRealObject) {
+                    $oldObjectToClean = $existingObj;
+                }
+                $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
+                if ($hadRealObject) {
+                    $this->notifications?->enqueueWebhooks($event);
+                }
+            });
 
             // Clean up old storage AFTER successful metadata write.
             if ($oldObjectToClean !== null) {
@@ -86,7 +109,7 @@ final class DeleteObjectHandler implements RequestHandler
 
             // Only fire notification if a real object was superseded by the delete marker.
             if ($hadRealObject) {
-                $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
+                $this->notifications?->dispatchInternalEvent($event);
             }
 
             return new Response(
@@ -100,10 +123,16 @@ final class DeleteObjectHandler implements RequestHandler
 
         if ($versionId !== null) {
             // Permanently delete a specific version.
-            // Check Object Lock before allowing deletion.
-            $this->lockChecker->check($bucket, $key, $versionId, $request);
-
-            $deletedInfo = $this->metadata->deleteObjectVersion($bucket, $key, $versionId);
+            $deletedInfo = null;
+            $event = $this->removalEvent($bucket, $key, $ownerId);
+            $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $versionId, $request, $event, &$deletedInfo): void {
+                OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                $this->lockChecker->check($bucket, $key, $versionId, $request);
+                $deletedInfo = $this->metadata->deleteObjectVersion($bucket, $key, $versionId);
+                if ($deletedInfo !== null) {
+                    $this->notifications?->enqueueWebhooks($event);
+                }
+            });
 
             $headers = [];
 
@@ -118,7 +147,7 @@ final class DeleteObjectHandler implements RequestHandler
                     $headers['x-amz-delete-marker'] = 'true';
                 }
 
-                $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
+                $this->notifications?->dispatchInternalEvent($event);
             }
 
             return new Response(
@@ -131,12 +160,26 @@ final class DeleteObjectHandler implements RequestHandler
         //    Delete metadata first so the object disappears from the API immediately.
         //    Then best-effort storage cleanup (orphaned file is preferable to an object
         //    visible in ListObjects but unreadable due to missing storage).
-        $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+        $event = $this->removalEvent($bucket, $key, $ownerId);
+        $objectInfo = $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $versioning, $event): ?ObjectInfo {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
+                throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                    'Bucket versioning changed while the delete was being committed.',
+                );
+            }
+            $object = $this->metadata->getObjectMetadata($bucket, $key);
+            if ($object !== null) {
+                $this->metadata->deleteObjectMetadata($bucket, $key);
+                $this->notifications?->enqueueWebhooks($event);
+            }
+
+            return $object;
+        });
 
         if ($objectInfo !== null) {
-            $this->metadata->deleteObjectMetadata($bucket, $key);
             $this->deleteStoredData($objectInfo);
-            $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
+            $this->notifications?->dispatchInternalEvent($event);
         }
 
         return new Response(status: 204);
@@ -146,20 +189,18 @@ final class DeleteObjectHandler implements RequestHandler
     {
         $storagePath = $object->systemMetadata['storagePath'] ?? null;
         if ($storagePath !== null && $storagePath !== '') {
-            try {
-                $this->storageTiers->tier($object->storageTier)->backend
-                    ->deleteObjectByPath($storagePath, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->tier($object->storageTier)->backend, $object->bucket, $object->storageTier, $storagePath);
         }
 
         if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
-            try {
-                $this->storageTiers->defaultBackend()
-                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->defaultBackend(), $object->bucket, $this->storageTiers->defaultTier()->name, $object->restoredStoragePath);
         }
+    }
+
+    private function removalEvent(string $bucket, string $key, string $ownerId): S3Event
+    {
+        return $this->notifications?->createEvent('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId)
+            ?? new S3Event('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId);
     }
 
 }

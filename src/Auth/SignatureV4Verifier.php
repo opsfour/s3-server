@@ -232,7 +232,7 @@ final class SignatureV4Verifier
         $min   = (int) substr($timestamp, 11, 2);
         $sec   = (int) substr($timestamp, 13, 2);
 
-        if ($month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $min > 59 || $sec > 59) {
+        if (! checkdate($month, $day, $year) || $hour > 23 || $min > 59 || $sec > 59) {
             throw new AccessDeniedException(
                 'Invalid date/time components in request.',
             );

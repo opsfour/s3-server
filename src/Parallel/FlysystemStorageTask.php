@@ -202,7 +202,7 @@ final class FlysystemStorageTask implements Task
     }
 
     /**
-     * @return array<int, array{partNumber: int, etag: string}>
+     * @return array<int, array{partNumber: int, etag: string, storagePath: string}>
      */
     private function partsArgument(int $offset): array
     {
@@ -211,7 +211,7 @@ final class FlysystemStorageTask implements Task
             throw new \LogicException("Flysystem task argument {$offset} must be a parts array.");
         }
 
-        /** @var array<int, array{partNumber: int, etag: string}> $value */
+        /** @var array<int, array{partNumber: int, etag: string, storagePath: string}> $value */
         return $value;
     }
 }

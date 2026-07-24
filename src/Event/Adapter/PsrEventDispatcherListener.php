@@ -14,16 +14,21 @@ use OpsFour\S3Server\Event\S3Event;
  */
 final readonly class PsrEventDispatcherListener
 {
+    private \Closure $dispatch;
+
     public function __construct(
-        private object $dispatcher,
+        object $dispatcher,
     ) {
-        if (!method_exists($this->dispatcher, 'dispatch')) {
+        $dispatch = [$dispatcher, 'dispatch'];
+        if (!is_callable($dispatch)) {
             throw new \InvalidArgumentException('PSR event dispatcher adapter requires a dispatch(object): object method.');
         }
+
+        $this->dispatch = \Closure::fromCallable($dispatch);
     }
 
     public function __invoke(S3Event $event): void
     {
-        $this->dispatcher->dispatch($event);
+        ($this->dispatch)($event);
     }
 }

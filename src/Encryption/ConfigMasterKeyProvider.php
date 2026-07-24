@@ -37,8 +37,8 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
             $keys = [];
             foreach ($parsed as $keyId => $b64) {
                 $keyId = (string) $keyId;
-                if (strlen($keyId) > 255) {
-                    throw new \RuntimeException("Key ID '{$keyId}' exceeds 255 characters.");
+                if ($keyId === '' || strlen($keyId) > 255) {
+                    throw new \RuntimeException('Key IDs must contain between 1 and 255 bytes.');
                 }
                 $decoded = base64_decode($b64, true);
                 if ($decoded === false || strlen($decoded) !== 32) {

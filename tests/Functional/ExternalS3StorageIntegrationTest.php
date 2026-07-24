@@ -142,7 +142,11 @@ final class ExternalS3StorageIntegrationTest extends TestCase
                 $partNumber,
                 new ReadableBuffer($payload),
             );
-            $parts[] = ['partNumber' => $partNumber, 'etag' => $part->md5Hex];
+            $parts[] = [
+                'partNumber' => $partNumber,
+                'etag' => $part->md5Hex,
+                'storagePath' => $part->path,
+            ];
         }
 
         $assembled = $this->backend->assembleMultipartUpload(

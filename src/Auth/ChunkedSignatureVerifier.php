@@ -54,6 +54,10 @@ final class ChunkedSignatureVerifier
      */
     private const string CHUNK_HEADER_PATTERN = '/^([0-9a-fA-F]+);chunk-signature=([0-9a-f]{64})$/';
 
+    private const int MAX_HEADER_SIZE = 1024;
+
+    private const int MAX_TRAILER_SIZE = 16_384;
+
     /**
      * Create a verified readable stream that strips chunked encoding framing
      * and verifies each chunk's signature.
@@ -68,6 +72,7 @@ final class ChunkedSignatureVerifier
      * @param  string  $credentialScope  The credential scope (date/region/s3/aws4_request).
      * @param  string  $seedSignature  The initial signature from the Authorization header.
      * @return ReadableStream A stream yielding verified, decoded chunk data.
+     * @param list<string> $trailerNames
      */
     public function createVerifiedStream(
         ReadableStream $body,
@@ -75,14 +80,26 @@ final class ChunkedSignatureVerifier
         string $timestamp,
         string $credentialScope,
         string $seedSignature,
+        array $trailerNames = [],
+        ?\Closure $onTrailers = null,
     ): ReadableStream {
         $queue = new Queue(bufferSize: 8);
 
         // Process chunks asynchronously using Amp's fiber-based concurrency.
-        \Amp\async(function () use ($body, $signingKey, $timestamp, $credentialScope, $seedSignature, $queue): void {
+        \Amp\async(function () use (
+            $body,
+            $signingKey,
+            $timestamp,
+            $credentialScope,
+            $seedSignature,
+            $trailerNames,
+            $onTrailers,
+            $queue,
+        ): void {
             try {
                 $previousSignature = $seedSignature;
                 $buffer = '';
+                $checksumContexts = self::checksumContexts($trailerNames);
 
                 while (true) {
                     // Read data from the underlying stream into our buffer.
@@ -99,7 +116,7 @@ final class ChunkedSignatureVerifier
 
                     // Process as many complete chunks as possible from the buffer.
                     while (true) {
-                        $result = self::tryParseChunk($buffer);
+                        $result = self::tryParseChunk($buffer, $trailerNames !== []);
                         if ($result === null) {
                             // Need more data to parse a complete chunk.
                             break;
@@ -127,6 +144,24 @@ final class ChunkedSignatureVerifier
 
                         // Final chunk (size 0) means we're done.
                         if ($chunkSize === 0) {
+                            if ($trailerNames !== []) {
+                                $trailers = self::readAndVerifyTrailers(
+                                    $body,
+                                    $buffer,
+                                    $signingKey,
+                                    $timestamp,
+                                    $credentialScope,
+                                    $previousSignature,
+                                    $trailerNames,
+                                    $checksumContexts,
+                                );
+                                $onTrailers?->__invoke($trailers);
+                            } elseif ($buffer !== '') {
+                                throw new InvalidArgumentException('Unexpected data after the final signed chunk.');
+                            }
+                            if ($body->read() !== null) {
+                                throw new InvalidArgumentException('Unexpected data after the final signed chunk.');
+                            }
                             $queue->complete();
 
                             return;
@@ -134,6 +169,9 @@ final class ChunkedSignatureVerifier
 
                         // Yield the verified chunk data.
                         if ($chunkData !== '') {
+                            foreach ($checksumContexts as $context) {
+                                hash_update($context, $chunkData);
+                            }
                             $queue->push($chunkData);
                         }
                     }
@@ -154,12 +192,19 @@ final class ChunkedSignatureVerifier
      *
      * @return array{0: int, 1: string, 2: string, 3: int}|null
      */
-    private static function tryParseChunk(string $buffer): ?array
+    private static function tryParseChunk(string $buffer, bool $expectTrailers): ?array
     {
         // Find the chunk header line (terminated by \r\n).
         $headerEnd = strpos($buffer, "\r\n");
         if ($headerEnd === false) {
+            if (strlen($buffer) > self::MAX_HEADER_SIZE) {
+                throw new InvalidArgumentException('Signed chunk header exceeds maximum allowed size.');
+            }
+
             return null;
+        }
+        if ($headerEnd > self::MAX_HEADER_SIZE) {
+            throw new InvalidArgumentException('Signed chunk header exceeds maximum allowed size.');
         }
 
         $headerLine = substr($buffer, 0, $headerEnd);
@@ -175,8 +220,9 @@ final class ChunkedSignatureVerifier
         if (! is_int($chunkSize)) {
             $chunkSize = (int) $chunkSize;
         }
-        // Reject absurdly large chunks to prevent OOM (256 MiB max per chunk).
-        if ($chunkSize < 0 || $chunkSize > 268_435_456) {
+        // The parser buffers one encoded chunk. Keep this bounded independently
+        // from the total request size so a validly signed request cannot exhaust RAM.
+        if ($chunkSize < 0 || $chunkSize > 16_777_216) {
             throw new InvalidArgumentException('Chunk size exceeds maximum allowed limit.');
         }
         $chunkSignature = $matches[2];
@@ -184,7 +230,7 @@ final class ChunkedSignatureVerifier
         // Calculate the total bytes needed for this complete chunk:
         // header + \r\n + data + \r\n
         $dataStart = $headerEnd + 2; // After header's \r\n
-        $totalNeeded = $dataStart + $chunkSize + 2; // +2 for trailing \r\n
+        $totalNeeded = $dataStart + $chunkSize + ($chunkSize === 0 && $expectTrailers ? 0 : 2);
 
         if (strlen($buffer) < $totalNeeded) {
             return null; // Need more data.
@@ -192,12 +238,14 @@ final class ChunkedSignatureVerifier
 
         $chunkData = $chunkSize > 0 ? substr($buffer, $dataStart, $chunkSize) : '';
 
-        // Verify the trailing \r\n after chunk data.
-        $trailingCrlf = substr($buffer, $dataStart + $chunkSize, 2);
-        if ($trailingCrlf !== "\r\n") {
-            throw new InvalidArgumentException(
-                'Invalid chunk encoding: missing CRLF after chunk data.',
-            );
+        if (! ($chunkSize === 0 && $expectTrailers)) {
+            // Verify the trailing \r\n after chunk data.
+            $trailingCrlf = substr($buffer, $dataStart + $chunkSize, 2);
+            if ($trailingCrlf !== "\r\n") {
+                throw new InvalidArgumentException(
+                    'Invalid chunk encoding: missing CRLF after chunk data.',
+                );
+            }
         }
 
         return [$chunkSize, $chunkSignature, $chunkData, $totalNeeded];
@@ -231,5 +279,117 @@ final class ChunkedSignatureVerifier
         ]);
 
         return hash_hmac('sha256', $stringToSign, $signingKey);
+    }
+
+    /**
+     * @param list<string> $trailerNames
+     * @return array<string, \HashContext>
+     */
+    private static function checksumContexts(array $trailerNames): array
+    {
+        $contexts = [];
+        foreach ($trailerNames as $name) {
+            $algorithm = match ($name) {
+                'x-amz-checksum-crc32' => 'crc32b',
+                'x-amz-checksum-crc32c' => 'crc32c',
+                'x-amz-checksum-sha1' => 'sha1',
+                'x-amz-checksum-sha256' => 'sha256',
+                default => throw new InvalidArgumentException("Unsupported signed trailer: {$name}."),
+            };
+            $contexts[$name] = hash_init($algorithm);
+        }
+
+        return $contexts;
+    }
+
+    /**
+     * @param list<string> $trailerNames
+     * @param array<string, \HashContext> $checksumContexts
+     * @return array<string, string>
+     */
+    private static function readAndVerifyTrailers(
+        ReadableStream $body,
+        string &$buffer,
+        string $signingKey,
+        string $timestamp,
+        string $credentialScope,
+        string $previousSignature,
+        array $trailerNames,
+        array $checksumContexts,
+    ): array {
+        while (($end = strpos($buffer, "\r\n\r\n")) === false) {
+            if (strlen($buffer) > self::MAX_TRAILER_SIZE) {
+                throw new InvalidArgumentException('Signed trailer block exceeds 16 KiB.');
+            }
+            $next = $body->read();
+            if ($next === null) {
+                throw new InvalidArgumentException('Signed trailer block terminated unexpectedly.');
+            }
+            $buffer .= $next;
+        }
+        if ($end > self::MAX_TRAILER_SIZE) {
+            throw new InvalidArgumentException('Signed trailer block exceeds 16 KiB.');
+        }
+
+        $block = substr($buffer, 0, $end);
+        $remaining = substr($buffer, $end + 4);
+        if ($remaining !== '' || $body->read() !== null) {
+            throw new InvalidArgumentException('Unexpected data after the signed trailer block.');
+        }
+
+        $trailers = [];
+        foreach (explode("\r\n", $block) as $line) {
+            $separator = strpos($line, ':');
+            if ($separator === false) {
+                throw new InvalidArgumentException('Malformed signed trailer header.');
+            }
+            $name = strtolower(trim(substr($line, 0, $separator)));
+            $value = trim(preg_replace('/[ \t]+/', ' ', substr($line, $separator + 1)) ?? '');
+            if ($name === '' || isset($trailers[$name])) {
+                throw new InvalidArgumentException('Duplicate or empty signed trailer header.');
+            }
+            $trailers[$name] = $value;
+        }
+
+        $trailerSignature = $trailers['x-amz-trailer-signature'] ?? null;
+        unset($trailers['x-amz-trailer-signature']);
+        if ($trailerSignature === null || preg_match('/^[a-f0-9]{64}$/', $trailerSignature) !== 1) {
+            throw new SignatureDoesNotMatchException('Missing or malformed x-amz-trailer-signature.');
+        }
+
+        sort($trailerNames, SORT_STRING);
+        if (array_keys($trailers) !== $trailerNames) {
+            ksort($trailers, SORT_STRING);
+            if (array_keys($trailers) !== $trailerNames) {
+                throw new InvalidArgumentException('Signed trailers do not match the x-amz-trailer declaration.');
+            }
+        }
+
+        $canonicalTrailers = '';
+        foreach ($trailerNames as $name) {
+            $canonicalTrailers .= $name . ':' . $trailers[$name] . "\n";
+        }
+        $stringToSign = implode("\n", [
+            'AWS4-HMAC-SHA256-TRAILER',
+            $timestamp,
+            $credentialScope,
+            $previousSignature,
+            hash('sha256', $canonicalTrailers),
+        ]);
+        $expectedSignature = hash_hmac('sha256', $stringToSign, $signingKey);
+        if (! hash_equals($expectedSignature, $trailerSignature)) {
+            throw new SignatureDoesNotMatchException('Trailer signature verification failed.');
+        }
+
+        foreach ($checksumContexts as $name => $context) {
+            $computed = base64_encode(hash_final($context, true));
+            if (! hash_equals($computed, $trailers[$name])) {
+                throw new \OpsFour\S3Server\Exception\BadDigestException(
+                    "The {$name} trailer did not match the streamed payload.",
+                );
+            }
+        }
+
+        return $trailers;
     }
 }

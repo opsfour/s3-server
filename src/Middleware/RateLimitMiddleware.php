@@ -45,7 +45,9 @@ final class RateLimitMiddleware implements Middleware
         }
 
         if (!$allowed) {
-            $requestId = $request->getAttribute('requestId') ?? '';
+            $requestId = $request->hasAttribute('requestId')
+                ? (string) $request->getAttribute('requestId')
+                : '';
             $resource = $request->getUri()->getPath();
 
             $xml = ErrorResponseBuilder::build(

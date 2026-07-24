@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -37,19 +38,19 @@ final class GetObjectTaggingHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Verify the object exists.
-        if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException();
-        }
+        $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
 
-        $tags = $this->metadata->getObjectTagging($bucket, $key);
+        $tags = $this->metadata->getObjectTagging($bucket, $key, $object->versionId);
 
         // For objects, return empty TagSet (not an error) when no tags exist.
         $xml = XmlResponseBuilder::taggingResult($tags);
 
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'application/xml'],
+            headers: array_filter([
+                'Content-Type' => 'application/xml',
+                'x-amz-version-id' => $object->versionId,
+            ]),
             body: $xml,
         );
     }

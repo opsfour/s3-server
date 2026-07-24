@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth;
 
-use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\S3Exception;
@@ -32,7 +32,7 @@ use OpsFour\S3Server\Routing\S3Operation;
  * a verified stream that strips chunked framing and verifies each
  * chunk's signature.
  */
-final class AuthMiddleware implements Middleware
+final class AuthMiddleware implements AuthenticationMiddleware
 {
     private readonly SignatureV4Verifier $sigV4Verifier;
 
@@ -99,12 +99,15 @@ final class AuthMiddleware implements Middleware
         if ($contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD') {
             $this->wrapChunkedBody($request, $authResult);
         } elseif ($contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER') {
-            // TRAILER variant uses a different string-to-sign for the trailing
-            // checksum block. Treat as regular chunked SigV4 for now — the chunk
-            // data signatures are identical, only the trailing checksum header
-            // is unverified. This is safe because the individual chunk signatures
-            // still guarantee data integrity.
-            $this->wrapChunkedBody($request, $authResult);
+            $this->wrapChunkedBody($request, $authResult, true);
+        } elseif ($contentSha === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER') {
+            $trailerNames = $this->trailerNames($request);
+            $request->setBody((new UnsignedChunkedTrailerDecoder())->createDecodedStream(
+                $request->getBody(),
+                $trailerNames,
+                $this->trailerCallback($request),
+            ));
+            $this->removeAwsChunkedContentEncoding($request);
         }
 
         return $requestHandler->handleRequest($request);
@@ -158,7 +161,7 @@ final class AuthMiddleware implements Middleware
      * the signing key to create a verified stream that strips chunked framing
      * and verifies each chunk's signature in the chain.
      */
-    private function wrapChunkedBody(Request $request, AuthResult $authResult): void
+    private function wrapChunkedBody(Request $request, AuthResult $authResult, bool $withTrailers = false): void
     {
         // Use pre-parsed auth data from AuthResult instead of re-parsing the header.
         if ($authResult->signature === '' || $authResult->credentialDate === '') {
@@ -183,6 +186,11 @@ final class AuthMiddleware implements Middleware
 
         $credentialScope = sprintf('%s/%s/s3/aws4_request', $date, $scopeRegion);
 
+        $trailerNames = [];
+        if ($withTrailers) {
+            $trailerNames = $this->trailerNames($request);
+        }
+
         // Replace the request body with the verified stream.
         $verifiedStream = $this->chunkedVerifier->createVerifiedStream(
             body: $request->getBody(),
@@ -190,8 +198,52 @@ final class AuthMiddleware implements Middleware
             timestamp: $timestamp,
             credentialScope: $credentialScope,
             seedSignature: $authResult->signature,
+            trailerNames: $trailerNames,
+            onTrailers: $this->trailerCallback($request),
         );
 
         $request->setBody($verifiedStream);
+        $this->removeAwsChunkedContentEncoding($request);
+    }
+
+    /** @return list<string> */
+    private function trailerNames(Request $request): array
+    {
+        $declaration = strtolower($request->getHeader('x-amz-trailer') ?? '');
+        $trailerNames = array_values(array_filter(array_map('trim', explode(',', $declaration))));
+        if ($trailerNames === [] || count(array_unique($trailerNames)) !== count($trailerNames)) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'x-amz-trailer must declare one or more unique checksum trailer names.',
+            );
+        }
+
+        return $trailerNames;
+    }
+
+    private function trailerCallback(Request $request): \Closure
+    {
+        return static function (array $trailers) use ($request): void {
+            foreach ($trailers as $name => $value) {
+                if (! is_string($name) || $name === '' || ! is_string($value)) {
+                    throw new \LogicException('Verified trailer callback received malformed headers.');
+                }
+                $request->setHeader($name, $value);
+            }
+        };
+    }
+
+    private function removeAwsChunkedContentEncoding(Request $request): void
+    {
+        $encodings = array_values(array_filter(
+            array_map('trim', explode(',', $request->getHeader('content-encoding') ?? '')),
+            static fn(string $encoding): bool => strtolower($encoding) !== 'aws-chunked' && $encoding !== '',
+        ));
+        if ($encodings === []) {
+            $request->removeHeader('content-encoding');
+
+            return;
+        }
+
+        $request->setHeader('content-encoding', implode(', ', $encodings));
     }
 }

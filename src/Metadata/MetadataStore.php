@@ -362,6 +362,11 @@ interface MetadataStore
     ): array;
 
     /**
+     * @return array{uploadCount: int, bytesUsed: int}
+     */
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array;
+
+    /**
      * Store a part record for a multipart upload.
      *
      * @param  string  $uploadId  The upload ID.
@@ -584,7 +589,7 @@ interface MetadataStore
      * @param  string  $key  The object key.
      * @return list<array{key: string, value: string}>
      */
-    public function getObjectTagging(string $bucket, string $key): array;
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array;
 
     /**
      * Replace all tags for an object.
@@ -593,7 +598,7 @@ interface MetadataStore
      * @param  string  $key  The object key.
      * @param  list<array{key: string, value: string}>  $tags
      */
-    public function putObjectTagging(string $bucket, string $key, array $tags): void;
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void;
 
     /**
      * Delete all tags for an object.
@@ -601,7 +606,7 @@ interface MetadataStore
      * @param  string  $bucket  The bucket name.
      * @param  string  $key  The object key.
      */
-    public function deleteObjectTagging(string $bucket, string $key): void;
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void;
 
     // ---------------------------------------------------------------
     // Bucket Policies
@@ -734,6 +739,11 @@ interface MetadataStore
     ): void;
 
     /**
+     * Extend a processing lease. Returns false if the job is no longer processing.
+     */
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool;
+
+    /**
      * @return array<string, mixed>|null
      */
     public function getTierTransitionJob(int $id): ?array;
@@ -765,6 +775,11 @@ interface MetadataStore
         bool $incrementAttempts = true,
         ?string $restoredStoragePath = null,
     ): void;
+
+    /**
+     * Extend a processing lease. Returns false if the job is no longer processing.
+     */
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool;
 
     /**
      * @return array<string, mixed>|null
@@ -897,7 +912,7 @@ interface MetadataStore
      *
      * @return list<array{upload_id: string, bucket: string, key_name: string}>
      */
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array;
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array;
 
     /**
      * List delete markers that are the only remaining version of their key.
@@ -1002,6 +1017,23 @@ interface MetadataStore
      * Remove old completed/dead-letter notifications.
      */
     public function cleanupOldNotifications(int $maxAgeSeconds): void;
+
+    // ---------------------------------------------------------------
+    // Storage garbage queue
+    // ---------------------------------------------------------------
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void;
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void;
+
+    /**
+     * @return list<array{id: int, bucket: string, storage_tier: string, storage_path: string, attempts: int}>
+     */
+    public function dequeueStorageGarbage(int $limit): array;
+
+    public function completeStorageGarbage(int $id): void;
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void;
 
     // ---------------------------------------------------------------
     // Transaction support

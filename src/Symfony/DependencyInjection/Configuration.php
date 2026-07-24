@@ -9,6 +9,7 @@ use Symfony\Component\Config\Definition\ConfigurationInterface;
 
 final class Configuration implements ConfigurationInterface
 {
+    /** @return TreeBuilder<'array'> */
     public function getConfigTreeBuilder(): TreeBuilder
     {
         $treeBuilder = new TreeBuilder('opsfour_s3_server');
@@ -33,10 +34,11 @@ final class Configuration implements ConfigurationInterface
                         ->booleanNode('strict_bucket_naming')->defaultTrue()->end()
                         ->scalarNode('website_host_pattern')->defaultNull()->end()
                         ->scalarNode('master_key_provider')->defaultValue('config')->end()
-                        ->booleanNode('enforce_min_part_size')->defaultFalse()->end()
+                        ->booleanNode('enforce_min_part_size')->defaultTrue()->end()
                         ->integerNode('max_encrypted_object_size')->defaultValue(268_435_456)->min(0)->end()
                         ->integerNode('max_select_object_size')->defaultValue(268_435_456)->min(0)->end()
                         ->integerNode('shutdown_drain_timeout')->defaultValue(30)->min(1)->end()
+                        ->scalarNode('metrics_bearer_token')->defaultNull()->end()
                     ->end()
                 ->end()
                 ->arrayNode('storage')
@@ -83,11 +85,14 @@ final class Configuration implements ConfigurationInterface
                     ->addDefaultsIfNotSet()
                     ->children()
                         ->enumNode('driver')->values(['memory', 'database', 'file'])->defaultValue('memory')->end()
-                        ->scalarNode('access_key')->defaultValue('testAccessKey')->end()
-                        ->scalarNode('secret_key')->defaultValue('testSecretKey')->end()
-                        ->scalarNode('owner_id')->defaultValue('default-owner')->end()
-                        ->scalarNode('display_name')->defaultValue('Default User')->end()
+                        ->scalarNode('access_key')->defaultNull()->end()
+                        ->scalarNode('secret_key')->defaultNull()->end()
+                        ->scalarNode('owner_id')->defaultNull()->end()
+                        ->scalarNode('display_name')->defaultNull()->end()
                         ->scalarNode('dsn')->defaultNull()->end()
+                        ->scalarNode('username')->defaultNull()->end()
+                        ->scalarNode('password')->defaultNull()->end()
+                        ->floatNode('cache_ttl')->defaultValue(1.0)->min(0)->end()
                         ->scalarNode('path')->defaultNull()->end()
                     ->end()
                 ->end()
@@ -106,6 +111,7 @@ final class Configuration implements ConfigurationInterface
                     ->children()
                         ->integerNode('sqlite_workers')->defaultValue(0)->min(0)->end()
                         ->integerNode('encryption_workers')->defaultValue(0)->min(0)->end()
+                        ->integerNode('select_workers')->defaultNull()->min(0)->end()
                         ->integerNode('request_body_spool_workers')->defaultValue(8)->min(1)->end()
                         ->integerNode('encryption_threshold')->defaultValue(65_536)->min(0)->end()
                     ->end()
@@ -117,6 +123,10 @@ final class Configuration implements ConfigurationInterface
                         ->integerNode('max_objects_per_bucket')->defaultValue(0)->min(0)->end()
                         ->integerNode('max_bytes_per_bucket')->defaultValue(0)->min(0)->end()
                         ->integerNode('max_bytes_per_owner')->defaultValue(0)->min(0)->end()
+                        ->integerNode('max_multipart_uploads_per_bucket')->defaultValue(0)->min(0)->end()
+                        ->integerNode('max_multipart_uploads_per_owner')->defaultValue(0)->min(0)->end()
+                        ->integerNode('max_multipart_bytes_per_bucket')->defaultValue(0)->min(0)->end()
+                        ->integerNode('max_multipart_bytes_per_owner')->defaultValue(0)->min(0)->end()
                     ->end()
                 ->end()
                 ->arrayNode('lifecycle')
@@ -126,6 +136,7 @@ final class Configuration implements ConfigurationInterface
                         ->integerNode('batch_size')->defaultValue(1000)->min(1)->end()
                         ->integerNode('max_actions_per_run')->defaultValue(1000)->min(1)->end()
                         ->integerNode('lock_ttl_seconds')->defaultValue(300)->min(1)->end()
+                        ->integerNode('multipart_max_age_seconds')->defaultValue(604_800)->min(0)->end()
                     ->end()
                 ->end()
                 ->arrayNode('notifications')

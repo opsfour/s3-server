@@ -60,10 +60,17 @@ Store credentials in PostgreSQL or MySQL for dynamic management.
 
 ```bash
 S3_CREDENTIALS_DRIVER=database
-S3_CREDENTIALS_DSN="host=localhost port=5432 dbname=s3server user=s3 password=secret"
+S3_CREDENTIALS_DSN="pgsql:host=localhost;port=5432;dbname=s3server"
+S3_CREDENTIALS_USERNAME=s3
+S3_CREDENTIALS_PASSWORD=secret
+S3_CREDENTIALS_CACHE_TTL=1
 ```
 
-The credentials table is auto-created. Manage credentials by inserting/updating rows directly in the database.
+The credentials table is auto-created. The DSN uses PDO syntax; credentials
+are passed separately so the same configuration works for PostgreSQL and
+MySQL. Positive lookups are cached for one second by default. Set
+`S3_CREDENTIALS_CACHE_TTL=0` when revocation must be observed by every node on
+the next request.
 
 ## External IAM / OIDC Credential Issuer
 
@@ -220,12 +227,12 @@ If no auth middleware is registered, the server runs unauthenticated (logs a war
 Add your own middleware for custom auth flows:
 
 ```php
-use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 
-class MyAuthMiddleware implements Middleware
+class MyAuthMiddleware implements AuthenticationMiddleware
 {
     public function handleRequest(Request $request, RequestHandler $handler): Response
     {
@@ -291,7 +298,9 @@ With the database driver:
 ```bash
 php vendor/bin/s3-server credentials create \
   --credentials-driver=database \
-  --credentials-dsn="pgsql:host=localhost;dbname=s3server;user=s3;password=secret" \
+  --credentials-dsn="pgsql:host=localhost;port=5432;dbname=s3server" \
+  --credentials-username=s3 \
+  --credentials-password=secret \
   --owner-id=tenant-beta \
   --display-name="Beta Inc"
 ```

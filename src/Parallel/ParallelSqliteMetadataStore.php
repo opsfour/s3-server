@@ -356,6 +356,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ]);
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        return $this->submit('getMultipartStorageStats', [$ownerId, $bucket]);
+    }
+
     public function putPart(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath): void
     {
         $this->submit('putPart', [$uploadId, $partNumber, $etag, $size, $storagePath]);
@@ -509,19 +514,19 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->submit('deleteBucketTagging', [$bucket]);
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
-        return $this->submit('getObjectTagging', [$bucket, $key]);
+        return $this->submit('getObjectTagging', [$bucket, $key, $versionId]);
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
-        $this->submit('putObjectTagging', [$bucket, $key, $tags]);
+        $this->submit('putObjectTagging', [$bucket, $key, $tags, $versionId]);
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
-        $this->submit('deleteObjectTagging', [$bucket, $key]);
+        $this->submit('deleteObjectTagging', [$bucket, $key, $versionId]);
     }
 
     // ---------------------------------------------------------------
@@ -638,6 +643,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->submit('updateTierTransitionJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath]);
     }
 
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->submit('renewTierTransitionJobLease', [$id, $leaseExpiresAt]);
+    }
+
     public function getTierTransitionJob(int $id): ?array
     {
         return $this->submit('getTierTransitionJob', [$id]);
@@ -669,6 +679,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ?string $restoredStoragePath = null,
     ): void {
         $this->submit('updateRestoreJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath]);
+    }
+
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        return $this->submit('renewRestoreJobLease', [$id, $leaseExpiresAt]);
     }
 
     public function getRestoreJob(int $id): ?array
@@ -781,9 +796,9 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('listExpiredNoncurrentVersions', [$bucket, $prefix, $noncurrentDays, $limit, $tags, $afterKey, $afterVersionId]);
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
-        return $this->submit('listExpiredMultipartUploads', [$bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId]);
+        return $this->submit('listExpiredMultipartUploads', [$bucket, $daysAfterInitiation, $limit, $prefix, $afterKey, $afterUploadId, $createdBefore]);
     }
 
     public function listOrphanedDeleteMarkers(string $bucket, ?string $prefix, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array
@@ -867,6 +882,31 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     public function cleanupOldNotifications(int $maxAgeSeconds): void
     {
         $this->submit('cleanupOldNotifications', [$maxAgeSeconds]);
+    }
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->submit('enqueueStorageGarbage', [$bucket, $storageTier, $storagePath]);
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->submit('discardStorageGarbage', [$bucket, $storageTier, $storagePath]);
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->submit('dequeueStorageGarbage', [$limit]);
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->submit('completeStorageGarbage', [$id]);
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->submit('retryStorageGarbage', [$id, $error, $nextAttemptAt]);
     }
 
     // ---------------------------------------------------------------

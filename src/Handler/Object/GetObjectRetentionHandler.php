@@ -8,8 +8,8 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
-use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\ObjectLockConfigurationNotFoundException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -37,11 +37,8 @@ final class GetObjectRetentionHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Parse versionId from query params.
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $versionId = $queryParams['versionId'] ?? null;
-
-        $retention = $this->metadata->getObjectRetention($bucket, $key, $versionId);
+        $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        $retention = $this->metadata->getObjectRetention($bucket, $key, $object->versionId);
 
         if ($retention === null) {
             throw new ObjectLockConfigurationNotFoundException('The specified object does not have a retention configuration.');

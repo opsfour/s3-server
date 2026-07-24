@@ -131,7 +131,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::DeleteBucket,
-            new DeleteBucketHandler($metadata, $storage),
+            new DeleteBucketHandler($metadata, $storage, $storageTiers),
         );
 
         $registry->register(
@@ -221,17 +221,17 @@ final class HandlerRegistrar
         // Phase 4: Multipart upload operations.
         $registry->register(
             S3Operation::CreateMultipartUpload,
-            new CreateMultipartUploadHandler($metadata, $encryption),
+            new CreateMultipartUploadHandler($metadata, $encryption, $quotas),
         );
 
         $registry->register(
             S3Operation::UploadPart,
-            new UploadPartHandler($metadata, $storage),
+            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers),
         );
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas),
         );
 
         $registry->register(
@@ -250,7 +250,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::AbortMultipartUpload,
-            new AbortMultipartUploadHandler($metadata, $storage, $notifications),
+            new AbortMultipartUploadHandler($metadata, $storage, $notifications, $storageTiers),
         );
 
         $registry->register(
@@ -398,7 +398,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::PutBucketEncryption,
-            new PutBucketEncryptionHandler($metadata),
+            new PutBucketEncryptionHandler($metadata, $encryption),
         );
 
         $registry->register(

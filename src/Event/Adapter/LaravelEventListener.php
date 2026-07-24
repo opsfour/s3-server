@@ -14,23 +14,28 @@ use OpsFour\S3Server\Event\S3Event;
  */
 final readonly class LaravelEventListener
 {
+    private \Closure $dispatch;
+
     public function __construct(
-        private object $events,
+        object $events,
         private ?string $eventName = null,
     ) {
-        if (!method_exists($this->events, 'dispatch')) {
+        $dispatch = [$events, 'dispatch'];
+        if (!is_callable($dispatch)) {
             throw new \InvalidArgumentException('Laravel event adapter requires a dispatch() method.');
         }
+
+        $this->dispatch = \Closure::fromCallable($dispatch);
     }
 
     public function __invoke(S3Event $event): void
     {
         if ($this->eventName === null) {
-            $this->events->dispatch($event);
+            ($this->dispatch)($event);
 
             return;
         }
 
-        $this->events->dispatch($this->eventName, [$event]);
+        ($this->dispatch)($this->eventName, [$event]);
     }
 }

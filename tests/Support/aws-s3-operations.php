@@ -3,6 +3,8 @@
 declare(strict_types=1);
 
 return [
+    'sdk_version' => '3.389.0',
+
     /*
      * Operations this package intends to support as local S3-compatible
      * functionality. Each entry must either have an AWS SDK functional test or
@@ -74,6 +76,7 @@ return [
         'putObjectRetention',
         'putObjectTagging',
         'putPublicAccessBlock',
+        'restoreObject',
         'selectObjectContent',
         'uploadPart',
         'uploadPartCopy',
@@ -96,6 +99,7 @@ return [
         'deleteBucketMetricsConfiguration',
         'deleteBucketOwnershipControls',
         'deleteBucketReplication',
+        'deleteObjectAnnotation',
         'getBucketAbac',
         'getBucketAccelerateConfiguration',
         'getBucketAnalyticsConfiguration',
@@ -107,12 +111,14 @@ return [
         'getBucketOwnershipControls',
         'getBucketReplication',
         'getBucketRequestPayment',
+        'getObjectAnnotation',
         'getObjectTorrent',
         'listBucketAnalyticsConfigurations',
         'listBucketIntelligentTieringConfigurations',
         'listBucketInventoryConfigurations',
         'listBucketMetricsConfigurations',
         'listDirectoryBuckets',
+        'listObjectAnnotations',
         'putBucketAbac',
         'putBucketAccelerateConfiguration',
         'putBucketAnalyticsConfiguration',
@@ -122,8 +128,9 @@ return [
         'putBucketOwnershipControls',
         'putBucketReplication',
         'putBucketRequestPayment',
+        'putObjectAnnotation',
         'renameObject',
-        'restoreObject',
+        'updateBucketMetadataAnnotationTableConfiguration',
         'updateBucketMetadataInventoryTableConfiguration',
         'updateBucketMetadataJournalTableConfiguration',
         'updateObjectEncryption',

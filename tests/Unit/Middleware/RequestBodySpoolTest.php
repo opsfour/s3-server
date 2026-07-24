@@ -14,6 +14,36 @@ use function Amp\Future\await;
 
 final class RequestBodySpoolTest extends TestCase
 {
+    public function test_first_create_removes_only_stale_owned_spool_files(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        mkdir($tempDir, 0o755, true);
+        $stale = $tempDir . '/s3-md5-stale.tmp';
+        $recent = $tempDir . '/s3-sha256-recent.tmp';
+        $foreign = $tempDir . '/foreign-stale.tmp';
+        file_put_contents($stale, 'stale');
+        file_put_contents($recent, 'recent');
+        file_put_contents($foreign, 'foreign');
+        touch($stale, time() - 90_000);
+        touch($foreign, time() - 90_000);
+
+        $pool = new ContextWorkerPool(2);
+        $spool = new RequestBodySpool($pool, $tempDir);
+
+        try {
+            $created = $spool->create('request-');
+            self::assertFileDoesNotExist($stale);
+            self::assertFileExists($recent);
+            self::assertFileExists($foreign);
+            $spool->delete($created);
+        } finally {
+            $pool->shutdown();
+            @unlink($recent);
+            @unlink($foreign);
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_concurrency_above_worker_count_does_not_exhaust_pool(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));

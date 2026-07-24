@@ -119,7 +119,9 @@ final class TierTransitionJobMetadataStoreTest extends TestCase
         $firstBatch = $this->store->dequeueTierTransitionJobs(1);
         self::assertCount(1, $firstBatch);
         self::assertSame($firstId, $firstBatch[0]['id']);
-        self::assertSame('processing', $this->store->getTierTransitionJob($firstId)['status']);
+        $processing = $this->store->getTierTransitionJob($firstId);
+        self::assertNotNull($processing);
+        self::assertSame('processing', $processing['status']);
 
         $secondBatch = $this->store->dequeueTierTransitionJobs(10);
         self::assertCount(1, $secondBatch);
@@ -154,7 +156,9 @@ final class TierTransitionJobMetadataStoreTest extends TestCase
         $dequeued = $this->store->dequeueRestoreJobs(1);
         self::assertCount(1, $dequeued);
         self::assertSame($id, $dequeued[0]['id']);
-        self::assertSame('processing', $this->store->getRestoreJob($id)['status']);
+        $processing = $this->store->getRestoreJob($id);
+        self::assertNotNull($processing);
+        self::assertSame('processing', $processing['status']);
 
         $this->store->updateRestoreJobStatus($id, 'completed', incrementAttempts: false, restoredStoragePath: '/hot/archive.bin');
         $completed = $this->store->getRestoreJob($id);

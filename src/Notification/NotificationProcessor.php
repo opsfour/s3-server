@@ -46,6 +46,8 @@ final class NotificationProcessor
 
     private const float CIRCUIT_BREAKER_COOLDOWN = 60.0;
 
+    private const int MAX_CIRCUIT_BREAKERS = 10_000;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly LoggerInterface $logger = new NullLogger(),
@@ -71,15 +73,28 @@ final class NotificationProcessor
         );
     }
 
-    public function stop(): void
+    public function stop(float $timeoutSeconds = 10): void
     {
         $this->running = false;
         $this->deferredCancellation?->cancel();
 
         try {
-            $this->loopFuture?->await(new \Amp\TimeoutCancellation(10));
+            $this->loopFuture?->await(new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds)));
         } catch (\Amp\CancelledException) {
-            // Cancellation is the expected loop exit path.
+            $this->logger->warning('Notification processor did not stop within {timeout}s; waiting before dependency shutdown.', $this->logContext([
+                'event' => 'processor_stop_timeout',
+                'timeout' => $timeoutSeconds,
+            ]));
+
+            try {
+                $this->loopFuture->await();
+            } catch (\Throwable $e) {
+                $this->logger->error('Notification processor did not stop cleanly.', $this->logContext([
+                    'event' => 'processor_stop_failed',
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]));
+            }
         } catch (\Throwable $e) {
             $this->logger->error('Notification processor did not stop cleanly.', $this->logContext([
                 'event' => 'processor_stop_failed',
@@ -433,6 +448,10 @@ final class NotificationProcessor
     private function recordFailure(string $destination): void
     {
         if (!isset($this->circuitBreakers[$destination])) {
+            if (count($this->circuitBreakers) >= self::MAX_CIRCUIT_BREAKERS) {
+                array_shift($this->circuitBreakers);
+                $this->metrics?->recordNotificationEvent('circuit_breaker', 'evicted');
+            }
             $this->circuitBreakers[$destination] = ['failures' => 0, 'cooldownUntil' => 0.0];
         }
 

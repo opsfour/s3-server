@@ -30,7 +30,8 @@ final class S3CredentialsCommand extends Command
 
     public function handle(): int
     {
-        $action = (string) $this->argument('action');
+        $actionValue = $this->argument('action');
+        $action = is_string($actionValue) ? $actionValue : '';
 
         if (!in_array($action, self::VALID_ACTIONS, true)) {
             $this->error("Unknown action '{$action}'. Expected: " . implode(', ', self::VALID_ACTIONS));
@@ -64,17 +65,21 @@ final class S3CredentialsCommand extends Command
     private function handleCreate(CredentialManager $manager): int
     {
         $ownerId = $this->option('owner-id');
-        if ($ownerId === null || $ownerId === '') {
+        if (! is_string($ownerId) || $ownerId === '') {
             $this->error('--owner-id is required when creating a credential.');
 
             return self::FAILURE;
         }
 
+        $displayName = $this->option('display-name');
+        $accessKey = $this->option('access-key');
+        $secretKey = $this->option('secret-key');
+
         $credential = $manager->createCredential(
             ownerId: $ownerId,
-            displayName: (string) ($this->option('display-name') ?? ''),
-            accessKeyId: $this->option('access-key'),
-            secretAccessKey: $this->option('secret-key'),
+            displayName: is_string($displayName) ? $displayName : '',
+            accessKeyId: is_string($accessKey) ? $accessKey : null,
+            secretAccessKey: is_string($secretKey) ? $secretKey : null,
         );
 
         $this->info('Credential created successfully.');
@@ -185,12 +190,12 @@ final class S3CredentialsCommand extends Command
     private function requireAccessKeyId(): ?string
     {
         $id = $this->argument('access-key-id');
-        if ($id === null || $id === '') {
+        if (! is_string($id) || $id === '') {
             $this->error('Access key ID argument is required for this action.');
 
             return null;
         }
 
-        return (string) $id;
+        return $id;
     }
 }

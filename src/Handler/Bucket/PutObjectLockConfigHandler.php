@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -26,7 +27,7 @@ final class PutObjectLockConfigHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -34,12 +35,19 @@ final class PutObjectLockConfigHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
-
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseObjectLockConfiguration($body);
 
-        $this->metadata->putObjectLockConfig($bucket, $config);
+        $this->metadata->transaction(function () use ($bucketInfo, $bucket, $ownerId, $config): void {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            if ($this->metadata->getBucketVersioning($bucket) !== 'Enabled') {
+                throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                    'Object Lock requires bucket versioning to be enabled.',
+                );
+            }
+            $this->metadata->putObjectLockConfig($bucket, $config);
+        });
 
         return new Response(status: 200);
     }

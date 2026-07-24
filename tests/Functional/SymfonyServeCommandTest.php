@@ -59,7 +59,7 @@ final class SymfonyServeCommandTest extends TestCase
         self::assertNotSame('', $this->scriptPath);
         file_put_contents($this->scriptPath, $this->scriptContents());
 
-        $this->process = proc_open(
+        $process = proc_open(
             sprintf(
                 'exec php %s --host=127.0.0.1 --port=%d --admin-token=test-admin-token',
                 escapeshellarg($this->scriptPath),
@@ -73,17 +73,20 @@ final class SymfonyServeCommandTest extends TestCase
             $this->pipes,
         );
 
-        self::assertIsResource($this->process);
+        if (!is_resource($process)) {
+            self::fail('Failed to start the Symfony serve command.');
+        }
+        $this->process = $process;
         fclose($this->pipes[0]);
         unset($this->pipes[0], $this->pipes[1], $this->pipes[2]);
 
         $this->waitForServer();
 
-        proc_terminate($this->process, SIGTERM);
+        proc_terminate($process, SIGTERM);
 
         $stopped = false;
         for ($i = 0; $i < 30; $i++) {
-            $status = proc_get_status($this->process);
+            $status = proc_get_status($process);
             if (! $status['running']) {
                 $stopped = true;
                 break;
@@ -97,8 +100,15 @@ final class SymfonyServeCommandTest extends TestCase
     private function findFreePort(): int
     {
         $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-        socket_bind($sock, '127.0.0.1', 0);
-        socket_getsockname($sock, $addr, $port);
+        if ($sock === false) {
+            self::fail('Failed to create a socket for the Symfony test server.');
+        }
+        if (!socket_bind($sock, '127.0.0.1', 0)
+            || !socket_getsockname($sock, $addr, $port)
+            || !is_int($port)) {
+            socket_close($sock);
+            self::fail('Failed to reserve a port for the Symfony test server.');
+        }
         socket_close($sock);
 
         return $port;
@@ -106,8 +116,12 @@ final class SymfonyServeCommandTest extends TestCase
 
     private function waitForServer(): void
     {
+        if (!is_resource($this->process)) {
+            self::fail('Symfony serve command process is not running.');
+        }
+        $process = $this->process;
         for ($i = 0; $i < 100; $i++) {
-            $status = proc_get_status($this->process);
+            $status = proc_get_status($process);
             if (! $status['running']) {
                 self::fail('Symfony serve command exited before accepting connections.' . "\n" . $this->logs());
             }
@@ -175,7 +189,8 @@ $container = new ContainerBuilder;
 $container->compile();
 
 $app = new Application('OpsFour S3 Symfony Smoke');
-$app->add($container->get(S3ServerServeCommand::class));
+$registerCommand = method_exists($app, 'addCommand') ? 'addCommand' : 'add';
+$app->{$registerCommand}($container->get(S3ServerServeCommand::class));
 $app->setDefaultCommand('opsfour:s3:serve', true);
 $app->run();
 PHP

@@ -110,7 +110,11 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
     {
         $now = time();
 
-        if (isset($claims['exp']) && (!is_int($claims['exp']) || $claims['exp'] < $now - $this->clockSkewSeconds)) {
+        $expiration = $claims['exp'] ?? null;
+        if (! is_int($expiration)) {
+            throw new ExternalIdentityAuthenticationException('JWT expiration is required.');
+        }
+        if ($expiration < $now - $this->clockSkewSeconds) {
             throw new ExternalIdentityAuthenticationException('JWT has expired.');
         }
 

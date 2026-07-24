@@ -83,6 +83,18 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame('Request body must be a JSON object.', $this->json($response)['message']);
     }
 
+    public function test_issue_rejects_oversized_body_without_throwing_buffer_exception(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            str_repeat('x', 16_385),
+        ));
+
+        $this->assertSame(400, $response->getStatus());
+        $this->assertSame('invalid_request', $this->json($response)['error']);
+    }
+
     public function test_revoke_deletes_credential(): void
     {
         $credentialProvider = new InMemoryCredentialProvider();
@@ -130,7 +142,9 @@ final class AdminCredentialApiHandlerTest extends TestCase
     }
 
     /**
-     * @param array<string, string> $headers
+     * @param non-empty-string $method
+     * @param array<string, mixed>|string $body
+     * @param array<non-empty-string, string> $headers
      */
     private function request(string $method, string $path, array|string $body = '', array $headers = []): Request
     {

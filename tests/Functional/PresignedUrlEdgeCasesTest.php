@@ -187,6 +187,7 @@ final class PresignedUrlEdgeCasesTest extends S3FunctionalTestCase
 
         // Tamper with the signature.
         $tamperedUrl = preg_replace('/X-Amz-Signature=[a-f0-9]+/', 'X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000', $presignedUrl);
+        self::assertIsString($tamperedUrl);
 
         $client = new Client(['http_errors' => false]);
         $response = $client->get($tamperedUrl);

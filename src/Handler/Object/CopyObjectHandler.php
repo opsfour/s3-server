@@ -9,18 +9,23 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\PreconditionFailedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
+use OpsFour\S3Server\Event\S3Event;
+use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\Quota\QuotaManager;
-use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Security\ObjectReadAuthorizer;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -96,6 +101,27 @@ final class CopyObjectHandler implements RequestHandler
         if ($srcObjectInfo === null || $srcObjectInfo->isDeleteMarker) {
             throw new NoSuchKeyException();
         }
+        (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $srcObjectInfo);
+        $destinationEncryptionMode = EncryptionRequestResolver::resolveDestination(
+            $request,
+            $this->metadata,
+            $dstBucket,
+            $this->encryption,
+        );
+        (new ObjectLockRequestApplier($this->metadata))->validate($request, $dstBucket);
+        $sourceEncryptionMode = $srcObjectInfo->userMetadata['__sse-algorithm'] ?? null;
+        if ($sourceEncryptionMode !== null) {
+            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        }
+        $sourceCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $sourceEncryptionMode === 'SSE-C',
+            $srcObjectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+            copySource: true,
+        );
+        if ($sourceEncryptionMode !== 'SSE-C' && $sourceCustomerKey !== null) {
+            throw new InvalidArgumentException('Copy-source SSE-C headers are not valid for this object.');
+        }
 
         // 5. Evaluate conditional copy headers.
         self::evaluateCopyConditionals($request, $srcObjectInfo);
@@ -135,7 +161,7 @@ final class CopyObjectHandler implements RequestHandler
         }
         $destinationStorage = $this->storageTiers->defaultBackend();
 
-        if ($sourceStorage === $destinationStorage && $destinationStorage instanceof FilesystemBackend) {
+        if ($sourceStorage === $destinationStorage) {
             $writeResult = $destinationStorage->copyObject($srcPath, $dstBucket, $dstKey);
         } else {
             // Fallback: read source and write to destination.
@@ -148,10 +174,13 @@ final class CopyObjectHandler implements RequestHandler
         // 8. Handle encryption: decrypt source if encrypted, re-encrypt for destination if needed.
         $encMeta = [];
         $objectSize = $writeResult->size;
+        $bufferedWorkLock = ($sourceEncryptionMode !== null || $destinationEncryptionMode !== null)
+            ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
+            : null;
 
         try {
             if ($this->encryption !== null) {
-                $srcSseAlgo = $srcObjectInfo->userMetadata['__sse-algorithm'] ?? null;
+                $srcSseAlgo = $sourceEncryptionMode;
 
                 // If the source is encrypted, decrypt the copied file back to plaintext first.
                 if ($srcSseAlgo !== null) {
@@ -165,21 +194,10 @@ final class CopyObjectHandler implements RequestHandler
                     );
 
                     if ($srcSseAlgo === 'SSE-C') {
-                        // Source SSE-C: require copy-source SSE-C headers.
-                        $copySrcAlgo = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-algorithm');
-                        $copySrcKey = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key');
-                        $copySrcKeyMd5 = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key-MD5');
-
-                        if ($copySrcAlgo === null || $copySrcKey === null || $copySrcKeyMd5 === null) {
-                            throw new InvalidArgumentException(
-                                'SSE-C copy-source headers required for encrypted source object.',
-                            );
-                        }
-
-                        $customerKey = EncryptionService::validateSseCHeaders($copySrcAlgo, $copySrcKey, $copySrcKeyMd5);
+                        \assert($sourceCustomerKey !== null);
                         $plaintext = $this->encryption->decryptSseC(
                             $copiedCiphertext,
-                            $customerKey,
+                            $sourceCustomerKey,
                             $srcObjectInfo->userMetadata['__sse-iv'],
                             $srcObjectInfo->userMetadata['__sse-tag'],
                         );
@@ -208,11 +226,11 @@ final class CopyObjectHandler implements RequestHandler
                 }
 
                 // Now apply destination encryption (SSE-C or SSE-S3).
-                $dstSseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
-                $dstSseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
-                $dstSseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
-
-                if ($dstSseCAlgo !== null && $dstSseCKey !== null && $dstSseCKeyMd5 !== null) {
+                if ($destinationEncryptionMode === EncryptionRequestResolver::SSE_C) {
+                    $dstSseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
+                    $dstSseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
+                    $dstSseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+                    \assert($dstSseCAlgo !== null && $dstSseCKey !== null && $dstSseCKeyMd5 !== null);
                     // Destination SSE-C.
                     if ($objectSize > $this->maxEncryptedObjectSize) {
                         throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
@@ -234,20 +252,10 @@ final class CopyObjectHandler implements RequestHandler
                         'sse-algorithm' => 'SSE-C',
                         'sse-iv' => $enc['iv'],
                         'sse-tag' => $enc['tag'],
+                        'sse-customer-key-md5' => $dstSseCKeyMd5,
                     ];
                 } else {
-                    // Check for SSE-S3 header or bucket default.
-                    $sseHeader = $request->getHeader('x-amz-server-side-encryption');
-                    $applySSE = ($sseHeader === 'AES256');
-
-                    if (! $applySSE) {
-                        $bucketEnc = $this->metadata->getBucketEncryption($dstBucket);
-                        if ($bucketEnc !== null && ($bucketEnc['sseAlgorithm'] === 'AES256' || $bucketEnc['sseAlgorithm'] === 'aws:kms')) {
-                            $applySSE = true;
-                        }
-                    }
-
-                    if ($applySSE) {
+                    if ($destinationEncryptionMode === EncryptionRequestResolver::SSE_S3) {
                         if ($objectSize > $this->maxEncryptedObjectSize) {
                             throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                                 'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
@@ -273,12 +281,16 @@ final class CopyObjectHandler implements RequestHandler
                 }
             }
         } catch (\Throwable $e) {
-            // Clean up copied file on encryption/decryption failure.
-            try {
-                $destinationStorage->deleteObjectByPath($writeResult->path, $dstBucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $destinationStorage,
+                $dstBucket,
+                $this->storageTiers->defaultTier()->name,
+                $writeResult->path,
+            );
             throw $e;
+        } finally {
+            $bufferedWorkLock?->release();
         }
 
         // 9. Store destination metadata.
@@ -330,11 +342,32 @@ final class CopyObjectHandler implements RequestHandler
         $dstVersioning = $this->metadata->getBucketVersioning($dstBucket);
         $versionId = null;
         $oldObjectToClean = null;
+        $event = $this->notifications?->createEvent(
+            's3:ObjectCreated:Copy',
+            $dstBucket,
+            $dstKey,
+            $objectSize,
+            $etag,
+            $ownerId,
+        ) ?? new S3Event('s3:ObjectCreated:Copy', $dstBucket, $dstKey, $objectSize, $etag, $ownerId);
 
         try {
             if ($dstVersioning === 'Enabled') {
-                $this->metadata->transaction(function () use ($dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, &$versionId) {
-                    $this->metadata->lockOwnerForUpdate($ownerId);
+                $this->metadata->transaction(function () use ($dstBucketInfo, $dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $request, $event, $dstVersioning, &$versionId) {
+                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId);
+                    if ($this->metadata->getBucketVersioning($dstBucket) !== $dstVersioning) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                            'Bucket versioning changed while the copy was being committed.',
+                        );
+                    }
+                    $publicAccessBlock = $this->metadata->getPublicAccessBlock($dstBucket);
+                    if (
+                        $publicAccessBlock !== null
+                        && $publicAccessBlock['blockPublicAcls']
+                        && AclGrantResolver::isPublic($aclGrants)
+                    ) {
+                        throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
+                    }
                     $this->quotas?->assertCanWriteObject($ownerId, $dstBucket, null, $objectSize, true);
 
                     $versionId = $this->metadata->putObjectVersioned(
@@ -355,11 +388,37 @@ final class CopyObjectHandler implements RequestHandler
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
-                    $this->metadata->putAcl('object', $dstBucket . '/' . $dstKey, $ownerId, $aclGrants);
+                    $this->metadata->putAcl('object', $dstBucket . '/' . $dstKey, $ownerId, []);
+                    $this->metadata->putAcl(
+                        'object',
+                        ObjectVersionResolver::aclResourceName($dstBucket, $dstKey, $versionId),
+                        $ownerId,
+                        $aclGrants,
+                    );
+                    (new ObjectLockRequestApplier($this->metadata))->apply(
+                        $request,
+                        $dstBucket,
+                        $dstKey,
+                        $versionId,
+                    );
+                    $this->notifications?->enqueueWebhooks($event);
                 });
             } else {
-                $this->metadata->transaction(function () use ($dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants) {
-                    $this->metadata->lockOwnerForUpdate($ownerId);
+                $this->metadata->transaction(function () use ($dstBucketInfo, $dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $request, $event, $dstVersioning) {
+                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId);
+                    if ($this->metadata->getBucketVersioning($dstBucket) !== $dstVersioning) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                            'Bucket versioning changed while the copy was being committed.',
+                        );
+                    }
+                    $publicAccessBlock = $this->metadata->getPublicAccessBlock($dstBucket);
+                    if (
+                        $publicAccessBlock !== null
+                        && $publicAccessBlock['blockPublicAcls']
+                        && AclGrantResolver::isPublic($aclGrants)
+                    ) {
+                        throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
+                    }
                     $existingObj = $this->metadata->getObjectMetadata($dstBucket, $dstKey);
                     $oldObjectToClean = $existingObj;
 
@@ -383,14 +442,30 @@ final class CopyObjectHandler implements RequestHandler
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
-                    $this->metadata->putAcl('object', $dstBucket . '/' . $dstKey, $ownerId, $aclGrants);
+                    $this->metadata->putAcl('object', $dstBucket . '/' . $dstKey, $ownerId, []);
+                    $this->metadata->putAcl(
+                        'object',
+                        ObjectVersionResolver::aclResourceName($dstBucket, $dstKey, null),
+                        $ownerId,
+                        $aclGrants,
+                    );
+                    (new ObjectLockRequestApplier($this->metadata))->apply(
+                        $request,
+                        $dstBucket,
+                        $dstKey,
+                        null,
+                    );
+                    $this->notifications?->enqueueWebhooks($event);
                 });
             }
         } catch (\Throwable $e) {
-            try {
-                $destinationStorage->deleteObjectByPath($writeResult->path, $dstBucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $destinationStorage,
+                $dstBucket,
+                $this->storageTiers->defaultTier()->name,
+                $writeResult->path,
+            );
             throw $e;
         }
 
@@ -406,14 +481,7 @@ final class CopyObjectHandler implements RequestHandler
         $xml = XmlResponseBuilder::copyObjectResult($etag, $lastModified);
 
         // 11. Dispatch event notification.
-        $this->notifications?->dispatch(
-            's3:ObjectCreated:Copy',
-            $dstBucket,
-            $dstKey,
-            $objectSize,
-            $etag,
-            $ownerId,
-        );
+        $this->notifications?->dispatchInternalEvent($event);
 
         $responseHeaders = ['Content-Type' => 'application/xml'];
 
@@ -443,19 +511,11 @@ final class CopyObjectHandler implements RequestHandler
     {
         $path = $object->systemMetadata['storagePath'] ?? null;
         if ($path !== null && $path !== '' && $path !== $preservePath) {
-            try {
-                $this->storageTiers->tier($object->storageTier)->backend
-                    ->deleteObjectByPath($path, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->tier($object->storageTier)->backend, $object->bucket, $object->storageTier, $path);
         }
 
         if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '' && $object->restoredStoragePath !== $preservePath) {
-            try {
-                $this->storageTiers->defaultBackend()
-                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->defaultBackend(), $object->bucket, $this->storageTiers->defaultTier()->name, $object->restoredStoragePath);
         }
     }
 
@@ -473,12 +533,21 @@ final class CopyObjectHandler implements RequestHandler
         );
 
         try {
-            $storage->deleteObjectByPath($original->path, $bucket);
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $storage,
+                $bucket,
+                $this->storageTiers->defaultTier()->name,
+                $original->path,
+            );
         } catch (\Throwable $e) {
-            try {
-                $storage->deleteObjectByPath($replacement->path, $bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $storage,
+                $bucket,
+                $this->storageTiers->defaultTier()->name,
+                $replacement->path,
+            );
             throw $e;
         }
 

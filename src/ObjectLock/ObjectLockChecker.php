@@ -24,6 +24,24 @@ final class ObjectLockChecker
      */
     public function check(string $bucket, string $key, string $versionId, Request $request): void
     {
+        $this->checkProtection(
+            $bucket,
+            $key,
+            $versionId,
+            strtolower($request->getHeader('x-amz-bypass-governance-retention') ?? '') === 'true'
+                && $request->getAttribute('s3.canBypassGovernanceRetention') === true,
+        );
+    }
+
+    /**
+     * @throws ObjectLockedException
+     */
+    public function checkProtection(
+        string $bucket,
+        string $key,
+        string $versionId,
+        bool $canBypassGovernance = false,
+    ): void {
         // Check legal hold first.
         $legalHold = $this->metadata->getObjectLegalHold($bucket, $key, $versionId);
         if ($legalHold === 'ON') {
@@ -44,12 +62,7 @@ final class ObjectLockChecker
                 }
 
                 if ($mode === 'GOVERNANCE') {
-                    // Note: AWS S3 requires s3:BypassGovernanceRetention IAM permission
-                    // in addition to this header. This server does not implement IAM,
-                    // so any authenticated user can bypass GOVERNANCE mode with this header.
-                    // Use COMPLIANCE mode for enforcement that cannot be bypassed.
-                    $bypassHeader = $request->getHeader('x-amz-bypass-governance-retention');
-                    if ($bypassHeader === null || strtolower($bypassHeader) !== 'true') {
+                    if (! $canBypassGovernance) {
                         throw new ObjectLockedException();
                     }
                 }

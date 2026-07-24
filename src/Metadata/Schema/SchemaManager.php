@@ -388,6 +388,89 @@ final class SchemaManager
         $stmt->execute([11, 'Add durable restore job queue']);
     }
 
+    /**
+     * Apply schema version 12 - make object tags version-aware.
+     */
+    private function applyVersion12(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            ALTER TABLE s3_tagging RENAME TO s3_tagging_v11;
+
+            CREATE TABLE s3_tagging (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_type TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                key_name TEXT,
+                version_id TEXT NOT NULL DEFAULT 'null',
+                tag_key TEXT NOT NULL,
+                tag_value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(resource_type, bucket, key_name, version_id, tag_key)
+            );
+
+            INSERT INTO s3_tagging (
+                id, resource_type, bucket, key_name, version_id, tag_key, tag_value, created_at
+            )
+            SELECT id, resource_type, bucket, key_name, 'null', tag_key, tag_value, created_at
+            FROM s3_tagging_v11;
+
+            DROP TABLE s3_tagging_v11;
+            CREATE INDEX idx_s3_tagging_resource
+                ON s3_tagging(resource_type, bucket, key_name, version_id);
+        SQL);
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([12, 'Make object tags version-aware']);
+    }
+
+    /**
+     * Apply schema version 13 - multipart staging quotas.
+     */
+    private function applyVersion13(): void
+    {
+        foreach ([
+            'max_multipart_uploads_per_bucket',
+            'max_multipart_uploads_per_owner',
+            'max_multipart_bytes_per_bucket',
+            'max_multipart_bytes_per_owner',
+        ] as $column) {
+            $this->pdo->exec(
+                "ALTER TABLE s3_account_quotas ADD COLUMN {$column} INTEGER NOT NULL DEFAULT 0",
+            );
+        }
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([13, 'Add multipart staging quota limits']);
+    }
+
+    private function applyVersion14(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_garbage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_status
+                ON s3_storage_garbage(status, next_attempt_at);
+        SQL);
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([14, 'Add durable physical storage garbage queue']);
+    }
+
     private function columnExists(string $table, string $column): bool
     {
         $stmt = $this->pdo->query("PRAGMA table_info({$table})");
@@ -428,6 +511,7 @@ final class SchemaManager
             's3_account_policies',
             's3_account_quotas',
             's3_notification_queue',
+            's3_storage_garbage',
             's3_rate_limit_buckets',
             's3_bucket_logging',
             's3_public_access_blocks',

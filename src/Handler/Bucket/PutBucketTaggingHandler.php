@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
@@ -39,14 +40,10 @@ final class PutBucketTaggingHandler implements RequestHandler
         }
 
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $tags = XmlRequestParser::parseTagging($body);
 
-        if (count($tags) > self::MAX_BUCKET_TAGS) {
-            throw new InvalidArgumentException(
-                'Bucket tags cannot be greater than ' . self::MAX_BUCKET_TAGS,
-            );
-        }
+        $tags = ObjectTagValidator::validate($tags, self::MAX_BUCKET_TAGS);
 
         $this->metadata->putBucketTagging($bucket, $tags);
 

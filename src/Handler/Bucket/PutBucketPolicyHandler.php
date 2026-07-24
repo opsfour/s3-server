@@ -11,6 +11,8 @@ use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Policy\PolicyDocumentValidator;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 
 /**
@@ -27,7 +29,7 @@ final class PutBucketPolicyHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -37,26 +39,22 @@ final class PutBucketPolicyHandler implements RequestHandler
         }
 
         // Read raw JSON body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 131_072);
 
         if (trim($body) === '') {
             throw new MalformedXmlException('Request body is empty.');
         }
 
-        // Validate that the body is valid JSON.
-        try {
-            json_decode($body, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            throw new MalformedXmlException('The policy is not valid JSON.');
-        }
+        PolicyDocumentValidator::validateBucketPolicy($body);
 
-        // Check Public Access Block — reject public policies if blockPublicPolicy is set.
-        $pab = $this->metadata->getPublicAccessBlock($bucket);
-        if ($pab !== null && $pab['blockPublicPolicy'] && PolicyEvaluator::isPublicPolicy($body)) {
-            throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
-        }
-
-        $this->metadata->putBucketPolicy($bucket, $body);
+        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $bucket, $body): void {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $pab = $this->metadata->getPublicAccessBlock($bucket);
+            if ($pab !== null && $pab['blockPublicPolicy'] && PolicyEvaluator::isPublicPolicy($body)) {
+                throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
+            }
+            $this->metadata->putBucketPolicy($bucket, $body);
+        });
 
         return new Response(status: 204);
     }

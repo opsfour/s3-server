@@ -90,7 +90,6 @@ final class S3ServerConfig
         get => $this->websiteHostPattern;
     }
 
-    /** @internal Reserved for future use. */
     public string $masterKeyProvider {
         get => $this->masterKeyProvider;
     }
@@ -123,6 +122,10 @@ final class S3ServerConfig
         get => $this->encryptionWorkerPoolSize;
     }
 
+    public int $selectWorkerPoolSize {
+        get => $this->selectWorkerPoolSize;
+    }
+
     public int $requestBodySpoolWorkerPoolSize {
         get => $this->requestBodySpoolWorkerPoolSize;
     }
@@ -151,6 +154,14 @@ final class S3ServerConfig
         get => $this->lifecycleLockTtlSeconds;
     }
 
+    public int $multipartMaxAgeSeconds {
+        get => $this->multipartMaxAgeSeconds;
+    }
+
+    public ?string $metricsBearerToken {
+        get => $this->metricsBearerToken;
+    }
+
     /**
      * @param  string  $host  Listen address.
      * @param  int  $port  Listen port.
@@ -168,13 +179,13 @@ final class S3ServerConfig
      * @param  int  $writeTimeout  Write timeout in seconds.
      * @param  int  $perClientRateLimit  Per-client rate limit (0 = unlimited).
      * @param  string|null  $baseDomain  Base domain for virtual-hosted-style requests.
-     * @param  bool  $strictBucketNaming  Enforce strict S3 bucket naming rules.
+     * @param  bool  $strictBucketNaming  Reject AWS-reserved bucket name prefixes and suffixes.
      * @param  string|null  $websiteHostPattern  Glob pattern for website hosting endpoints (e.g., '*.s3-website.example.com').
      * @param  string  $masterKeyProvider  Master key provider type: 'config', 'redis', or 'vault'.
      * @param  bool  $enforceMinPartSize  Enforce 5 MiB minimum part size on CompleteMultipartUpload (default true, matches AWS S3).
      * @param  int  $maxEncryptedObjectSize  Maximum size in bytes for objects encrypted with SSE (default 256 MiB).
      * @param  int  $maxSelectObjectSize  Maximum size in bytes for S3 Select queries (default 256 MiB).
-     * @param  int  $shutdownDrainTimeout  Seconds to wait for in-flight requests on shutdown (default 30).
+     * @param  int  $shutdownDrainTimeout  Seconds before warning about in-flight shutdown work (default 30).
      * @param  bool  $notificationRequireHttps  Reject non-HTTPS webhook destinations.
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
      * @param  int  $encryptionWorkerPoolSize  Number of amphp/parallel workers for encryption (0 = disable).
@@ -184,6 +195,8 @@ final class S3ServerConfig
      * @param  int  $lifecycleBatchSize  Maximum rows fetched per lifecycle query.
      * @param  int  $lifecycleMaxActionsPerRun  Maximum destructive lifecycle actions per sweep.
      * @param  int  $lifecycleLockTtlSeconds  Seconds before a lifecycle lease is considered stale.
+     * @param  int  $multipartMaxAgeSeconds  Global maximum age for incomplete multipart uploads (0 disables cleanup).
+     * @param  int|null  $selectWorkerPoolSize  Number of amphp/parallel workers for S3 Select (null inherits encryptionWorkerPoolSize for compatibility).
      */
     public function __construct(
         string $host = '0.0.0.0',
@@ -202,10 +215,10 @@ final class S3ServerConfig
         int $writeTimeout = 300,
         int $perClientRateLimit = 1000,
         ?string $baseDomain = null,
-        bool $strictBucketNaming = false,
+        bool $strictBucketNaming = true,
         ?string $websiteHostPattern = null,
         string $masterKeyProvider = 'config',
-        bool $enforceMinPartSize = false,
+        bool $enforceMinPartSize = true,
         int $maxEncryptedObjectSize = 268_435_456,
         int $maxSelectObjectSize = 268_435_456,
         int $shutdownDrainTimeout = 30,
@@ -219,6 +232,9 @@ final class S3ServerConfig
         int $lifecycleBatchSize = 1000,
         int $lifecycleMaxActionsPerRun = 1000,
         int $lifecycleLockTtlSeconds = 300,
+        int $multipartMaxAgeSeconds = 604_800,
+        ?string $metricsBearerToken = null,
+        ?int $selectWorkerPoolSize = null,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
@@ -243,6 +259,10 @@ final class S3ServerConfig
 
         if ($region === '') {
             throw new \InvalidArgumentException('region cannot be empty.');
+        }
+
+        if (! in_array($masterKeyProvider, ['config', 'redis', 'vault'], true)) {
+            throw new \InvalidArgumentException('masterKeyProvider must be one of: config, redis, vault.');
         }
 
         if ($maxConcurrentConnections < 1) {
@@ -287,6 +307,42 @@ final class S3ServerConfig
             );
         }
 
+        if ($sqliteWorkerPoolSize < 0) {
+            throw new \InvalidArgumentException(
+                "sqliteWorkerPoolSize must be >= 0, got {$sqliteWorkerPoolSize}.",
+            );
+        }
+
+        if ($encryptionWorkerPoolSize < 0) {
+            throw new \InvalidArgumentException(
+                "encryptionWorkerPoolSize must be >= 0, got {$encryptionWorkerPoolSize}.",
+            );
+        }
+
+        if ($selectWorkerPoolSize !== null && $selectWorkerPoolSize < 0) {
+            throw new \InvalidArgumentException(
+                "selectWorkerPoolSize must be >= 0, got {$selectWorkerPoolSize}.",
+            );
+        }
+
+        if ($encryptionParallelThreshold < 0) {
+            throw new \InvalidArgumentException(
+                "encryptionParallelThreshold must be >= 0, got {$encryptionParallelThreshold}.",
+            );
+        }
+
+        if ($maxEncryptedObjectSize < 1) {
+            throw new \InvalidArgumentException(
+                "maxEncryptedObjectSize must be >= 1, got {$maxEncryptedObjectSize}.",
+            );
+        }
+
+        if ($maxSelectObjectSize < 1) {
+            throw new \InvalidArgumentException(
+                "maxSelectObjectSize must be >= 1, got {$maxSelectObjectSize}.",
+            );
+        }
+
         if ($perClientRateLimit < 0) {
             throw new \InvalidArgumentException(
                 "perClientRateLimit must be >= 0, got {$perClientRateLimit}.",
@@ -321,6 +377,10 @@ final class S3ServerConfig
             throw new \InvalidArgumentException('lifecycleLockTtlSeconds must be >= 1.');
         }
 
+        if ($multipartMaxAgeSeconds < 0) {
+            throw new \InvalidArgumentException('multipartMaxAgeSeconds must be >= 0.');
+        }
+
         $this->host = $host;
         $this->port = $port;
         $this->region = $region;
@@ -347,6 +407,7 @@ final class S3ServerConfig
         $this->notificationRequireHttps = $notificationRequireHttps;
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
+        $this->selectWorkerPoolSize = $selectWorkerPoolSize ?? $encryptionWorkerPoolSize;
         $this->requestBodySpoolWorkerPoolSize = $requestBodySpoolWorkerPoolSize;
         $this->encryptionParallelThreshold = $encryptionParallelThreshold;
         $this->quota = $quota ?? new QuotaConfig();
@@ -354,6 +415,8 @@ final class S3ServerConfig
         $this->lifecycleBatchSize = $lifecycleBatchSize;
         $this->lifecycleMaxActionsPerRun = $lifecycleMaxActionsPerRun;
         $this->lifecycleLockTtlSeconds = $lifecycleLockTtlSeconds;
+        $this->multipartMaxAgeSeconds = $multipartMaxAgeSeconds;
+        $this->metricsBearerToken = $metricsBearerToken;
     }
 
     /**
@@ -407,6 +470,7 @@ final class S3ServerConfig
             'notificationRequireHttps' => $this->notificationRequireHttps,
             'sqliteWorkerPoolSize' => $this->sqliteWorkerPoolSize,
             'encryptionWorkerPoolSize' => $this->encryptionWorkerPoolSize,
+            'selectWorkerPoolSize' => $this->selectWorkerPoolSize,
             'requestBodySpoolWorkerPoolSize' => $this->requestBodySpoolWorkerPoolSize,
             'encryptionParallelThreshold' => $this->encryptionParallelThreshold,
             'quota' => $this->quota,
@@ -414,6 +478,8 @@ final class S3ServerConfig
             'lifecycleBatchSize' => $this->lifecycleBatchSize,
             'lifecycleMaxActionsPerRun' => $this->lifecycleMaxActionsPerRun,
             'lifecycleLockTtlSeconds' => $this->lifecycleLockTtlSeconds,
+            'multipartMaxAgeSeconds' => $this->multipartMaxAgeSeconds,
+            'metricsBearerToken' => $this->metricsBearerToken,
         ];
 
         $merged = array_merge($defaults, $overrides);

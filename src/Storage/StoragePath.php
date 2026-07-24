@@ -56,7 +56,7 @@ final class StoragePath
     /**
      * Compute the storage path for a multipart upload part.
      *
-     * Layout: {basePath}/.parts/{uploadId}/{partNumber}
+     * Layout: {basePath}/.parts/{uploadId}/{partNumber}-{uuid}
      *
      * @param  string  $basePath  Root storage directory.
      * @param  string  $uploadId  Multipart upload identifier.
@@ -70,7 +70,13 @@ final class StoragePath
             throw new \InvalidArgumentException('Invalid uploadId format.');
         }
 
-        return sprintf('%s/.parts/%s/%d', $basePath, $uploadId, $partNumber);
+        return sprintf(
+            '%s/.parts/%s/%d-%s',
+            $basePath,
+            $uploadId,
+            $partNumber,
+            bin2hex(random_bytes(16)),
+        );
     }
 
     /**

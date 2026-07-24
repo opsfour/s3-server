@@ -9,6 +9,9 @@ Run SQL queries directly on objects stored in S3, returning only the data you ne
 | CSV | Yes | Yes |
 | JSON | Yes | Yes |
 
+Encrypted objects and Parquet input are not supported by the current S3 Select
+implementation.
+
 ## Basic Usage
 
 ```php
@@ -108,7 +111,6 @@ SELECT COUNT(*) FROM s3object s WHERE s.status = 'active'
 | `FieldDelimiter` | Any character | `,` | Column separator |
 | `RecordDelimiter` | Any string | `\n` | Row separator |
 | `QuoteCharacter` | Any character | `"` | Quote character |
-| `Comments` | Any character | - | Lines starting with this are skipped |
 
 When `FileHeaderInfo` is `USE`, column names from the header row can be used in SQL. With `NONE`, use positional references: `s._1`, `s._2`, etc.
 

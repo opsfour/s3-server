@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 12;
+    public const int VERSION = 15;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -54,6 +54,10 @@ final class PostgresSchema
                 max_objects_per_bucket BIGINT NOT NULL DEFAULT 0,
                 max_bytes_per_bucket BIGINT NOT NULL DEFAULT 0,
                 max_bytes_per_owner BIGINT NOT NULL DEFAULT 0,
+                max_multipart_uploads_per_bucket BIGINT NOT NULL DEFAULT 0,
+                max_multipart_uploads_per_owner BIGINT NOT NULL DEFAULT 0,
+                max_multipart_bytes_per_bucket BIGINT NOT NULL DEFAULT 0,
+                max_multipart_bytes_per_owner BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -249,13 +253,14 @@ final class PostgresSchema
                 resource_type TEXT NOT NULL,
                 bucket TEXT NOT NULL,
                 key_name TEXT,
+                version_id TEXT NOT NULL DEFAULT 'null',
                 tag_key TEXT NOT NULL,
                 tag_value TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(resource_type, bucket, key_name, tag_key)
+                CONSTRAINT uq_s3_tagging_version UNIQUE(resource_type, bucket, key_name, version_id, tag_key)
             )
             SQL,
-            'CREATE INDEX IF NOT EXISTS idx_s3_tagging_resource ON s3_tagging(resource_type, bucket, key_name)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_tagging_resource ON s3_tagging(resource_type, bucket, key_name, version_id)',
 
             // Policies
             <<<'SQL'
@@ -449,6 +454,22 @@ final class PostgresSchema
             'CREATE INDEX IF NOT EXISTS idx_s3_nq_status_next ON s3_notification_queue(status, next_attempt_at)',
             'CREATE INDEX IF NOT EXISTS idx_s3_nq_created ON s3_notification_queue(created_at)',
 
+            // Durable physical storage cleanup queue (version 15)
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_garbage (
+                id BIGSERIAL PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL,
+            'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_status ON s3_storage_garbage(status, next_attempt_at)',
+
         ];
     }
 
@@ -606,6 +627,39 @@ final class PostgresSchema
                 owner_id TEXT PRIMARY KEY
             )
             SQL;
+        }
+
+        if ($fromVersion < 13) {
+            $statements[] = "ALTER TABLE s3_tagging ADD COLUMN IF NOT EXISTS version_id TEXT NOT NULL DEFAULT 'null'";
+            $statements[] = 'ALTER TABLE s3_tagging DROP CONSTRAINT IF EXISTS s3_tagging_resource_type_bucket_key_name_tag_key_key';
+            $statements[] = 'ALTER TABLE s3_tagging DROP CONSTRAINT IF EXISTS uq_s3_tagging_version';
+            $statements[] = 'ALTER TABLE s3_tagging ADD CONSTRAINT uq_s3_tagging_version UNIQUE (resource_type, bucket, key_name, version_id, tag_key)';
+            $statements[] = 'DROP INDEX IF EXISTS idx_s3_tagging_resource';
+            $statements[] = 'CREATE INDEX idx_s3_tagging_resource ON s3_tagging(resource_type, bucket, key_name, version_id)';
+        }
+
+        if ($fromVersion < 14) {
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN IF NOT EXISTS max_multipart_uploads_per_bucket BIGINT NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN IF NOT EXISTS max_multipart_uploads_per_owner BIGINT NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN IF NOT EXISTS max_multipart_bytes_per_bucket BIGINT NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN IF NOT EXISTS max_multipart_bytes_per_owner BIGINT NOT NULL DEFAULT 0';
+        }
+
+        if ($fromVersion < 15) {
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_garbage (
+                id BIGSERIAL PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL;
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_status ON s3_storage_garbage(status, next_attempt_at)';
         }
 
         return $statements;

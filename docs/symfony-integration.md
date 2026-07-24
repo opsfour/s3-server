@@ -10,9 +10,9 @@ consistent across integrations.
 composer require opsfour/s3-server
 ```
 
-Symfony support uses optional Symfony components. In a normal Symfony
-7 or 8 application these are already present. If you embed the bundle into a
-custom application, install:
+Symfony support uses optional Symfony components. In a maintained Symfony 7.4
+LTS or 8.1+ application these are already present. If you embed the bundle into
+a custom application, install:
 
 ```bash
 composer require symfony/http-kernel symfony/dependency-injection symfony/config
@@ -97,6 +97,9 @@ opsfour_s3_server:
     owner_id: '%env(S3_OWNER_ID)%'
     display_name: '%env(S3_DISPLAY_NAME)%'
     dsn: '%env(S3_CREDENTIALS_DSN)%'
+    username: '%env(S3_CREDENTIALS_USERNAME)%'
+    password: '%env(S3_CREDENTIALS_PASSWORD)%'
+    cache_ttl: '%env(float:S3_CREDENTIALS_CACHE_TTL)%'
     path: '%env(S3_CREDENTIALS_PATH)%'
 ```
 
@@ -190,7 +193,10 @@ opsfour_s3_server:
 
   credentials:
     driver: database
-    dsn: 'host=127.0.0.1 port=5432 dbname=s3server user=s3 password=secret'
+    dsn: 'pgsql:host=127.0.0.1;port=5432;dbname=s3server'
+    username: 's3'
+    password: 'secret'
+    cache_ttl: 1.0
 
   quotas:
     max_buckets_per_owner: 0
@@ -422,6 +428,7 @@ opsfour_s3_server:
 
   parallel:
     encryption_workers: 0
+    select_workers: 0
     encryption_threshold: 65536
 ```
 
@@ -464,7 +471,7 @@ autorestart=true
 user=www-data
 redirect_stderr=true
 stdout_logfile=/var/log/opsfour-s3-server.log
-stopwaitsecs=35
+stopwaitsecs=60
 stopsignal=TERM
 ```
 
@@ -483,7 +490,7 @@ ExecStart=/usr/bin/php /var/www/app/bin/console opsfour:s3:serve
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=35
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

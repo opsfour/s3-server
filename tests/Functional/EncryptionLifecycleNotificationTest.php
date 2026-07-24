@@ -11,9 +11,31 @@ use Aws\S3\Exception\S3Exception;
  */
 final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
 {
+    private static string|false $previousMasterKey = false;
+
     private static string $bucket = '';
 
     private static bool $seeded = false;
+
+    public static function setUpBeforeClass(): void
+    {
+        self::$previousMasterKey = getenv('S3_ENCRYPTION_MASTER_KEY');
+        putenv('S3_ENCRYPTION_MASTER_KEY=' . base64_encode(str_repeat('E', 32)));
+
+        parent::setUpBeforeClass();
+    }
+
+    public static function tearDownAfterClass(): void
+    {
+        parent::tearDownAfterClass();
+
+        if (self::$previousMasterKey === false) {
+            putenv('S3_ENCRYPTION_MASTER_KEY');
+        } else {
+            putenv('S3_ENCRYPTION_MASTER_KEY=' . self::$previousMasterKey);
+        }
+        self::$seeded = false;
+    }
 
     protected function setUp(): void
     {

@@ -288,8 +288,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, StorageBac
 
         $checksums = $calculator->finalize();
 
-        // Move temp to final part path (overwrite if re-uploading same part number).
-        // rename() atomically replaces the destination — no need to delete first.
+        // Every attempt receives a unique path. Metadata atomically selects the
+        // winning attempt, so a failed replacement cannot destroy the previous part.
         try {
             $this->atomicMove($tempPath, $partPath);
         } catch (\Throwable $e) {
@@ -317,7 +317,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, StorageBac
      * @param  string  $bucket  Bucket name.
      * @param  string  $key  Object key.
      * @param  string  $uploadId  Upload identifier.
-     * @param  array<int, array{partNumber: int, etag: string}>  $parts  Ordered list of parts with their ETags.
+     * @param  array<int, array{partNumber: int, etag: string, storagePath: string}>  $parts  Ordered committed parts.
      * @return StorageWriteResult Metadata about the assembled object.
      */
     public function assembleMultipartUpload(
@@ -343,7 +343,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, StorageBac
         try {
             foreach ($parts as $part) {
                 $partNumber = $part['partNumber'];
-                $partPath = StoragePath::forPart($this->basePath, $uploadId, $partNumber);
+                $partPath = $part['storagePath'];
 
                 if (! $this->metadataFilesystem->exists($partPath)) {
                     throw new InternalErrorException("Part {$partNumber} not found for upload {$uploadId}.");

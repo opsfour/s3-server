@@ -40,6 +40,27 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
         self::$s3->deleteBucket(['Bucket' => $bucket]);
     }
 
+    #[DataProvider('validAwsBucketNamesProvider')]
+    public function test_create_bucket_accepts_valid_aws_name(string $bucket): void
+    {
+        $result = self::$s3->createBucket(['Bucket' => $bucket]);
+
+        self::assertSame(200, $result['@metadata']['statusCode']);
+        self::$s3->deleteBucket(['Bucket' => $bucket]);
+    }
+
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function validAwsBucketNamesProvider(): array
+    {
+        return [
+            'periods' => ['valid.bucket.name'],
+            'consecutive hyphens' => ['valid--bucket'],
+            'period next to hyphen' => ['valid.-bucket'],
+        ];
+    }
+
     // -----------------------------------------------------------------
     // Invalid bucket names (parameterized)
     // -----------------------------------------------------------------
@@ -68,7 +89,12 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
             'starting with hyphen' => ['-bucket', 'starts with hyphen'],
             'ending with hyphen' => ['bucket-', 'ends with hyphen'],
             'xn-- prefix' => ['xn--bucket', 'xn-- prefix (IDN)'],
+            'sthree- prefix' => ['sthree-bucket', 'reserved sthree- prefix'],
+            'amzn-s3-demo- prefix' => ['amzn-s3-demo-bucket', 'reserved AWS demo prefix'],
             '-s3alias suffix' => ['bucket-s3alias', '-s3alias suffix'],
+            '.mrap suffix' => ['bucket.mrap', '.mrap suffix'],
+            '--table-s3 suffix' => ['bucket--table-s3', '--table-s3 suffix'],
+            '-an suffix' => ['bucket-an', 'account-regional namespace suffix'],
         ];
     }
 
@@ -115,6 +141,47 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
 
         // Clean up: delete object first, then bucket.
         self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'file.txt']);
+        self::$s3->deleteBucket(['Bucket' => $bucket]);
+    }
+
+    public function test_delete_bucket_purges_configs_and_incomplete_multipart_uploads(): void
+    {
+        $bucket = 'purge-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketTagging([
+            'Bucket' => $bucket,
+            'Tagging' => ['TagSet' => [['Key' => 'old', 'Value' => 'state']]],
+        ]);
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Enabled'],
+        ]);
+        self::$s3->putBucketWebsite([
+            'Bucket' => $bucket,
+            'WebsiteConfiguration' => ['IndexDocument' => ['Suffix' => 'index.html']],
+        ]);
+        self::$s3->createMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => 'unfinished.bin',
+        ]);
+
+        self::$s3->deleteBucket(['Bucket' => $bucket]);
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        self::assertSame([], self::$s3->listMultipartUploads(['Bucket' => $bucket])['Uploads'] ?? []);
+        self::assertSame(
+            null,
+            self::$s3->getBucketVersioning(['Bucket' => $bucket])['Status'] ?? null,
+        );
+        foreach (['getBucketTagging', 'getBucketWebsite'] as $operation) {
+            try {
+                self::$s3->{$operation}(['Bucket' => $bucket]);
+                self::fail("Expected {$operation} to find no inherited configuration.");
+            } catch (S3Exception $e) {
+                self::assertSame(404, $e->getStatusCode());
+            }
+        }
+
         self::$s3->deleteBucket(['Bucket' => $bucket]);
     }
 

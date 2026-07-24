@@ -11,15 +11,15 @@ PHP Fibers.
 - **Multiple metadata backends** — SQLite (single-node), PostgreSQL or MySQL (multi-node HA)
 - **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory
 - **Server-side encryption** — SSE-S3 with key rotation support, SSE-C (customer-provided keys), AES-256-GCM
-- **Authentication** — AWS Signature V4, presigned URLs, chunked streaming signatures
+- **Authentication** — AWS Signature V4, presigned URLs, signed and unsigned `aws-chunked` checksum trailers
 - **Multi-tenant** — Owner ID scopes all operations; multiple credential providers (memory, database, file, chain)
 - **Framework integrations** — Standalone CLI, Laravel service provider, and Symfony Bundle
-- **Quotas and tiering** — Per-owner and per-bucket quotas, physical storage tiers, cold-tier restore workflow
+- **Quotas and tiering** — Per-owner/per-bucket object and multipart-staging quotas, physical storage tiers, cold-tier restore workflow
 - **Event notifications** — Persistent queue with retry, exponential backoff, dead-letter, and SSRF protection
-- **S3 Select** — SQL queries over CSV, JSON, and Parquet objects
+- **S3 Select** — SQL queries over unencrypted CSV and JSON objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Production hardened** — 590+ PHPUnit tests plus opt-in large-object, high-concurrency, remote-storage, and five-minute soak profiles
+- **Production hardened** — 740+ PHPUnit tests plus opt-in large-object, high-concurrency, remote-storage, and five-minute soak profiles
 
 ## Requirements
 
@@ -27,8 +27,8 @@ PHP Fibers.
 - Composer 2.x
 - ext-openssl (encryption)
 - ext-pdo_sqlite (default metadata) or ext-pdo_pgsql / ext-pdo_mysql
-- Symfony 7 or 8 when using the Symfony Bundle
-- Laravel 11+ when using the Laravel service provider
+- Symfony 7.4 LTS or 8.1+ when using the Symfony Bundle
+- Laravel 12 or 13 when using the Laravel service provider
 
 ## Quick Start
 

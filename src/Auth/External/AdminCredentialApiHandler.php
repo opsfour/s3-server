@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth\External;
 
+use Amp\ByteStream\BufferException;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
@@ -95,8 +96,9 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
      */
     private function decodeJsonBody(Request $request): array
     {
-        $raw = $request->getBody()->buffer(limit: self::MAX_BODY_BYTES + 1);
-        if (strlen($raw) > self::MAX_BODY_BYTES) {
+        try {
+            $raw = $request->getBody()->buffer(limit: self::MAX_BODY_BYTES);
+        } catch (BufferException) {
             throw new \InvalidArgumentException('Request body is too large.');
         }
 

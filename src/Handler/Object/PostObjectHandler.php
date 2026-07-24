@@ -10,6 +10,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\PostObjectForm;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -120,13 +121,8 @@ final class PostObjectHandler implements RequestHandler
             return $this->errorResponse(400, 'InvalidArgument', 'Policy must contain a string expiration.');
         }
 
-        if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/', $expiration)) {
-            return $this->errorResponse(400, 'InvalidArgument', 'Invalid Policy: invalid expiration date format.');
-        }
-
-        try {
-            $expiresAt = new \DateTimeImmutable($expiration, new \DateTimeZone('UTC'));
-        } catch (\Throwable) {
+        $expiresAt = Iso8601Timestamp::parse($expiration, requireUtc: true);
+        if ($expiresAt === null) {
             return $this->errorResponse(400, 'InvalidArgument', 'Invalid expiration date format in policy.');
         }
 

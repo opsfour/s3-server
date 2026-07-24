@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -14,6 +15,7 @@ final class RestoreGarbageCollector
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $hotStorage,
         private readonly LoggerInterface $logger = new NullLogger(),
+        private readonly string $hotTier = 'STANDARD',
     ) {}
 
     /**
@@ -32,14 +34,45 @@ final class RestoreGarbageCollector
             }
 
             try {
-                $this->hotStorage->deleteObjectByPath($path, $object->bucket);
-                $this->metadata->updateObjectRestoreState(
-                    bucket: $object->bucket,
-                    key: $object->key,
-                    versionId: $object->versionId,
-                    restoreStatus: null,
-                    restoredStoragePath: null,
-                    restoreExpiresAt: null,
+                $bucketOwner = $this->metadata->getBucketOwner($object->bucket);
+                $cleared = $this->metadata->transaction(function () use ($object, $path, $now, $bucketOwner): bool {
+                    if ($bucketOwner === null) {
+                        return false;
+                    }
+                    OwnerWriteLock::acquire($this->metadata, $bucketOwner);
+                    $current = $object->versionId !== null
+                        ? $this->metadata->getObjectMetadataByVersion($object->bucket, $object->key, $object->versionId)
+                        : $this->metadata->getObjectMetadata($object->bucket, $object->key);
+                    if (
+                        $current === null
+                        || $current->restoredStoragePath !== $path
+                        || $current->restoreExpiresAt === null
+                        || $current->restoreExpiresAt > $now
+                    ) {
+                        return false;
+                    }
+
+                    $this->metadata->updateObjectRestoreState(
+                        bucket: $current->bucket,
+                        key: $current->key,
+                        versionId: $current->versionId,
+                        restoreStatus: null,
+                        restoredStoragePath: null,
+                        restoreExpiresAt: null,
+                    );
+
+                    return true;
+                });
+                if (! $cleared) {
+                    continue;
+                }
+
+                DurableStorageDelete::run(
+                    $this->metadata,
+                    $this->hotStorage,
+                    $object->bucket,
+                    $this->hotTier,
+                    $path,
                 );
                 $stats['expired']++;
             } catch (\Throwable $e) {

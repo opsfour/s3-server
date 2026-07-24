@@ -17,10 +17,13 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
  */
 final class UserMetadataExtractor
 {
+    private const int MAX_USER_METADATA_BYTES = 2048;
+
     /** @return array<string, string> */
     public static function extract(Request $request): array
     {
         $metadata = [];
+        $bytes = 0;
 
         foreach ($request->getHeaders() as $name => $values) {
             $lower = strtolower($name);
@@ -29,8 +32,17 @@ final class UserMetadataExtractor
                 if (str_starts_with($metaKey, '__')) {
                     throw new InvalidArgumentException("Metadata key '{$metaKey}' uses reserved prefix '__'.");
                 }
+                if ($metaKey === '') {
+                    throw new InvalidArgumentException('Metadata keys must not be empty.');
+                }
                 $metadata[$metaKey] = $values[0];
+                $bytes += strlen($metaKey) + strlen($values[0]);
             }
+        }
+        if ($bytes > self::MAX_USER_METADATA_BYTES) {
+            throw new InvalidArgumentException(
+                'User-defined metadata exceeds the 2 KiB S3 limit.',
+            );
         }
 
         return $metadata;

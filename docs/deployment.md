@@ -48,13 +48,19 @@ For high availability and horizontal scaling, use PostgreSQL/MySQL and shared st
 S3_METADATA_DRIVER=postgres
 S3_METADATA_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=secret"
 S3_CREDENTIALS_DRIVER=database
-S3_CREDENTIALS_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=secret"
+S3_CREDENTIALS_DSN="pgsql:host=db.internal;port=5432;dbname=s3server"
+S3_CREDENTIALS_USERNAME=s3
+S3_CREDENTIALS_PASSWORD=secret
+S3_CREDENTIALS_CACHE_TTL=1
 S3_STORAGE_DRIVER=filesystem
 S3_STORAGE_PATH=/mnt/shared-storage/s3   # NFS, EFS, or other shared filesystem
 ```
 
 In multi-node mode:
 - Rate limiting is shared across all nodes (database-backed)
+- Credential revocations and rotations become visible on every node within
+  `S3_CREDENTIALS_CACHE_TTL` seconds; set it to `0` for a database read on
+  every authenticated request
 - Notification queue is processed by all nodes with `FOR UPDATE SKIP LOCKED` (no duplicates)
 - Schema migrations are idempotent and safe to run concurrently
 
@@ -82,7 +88,9 @@ Configure the load balancer to forward `Host`, `X-Forwarded-For`, and `X-Forward
 ## Health Checks
 
 ```bash
-# Liveness probe
+# Process liveness
+curl -f http://localhost:9000/.live
+# Dependency readiness (metadata and every storage tier)
 curl -f http://localhost:9000/.health
 # {"status":"ok"}
 ```
@@ -92,7 +100,7 @@ For Kubernetes:
 ```yaml
 livenessProbe:
   httpGet:
-    path: /.health
+    path: /.live
     port: 9000
   initialDelaySeconds: 5
   periodSeconds: 10
@@ -108,11 +116,15 @@ readinessProbe:
 
 The server handles `SIGTERM` and `SIGINT` signals:
 
-1. Stops accepting new connections
-2. Waits up to `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds for in-flight requests
-3. Stops background processors (lifecycle, notifications, cleanup)
-4. Shuts down worker pools
-5. Exits cleanly
+1. Cancels and drains background processors.
+2. Stops accepting new connections and drains in-flight requests.
+3. Logs a warning after `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds but keeps runtime dependencies alive until work has stopped.
+4. Shuts down storage and worker pools.
+5. Exits cleanly.
+
+Set the process supervisor's hard stop deadline above
+`S3_SHUTDOWN_DRAIN_TIMEOUT`; the supervisor remains responsible for terminating
+a callback or backend operation that never returns.
 
 ```bash
 S3_SHUTDOWN_DRAIN_TIMEOUT=30   # seconds
@@ -135,7 +147,7 @@ ExecStart=/usr/bin/php vendor/bin/s3-server
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=35
+TimeoutStopSec=60
 EnvironmentFile=/etc/s3-server/env
 
 [Install]
@@ -147,9 +159,11 @@ WantedBy=multi-user.target
 ```dockerfile
 FROM php:8.4-cli
 
-RUN apt-get update && apt-get install -y libpq-dev \
+RUN apt-get update && apt-get install -y curl libpq-dev \
     && docker-php-ext-install pdo_pgsql pcntl \
-    && pecl install ev && docker-php-ext-enable ev
+    && pecl install ev \
+    && docker-php-ext-enable ev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY composer.json composer.lock ./
@@ -158,7 +172,7 @@ RUN composer install --no-dev --optimize-autoloader
 COPY . .
 
 EXPOSE 9000
-HEALTHCHECK CMD curl -f http://localhost:9000/.health || exit 1
+HEALTHCHECK CMD curl -f http://localhost:9000/.live || exit 1
 
 CMD ["php", "vendor/bin/s3-server"]
 ```
@@ -218,6 +232,15 @@ For high-throughput SSE-S3 encryption:
 ```bash
 S3_ENCRYPTION_WORKERS=4
 S3_ENCRYPTION_THRESHOLD=65536   # Objects > 64 KiB offloaded to workers
+```
+
+### S3 Select Workers
+
+Configure S3 Select independently when query concurrency differs from
+encryption throughput. When omitted, it inherits `S3_ENCRYPTION_WORKERS`.
+
+```bash
+S3_SELECT_WORKERS=4
 ```
 
 ### Rate Limiting
@@ -315,7 +338,8 @@ php -v
 php -m | grep -E 'pdo|pcntl|openssl'
 php vendor/bin/s3-server --help
 curl -fsS http://127.0.0.1:9000/.health
-curl -fsS http://127.0.0.1:9000/.metrics | grep s3_server_up
+curl -fsS -H "Authorization: Bearer ${S3_METRICS_BEARER_TOKEN}" \
+  http://127.0.0.1:9000/.metrics | grep s3_server_up
 ```
 
 Run the test suite for the deployment driver mix before rollout:
@@ -335,7 +359,7 @@ Recommended layout:
 - Expose only the S3 data-plane host publicly.
 - Terminate TLS at a load balancer or reverse proxy.
 - Keep `/.metrics`, `/.admin/*`, and direct node ports private.
-- Allow `/.health` only from the load balancer, orchestrator, or monitoring
+- Allow `/.live` and `/.health` only from the load balancer, orchestrator, or monitoring
   network.
 - Forward `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto`.
 
@@ -343,6 +367,12 @@ Example Nginx policy for admin surfaces:
 
 ```nginx
 location = /.health {
+    allow 10.0.0.0/8;
+    deny all;
+    proxy_pass http://s3_nodes;
+}
+
+location = /.live {
     allow 10.0.0.0/8;
     deny all;
     proxy_pass http://s3_nodes;
@@ -428,6 +458,8 @@ pre-migration backup or roll forward with a hotfix.
 - [ ] Graceful shutdown timeout set (`S3_SHUTDOWN_DRAIN_TIMEOUT`)
 - [ ] Health check endpoint accessible to load balancer only
 - [ ] Metrics and admin endpoints restricted to trusted networks
+- [ ] Metrics bearer token configured (`S3_METRICS_BEARER_TOKEN`) unless an
+  equivalent private-network control is enforced
 - [ ] Backups cover metadata and every configured storage tier
 - [ ] Restore procedure tested in a non-production environment
 - [ ] Alerts configured for request errors, backend errors, lifecycle staleness,

@@ -16,10 +16,8 @@ use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
-use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
-use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
@@ -45,29 +43,6 @@ class S3ServerCommand extends Command
 
     public function handle(): int
     {
-        $config = app(S3ServerConfig::class);
-
-        // Apply CLI overrides to server config.
-        $overrides = [];
-        if ($this->option('host') !== null) {
-            $overrides['host'] = $this->option('host');
-        }
-        if ($this->option('port') !== null) {
-            $overrides['port'] = (int) $this->option('port');
-        }
-        if ($this->option('storage-path') !== null) {
-            $overrides['storagePath'] = $this->option('storage-path');
-        }
-
-        if (! empty($overrides)) {
-            $config = $config->with($overrides);
-        }
-
-        // Ensure storage path exists.
-        if (! is_dir($config->storagePath)) {
-            mkdir($config->storagePath, 0o755, true);
-        }
-
         // Build logger.
         $logHandler = new StreamHandler(ByteStream\getStdout());
         $logHandler->pushProcessor(new PsrLogMessageProcessor());
@@ -76,36 +51,72 @@ class S3ServerCommand extends Command
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
 
-        // Resolve backends from container (or rebuild with CLI overrides).
-        $metrics = app(MetricsCollector::class);
-        $storageTierRegistry = app(StorageTierRegistry::class);
-        $storage = $this->resolveStorage($config);
-        $storage = new ObservedStorageBackend(
-            $storage,
-            $metrics,
-            (string) config('s3-server.storage.driver', 'filesystem'),
-        );
-        $metadata = app(MetadataStore::class);
-        $metadata = new ObservedMetadataStore(
-            $metadata,
-            $metrics,
-            (string) config('s3-server.metadata.driver', 'sqlite'),
-        );
-        $credentialProvider = $this->resolveCredentials();
+        try {
+            $config = app(S3ServerConfig::class);
 
-        $adminToken = config('s3-server.admin.token')
-            ?: config('s3-server.external_iam.admin_token');
-        $runtime = (new S3ServerRuntimeFactory())->create(
-            config: $config,
-            metadata: $metadata,
-            storage: $storage,
-            credentialProvider: $credentialProvider,
-            logger: $logger,
-            metrics: $metrics,
-            storageTiers: $storageTierRegistry,
-            externalIamConfig: config('s3-server.external_iam', []),
-            adminToken: is_string($adminToken) ? $adminToken : null,
-        );
+            // Apply CLI overrides to server config.
+            $overrides = [];
+            if ($this->option('host') !== null) {
+                $overrides['host'] = $this->option('host');
+            }
+            if ($this->option('port') !== null) {
+                $overrides['port'] = (int) $this->option('port');
+            }
+            if ($this->option('storage-path') !== null) {
+                $overrides['storagePath'] = $this->option('storage-path');
+            }
+
+            if (! empty($overrides)) {
+                $config = $config->with($overrides);
+            }
+
+            $storageDriver = (string) config('s3-server.storage.driver', 'filesystem');
+            if ($this->option('storage-path') !== null && $storageDriver !== 'filesystem') {
+                $this->error('--storage-path can only override the filesystem storage driver.');
+
+                return self::FAILURE;
+            }
+
+            // Remote backends only create their configured local staging directory.
+            if ($storageDriver === 'filesystem' && ! is_dir($config->storagePath)) {
+                if (! @mkdir($config->storagePath, 0o755, true) && ! is_dir($config->storagePath)) {
+                    $this->error("Cannot create storage directory: {$config->storagePath}");
+
+                    return self::FAILURE;
+                }
+            }
+
+            // Resolve backends from container (or rebuild with CLI overrides).
+            $metrics = app(MetricsCollector::class);
+            $storageTierRegistry = $this->resolveStorageTiers($config, $metrics);
+            $storage = $storageTierRegistry->defaultBackend();
+            $metadata = app(MetadataStore::class);
+            $metadata = new ObservedMetadataStore(
+                $metadata,
+                $metrics,
+                (string) config('s3-server.metadata.driver', 'sqlite'),
+            );
+            $credentialProvider = $this->resolveCredentials();
+
+            $adminToken = config('s3-server.admin.token')
+                ?: config('s3-server.external_iam.admin_token');
+            $runtime = (new S3ServerRuntimeFactory())->create(
+                config: $config,
+                metadata: $metadata,
+                storage: $storage,
+                credentialProvider: $credentialProvider,
+                logger: $logger,
+                metrics: $metrics,
+                storageTiers: $storageTierRegistry,
+                externalIamConfig: config('s3-server.external_iam', []),
+                adminToken: is_string($adminToken) ? $adminToken : null,
+            );
+        } catch (\Throwable $e) {
+            $logger->error('S3 server bootstrap failed: {error}', ['error' => $e->getMessage()]);
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        }
 
         $this->info("OpsFour S3 Server starting on {$config->host}:{$config->port}");
         $this->info("Storage: {$config->storagePath}");
@@ -115,18 +126,27 @@ class S3ServerCommand extends Command
         if ($config->encryptionWorkerPoolSize > 0) {
             $this->info("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers (threshold: {$config->encryptionParallelThreshold} bytes)");
         }
+        if ($config->selectWorkerPoolSize > 0) {
+            $this->info("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
+        }
         $this->info('Press Ctrl+C to stop.');
 
-        $runtime->server->start();
+        try {
+            $runtime->server->start();
 
-        // Wait for termination signal.
-        $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            // Wait for termination signal.
+            $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            $logger->info('Received signal {signal}, shutting down...', [
+                'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
+            ]);
+        } catch (\Throwable $e) {
+            $logger->error('S3 server runtime failed: {error}', ['error' => $e->getMessage()]);
+            $this->error($e->getMessage());
 
-        $logger->info('Received signal {signal}, shutting down...', [
-            'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
-        ]);
-
-        $runtime->stop();
+            return self::FAILURE;
+        } finally {
+            $runtime->stop();
+        }
 
         $this->info('Server stopped.');
 
@@ -136,17 +156,19 @@ class S3ServerCommand extends Command
     /**
      * Resolve storage backend, rebuilding if --storage-path was given.
      */
-    private function resolveStorage(S3ServerConfig $config): StorageBackend
-    {
+    private function resolveStorageTiers(
+        S3ServerConfig $config,
+        MetricsCollector $metrics,
+    ): StorageTierRegistry {
         if ($this->option('storage-path') !== null) {
-            $driver = config('s3-server.storage.driver', 'filesystem');
+            $storageConfig = config('s3-server.storage', []);
+            $storageConfig['path'] = $config->storagePath;
+            $storageConfig['tiers'] = [];
 
-            return StorageBackendFactory::create($driver, [
-                'path' => $config->storagePath,
-            ]);
+            return StorageBackendFactory::createTierRegistry($storageConfig, $metrics);
         }
 
-        return app(StorageBackend::class);
+        return app(StorageTierRegistry::class);
     }
 
     /**

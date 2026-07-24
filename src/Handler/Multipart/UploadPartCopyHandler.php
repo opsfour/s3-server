@@ -7,14 +7,16 @@ namespace OpsFour\S3Server\Handler\Multipart;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
-use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Quota\QuotaManager;
+use OpsFour\S3Server\Security\ObjectReadAuthorizer;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -29,6 +31,7 @@ final class UploadPartCopyHandler implements RequestHandler
         private readonly ?EncryptionServiceInterface $encryption = null,
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         ?StorageTierRegistry $storageTiers = null,
+        private readonly ?QuotaManager $quotas = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
     }
@@ -61,6 +64,17 @@ final class UploadPartCopyHandler implements RequestHandler
         if ($upload['owner_id'] !== $ownerId) {
             throw new NoSuchUploadException();
         }
+        $uploadSseAlgorithm = $upload['user_metadata']['__sse-algorithm'] ?? null;
+        $destinationCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $uploadSseAlgorithm === 'SSE-C',
+            $upload['user_metadata']['__sse-customer-key-md5'] ?? null,
+        );
+        if ($uploadSseAlgorithm !== 'SSE-C' && $destinationCustomerKey !== null) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'SSE-C headers are not valid for this multipart upload.',
+            );
+        }
 
         // Parse copy source.
         $copySource = $request->getHeader('x-amz-copy-source') ?? '';
@@ -77,6 +91,7 @@ final class UploadPartCopyHandler implements RequestHandler
         if ($srcObject === null || $srcObject->isDeleteMarker) {
             throw new NoSuchKeyException();
         }
+        (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $srcObject);
 
         // Parse optional range.
         $rangeHeader = $request->getHeader('x-amz-copy-source-range');
@@ -119,71 +134,121 @@ final class UploadPartCopyHandler implements RequestHandler
             $srcPath = $srcObject->restoredStoragePath;
         }
         $srcSseAlgo = $srcObject->userMetadata['__sse-algorithm'] ?? null;
+        if ($srcSseAlgo !== null) {
+            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        }
+        $sourceCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $srcSseAlgo === 'SSE-C',
+            $srcObject->userMetadata['__sse-customer-key-md5'] ?? null,
+            copySource: true,
+        );
+        if ($srcSseAlgo !== 'SSE-C' && $sourceCustomerKey !== null) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'Copy-source SSE-C headers are not valid for this object.',
+            );
+        }
 
-        if ($srcSseAlgo !== null && $this->encryption !== null) {
-            // Size guard: encrypted objects must be fully buffered for decryption.
-            if ($srcObject->size > $this->maxEncryptedObjectSize) {
-                throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                    'Encrypted source object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                );
-            }
-
-            // Source is encrypted: read ciphertext, decrypt, then write plaintext as part.
-            $ciphertext = \Amp\ByteStream\buffer($sourceStorage->getObjectByPath($srcPath));
-
-            if ($srcSseAlgo === 'SSE-C') {
-                $copySrcAlgo = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-algorithm');
-                $copySrcKey = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key');
-                $copySrcKeyMd5 = $request->getHeader('x-amz-copy-source-server-side-encryption-customer-key-MD5');
-
-                if ($copySrcAlgo === null || $copySrcKey === null || $copySrcKeyMd5 === null) {
-                    throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
-                        'SSE-C copy-source headers required for encrypted source object.',
+        $bufferedWorkLock = $srcSseAlgo !== null
+            ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
+            : null;
+        try {
+            if ($srcSseAlgo !== null && $this->encryption !== null) {
+                // Size guard: encrypted objects must be fully buffered for decryption.
+                if ($srcObject->size > $this->maxEncryptedObjectSize) {
+                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                        'Encrypted source object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                     );
                 }
 
-                $customerKey = EncryptionService::validateSseCHeaders($copySrcAlgo, $copySrcKey, $copySrcKeyMd5);
-                $plaintext = $this->encryption->decryptSseC(
-                    $ciphertext,
-                    $customerKey,
-                    $srcObject->userMetadata['__sse-iv'],
-                    $srcObject->userMetadata['__sse-tag'],
-                );
+                // Source is encrypted: read ciphertext, decrypt, then write plaintext as part.
+                $ciphertext = \Amp\ByteStream\buffer($sourceStorage->getObjectByPath($srcPath));
+
+                if ($srcSseAlgo === 'SSE-C') {
+                    \assert($sourceCustomerKey !== null);
+                    $plaintext = $this->encryption->decryptSseC(
+                        $ciphertext,
+                        $sourceCustomerKey,
+                        $srcObject->userMetadata['__sse-iv'],
+                        $srcObject->userMetadata['__sse-tag'],
+                    );
+                } else {
+                    // SSE-S3.
+                    $plaintext = $this->encryption->decryptSseS3(
+                        $ciphertext,
+                        $srcObject->userMetadata['__sse-key'],
+                        $srcObject->userMetadata['__sse-iv'],
+                        $srcObject->userMetadata['__sse-tag'],
+                    );
+                }
+
+                // Apply range to decrypted plaintext if requested.
+                if ($offset !== null && $length !== null) {
+                    $plaintext = substr($plaintext, $offset, $length);
+                } elseif ($offset !== null) {
+                    $plaintext = substr($plaintext, $offset);
+                }
+
+                $stream = new \Amp\ByteStream\ReadableBuffer($plaintext);
             } else {
-                // SSE-S3.
-                $plaintext = $this->encryption->decryptSseS3(
-                    $ciphertext,
-                    $srcObject->userMetadata['__sse-key'],
-                    $srcObject->userMetadata['__sse-iv'],
-                    $srcObject->userMetadata['__sse-tag'],
-                );
+                $stream = $sourceStorage->getObjectByPath($srcPath, $offset, $length);
             }
 
-            // Apply range to decrypted plaintext if requested.
-            if ($offset !== null && $length !== null) {
-                $plaintext = substr($plaintext, $offset, $length);
-            } elseif ($offset !== null) {
-                $plaintext = substr($plaintext, $offset);
-            }
-
-            $stream = new \Amp\ByteStream\ReadableBuffer($plaintext);
-        } else {
-            $stream = $sourceStorage->getObjectByPath($srcPath, $offset, $length);
+            // Write as a part.
+            $writeResult = $this->storage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
+        } finally {
+            $bufferedWorkLock?->release();
         }
-
-        // Write as a part.
-        $writeResult = $this->storage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
 
         $etag = '"' . $writeResult->md5Hex . '"';
 
+        $previousPartPath = null;
         try {
-            $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+            $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, &$previousPartPath): void {
+                \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                $activeUpload = $this->metadata->getMultipartUpload($uploadId);
+                if (
+                    $activeUpload === null
+                    || $activeUpload['bucket'] !== $bucket
+                    || $activeUpload['key_name'] !== $key
+                    || $activeUpload['owner_id'] !== $ownerId
+                ) {
+                    throw new NoSuchUploadException();
+                }
+                foreach ($this->metadata->getParts($uploadId) as $part) {
+                    if ($part['part_number'] === $partNumber) {
+                        $previousPartPath = $part['storage_path'];
+                        break;
+                    }
+                }
+                $this->quotas?->assertCanWritePart(
+                    $ownerId,
+                    $bucket,
+                    $uploadId,
+                    $partNumber,
+                    $writeResult->size,
+                );
+                $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+            });
         } catch (\Throwable $e) {
-            try {
-                $this->storage->deleteObjectByPath($writeResult->path, $bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $this->storage,
+                $bucket,
+                $this->storageTiers->defaultTier()->name,
+                $writeResult->path,
+            );
             throw $e;
+        }
+
+        if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+                $this->metadata,
+                $this->storage,
+                $bucket,
+                $this->storageTiers->defaultTier()->name,
+                $previousPartPath,
+            );
         }
 
         $lastModified = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))

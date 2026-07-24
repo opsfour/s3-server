@@ -149,7 +149,12 @@ final class FlysystemBackend implements StorageBackend
             rewind($tmpStream);
 
             $checksums = $calculator->finalize();
-            $partPath = ".parts/{$uploadId}/{$partNumber}";
+            $partPath = sprintf(
+                '.parts/%s/%d-%s',
+                $uploadId,
+                $partNumber,
+                bin2hex(random_bytes(16)),
+            );
 
             try {
                 $this->filesystem->writeStream($partPath, $tmpStream);
@@ -191,7 +196,7 @@ final class FlysystemBackend implements StorageBackend
         try {
             foreach ($parts as $part) {
                 $partNumber = $part['partNumber'];
-                $partPath = ".parts/{$uploadId}/{$partNumber}";
+                $partPath = $part['storagePath'];
 
                 try {
                     $partStream = $this->filesystem->readStream($partPath);
@@ -202,17 +207,21 @@ final class FlysystemBackend implements StorageBackend
 
                 $partMd5Context = hash_init('md5');
 
-                while (!feof($partStream)) {
-                    $chunk = fread($partStream, 65536);
-                    if ($chunk === false || $chunk === '') {
-                        break;
-                    }
-                    $calculator->update($chunk);
-                    hash_update($partMd5Context, $chunk);
-                    $size += strlen($chunk);
-                    self::writeAll($outHandle, $chunk);
+                try {
+                    self::consumeResource($partStream, function (string $chunk) use (
+                        $calculator,
+                        $partMd5Context,
+                        $outHandle,
+                        &$size,
+                    ): void {
+                        $calculator->update($chunk);
+                        hash_update($partMd5Context, $chunk);
+                        $size += strlen($chunk);
+                        self::writeAll($outHandle, $chunk);
+                    });
+                } finally {
+                    fclose($partStream);
                 }
-                fclose($partStream);
 
                 $partMd5s .= hex2bin(hash_final($partMd5Context));
             }
@@ -268,49 +277,54 @@ final class FlysystemBackend implements StorageBackend
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
         try {
-            $srcStream = $this->filesystem->readStream($srcPath);
+            if (! $this->filesystem->fileExists($srcPath)) {
+                throw new NoSuchKeyException();
+            }
+        } catch (NoSuchKeyException $error) {
+            throw $error;
         } catch (\Throwable) {
             throw new NoSuchKeyException();
+        }
+
+        $storagePath = $this->objectPath($dstBucket, $dstKey);
+
+        try {
+            $this->filesystem->copy($srcPath, $storagePath);
+        } catch (\Throwable $error) {
+            try {
+                $this->filesystem->delete($storagePath);
+            } catch (\Throwable) {
+            }
+
+            throw new InternalErrorException('Failed to copy object in Flysystem backend: ' . $error->getMessage(), $error);
         }
 
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        $tmpFile = $this->createTempFile('s3copy_');
-        $tmpStream = fopen($tmpFile, 'w+b');
-        if ($tmpStream === false) {
-            fclose($srcStream);
-            @unlink($tmpFile);
-            throw new InternalErrorException('Failed to open temp stream.');
-        }
-
         try {
-            while (!feof($srcStream)) {
-                $chunk = fread($srcStream, 65536);
-                if ($chunk === false || $chunk === '') {
-                    break;
-                }
-                $calculator->update($chunk);
-                $size += strlen($chunk);
-                self::writeAll($tmpStream, $chunk);
-            }
-            fclose($srcStream);
-            rewind($tmpStream);
-
-            $checksums = $calculator->finalize();
-            $storagePath = $this->objectPath($dstBucket, $dstKey);
-
+            $copiedStream = $this->filesystem->readStream($storagePath);
             try {
-                $this->filesystem->writeStream($storagePath, $tmpStream);
-            } catch (\Throwable $e) {
-                throw new InternalErrorException('Failed to write copied object to Flysystem backend: ' . $e->getMessage(), $e);
+                self::consumeResource($copiedStream, static function (string $chunk) use (
+                    $calculator,
+                    &$size,
+                ): void {
+                    $calculator->update($chunk);
+                    $size += strlen($chunk);
+                });
+            } finally {
+                fclose($copiedStream);
             }
-        } finally {
-            if (is_resource($tmpStream)) {
-                fclose($tmpStream);
+        } catch (\Throwable $error) {
+            try {
+                $this->filesystem->delete($storagePath);
+            } catch (\Throwable) {
             }
-            @unlink($tmpFile);
+
+            throw new InternalErrorException('Failed to verify copied Flysystem object: ' . $error->getMessage(), $error);
         }
+
+        $checksums = $calculator->finalize();
 
         return new StorageWriteResult(
             path: $storagePath,
@@ -388,6 +402,34 @@ final class FlysystemBackend implements StorageBackend
             }
 
             $offset += $written;
+        }
+    }
+
+    /**
+     * @param resource $resource
+     * @param callable(string): void $consumer
+     */
+    private static function consumeResource($resource, callable $consumer): void
+    {
+        $emptySince = null;
+
+        while (! feof($resource)) {
+            $chunk = fread($resource, 65536);
+            if ($chunk === false) {
+                throw new \RuntimeException('Failed to read Flysystem stream.');
+            }
+            if ($chunk === '') {
+                $emptySince ??= microtime(true);
+                if (microtime(true) - $emptySince >= 30) {
+                    throw new \RuntimeException('Flysystem stream made no progress for 30 seconds.');
+                }
+
+                usleep(1000);
+                continue;
+            }
+
+            $emptySince = null;
+            $consumer($chunk);
         }
     }
 

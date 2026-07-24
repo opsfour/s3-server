@@ -54,8 +54,8 @@ final class ParallelFlysystemBackendTest extends TestCase
             $part1 = $backend->putPart('bucket', 'multipart.bin', 'upload', 1, new ReadableBuffer('abc'));
             $part2 = $backend->putPart('bucket', 'multipart.bin', 'upload', 2, new ReadableBuffer('def'));
             $assembled = $backend->assembleMultipartUpload('bucket', 'multipart.bin', 'upload', [
-                ['partNumber' => 1, 'etag' => $part1->md5Hex],
-                ['partNumber' => 2, 'etag' => $part2->md5Hex],
+                ['partNumber' => 1, 'etag' => $part1->md5Hex, 'storagePath' => $part1->path],
+                ['partNumber' => 2, 'etag' => $part2->md5Hex, 'storagePath' => $part2->path],
             ]);
             self::assertSame('abcdef', self::readAll($backend->getObjectByPath($assembled->path)));
             $backend->abortMultipartUpload('bucket', 'multipart.bin', 'upload');

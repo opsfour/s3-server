@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler\Bucket;
 
-use Amp\ByteStream;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Xml\SafeXmlParser;
 
 final class PutBucketLoggingHandler implements RequestHandler
 {
@@ -28,17 +28,9 @@ final class PutBucketLoggingHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $body = ByteStream\buffer($request->getBody());
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
 
-        try {
-            $body = preg_replace('/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?[^>]*>/i', '', $body);
-            if ($body === null) {
-                throw new \RuntimeException('Failed to sanitize XML.');
-            }
-            $element = new \SimpleXMLElement($body, LIBXML_NONET);
-        } catch (\Exception) {
-            throw new MalformedXmlException('Invalid BucketLoggingStatus XML.');
-        }
+        $element = SafeXmlParser::parse($body, 'Invalid BucketLoggingStatus XML.');
 
         if (isset($element->LoggingEnabled)) {
             $targetBucket = (string) ($element->LoggingEnabled->TargetBucket ?? '');

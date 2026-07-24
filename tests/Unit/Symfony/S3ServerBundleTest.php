@@ -11,6 +11,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -82,21 +83,42 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        self::assertInstanceOf(S3ServerConfig::class, $container->get(S3ServerConfig::class));
-        self::assertInstanceOf(MetricsCollector::class, $container->get(MetricsCollector::class));
-        self::assertInstanceOf(StorageTierRegistry::class, $container->get(StorageTierRegistry::class));
-        self::assertInstanceOf(StorageBackend::class, $container->get(StorageBackend::class));
-        self::assertInstanceOf(MetadataStore::class, $container->get(MetadataStore::class));
-        self::assertInstanceOf(CredentialProvider::class, $container->get(CredentialProvider::class));
-        self::assertInstanceOf(S3ServerRuntimeFactory::class, $container->get(S3ServerRuntimeFactory::class));
-        self::assertInstanceOf(S3ServerServeCommand::class, $container->get(S3ServerServeCommand::class));
-        self::assertInstanceOf(S3ServerCredentialsCommand::class, $container->get(S3ServerCredentialsCommand::class));
-        self::assertInstanceOf(S3ServerQuotaCommand::class, $container->get(S3ServerQuotaCommand::class));
+        self::assertInstanceOf(S3ServerConfig::class, $this->service($container, S3ServerConfig::class));
+        self::assertInstanceOf(MetricsCollector::class, $this->service($container, MetricsCollector::class));
+        self::assertInstanceOf(StorageTierRegistry::class, $this->service($container, StorageTierRegistry::class));
+        self::assertInstanceOf(StorageBackend::class, $this->service($container, StorageBackend::class));
+        self::assertInstanceOf(MetadataStore::class, $this->service($container, MetadataStore::class));
+        self::assertInstanceOf(CredentialProvider::class, $this->service($container, CredentialProvider::class));
+        self::assertInstanceOf(S3ServerRuntimeFactory::class, $this->service($container, S3ServerRuntimeFactory::class));
+        self::assertInstanceOf(S3ServerServeCommand::class, $this->service($container, S3ServerServeCommand::class));
+        self::assertInstanceOf(S3ServerCredentialsCommand::class, $this->service($container, S3ServerCredentialsCommand::class));
+        self::assertInstanceOf(S3ServerQuotaCommand::class, $this->service($container, S3ServerQuotaCommand::class));
 
-        $config = $container->get(S3ServerConfig::class);
+        $config = $this->service($container, S3ServerConfig::class);
         self::assertSame('0.0.0.0', $config->host);
         self::assertSame(9000, $config->port);
         self::assertSame('us-east-1', $config->region);
+        self::assertTrue($config->enforceMinPartSize);
+    }
+
+    public function test_default_configuration_does_not_expose_known_memory_credentials(): void
+    {
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => [
+                'driver' => 'memory',
+                'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
+            ],
+            'metadata' => [
+                'path' => ':memory:',
+            ],
+        ]], $container);
+        $container->compile();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Memory credentials requires "access_key"');
+
+        $container->get(CredentialProvider::class);
     }
 
     public function test_config_overrides_are_applied_to_server_config(): void
@@ -109,6 +131,7 @@ final class S3ServerBundleTest extends TestCase
                 'region' => 'eu-central-1',
                 'max_connections' => 123,
                 'body_size_limit' => 456789,
+                'enforce_min_part_size' => false,
             ],
             'storage' => [
                 'driver' => 'memory',
@@ -118,17 +141,20 @@ final class S3ServerBundleTest extends TestCase
                 'path' => ':memory:',
             ],
             'parallel' => [
+                'select_workers' => 4,
                 'request_body_spool_workers' => 3,
             ],
         ]], $container);
         $container->compile();
 
-        $config = $container->get(S3ServerConfig::class);
+        $config = $this->service($container, S3ServerConfig::class);
         self::assertSame('127.0.0.1', $config->host);
         self::assertSame(9444, $config->port);
         self::assertSame('eu-central-1', $config->region);
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456789, $config->requestBodySizeLimit);
+        self::assertFalse($config->enforceMinPartSize);
+        self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
     }
 
@@ -136,7 +162,7 @@ final class S3ServerBundleTest extends TestCase
     {
         $container = $this->container();
 
-        $metadata = $container->get(MetadataStore::class);
+        $metadata = $this->service($container, MetadataStore::class);
         self::assertInstanceOf(CachedMetadataStoreDecorator::class, $metadata);
         self::assertInstanceOf(SqliteMetadataStore::class, $metadata->innerStore());
     }
@@ -164,6 +190,7 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'credentials' => $this->memoryCredentials(),
         ]], $container);
         $container->compile();
 
@@ -172,11 +199,22 @@ final class S3ServerBundleTest extends TestCase
             ['command' => 'opsfour:s3:serve'],
         ], $definition->getTag('console.command'));
 
-        $command = $container->get(S3ServerServeCommand::class);
+        $command = $this->service($container, S3ServerServeCommand::class);
         self::assertSame('opsfour:s3:serve', $command->getName());
         self::assertTrue($command->getDefinition()->hasOption('host'));
         self::assertTrue($command->getDefinition()->hasOption('port'));
         self::assertTrue($command->getDefinition()->hasOption('admin-token'));
+    }
+
+    public function test_serve_command_reports_invalid_overrides_as_failure(): void
+    {
+        $container = $this->container();
+        $tester = new CommandTester($this->service($container, S3ServerServeCommand::class));
+
+        $exit = $tester->execute(['--port' => '0']);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('Port must be between 1 and 65535', $tester->getDisplay());
     }
 
     public function test_credentials_command_manages_configured_file_provider(): void
@@ -189,7 +227,7 @@ final class S3ServerBundleTest extends TestCase
             ],
         ]);
 
-        $tester = new CommandTester($container->get(S3ServerCredentialsCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerCredentialsCommand::class));
         $exit = $tester->execute([
             'action' => 'create',
             '--owner-id' => 'account-a',
@@ -200,13 +238,13 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
         self::assertStringContainsString('Credential created successfully', $tester->getDisplay());
 
-        $tester = new CommandTester($container->get(S3ServerCredentialsCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerCredentialsCommand::class));
         $exit = $tester->execute(['action' => 'list']);
         self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
         self::assertStringContainsString('symfony-key-a', $tester->getDisplay());
         self::assertStringContainsString('account-a', $tester->getDisplay());
 
-        $tester = new CommandTester($container->get(S3ServerCredentialsCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerCredentialsCommand::class));
         $exit = $tester->execute([
             'action' => 'show',
             'access-key-id' => 'symfony-key-a',
@@ -220,7 +258,7 @@ final class S3ServerBundleTest extends TestCase
     {
         $container = $this->container();
 
-        $tester = new CommandTester($container->get(S3ServerQuotaCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
         $exit = $tester->execute([
             'action' => 'set',
             'owner-id' => 'account-a',
@@ -232,7 +270,7 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
         self::assertStringContainsString('Quota saved for owner account-a', $tester->getDisplay());
 
-        $tester = new CommandTester($container->get(S3ServerQuotaCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
         $exit = $tester->execute([
             'action' => 'show',
             'owner-id' => 'account-a',
@@ -241,12 +279,12 @@ final class S3ServerBundleTest extends TestCase
         self::assertStringContainsString('account-a', $tester->getDisplay());
         self::assertStringContainsString('4096', $tester->getDisplay());
 
-        $tester = new CommandTester($container->get(S3ServerQuotaCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
         $exit = $tester->execute(['action' => 'list']);
         self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
         self::assertStringContainsString('account-a', $tester->getDisplay());
 
-        $tester = new CommandTester($container->get(S3ServerQuotaCommand::class));
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
         $exit = $tester->execute([
             'action' => 'delete',
             'owner-id' => 'account-a',
@@ -276,7 +314,9 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        self::assertInstanceOf(FlysystemBackend::class, $container->get(StorageBackend::class));
+        $storage = $container->get(StorageBackend::class);
+        self::assertInstanceOf(ObservedStorageBackend::class, $storage);
+        self::assertInstanceOf(FlysystemBackend::class, $storage->innerBackend());
     }
 
     public function test_flysystem_worker_factory_can_reference_symfony_service(): void
@@ -303,7 +343,8 @@ final class S3ServerBundleTest extends TestCase
         $container->compile();
 
         $storage = $container->get(StorageBackend::class);
-        self::assertInstanceOf(ParallelFlysystemBackend::class, $storage);
+        self::assertInstanceOf(ObservedStorageBackend::class, $storage);
+        self::assertInstanceOf(ParallelFlysystemBackend::class, $storage->innerBackend());
         $storage->shutdown();
     }
 
@@ -344,9 +385,13 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        $tiers = $container->get(StorageTierRegistry::class);
-        self::assertInstanceOf(FlysystemBackend::class, $tiers->tier('STANDARD')->backend);
-        self::assertInstanceOf(FlysystemBackend::class, $tiers->tier('GLACIER')->backend);
+        $tiers = $this->service($container, StorageTierRegistry::class);
+        $standard = $tiers->tier('STANDARD')->backend;
+        $glacier = $tiers->tier('GLACIER')->backend;
+        self::assertInstanceOf(ObservedStorageBackend::class, $standard);
+        self::assertInstanceOf(FlysystemBackend::class, $standard->innerBackend());
+        self::assertInstanceOf(ObservedStorageBackend::class, $glacier);
+        self::assertInstanceOf(FlysystemBackend::class, $glacier->innerBackend());
         self::assertTrue($tiers->tier('GLACIER')->restoreRequired);
     }
 
@@ -364,6 +409,7 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'credentials' => $this->memoryCredentials(),
             'notifications' => [
                 'listeners' => [
                     [
@@ -375,7 +421,7 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        $listeners = $this->notificationListeners($container->get(S3ServerServeCommand::class));
+        $listeners = $this->notificationListeners($this->service($container, S3ServerServeCommand::class));
         self::assertCount(1, $listeners);
         self::assertSame('s3:ObjectCreated:*', $listeners[0]['pattern']);
         self::assertInstanceOf(RecordingSymfonyS3Listener::class, $listeners[0]['listener']);
@@ -395,6 +441,7 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'credentials' => $this->memoryCredentials(),
             'notifications' => [
                 'symfony_event_dispatcher' => [
                     'service' => 'test.event_dispatcher',
@@ -404,13 +451,17 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        $listeners = $this->notificationListeners($container->get(S3ServerServeCommand::class));
+        $listeners = $this->notificationListeners($this->service($container, S3ServerServeCommand::class));
         self::assertCount(1, $listeners);
         self::assertSame('s3:*', $listeners[0]['pattern']);
         self::assertInstanceOf(SymfonyEventDispatcherListener::class, $listeners[0]['listener']);
 
         $received = [];
-        $container->get('test.event_dispatcher')->addListener(
+        $eventDispatcher = $container->get('test.event_dispatcher');
+        if (!$eventDispatcher instanceof EventDispatcher) {
+            self::fail('Expected the configured Symfony event dispatcher service.');
+        }
+        $eventDispatcher->addListener(
             's3:ObjectCreated:Put',
             static function (S3Event $event) use (&$received): void {
                 $received[] = $event;
@@ -436,16 +487,19 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'credentials' => $this->memoryCredentials(),
             'encryption' => [
                 'service' => 'test.encryption',
             ],
         ]], $container);
         $container->compile();
 
-        self::assertSame($container->get('test.encryption'), $container->get(EncryptionServiceInterface::class));
+        $encryption = $container->get('test.encryption');
+        self::assertInstanceOf(RecordingEncryptionService::class, $encryption);
+        self::assertSame($encryption, $this->service($container, EncryptionServiceInterface::class));
         self::assertSame(
-            $container->get('test.encryption'),
-            $this->serveCommandEncryption($container->get(S3ServerServeCommand::class)),
+            $encryption,
+            $this->serveCommandEncryption($this->service($container, S3ServerServeCommand::class)),
         );
     }
 
@@ -464,14 +518,17 @@ final class S3ServerBundleTest extends TestCase
             'metadata' => [
                 'path' => ':memory:',
             ],
+            'credentials' => $this->memoryCredentials(),
             'encryption' => [
                 'master_key_provider_service' => 'test.master_key_provider',
             ],
         ]], $container);
         $container->compile();
 
-        self::assertInstanceOf(EncryptionService::class, $container->get(EncryptionServiceInterface::class));
-        self::assertInstanceOf(EncryptionService::class, $this->serveCommandEncryption($container->get(S3ServerServeCommand::class)));
+        self::assertInstanceOf(EncryptionService::class, $this->service($container, EncryptionServiceInterface::class));
+        self::assertInstanceOf(EncryptionService::class, $this->serveCommandEncryption(
+            $this->service($container, S3ServerServeCommand::class),
+        ));
     }
 
     public function test_invalid_config_fails_during_extension_load(): void
@@ -526,6 +583,33 @@ final class S3ServerBundleTest extends TestCase
         $this->cleanupPaths[] = $path;
 
         return $path;
+    }
+
+    /**
+     * @template T of object
+     * @param class-string<T> $id
+     * @return T
+     */
+    private function service(ContainerBuilder $container, string $id): object
+    {
+        $service = $container->get($id);
+        if (!$service instanceof $id) {
+            self::fail("Container service {$id} did not resolve to the expected type.");
+        }
+
+        return $service;
+    }
+
+    /** @return array<string, string> */
+    private function memoryCredentials(): array
+    {
+        return [
+            'driver' => 'memory',
+            'access_key' => 'symfonyAccessKey',
+            'secret_key' => 'symfonySecretKey',
+            'owner_id' => 'symfony-owner',
+            'display_name' => 'Symfony Owner',
+        ];
     }
 
     /**

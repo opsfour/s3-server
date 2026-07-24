@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Lifecycle;
 
 use Amp\ByteStream\ReadableBuffer;
 use OpsFour\S3Server\Event\S3Event;
+use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
@@ -157,6 +158,28 @@ final class LifecycleExecutorTest extends TestCase
 
         $this->assertNull($this->metadata->getMultipartUpload($expiredUploadId));
         $this->assertNotNull($this->metadata->getMultipartUpload($keptUploadId));
+    }
+
+    public function test_global_multipart_max_age_uses_exact_seconds_without_lifecycle_rules(): void
+    {
+        $this->createBucket('bucket');
+        $uploadId = $this->createMultipartUploadWithPart('bucket', 'stale.bin');
+        $this->sql(
+            'UPDATE s3_multipart_uploads SET created_at = ? WHERE upload_id = ?',
+            [
+                (new \DateTimeImmutable('-2 seconds', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s\Z'),
+                $uploadId,
+            ],
+        );
+
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            multipartMaxAgeSeconds: 1,
+        );
+        $executor->processBucket('bucket');
+
+        self::assertNull($this->metadata->getMultipartUpload($uploadId));
     }
 
     public function test_expiration_tag_filter_deletes_only_matching_objects(): void
@@ -362,6 +385,43 @@ final class LifecycleExecutorTest extends TestCase
         $rendered = $metrics->renderPrometheus();
         $this->assertStringContainsString('s3_server_lifecycle_sweeps_total{status="completed"} 1', $rendered);
         $this->assertStringContainsString('s3_server_lifecycle_actions_total{action="expire_current"} 1', $rendered);
+    }
+
+    public function test_lease_renewal_aborts_after_lock_ownership_is_lost(): void
+    {
+        self::assertTrue($this->metadata->acquireLock('lifecycle:global', 'node-a', 1));
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            lockTtlSeconds: 1,
+            lockOwnerId: 'node-a',
+        );
+
+        $reflection = new \ReflectionClass($executor);
+        $reflection->getProperty('leaseHeld')->setValue($executor, true);
+        $reflection->getProperty('lastLeaseRenewal')->setValue($executor, 0.0);
+        $this->sql(
+            'UPDATE s3_locks SET expires_at = ? WHERE lock_name = ?',
+            ['2000-01-01T00:00:00Z', 'lifecycle:global'],
+        );
+        self::assertTrue($this->metadata->acquireLock('lifecycle:global', 'node-b', 60));
+
+        $this->expectException(OperationAbortedException::class);
+        $reflection->getMethod('renewLeaseIfNeeded')->invoke($executor);
+    }
+
+    public function test_shutdown_request_cancels_sweep_before_acquiring_global_lease(): void
+    {
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            lockOwnerId: 'node-a',
+        );
+
+        $executor->requestStop();
+        $executor->execute();
+
+        self::assertTrue($this->metadata->acquireLock('lifecycle:global', 'node-b', 60));
     }
 
     public function test_lifecycle_action_logs_include_structured_context(): void
@@ -642,8 +702,18 @@ final class LifecycleExecutorTest extends TestCase
     private function tierTransitionJobs(): array
     {
         $stmt = $this->pdo()->query('SELECT * FROM s3_tier_transition_jobs ORDER BY id ASC');
+        if ($stmt === false) {
+            return [];
+        }
 
-        return $stmt !== false ? $stmt->fetchAll(\PDO::FETCH_ASSOC) : [];
+        $result = [];
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            if (is_array($row)) {
+                $result[] = $row;
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -660,8 +730,12 @@ final class LifecycleExecutorTest extends TestCase
         $reflection = new \ReflectionClass($this->metadata);
         $method = $reflection->getMethod('connection');
         $method->setAccessible(true);
-        /** @var \PDO $pdo */
-        return $method->invoke($this->metadata);
+        $connection = $method->invoke($this->metadata);
+        if (! $connection instanceof \PDO) {
+            throw new \RuntimeException('SQLite metadata test connection is unavailable.');
+        }
+
+        return $connection;
     }
 
     private function past(int $days): string

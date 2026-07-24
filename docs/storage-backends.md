@@ -27,6 +27,29 @@ Stores objects via the [League\Flysystem](https://flysystem.thephpleague.com/) a
 S3_STORAGE_DRIVER=flysystem
 ```
 
+### Standalone S3-Compatible Backend
+
+The standalone CLI can construct the bundled serializable S3-compatible worker
+factory directly from environment variables:
+
+```bash
+S3_STORAGE_DRIVER=flysystem
+S3_STORAGE_TEMP_DIR=/var/lib/opsfour-s3/tmp
+S3_FLYSYSTEM_WORKERS=8
+S3_BACKING_BUCKET=backing-bucket
+S3_BACKING_REGION=eu-central-1
+S3_BACKING_ACCESS_KEY=change-me
+S3_BACKING_SECRET_KEY=change-me
+S3_BACKING_ENDPOINT=https://eu-central-1.linodeobjects.com
+S3_BACKING_PATH_STYLE=true
+S3_BACKING_PREFIX=production
+```
+
+Standalone Flysystem mode rejects `S3_FLYSYSTEM_WORKERS=0` because synchronous
+remote calls would block the Amp event loop. It never creates
+`S3_STORAGE_PATH`; only `S3_STORAGE_TEMP_DIR` and an optional local SQLite
+metadata path are created locally.
+
 ### Programmatic Setup
 
 For development and low-concurrency use, Flysystem accepts a configured

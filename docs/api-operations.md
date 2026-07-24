@@ -1,6 +1,9 @@
 # API Operations
 
-OpsFour S3 Server implements 66 S3 API operations. All operations use standard AWS S3 request/response formats and work with any S3-compatible client.
+OpsFour S3 Server implements 66 S3 API operations using standard AWS S3
+request/response formats. Compatibility is limited to the documented operation
+and policy subset; AWS-specific control-plane services such as KMS and STS are
+not implied.
 
 ## Bucket Operations
 
@@ -16,7 +19,7 @@ OpsFour S3 Server implements 66 S3 API operations. All operations use standard A
 
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
-| PutObject | `PUT` | `/{bucket}/{key}` | Upload an object |
+| PutObject | `PUT` | `/{bucket}/{key}` | Upload an object, including signed or unsigned `aws-chunked` checksum trailers |
 | GetObject | `GET` | `/{bucket}/{key}` | Download an object (supports Range headers) |
 | HeadObject | `HEAD` | `/{bucket}/{key}` | Get object metadata without body |
 | DeleteObject | `DELETE` | `/{bucket}/{key}` | Delete an object (or create delete marker) |
@@ -37,7 +40,7 @@ OpsFour S3 Server implements 66 S3 API operations. All operations use standard A
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
 | CreateMultipartUpload | `POST` | `/{bucket}/{key}?uploads` | Initiate multipart upload |
-| UploadPart | `PUT` | `/{bucket}/{key}?uploadId=...&partNumber=...` | Upload a part |
+| UploadPart | `PUT` | `/{bucket}/{key}?uploadId=...&partNumber=...` | Upload a part, including signed or unsigned `aws-chunked` checksum trailers |
 | UploadPartCopy | `PUT` | `/{bucket}/{key}?uploadId=...&partNumber=...` | Copy a part from existing object |
 | CompleteMultipartUpload | `POST` | `/{bucket}/{key}?uploadId=...` | Complete and assemble parts |
 | AbortMultipartUpload | `DELETE` | `/{bucket}/{key}?uploadId=...` | Cancel and clean up parts |
@@ -168,6 +171,15 @@ See [S3 Select](s3-select.md) for SQL syntax.
 |-----------|--------|------|-------------|
 | GetObjectAttributes | `GET` | `/{bucket}/{key}?attributes` | Get checksum and part info |
 | HealthCheck | `GET` | `/.health` | Server health probe, not counted as an S3 API operation |
+
+## Unsupported AWS-Specific APIs
+
+The exhaustive classification in `tests/Support/aws-s3-operations.php` is
+checked against every operation exposed by the installed AWS SDK. AWS-specific
+control-plane features remain outside this server's compatibility target,
+including S3 Express sessions, metadata tables, object annotations and
+annotation tables, Object Lambda, replication, inventory/analytics
+configuration, request-payer configuration, and Torrent.
 
 ## Error Responses
 

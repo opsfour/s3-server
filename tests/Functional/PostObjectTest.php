@@ -64,6 +64,45 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
     }
 
+    public function test_sigv4_form_rejects_impossible_calendar_date(): void
+    {
+        $response = $this->postV4(
+            key: 'invalid-date.txt',
+            filename: 'invalid-date.txt',
+            body: 'must not be written',
+            dateTime: '20260231T120000Z',
+        );
+
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+    }
+
+    public function test_sigv4_form_rejects_impossible_policy_expiration(): void
+    {
+        $response = $this->postV4(
+            key: 'invalid-policy-expiration.txt',
+            filename: 'invalid-policy-expiration.txt',
+            body: 'must not be written',
+            policyExpiration: '2030-02-31T12:00:00.000Z',
+        );
+
+        $this->assertSame(400, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+    }
+
+    public function test_sigv4_form_rejects_policy_expiration_with_trailing_data(): void
+    {
+        $response = $this->postV4(
+            key: 'invalid-policy-trailer.txt',
+            filename: 'invalid-policy-trailer.txt',
+            body: 'must not be written',
+            policyExpiration: gmdate('Y-m-d\TH:i:s\Z', time() + 300) . ' trailing-data',
+        );
+
+        $this->assertSame(400, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+    }
+
     public function test_anonymous_form_is_allowed_by_public_write_acl(): void
     {
         self::$s3->putBucketAcl([
@@ -133,9 +172,15 @@ final class PostObjectTest extends S3FunctionalTestCase
      * @param resource|string $body
      * @param array<string, string> $extraFields
      */
-    private function postV4(string $key, string $filename, mixed $body, array $extraFields = []): \Psr\Http\Message\ResponseInterface
-    {
-        $dateTime = gmdate('Ymd\THis\Z');
+    private function postV4(
+        string $key,
+        string $filename,
+        mixed $body,
+        array $extraFields = [],
+        ?string $dateTime = null,
+        ?string $policyExpiration = null,
+    ): \Psr\Http\Message\ResponseInterface {
+        $dateTime ??= gmdate('Ymd\THis\Z');
         $date = substr($dateTime, 0, 8);
         $credential = self::$accessKey . "/{$date}/us-east-1/s3/aws4_request";
 
@@ -159,7 +204,7 @@ final class PostObjectTest extends S3FunctionalTestCase
         }
 
         $policy = base64_encode(json_encode([
-            'expiration' => gmdate('Y-m-d\TH:i:s\Z', time() + 300),
+            'expiration' => $policyExpiration ?? gmdate('Y-m-d\TH:i:s\Z', time() + 300),
             'conditions' => $conditions,
         ], JSON_THROW_ON_ERROR));
         $signature = hash_hmac(

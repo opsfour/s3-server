@@ -185,7 +185,7 @@ final class PostObjectFormParser
             || $scope[2] !== $this->region
             || $scope[3] !== 's3'
             || $scope[4] !== 'aws4_request'
-            || !preg_match('/^\d{8}T\d{6}Z$/', $dateTime)
+            || !self::isValidAmzDate($dateTime)
             || !str_starts_with($dateTime, $scope[1])) {
             throw new AccessDeniedException('Invalid POST credential scope.');
         }
@@ -198,6 +198,25 @@ final class PostObjectFormParser
         }
 
         return $credential;
+    }
+
+    private static function isValidAmzDate(string $dateTime): bool
+    {
+        if (!preg_match('/^\d{8}T\d{6}Z$/', $dateTime)) {
+            return false;
+        }
+
+        $year = (int) substr($dateTime, 0, 4);
+        $month = (int) substr($dateTime, 4, 2);
+        $day = (int) substr($dateTime, 6, 2);
+        $hour = (int) substr($dateTime, 9, 2);
+        $minute = (int) substr($dateTime, 11, 2);
+        $second = (int) substr($dateTime, 13, 2);
+
+        return checkdate($month, $day, $year)
+            && $hour <= 23
+            && $minute <= 59
+            && $second <= 59;
     }
 
     private function credential(string $accessKeyId, ?string $sessionToken): Credential

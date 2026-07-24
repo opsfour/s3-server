@@ -142,7 +142,7 @@ ecosystem conveniences.
 
 ## Production Verification
 
-- [x] Full PHPUnit suite: `538 tests, 2259 assertions, 5 skipped`.
+- [x] Full PHPUnit suite: `745 tests, 3287 assertions, 9 skipped`.
 - [x] Composer metadata validation passes.
 - [x] Targeted Symfony unit and functional tests pass.
 - [x] Existing AWS SDK functional tests continue to exercise the shared runtime

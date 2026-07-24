@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class SqliteSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 11;
+    public const int VERSION = 14;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -226,13 +226,14 @@ final class SqliteSchema
             resource_type TEXT NOT NULL,
             bucket TEXT NOT NULL,
             key_name TEXT,
+            version_id TEXT NOT NULL DEFAULT 'null',
             tag_key TEXT NOT NULL,
             tag_value TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-            UNIQUE(resource_type, bucket, key_name, tag_key)
+            UNIQUE(resource_type, bucket, key_name, version_id, tag_key)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_s3_tagging_resource ON s3_tagging(resource_type, bucket, key_name);
+        CREATE INDEX IF NOT EXISTS idx_s3_tagging_resource ON s3_tagging(resource_type, bucket, key_name, version_id);
 
         CREATE TABLE IF NOT EXISTS s3_policies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -27,7 +27,7 @@ final class PutBucketWebsiteHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseWebsiteConfiguration($body);
 
         $this->metadata->putBucketWebsite(

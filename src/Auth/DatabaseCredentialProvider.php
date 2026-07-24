@@ -7,33 +7,48 @@ namespace OpsFour\S3Server\Auth;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 
 /**
- * PDO-backed credential store with in-memory cache.
+ * PDO-backed credential store with a bounded-staleness in-memory cache.
  *
- * Manages its own `s3_credentials` table. The cache is populated on
- * first access and invalidated on writes. PDO is used (not amphp)
- * because credential lookups are cached and DB hits are infrequent.
- *
- * To avoid any blocking during request handling, call listCredentials()
- * at startup to preload all credentials into the in-memory cache.
+ * Manages its own `s3_credentials` table. Positive lookups may be cached for
+ * a short, configurable period. Expired entries are always re-read so
+ * revocation and rotation performed by another server node become visible.
  */
 final class DatabaseCredentialProvider implements CredentialProvider
 {
+    private const int DEFAULT_MAX_CACHE_ENTRIES = 10_000;
+
     /** @var array<string, Credential> In-memory cache keyed by accessKeyId. */
     private array $cache = [];
 
+    /** @var array<string, int> Monotonic expiry timestamps in nanoseconds. */
+    private array $cacheExpiresAt = [];
+
     public function __construct(
         private readonly \PDO $pdo,
-    ) {}
+        private readonly float $cacheTtlSeconds = 1.0,
+        private readonly int $maxCacheEntries = self::DEFAULT_MAX_CACHE_ENTRIES,
+    ) {
+        if ($cacheTtlSeconds < 0.0) {
+            throw new \InvalidArgumentException('Credential cache TTL must be >= 0 seconds.');
+        }
+        if ($maxCacheEntries < 1) {
+            throw new \InvalidArgumentException('Credential cache entry limit must be >= 1.');
+        }
+    }
 
-    public static function fromDsn(string $dsn): self
-    {
-        $pdo = new \PDO($dsn, null, null, [
+    public static function fromDsn(
+        string $dsn,
+        ?string $username = null,
+        ?string $password = null,
+        float $cacheTtlSeconds = 1.0,
+    ): self {
+        $pdo = new \PDO($dsn, $username, $password, [
             \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
             \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
             \PDO::ATTR_EMULATE_PREPARES => false,
         ]);
 
-        $provider = new self($pdo);
+        $provider = new self($pdo, $cacheTtlSeconds);
         $provider->initialize();
 
         return $provider;
@@ -67,9 +82,13 @@ final class DatabaseCredentialProvider implements CredentialProvider
 
     public function getCredential(string $accessKeyId): ?Credential
     {
-        if (isset($this->cache[$accessKeyId])) {
+        if (
+            isset($this->cache[$accessKeyId], $this->cacheExpiresAt[$accessKeyId])
+            && $this->cacheExpiresAt[$accessKeyId] > hrtime(true)
+        ) {
             return $this->cache[$accessKeyId];
         }
+        unset($this->cache[$accessKeyId], $this->cacheExpiresAt[$accessKeyId]);
 
         $stmt = $this->pdo->prepare(
             'SELECT access_key_id, secret_access_key, owner_id, display_name, is_active, session_token, expires_at, policy_names, allowed_prefixes FROM s3_credentials WHERE access_key_id = ?',
@@ -81,19 +100,8 @@ final class DatabaseCredentialProvider implements CredentialProvider
             return null;
         }
 
-        $credential = new Credential(
-            accessKeyId: $row['access_key_id'],
-            secretAccessKey: $row['secret_access_key'],
-            ownerId: $row['owner_id'],
-            displayName: $row['display_name'],
-            isActive: (bool) $row['is_active'],
-            sessionToken: $row['session_token'] !== null ? (string) $row['session_token'] : null,
-            expiresAt: $row['expires_at'] !== null ? new \DateTimeImmutable((string) $row['expires_at']) : null,
-            policyNames: self::jsonStringList($row['policy_names'] ?? null),
-            allowedPrefixes: self::jsonStringList($row['allowed_prefixes'] ?? null),
-        );
-
-        $this->cache[$accessKeyId] = $credential;
+        $credential = self::credentialFromRow($row);
+        $this->cacheCredential($credential);
 
         return $credential;
     }
@@ -111,19 +119,9 @@ final class DatabaseCredentialProvider implements CredentialProvider
         $credentials = [];
 
         while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-            $credential = new Credential(
-                accessKeyId: $row['access_key_id'],
-                secretAccessKey: $row['secret_access_key'],
-                ownerId: $row['owner_id'],
-                displayName: $row['display_name'],
-                isActive: (bool) $row['is_active'],
-                sessionToken: $row['session_token'] !== null ? (string) $row['session_token'] : null,
-                expiresAt: $row['expires_at'] !== null ? new \DateTimeImmutable((string) $row['expires_at']) : null,
-                policyNames: self::jsonStringList($row['policy_names'] ?? null),
-                allowedPrefixes: self::jsonStringList($row['allowed_prefixes'] ?? null),
-            );
+            $credential = self::credentialFromRow($row);
             $credentials[] = $credential;
-            $this->cache[$credential->accessKeyId] = $credential;
+            $this->cacheCredential($credential);
         }
 
         return $credentials;
@@ -146,7 +144,8 @@ final class DatabaseCredentialProvider implements CredentialProvider
                     session_token = VALUES(session_token),
                     expires_at = VALUES(expires_at),
                     policy_names = VALUES(policy_names),
-                    allowed_prefixes = VALUES(allowed_prefixes)
+                    allowed_prefixes = VALUES(allowed_prefixes),
+                    updated_at = CURRENT_TIMESTAMP
                 SQL;
         } else {
             $sql = <<<'SQL'
@@ -160,7 +159,8 @@ final class DatabaseCredentialProvider implements CredentialProvider
                     session_token = excluded.session_token,
                     expires_at = excluded.expires_at,
                     policy_names = excluded.policy_names,
-                    allowed_prefixes = excluded.allowed_prefixes
+                    allowed_prefixes = excluded.allowed_prefixes,
+                    updated_at = CURRENT_TIMESTAMP
                 SQL;
         }
 
@@ -177,7 +177,7 @@ final class DatabaseCredentialProvider implements CredentialProvider
             json_encode($credential->allowedPrefixes, JSON_THROW_ON_ERROR),
         ]);
 
-        $this->cache[$credential->accessKeyId] = $credential;
+        $this->cacheCredential($credential);
     }
 
     public function deleteCredential(string $accessKeyId): void
@@ -185,7 +185,7 @@ final class DatabaseCredentialProvider implements CredentialProvider
         $stmt = $this->pdo->prepare('DELETE FROM s3_credentials WHERE access_key_id = ?');
         $stmt->execute([$accessKeyId]);
 
-        unset($this->cache[$accessKeyId]);
+        unset($this->cache[$accessKeyId], $this->cacheExpiresAt[$accessKeyId]);
     }
 
     private function addColumnIfMissing(string $column, string $definition): void
@@ -232,5 +232,72 @@ final class DatabaseCredentialProvider implements CredentialProvider
         }
 
         return array_values(array_filter($decoded, is_string(...)));
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private static function credentialFromRow(array $row): Credential
+    {
+        return new Credential(
+            accessKeyId: (string) $row['access_key_id'],
+            secretAccessKey: (string) $row['secret_access_key'],
+            ownerId: (string) $row['owner_id'],
+            displayName: (string) $row['display_name'],
+            isActive: self::databaseBoolean($row['is_active']),
+            sessionToken: $row['session_token'] !== null ? (string) $row['session_token'] : null,
+            expiresAt: $row['expires_at'] !== null ? new \DateTimeImmutable((string) $row['expires_at']) : null,
+            policyNames: self::jsonStringList($row['policy_names'] ?? null),
+            allowedPrefixes: self::jsonStringList($row['allowed_prefixes'] ?? null),
+        );
+    }
+
+    private static function databaseBoolean(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                '0', 'f', 'false', 'no', 'off', '' => false,
+                default => throw new \UnexpectedValueException('Credential is_active contains an invalid boolean value.'),
+            };
+        }
+
+        throw new \UnexpectedValueException('Credential is_active contains an invalid boolean value.');
+    }
+
+    private function cacheCredential(Credential $credential): void
+    {
+        if ($this->cacheTtlSeconds <= 0.0) {
+            return;
+        }
+
+        if (! isset($this->cache[$credential->accessKeyId]) && count($this->cache) >= $this->maxCacheEntries) {
+            $this->evictExpiredCacheEntries(hrtime(true));
+            if (count($this->cache) >= $this->maxCacheEntries) {
+                $oldest = array_key_first($this->cache);
+                if ($oldest !== null) {
+                    unset($this->cache[$oldest], $this->cacheExpiresAt[$oldest]);
+                }
+            }
+        }
+
+        $this->cache[$credential->accessKeyId] = $credential;
+        $this->cacheExpiresAt[$credential->accessKeyId] = hrtime(true)
+            + (int) ceil($this->cacheTtlSeconds * 1_000_000_000);
+    }
+
+    private function evictExpiredCacheEntries(int $now): void
+    {
+        foreach ($this->cacheExpiresAt as $accessKeyId => $expiresAt) {
+            if ($expiresAt <= $now) {
+                unset($this->cache[$accessKeyId], $this->cacheExpiresAt[$accessKeyId]);
+            }
+        }
     }
 }

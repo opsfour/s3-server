@@ -11,8 +11,8 @@ use Amp\Http\Client\Request;
 /**
  * Reads master keys from HashiCorp Vault (KV v2 engine).
  *
- * Multi-key format: Vault secret contains a "keys" field with JSON map {keyId: base64Key}.
- * First key in the map is active.
+ * Multi-key format: Vault secret contains a "keys" field with JSON map
+ * {keyId: base64Key} and an "activeKeyId" field.
  *
  * Legacy single-key format: Vault secret contains a single base64 key in the configured field.
  *
@@ -53,22 +53,37 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         $path = $vaultPath ?? (getenv('S3_VAULT_PATH') ?: 'secret/data/s3-server/master-key');
         $field = $keyField ?? (getenv('S3_VAULT_KEY_FIELD') ?: 'key');
 
-        $client = $httpClient ?? HttpClientBuilder::buildDefault();
+        // Never follow redirects with the Vault token attached. In particular,
+        // HTTPS must not redirect the secret header to plaintext HTTP.
+        $client = $httpClient ?? (new HttpClientBuilder())
+            ->followRedirects(0)
+            ->build();
 
         $url = rtrim($addr, '/') . '/v1/' . ltrim($path, '/');
         $request = new Request($url, 'GET');
         $request->setHeader('X-Vault-Token', $token);
 
-        $response = $client->request($request);
-        $body = $response->getBody()->buffer();
+        try {
+            $response = $client->request($request);
+            $body = $response->getBody()->buffer(limit: 1_048_576);
+        } catch (\Throwable $e) {
+            throw new \RuntimeException("Unable to read master keys from Vault path '{$path}'.", 0, $e);
+        }
         $statusCode = $response->getStatus();
 
         if ($statusCode !== 200) {
-            throw new \RuntimeException("Vault returned HTTP {$statusCode} for path '{$path}': {$body}");
+            throw new \RuntimeException("Vault returned HTTP {$statusCode} for path '{$path}'.");
         }
 
-        $data = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
-        $secretData = $data['data']['data'] ?? [];
+        try {
+            $data = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new \RuntimeException("Vault returned invalid JSON for path '{$path}'.", 0, $e);
+        }
+        $secretData = is_array($data) ? ($data['data']['data'] ?? null) : null;
+        if (! is_array($secretData)) {
+            throw new \RuntimeException("Vault response for path '{$path}' does not contain KV v2 secret data.");
+        }
 
         // Try multi-key format first: "keys" field with JSON map.
         $keysField = $secretData['keys'] ?? null;
@@ -79,6 +94,9 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         if (is_array($keysField) && $keysField !== []) {
             $keys = [];
             foreach ($keysField as $keyId => $b64) {
+                if (! is_string($keyId) || $keyId === '' || strlen($keyId) > 255 || ! is_string($b64)) {
+                    throw new \RuntimeException('Vault master key IDs must contain between 1 and 255 bytes and map to strings.');
+                }
                 $decoded = base64_decode($b64, true);
                 if ($decoded === false || strlen($decoded) !== 32) {
                     throw new \RuntimeException("Master key '{$keyId}' from Vault must be exactly 32 bytes base64-encoded.");
@@ -86,8 +104,16 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
                 $keys[(string) $keyId] = $decoded;
             }
 
+            $activeKeyId = $secretData['activeKeyId'] ?? null;
+            if (! is_string($activeKeyId) || $activeKeyId === '') {
+                throw new \RuntimeException("Active master key ID field 'activeKeyId' is missing from Vault secret at '{$path}'.");
+            }
+            if (! isset($keys[$activeKeyId])) {
+                throw new \RuntimeException("Active Vault master key ID '{$activeKeyId}' does not exist in the keys map.");
+            }
+
             $this->keys = $keys;
-            $this->activeKeyId = array_key_first($keys);
+            $this->activeKeyId = $activeKeyId;
 
             return;
         }

@@ -12,6 +12,7 @@ use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class RestoreExecutorTest extends TestCase
@@ -156,6 +157,47 @@ final class RestoreExecutorTest extends TestCase
         self::assertSame('new-hot', \Amp\ByteStream\buffer($hot->getObjectByPath($object->systemMetadata['storagePath'])));
     }
 
+    public function test_overwrite_during_physical_restore_does_not_attach_old_restore_copy(): void
+    {
+        $hot = new InMemoryBackend();
+        $cold = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $cold->createBucket('bucket');
+
+        $old = $cold->putObject('bucket', 'racing.bin', new ReadableBuffer('old-cold'));
+        $this->metadata->putObjectMetadata('bucket', 'racing.bin', 'owner', $old->size, '"' . $old->md5Hex . '"', 'application/octet-stream', $old->path);
+        $this->metadata->updateObjectPlacement('bucket', 'racing.bin', null, 'GLACIER', 'GLACIER', $old->path);
+        $jobId = $this->metadata->enqueueRestoreJob('bucket', 'racing.bin', null, 'GLACIER', $old->path, 2);
+        $this->metadata->updateObjectRestoreState('bucket', 'racing.bin', null, 'pending');
+
+        $target = new CallbackStorageBackend($hot, afterPut: function () use ($hot): void {
+            $new = $hot->putObject('bucket', 'racing.bin', new ReadableBuffer('new-hot'));
+            $this->metadata->putObjectMetadata('bucket', 'racing.bin', 'owner', $new->size, '"' . $new->md5Hex . '"', 'application/octet-stream', $new->path);
+        });
+        $executor = new RestoreExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $target, defaultWriteTier: true),
+            new StorageTier('GLACIER', $cold, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+
+        $job = $this->metadata->getRestoreJob($jobId);
+        $object = $this->metadata->getObjectMetadata('bucket', 'racing.bin');
+        self::assertNotNull($job);
+        self::assertSame('completed', $job['status']);
+        self::assertNotNull($object);
+        self::assertNull($object->restoreStatus);
+        self::assertNull($object->restoredStoragePath);
+        self::assertSame('new-hot', \Amp\ByteStream\buffer($hot->getObjectByPath($object->systemMetadata['storagePath'])));
+        self::assertNotNull($target->lastWrite);
+
+        $this->expectException(\OpsFour\S3Server\Exception\NoSuchKeyException::class);
+        $hot->getObjectByPath($target->lastWrite->path)->read();
+    }
+
     public function test_deleted_object_restore_job_is_completed_as_stale_noop(): void
     {
         $hot = new InMemoryBackend();
@@ -181,5 +223,65 @@ final class RestoreExecutorTest extends TestCase
         self::assertNotNull($job);
         self::assertSame('completed', $job['status']);
         self::assertNull($this->metadata->getObjectMetadata('bucket', 'deleted.bin'));
+    }
+
+    public function test_lost_processing_lease_cannot_attach_or_reopen_completed_restore_job(): void
+    {
+        $hot = new InMemoryBackend();
+        $cold = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $cold->createBucket('bucket');
+
+        $source = $cold->putObject('bucket', 'lease.bin', new ReadableBuffer('cold-data'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'lease.bin',
+            'owner',
+            $source->size,
+            '"' . $source->md5Hex . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'lease.bin', null, 'GLACIER', 'GLACIER', $source->path);
+        $jobId = $this->metadata->enqueueRestoreJob('bucket', 'lease.bin', null, 'GLACIER', $source->path, 1);
+        $target = new CallbackStorageBackend(
+            $hot,
+            afterPut: fn() => $this->metadata->updateRestoreJobStatus(
+                $jobId,
+                'completed',
+                incrementAttempts: false,
+            ),
+        );
+        $executor = new RestoreExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $target, defaultWriteTier: true),
+            new StorageTier('GLACIER', $cold, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+
+        $job = $this->metadata->getRestoreJob($jobId);
+        $object = $this->metadata->getObjectMetadata('bucket', 'lease.bin');
+        self::assertNotNull($job);
+        self::assertSame('completed', $job['status']);
+        self::assertSame(0, $job['attempts']);
+        self::assertNotNull($object);
+        self::assertNull($object->restoredStoragePath);
+    }
+
+    public function test_cancelled_batch_does_not_claim_another_restore_job(): void
+    {
+        $storage = new InMemoryBackend();
+        $cancellation = new \Amp\DeferredCancellation();
+        $cancellation->cancel();
+        $executor = new RestoreExecutor(
+            $this->metadata,
+            StorageTierRegistry::single($storage),
+        );
+
+        $this->expectException(\Amp\CancelledException::class);
+        $executor->processNext(10, $cancellation->getCancellation());
     }
 }

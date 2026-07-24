@@ -54,6 +54,9 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
     // Assertion helpers
     // -----------------------------------------------------------------
 
+    /**
+     * @param array{Grantee: array{Type: string, ID: string}, Permission: string} $grant
+     */
     private function assertOwnerFullControl(array $grant): void
     {
         $this->assertSame('CanonicalUser', $grant['Grantee']['Type']);
@@ -61,6 +64,9 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
         $this->assertSame('FULL_CONTROL', $grant['Permission']);
     }
 
+    /**
+     * @param array{Grantee: array{Type: string, URI: string}, Permission: string} $grant
+     */
     private function assertGroupGrant(array $grant, string $uri, string $permission): void
     {
         $this->assertSame('Group', $grant['Grantee']['Type']);
@@ -68,6 +74,9 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
         $this->assertSame($permission, $grant['Permission']);
     }
 
+    /**
+     * @param Result<mixed> $result
+     */
     private function assertOwnerIdInResult(Result $result): void
     {
         $this->assertSame(self::OWNER_ID, $result['Owner']['ID']);

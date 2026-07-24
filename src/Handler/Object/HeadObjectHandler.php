@@ -9,11 +9,13 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidRangeException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -73,6 +75,16 @@ final class HeadObjectHandler implements RequestHandler
             throw (new NoSuchKeyException())->withExtraHeaders($dmHeaders);
         }
 
+        $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        $customerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $sseAlgo === 'SSE-C',
+            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+        );
+        if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
+            throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
+        }
+
         // 3. Evaluate conditional headers.
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo);
 
@@ -82,6 +94,7 @@ final class HeadObjectHandler implements RequestHandler
         $rangeHeader = $request->getHeader('range');
         $contentLength = $objectInfo->size;
         $status = 200;
+        $range = null;
 
         if ($rangeHeader !== null && $objectInfo->size > 0) {
             $range = self::parseRangeHeader($rangeHeader, $objectInfo->size);
@@ -95,7 +108,7 @@ final class HeadObjectHandler implements RequestHandler
         // 5. Build response headers (same as GetObject, no body).
         $headers = S3ResponseHeaders::build($objectInfo, $contentLength);
 
-        if ($status === 206 && isset($range)) {
+        if ($status === 206 && $range !== null) {
             $headers['Content-Range'] = sprintf(
                 'bytes %d-%d/%d',
                 $range['start'],

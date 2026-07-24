@@ -61,12 +61,15 @@ final class PostgresMetadataStore implements MetadataStore
             // Table doesn't exist yet.
         }
 
-        foreach (PostgresSchema::getCreateStatements() as $sql) {
-            $this->pool->execute($sql);
+        if ($currentVersion > 0) {
+            // Existing tables must be migrated before current-schema indexes
+            // are created because those indexes may reference new columns.
+            foreach (PostgresSchema::getMigrationStatements($currentVersion) as $sql) {
+                $this->pool->execute($sql);
+            }
         }
 
-        // Run migration statements for upgrades (indexes use IF NOT EXISTS, safe to re-run).
-        foreach (PostgresSchema::getMigrationStatements($currentVersion) as $sql) {
+        foreach (PostgresSchema::getCreateStatements() as $sql) {
             $this->pool->execute($sql);
         }
 
@@ -99,33 +102,54 @@ final class PostgresMetadataStore implements MetadataStore
 
     public function deleteBucket(string $ownerId, string $bucket): void
     {
-        $result = $this->conn()->execute(
-            'SELECT owner_id FROM s3_buckets WHERE name = $1',
-            [$bucket],
-        );
-        $row = $result->fetchRow();
+        $this->transaction(function () use ($ownerId, $bucket): void {
+            $result = $this->conn()->execute(
+                'SELECT owner_id FROM s3_buckets WHERE name = $1 FOR UPDATE',
+                [$bucket],
+            );
+            $row = $result->fetchRow();
 
-        if ($row === null) {
-            throw new NoSuchBucketException('The specified bucket does not exist.');
-        }
+            if ($row === null) {
+                throw new NoSuchBucketException('The specified bucket does not exist.');
+            }
+            if ($row['owner_id'] !== $ownerId) {
+                throw new AccessDeniedException('Access Denied');
+            }
+            if ($this->countObjects($bucket) > 0) {
+                throw new BucketNotEmptyException('The bucket you tried to delete is not empty.');
+            }
 
-        if ($row['owner_id'] !== $ownerId) {
-            throw new AccessDeniedException('Access Denied');
-        }
+            $bucketTables = [
+                's3_lifecycle_checkpoints',
+                's3_tier_transition_jobs',
+                's3_restore_jobs',
+                's3_notification_configs',
+                's3_lifecycle_rules',
+                's3_encryption_configs',
+                's3_lock_configs',
+                's3_object_retention',
+                's3_object_legal_holds',
+                's3_website_configs',
+                's3_public_access_blocks',
+                's3_bucket_logging',
+                's3_cors_rules',
+                's3_policies',
+                's3_tagging',
+            ];
 
-        $objectCount = $this->countObjects($bucket);
-        if ($objectCount > 0) {
-            throw new BucketNotEmptyException('The bucket you tried to delete is not empty.');
-        }
-
-        // Auto-abort any outstanding multipart uploads (AWS S3 behavior since 2023).
-        $this->conn()->execute('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = $1)', [$bucket]);
-        $this->conn()->execute('DELETE FROM s3_multipart_uploads WHERE bucket = $1', [$bucket]);
-
-        $this->conn()->execute(
-            'DELETE FROM s3_buckets WHERE name = $1 AND owner_id = $2',
-            [$bucket, $ownerId],
-        );
+            $this->conn()->execute('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = $1)', [$bucket]);
+            $this->conn()->execute('DELETE FROM s3_multipart_uploads WHERE bucket = $1', [$bucket]);
+            foreach ($bucketTables as $table) {
+                $this->conn()->execute("DELETE FROM {$table} WHERE bucket = \$1", [$bucket]);
+            }
+            $this->conn()->execute(
+                "DELETE FROM s3_acls
+                 WHERE (resource_type = 'bucket' AND resource_name = \$1)
+                    OR (resource_type = 'object' AND resource_name LIKE \$2 ESCAPE '\\')",
+                [$bucket, $this->escapeLikePattern($bucket . '/') . '%'],
+            );
+            $this->conn()->execute('DELETE FROM s3_buckets WHERE name = $1 AND owner_id = $2', [$bucket, $ownerId]);
+        });
     }
 
     public function getBucket(string $bucket): ?BucketInfo
@@ -415,7 +439,7 @@ final class PostgresMetadataStore implements MetadataStore
     public function getAccountQuota(string $ownerId): ?QuotaConfig
     {
         $result = $this->conn()->execute(
-            'SELECT max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas WHERE owner_id = $1',
+            'SELECT * FROM s3_account_quotas WHERE owner_id = $1',
             [$ownerId],
         );
         $row = $result->fetchRow();
@@ -429,13 +453,17 @@ final class PostgresMetadataStore implements MetadataStore
             maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
             maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
             maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+            maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+            maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+            maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+            maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
         );
     }
 
     public function listAccountQuotas(): array
     {
         $result = $this->conn()->execute(
-            'SELECT owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas ORDER BY owner_id ASC',
+            'SELECT * FROM s3_account_quotas ORDER BY owner_id ASC',
         );
 
         $quotas = [];
@@ -445,6 +473,10 @@ final class PostgresMetadataStore implements MetadataStore
                 maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
                 maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
                 maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+                maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+                maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+                maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+                maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
             );
         }
 
@@ -455,16 +487,30 @@ final class PostgresMetadataStore implements MetadataStore
     {
         $this->conn()->execute(
             <<<'SQL'
-            INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+            INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, max_multipart_uploads_per_bucket, max_multipart_uploads_per_owner, max_multipart_bytes_per_bucket, max_multipart_bytes_per_owner, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
             ON CONFLICT(owner_id) DO UPDATE SET
                 max_buckets_per_owner = excluded.max_buckets_per_owner,
                 max_objects_per_bucket = excluded.max_objects_per_bucket,
                 max_bytes_per_bucket = excluded.max_bytes_per_bucket,
                 max_bytes_per_owner = excluded.max_bytes_per_owner,
+                max_multipart_uploads_per_bucket = excluded.max_multipart_uploads_per_bucket,
+                max_multipart_uploads_per_owner = excluded.max_multipart_uploads_per_owner,
+                max_multipart_bytes_per_bucket = excluded.max_multipart_bytes_per_bucket,
+                max_multipart_bytes_per_owner = excluded.max_multipart_bytes_per_owner,
                 updated_at = excluded.updated_at
             SQL,
-            [$ownerId, $quota->maxBucketsPerOwner, $quota->maxObjectsPerBucket, $quota->maxBytesPerBucket, $quota->maxBytesPerOwner],
+            [
+                $ownerId,
+                $quota->maxBucketsPerOwner,
+                $quota->maxObjectsPerBucket,
+                $quota->maxBytesPerBucket,
+                $quota->maxBytesPerOwner,
+                $quota->maxMultipartUploadsPerBucket,
+                $quota->maxMultipartUploadsPerOwner,
+                $quota->maxMultipartBytesPerBucket,
+                $quota->maxMultipartBytesPerOwner,
+            ],
         );
     }
 
@@ -879,6 +925,25 @@ final class PostgresMetadataStore implements MetadataStore
         ];
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        $sql = 'SELECT COUNT(DISTINCT u.upload_id) AS upload_count, COALESCE(SUM(p.size), 0) AS bytes_used
+                FROM s3_multipart_uploads u
+                LEFT JOIN s3_parts p ON p.upload_id = u.upload_id
+                WHERE u.owner_id = $1';
+        $params = [$ownerId];
+        if ($bucket !== null) {
+            $sql .= ' AND u.bucket = $2';
+            $params[] = $bucket;
+        }
+        $row = $this->conn()->execute($sql, $params)->fetchRow();
+
+        return [
+            'uploadCount' => $row !== null ? (int) $row['upload_count'] : 0,
+            'bytesUsed' => $row !== null ? (int) $row['bytes_used'] : 0,
+        ];
+    }
+
     public function putPart(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath): void
     {
         $upload = $this->getMultipartUpload($uploadId);
@@ -1167,6 +1232,14 @@ final class PostgresMetadataStore implements MetadataStore
             $link->execute(
                 'DELETE FROM s3_object_legal_holds WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
                 [$bucket, $key, $effectiveVersionId],
+            );
+            $link->execute(
+                "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 AND version_id = $3",
+                [$bucket, $key, $effectiveVersionId],
+            );
+            $link->execute(
+                "DELETE FROM s3_acls WHERE resource_type = 'object' AND resource_name = $1",
+                [\OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, $versionId)],
             );
 
             if ($ownTx) {
@@ -1609,11 +1682,11 @@ final class PostgresMetadataStore implements MetadataStore
         $this->conn()->execute("DELETE FROM s3_tagging WHERE resource_type = 'bucket' AND bucket = $1 AND key_name IS NULL", [$bucket]);
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
         $result = $this->conn()->execute(
-            "SELECT tag_key, tag_value FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 ORDER BY id ASC",
-            [$bucket, $key],
+            "SELECT tag_key, tag_value FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 AND version_id = $3 ORDER BY id ASC",
+            [$bucket, $key, $versionId ?? 'null'],
         );
 
         $tags = [];
@@ -1624,18 +1697,18 @@ final class PostgresMetadataStore implements MetadataStore
         return $tags;
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
         $existingTx = $this->fiberTransaction();
         $ownTx = ($existingTx === null);
         $link = $ownTx ? $this->pool->beginTransaction() : $existingTx;
 
         try {
-            $link->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2", [$bucket, $key]);
+            $link->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 AND version_id = $3", [$bucket, $key, $versionId ?? 'null']);
             foreach ($tags as $tag) {
                 $link->execute(
-                    "INSERT INTO s3_tagging (resource_type, bucket, key_name, tag_key, tag_value) VALUES ('object', $1, $2, $3, $4)",
-                    [$bucket, $key, $tag['key'], $tag['value']],
+                    "INSERT INTO s3_tagging (resource_type, bucket, key_name, version_id, tag_key, tag_value) VALUES ('object', $1, $2, $3, $4, $5)",
+                    [$bucket, $key, $versionId ?? 'null', $tag['key'], $tag['value']],
                 );
             }
             if ($ownTx) {
@@ -1649,9 +1722,12 @@ final class PostgresMetadataStore implements MetadataStore
         }
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
-        $this->conn()->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2", [$bucket, $key]);
+        $this->conn()->execute(
+            "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 AND version_id = $3",
+            [$bucket, $key, $versionId ?? 'null'],
+        );
     }
 
     // ===============================================================
@@ -1904,7 +1980,7 @@ final class PostgresMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_tier_transition_jobs SET status = 'pending', updated_at = NOW()
              WHERE status = 'processing' AND next_attempt_at < $1",
-            [$now - 300],
+            [$now],
         );
 
         $tx = $this->pool->beginTransaction();
@@ -1926,10 +2002,12 @@ final class PostgresMetadataStore implements MetadataStore
 
             if ($rows !== []) {
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
-                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 2), range(0, count($ids) - 1)));
                 $tx->execute(
-                    "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
-                    $ids,
+                    "UPDATE s3_tier_transition_jobs
+                     SET status = 'processing', next_attempt_at = $1, updated_at = NOW()
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...$ids],
                 );
             }
 
@@ -1954,6 +2032,18 @@ final class PostgresMetadataStore implements MetadataStore
             ? 'UPDATE s3_tier_transition_jobs SET status = $1, last_error = $2, next_attempt_at = COALESCE($3, next_attempt_at), attempts = attempts + 1, target_storage_path = COALESCE($4, target_storage_path), updated_at = NOW() WHERE id = $5'
             : 'UPDATE s3_tier_transition_jobs SET status = $1, last_error = $2, next_attempt_at = COALESCE($3, next_attempt_at), target_storage_path = COALESCE($4, target_storage_path), updated_at = NOW() WHERE id = $5';
         $this->conn()->execute($sql, [$status, $error, $nextAttemptAt, $targetStoragePath, $id]);
+    }
+
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $result = $this->conn()->execute(
+            "UPDATE s3_tier_transition_jobs
+             SET next_attempt_at = $1, updated_at = NOW()
+             WHERE id = $2 AND status = 'processing'",
+            [$leaseExpiresAt, $id],
+        );
+
+        return ($result->getRowCount() ?? 0) > 0;
     }
 
     public function getTierTransitionJob(int $id): ?array
@@ -1992,7 +2082,7 @@ final class PostgresMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_restore_jobs SET status = 'pending', updated_at = NOW()
              WHERE status = 'processing' AND next_attempt_at < $1",
-            [$now - 300],
+            [$now],
         );
 
         $tx = $this->pool->beginTransaction();
@@ -2014,10 +2104,12 @@ final class PostgresMetadataStore implements MetadataStore
 
             if ($rows !== []) {
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
-                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 2), range(0, count($ids) - 1)));
                 $tx->execute(
-                    "UPDATE s3_restore_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
-                    $ids,
+                    "UPDATE s3_restore_jobs
+                     SET status = 'processing', next_attempt_at = $1, updated_at = NOW()
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...$ids],
                 );
             }
 
@@ -2042,6 +2134,18 @@ final class PostgresMetadataStore implements MetadataStore
             ? 'UPDATE s3_restore_jobs SET status = $1, last_error = $2, next_attempt_at = COALESCE($3, next_attempt_at), attempts = attempts + 1, restored_storage_path = COALESCE($4, restored_storage_path), updated_at = NOW() WHERE id = $5'
             : 'UPDATE s3_restore_jobs SET status = $1, last_error = $2, next_attempt_at = COALESCE($3, next_attempt_at), restored_storage_path = COALESCE($4, restored_storage_path), updated_at = NOW() WHERE id = $5';
         $this->conn()->execute($sql, [$status, $error, $nextAttemptAt, $restoredStoragePath, $id]);
+    }
+
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $result = $this->conn()->execute(
+            "UPDATE s3_restore_jobs
+             SET next_attempt_at = $1, updated_at = NOW()
+             WHERE id = $2 AND status = 'processing'",
+            [$leaseExpiresAt, $id],
+        );
+
+        return ($result->getRowCount() ?? 0) > 0;
     }
 
     public function getRestoreJob(int $id): ?array
@@ -2190,26 +2294,30 @@ final class PostgresMetadataStore implements MetadataStore
     {
         $now = microtime(true);
 
-        $result = $this->conn()->execute(
-            'INSERT INTO s3_rate_limit_buckets (ip, tokens, last_refill_at) VALUES ($1, $2, $3)
-             ON CONFLICT (ip) DO UPDATE SET
-                tokens = LEAST($2, s3_rate_limit_buckets.tokens + ($3 - s3_rate_limit_buckets.last_refill_at) * $4),
-                last_refill_at = $3
-             RETURNING tokens',
-            [$ip, $maxTokens, $now, $refillRate],
-        );
+        return $this->transaction(function () use ($ip, $maxTokens, $refillRate, $now): bool {
+            $this->conn()->execute(
+                'INSERT INTO s3_rate_limit_buckets (ip, tokens, last_refill_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (ip) DO NOTHING',
+                [$ip, $maxTokens, $now],
+            );
+            $row = $this->conn()->execute(
+                'SELECT tokens, last_refill_at FROM s3_rate_limit_buckets WHERE ip = $1 FOR UPDATE',
+                [$ip],
+            )->fetchRow();
+            \assert($row !== null);
 
-        $row = $result->fetchRow();
-        if ($row === null || (float) $row['tokens'] < 1.0) {
-            return false;
-        }
+            $available = min(
+                $maxTokens,
+                (float) $row['tokens'] + max(0.0, $now - (float) $row['last_refill_at']) * $refillRate,
+            );
+            $allowed = $available >= 1.0;
+            $this->conn()->execute(
+                'UPDATE s3_rate_limit_buckets SET tokens = $1, last_refill_at = $2 WHERE ip = $3',
+                [$allowed ? $available - 1.0 : $available, $now, $ip],
+            );
 
-        $this->conn()->execute(
-            'UPDATE s3_rate_limit_buckets SET tokens = tokens - 1.0 WHERE ip = $1',
-            [$ip],
-        );
-
-        return true;
+            return $allowed;
+        });
     }
 
     public function rateLimitCleanup(int $maxAgeSeconds): void
@@ -2248,7 +2356,7 @@ final class PostgresMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_notification_queue SET status = 'pending'
              WHERE status = 'processing' AND next_attempt_at < $1",
-            [$now - 300],
+            [$now],
         );
 
         // FOR UPDATE SKIP LOCKED requires a transaction to hold the lock.
@@ -2272,10 +2380,12 @@ final class PostgresMetadataStore implements MetadataStore
 
             if ($rows !== []) {
                 $ids = array_column($rows, 'id');
-                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 1), range(0, count($ids) - 1)));
+                $placeholders = implode(',', array_map(fn(int $i) => '$' . ($i + 2), range(0, count($ids) - 1)));
                 $tx->execute(
-                    "UPDATE s3_notification_queue SET status = 'processing' WHERE id IN ({$placeholders})",
-                    array_map(fn($id) => (int) $id, $ids),
+                    "UPDATE s3_notification_queue
+                     SET status = 'processing', next_attempt_at = $1
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...array_map(fn($id) => (int) $id, $ids)],
                 );
             }
 
@@ -2331,6 +2441,82 @@ final class PostgresMetadataStore implements MetadataStore
         $this->conn()->execute(
             "DELETE FROM s3_notification_queue WHERE status IN ('sent', 'dead_letter') AND created_at < $1",
             [$cutoff],
+        );
+    }
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->conn()->execute(
+            'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
+             VALUES ($1, $2, $3, $4)',
+            [$bucket, $storageTier, $storagePath, microtime(true)],
+        );
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->conn()->execute(
+            'DELETE FROM s3_storage_garbage
+             WHERE bucket = $1 AND storage_tier = $2 AND storage_path = $3',
+            [$bucket, $storageTier, $storagePath],
+        );
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->transaction(function () use ($limit): array {
+            $now = microtime(true);
+            $this->conn()->execute(
+                "UPDATE s3_storage_garbage SET status = 'pending'
+                 WHERE status = 'processing' AND next_attempt_at < $1",
+                [$now],
+            );
+            $result = $this->conn()->execute(
+                "SELECT id, bucket, storage_tier, storage_path, attempts
+                 FROM s3_storage_garbage
+                 WHERE status = 'pending' AND next_attempt_at <= $1
+                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $2",
+                [$now, $limit],
+            );
+            $rows = [];
+            while (($row = $result->fetchRow()) !== null) {
+                $id = $row['id'] ?? null;
+                $bucket = $row['bucket'] ?? null;
+                $storageTier = $row['storage_tier'] ?? null;
+                $storagePath = $row['storage_path'] ?? null;
+                $attempts = $row['attempts'] ?? null;
+                if (! is_scalar($id) || ! is_scalar($bucket) || ! is_scalar($storageTier) || ! is_scalar($storagePath) || ! is_scalar($attempts)) {
+                    throw new \RuntimeException('Storage garbage queue returned an invalid row.');
+                }
+                $this->conn()->execute(
+                    "UPDATE s3_storage_garbage SET status = 'processing', next_attempt_at = $1 WHERE id = $2",
+                    [$now + 300, $id],
+                );
+                $rows[] = [
+                    'id' => (int) $id,
+                    'bucket' => (string) $bucket,
+                    'storage_tier' => (string) $storageTier,
+                    'storage_path' => (string) $storagePath,
+                    'attempts' => (int) $attempts,
+                ];
+            }
+
+            return $rows;
+        });
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->conn()->execute('DELETE FROM s3_storage_garbage WHERE id = $1', [$id]);
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->conn()->execute(
+            "UPDATE s3_storage_garbage
+             SET status = 'pending', attempts = attempts + 1, last_error = $1, next_attempt_at = $2
+             WHERE id = $3",
+            [$error, $nextAttemptAt, $id],
         );
     }
 
@@ -2880,10 +3066,11 @@ final class PostgresMetadataStore implements MetadataStore
         return $objects;
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
-        $cutoff = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
-            ->modify("-{$daysAfterInitiation} days")
+        $cutoff = ($createdBefore ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify("-{$daysAfterInitiation} days"))
+            ->setTimezone(new \DateTimeZone('UTC'))
             ->format('Y-m-d\TH:i:s\Z');
 
         $sql = 'SELECT upload_id, bucket, key_name FROM s3_multipart_uploads WHERE bucket = $1 AND created_at < $2';
@@ -2999,6 +3186,7 @@ final class PostgresMetadataStore implements MetadataStore
                 WHERE lt.resource_type = 'object'
                   AND lt.bucket = {$objectAlias}.bucket
                   AND lt.key_name = {$objectAlias}.key_name
+                  AND lt.version_id = {$objectAlias}.version_id
                   AND lt.tag_key = \${$keyParam}
                   AND lt.tag_value = \${$valueParam}
             )";

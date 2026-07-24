@@ -62,20 +62,24 @@ final class MysqlMetadataStore implements MetadataStore
             // Table doesn't exist yet.
         }
 
-        foreach (MysqlSchema::getCreateStatements() as $sql) {
-            $this->pool->execute($sql);
-        }
-
-        // MySQL DDL auto-commits. Duplicate schema objects are safe on a
-        // partially applied retry; every other error must stop versioning.
-        foreach (MysqlSchema::getMigrationStatements($currentVersion) as $sql) {
-            try {
-                $this->pool->execute($sql);
-            } catch (\Throwable $e) {
-                if (! self::isDuplicateSchemaObject($e)) {
-                    throw $e;
+        if ($currentVersion > 0) {
+            // Existing tables must be migrated before current-schema indexes
+            // are created because those indexes may reference new columns.
+            // MySQL DDL auto-commits. Duplicate schema objects are safe on a
+            // partially applied retry; every other error must stop versioning.
+            foreach (MysqlSchema::getMigrationStatements($currentVersion) as $sql) {
+                try {
+                    $this->pool->execute($sql);
+                } catch (\Throwable $e) {
+                    if (! self::isDuplicateSchemaObject($e)) {
+                        throw $e;
+                    }
                 }
             }
+        }
+
+        foreach (MysqlSchema::getCreateStatements() as $sql) {
+            $this->pool->execute($sql);
         }
 
         $this->pool->execute(
@@ -107,33 +111,54 @@ final class MysqlMetadataStore implements MetadataStore
 
     public function deleteBucket(string $ownerId, string $bucket): void
     {
-        $result = $this->conn()->execute(
-            'SELECT owner_id FROM s3_buckets WHERE name = ?',
-            [$bucket],
-        );
-        $row = $result->fetchRow();
+        $this->transaction(function () use ($ownerId, $bucket): void {
+            $result = $this->conn()->execute(
+                'SELECT owner_id FROM s3_buckets WHERE name = ? FOR UPDATE',
+                [$bucket],
+            );
+            $row = $result->fetchRow();
 
-        if ($row === null) {
-            throw new NoSuchBucketException('The specified bucket does not exist.');
-        }
+            if ($row === null) {
+                throw new NoSuchBucketException('The specified bucket does not exist.');
+            }
+            if ($row['owner_id'] !== $ownerId) {
+                throw new AccessDeniedException('Access Denied');
+            }
+            if ($this->countObjects($bucket) > 0) {
+                throw new BucketNotEmptyException('The bucket you tried to delete is not empty.');
+            }
 
-        if ($row['owner_id'] !== $ownerId) {
-            throw new AccessDeniedException('Access Denied');
-        }
+            $bucketTables = [
+                's3_lifecycle_checkpoints',
+                's3_tier_transition_jobs',
+                's3_restore_jobs',
+                's3_notification_configs',
+                's3_lifecycle_rules',
+                's3_encryption_configs',
+                's3_lock_configs',
+                's3_object_retention',
+                's3_object_legal_holds',
+                's3_website_configs',
+                's3_public_access_blocks',
+                's3_bucket_logging',
+                's3_cors_rules',
+                's3_policies',
+                's3_tagging',
+            ];
 
-        $objectCount = $this->countObjects($bucket);
-        if ($objectCount > 0) {
-            throw new BucketNotEmptyException('The bucket you tried to delete is not empty.');
-        }
-
-        // Auto-abort any outstanding multipart uploads (AWS S3 behavior since 2023).
-        $this->conn()->execute('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = ?)', [$bucket]);
-        $this->conn()->execute('DELETE FROM s3_multipart_uploads WHERE bucket = ?', [$bucket]);
-
-        $this->conn()->execute(
-            'DELETE FROM s3_buckets WHERE name = ? AND owner_id = ?',
-            [$bucket, $ownerId],
-        );
+            $this->conn()->execute('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = ?)', [$bucket]);
+            $this->conn()->execute('DELETE FROM s3_multipart_uploads WHERE bucket = ?', [$bucket]);
+            foreach ($bucketTables as $table) {
+                $this->conn()->execute("DELETE FROM {$table} WHERE bucket = ?", [$bucket]);
+            }
+            $this->conn()->execute(
+                "DELETE FROM s3_acls
+                 WHERE (resource_type = 'bucket' AND resource_name = ?)
+                    OR (resource_type = 'object' AND resource_name LIKE ? ESCAPE '\\\\')",
+                [$bucket, $this->escapeLikePattern($bucket . '/') . '%'],
+            );
+            $this->conn()->execute('DELETE FROM s3_buckets WHERE name = ? AND owner_id = ?', [$bucket, $ownerId]);
+        });
     }
 
     public function getBucket(string $bucket): ?BucketInfo
@@ -423,7 +448,7 @@ final class MysqlMetadataStore implements MetadataStore
     public function getAccountQuota(string $ownerId): ?QuotaConfig
     {
         $result = $this->conn()->execute(
-            'SELECT max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas WHERE owner_id = ?',
+            'SELECT * FROM s3_account_quotas WHERE owner_id = ?',
             [$ownerId],
         );
         $row = $result->fetchRow();
@@ -437,13 +462,17 @@ final class MysqlMetadataStore implements MetadataStore
             maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
             maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
             maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+            maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+            maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+            maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+            maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
         );
     }
 
     public function listAccountQuotas(): array
     {
         $result = $this->conn()->execute(
-            'SELECT owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas ORDER BY owner_id ASC',
+            'SELECT * FROM s3_account_quotas ORDER BY owner_id ASC',
         );
 
         $quotas = [];
@@ -453,6 +482,10 @@ final class MysqlMetadataStore implements MetadataStore
                 maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
                 maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
                 maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+                maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+                maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+                maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+                maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
             );
         }
 
@@ -463,16 +496,30 @@ final class MysqlMetadataStore implements MetadataStore
     {
         $this->conn()->execute(
             <<<'SQL'
-            INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, max_multipart_uploads_per_bucket, max_multipart_uploads_per_owner, max_multipart_bytes_per_bucket, max_multipart_bytes_per_owner, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON DUPLICATE KEY UPDATE
                 max_buckets_per_owner = VALUES(max_buckets_per_owner),
                 max_objects_per_bucket = VALUES(max_objects_per_bucket),
                 max_bytes_per_bucket = VALUES(max_bytes_per_bucket),
                 max_bytes_per_owner = VALUES(max_bytes_per_owner),
+                max_multipart_uploads_per_bucket = VALUES(max_multipart_uploads_per_bucket),
+                max_multipart_uploads_per_owner = VALUES(max_multipart_uploads_per_owner),
+                max_multipart_bytes_per_bucket = VALUES(max_multipart_bytes_per_bucket),
+                max_multipart_bytes_per_owner = VALUES(max_multipart_bytes_per_owner),
                 updated_at = VALUES(updated_at)
             SQL,
-            [$ownerId, $quota->maxBucketsPerOwner, $quota->maxObjectsPerBucket, $quota->maxBytesPerBucket, $quota->maxBytesPerOwner],
+            [
+                $ownerId,
+                $quota->maxBucketsPerOwner,
+                $quota->maxObjectsPerBucket,
+                $quota->maxBytesPerBucket,
+                $quota->maxBytesPerOwner,
+                $quota->maxMultipartUploadsPerBucket,
+                $quota->maxMultipartUploadsPerOwner,
+                $quota->maxMultipartBytesPerBucket,
+                $quota->maxMultipartBytesPerOwner,
+            ],
         );
     }
 
@@ -879,6 +926,25 @@ final class MysqlMetadataStore implements MetadataStore
         ];
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        $sql = 'SELECT COUNT(DISTINCT u.upload_id) AS upload_count, COALESCE(SUM(p.size), 0) AS bytes_used
+                FROM s3_multipart_uploads u
+                LEFT JOIN s3_parts p ON p.upload_id = u.upload_id
+                WHERE u.owner_id = ?';
+        $params = [$ownerId];
+        if ($bucket !== null) {
+            $sql .= ' AND u.bucket = ?';
+            $params[] = $bucket;
+        }
+        $row = $this->conn()->execute($sql, $params)->fetchRow();
+
+        return [
+            'uploadCount' => $row !== null ? (int) $row['upload_count'] : 0,
+            'bytesUsed' => $row !== null ? (int) $row['bytes_used'] : 0,
+        ];
+    }
+
     public function putPart(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath): void
     {
         $upload = $this->getMultipartUpload($uploadId);
@@ -1172,6 +1238,14 @@ final class MysqlMetadataStore implements MetadataStore
             $link->execute(
                 'DELETE FROM s3_object_legal_holds WHERE bucket = ? AND key_name = ? AND version_id = ?',
                 [$bucket, $key, $effectiveVersionId],
+            );
+            $link->execute(
+                "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?",
+                [$bucket, $key, $effectiveVersionId],
+            );
+            $link->execute(
+                "DELETE FROM s3_acls WHERE resource_type = 'object' AND resource_name = ?",
+                [\OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, $versionId)],
             );
 
             if ($ownTx) {
@@ -1610,11 +1684,11 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute("DELETE FROM s3_tagging WHERE resource_type = 'bucket' AND bucket = ? AND key_name IS NULL", [$bucket]);
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
         $result = $this->conn()->execute(
-            "SELECT tag_key, tag_value FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? ORDER BY id ASC",
-            [$bucket, $key],
+            "SELECT tag_key, tag_value FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ? ORDER BY id ASC",
+            [$bucket, $key, $versionId ?? 'null'],
         );
 
         $tags = [];
@@ -1625,18 +1699,18 @@ final class MysqlMetadataStore implements MetadataStore
         return $tags;
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
         $existingTx = $this->fiberTransaction();
         $ownTx = ($existingTx === null);
         $link = $ownTx ? $this->pool->beginTransaction() : $existingTx;
 
         try {
-            $link->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ?", [$bucket, $key]);
+            $link->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?", [$bucket, $key, $versionId ?? 'null']);
             foreach ($tags as $tag) {
                 $link->execute(
-                    "INSERT INTO s3_tagging (resource_type, bucket, key_name, tag_key, tag_value) VALUES ('object', ?, ?, ?, ?)",
-                    [$bucket, $key, $tag['key'], $tag['value']],
+                    "INSERT INTO s3_tagging (resource_type, bucket, key_name, version_id, tag_key, tag_value) VALUES ('object', ?, ?, ?, ?, ?)",
+                    [$bucket, $key, $versionId ?? 'null', $tag['key'], $tag['value']],
                 );
             }
             if ($ownTx) {
@@ -1650,9 +1724,12 @@ final class MysqlMetadataStore implements MetadataStore
         }
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
-        $this->conn()->execute("DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ?", [$bucket, $key]);
+        $this->conn()->execute(
+            "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?",
+            [$bucket, $key, $versionId ?? 'null'],
+        );
     }
 
     // ===============================================================
@@ -1875,7 +1952,7 @@ final class MysqlMetadataStore implements MetadataStore
         int $maxAttempts = 10,
     ): int {
         $link = $this->conn();
-        $link->execute(
+        $result = $link->execute(
             'INSERT INTO s3_tier_transition_jobs (
                 bucket, key_name, version_id, source_tier, target_tier,
                 target_storage_class, source_storage_path, max_attempts, next_attempt_at
@@ -1893,10 +1970,8 @@ final class MysqlMetadataStore implements MetadataStore
             ],
         );
 
-        $result = $link->execute('SELECT LAST_INSERT_ID() AS id');
-        $row = $result->fetchRow();
-
-        return $row !== null ? (int) $row['id'] : 0;
+        return $result->getLastInsertId()
+            ?? throw new \RuntimeException('MySQL did not return the inserted tier transition job ID.');
     }
 
     public function dequeueTierTransitionJobs(int $limit): array
@@ -1907,7 +1982,7 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_tier_transition_jobs SET status = 'pending', updated_at = NOW()
              WHERE status = 'processing' AND next_attempt_at < ?",
-            [$now - 300],
+            [$now],
         );
 
         $tx = $this->pool->beginTransaction();
@@ -1931,8 +2006,10 @@ final class MysqlMetadataStore implements MetadataStore
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
-                    "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
-                    $ids,
+                    "UPDATE s3_tier_transition_jobs
+                     SET status = 'processing', next_attempt_at = ?, updated_at = NOW()
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...$ids],
                 );
             }
 
@@ -1959,6 +2036,18 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute($sql, [$status, $error, $nextAttemptAt, $targetStoragePath, $id]);
     }
 
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $result = $this->conn()->execute(
+            "UPDATE s3_tier_transition_jobs
+             SET next_attempt_at = ?, updated_at = NOW()
+             WHERE id = ? AND status = 'processing'",
+            [$leaseExpiresAt, $id],
+        );
+
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
     public function getTierTransitionJob(int $id): ?array
     {
         $result = $this->conn()->execute('SELECT * FROM s3_tier_transition_jobs WHERE id = ?', [$id]);
@@ -1977,16 +2066,14 @@ final class MysqlMetadataStore implements MetadataStore
         int $maxAttempts = 10,
     ): int {
         $link = $this->conn();
-        $link->execute(
+        $result = $link->execute(
             'INSERT INTO s3_restore_jobs (bucket, key_name, version_id, source_tier, source_storage_path, restore_days, max_attempts, next_attempt_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [$bucket, $key, $versionId, $sourceTier, $sourceStoragePath, max(1, $restoreDays), max(1, $maxAttempts), microtime(true)],
         );
 
-        $result = $link->execute('SELECT LAST_INSERT_ID() AS id');
-        $row = $result->fetchRow();
-
-        return $row !== null ? (int) $row['id'] : 0;
+        return $result->getLastInsertId()
+            ?? throw new \RuntimeException('MySQL did not return the inserted restore job ID.');
     }
 
     public function dequeueRestoreJobs(int $limit): array
@@ -1997,7 +2084,7 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_restore_jobs SET status = 'pending', updated_at = NOW()
              WHERE status = 'processing' AND next_attempt_at < ?",
-            [$now - 300],
+            [$now],
         );
 
         $tx = $this->pool->beginTransaction();
@@ -2021,8 +2108,10 @@ final class MysqlMetadataStore implements MetadataStore
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
-                    "UPDATE s3_restore_jobs SET status = 'processing', updated_at = NOW() WHERE id IN ({$placeholders})",
-                    $ids,
+                    "UPDATE s3_restore_jobs
+                     SET status = 'processing', next_attempt_at = ?, updated_at = NOW()
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...$ids],
                 );
             }
 
@@ -2047,6 +2136,18 @@ final class MysqlMetadataStore implements MetadataStore
             ? 'UPDATE s3_restore_jobs SET status = ?, last_error = ?, next_attempt_at = COALESCE(?, next_attempt_at), attempts = attempts + 1, restored_storage_path = COALESCE(?, restored_storage_path), updated_at = NOW() WHERE id = ?'
             : 'UPDATE s3_restore_jobs SET status = ?, last_error = ?, next_attempt_at = COALESCE(?, next_attempt_at), restored_storage_path = COALESCE(?, restored_storage_path), updated_at = NOW() WHERE id = ?';
         $this->conn()->execute($sql, [$status, $error, $nextAttemptAt, $restoredStoragePath, $id]);
+    }
+
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $result = $this->conn()->execute(
+            "UPDATE s3_restore_jobs
+             SET next_attempt_at = ?, updated_at = NOW()
+             WHERE id = ? AND status = 'processing'",
+            [$leaseExpiresAt, $id],
+        );
+
+        return ($result->getRowCount() ?? 0) > 0;
     }
 
     public function getRestoreJob(int $id): ?array
@@ -2195,30 +2296,30 @@ final class MysqlMetadataStore implements MetadataStore
     {
         $now = microtime(true);
 
-        $this->conn()->execute(
-            'INSERT INTO s3_rate_limit_buckets (ip, tokens, last_refill_at) VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-                tokens = LEAST(?, s3_rate_limit_buckets.tokens + (? - s3_rate_limit_buckets.last_refill_at) * ?),
-                last_refill_at = ?',
-            [$ip, $maxTokens, $now, $maxTokens, $now, $refillRate, $now],
-        );
+        return $this->transaction(function () use ($ip, $maxTokens, $refillRate, $now): bool {
+            $this->conn()->execute(
+                'INSERT INTO s3_rate_limit_buckets (ip, tokens, last_refill_at) VALUES (?, ?, ?)
+                 ON DUPLICATE KEY UPDATE ip = VALUES(ip)',
+                [$ip, $maxTokens, $now],
+            );
+            $row = $this->conn()->execute(
+                'SELECT tokens, last_refill_at FROM s3_rate_limit_buckets WHERE ip = ? FOR UPDATE',
+                [$ip],
+            )->fetchRow();
+            \assert($row !== null);
 
-        $result = $this->conn()->execute(
-            'SELECT tokens FROM s3_rate_limit_buckets WHERE ip = ?',
-            [$ip],
-        );
-        $row = $result->fetchRow();
+            $available = min(
+                $maxTokens,
+                (float) $row['tokens'] + max(0.0, $now - (float) $row['last_refill_at']) * $refillRate,
+            );
+            $allowed = $available >= 1.0;
+            $this->conn()->execute(
+                'UPDATE s3_rate_limit_buckets SET tokens = ?, last_refill_at = ? WHERE ip = ?',
+                [$allowed ? $available - 1.0 : $available, $now, $ip],
+            );
 
-        if ($row === null || (float) $row['tokens'] < 1.0) {
-            return false;
-        }
-
-        $this->conn()->execute(
-            'UPDATE s3_rate_limit_buckets SET tokens = tokens - 1.0 WHERE ip = ?',
-            [$ip],
-        );
-
-        return true;
+            return $allowed;
+        });
     }
 
     public function rateLimitCleanup(int $maxAgeSeconds): void
@@ -2257,7 +2358,7 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute(
             "UPDATE s3_notification_queue SET status = 'pending'
              WHERE status = 'processing' AND next_attempt_at < ?",
-            [$now - 300],
+            [$now],
         );
 
         // FOR UPDATE SKIP LOCKED requires a transaction to hold the lock.
@@ -2283,8 +2384,10 @@ final class MysqlMetadataStore implements MetadataStore
                 $ids = array_column($rows, 'id');
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $tx->execute(
-                    "UPDATE s3_notification_queue SET status = 'processing' WHERE id IN ({$placeholders})",
-                    array_map(fn($id) => (int) $id, $ids),
+                    "UPDATE s3_notification_queue
+                     SET status = 'processing', next_attempt_at = ?
+                     WHERE id IN ({$placeholders})",
+                    [QueueLease::expiresAt($now), ...array_map(fn($id) => (int) $id, $ids)],
                 );
             }
 
@@ -2340,6 +2443,73 @@ final class MysqlMetadataStore implements MetadataStore
         $this->conn()->execute(
             "DELETE FROM s3_notification_queue WHERE status IN ('sent', 'dead_letter') AND created_at < ?",
             [$cutoff],
+        );
+    }
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->conn()->execute(
+            'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
+             VALUES (?, ?, ?, ?)',
+            [$bucket, $storageTier, $storagePath, microtime(true)],
+        );
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->conn()->execute(
+            'DELETE FROM s3_storage_garbage
+             WHERE bucket = ? AND storage_tier = ? AND storage_path = ?',
+            [$bucket, $storageTier, $storagePath],
+        );
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->transaction(function () use ($limit): array {
+            $now = microtime(true);
+            $this->conn()->execute(
+                "UPDATE s3_storage_garbage SET status = 'pending'
+                 WHERE status = 'processing' AND next_attempt_at < ?",
+                [$now],
+            );
+            $result = $this->conn()->execute(
+                "SELECT id, bucket, storage_tier, storage_path, attempts
+                 FROM s3_storage_garbage
+                 WHERE status = 'pending' AND next_attempt_at <= ?
+                 ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED",
+                [$now, $limit],
+            );
+            $rows = [];
+            while (($row = $result->fetchRow()) !== null) {
+                $this->conn()->execute(
+                    "UPDATE s3_storage_garbage SET status = 'processing', next_attempt_at = ? WHERE id = ?",
+                    [$now + 300, $row['id']],
+                );
+                $rows[] = [
+                    'id' => (int) $row['id'],
+                    'bucket' => (string) $row['bucket'],
+                    'storage_tier' => (string) $row['storage_tier'],
+                    'storage_path' => (string) $row['storage_path'],
+                    'attempts' => (int) $row['attempts'],
+                ];
+            }
+            return $rows;
+        });
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->conn()->execute('DELETE FROM s3_storage_garbage WHERE id = ?', [$id]);
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->conn()->execute(
+            "UPDATE s3_storage_garbage
+             SET status = 'pending', attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+             WHERE id = ?",
+            [$error, $nextAttemptAt, $id],
         );
     }
 
@@ -2452,7 +2622,8 @@ final class MysqlMetadataStore implements MetadataStore
 
         return str_contains($message, 'duplicate key name')
             || str_contains($message, 'duplicate column name')
-            || str_contains($message, 'already exists');
+            || str_contains($message, 'already exists')
+            || str_contains($message, 'check that column/key exists');
     }
 
     /** @param array<string, int|float|string|null> $row */
@@ -2875,10 +3046,11 @@ final class MysqlMetadataStore implements MetadataStore
         return $objects;
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
-        $cutoff = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
-            ->modify("-{$daysAfterInitiation} days")
+        $cutoff = ($createdBefore ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify("-{$daysAfterInitiation} days"))
+            ->setTimezone(new \DateTimeZone('UTC'))
             ->format('Y-m-d H:i:s');
 
         $sql = 'SELECT upload_id, bucket, key_name FROM s3_multipart_uploads WHERE bucket = ? AND created_at < ?';
@@ -2983,6 +3155,7 @@ final class MysqlMetadataStore implements MetadataStore
                 WHERE lt.resource_type = 'object'
                   AND lt.bucket = {$objectAlias}.bucket
                   AND lt.key_name = {$objectAlias}.key_name
+                  AND lt.version_id = {$objectAlias}.version_id
                   AND lt.tag_key = ?
                   AND lt.tag_value = ?
             )";

@@ -29,7 +29,12 @@ final class FileReadableStream implements \IteratorAggregate, ReadableStream
 
     public function read(?Cancellation $cancellation = null): ?string
     {
-        return $this->file->read($cancellation, $this->chunkSize);
+        $chunk = $this->file->read($cancellation, $this->chunkSize);
+        if ($chunk === null) {
+            $this->file->close();
+        }
+
+        return $chunk;
     }
 
     public function isReadable(): bool
@@ -50,5 +55,13 @@ final class FileReadableStream implements \IteratorAggregate, ReadableStream
     public function onClose(\Closure $onClose): void
     {
         $this->file->onClose($onClose);
+    }
+
+    public function __destruct()
+    {
+        try {
+            $this->file->close();
+        } catch (\Throwable) {
+        }
     }
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use Aws\S3\Exception\S3Exception;
+
 final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
 {
     private static string|false $previousMasterKeys;
@@ -45,73 +47,27 @@ final class KmsEncryptionFunctionalTest extends S3FunctionalTestCase
         self::$s3->createBucket(['Bucket' => self::$bucket]);
     }
 
-    public function test_aws_kms_bucket_default_round_trips_with_configured_master_key_provider(): void
+    public function test_aws_kms_bucket_default_is_rejected_until_a_real_kms_adapter_exists(): void
     {
-        self::$s3->putBucketEncryption([
-            'Bucket' => self::$bucket,
-            'ServerSideEncryptionConfiguration' => [
-                'Rules' => [
-                    [
-                        'ApplyServerSideEncryptionByDefault' => [
-                            'SSEAlgorithm' => 'aws:kms',
-                            'KMSMasterKeyID' => 'alias/test-key',
+        try {
+            self::$s3->putBucketEncryption([
+                'Bucket' => self::$bucket,
+                'ServerSideEncryptionConfiguration' => [
+                    'Rules' => [
+                        [
+                            'ApplyServerSideEncryptionByDefault' => [
+                                'SSEAlgorithm' => 'aws:kms',
+                                'KMSMasterKeyID' => 'alias/test-key',
+                            ],
+                            'BucketKeyEnabled' => true,
                         ],
-                        'BucketKeyEnabled' => true,
                     ],
                 ],
-            ],
-        ]);
-
-        $encryption = self::$s3->getBucketEncryption(['Bucket' => self::$bucket]);
-        $defaults = $encryption['ServerSideEncryptionConfiguration']['Rules'][0]['ApplyServerSideEncryptionByDefault'];
-
-        self::assertSame('aws:kms', $defaults['SSEAlgorithm']);
-        self::assertSame('alias/test-key', $defaults['KMSMasterKeyID']);
-
-        $key = 'kms/default-object.txt';
-        $body = 'kms encrypted payload ' . bin2hex(random_bytes(16));
-
-        self::$s3->putObject([
-            'Bucket' => self::$bucket,
-            'Key' => $key,
-            'Body' => $body,
-        ]);
-
-        $head = self::$s3->headObject([
-            'Bucket' => self::$bucket,
-            'Key' => $key,
-        ]);
-        self::assertSame('AES256', $head['ServerSideEncryption']);
-
-        $get = self::$s3->getObject([
-            'Bucket' => self::$bucket,
-            'Key' => $key,
-        ]);
-        self::assertSame($body, (string) $get['Body']);
-
-        self::assertFalse(
-            self::storageContains($body),
-            'Plaintext payload was found in storage while aws:kms default encryption was enabled.',
-        );
-    }
-
-    private static function storageContains(string $needle): bool
-    {
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator(self::$storagePath, \FilesystemIterator::SKIP_DOTS),
-        );
-
-        foreach ($iterator as $file) {
-            if (! $file->isFile()) {
-                continue;
-            }
-
-            $contents = file_get_contents($file->getPathname());
-            if ($contents !== false && str_contains($contents, $needle)) {
-                return true;
-            }
+            ]);
+            self::fail('Expected aws:kms bucket encryption to be rejected.');
+        } catch (S3Exception $e) {
+            self::assertSame(501, $e->getStatusCode());
+            self::assertSame('NotImplemented', $e->getAwsErrorCode());
         }
-
-        return false;
     }
 }

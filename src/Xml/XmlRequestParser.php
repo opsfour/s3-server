@@ -798,39 +798,6 @@ final class XmlRequestParser
      */
     private static function parse(string $xml): \SimpleXMLElement
     {
-        if (trim($xml) === '') {
-            throw new MalformedXmlException('Request body is empty.');
-        }
-
-        $previousUseErrors = libxml_use_internal_errors(true);
-        libxml_clear_errors();
-
-        try {
-            // Strip DTD to prevent entity expansion (billion laughs / XXE).
-            // Handles inline DTD subsets including nested brackets: <!DOCTYPE root [<!ENTITY ...> [...]]>
-            $xml = preg_replace('/<!DOCTYPE\b[^[>]*(?:\[(?:[^\]]*|\[[^\]]*\])*\])?[^>]*>/si', '', $xml);
-            if ($xml === null) {
-                throw new \RuntimeException('Failed to sanitize XML.');
-            }
-            $element = new \SimpleXMLElement($xml, LIBXML_NONET);
-        } catch (\Exception $e) {
-            libxml_clear_errors();
-            libxml_use_internal_errors($previousUseErrors);
-            throw new MalformedXmlException(
-                'The XML you provided was not well-formed or did not validate against our published schema.',
-            );
-        }
-
-        $errors = libxml_get_errors();
-        libxml_clear_errors();
-        libxml_use_internal_errors($previousUseErrors);
-
-        if ($errors !== []) {
-            throw new MalformedXmlException(
-                'The XML you provided was not well-formed or did not validate against our published schema.',
-            );
-        }
-
-        return $element;
+        return SafeXmlParser::parse($xml);
     }
 }

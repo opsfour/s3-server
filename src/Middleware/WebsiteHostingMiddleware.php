@@ -247,7 +247,18 @@ final class WebsiteHostingMiddleware implements Middleware
             }
         }
 
-        $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
+        $object = $this->metadata->getObjectMetadata($bucket, $key);
+        $grants = $this->metadata->getAcl(
+            'object',
+            \OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName(
+                $bucket,
+                $key,
+                $object?->versionId,
+            ),
+        );
+        if ($grants === []) {
+            $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
+        }
 
         return AclEvaluator::isAllowed(
             operation: S3Operation::GetObject,

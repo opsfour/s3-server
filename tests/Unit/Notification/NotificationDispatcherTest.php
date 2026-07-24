@@ -134,6 +134,96 @@ final class NotificationDispatcherTest extends TestCase
         );
     }
 
+    public function test_shutdown_waits_for_in_flight_internal_listeners(): void
+    {
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $completed = false;
+        $dispatcher->listen('s3:ObjectCreated:*', static function () use (&$completed): void {
+            \Amp\delay(0.02);
+            $completed = true;
+        });
+
+        $dispatcher->dispatchEvent(new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'drain.txt',
+            ownerId: 'owner',
+        ), enqueueWebhooks: false);
+        $dispatcher->shutdown(1);
+
+        self::assertTrue($completed);
+    }
+
+    public function test_shutdown_keeps_waiting_after_timeout_warning(): void
+    {
+        $logger = new NotificationArrayLogger();
+        $dispatcher = new NotificationDispatcher($this->metadata, $logger);
+        $completed = false;
+        $dispatcher->listen('s3:ObjectCreated:*', static function () use (&$completed): void {
+            \Amp\delay(0.03);
+            $completed = true;
+        });
+
+        $dispatcher->dispatchEvent(new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'slow-drain.txt',
+            ownerId: 'owner',
+        ), enqueueWebhooks: false);
+        $dispatcher->shutdown(0.005);
+
+        self::assertTrue($completed);
+        self::assertNotNull($logger->findContext('listener_shutdown_timeout', [
+            'component' => 'notification',
+        ]));
+    }
+
+    public function test_webhook_enqueue_rolls_back_with_caller_transaction(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'webhook-created',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => null,
+        ]]);
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $event = $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'rolled-back.txt');
+
+        try {
+            $this->metadata->transaction(function () use ($dispatcher, $event): void {
+                $dispatcher->enqueueWebhooks($event);
+                throw new \RuntimeException('roll back');
+            });
+        } catch (\RuntimeException $e) {
+            self::assertSame('roll back', $e->getMessage());
+        }
+
+        self::assertSame([], $this->metadata->dequeueNotifications(10));
+    }
+
+    public function test_committed_webhook_outbox_survives_bucket_deletion(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'webhook-created',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => null,
+        ]]);
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $dispatcher->enqueueWebhooks(
+            $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'committed.txt'),
+        );
+
+        $this->metadata->deleteBucket('owner', 'bucket');
+
+        $queued = $this->metadata->dequeueNotifications(10);
+        self::assertCount(1, $queued);
+        self::assertSame('s3:ObjectCreated:Put', $queued[0]['event_name']);
+        self::assertSame('bucket', $queued[0]['bucket']);
+    }
+
     private function runEventLoopTick(): void
     {
         $suspension = EventLoop::getSuspension();

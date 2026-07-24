@@ -15,7 +15,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 12;
+    public const int VERSION = 15;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -78,6 +78,10 @@ final class MysqlSchema
                 max_objects_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_bytes_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_bytes_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                max_multipart_uploads_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                max_multipart_uploads_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                max_multipart_bytes_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                max_multipart_bytes_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -248,11 +252,21 @@ final class MysqlSchema
                 resource_type VARCHAR(64) NOT NULL,
                 bucket VARCHAR(255) NOT NULL,
                 key_name VARCHAR(1024),
+                version_id VARCHAR(255) NOT NULL DEFAULT 'null',
                 tag_key VARCHAR(128) NOT NULL,
                 tag_value VARCHAR(256) NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uk_s3_tagging (resource_type, bucket, key_name(255), tag_key),
-                KEY idx_s3_tagging_resource (resource_type, bucket, key_name(255))
+                tag_identity BINARY(32) GENERATED ALWAYS AS (
+                    UNHEX(SHA2(CONCAT(
+                        LENGTH(resource_type), ':', resource_type,
+                        LENGTH(bucket), ':', bucket,
+                        IF(key_name IS NULL, '-1:', CONCAT(LENGTH(key_name), ':', key_name)),
+                        LENGTH(version_id), ':', version_id,
+                        LENGTH(tag_key), ':', tag_key
+                    ), 256))
+                ) STORED,
+                UNIQUE KEY uq_s3_tagging_version (tag_identity),
+                KEY idx_s3_tagging_resource (resource_type, bucket(63), key_name(191), version_id(64))
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -444,6 +458,22 @@ final class MysqlSchema
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
+            // Durable physical storage cleanup queue (version 15)
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_garbage (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                bucket VARCHAR(255) NOT NULL,
+                storage_tier VARCHAR(64) NOT NULL,
+                storage_path VARCHAR(1024) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                attempts INT NOT NULL DEFAULT 0,
+                next_attempt_at DOUBLE NOT NULL,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_s3_storage_gc_status (status, next_attempt_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
         ];
     }
 
@@ -599,6 +629,49 @@ final class MysqlSchema
             $statements[] = <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
                 owner_id VARCHAR(255) NOT NULL PRIMARY KEY
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL;
+        }
+
+        if ($fromVersion < 13) {
+            $statements[] = "ALTER TABLE s3_tagging ADD COLUMN version_id VARCHAR(255) NOT NULL DEFAULT 'null' AFTER key_name";
+            $statements[] = 'ALTER TABLE s3_tagging DROP INDEX uk_s3_tagging';
+            $statements[] = 'ALTER TABLE s3_tagging DROP INDEX idx_s3_tagging_resource';
+            $statements[] = <<<'SQL'
+            ALTER TABLE s3_tagging ADD COLUMN tag_identity BINARY(32) GENERATED ALWAYS AS (
+                UNHEX(SHA2(CONCAT(
+                    LENGTH(resource_type), ':', resource_type,
+                    LENGTH(bucket), ':', bucket,
+                    IF(key_name IS NULL, '-1:', CONCAT(LENGTH(key_name), ':', key_name)),
+                    LENGTH(version_id), ':', version_id,
+                    LENGTH(tag_key), ':', tag_key
+                ), 256))
+            ) STORED
+            SQL;
+            $statements[] = 'ALTER TABLE s3_tagging ADD UNIQUE KEY uq_s3_tagging_version (tag_identity)';
+            $statements[] = 'ALTER TABLE s3_tagging ADD KEY idx_s3_tagging_resource (resource_type, bucket(63), key_name(191), version_id(64))';
+        }
+
+        if ($fromVersion < 14) {
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN max_multipart_uploads_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN max_multipart_uploads_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN max_multipart_bytes_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_account_quotas ADD COLUMN max_multipart_bytes_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0';
+        }
+
+        if ($fromVersion < 15) {
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_garbage (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                bucket VARCHAR(255) NOT NULL,
+                storage_tier VARCHAR(64) NOT NULL,
+                storage_path VARCHAR(1024) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                attempts INT NOT NULL DEFAULT 0,
+                next_attempt_at DOUBLE NOT NULL,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_s3_storage_gc_status (status, next_attempt_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL;
         }

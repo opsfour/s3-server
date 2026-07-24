@@ -63,8 +63,20 @@ final class CredentialProviderFactory
      */
     private static function createDatabase(array $config): DatabaseCredentialProvider
     {
+        $cacheTtl = $config['cache_ttl'] ?? 1.0;
+        if (! is_numeric($cacheTtl) || (float) $cacheTtl < 0.0) {
+            throw new \InvalidArgumentException('Database credentials "cache_ttl" must be a number >= 0.');
+        }
+
         return DatabaseCredentialProvider::fromDsn(
             $config['dsn'] ?? throw new \InvalidArgumentException('Database credentials requires "dsn"'),
+            isset($config['username']) && is_string($config['username']) && $config['username'] !== ''
+                ? $config['username']
+                : null,
+            isset($config['password']) && is_string($config['password'])
+                ? $config['password']
+                : null,
+            (float) $cacheTtl,
         );
     }
 

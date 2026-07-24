@@ -378,10 +378,73 @@ final class VersioningTest extends S3FunctionalTestCase
     // Object Lock
     // -----------------------------------------------------------------
 
+    #[Depends('test_enable_versioning')]
+    public function test_tags_and_acls_are_isolated_per_object_version(): void
+    {
+        $key = 'version-scoped-metadata.txt';
+        $v1 = self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'version one',
+        ])['VersionId'];
+        self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'VersionId' => $v1,
+            'Tagging' => ['TagSet' => [['Key' => 'release', 'Value' => 'one']]],
+        ]);
+        self::$s3->putObjectAcl([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'VersionId' => $v1,
+            'ACL' => 'public-read',
+        ]);
+
+        $v2 = self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'version two',
+            'Tagging' => 'release=two',
+        ])['VersionId'];
+
+        self::assertSame(
+            'one',
+            self::$s3->getObjectTagging([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'VersionId' => $v1,
+            ])['TagSet'][0]['Value'],
+        );
+        self::assertSame(
+            'two',
+            self::$s3->getObjectTagging([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'VersionId' => $v2,
+            ])['TagSet'][0]['Value'],
+        );
+
+        $v1Acl = self::$s3->getObjectAcl([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'VersionId' => $v1,
+        ]);
+        $v2Acl = self::$s3->getObjectAcl([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'VersionId' => $v2,
+        ]);
+        self::assertTrue($this->hasAllUsersReadGrant($v1Acl['Grants']));
+        self::assertFalse($this->hasAllUsersReadGrant($v2Acl['Grants']));
+    }
+
     public function test_object_lock_config_crud(): void
     {
         $lockBucket = 'test-lock-config-bucket';
-        self::$s3->createBucket(['Bucket' => $lockBucket]);
+        self::$s3->createBucket([
+            'Bucket' => $lockBucket,
+            'ObjectLockEnabledForBucket' => true,
+        ]);
 
         // Put Object Lock config.
         self::$s3->putObjectLockConfiguration([
@@ -408,8 +471,43 @@ final class VersioningTest extends S3FunctionalTestCase
         $this->assertSame('GOVERNANCE', $defaultRetention['Mode']);
         $this->assertSame(30, $defaultRetention['Days']);
 
+        $put = self::$s3->putObject([
+            'Bucket' => $lockBucket,
+            'Key' => 'default-retention.txt',
+            'Body' => 'locked by bucket default',
+        ]);
+        $retention = self::$s3->getObjectRetention([
+            'Bucket' => $lockBucket,
+            'Key' => 'default-retention.txt',
+            'VersionId' => $put['VersionId'],
+        ]);
+        $this->assertSame('GOVERNANCE', $retention['Retention']['Mode']);
+        $this->assertGreaterThan(new \DateTimeImmutable('+29 days'), $retention['Retention']['RetainUntilDate']);
+
+        self::$s3->deleteObject([
+            'Bucket' => $lockBucket,
+            'Key' => 'default-retention.txt',
+            'VersionId' => $put['VersionId'],
+            'BypassGovernanceRetention' => true,
+        ]);
+
         // Clean up.
         self::$s3->deleteBucket(['Bucket' => $lockBucket]);
+    }
+
+    /** @param iterable<array<string, mixed>> $grants */
+    private function hasAllUsersReadGrant(iterable $grants): bool
+    {
+        foreach ($grants as $grant) {
+            if (
+                ($grant['Permission'] ?? null) === 'READ'
+                && ($grant['Grantee']['URI'] ?? null) === 'http://acs.amazonaws.com/groups/global/AllUsers'
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // -----------------------------------------------------------------

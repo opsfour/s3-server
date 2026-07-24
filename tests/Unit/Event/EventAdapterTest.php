@@ -66,6 +66,7 @@ final class EventAdapterTest extends TestCase
 
     public function test_queue_job_adapter_enqueues_event_array_or_factory_job(): void
     {
+        /** @var list<array{job: mixed, event: S3Event}> $jobs */
         $jobs = [];
         $event = $this->event();
 

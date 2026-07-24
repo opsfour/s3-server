@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use Aws\S3\Exception\S3Exception;
+
 final class ObjectAttributesAndSelectTest extends S3FunctionalTestCase
 {
     private static string $bucket = '';
@@ -132,5 +134,26 @@ final class ObjectAttributesAndSelectTest extends S3FunctionalTestCase
         $this->assertStringContainsString('Ada', $records);
         $this->assertStringContainsString('Bob', $records);
         $this->assertStringNotContainsString('Cyd', $records);
+    }
+
+    public function test_restore_object_sdk_route_rejects_non_archive_objects(): void
+    {
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'standard-restore.txt',
+            'Body' => 'not archived',
+        ]);
+
+        try {
+            self::$s3->restoreObject([
+                'Bucket' => self::$bucket,
+                'Key' => 'standard-restore.txt',
+                'RestoreRequest' => ['Days' => 1],
+            ]);
+            self::fail('Expected RestoreObject to reject a STANDARD object.');
+        } catch (S3Exception $e) {
+            self::assertSame(403, $e->getStatusCode());
+            self::assertSame('InvalidObjectState', $e->getAwsErrorCode());
+        }
     }
 }

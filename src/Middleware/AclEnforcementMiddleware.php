@@ -10,6 +10,8 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclEvaluator;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
+use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 
@@ -75,12 +77,26 @@ final class AclEnforcementMiddleware implements Middleware
         // For object operations: check object ACL first, then fall back to bucket ACL.
         // Bucket WRITE grants PutObject/DeleteObject; bucket READ grants ListObjects.
         $resourceType = $key !== null ? 'object' : 'bucket';
-        $resourceName = $key !== null ? "{$bucket}/{$key}" : $bucket;
+        $resourceName = $bucket;
+        if ($key !== null) {
+            $versionId = QueryStringParser::parse($request->getUri()->getQuery())['versionId'] ?? null;
+            if ($versionId === null) {
+                $versionId = $this->metadata->getObjectMetadata($bucket, $key)?->versionId;
+            }
+            $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $versionId);
+        }
 
         // Fetch ACL grants.
         $grants = [];
         try {
             $grants = $this->metadata->getAcl($resourceType, $resourceName);
+            if (
+                $grants === []
+                && $key !== null
+                && ($versionId === null || $versionId === 'null')
+            ) {
+                $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
+            }
         } catch (\Throwable) {
         }
 

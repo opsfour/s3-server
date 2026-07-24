@@ -74,7 +74,9 @@ final class TlsRuntimeTest extends TestCase
         $this->assertNotFalse($privateKey);
 
         $csr = openssl_csr_new(['commonName' => 'localhost'], $privateKey, ['digest_alg' => 'sha256']);
-        $this->assertNotFalse($csr);
+        if (!$csr instanceof \OpenSSLCertificateSigningRequest) {
+            self::fail('Failed to create the TLS test certificate request.');
+        }
         $certificate = openssl_csr_sign($csr, null, $privateKey, 1, ['digest_alg' => 'sha256']);
         $this->assertNotFalse($certificate);
 
@@ -107,12 +109,15 @@ final class TlsRuntimeTest extends TestCase
             escapeshellarg($keyPath),
         );
 
-        $this->process = proc_open($command, [
+        $process = proc_open($command, [
             0 => ['pipe', 'r'],
             1 => ['file', $stdout, 'a'],
             2 => ['file', $stderr, 'a'],
         ], $this->pipes);
-        $this->assertIsResource($this->process);
+        if (!is_resource($process)) {
+            self::fail('Failed to start the TLS test server.');
+        }
+        $this->process = $process;
 
         fclose($this->pipes[0]);
         unset($this->pipes[0]);
@@ -120,9 +125,13 @@ final class TlsRuntimeTest extends TestCase
 
     private function waitForHttps(Client $client, string $url): \Psr\Http\Message\ResponseInterface
     {
+        if (!is_resource($this->process)) {
+            self::fail('TLS test server process is not running.');
+        }
+        $process = $this->process;
         $lastError = null;
         for ($attempt = 0; $attempt < 100; $attempt++) {
-            $status = proc_get_status($this->process);
+            $status = proc_get_status($process);
             if (!$status['running']) {
                 $stderr = @file_get_contents($this->tempDir . '/stderr.log') ?: '';
                 $this->fail("TLS server stopped before becoming ready: {$stderr}");

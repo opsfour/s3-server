@@ -105,21 +105,34 @@ final class AdminQuotaApiHandlerTest extends TestCase
         $this->assertSame('invalid_request', $this->json($response)['error']);
     }
 
+    public function test_put_rejects_oversized_body_without_throwing_buffer_exception(): void
+    {
+        $response = $this->handler()->handleRequest($this->request(
+            'PUT',
+            '/.admin/quotas/tenant-a',
+            str_repeat('x', 4097),
+            $this->authHeaders(),
+        ));
+
+        $this->assertSame(400, $response->getStatus());
+        $this->assertSame('invalid_request', $this->json($response)['error']);
+    }
+
     private function handler(): AdminQuotaApiHandler
     {
         return new AdminQuotaApiHandler($this->metadata, 'admin-secret');
     }
 
-    /**
-     * @return array<string, string>
-     */
+    /** @return array{authorization: string} */
     private function authHeaders(): array
     {
         return ['authorization' => 'Bearer admin-secret'];
     }
 
     /**
-     * @param array<string, string> $headers
+     * @param non-empty-string $method
+     * @param array<string, mixed>|string $body
+     * @param array<non-empty-string, string> $headers
      */
     private function request(string $method, string $path, array|string $body = '', array $headers = []): Request
     {

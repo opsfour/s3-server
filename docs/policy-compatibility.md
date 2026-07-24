@@ -11,10 +11,10 @@ explicitly, and unsupported condition operators or keys fail closed with
 | --- | --- | --- |
 | JSON bucket policies | Supported | `Version` is accepted but not semantically versioned. |
 | Single `Statement` object | Supported | Normalized to a one-item statement list. |
-| Statement list | Supported | Non-object statements are ignored. |
+| Statement list | Supported | Must be non-empty and contain only statement objects. |
 | `Effect: Allow` | Supported | Allows only if principal, action, resource, and conditions match. |
 | `Effect: Deny` | Supported | Explicit deny wins over allow. |
-| Invalid/corrupt policy JSON | Fail closed | Evaluates as `Deny`. |
+| Invalid/corrupt policy JSON | Fail closed | Directly loaded corrupt policies evaluate as `Deny`; `PutBucketPolicy` rejects malformed documents with `MalformedPolicy`. |
 | Unsupported condition operator/key | Fail closed | Evaluates as `Deny` for the whole policy. |
 | Account policies | Supported local extension | One policy document per `ownerId`; evaluated before bucket-owner bypass. |
 | Named credential policies | Supported local extension | Credentials can reference reusable policy names stored in the metadata backend. |

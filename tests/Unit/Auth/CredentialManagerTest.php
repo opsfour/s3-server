@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Tests\Unit\Auth;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\CredentialManager;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class CredentialManagerTest extends TestCase
@@ -90,6 +91,60 @@ final class CredentialManagerTest extends TestCase
         $this->assertSame('custom-secret-key-value', $credential->secretAccessKey);
         $this->assertSame('session-token', $credential->sessionToken);
         $this->assertSame($expiresAt, $credential->expiresAt);
+    }
+
+    /**
+     * @return iterable<string, array<string, mixed>>
+     */
+    public static function invalidCredentialFields(): iterable
+    {
+        yield 'empty owner' => ['ownerId' => ''];
+        yield 'oversized owner' => ['ownerId' => str_repeat('o', 256)];
+        yield 'invalid access key characters' => [
+            'ownerId' => 'owner-1',
+            'accessKeyId' => 'invalid/access/key',
+        ];
+        yield 'empty secret' => [
+            'ownerId' => 'owner-1',
+            'secretAccessKey' => '',
+        ];
+        yield 'oversized display name' => [
+            'ownerId' => 'owner-1',
+            'displayName' => str_repeat('d', 256),
+        ];
+        yield 'too many policy names' => [
+            'ownerId' => 'owner-1',
+            'policyNames' => array_fill(0, 129, 'policy'),
+        ];
+        yield 'oversized allowed prefix' => [
+            'ownerId' => 'owner-1',
+            'allowedPrefixes' => [str_repeat('p', 1025)],
+        ];
+    }
+
+    /**
+     * @param list<string> $policyNames
+     * @param list<string> $allowedPrefixes
+     */
+    #[DataProvider('invalidCredentialFields')]
+    public function test_create_credential_rejects_invalid_or_unpersistable_fields(
+        string $ownerId,
+        string $displayName = '',
+        ?string $accessKeyId = null,
+        ?string $secretAccessKey = null,
+        array $policyNames = [],
+        array $allowedPrefixes = [],
+    ): void {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->manager->createCredential(
+            ownerId: $ownerId,
+            displayName: $displayName,
+            accessKeyId: $accessKeyId,
+            secretAccessKey: $secretAccessKey,
+            policyNames: $policyNames,
+            allowedPrefixes: $allowedPrefixes,
+        );
     }
 
     public function test_create_credential_persists_to_provider(): void

@@ -11,8 +11,10 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Xml\XmlRequestParser;
@@ -48,7 +50,7 @@ final class DeleteObjectsHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -57,7 +59,7 @@ final class DeleteObjectsHandler implements RequestHandler
         }
 
         // Read and parse the XML body.
-        $body = ByteStream\buffer($request->getBody());
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 2_097_152);
         $parsed = XmlRequestParser::parseDeleteObjects($body);
 
         if (count($parsed['objects']) > 1000) {
@@ -74,10 +76,17 @@ final class DeleteObjectsHandler implements RequestHandler
         // Collect storage paths and notifications to process after commit.
         /** @var list<ObjectInfo> $objectsToClean */
         $objectsToClean = [];
-        $notificationKeys = [];
+        /** @var list<S3Event> $notificationEvents */
+        $notificationEvents = [];
 
         // Wrap all metadata deletions in a transaction for atomicity.
-        $this->metadata->transaction(function () use ($parsed, $bucket, $ownerId, $versioning, $quiet, $request, &$deleted, &$errors, &$objectsToClean, &$notificationKeys): void {
+        $this->metadata->transaction(function () use ($parsed, $bucketInfo, $bucket, $ownerId, $versioning, $quiet, $request, &$deleted, &$errors, &$objectsToClean, &$notificationEvents): void {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
+                throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                    'Bucket versioning changed while the batch delete was being committed.',
+                );
+            }
             foreach ($parsed['objects'] as $obj) {
                 $key = $obj['key'];
                 $versionId = $obj['versionId'] ?? null;
@@ -96,7 +105,7 @@ final class DeleteObjectsHandler implements RequestHandler
                                 $objectsToClean[] = $deletedInfo;
                             }
 
-                            $notificationKeys[] = $key;
+                            $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
 
                             if (! $quiet) {
                                 $entry = ['key' => $key, 'versionId' => $versionId];
@@ -131,7 +140,7 @@ final class DeleteObjectsHandler implements RequestHandler
                         if ($oldSuspendedObject !== null) {
                             $objectsToClean[] = $oldSuspendedObject;
                         }
-                        $notificationKeys[] = $key;
+                        $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
 
                         if (! $quiet) {
                             $deleted[] = [
@@ -150,7 +159,7 @@ final class DeleteObjectsHandler implements RequestHandler
                             // Collect path AFTER metadata delete succeeds to avoid
                             // deleting storage for objects whose metadata wasn't removed.
                             $objectsToClean[] = $objectInfo;
-                            $notificationKeys[] = $key;
+                            $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
                         }
 
                         // S3 returns success even if the object didn't exist.
@@ -173,6 +182,10 @@ final class DeleteObjectsHandler implements RequestHandler
                     ];
                 }
             }
+
+            foreach ($notificationEvents as $event) {
+                $this->notifications?->enqueueWebhooks($event);
+            }
         });
 
         // Delete storage files AFTER successful metadata commit.
@@ -181,8 +194,8 @@ final class DeleteObjectsHandler implements RequestHandler
         }
 
         // Dispatch notifications after commit.
-        foreach ($notificationKeys as $key) {
-            $this->notifications?->dispatch('s3:ObjectRemoved:Delete', $bucket, $key, 0, '', $ownerId);
+        foreach ($notificationEvents as $event) {
+            $this->notifications?->dispatchInternalEvent($event);
         }
 
         $xml = XmlResponseBuilder::deleteResult($deleted, $errors);
@@ -198,20 +211,18 @@ final class DeleteObjectsHandler implements RequestHandler
     {
         $path = $object->systemMetadata['storagePath'] ?? null;
         if ($path !== null && $path !== '') {
-            try {
-                $this->storageTiers->tier($object->storageTier)->backend
-                    ->deleteObjectByPath($path, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->tier($object->storageTier)->backend, $object->bucket, $object->storageTier, $path);
         }
 
         if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
-            try {
-                $this->storageTiers->defaultBackend()
-                    ->deleteObjectByPath($object->restoredStoragePath, $object->bucket);
-            } catch (\Throwable) {
-            }
+            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->defaultBackend(), $object->bucket, $this->storageTiers->defaultTier()->name, $object->restoredStoragePath);
         }
+    }
+
+    private function removalEvent(string $bucket, string $key, string $ownerId): S3Event
+    {
+        return $this->notifications?->createEvent('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId)
+            ?? new S3Event('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId);
     }
 
 }

@@ -44,7 +44,7 @@ final class CreateBucketHandler implements RequestHandler
 
         // 2. Parse optional CreateBucketConfiguration XML body.
         $region = $this->config->region;
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 65_536);
 
         if ($body !== '') {
             $parsed = XmlRequestParser::parseCreateBucketConfiguration($body);
@@ -54,10 +54,13 @@ final class CreateBucketHandler implements RequestHandler
         }
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'bucket')
             ?? AclGrantResolver::privateAcl($ownerId);
+        $objectLockEnabled = strtolower(
+            $request->getHeader('x-amz-bucket-object-lock-enabled') ?? 'false',
+        ) === 'true';
 
         // 3. Serialize same-account quota checks and metadata creation.
         $alreadyOwned = false;
-        $this->metadata->transaction(function () use ($ownerId, $bucket, $region, $aclGrants, &$alreadyOwned): void {
+        $this->metadata->transaction(function () use ($ownerId, $bucket, $region, $aclGrants, $objectLockEnabled, &$alreadyOwned): void {
             $this->metadata->lockOwnerForUpdate($ownerId);
 
             $existingOwner = $this->metadata->getBucketOwner($bucket);
@@ -73,9 +76,20 @@ final class CreateBucketHandler implements RequestHandler
             $this->quotas?->assertCanCreateBucket($ownerId);
             $this->metadata->createBucket($ownerId, $bucket, $region);
             $this->metadata->putAcl('bucket', $bucket, $ownerId, $aclGrants);
+            if ($objectLockEnabled) {
+                $this->metadata->setBucketVersioning($bucket, 'Enabled');
+                $this->metadata->putObjectLockConfig($bucket, [
+                    'objectLockEnabled' => 'Enabled',
+                ]);
+            }
         });
 
         if ($alreadyOwned) {
+            // A previous attempt may have committed metadata before storage
+            // provisioning failed. Re-run the idempotent backend operation so a
+            // retry repairs that partial state.
+            $this->storage->createBucket($bucket);
+
             return new Response(status: 200, headers: ['Location' => '/' . $bucket]);
         }
 
@@ -107,7 +121,7 @@ final class CreateBucketHandler implements RequestHandler
      * - Must start and end with a letter or number.
      * - Must not contain consecutive dots.
      * - Must not be formatted as an IP address (e.g., 192.168.5.4).
-     * - Strict mode (default): no dots allowed (AWS recommendation since 2018).
+     * - Strict mode (default): reject AWS-reserved prefixes and suffixes.
      *
      * @throws InvalidBucketNameException If the bucket name is invalid.
      */
@@ -136,41 +150,16 @@ final class CreateBucketHandler implements RequestHandler
             );
         }
 
-        if ($strict) {
-            // Strict mode: only lowercase letters, numbers, and hyphens (no dots).
-            if (! preg_match('/^[a-z0-9][a-z0-9-]*[a-z0-9]$/', $name)) {
-                throw new InvalidBucketNameException(
-                    'Bucket name can only contain lowercase letters, numbers, and hyphens.',
-                );
-            }
+        if (! preg_match('/^[a-z0-9][a-z0-9.\-]*[a-z0-9]$/', $name)) {
+            throw new InvalidBucketNameException(
+                'Bucket name can only contain lowercase letters, numbers, hyphens, and dots.',
+            );
+        }
 
-            // No consecutive hyphens.
-            if (str_contains($name, '--')) {
-                throw new InvalidBucketNameException(
-                    'Bucket name must not contain consecutive hyphens.',
-                );
-            }
-        } else {
-            // Relaxed mode: lowercase letters, numbers, hyphens, and dots.
-            if (! preg_match('/^[a-z0-9][a-z0-9.\-]*[a-z0-9]$/', $name)) {
-                throw new InvalidBucketNameException(
-                    'Bucket name can only contain lowercase letters, numbers, hyphens, and dots.',
-                );
-            }
-
-            // No consecutive dots.
-            if (str_contains($name, '..')) {
-                throw new InvalidBucketNameException(
-                    'Bucket name must not contain consecutive dots.',
-                );
-            }
-
-            // No dot adjacent to hyphen (e.g., "my-.bucket" or "my.-bucket").
-            if (preg_match('/\.\-|\-\./', $name)) {
-                throw new InvalidBucketNameException(
-                    'Bucket name must not contain a dot adjacent to a hyphen.',
-                );
-            }
+        if (str_contains($name, '..')) {
+            throw new InvalidBucketNameException(
+                'Bucket name must not contain consecutive dots.',
+            );
         }
 
         // Must not be formatted as an IP address.
@@ -180,18 +169,22 @@ final class CreateBucketHandler implements RequestHandler
             );
         }
 
-        // Must not start with "xn--" (internationalized domain name prefix).
-        if (str_starts_with($name, 'xn--')) {
-            throw new InvalidBucketNameException(
-                'Bucket name must not start with the "xn--" prefix.',
-            );
-        }
+        if ($strict) {
+            foreach (['xn--', 'sthree-', 'amzn-s3-demo-'] as $prefix) {
+                if (str_starts_with($name, $prefix)) {
+                    throw new InvalidBucketNameException(
+                        "Bucket name must not start with the reserved \"{$prefix}\" prefix.",
+                    );
+                }
+            }
 
-        // Must not end with "-s3alias" or "--ol-s3".
-        if (str_ends_with($name, '-s3alias') || str_ends_with($name, '--ol-s3')) {
-            throw new InvalidBucketNameException(
-                'Bucket name must not end with "-s3alias" or "--ol-s3".',
-            );
+            foreach (['-s3alias', '--ol-s3', '.mrap', '--x-s3', '--table-s3', '-an'] as $suffix) {
+                if (str_ends_with($name, $suffix)) {
+                    throw new InvalidBucketNameException(
+                        "Bucket name must not end with the reserved \"{$suffix}\" suffix.",
+                    );
+                }
+            }
         }
     }
 }

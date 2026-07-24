@@ -33,7 +33,11 @@ final class S3ServerQuotaCommand extends Command
             ->addOption('max-buckets', null, InputOption::VALUE_REQUIRED, 'Maximum buckets for the account (0 = unlimited)', '0')
             ->addOption('max-objects-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum objects per bucket (0 = unlimited)', '0')
             ->addOption('max-bytes-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum bytes per bucket (0 = unlimited)', '0')
-            ->addOption('max-bytes', null, InputOption::VALUE_REQUIRED, 'Maximum bytes for the account (0 = unlimited)', '0');
+            ->addOption('max-bytes', null, InputOption::VALUE_REQUIRED, 'Maximum bytes for the account (0 = unlimited)', '0')
+            ->addOption('max-multipart-uploads-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum active multipart uploads per bucket', '0')
+            ->addOption('max-multipart-uploads-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum active multipart uploads per owner', '0')
+            ->addOption('max-multipart-bytes-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum staged multipart bytes per bucket', '0')
+            ->addOption('max-multipart-bytes-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum staged multipart bytes per owner', '0');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -68,6 +72,10 @@ final class S3ServerQuotaCommand extends Command
                 maxObjectsPerBucket: $this->optionInt($input, 'max-objects-per-bucket'),
                 maxBytesPerBucket: $this->optionInt($input, 'max-bytes-per-bucket'),
                 maxBytesPerOwner: $this->optionInt($input, 'max-bytes'),
+                maxMultipartUploadsPerBucket: $this->optionInt($input, 'max-multipart-uploads-per-bucket'),
+                maxMultipartUploadsPerOwner: $this->optionInt($input, 'max-multipart-uploads-per-owner'),
+                maxMultipartBytesPerBucket: $this->optionInt($input, 'max-multipart-bytes-per-bucket'),
+                maxMultipartBytesPerOwner: $this->optionInt($input, 'max-multipart-bytes-per-owner'),
             );
         } catch (\InvalidArgumentException $e) {
             $io->error($e->getMessage());
@@ -172,6 +180,10 @@ final class S3ServerQuotaCommand extends Command
             ['Max Objects/Bucket' => (string) $quota->maxObjectsPerBucket],
             ['Max Bytes/Bucket' => (string) $quota->maxBytesPerBucket],
             ['Max Bytes/Owner' => (string) $quota->maxBytesPerOwner],
+            ['Max Multipart Uploads/Bucket' => (string) $quota->maxMultipartUploadsPerBucket],
+            ['Max Multipart Uploads/Owner' => (string) $quota->maxMultipartUploadsPerOwner],
+            ['Max Multipart Bytes/Bucket' => (string) $quota->maxMultipartBytesPerBucket],
+            ['Max Multipart Bytes/Owner' => (string) $quota->maxMultipartBytesPerOwner],
         );
     }
 }

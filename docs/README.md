@@ -37,7 +37,7 @@ available on request.
 - [Production Feature Roadmap](production-feature-roadmap.md) — Quotas, IAM/OIDC, eventing, lifecycle hardening, and deferred AWS features
 - [Production Hardening Status](production-hardening-status.md) — Release blockers, remediation progress, and verified acceptance criteria
 - [Policy Compatibility Matrix](policy-compatibility.md) — Supported bucket policy principals, actions, resources, conditions, and fail-closed behavior
-- [S3 Select](s3-select.md) — SQL queries over CSV, JSON, and Parquet objects
+- [S3 Select](s3-select.md) — SQL queries over unencrypted CSV and JSON objects
 
 ## Operations
 

@@ -81,35 +81,51 @@ final class SqliteMetadataStore implements MetadataStore
 
     public function deleteBucket(string $ownerId, string $bucket): void
     {
-        // Verify the bucket exists and get its owner.
-        $stmt = $this->prepare('SELECT owner_id FROM s3_buckets WHERE name = ?');
-        $stmt->execute([$bucket]);
-        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        $this->transaction(function () use ($ownerId, $bucket): void {
+            $stmt = $this->prepare('SELECT owner_id FROM s3_buckets WHERE name = ?');
+            $stmt->execute([$bucket]);
+            $row = $stmt->fetch(\PDO::FETCH_ASSOC);
 
-        if ($row === false) {
-            throw new NoSuchBucketException(
-                'The specified bucket does not exist.',
-            );
-        }
+            if ($row === false) {
+                throw new NoSuchBucketException('The specified bucket does not exist.');
+            }
+            if ($row['owner_id'] !== $ownerId) {
+                throw new AccessDeniedException('Access Denied');
+            }
+            if ($this->countObjects($bucket) > 0) {
+                throw new BucketNotEmptyException('The bucket you tried to delete is not empty.');
+            }
 
-        if ($row['owner_id'] !== $ownerId) {
-            throw new AccessDeniedException('Access Denied');
-        }
+            $bucketTables = [
+                's3_lifecycle_checkpoints',
+                's3_tier_transition_jobs',
+                's3_restore_jobs',
+                's3_notification_configs',
+                's3_lifecycle_rules',
+                's3_encryption_configs',
+                's3_lock_configs',
+                's3_object_retention',
+                's3_object_legal_holds',
+                's3_website_configs',
+                's3_public_access_blocks',
+                's3_bucket_logging',
+                's3_cors_rules',
+                's3_policies',
+                's3_tagging',
+            ];
 
-        // Verify the bucket is empty.
-        $objectCount = $this->countObjects($bucket);
-        if ($objectCount > 0) {
-            throw new BucketNotEmptyException(
-                'The bucket you tried to delete is not empty.',
-            );
-        }
-
-        // Auto-abort any outstanding multipart uploads (AWS S3 behavior since 2023).
-        $this->prepare('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = ?)')->execute([$bucket]);
-        $this->prepare('DELETE FROM s3_multipart_uploads WHERE bucket = ?')->execute([$bucket]);
-
-        $stmt = $this->prepare('DELETE FROM s3_buckets WHERE name = ? AND owner_id = ?');
-        $stmt->execute([$bucket, $ownerId]);
+            $this->prepare('DELETE FROM s3_parts WHERE upload_id IN (SELECT upload_id FROM s3_multipart_uploads WHERE bucket = ?)')->execute([$bucket]);
+            $this->prepare('DELETE FROM s3_multipart_uploads WHERE bucket = ?')->execute([$bucket]);
+            foreach ($bucketTables as $table) {
+                $this->prepare("DELETE FROM {$table} WHERE bucket = ?")->execute([$bucket]);
+            }
+            $this->prepare(
+                "DELETE FROM s3_acls
+                 WHERE (resource_type = 'bucket' AND resource_name = ?)
+                    OR (resource_type = 'object' AND resource_name LIKE ? ESCAPE '\\')",
+            )->execute([$bucket, $this->escapeLikePattern($bucket . '/') . '%']);
+            $this->prepare('DELETE FROM s3_buckets WHERE name = ? AND owner_id = ?')->execute([$bucket, $ownerId]);
+        });
     }
 
     public function getBucket(string $bucket): ?BucketInfo
@@ -418,7 +434,7 @@ final class SqliteMetadataStore implements MetadataStore
     public function getAccountQuota(string $ownerId): ?QuotaConfig
     {
         $stmt = $this->prepare(
-            'SELECT max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas WHERE owner_id = ?',
+            'SELECT * FROM s3_account_quotas WHERE owner_id = ?',
         );
         $stmt->execute([$ownerId]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -432,13 +448,17 @@ final class SqliteMetadataStore implements MetadataStore
             maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
             maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
             maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+            maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+            maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+            maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+            maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
         );
     }
 
     public function listAccountQuotas(): array
     {
         $stmt = $this->prepare(
-            'SELECT owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner FROM s3_account_quotas ORDER BY owner_id ASC',
+            'SELECT * FROM s3_account_quotas ORDER BY owner_id ASC',
         );
         $stmt->execute();
 
@@ -449,6 +469,10 @@ final class SqliteMetadataStore implements MetadataStore
                 maxObjectsPerBucket: (int) $row['max_objects_per_bucket'],
                 maxBytesPerBucket: (int) $row['max_bytes_per_bucket'],
                 maxBytesPerOwner: (int) $row['max_bytes_per_owner'],
+                maxMultipartUploadsPerBucket: (int) $row['max_multipart_uploads_per_bucket'],
+                maxMultipartUploadsPerOwner: (int) $row['max_multipart_uploads_per_owner'],
+                maxMultipartBytesPerBucket: (int) $row['max_multipart_bytes_per_bucket'],
+                maxMultipartBytesPerOwner: (int) $row['max_multipart_bytes_per_owner'],
             );
         }
 
@@ -458,13 +482,17 @@ final class SqliteMetadataStore implements MetadataStore
     public function putAccountQuota(string $ownerId, QuotaConfig $quota): void
     {
         $stmt = $this->prepare(
-            'INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, updated_at)
-             VALUES (?, ?, ?, ?, ?, strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\'))
+            'INSERT INTO s3_account_quotas (owner_id, max_buckets_per_owner, max_objects_per_bucket, max_bytes_per_bucket, max_bytes_per_owner, max_multipart_uploads_per_bucket, max_multipart_uploads_per_owner, max_multipart_bytes_per_bucket, max_multipart_bytes_per_owner, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\'))
              ON CONFLICT(owner_id) DO UPDATE SET
                 max_buckets_per_owner = excluded.max_buckets_per_owner,
                 max_objects_per_bucket = excluded.max_objects_per_bucket,
                 max_bytes_per_bucket = excluded.max_bytes_per_bucket,
                 max_bytes_per_owner = excluded.max_bytes_per_owner,
+                max_multipart_uploads_per_bucket = excluded.max_multipart_uploads_per_bucket,
+                max_multipart_uploads_per_owner = excluded.max_multipart_uploads_per_owner,
+                max_multipart_bytes_per_bucket = excluded.max_multipart_bytes_per_bucket,
+                max_multipart_bytes_per_owner = excluded.max_multipart_bytes_per_owner,
                 updated_at = excluded.updated_at',
         );
         $stmt->execute([
@@ -473,6 +501,10 @@ final class SqliteMetadataStore implements MetadataStore
             $quota->maxObjectsPerBucket,
             $quota->maxBytesPerBucket,
             $quota->maxBytesPerOwner,
+            $quota->maxMultipartUploadsPerBucket,
+            $quota->maxMultipartUploadsPerOwner,
+            $quota->maxMultipartBytesPerBucket,
+            $quota->maxMultipartBytesPerOwner,
         ]);
     }
 
@@ -921,6 +953,27 @@ final class SqliteMetadataStore implements MetadataStore
         ];
     }
 
+    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    {
+        $sql = 'SELECT COUNT(DISTINCT u.upload_id) AS upload_count, COALESCE(SUM(p.size), 0) AS bytes_used
+                FROM s3_multipart_uploads u
+                LEFT JOIN s3_parts p ON p.upload_id = u.upload_id
+                WHERE u.owner_id = ?';
+        $params = [$ownerId];
+        if ($bucket !== null) {
+            $sql .= ' AND u.bucket = ?';
+            $params[] = $bucket;
+        }
+        $stmt = $this->prepare($sql);
+        $stmt->execute($params);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+        return [
+            'uploadCount' => $row !== false ? (int) $row['upload_count'] : 0,
+            'bytesUsed' => $row !== false ? (int) $row['bytes_used'] : 0,
+        ];
+    }
+
     public function putPart(
         string $uploadId,
         int $partNumber,
@@ -1254,6 +1307,12 @@ final class SqliteMetadataStore implements MetadataStore
                 'DELETE FROM s3_object_legal_holds WHERE bucket = ? AND key_name = ? AND version_id = ?',
             );
             $stmt->execute([$bucket, $key, $effectiveVersionId]);
+            $this->prepare(
+                "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?",
+            )->execute([$bucket, $key, $effectiveVersionId]);
+            $this->prepare(
+                "DELETE FROM s3_acls WHERE resource_type = 'object' AND resource_name = ?",
+            )->execute([\OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, $versionId)]);
 
             if ($ownTx) {
                 $pdo->commit();
@@ -1750,13 +1809,13 @@ final class SqliteMetadataStore implements MetadataStore
         $stmt->execute([$bucket]);
     }
 
-    public function getObjectTagging(string $bucket, string $key): array
+    public function getObjectTagging(string $bucket, string $key, ?string $versionId = null): array
     {
         $stmt = $this->prepare(
             'SELECT tag_key, tag_value FROM s3_tagging '
-            . "WHERE resource_type = 'object' AND bucket = ? AND key_name = ? ORDER BY id ASC",
+            . "WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ? ORDER BY id ASC",
         );
-        $stmt->execute([$bucket, $key]);
+        $stmt->execute([$bucket, $key, $versionId ?? 'null']);
 
         $tags = [];
 
@@ -1770,7 +1829,7 @@ final class SqliteMetadataStore implements MetadataStore
         return $tags;
     }
 
-    public function putObjectTagging(string $bucket, string $key, array $tags): void
+    public function putObjectTagging(string $bucket, string $key, array $tags, ?string $versionId = null): void
     {
         $pdo = $this->connection();
 
@@ -1781,17 +1840,17 @@ final class SqliteMetadataStore implements MetadataStore
 
         try {
             $stmt = $this->prepare(
-                "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ?",
+                "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?",
             );
-            $stmt->execute([$bucket, $key]);
+            $stmt->execute([$bucket, $key, $versionId ?? 'null']);
 
             $stmt = $this->prepare(
-                'INSERT INTO s3_tagging (resource_type, bucket, key_name, tag_key, tag_value) '
-                . "VALUES ('object', ?, ?, ?, ?)",
+                'INSERT INTO s3_tagging (resource_type, bucket, key_name, version_id, tag_key, tag_value) '
+                . "VALUES ('object', ?, ?, ?, ?, ?)",
             );
 
             foreach ($tags as $tag) {
-                $stmt->execute([$bucket, $key, $tag['key'], $tag['value']]);
+                $stmt->execute([$bucket, $key, $versionId ?? 'null', $tag['key'], $tag['value']]);
             }
 
             if ($ownTx) {
@@ -1805,12 +1864,12 @@ final class SqliteMetadataStore implements MetadataStore
         }
     }
 
-    public function deleteObjectTagging(string $bucket, string $key): void
+    public function deleteObjectTagging(string $bucket, string $key, ?string $versionId = null): void
     {
         $stmt = $this->prepare(
-            "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ?",
+            "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = ?",
         );
-        $stmt->execute([$bucket, $key]);
+        $stmt->execute([$bucket, $key, $versionId ?? 'null']);
     }
 
     // ===============================================================
@@ -2100,7 +2159,7 @@ final class SqliteMetadataStore implements MetadataStore
         $this->executeWithRetry(
             "UPDATE s3_tier_transition_jobs SET status = 'pending', updated_at = ?
              WHERE status = 'processing' AND next_attempt_at < ?",
-            [gmdate('Y-m-d\TH:i:s\Z'), $now - 300],
+            [gmdate('Y-m-d\TH:i:s\Z'), $now],
         );
 
         $ownTx = !$pdo->inTransaction();
@@ -2122,9 +2181,11 @@ final class SqliteMetadataStore implements MetadataStore
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $update = $this->prepare(
-                    "UPDATE s3_tier_transition_jobs SET status = 'processing', updated_at = ? WHERE id IN ({$placeholders})",
+                    "UPDATE s3_tier_transition_jobs
+                     SET status = 'processing', next_attempt_at = ?, updated_at = ?
+                     WHERE id IN ({$placeholders})",
                 );
-                $update->execute([gmdate('Y-m-d\TH:i:s\Z'), ...$ids]);
+                $update->execute([QueueLease::expiresAt($now), gmdate('Y-m-d\TH:i:s\Z'), ...$ids]);
             }
 
             if ($ownTx) {
@@ -2160,6 +2221,18 @@ final class SqliteMetadataStore implements MetadataStore
             gmdate('Y-m-d\TH:i:s\Z'),
             $id,
         ]);
+    }
+
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $stmt = $this->prepare(
+            "UPDATE s3_tier_transition_jobs
+             SET next_attempt_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'processing'",
+        );
+        $stmt->execute([$leaseExpiresAt, gmdate('Y-m-d\TH:i:s\Z'), $id]);
+
+        return $stmt->rowCount() > 0;
     }
 
     public function getTierTransitionJob(int $id): ?array
@@ -2208,7 +2281,7 @@ final class SqliteMetadataStore implements MetadataStore
         $this->executeWithRetry(
             "UPDATE s3_restore_jobs SET status = 'pending', updated_at = ?
              WHERE status = 'processing' AND next_attempt_at < ?",
-            [gmdate('Y-m-d\TH:i:s\Z'), $now - 300],
+            [gmdate('Y-m-d\TH:i:s\Z'), $now],
         );
 
         $ownTx = !$pdo->inTransaction();
@@ -2230,9 +2303,11 @@ final class SqliteMetadataStore implements MetadataStore
                 $ids = array_map(static fn(array $row): int => (int) $row['id'], $rows);
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 $update = $this->prepare(
-                    "UPDATE s3_restore_jobs SET status = 'processing', updated_at = ? WHERE id IN ({$placeholders})",
+                    "UPDATE s3_restore_jobs
+                     SET status = 'processing', next_attempt_at = ?, updated_at = ?
+                     WHERE id IN ({$placeholders})",
                 );
-                $update->execute([gmdate('Y-m-d\TH:i:s\Z'), ...$ids]);
+                $update->execute([QueueLease::expiresAt($now), gmdate('Y-m-d\TH:i:s\Z'), ...$ids]);
             }
 
             if ($ownTx) {
@@ -2268,6 +2343,18 @@ final class SqliteMetadataStore implements MetadataStore
             gmdate('Y-m-d\TH:i:s\Z'),
             $id,
         ]);
+    }
+
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    {
+        $stmt = $this->prepare(
+            "UPDATE s3_restore_jobs
+             SET next_attempt_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'processing'",
+        );
+        $stmt->execute([$leaseExpiresAt, gmdate('Y-m-d\TH:i:s\Z'), $id]);
+
+        return $stmt->rowCount() > 0;
     }
 
     public function getRestoreJob(int $id): ?array
@@ -2669,12 +2756,13 @@ final class SqliteMetadataStore implements MetadataStore
         return array_values(array_map(fn(array $row) => $this->rowToObjectInfo($row), $stmt->fetchAll(\PDO::FETCH_ASSOC)));
     }
 
-    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null): array
+    public function listExpiredMultipartUploads(string $bucket, int $daysAfterInitiation, int $limit = 1000, ?string $prefix = null, ?string $afterKey = null, ?string $afterUploadId = null, ?\DateTimeImmutable $createdBefore = null): array
     {
         $pdo = $this->connection();
 
-        $cutoff = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
-            ->modify("-{$daysAfterInitiation} days")
+        $cutoff = ($createdBefore ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify("-{$daysAfterInitiation} days"))
+            ->setTimezone(new \DateTimeZone('UTC'))
             ->format('Y-m-d\TH:i:s\Z');
 
         $sql = 'SELECT upload_id, bucket, key_name FROM s3_multipart_uploads WHERE bucket = ? AND created_at < ?';
@@ -2821,7 +2909,7 @@ final class SqliteMetadataStore implements MetadataStore
             $this->prepare(
                 "UPDATE s3_notification_queue SET status = 'pending'
                  WHERE status = 'processing' AND next_attempt_at < ?",
-            )->execute([$now - 300]);
+            )->execute([$now]);
 
             $stmt = $this->prepare(
                 "SELECT id, bucket, key_name, event_name, destination_url, payload_json, attempts, max_attempts
@@ -2838,8 +2926,10 @@ final class SqliteMetadataStore implements MetadataStore
                 $placeholders = implode(',', array_fill(0, count($ids), '?'));
                 // Use connection()->prepare() directly — dynamic IN clause would pollute the statement cache.
                 $pdo->prepare(
-                    "UPDATE s3_notification_queue SET status = 'processing' WHERE id IN ({$placeholders})",
-                )->execute($ids);
+                    "UPDATE s3_notification_queue
+                     SET status = 'processing', next_attempt_at = ?
+                     WHERE id IN ({$placeholders})",
+                )->execute([QueueLease::expiresAt($now), ...$ids]);
             }
 
             if ($ownTx) {
@@ -2908,6 +2998,70 @@ final class SqliteMetadataStore implements MetadataStore
         $this->prepare(
             "DELETE FROM s3_notification_queue WHERE status IN ('sent', 'dead_letter') AND created_at < ?",
         )->execute([$cutoff]);
+    }
+
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->prepare(
+            'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
+             VALUES (?, ?, ?, ?)',
+        )->execute([$bucket, $storageTier, $storagePath, microtime(true)]);
+    }
+
+    public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        $this->prepare(
+            'DELETE FROM s3_storage_garbage
+             WHERE bucket = ? AND storage_tier = ? AND storage_path = ?',
+        )->execute([$bucket, $storageTier, $storagePath]);
+    }
+
+    public function dequeueStorageGarbage(int $limit): array
+    {
+        return $this->transaction(function () use ($limit): array {
+            $now = microtime(true);
+            $this->prepare(
+                "UPDATE s3_storage_garbage SET status = 'pending'
+                 WHERE status = 'processing' AND next_attempt_at < ?",
+            )->execute([$now]);
+            $stmt = $this->prepare(
+                "SELECT id, bucket, storage_tier, storage_path, attempts
+                 FROM s3_storage_garbage
+                 WHERE status = 'pending' AND next_attempt_at <= ?
+                 ORDER BY id LIMIT ?",
+            );
+            $stmt->execute([$now, $limit]);
+            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+            foreach ($rows as $row) {
+                $this->prepare(
+                    "UPDATE s3_storage_garbage
+                     SET status = 'processing', next_attempt_at = ?
+                     WHERE id = ?",
+                )->execute([QueueLease::expiresAt($now), (int) $row['id']]);
+            }
+
+            return array_values(array_map(static fn(array $row): array => [
+                'id' => (int) $row['id'],
+                'bucket' => (string) $row['bucket'],
+                'storage_tier' => (string) $row['storage_tier'],
+                'storage_path' => (string) $row['storage_path'],
+                'attempts' => (int) $row['attempts'],
+            ], $rows));
+        });
+    }
+
+    public function completeStorageGarbage(int $id): void
+    {
+        $this->prepare('DELETE FROM s3_storage_garbage WHERE id = ?')->execute([$id]);
+    }
+
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    {
+        $this->prepare(
+            "UPDATE s3_storage_garbage
+             SET status = 'pending', attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+             WHERE id = ?",
+        )->execute([$error, $nextAttemptAt, $id]);
     }
 
     // ===============================================================
@@ -3249,6 +3403,7 @@ final class SqliteMetadataStore implements MetadataStore
                 WHERE lt.resource_type = 'object'
                   AND lt.bucket = {$objectAlias}.bucket
                   AND lt.key_name = {$objectAlias}.key_name
+                  AND lt.version_id = {$objectAlias}.version_id
                   AND lt.tag_key = ?
                   AND lt.tag_value = ?
             )";

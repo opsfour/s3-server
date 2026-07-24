@@ -23,6 +23,7 @@ use OpsFour\S3Server\Select\JsonProcessor;
 use OpsFour\S3Server\Select\SqlParser;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Xml\SafeXmlParser;
 
 /**
  * Handles SelectObjectContent (POST /{bucket}/{key}?select&select-type=2).
@@ -69,7 +70,7 @@ final class SelectObjectContentHandler implements RequestHandler
         }
 
         // Parse request XML.
-        $body = ByteStream\buffer($request->getBody());
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 262_144);
         $config = self::parseSelectRequest($body);
 
         // Fetch object data.
@@ -97,14 +98,22 @@ final class SelectObjectContentHandler implements RequestHandler
             throw new InvalidObjectStateException('S3 Select does not support encrypted objects.');
         }
 
-        $objectData = ByteStream\buffer($readStorage->getObjectByPath($storagePath));
+        $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+        try {
+            $objectData = ByteStream\buffer(
+                $readStorage->getObjectByPath($storagePath),
+                limit: $this->maxSelectObjectSize,
+            );
 
-        // Offload to worker if pool is available.
-        if ($this->workerPool !== null) {
-            return $this->processInWorker($this->workerPool, $objectData, $config);
+            // Offload to worker if pool is available.
+            if ($this->workerPool !== null) {
+                return $this->processInWorker($this->workerPool, $objectData, $config);
+            }
+
+            return $this->processInline($objectData, $config);
+        } finally {
+            $bufferedWorkLock->release();
         }
-
-        return $this->processInline($objectData, $config);
     }
 
     /**
@@ -277,15 +286,7 @@ final class SelectObjectContentHandler implements RequestHandler
      */
     private static function parseSelectRequest(string $xml): array
     {
-        try {
-            $xml = preg_replace('/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?[^>]*>/i', '', $xml);
-            if ($xml === null) {
-                throw new \RuntimeException('Failed to sanitize XML.');
-            }
-            $element = new \SimpleXMLElement($xml, LIBXML_NONET);
-        } catch (\Exception) {
-            throw new \OpsFour\S3Server\Exception\MalformedXmlException('Invalid SelectObjectContent request XML.');
-        }
+        $element = SafeXmlParser::parse($xml, 'Invalid SelectObjectContent request XML.');
 
         $expression = (string) ($element->Expression ?? '');
 

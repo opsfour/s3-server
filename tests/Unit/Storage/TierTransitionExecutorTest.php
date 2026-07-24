@@ -10,6 +10,7 @@ use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
+use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class TierTransitionExecutorTest extends TestCase
@@ -235,6 +236,45 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertSame('new', $hot->getObjectByPath($object->systemMetadata['storagePath'])->read());
     }
 
+    public function test_overwrite_during_physical_transition_does_not_switch_new_object(): void
+    {
+        $hot = new InMemoryBackend();
+        $archive = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $archive->createBucket('bucket');
+
+        $old = $hot->putObject('bucket', 'racing.bin', new ReadableBuffer('old'));
+        $this->metadata->putObjectMetadata('bucket', 'racing.bin', 'owner', $old->size, '"' . $old->md5Hex . '"', 'application/octet-stream', $old->path);
+        $jobId = $this->metadata->enqueueTierTransitionJob('bucket', 'racing.bin', null, 'STANDARD', 'GLACIER', 'GLACIER', $old->path);
+        $this->metadata->updateObjectPlacement('bucket', 'racing.bin', null, 'STANDARD', 'STANDARD', $old->path, 'pending', 'GLACIER');
+
+        $target = new CallbackStorageBackend($archive, afterPut: function () use ($hot): void {
+            $new = $hot->putObject('bucket', 'racing.bin', new ReadableBuffer('new'));
+            $this->metadata->putObjectMetadata('bucket', 'racing.bin', 'owner', $new->size, '"' . $new->md5Hex . '"', 'application/octet-stream', $new->path);
+        });
+        $executor = new TierTransitionExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+            new StorageTier('GLACIER', $target, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+
+        $job = $this->metadata->getTierTransitionJob($jobId);
+        $object = $this->metadata->getObjectMetadata('bucket', 'racing.bin');
+        self::assertNotNull($job);
+        self::assertSame('completed', $job['status']);
+        self::assertNotNull($object);
+        self::assertSame('STANDARD', $object->storageTier);
+        self::assertSame('new', \Amp\ByteStream\buffer($hot->getObjectByPath($object->systemMetadata['storagePath'])));
+        self::assertNotNull($target->lastWrite);
+
+        $this->expectException(\OpsFour\S3Server\Exception\NoSuchKeyException::class);
+        $archive->getObjectByPath($target->lastWrite->path)->read();
+    }
+
     public function test_versioned_transition_job_moves_only_target_version_when_latest_changes(): void
     {
         $hot = new InMemoryBackend();
@@ -333,5 +373,69 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertSame('GLACIER', $object->storageTier);
         self::assertSame('ON', $this->metadata->getObjectLegalHold('bucket', 'locked.bin'));
         self::assertSame('locked-data', $archive->getObjectByPath($object->systemMetadata['storagePath'])->read());
+    }
+
+    public function test_lost_processing_lease_cannot_reopen_completed_transition_job(): void
+    {
+        $hot = new InMemoryBackend();
+        $archive = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $archive->createBucket('bucket');
+
+        $source = $hot->putObject('bucket', 'lease.bin', new ReadableBuffer('source'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'lease.bin',
+            'owner',
+            $source->size + 1,
+            '"' . $source->md5Hex . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $jobId = $this->metadata->enqueueTierTransitionJob(
+            'bucket',
+            'lease.bin',
+            null,
+            'STANDARD',
+            'GLACIER',
+            'GLACIER',
+            $source->path,
+        );
+        $target = new CallbackStorageBackend(
+            $archive,
+            afterPut: fn() => $this->metadata->updateTierTransitionJobStatus(
+                $jobId,
+                'completed',
+                incrementAttempts: false,
+            ),
+        );
+        $executor = new TierTransitionExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+            new StorageTier('GLACIER', $target, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            $executor->processNext(1),
+        );
+
+        $job = $this->metadata->getTierTransitionJob($jobId);
+        self::assertNotNull($job);
+        self::assertSame('completed', $job['status']);
+        self::assertSame(0, $job['attempts']);
+    }
+
+    public function test_cancelled_batch_does_not_claim_another_transition_job(): void
+    {
+        $storage = new InMemoryBackend();
+        $cancellation = new \Amp\DeferredCancellation();
+        $cancellation->cancel();
+        $executor = new TierTransitionExecutor(
+            $this->metadata,
+            StorageTierRegistry::single($storage),
+        );
+
+        $this->expectException(\Amp\CancelledException::class);
+        $executor->processNext(10, $cancellation->getCancellation());
     }
 }

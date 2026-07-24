@@ -15,6 +15,8 @@ namespace OpsFour\S3Server\Auth;
  */
 final class SigningKey
 {
+    private const int MAX_CACHE_ENTRIES = 10_000;
+
     /** @var array<string, string> Cached signing keys. Key = hash of inputs, value = 32-byte binary signing key. */
     private static array $cache = [];
 
@@ -24,7 +26,7 @@ final class SigningKey
      * Derive the signing key for AWS Signature Version 4.
      *
      * Results are cached per (secretKey, date, region, service) tuple with daily eviction.
-     * The cache key uses xxh128(secretKey) — the raw secret is NEVER stored as an array key.
+     * The cache key uses SHA-256(secretKey); the raw secret is never stored as an array key.
      *
      * HMAC chain:
      *   kDate    = HMAC-SHA256("AWS4" + secretKey, date)
@@ -46,7 +48,7 @@ final class SigningKey
             self::$cacheDate = $dateInt;
         }
 
-        $cacheKey = hash('xxh128', $secretKey, binary: true) . $date . "\0" . $region . "\0" . $service;
+        $cacheKey = hash('sha256', $secretKey, binary: true) . $date . "\0" . $region . "\0" . $service;
         if (isset(self::$cache[$cacheKey])) {
             return self::$cache[$cacheKey];
         }
@@ -56,6 +58,12 @@ final class SigningKey
         $kService = hash_hmac('sha256', $service, $kRegion, binary: true);
         $kSigning = hash_hmac('sha256', 'aws4_request', $kService, binary: true);
 
+        if (count(self::$cache) >= self::MAX_CACHE_ENTRIES) {
+            $oldest = array_key_first(self::$cache);
+            if ($oldest !== null) {
+                unset(self::$cache[$oldest]);
+            }
+        }
         self::$cache[$cacheKey] = $kSigning;
 
         return $kSigning;

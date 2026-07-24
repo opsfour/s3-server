@@ -10,9 +10,14 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
+use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class CreateMultipartUploadHandler implements RequestHandler
@@ -20,6 +25,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly ?EncryptionServiceInterface $encryption = null,
+        private readonly ?QuotaManager $quotas = null,
     ) {}
 
     public function handleRequest(Request $request): Response
@@ -32,6 +38,13 @@ final class CreateMultipartUploadHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
+        $encryptionMode = EncryptionRequestResolver::resolveDestination(
+            $request,
+            $this->metadata,
+            $bucket,
+            $this->encryption,
+        );
+        (new ObjectLockRequestApplier($this->metadata))->validate($request, $bucket);
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId)
             ?? AclGrantResolver::privateAcl($ownerId);
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
@@ -68,45 +81,63 @@ final class CreateMultipartUploadHandler implements RequestHandler
         if ($storageClass !== 'STANDARD') {
             $userMetadata['__mpu-storage-class'] = $storageClass;
         }
+        foreach ([
+            '__object-lock-mode' => 'x-amz-object-lock-mode',
+            '__object-lock-retain-until-date' => 'x-amz-object-lock-retain-until-date',
+            '__object-lock-legal-hold' => 'x-amz-object-lock-legal-hold',
+        ] as $metadataKey => $header) {
+            $value = $request->getHeader($header);
+            if ($value !== null) {
+                $userMetadata[$metadataKey] = $value;
+            }
+        }
+
+        $taggingHeader = $request->getHeader('x-amz-tagging');
+        if ($taggingHeader !== null) {
+            $userMetadata['__mpu-tags'] = json_encode(
+                ObjectTagValidator::parseHeader($taggingHeader),
+                JSON_THROW_ON_ERROR,
+            );
+        }
 
         // Store encryption context in upload metadata for CompleteMultipartUpload.
-        $sseAlgo = null;
-        if ($this->encryption !== null) {
+        $sseAlgo = $encryptionMode;
+        if ($encryptionMode !== null) {
             $sseCAlgorithm = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
             $sseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
             $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
 
-            if ($sseCAlgorithm !== null && $sseCKey !== null && $sseCKeyMd5 !== null) {
+            if ($encryptionMode === EncryptionRequestResolver::SSE_C) {
+                \assert($sseCAlgorithm !== null && $sseCKey !== null && $sseCKeyMd5 !== null);
                 // Validate SSE-C headers (throws on invalid).
                 EncryptionService::validateSseCHeaders($sseCAlgorithm, $sseCKey, $sseCKeyMd5);
-                $sseAlgo = 'SSE-C';
                 $userMetadata['__sse-algorithm'] = 'SSE-C';
+                $userMetadata['__sse-customer-key-md5'] = $sseCKeyMd5;
             } else {
-                $sseHeader = $request->getHeader('x-amz-server-side-encryption');
-                $applySSE = ($sseHeader === 'AES256');
-
-                if (! $applySSE) {
-                    $bucketEnc = $this->metadata->getBucketEncryption($bucket);
-                    if ($bucketEnc !== null && ($bucketEnc['sseAlgorithm'] === 'AES256' || $bucketEnc['sseAlgorithm'] === 'aws:kms')) {
-                        $applySSE = true;
-                    }
-                }
-
-                if ($applySSE) {
-                    $sseAlgo = 'AES256';
-                    $userMetadata['__sse-algorithm'] = 'AES256';
-                }
+                $userMetadata['__sse-algorithm'] = 'AES256';
             }
         }
 
-        $this->metadata->createMultipartUpload(
-            uploadId: $uploadId,
-            bucket: $bucket,
-            key: $key,
-            ownerId: $ownerId,
-            contentType: $contentType,
-            userMetadata: $userMetadata,
-        );
+        $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants): void {
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
+            if (
+                $publicAccessBlock !== null
+                && $publicAccessBlock['blockPublicAcls']
+                && AclGrantResolver::isPublic($aclGrants)
+            ) {
+                throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
+            }
+            $this->quotas?->assertCanCreateMultipart($ownerId, $bucket);
+            $this->metadata->createMultipartUpload(
+                uploadId: $uploadId,
+                bucket: $bucket,
+                key: $key,
+                ownerId: $ownerId,
+                contentType: $contentType,
+                userMetadata: $userMetadata,
+            );
+        });
 
         $xml = XmlResponseBuilder::initiateMultipartUploadResult($bucket, $key, $uploadId);
 

@@ -41,6 +41,20 @@ final class AuthorizationSecurityTest extends S3FunctionalTestCase
         $this->assertNotContains($bucket, $names);
     }
 
+    public function test_put_bucket_policy_rejects_structurally_malformed_document(): void
+    {
+        try {
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode(['Statement' => []], JSON_THROW_ON_ERROR),
+            ]);
+            $this->fail('Expected malformed bucket policy to be rejected.');
+        } catch (S3Exception $e) {
+            $this->assertSame(400, $e->getStatusCode());
+            $this->assertSame('MalformedPolicy', $e->getAwsErrorCode());
+        }
+    }
+
     public function test_bucket_policy_explicit_deny_applies_to_owner(): void
     {
         self::$s3->putBucketPolicy([

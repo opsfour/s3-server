@@ -57,6 +57,17 @@ final class SessionCredentialVerifierTest extends TestCase
         (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
     }
 
+    public function test_header_sigv4_rejects_impossible_calendar_date(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->signedHeaderRequest($credential, $credential->sessionToken, '20260231T120000Z');
+
+        $this->expectException(AccessDeniedException::class);
+        $this->expectExceptionMessage('Invalid date/time components in request.');
+
+        (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
+    }
+
     public function test_presigned_url_accepts_valid_session_token(): void
     {
         $credential = $this->temporaryCredential();
@@ -82,6 +93,17 @@ final class SessionCredentialVerifierTest extends TestCase
         (new PresignedUrlValidator())->validate($request, new InMemoryCredentialProvider($credential), 'us-east-1');
     }
 
+    public function test_presigned_url_rejects_impossible_calendar_date(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->presignedRequest($credential, $credential->sessionToken, '20260231T120000Z');
+
+        $this->expectException(AccessDeniedException::class);
+        $this->expectExceptionMessage('Invalid date/time components in X-Amz-Date.');
+
+        (new PresignedUrlValidator())->validate($request, new InMemoryCredentialProvider($credential), 'us-east-1');
+    }
+
     private function temporaryCredential(?\DateTimeImmutable $expiresAt = null): Credential
     {
         return new Credential(
@@ -95,9 +117,12 @@ final class SessionCredentialVerifierTest extends TestCase
         );
     }
 
-    private function signedHeaderRequest(Credential $credential, ?string $sessionToken): Request
-    {
-        $timestamp = gmdate('Ymd\THis\Z');
+    private function signedHeaderRequest(
+        Credential $credential,
+        ?string $sessionToken,
+        ?string $timestamp = null,
+    ): Request {
+        $timestamp ??= gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
         $headers = [
             'host' => ['127.0.0.1'],
@@ -139,9 +164,12 @@ final class SessionCredentialVerifierTest extends TestCase
         return $this->request('GET', '/bucket/key.txt', $headers);
     }
 
-    private function presignedRequest(Credential $credential, ?string $sessionToken): Request
-    {
-        $timestamp = gmdate('Ymd\THis\Z');
+    private function presignedRequest(
+        Credential $credential,
+        ?string $sessionToken,
+        ?string $timestamp = null,
+    ): Request {
+        $timestamp ??= gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
         $credentialScope = "{$date}/us-east-1/s3/aws4_request";
         $query = [
@@ -189,7 +217,8 @@ final class SessionCredentialVerifierTest extends TestCase
     }
 
     /**
-     * @param array<string, list<string>> $headers
+     * @param non-empty-string $method
+     * @param array<non-empty-string, list<string>> $headers
      */
     private function request(string $method, string $path, array $headers): Request
     {

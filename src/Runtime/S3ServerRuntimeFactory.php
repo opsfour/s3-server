@@ -12,10 +12,14 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Encryption\MasterKeyProvider;
+use OpsFour\S3Server\Encryption\RedisMasterKeyProvider;
+use OpsFour\S3Server\Encryption\VaultMasterKeyProvider;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Parallel\ParallelEncryptionService;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
@@ -46,6 +50,11 @@ final readonly class S3ServerRuntimeFactory
         array $notificationListeners = [],
     ): S3ServerRuntime {
         $storageTiers ??= StorageTierRegistry::single($storage);
+        $storageTiers = $storageTiers->withObservability($metrics);
+        $storage = $storageTiers->defaultBackend();
+        if (! $metadata instanceof ObservedMetadataStore) {
+            $metadata = new ObservedMetadataStore($metadata, $metrics, $config->metadataDriver);
+        }
 
         $server = new S3Server(
             config: $config,
@@ -55,83 +64,106 @@ final readonly class S3ServerRuntimeFactory
             metrics: $metrics,
         );
         $server->setStorageTierRegistry($storageTiers);
+        $runtime = null;
 
-        $server->addMiddleware(new AuthMiddleware(
-            credentialProvider: $credentialProvider,
-            region: $config->region,
-            requestBodySizeLimit: $config->requestBodySizeLimit,
-        ));
+        try {
+            $server->addMiddleware(new AuthMiddleware(
+                credentialProvider: $credentialProvider,
+                region: $config->region,
+                requestBodySizeLimit: $config->requestBodySizeLimit,
+            ));
 
-        $adminCredentialApi = AdminCredentialApiFactory::create($externalIamConfig, $credentialProvider);
-        if ($adminCredentialApi !== null) {
-            $server->setAdminCredentialApiHandler($adminCredentialApi);
-        }
-
-        if ($adminToken !== null && trim($adminToken) !== '') {
-            $server->setAdminQuotaApiHandler(new AdminQuotaApiHandler($metadata, trim($adminToken)));
-        }
-
-        $encryption ??= $this->encryptionFromEnvironment($config, $metrics);
-
-        $selectWorkerPool = null;
-        if ($config->encryptionWorkerPoolSize > 0) {
-            $selectWorkerPool = new ContextWorkerPool($config->encryptionWorkerPoolSize);
-            $server->addWorkerPool($selectWorkerPool, 'select', $config->encryptionWorkerPoolSize);
-        }
-
-        $notifications = new NotificationDispatcher(
-            metadata: $metadata,
-            logger: $logger,
-            region: $config->region,
-            metrics: $metrics,
-        );
-        foreach ($notificationListeners as $listenerConfig) {
-            $pattern = $listenerConfig['pattern'] ?? null;
-            $listener = $listenerConfig['listener'] ?? null;
-
-            if (! is_string($pattern) || $pattern === '') {
-                throw new \InvalidArgumentException('Notification listener pattern must be a non-empty string.');
+            $adminCredentialApi = AdminCredentialApiFactory::create($externalIamConfig, $credentialProvider);
+            if ($adminCredentialApi !== null) {
+                $server->setAdminCredentialApiHandler($adminCredentialApi);
             }
 
-            if (! is_callable($listener)) {
-                throw new \InvalidArgumentException("Notification listener for pattern {$pattern} must be callable.");
+            if ($adminToken !== null && trim($adminToken) !== '') {
+                $server->setAdminQuotaApiHandler(new AdminQuotaApiHandler($metadata, trim($adminToken)));
             }
 
-            $notifications->listen($pattern, $listener);
+            $encryption ??= $this->encryptionFromEnvironment($config, $metrics);
+
+            $selectWorkerPool = null;
+            if ($config->selectWorkerPoolSize > 0) {
+                $selectWorkerPool = new ContextWorkerPool($config->selectWorkerPoolSize);
+                $server->addWorkerPool($selectWorkerPool, 'select', $config->selectWorkerPoolSize);
+            }
+
+            $notifications = new NotificationDispatcher(
+                metadata: $metadata,
+                logger: $logger,
+                region: $config->region,
+                metrics: $metrics,
+            );
+            $server->setNotificationDispatcher($notifications);
+            $runtime = new S3ServerRuntime($server, $notifications, $encryption, $selectWorkerPool, $logger);
+
+            foreach ($notificationListeners as $listenerConfig) {
+                $pattern = $listenerConfig['pattern'] ?? null;
+                $listener = $listenerConfig['listener'] ?? null;
+
+                if (! is_string($pattern) || $pattern === '') {
+                    throw new \InvalidArgumentException('Notification listener pattern must be a non-empty string.');
+                }
+
+                if (! is_callable($listener)) {
+                    throw new \InvalidArgumentException("Notification listener for pattern {$pattern} must be callable.");
+                }
+
+                $notifications->listen($pattern, $listener);
+            }
+
+            HandlerRegistrar::registerAll(
+                registry: $server->getHandlerRegistry(),
+                metadata: $metadata,
+                storage: $storage,
+                config: $config,
+                encryption: $encryption,
+                notifications: $notifications,
+                selectWorkerPool: $selectWorkerPool,
+                credentialProvider: $credentialProvider,
+                metrics: $metrics,
+                storageTiers: $storageTiers,
+            );
+
+            return $runtime;
+        } catch (\Throwable $e) {
+            if ($runtime !== null) {
+                $runtime->stop();
+            } else {
+                try {
+                    $server->stop();
+                } catch (\Throwable $cleanupError) {
+                    $logger->warning('Runtime factory server cleanup error: {error}', ['error' => $cleanupError->getMessage()]);
+                }
+
+                if ($encryption !== null && method_exists($encryption, 'shutdown')) {
+                    try {
+                        $encryption->shutdown();
+                    } catch (\Throwable $cleanupError) {
+                        $logger->warning('Runtime factory encryption cleanup error: {error}', ['error' => $cleanupError->getMessage()]);
+                    }
+                }
+            }
+
+            throw $e;
         }
-        $server->setNotificationDispatcher($notifications);
-
-        HandlerRegistrar::registerAll(
-            registry: $server->getHandlerRegistry(),
-            metadata: $metadata,
-            storage: $storage,
-            config: $config,
-            encryption: $encryption,
-            notifications: $notifications,
-            selectWorkerPool: $selectWorkerPool,
-            credentialProvider: $credentialProvider,
-            metrics: $metrics,
-            storageTiers: $storageTiers,
-        );
-
-        return new S3ServerRuntime($server, $notifications, $encryption, $selectWorkerPool);
     }
 
     private function encryptionFromEnvironment(
         S3ServerConfig $config,
         MetricsCollector $metrics,
     ): ?EncryptionServiceInterface {
-        $masterKeyEnv = getenv('S3_ENCRYPTION_MASTER_KEY');
-        $masterKeysEnv = getenv('S3_ENCRYPTION_MASTER_KEYS');
-        if (($masterKeyEnv === false || $masterKeyEnv === '') && ($masterKeysEnv === false || $masterKeysEnv === '')) {
+        $masterKeyProvider = $this->masterKeyProvider($config);
+        if ($masterKeyProvider === null) {
             return null;
         }
 
-        $masterKeyProvider = new ConfigMasterKeyProvider(
-            $masterKeyEnv !== false && $masterKeyEnv !== '' ? $masterKeyEnv : null,
-        );
-
-        if ($config->encryptionWorkerPoolSize > 0) {
+        // Encryption workers intentionally read config keys from inherited
+        // environment variables. External providers stay in-process so key
+        // material is never serialized over worker IPC.
+        if ($config->encryptionWorkerPoolSize > 0 && $config->masterKeyProvider === 'config') {
             return new ParallelEncryptionService(
                 $masterKeyProvider,
                 $config->encryptionWorkerPoolSize,
@@ -141,5 +173,27 @@ final readonly class S3ServerRuntimeFactory
         }
 
         return new EncryptionService($masterKeyProvider);
+    }
+
+    private function masterKeyProvider(S3ServerConfig $config): ?MasterKeyProvider
+    {
+        if ($config->masterKeyProvider === 'redis') {
+            return new RedisMasterKeyProvider();
+        }
+
+        if ($config->masterKeyProvider === 'vault') {
+            return new VaultMasterKeyProvider();
+        }
+
+        $masterKey = getenv('S3_ENCRYPTION_MASTER_KEY');
+        $masterKeys = getenv('S3_ENCRYPTION_MASTER_KEYS');
+        if (($masterKey === false || $masterKey === '') && ($masterKeys === false || $masterKeys === '')) {
+            return null;
+        }
+
+        return new ConfigMasterKeyProvider(
+            $masterKey !== false && $masterKey !== '' ? $masterKey : null,
+            $masterKeys !== false && $masterKeys !== '' ? $masterKeys : null,
+        );
     }
 }

@@ -116,9 +116,12 @@ All backends use automatic schema versioning. Tables are created on first start 
 | 10 | Durable tier-transition jobs |
 | 11 | Durable restore jobs |
 | 12 | PostgreSQL/MySQL owner-scoped write locks |
+| 12 (SQLite) / 13 (PostgreSQL/MySQL) | Version-aware object tags and ACL resource data |
+| 13 (SQLite) / 14 (PostgreSQL/MySQL) | Multipart upload-count and staged-byte quotas |
+| 14 (SQLite) / 15 (PostgreSQL/MySQL) | Durable physical storage garbage queue |
 
-SQLite currently uses schema version `11`; PostgreSQL and MySQL use version
-`12`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+SQLite currently uses schema version `14`; PostgreSQL and MySQL use version
+`15`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error

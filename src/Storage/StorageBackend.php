@@ -87,7 +87,7 @@ interface StorageBackend
      * @param  string  $bucket  Bucket name.
      * @param  string  $key  Object key.
      * @param  string  $uploadId  Upload identifier.
-     * @param  array<int, array{partNumber: int, etag: string}>  $parts  Ordered list of parts.
+     * @param  array<int, array{partNumber: int, etag: string, storagePath: string}>  $parts  Ordered list of committed parts.
      * @return StorageWriteResult Metadata about the assembled object.
      */
     public function assembleMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): StorageWriteResult;

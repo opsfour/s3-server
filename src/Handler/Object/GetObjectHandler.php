@@ -126,68 +126,73 @@ final class GetObjectHandler implements RequestHandler
 
         // 5. Stream body from storage — handle decryption if encrypted.
         $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        $customerKey = \OpsFour\S3Server\Encryption\EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $sseAlgo === 'SSE-C',
+            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+        );
+        if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
+            throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
+        }
 
         [$readStorage, $storagePath] = $this->resolveReadableStorage($objectInfo);
         if ($storagePath === null || $storagePath === '') {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Object storage path missing.');
         }
 
-        if ($sseAlgo !== null && $this->encryption !== null) {
-            // Size guard: encrypted objects must be fully buffered for decryption.
-            if ($objectInfo->size > $this->maxEncryptedObjectSize) {
-                throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                    'Encrypted object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                );
-            }
-
-            // Encrypted objects: read full ciphertext, decrypt, then apply range.
-            $ciphertext = \Amp\ByteStream\buffer(
-                $readStorage->getObjectByPath($storagePath),
-            );
-
-            if ($sseAlgo === 'SSE-C') {
-                $sseCAlgo = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
-                $sseCKeyHeader = $request->getHeader('x-amz-server-side-encryption-customer-key');
-                $sseCKeyMd5Header = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
-
-                if ($sseCAlgo === null || $sseCKeyHeader === null || $sseCKeyMd5Header === null) {
-                    throw new InvalidArgumentException(
-                        'SSE-C headers required to retrieve an SSE-C encrypted object.',
+        if ($sseAlgo !== null) {
+            \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            \assert($this->encryption !== null);
+            $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+            try {
+                // Size guard: encrypted objects must be fully buffered for decryption.
+                if ($objectInfo->size > $this->maxEncryptedObjectSize) {
+                    throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                        'Encrypted object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                     );
                 }
 
-                $customerKey = EncryptionService::validateSseCHeaders($sseCAlgo, $sseCKeyHeader, $sseCKeyMd5Header);
-                $plaintext = $this->encryption->decryptSseC(
-                    $ciphertext,
-                    $customerKey,
-                    $objectInfo->userMetadata['__sse-iv'],
-                    $objectInfo->userMetadata['__sse-tag'],
+                // Encrypted objects: read full ciphertext, decrypt, then apply range.
+                $ciphertext = \Amp\ByteStream\buffer(
+                    $readStorage->getObjectByPath($storagePath),
                 );
-            } else {
-                // SSE-S3.
-                $plaintext = $this->encryption->decryptSseS3(
-                    $ciphertext,
-                    $objectInfo->userMetadata['__sse-key'],
-                    $objectInfo->userMetadata['__sse-iv'],
-                    $objectInfo->userMetadata['__sse-tag'],
-                );
-            }
 
-            // Apply range on decrypted plaintext.
-            $decryptedSize = strlen($plaintext);
+                if ($sseAlgo === 'SSE-C') {
+                    \assert($customerKey !== null);
+                    $plaintext = $this->encryption->decryptSseC(
+                        $ciphertext,
+                        $customerKey,
+                        $objectInfo->userMetadata['__sse-iv'],
+                        $objectInfo->userMetadata['__sse-tag'],
+                    );
+                } else {
+                    // SSE-S3.
+                    $plaintext = $this->encryption->decryptSseS3(
+                        $ciphertext,
+                        $objectInfo->userMetadata['__sse-key'],
+                        $objectInfo->userMetadata['__sse-iv'],
+                        $objectInfo->userMetadata['__sse-tag'],
+                    );
+                }
 
-            if ($isPartialContent && $offset !== null) {
-                $body = substr($plaintext, $offset, $length);
-                $contentLength = strlen($body);
-                $contentRangeHeader = sprintf(
-                    'bytes %d-%d/%d',
-                    $offset,
-                    $offset + $contentLength - 1,
-                    $decryptedSize,
-                );
-            } else {
-                $body = $plaintext;
-                $contentLength = $decryptedSize;
+                // Apply range on decrypted plaintext.
+                $decryptedSize = strlen($plaintext);
+
+                if ($isPartialContent && $offset !== null) {
+                    $body = substr($plaintext, $offset, $length);
+                    $contentLength = strlen($body);
+                    $contentRangeHeader = sprintf(
+                        'bytes %d-%d/%d',
+                        $offset,
+                        $offset + $contentLength - 1,
+                        $decryptedSize,
+                    );
+                } else {
+                    $body = $plaintext;
+                    $contentLength = $decryptedSize;
+                }
+            } finally {
+                $bufferedWorkLock->release();
             }
         } else {
             // Non-encrypted: stream directly from storage.

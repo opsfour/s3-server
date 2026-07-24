@@ -57,12 +57,14 @@ class S3ServerServiceProvider extends ServiceProvider
                 strictBucketNaming: $config['strict_bucket_naming'] ?? true,
                 websiteHostPattern: $config['website_host_pattern'] ?? null,
                 masterKeyProvider: $config['master_key_provider'] ?? 'config',
+                enforceMinPartSize: $config['enforce_min_part_size'] ?? true,
                 maxEncryptedObjectSize: $config['max_encrypted_object_size'] ?? 268_435_456,
                 maxSelectObjectSize: $config['max_select_object_size'] ?? 268_435_456,
                 shutdownDrainTimeout: $config['shutdown_drain_timeout'] ?? 30,
                 notificationRequireHttps: $config['notifications']['require_https'] ?? true,
                 sqliteWorkerPoolSize: $config['parallel']['sqlite_workers'] ?? 0,
                 encryptionWorkerPoolSize: $config['parallel']['encryption_workers'] ?? 0,
+                selectWorkerPoolSize: $config['parallel']['select_workers'] ?? null,
                 requestBodySpoolWorkerPoolSize: $config['parallel']['request_body_spool_workers'] ?? 8,
                 encryptionParallelThreshold: $config['parallel']['encryption_threshold'] ?? 65_536,
                 quota: new QuotaConfig(
@@ -70,11 +72,17 @@ class S3ServerServiceProvider extends ServiceProvider
                     maxObjectsPerBucket: $config['quotas']['max_objects_per_bucket'] ?? 0,
                     maxBytesPerBucket: $config['quotas']['max_bytes_per_bucket'] ?? 0,
                     maxBytesPerOwner: $config['quotas']['max_bytes_per_owner'] ?? 0,
+                    maxMultipartUploadsPerBucket: $config['quotas']['max_multipart_uploads_per_bucket'] ?? 0,
+                    maxMultipartUploadsPerOwner: $config['quotas']['max_multipart_uploads_per_owner'] ?? 0,
+                    maxMultipartBytesPerBucket: $config['quotas']['max_multipart_bytes_per_bucket'] ?? 0,
+                    maxMultipartBytesPerOwner: $config['quotas']['max_multipart_bytes_per_owner'] ?? 0,
                 ),
                 lifecycleIntervalSeconds: $config['lifecycle']['interval_seconds'] ?? 60.0,
                 lifecycleBatchSize: $config['lifecycle']['batch_size'] ?? 1000,
                 lifecycleMaxActionsPerRun: $config['lifecycle']['max_actions_per_run'] ?? 1000,
                 lifecycleLockTtlSeconds: $config['lifecycle']['lock_ttl_seconds'] ?? 300,
+                multipartMaxAgeSeconds: $config['lifecycle']['multipart_max_age_seconds'] ?? 604_800,
+                metricsBearerToken: $config['metrics_bearer_token'] ?? null,
             );
         });
 
@@ -87,7 +95,10 @@ class S3ServerServiceProvider extends ServiceProvider
             $storageConfig = $config['storage'] ?? [];
             self::resolveLaravelStorageServices($storageConfig, $app);
 
-            return StorageBackendFactory::createTierRegistry($storageConfig);
+            return StorageBackendFactory::createTierRegistry(
+                $storageConfig,
+                $app->make(MetricsCollector::class),
+            );
         });
 
         $this->app->singleton(MetadataStore::class, function ($app) {
@@ -138,6 +149,7 @@ class S3ServerServiceProvider extends ServiceProvider
             $this->commands([
                 S3ServerCommand::class,
                 S3CredentialsCommand::class,
+                S3QuotaCommand::class,
             ]);
         }
     }

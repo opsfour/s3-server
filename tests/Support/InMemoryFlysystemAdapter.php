@@ -29,6 +29,8 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
 
     public int $writeCalls = 0;
 
+    public int $copyCalls = 0;
+
     public ?string $failNextWriteStreamReason = null;
 
     public function fileExists(string $path): bool
@@ -221,6 +223,8 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
 
     public function copy(string $source, string $destination, Config $config): void
     {
+        $this->copyCalls++;
+
         if (! array_key_exists($source, $this->files)) {
             throw UnableToCopyFile::fromLocationTo($source, $destination);
         }

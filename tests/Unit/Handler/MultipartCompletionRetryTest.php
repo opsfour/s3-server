@@ -70,6 +70,7 @@ final class MultipartCompletionRetryTest extends TestCase
                 'PUT',
                 '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
                 'retry payload',
+                $sseHeaders,
             ));
         $etag = $part->getHeader('ETag');
         self::assertNotNull($etag);

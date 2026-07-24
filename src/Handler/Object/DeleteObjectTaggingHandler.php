@@ -9,7 +9,9 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 
 /**
  * Handles DeleteObjectTagging (DELETE /{bucket}/{key}?tagging).
@@ -26,7 +28,7 @@ final class DeleteObjectTaggingHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -35,13 +37,16 @@ final class DeleteObjectTaggingHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Verify the object exists.
-        if (! $this->metadata->objectExists($bucket, $key)) {
-            throw new NoSuchKeyException();
-        }
+        $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key): ?string {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $this->metadata->deleteObjectTagging($bucket, $key, $object->versionId);
 
-        $this->metadata->deleteObjectTagging($bucket, $key);
-
-        return new Response(status: 204);
+            return $object->versionId;
+        });
+        return new Response(
+            status: 204,
+            headers: array_filter(['x-amz-version-id' => $versionId]),
+        );
     }
 }

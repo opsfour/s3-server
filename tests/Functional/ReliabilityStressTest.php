@@ -37,10 +37,11 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $source = self::createDeterministicFile('large-source-', $bytes);
         $download = tempnam(sys_get_temp_dir(), 'large-download-');
         $key = 'large-streamed-object.bin';
+        $transferClient = self::makeClient(self::envInt('S3_TEST_TRANSFER_TIMEOUT_SECONDS', 180));
 
         $rssBefore = self::serverRssBytes();
 
-        self::$s3->putObject([
+        $transferClient->putObject([
             'Bucket' => self::$bucket,
             'Key' => $key,
             'SourceFile' => $source,
@@ -48,14 +49,14 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             'ContentSHA256' => 'UNSIGNED-PAYLOAD',
         ]);
 
-        $head = self::$s3->headObject([
+        $head = $transferClient->headObject([
             'Bucket' => self::$bucket,
             'Key' => $key,
         ]);
 
         $this->assertSame($bytes, $head['ContentLength']);
 
-        self::$s3->getObject([
+        $transferClient->getObject([
             'Bucket' => self::$bucket,
             'Key' => $key,
             'SaveAs' => $download,
@@ -73,7 +74,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             );
         }
 
-        self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        $transferClient->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
         @unlink($source);
         @unlink($download);
     }
@@ -83,8 +84,9 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $partBytes = self::envInt('S3_TEST_MULTIPART_PART_BYTES', 8 * 1024 * 1024);
         $partCount = self::envInt('S3_TEST_MULTIPART_PARTS', 4);
         $key = 'large-multipart.bin';
+        $transferClient = self::makeClient(self::envInt('S3_TEST_TRANSFER_TIMEOUT_SECONDS', 180));
 
-        $create = self::$s3->createMultipartUpload([
+        $create = $transferClient->createMultipartUpload([
             'Bucket' => self::$bucket,
             'Key' => $key,
             'ContentType' => 'application/octet-stream',
@@ -106,7 +108,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 }
 
                 try {
-                    $upload = self::$s3->uploadPart([
+                    $upload = $transferClient->uploadPart([
                         'Bucket' => self::$bucket,
                         'Key' => $key,
                         'UploadId' => $uploadId,
@@ -126,7 +128,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 ];
             }
 
-            self::$s3->completeMultipartUpload([
+            $transferClient->completeMultipartUpload([
                 'Bucket' => self::$bucket,
                 'Key' => $key,
                 'UploadId' => $uploadId,
@@ -134,7 +136,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             ]);
 
             $download = tempnam(sys_get_temp_dir(), 'multipart-download-');
-            self::$s3->getObject([
+            $transferClient->getObject([
                 'Bucket' => self::$bucket,
                 'Key' => $key,
                 'SaveAs' => $download,
@@ -144,7 +146,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             $this->assertSame($partBytes * $partCount, filesize($download));
 
             @unlink($download);
-            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            $transferClient->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
         } finally {
             foreach ($partFiles as $file) {
                 @unlink($file);

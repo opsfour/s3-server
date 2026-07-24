@@ -16,10 +16,28 @@ final class MetricsHandler implements RequestHandler
     public function __construct(
         private readonly MetricsCollector $metrics,
         private readonly ?MetadataStore $metadata = null,
+        private readonly ?string $bearerToken = null,
     ) {}
 
     public function handleRequest(Request $request): Response
     {
+        if ($this->bearerToken !== null && $this->bearerToken !== '') {
+            $authorization = $request->getHeader('authorization') ?? '';
+            $provided = str_starts_with(strtolower($authorization), 'bearer ')
+                ? trim(substr($authorization, 7))
+                : '';
+            if (! hash_equals($this->bearerToken, $provided)) {
+                return new Response(
+                    status: 401,
+                    headers: [
+                        'Content-Type' => 'text/plain; charset=utf-8',
+                        'WWW-Authenticate' => 'Bearer',
+                    ],
+                    body: 'Unauthorized',
+                );
+            }
+        }
+
         if ($this->metadata !== null) {
             if ($this->metadata instanceof ObservedMetadataStore) {
                 $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());

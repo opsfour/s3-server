@@ -15,7 +15,8 @@ SDK clients:
 - Bucket operations, ACLs, bucket policies, Public Access Block, CORS, website
 - Versioning, object versions, delete markers
 - Object Lock configuration, retention, legal hold
-- Bucket encryption configuration, SSE-S3, SSE-C, `aws:kms`-compatible defaults
+- Bucket encryption configuration, SSE-S3, and SSE-C. `aws:kms` fails closed
+  until a real KMS adapter is configured and is not claimed as supported.
 - Lifecycle configuration parsing/storage
 - Bucket notification configuration and webhook delivery queue
 - Filesystem, Flysystem, memory storage backends
@@ -76,18 +77,26 @@ Need:
   - [x] max objects per bucket
   - [x] max bytes per bucket
   - [x] optional max bytes per owner
-- [x] Enforcement on `CreateBucket`, `PutObject`, `CopyObject`, multipart complete,
-  and versioned writes.
+  - [x] max active multipart uploads per bucket and owner
+  - [x] max staged multipart bytes per bucket and owner
+- [x] Enforcement on `CreateBucket`, `PutObject`, `CopyObject`, multipart
+  create/part/complete, and versioned writes.
 - [x] Config/env interface for quota definitions:
   `S3_QUOTA_MAX_BUCKETS_PER_OWNER`,
   `S3_QUOTA_MAX_OBJECTS_PER_BUCKET`,
   `S3_QUOTA_MAX_BYTES_PER_BUCKET`,
-  `S3_QUOTA_MAX_BYTES_PER_OWNER`.
+  `S3_QUOTA_MAX_BYTES_PER_OWNER`,
+  `S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET`,
+  `S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER`,
+  `S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET`,
+  `S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER`.
 - [x] Persistent metadata table for per-account quota overrides.
 - [x] Correct accounting for overwrite deltas and versioned writes.
 - [x] Operator CLI for changing quota definitions without restart.
 - [x] HTTP/Admin runtime API for changing quota definitions without restart.
 - [x] Explicit lifecycle-delete and delete-marker quota regression coverage.
+- [x] Staged multipart data counts toward normal storage limits and has
+  dedicated upload-count/byte limits.
 
 Acceptance:
 
@@ -142,9 +151,8 @@ Acceptance:
 
 ### 4. Tiering
 
-Status: Physical tiering and restore accepted for implementation. Metadata-only
-transitions remain the first compatibility layer, but production scope now
-includes safe data movement between configured storage tiers and temporary
+Status: Implemented for configured storage tiers. The production scope includes
+safe data movement between tiers, durable transition jobs, and temporary
 restore copies for cold tiers.
 
 Need:
@@ -230,7 +238,9 @@ Acceptance:
 
 - [x] Standard AWS SDK clients still use SigV4.
 - [x] Keycloak users/groups can be mapped to scoped S3 credential metadata.
-- [x] Credential revocation is enforced without server restart.
+- [x] Credential revocation is enforced without server restart and propagates
+  across database-backed nodes within the configured credential cache TTL
+  (`0` disables the positive cache).
 - [x] Keycloak/OIDC users can request credentials through a runtime admin API.
 - [x] Temporary credentials expire automatically without a separate cleanup job.
 
@@ -295,6 +305,8 @@ Acceptance:
   configured.
 - [x] Failed listeners are isolated and observable.
 - [x] Webhook delivery continues to use durable retry queue.
+- [x] Webhook outbox rows commit atomically with object metadata mutations.
+- [x] In-flight internal listener futures drain during graceful shutdown.
 
 ### 8. Additional Notification Destinations
 
@@ -344,7 +356,7 @@ Recommendation:
 - Keep unsupported for now. Operational metrics should be implemented as server
   observability, not AWS inventory/analytics compatibility.
 
-### 11. S3 Express, Metadata Tables, Object Lambda, Torrent
+### 11. S3 Express, Metadata Tables, Object Annotations, Object Lambda, Torrent
 
 Status: Unsupported.
 
@@ -352,10 +364,12 @@ Recommendation:
 
 - Keep unsupported. These are AWS-specific control-plane or specialized
   features and are not required for a production S3-compatible object server.
+- The AWS SDK operation guard explicitly classifies object annotation CRUD and
+  metadata annotation-table configuration as unsupported.
 - `RestoreObject` is supported for configured restore-required storage tiers
   and is documented in the Tiering section above.
 
-## Suggested Implementation Order
+## Historical Implementation Order
 
 1. Metrics and health endpoint.
 2. Quotas with strict concurrency tests.

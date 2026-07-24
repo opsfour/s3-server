@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.4"
+          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml
+          coverage: none
+        env:
+          fail-fast: "true"
+
+      - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+        with:
+          dependency-versions: locked
+
+      - run: composer validate --strict
+      - run: composer audit --locked
+      - run: composer analyse
+      - run: composer cs:check
+      - run: composer test
+
+  dependency-compatibility:
+    name: Dependencies (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lowest-laravel-12-symfony-7.4
+            dependencies: lowest
+            laravel: ^12.0
+            symfony: ^7.4
+          - name: highest-laravel-13-symfony-8.1
+            dependencies: highest
+            laravel: ^13.0
+            symfony: ^8.1
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.4"
+          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml
+          coverage: none
+        env:
+          fail-fast: "true"
+
+      - name: Constrain framework compatibility target
+        run: >-
+          composer require --dev --no-update
+          laravel/framework:${{ matrix.laravel }}
+          illuminate/console:${{ matrix.laravel }}
+          illuminate/support:${{ matrix.laravel }}
+          symfony/console:${{ matrix.symfony }}
+          symfony/config:${{ matrix.symfony }}
+          symfony/dependency-injection:${{ matrix.symfony }}
+          symfony/http-kernel:${{ matrix.symfony }}
+
+      - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+        with:
+          dependency-versions: ${{ matrix.dependencies }}
+
+      - run: composer show --direct
+      - run: composer analyse
+      - run: composer test
+
+  metadata-backends:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mysql:
+        image: mysql@sha256:4890b3247d48a6dc1f3ac1e979330af4e543d06f194322f3879b27e6c7052585
+        env:
+          MYSQL_DATABASE: s3server
+          MYSQL_USER: s3
+          MYSQL_PASSWORD: s3audit
+          MYSQL_ROOT_PASSWORD: s3audit
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ps3audit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      postgres:
+        image: postgres@sha256:2586e2a95d1c9b31cb2967feb562948f7d364854453d703039b6efa45fe48417
+        env:
+          POSTGRES_DB: s3server
+          POSTGRES_USER: s3
+          POSTGRES_PASSWORD: s3audit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U s3 -d s3server"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      S3_TEST_MYSQL_METADATA_DSN: host=127.0.0.1 port=3306 user=s3 password=s3audit db=s3server
+      S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 user=s3 password=s3audit db=s3server
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.4"
+          extensions: curl, mbstring, openssl, simplexml
+          coverage: none
+        env:
+          fail-fast: "true"
+
+      - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+        with:
+          dependency-versions: locked
+
+      - name: Metadata backend parity and concurrency
+        run: vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
+
+      - name: MySQL v11-to-current migration
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+        run: >-
+          vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
+          --filter 'migrates_v11_schema_to_current.*mysql'
+
+      - name: PostgreSQL v11-to-current migration
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+        run: >-
+          vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
+          --filter 'migrates_v11_schema_to_current.*postgres'

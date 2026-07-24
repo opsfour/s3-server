@@ -131,7 +131,13 @@ S3_VAULT_TOKEN=s.xxxxxxxxxxxxxxxx
 S3_VAULT_PATH=secret/data/s3-server/master-key
 ```
 
-Multi-key: store a `keys` field in the Vault secret containing a JSON map `{"keyId": "base64Key", ...}`.
+Multi-key: store a `keys` field in the Vault secret containing a JSON map
+`{"keyId": "base64Key", ...}` and set `activeKeyId` to one of those key IDs.
+Redis and Vault multi-key configurations fail closed when the active ID is
+missing or unknown; key selection never depends on map/hash iteration order.
+Vault responses are limited to 1 MiB and non-success response bodies are not
+included in exceptions. The built-in Vault HTTP client does not follow
+redirects, so `X-Vault-Token` is sent only to the configured HTTPS endpoint.
 
 ### Symfony Key Services
 
@@ -188,7 +194,9 @@ S3_ENCRYPTION_WORKERS=4         # Number of worker processes
 S3_ENCRYPTION_THRESHOLD=65536   # Objects larger than 64 KiB use workers
 ```
 
-Worker processes inherit the master key from the parent process's environment variables. No key material crosses IPC boundaries.
+With the `config` provider, worker processes inherit the master key from the
+parent process environment. Redis and Vault providers remain in-process so key
+material is never serialized over worker IPC.
 
 ## Size Limits
 
@@ -196,4 +204,5 @@ Worker processes inherit the master key from the parent process's environment va
 S3_MAX_ENCRYPTED_OBJECT_SIZE=268435456   # 256 MiB (default)
 ```
 
-Objects larger than this limit cannot use SSE-S3 encryption (they must be uploaded as multipart).
+Objects larger than this limit cannot use the built-in SSE-S3/SSE-C
+implementation. Multipart upload does not bypass the encryption limit.

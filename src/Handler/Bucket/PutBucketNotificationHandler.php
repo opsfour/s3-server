@@ -27,7 +27,7 @@ final class PutBucketNotificationHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $configs = XmlRequestParser::parseNotificationConfiguration($body);
 
         $this->metadata->putBucketNotification($bucket, $configs);

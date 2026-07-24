@@ -46,9 +46,11 @@ final class S3ServerConfigFactory
             maxEncryptedObjectSize: $server['max_encrypted_object_size'],
             maxSelectObjectSize: $server['max_select_object_size'],
             shutdownDrainTimeout: $server['shutdown_drain_timeout'],
+            metricsBearerToken: $server['metrics_bearer_token'],
             notificationRequireHttps: $notifications['require_https'],
             sqliteWorkerPoolSize: $parallel['sqlite_workers'],
             encryptionWorkerPoolSize: $parallel['encryption_workers'],
+            selectWorkerPoolSize: $parallel['select_workers'],
             requestBodySpoolWorkerPoolSize: $parallel['request_body_spool_workers'],
             encryptionParallelThreshold: $parallel['encryption_threshold'],
             quota: new QuotaConfig(
@@ -56,11 +58,16 @@ final class S3ServerConfigFactory
                 maxObjectsPerBucket: $quotas['max_objects_per_bucket'],
                 maxBytesPerBucket: $quotas['max_bytes_per_bucket'],
                 maxBytesPerOwner: $quotas['max_bytes_per_owner'],
+                maxMultipartUploadsPerBucket: $quotas['max_multipart_uploads_per_bucket'],
+                maxMultipartUploadsPerOwner: $quotas['max_multipart_uploads_per_owner'],
+                maxMultipartBytesPerBucket: $quotas['max_multipart_bytes_per_bucket'],
+                maxMultipartBytesPerOwner: $quotas['max_multipart_bytes_per_owner'],
             ),
             lifecycleIntervalSeconds: $lifecycle['interval_seconds'],
             lifecycleBatchSize: $lifecycle['batch_size'],
             lifecycleMaxActionsPerRun: $lifecycle['max_actions_per_run'],
             lifecycleLockTtlSeconds: $lifecycle['lock_ttl_seconds'],
+            multipartMaxAgeSeconds: $lifecycle['multipart_max_age_seconds'],
         );
     }
 }

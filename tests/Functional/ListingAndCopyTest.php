@@ -12,6 +12,19 @@ use Aws\S3\Exception\S3Exception;
  */
 final class ListingAndCopyTest extends S3FunctionalTestCase
 {
+    private const array TRANSIENT_KEYS = [
+        'batch-delete-0.txt',
+        'batch-delete-1.txt',
+        'batch-delete-2.txt',
+        'batch-delete-3.txt',
+        'batch-delete-4.txt',
+        'file1-copy.txt',
+        'file1-replace.txt',
+        'meta-copy.txt',
+        'meta-source.txt',
+        'quiet-delete.txt',
+    ];
+
     private static string $bucket = 'test-listing-bucket';
 
     private static bool $seeded = false;
@@ -48,6 +61,26 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         }
 
         self::$seeded = true;
+    }
+
+    protected function tearDown(): void
+    {
+        try {
+            self::$s3->deleteObjects([
+                'Bucket' => self::$bucket,
+                'Delete' => [
+                    'Quiet' => true,
+                    'Objects' => array_map(
+                        static fn(string $key): array => ['Key' => $key],
+                        self::TRANSIENT_KEYS,
+                    ),
+                ],
+            ]);
+        } catch (\Throwable) {
+            // Preserve the original test failure when the server is unavailable.
+        }
+
+        parent::tearDown();
     }
 
     // -----------------------------------------------------------------

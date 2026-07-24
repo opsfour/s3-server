@@ -117,6 +117,33 @@ final class PolicyEvaluatorCompatibilityTest extends TestCase
         ));
     }
 
+    public function test_invalid_cidr_conditions_fail_closed_without_throwing(): void
+    {
+        foreach ([
+            ['IpAddress', '192.0.2.0/33'],
+            ['NotIpAddress', 'not-a-cidr'],
+            ['NotIpAddress', '2001:db8::/129'],
+        ] as [$operator, $range]) {
+            $policy = $this->policy([[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => '*',
+                'Condition' => [
+                    $operator => ['aws:SourceIp' => $range],
+                ],
+            ]]);
+
+            $this->assertSame('Neutral', PolicyEvaluator::evaluate(
+                $policy,
+                's3:GetObject',
+                'arn:aws:s3:::bucket/key.txt',
+                'anonymous',
+                ['aws:SourceIp' => '192.0.2.1'],
+            ));
+        }
+    }
+
     public function test_unsupported_condition_operator_fails_closed(): void
     {
         $policy = $this->policy([

@@ -175,28 +175,25 @@ final class PresignedUrlValidator
      */
     private static function extractPresignParams(Request $request): array
     {
-        $required = [
-            'X-Amz-Algorithm' => 'algorithm',
-            'X-Amz-Credential' => 'credential',
-            'X-Amz-Date' => 'date',
-            'X-Amz-Expires' => 'expires',
-            'X-Amz-SignedHeaders' => 'signedHeaders',
-            'X-Amz-Signature' => 'signature',
-        ];
-
-        $params = [];
-
-        foreach ($required as $queryParam => $key) {
+        $requiredParameter = static function (string $queryParam) use ($request): string {
             $value = $request->getQueryParameter($queryParam);
             if ($value === null || $value === '') {
                 throw new AuthorizationHeaderMalformedException(
                     sprintf('Missing required query parameter: %s.', $queryParam),
                 );
             }
-            $params[$key] = $value;
-        }
 
-        return $params; // @phpstan-ignore return.type
+            return $value;
+        };
+
+        return [
+            'algorithm' => $requiredParameter('X-Amz-Algorithm'),
+            'credential' => $requiredParameter('X-Amz-Credential'),
+            'date' => $requiredParameter('X-Amz-Date'),
+            'expires' => $requiredParameter('X-Amz-Expires'),
+            'signedHeaders' => $requiredParameter('X-Amz-SignedHeaders'),
+            'signature' => $requiredParameter('X-Amz-Signature'),
+        ];
     }
 
     /**
@@ -222,7 +219,7 @@ final class PresignedUrlValidator
         $min   = (int) substr($amzDate, 11, 2);
         $sec   = (int) substr($amzDate, 13, 2);
 
-        if ($month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $min > 59 || $sec > 59) {
+        if (! checkdate($month, $day, $year) || $hour > 23 || $min > 59 || $sec > 59) {
             throw new AccessDeniedException(
                 'Invalid date/time components in X-Amz-Date.',
             );

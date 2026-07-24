@@ -32,6 +32,7 @@ final class TemporaryFileTask implements Task
             'append' => $this->append($cancellation),
             'read' => $this->read($cancellation),
             'delete' => $this->delete(),
+            'sweep' => $this->sweep($cancellation),
             default => throw new \LogicException("Unknown temporary-file operation: {$this->operation}."),
         };
     }
@@ -108,5 +109,42 @@ final class TemporaryFileTask implements Task
         }
 
         return null;
+    }
+
+    private function sweep(Cancellation $cancellation): string
+    {
+        if ($this->offset <= 0 || $this->length <= 0) {
+            throw new \InvalidArgumentException('Temporary-file sweep cutoff and limit are invalid.');
+        }
+
+        $prefixes = array_values(array_filter(explode(',', $this->data)));
+        $deleted = 0;
+
+        foreach (new \FilesystemIterator($this->path, \FilesystemIterator::SKIP_DOTS) as $file) {
+            $cancellation->throwIfRequested();
+            if (
+                ! $file instanceof \SplFileInfo
+                || $deleted >= $this->length
+                || ! $file->isFile()
+                || $file->isLink()
+            ) {
+                continue;
+            }
+
+            $name = $file->getFilename();
+            $matchesPrefix = false;
+            foreach ($prefixes as $prefix) {
+                if (str_starts_with($name, $prefix)) {
+                    $matchesPrefix = true;
+                    break;
+                }
+            }
+
+            if ($matchesPrefix && $file->getMTime() < $this->offset && @unlink($file->getPathname())) {
+                $deleted++;
+            }
+        }
+
+        return (string) $deleted;
     }
 }

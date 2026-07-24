@@ -9,6 +9,8 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
@@ -42,6 +44,16 @@ final class GetObjectAttributesHandler implements RequestHandler
             : $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null || $objectInfo->isDeleteMarker) {
             throw new NoSuchKeyException();
+        }
+
+        $sseAlgorithm = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        $customerKey = EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $sseAlgorithm === 'SSE-C',
+            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+        );
+        if ($sseAlgorithm !== 'SSE-C' && $customerKey !== null) {
+            throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
         }
 
         // Parse requested attributes.
@@ -84,6 +96,11 @@ final class GetObjectAttributesHandler implements RequestHandler
         $headers = ['Content-Type' => 'application/xml'];
         if ($objectInfo->versionId !== null) {
             $headers['x-amz-version-id'] = $objectInfo->versionId;
+        }
+        if ($sseAlgorithm === 'SSE-C') {
+            $headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+            $headers['x-amz-server-side-encryption-customer-key-MD5']
+                = $objectInfo->userMetadata['__sse-customer-key-md5'];
         }
 
         return new Response(

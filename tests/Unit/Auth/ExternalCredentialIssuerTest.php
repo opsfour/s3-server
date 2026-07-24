@@ -197,6 +197,25 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider->authenticate($token);
     }
 
+    public function test_jwt_external_identity_provider_rejects_token_without_expiration(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+
+        $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            'sub' => 'user-123',
+        ]);
+
+        $provider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => $jwk],
+        );
+
+        $this->expectException(ExternalIdentityAuthenticationException::class);
+        $this->expectExceptionMessage('JWT expiration is required.');
+
+        $provider->authenticate($token);
+    }
+
     public function test_jwt_external_identity_provider_rejects_tampered_signature(): void
     {
         [$privateKey, $jwk] = $this->createRsaKeyPair();

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Encryption;
 
+use Amp\Redis\RedisClient;
+
 /**
  * Reads master keys from Redis.
  *
@@ -11,7 +13,7 @@ namespace OpsFour\S3Server\Encryption;
  *
  * Multi-key format:
  * - HGETALL s3:master-keys → all key ID → base64 key mappings
- * - GET s3:active-key-id → active key ID
+ * - GET s3:active-key-id → required active key ID
  *
  * Legacy single-key format (fallback):
  * - GET s3:master-key → base64 key (stored as key ID "default")
@@ -30,26 +32,28 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
     public function __construct(
         ?string $redisDsn = null,
         ?string $keyName = null,
+        ?RedisClient $redisClient = null,
     ) {
-        if (!class_exists(\Amp\Redis\RedisClient::class)) {
+        if ($redisClient === null && ! function_exists('Amp\\Redis\\createRedisClient')) {
             throw new \RuntimeException(
                 'amphp/redis is required for RedisMasterKeyProvider. Install via: composer require amphp/redis',
             );
         }
 
-        $dsn = $redisDsn ?? (getenv('S3_REDIS_MASTER_KEY_DSN') ?: false);
-        if ($dsn === false || $dsn === '') {
-            throw new \RuntimeException('S3_REDIS_MASTER_KEY_DSN environment variable or redisDsn parameter is required.');
-        }
+        if ($redisClient === null) {
+            $dsn = $redisDsn ?? (getenv('S3_REDIS_MASTER_KEY_DSN') ?: false);
+            if ($dsn === false || $dsn === '') {
+                throw new \RuntimeException('S3_REDIS_MASTER_KEY_DSN environment variable or redisDsn parameter is required.');
+            }
 
-        /** @var \Amp\Redis\RedisClient $client */
-        $client = new \Amp\Redis\RedisClient($dsn);
+            $redisClient = \Amp\Redis\createRedisClient($dsn);
+        }
 
         // Try multi-key format first (HGETALL s3:master-keys).
         /** @var array<string, string> $allKeys */
         $allKeys = [];
         try {
-            $rawKeys = $client->execute('HGETALL', 's3:master-keys');
+            $rawKeys = $redisClient->execute('HGETALL', 's3:master-keys');
             if (is_array($rawKeys) && $rawKeys !== []) {
                 $assoc = [];
                 $isList = array_is_list($rawKeys);
@@ -67,14 +71,17 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
                     }
                 }
                 $allKeys = $assoc;
+            } elseif (! is_array($rawKeys)) {
+                throw new \UnexpectedValueException('HGETALL returned an invalid response.');
             }
-        } catch (\Throwable) {
-            $allKeys = [];
+        } catch (\Throwable $e) {
+            throw new \RuntimeException('Unable to read master keys from Redis.', 0, $e);
         }
 
         if ($allKeys !== []) {
             $keys = [];
             foreach ($allKeys as $keyId => $b64) {
+                self::validateKeyId($keyId);
                 $decoded = base64_decode($b64, true);
                 if ($decoded === false || strlen($decoded) !== 32) {
                     throw new \RuntimeException("Master key '{$keyId}' from Redis must be exactly 32 bytes base64-encoded.");
@@ -82,9 +89,12 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
                 $keys[(string) $keyId] = $decoded;
             }
 
-            $activeId = $client->get('s3:active-key-id');
-            if ($activeId === null || !isset($keys[$activeId])) {
-                $activeId = array_key_first($keys);
+            $activeId = $redisClient->get('s3:active-key-id');
+            if ($activeId === null || $activeId === '') {
+                throw new \RuntimeException('Active master key ID is missing from Redis key s3:active-key-id.');
+            }
+            if (! isset($keys[$activeId])) {
+                throw new \RuntimeException("Active Redis master key ID '{$activeId}' does not exist in s3:master-keys.");
             }
 
             $this->keys = $keys;
@@ -95,7 +105,7 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
 
         // Fallback to legacy single-key.
         $name = $keyName ?? (getenv('S3_REDIS_MASTER_KEY_NAME') ?: 's3:master-key');
-        $base64Key = $client->get($name);
+        $base64Key = $redisClient->get($name);
         if ($base64Key === null) {
             throw new \RuntimeException("Master key not found in Redis at key '{$name}'.");
         }
@@ -122,5 +132,12 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
     public function getMasterKeyById(string $keyId): string
     {
         return $this->keys[$keyId] ?? throw new \RuntimeException("Unknown key ID: {$keyId}");
+    }
+
+    private static function validateKeyId(string $keyId): void
+    {
+        if ($keyId === '' || strlen($keyId) > 255) {
+            throw new \RuntimeException('Redis master key IDs must contain between 1 and 255 bytes.');
+        }
     }
 }

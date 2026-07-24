@@ -15,7 +15,7 @@ use PHPUnit\Framework\TestCase;
  */
 abstract class S3FunctionalTestCase extends TestCase
 {
-    protected static ?S3Client $s3 = null;
+    protected static S3Client $s3;
 
     /** @var resource|null */
     protected static $serverProcess = null;
@@ -93,8 +93,6 @@ abstract class S3FunctionalTestCase extends TestCase
             self::recursiveDelete(self::$storagePath);
         }
 
-        self::$s3 = null;
-
         parent::tearDownAfterClass();
     }
 
@@ -165,8 +163,15 @@ abstract class S3FunctionalTestCase extends TestCase
     private static function findFreePort(): int
     {
         $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-        socket_bind($sock, '127.0.0.1', 0);
-        socket_getsockname($sock, $addr, $port);
+        if ($sock === false) {
+            self::fail('Failed to create a socket for the test server.');
+        }
+        if (!socket_bind($sock, '127.0.0.1', 0)
+            || !socket_getsockname($sock, $addr, $port)
+            || !is_int($port)) {
+            socket_close($sock);
+            self::fail('Failed to reserve a port for the test server.');
+        }
         socket_close($sock);
 
         return $port;
@@ -175,6 +180,9 @@ abstract class S3FunctionalTestCase extends TestCase
     private static function startServer(): void
     {
         $binPath = realpath(__DIR__ . '/../../bin/s3-server');
+        if ($binPath === false) {
+            self::fail('Unable to resolve the S3 server executable.');
+        }
 
         self::$serverStdoutPath = tempnam(sys_get_temp_dir(), 's3-server-stdout-') ?: '';
         self::$serverStderrPath = tempnam(sys_get_temp_dir(), 's3-server-stderr-') ?: '';
@@ -187,7 +195,7 @@ abstract class S3FunctionalTestCase extends TestCase
 
         // Use exec to replace the shell process so we can terminate the PHP process directly.
         $cmd = sprintf(
-            'exec php %s --host=%s --port=%d --storage-path=%s --access-key=%s --secret-key=%s',
+            'exec php %s --host=%s --port=%d --storage-path=%s --access-key=%s --secret-key=%s --enforce-min-part-size=false',
             escapeshellarg($binPath),
             escapeshellarg(self::$host),
             self::$port,
@@ -196,15 +204,16 @@ abstract class S3FunctionalTestCase extends TestCase
             escapeshellarg(self::$secretKey),
         );
 
-        self::$serverProcess = proc_open(
+        $process = proc_open(
             $cmd,
             $descriptors,
             self::$serverPipes,
         );
 
-        if (! is_resource(self::$serverProcess)) {
+        if (!is_resource($process)) {
             self::fail('Failed to start S3 server process.');
         }
+        self::$serverProcess = $process;
 
         // Close stdin — the server doesn't need it.
         fclose(self::$serverPipes[0]);
@@ -215,13 +224,17 @@ abstract class S3FunctionalTestCase extends TestCase
 
     private static function waitForServer(): void
     {
+        if (!is_resource(self::$serverProcess)) {
+            self::fail('S3 server process is not running.');
+        }
+        $process = self::$serverProcess;
         $maxWaitMs = 10_000;
         $intervalMs = 50;
         $elapsed = 0;
 
         while ($elapsed < $maxWaitMs) {
             // Check if process is still running.
-            $status = proc_get_status(self::$serverProcess);
+            $status = proc_get_status($process);
             if (! $status['running']) {
                 // Read stderr for error details.
                 $stderr = self::serverLogContents(self::$serverStderrPath);
@@ -266,6 +279,9 @@ abstract class S3FunctionalTestCase extends TestCase
     {
         if (is_dir($path)) {
             $items = scandir($path);
+            if ($items === false) {
+                throw new \RuntimeException("Unable to scan temporary test directory: {$path}");
+            }
 
             foreach ($items as $item) {
                 if ($item === '.' || $item === '..') {

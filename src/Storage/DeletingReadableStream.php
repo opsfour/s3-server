@@ -80,6 +80,9 @@ final class DeletingReadableStream implements \IteratorAggregate, ReadableStream
 
     public function __destruct()
     {
-        $this->close();
+        try {
+            $this->close();
+        } catch (\Throwable) {
+        }
     }
 }

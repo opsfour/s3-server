@@ -9,8 +9,8 @@
   - `ext-pdo_mysql` (optional, for MySQL metadata)
   - `ext-pcntl` (recommended, for signal handling)
 - **Composer 2.x**
-- **Symfony 7 or 8** when using the Symfony Bundle
-- **Laravel 11+** when using the Laravel service provider
+- **Symfony 7.4 LTS or 8.1+** when using the Symfony Bundle
+- **Laravel 12 or 13** when using the Laravel service provider
 
 ## Install via Composer
 
@@ -39,9 +39,15 @@ php vendor/bin/s3-server \
 | `--port` | `9000` | Listen port |
 | `--storage-path` | (required) | Root directory for object data |
 | `--storage-driver` | `filesystem` | `filesystem`, `flysystem`, or `memory` |
+| `--storage-temp-dir` | system temp | Local Flysystem staging directory |
+| `--flysystem-workers` | `0` | Bounded remote-storage workers; standalone Flysystem requires at least 1 |
+| `--backing-bucket` | - | Backing S3 bucket for standalone Flysystem |
+| `--backing-endpoint` | AWS default | Backing S3-compatible endpoint |
+| `--backing-path-style` | `false` | Use path-style backing requests |
 | `--region` | `us-east-1` | AWS region identifier |
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
 | `--metadata-dsn` | (auto) | Database DSN for postgres/mysql |
+| `--metadata-path` | (auto) | Standalone SQLite database path |
 | `--credentials-driver` | `memory` | `memory`, `database`, `file` |
 | `--access-key` | - | Access key (memory driver) |
 | `--secret-key` | - | Secret key (memory driver) |
@@ -68,7 +74,8 @@ php vendor/bin/s3-server
 ## Laravel Installation
 
 The package is framework-optional and does not require Laravel directly. The
-service provider is designed for Laravel 11 and newer applications.
+service provider is tested with Laravel 12 and 13. Laravel 11 reached the end
+of security support on March 12, 2026 and is not a production-supported target.
 
 ```bash
 composer require opsfour/s3-server
@@ -90,7 +97,7 @@ php artisan s3:serve
 
 ## Symfony Installation
 
-The Symfony Bundle supports Symfony 7 and 8. The package requires
+The Symfony Bundle supports maintained Symfony 7.4 LTS and 8.1+. The package requires
 `symfony/console` for the standalone CLI and keeps the bundle-specific Symfony
 components optional so non-Symfony users do not install a full framework stack.
 

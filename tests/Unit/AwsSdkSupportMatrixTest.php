@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit;
 
 use Aws\S3\S3Client;
+use Aws\Sdk;
 use PHPUnit\Framework\TestCase;
 
 final class AwsSdkSupportMatrixTest extends TestCase
@@ -32,7 +33,9 @@ final class AwsSdkSupportMatrixTest extends TestCase
         $stale = array_values(array_diff($classified, $sdkOperations));
 
         $this->assertSame([], $missing, 'AWS SDK S3 operations missing from support matrix.');
-        $this->assertSame([], $stale, 'Support matrix entries no longer present in the installed AWS SDK.');
+        if (version_compare(Sdk::VERSION, $matrix['sdk_version'], '>=')) {
+            $this->assertSame([], $stale, 'Support matrix entries no longer present in the installed AWS SDK.');
+        }
     }
 
     public function test_supported_operations_have_functional_sdk_coverage(): void
@@ -55,18 +58,18 @@ final class AwsSdkSupportMatrixTest extends TestCase
     }
 
     /**
-     * @return array{supported: list<string>, unsupported: list<string>, optional_external: list<string>}
+     * @return array{sdk_version: string, supported: list<string>, unsupported: list<string>, optional_external: list<string>}
      */
     private static function matrix(): array
     {
-        /** @var array{supported: list<string>, unsupported: list<string>, optional_external: list<string>} $matrix */
+        /** @var array{sdk_version: string, supported: list<string>, unsupported: list<string>, optional_external: list<string>} $matrix */
         $matrix = require __DIR__ . '/../Support/aws-s3-operations.php';
 
         return $matrix;
     }
 
     /**
-     * @param array{supported: list<string>, unsupported: list<string>, optional_external: list<string>} $matrix
+     * @param array{sdk_version: string, supported: list<string>, unsupported: list<string>, optional_external: list<string>} $matrix
      * @return list<string>
      */
     private static function classifiedOperations(array $matrix): array

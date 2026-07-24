@@ -60,7 +60,7 @@ final class S3ServerExtension extends Extension
 
         $container->setDefinition(StorageTierRegistry::class, (new Definition(StorageTierRegistry::class))
             ->setFactory([StorageBackendFactory::class, 'createTierRegistry'])
-            ->setArguments([$storageConfig])
+            ->setArguments([$storageConfig, new Reference(MetricsCollector::class)])
             ->setPublic(true));
 
         $container->setDefinition(StorageBackend::class, (new Definition(StorageBackend::class))

@@ -8,6 +8,9 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Exception\S3Exception;
+use OpsFour\S3Server\Logging\AccessLogWriter;
+use OpsFour\S3Server\Routing\S3Operation;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -20,6 +23,7 @@ final class LoggingMiddleware implements Middleware
 {
     public function __construct(
         private readonly LoggerInterface $logger,
+        private readonly ?AccessLogWriter $accessLogs = null,
     ) {}
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
@@ -28,19 +32,55 @@ final class LoggingMiddleware implements Middleware
 
         $method = $request->getMethod();
         $path = $request->getUri()->getPath();
-        $query = $request->getUri()->getQuery();
+        $query = self::redactSensitiveQueryValues($request->getUri()->getQuery());
         $fullPath = $query !== '' ? "{$path}?{$query}" : $path;
         $requestContentLength = $request->getHeader('Content-Length') ?? '-';
-        $requestId = $request->getAttribute('requestId') ?? '-';
+        $requestId = $request->hasAttribute('requestId')
+            ? (string) $request->getAttribute('requestId')
+            : '-';
 
-        $response = $requestHandler->handleRequest($request);
+        try {
+            $response = $requestHandler->handleRequest($request);
+        } catch (\Throwable $e) {
+            $this->writeLogEntry(
+                $request,
+                $method,
+                $fullPath,
+                $requestContentLength,
+                $requestId,
+                $e instanceof S3Exception ? $e->getHttpStatus() : 500,
+                '-',
+                $startTime,
+            );
 
-        $elapsedNs = hrtime(true) - $startTime;
-        $elapsedMs = round($elapsedNs / 1_000_000, 2);
+            throw $e;
+        }
 
-        $statusCode = $response->getStatus();
-        $responseContentLength = $response->getHeader('Content-Length') ?? '-';
+        $this->writeLogEntry(
+            $request,
+            $method,
+            $fullPath,
+            $requestContentLength,
+            $requestId,
+            $response->getStatus(),
+            $response->getHeader('Content-Length') ?? '-',
+            $startTime,
+        );
 
+        return $response;
+    }
+
+    private function writeLogEntry(
+        Request $request,
+        string $method,
+        string $fullPath,
+        string $requestContentLength,
+        string $requestId,
+        int $statusCode,
+        string $responseContentLength,
+        int $startTime,
+    ): void {
+        $elapsedMs = round((hrtime(true) - $startTime) / 1_000_000, 2);
         $this->logger->info(
             '{method} {path} {status} {time}ms',
             [
@@ -54,6 +94,50 @@ final class LoggingMiddleware implements Middleware
             ],
         );
 
-        return $response;
+        $bucket = $request->hasAttribute('s3.bucket')
+            ? (string) $request->getAttribute('s3.bucket')
+            : '';
+        if ($bucket !== '') {
+            $operation = $request->hasAttribute('s3.operation')
+                ? $request->getAttribute('s3.operation')
+                : null;
+            $this->accessLogs?->log(
+                bucket: $bucket,
+                key: $request->hasAttribute('s3.key') ? (string) $request->getAttribute('s3.key') : '',
+                operation: $operation instanceof S3Operation ? $operation->value : $method,
+                httpStatus: $statusCode,
+                bytesTransferred: is_numeric($responseContentLength) ? (int) $responseContentLength : 0,
+                remoteIp: $request->getClient()->getRemoteAddress()->toString(),
+                requesterId: $request->hasAttribute('ownerId') ? (string) $request->getAttribute('ownerId') : '',
+            );
+        }
+    }
+
+    private static function redactSensitiveQueryValues(string $query): string
+    {
+        if ($query === '') {
+            return '';
+        }
+
+        $sensitive = [
+            'awsaccesskeyid' => true,
+            'signature' => true,
+            'securitytoken' => true,
+            'x-amz-credential' => true,
+            'x-amz-security-token' => true,
+            'x-amz-signature' => true,
+        ];
+        $pairs = [];
+
+        foreach (explode('&', $query) as $pair) {
+            [$rawName] = array_pad(explode('=', $pair, 2), 2, '');
+            if (isset($sensitive[strtolower(rawurldecode($rawName))])) {
+                $pairs[] = $rawName . '=' . rawurlencode('[REDACTED]');
+            } else {
+                $pairs[] = $pair;
+            }
+        }
+
+        return implode('&', $pairs);
     }
 }

@@ -25,8 +25,14 @@ final class InMemoryBackend implements StorageBackend
     /** @var array<string, true> Bucket existence tracker. */
     private array $buckets = [];
 
-    /** @var array<string, array<int, string>> Parts keyed by uploadId → partNumber. */
+    /** @var array<string, string> Part data keyed by unique storage path. */
     private array $parts = [];
+
+    /** @var array<string, array<string, true>> Part paths keyed by upload ID. */
+    private array $partPathsByUpload = [];
+
+    /** @var array<string, string> Upload ID keyed by part storage path. */
+    private array $partUploadByPath = [];
 
     /** @var int Auto-incrementing path counter for unique storage paths. */
     private int $pathCounter = 0;
@@ -79,6 +85,14 @@ final class InMemoryBackend implements StorageBackend
     public function deleteObjectByPath(string $storagePath, string $bucket): void
     {
         unset($this->objects[$storagePath]);
+        unset($this->parts[$storagePath]);
+        $uploadId = $this->partUploadByPath[$storagePath] ?? null;
+        if ($uploadId !== null) {
+            unset($this->partUploadByPath[$storagePath], $this->partPathsByUpload[$uploadId][$storagePath]);
+            if ($this->partPathsByUpload[$uploadId] === []) {
+                unset($this->partPathsByUpload[$uploadId]);
+            }
+        }
     }
 
     public function createBucket(string $bucket): void
@@ -108,9 +122,10 @@ final class InMemoryBackend implements StorageBackend
 
         $checksums = $calculator->finalize();
 
-        $this->parts[$uploadId][$partNumber] = $content;
-
-        $path = "memory://parts/{$uploadId}/{$partNumber}";
+        $path = sprintf('memory://parts/%s/%d/%d', $uploadId, $partNumber, ++$this->pathCounter);
+        $this->parts[$path] = $content;
+        $this->partPathsByUpload[$uploadId][$path] = true;
+        $this->partUploadByPath[$path] = $uploadId;
 
         return new StorageWriteResult(
             path: $path,
@@ -131,12 +146,13 @@ final class InMemoryBackend implements StorageBackend
 
         foreach ($parts as $part) {
             $partNumber = $part['partNumber'];
+            $partPath = $part['storagePath'];
 
-            if (! isset($this->parts[$uploadId][$partNumber])) {
+            if (! isset($this->parts[$partPath], $this->partPathsByUpload[$uploadId][$partPath])) {
                 throw new InternalErrorException("Part {$partNumber} not found for upload {$uploadId}.");
             }
 
-            $partData = $this->parts[$uploadId][$partNumber];
+            $partData = $this->parts[$partPath];
             $calculator->update($partData);
             $assembled .= $partData;
 
@@ -162,7 +178,10 @@ final class InMemoryBackend implements StorageBackend
 
     public function abortMultipartUpload(string $bucket, string $key, string $uploadId): void
     {
-        unset($this->parts[$uploadId]);
+        foreach (array_keys($this->partPathsByUpload[$uploadId] ?? []) as $path) {
+            unset($this->parts[$path], $this->partUploadByPath[$path]);
+        }
+        unset($this->partPathsByUpload[$uploadId]);
     }
 
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult

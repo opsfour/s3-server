@@ -10,7 +10,9 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\BucketNotEmptyException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Multipart\MultipartCleanup;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
  * Handles DeleteBucket (DELETE /{bucket}).
@@ -25,10 +27,15 @@ use OpsFour\S3Server\Storage\StorageBackend;
  */
 final class DeleteBucketHandler implements RequestHandler
 {
+    private readonly StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
-    ) {}
+        ?StorageTierRegistry $storageTiers = null,
+    ) {
+        $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -42,12 +49,57 @@ final class DeleteBucketHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // 2. Delete from metadata store first — it performs the authoritative
-        // empty check (objects + active multipart uploads). If it throws
-        // BucketNotEmptyException, storage is untouched and the client can retry.
-        $this->metadata->deleteBucket($ownerId, $bucket);
+        // Consume every multipart upload and the bucket under the same owner
+        // lock. Concurrent part/object writes then either commit first or fail
+        // cleanly after the bucket disappears.
+        $cleanupUploads = $this->metadata->transaction(function () use ($ownerId, $bucket): array {
+            $this->metadata->lockOwnerForUpdate($ownerId);
+            $cleanupUploads = [];
+            $keyMarker = null;
+            $uploadIdMarker = null;
+            do {
+                $page = $this->metadata->listMultipartUploads(
+                    $bucket,
+                    maxUploads: 1000,
+                    keyMarker: $keyMarker,
+                    uploadIdMarker: $uploadIdMarker,
+                );
 
-        // 3. Clean up storage backend (best-effort — bucket is already gone from metadata).
+                foreach ($page['uploads'] as $upload) {
+                    $parts = MultipartCleanup::stage(
+                        $this->metadata,
+                        $bucket,
+                        $upload['key_name'],
+                        $upload['upload_id'],
+                        $upload['owner_id'],
+                        $this->storageTiers->defaultTier()->name,
+                    );
+                    $cleanupUploads[] = ['upload' => $upload, 'parts' => $parts];
+                }
+
+                $keyMarker = $page['nextKeyMarker'];
+                $uploadIdMarker = $page['nextUploadIdMarker'];
+            } while ($page['isTruncated']);
+
+            $this->metadata->deleteBucket($ownerId, $bucket);
+
+            return $cleanupUploads;
+        });
+
+        foreach ($cleanupUploads as $cleanup) {
+            MultipartCleanup::clean(
+                $this->metadata,
+                $this->storage,
+                $bucket,
+                $cleanup['upload']['key_name'],
+                $cleanup['upload']['upload_id'],
+                $this->storageTiers->defaultTier()->name,
+                $cleanup['parts'],
+            );
+        }
+
+        // Clean up storage backend namespace. Individual multipart paths remain
+        // in the durable garbage queue if this backend operation fails.
         try {
             $this->storage->deleteBucket($bucket);
         } catch (\Throwable) {
@@ -55,7 +107,6 @@ final class DeleteBucketHandler implements RequestHandler
             // will be re-created if a bucket with the same name is created later.
         }
 
-        // 4. Return 204 No Content.
         return new Response(status: 204);
     }
 }

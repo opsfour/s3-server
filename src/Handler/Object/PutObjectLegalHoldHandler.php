@@ -8,8 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
-use OpsFour\S3Server\Exception\NoSuchKeyException;
-use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
@@ -46,23 +45,20 @@ final class PutObjectLegalHoldHandler implements RequestHandler
             );
         }
 
-        // Parse versionId from query params.
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $versionId = $queryParams['versionId'] ?? null;
-
-        // Verify the object (or specific version) exists.
-        $objectInfo = ($versionId !== null)
-            ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
-            : $this->metadata->getObjectMetadata($bucket, $key);
-        if ($objectInfo === null) {
-            throw new NoSuchKeyException();
-        }
-
         // Parse the XML body.
-        $body = $request->getBody()->buffer();
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $legalHold = XmlRequestParser::parseLegalHold($body);
 
-        $this->metadata->putObjectLegalHold($bucket, $key, $legalHold['status'], $versionId);
+        $this->metadata->transaction(function () use ($bucketInfo, $request, $bucket, $key, $legalHold): void {
+            $this->metadata->lockOwnerForUpdate($bucketInfo->ownerId);
+            $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $this->metadata->putObjectLegalHold(
+                $bucket,
+                $key,
+                $legalHold['status'],
+                $objectInfo->versionId,
+            );
+        });
 
         return new Response(status: 200);
     }
