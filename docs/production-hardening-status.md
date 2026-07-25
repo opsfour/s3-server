@@ -7,12 +7,15 @@ in `release-checklist.md`.
 
 ## Release Decision
 
-Status: **P0, P1, and P2 complete; all configured release gates pass**
+Status: **P0, P1, and P2 complete; 12-hour external soak repeat pending**
 
 The default suite, PostgreSQL 16, MySQL 8.0, large-file, high-concurrency, and
 five-minute soak profiles pass on the current source. The external Linode
 Path-Style profile also passes against the configured remote bucket. AWS STS
-Query API compatibility remains optional and unsupported.
+Query API compatibility remains optional and unsupported. The first detached
+12-hour attempt was invalidated by a 9-hour-21-minute host suspension after
+4 hours 19 minutes of continuous workload; continuity detection and a macOS
+awake guard now prevent that pause from being reported as a successful gate.
 
 ## Priority Closure
 
@@ -179,6 +182,10 @@ Status: **Complete**
 - [x] The detached Docker soak runner enforces a 1 GiB no-swap cgroup for the
   complete PHP/S3 process tree, uses a separate bounded PostgreSQL container,
   and retains an independent remote-cleanup watchdog for OOM failures.
+- [x] Sustained-load runs reject workload gaps over 120 seconds and use a
+  launchd-managed macOS idle-sleep assertion when available.
+- [ ] Repeat the uninterrupted 12-hour external soak before updating `main` or
+  creating the next release tag.
 
 ## 9. Re-Audit Closure
 

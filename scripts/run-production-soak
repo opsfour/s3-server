@@ -8,6 +8,8 @@ STATE_DIR=${S3_SOAK_STATE_DIR:-/tmp/opsfour-s3-production-soak}
 RUNTIME_FILE="$STATE_DIR/runtime.env"
 RESULT_FILE="$STATE_DIR/result"
 PROJECT_NAME=opsfour-s3-production-soak
+AWAKE_GUARD_LABEL=com.opsfour.s3-production-soak
+AWAKE_GUARD_PLIST="$STATE_DIR/awake-guard.plist"
 
 load_environment()
 {
@@ -54,6 +56,53 @@ load_runtime()
     set +a
 }
 
+start_awake_guard()
+{
+    if [ "$(uname -s)" != Darwin ] \
+        || [ ! -x /usr/bin/caffeinate ] \
+        || [ ! -x /bin/launchctl ]; then
+        return
+    fi
+
+    awake_seconds=$((S3_SOAK_DURATION_SECONDS + 1200))
+    awake_domain="gui/$(id -u)"
+    /bin/launchctl bootout "$awake_domain/$AWAKE_GUARD_LABEL" >/dev/null 2>&1 || true
+
+    {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+        printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+        printf '%s\n' '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        printf '%s\n' '<plist version="1.0"><dict>'
+        printf '  <key>Label</key><string>%s</string>\n' "$AWAKE_GUARD_LABEL"
+        printf '%s\n' '  <key>ProgramArguments</key><array>'
+        printf '%s\n' '    <string>/usr/bin/caffeinate</string>'
+        printf '%s\n' '    <string>-i</string>'
+        printf '%s\n' '    <string>-t</string>'
+        printf '    <string>%s</string>\n' "$awake_seconds"
+        printf '%s\n' '  </array>'
+        printf '%s\n' '  <key>RunAtLoad</key><true/>'
+        printf '%s\n' '  <key>KeepAlive</key><false/>'
+        printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
+        printf '%s\n' '</dict></plist>'
+    } > "$AWAKE_GUARD_PLIST"
+
+    if /usr/bin/plutil -lint "$AWAKE_GUARD_PLIST" >/dev/null \
+        && /bin/launchctl bootstrap "$awake_domain" "$AWAKE_GUARD_PLIST"; then
+        printf 'macOS idle sleep blocked for up to %ss while the soak runs.\n' "$awake_seconds"
+    else
+        printf 'Warning: unable to start the macOS awake guard; host sleep invalidates the soak.\n' >&2
+    fi
+}
+
+stop_awake_guard()
+{
+    if [ "$(uname -s)" = Darwin ] && [ -x /bin/launchctl ]; then
+        awake_domain="gui/$(id -u)"
+        /bin/launchctl bootout "$awake_domain/$AWAKE_GUARD_LABEL" >/dev/null 2>&1 || true
+    fi
+    rm -f "$AWAKE_GUARD_PLIST"
+}
+
 start_soak()
 {
     mkdir -p "$STATE_DIR"
@@ -81,6 +130,7 @@ start_soak()
         "$S3_SOAK_STATE_DIR" > "$RUNTIME_FILE"
 
     compose up --detach --build --wait --wait-timeout 90
+    start_awake_guard
     printf 'Production soak started in Docker: duration %ss, prefix %s\n' \
         "$S3_SOAK_DURATION_SECONDS" \
         "$S3_SOAK_BACKING_PREFIX"
@@ -116,6 +166,7 @@ stop_soak()
     compose stop --timeout 30 soak cleanup || status=$?
     compose run --rm --no-deps soak php scripts/cleanup-production-soak.php || cleanup_status=$?
     compose down --volumes --remove-orphans || down_status=$?
+    stop_awake_guard
 
     if [ "$cleanup_status" -ne 0 ]; then
         status=$cleanup_status

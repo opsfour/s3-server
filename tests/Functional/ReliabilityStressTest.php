@@ -294,12 +294,14 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $concurrency = self::envInt('S3_TEST_PRODUCTION_SOAK_CONCURRENCY', 25);
         $allowedGrowth = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_RSS_GROWTH_BYTES', 256 * 1024 * 1024);
         $maximumTotalRss = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_TOTAL_RSS_BYTES', 768 * 1024 * 1024);
+        $maximumBatchGapSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_BATCH_GAP_SECONDS', 120);
         $pauseMilliseconds = self::envNonNegativeInt('S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS', 0);
         $progressSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS', 60);
 
         $rssBaseline = null;
         $tmpBefore = self::countFiles(self::$storagePath . '/.tmp');
         $deadline = microtime(true) + $durationSeconds;
+        $lastBatchCompletedAt = microtime(true);
         $iteration = 0;
         $nextProgress = microtime(true) + $progressSeconds;
 
@@ -374,7 +376,20 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 }
             }
 
-            $now = microtime(true);
+            $batchCompletedAt = microtime(true);
+            $batchGapSeconds = max(0.0, $batchCompletedAt - $lastBatchCompletedAt);
+            $this->assertLessThanOrEqual(
+                $maximumBatchGapSeconds,
+                $batchGapSeconds,
+                sprintf(
+                    'Production soak workload paused for %.3f seconds; the maximum is %d seconds.',
+                    $batchGapSeconds,
+                    $maximumBatchGapSeconds,
+                ),
+            );
+            $lastBatchCompletedAt = $batchCompletedAt;
+
+            $now = $batchCompletedAt;
             if ($now >= $nextProgress) {
                 fwrite(STDOUT, sprintf(
                     "\nSoak progress: %d seconds remaining, %d batches completed.\n",
@@ -389,6 +404,16 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             }
         }
 
+        $finalGapSeconds = max(0.0, microtime(true) - $lastBatchCompletedAt);
+        $this->assertLessThanOrEqual(
+            $maximumBatchGapSeconds,
+            $finalGapSeconds,
+            sprintf(
+                'Production soak ended after a %.3f-second workload pause; the maximum is %d seconds.',
+                $finalGapSeconds,
+                $maximumBatchGapSeconds,
+            ),
+        );
         $this->assertGreaterThan(0, $iteration, 'Production soak did not complete a workload batch.');
         $tmpAfter = self::countFiles(self::$storagePath . '/.tmp');
         $this->assertLessThanOrEqual($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
