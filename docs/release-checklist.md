@@ -7,7 +7,8 @@ advertised.
 
 ## Released Version
 
-`v1.3.0` was validated on 2026-07-26 with PHP 8.4.8:
+`v1.3.1` is a documentation-only follow-up to the runtime-identical `v1.3.0`,
+which was validated on 2026-07-26 with PHP 8.4.8:
 
 - SQLite schema version is `14`; PostgreSQL and MySQL schema version is `15`.
 - AWS STS Query API compatibility is intentionally outside the release scope.

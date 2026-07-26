@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-26
+
 ### Documentation
 
 - Add the versioned release history, mark the completed `v1.3.0` validation,
@@ -99,7 +101,8 @@ AWS STS Query API compatibility remains intentionally outside this release.
 
 - Initial public release.
 
-[Unreleased]: https://github.com/opsfour/s3-server/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/opsfour/s3-server/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/opsfour/s3-server/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/opsfour/s3-server/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/opsfour/s3-server/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/opsfour/s3-server/compare/v1.0.0...v1.1.0
