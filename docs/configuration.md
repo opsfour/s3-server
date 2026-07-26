@@ -186,6 +186,16 @@ which names one entry. Vault responses are bounded to 1 MiB.
 
 Rate limit state is persisted in the metadata database and survives server restarts. On multi-node deployments with Postgres/MySQL, rate limiting is shared across nodes.
 
+## Notifications
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_NOTIFICATION_REQUIRE_HTTPS` | `true` | Reject plaintext HTTP webhook destinations and redirects |
+
+Keep HTTPS enforcement enabled in production. Setting it to `false` only
+relaxes the transport requirement; private, reserved, loopback, and link-local
+destinations remain blocked by the notification SSRF policy.
+
 ## Timeouts
 
 | Variable | Default | Description |

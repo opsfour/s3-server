@@ -5,9 +5,9 @@ not complete merely because the default PHPUnit run passes: the opt-in
 integration and load profiles below are release gates for the backends being
 advertised.
 
-## Current Release Candidate
+## Released Version
 
-Validated on 2026-07-24 with PHP 8.4.8:
+`v1.3.0` was validated on 2026-07-26 with PHP 8.4.8:
 
 - SQLite schema version is `14`; PostgreSQL and MySQL schema version is `15`.
 - AWS STS Query API compatibility is intentionally outside the release scope.

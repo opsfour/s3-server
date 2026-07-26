@@ -9,6 +9,8 @@ in `release-checklist.md`.
 
 Status: **P0, P1, and P2 complete; all configured release gates pass**
 
+Released as `v1.3.0` on 2026-07-26.
+
 The default suite, PostgreSQL 16, MySQL 8.0, large-file, high-concurrency, and
 five-minute soak profiles pass on the current source. The external Linode
 Path-Style profile also passes against the configured remote bucket. AWS STS

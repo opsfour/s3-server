@@ -168,9 +168,14 @@ All webhook destinations are validated before delivery:
 
 1. DNS resolution of the hostname
 2. Rejection of private/reserved IP ranges (RFC 1918, RFC 5737, loopback, link-local)
-3. URL pinning to the resolved IP to prevent DNS rebinding attacks
+3. HTTPS enforcement by default, including every redirect destination
+4. URL pinning to the resolved IP to prevent DNS rebinding attacks
 
 Destinations resolving to private IPs are immediately dead-lettered.
+Plaintext HTTP destinations are also rejected by default. Keep
+`S3_NOTIFICATION_REQUIRE_HTTPS=true` in production; setting it to `false`
+changes only the transport requirement and does not disable destination or
+redirect SSRF validation.
 
 ## Monitoring
 

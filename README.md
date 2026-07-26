@@ -19,7 +19,7 @@ PHP Fibers.
 - **S3 Select** — SQL queries over unencrypted CSV and JSON objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Production hardened** — 740+ PHPUnit tests plus opt-in large-object, high-concurrency, remote-storage, and five-minute soak profiles
+- **Production hardened** — 745-test default suite plus large-object, high-concurrency, remote-storage, and uninterrupted 12-hour soak profiles
 
 ## Requirements
 
@@ -103,6 +103,7 @@ Full documentation is in the [docs/](docs/) directory:
 | [Policy Compatibility](docs/policy-compatibility.md) | Supported IAM-style actions and condition keys |
 | [Production Feature Roadmap](docs/production-feature-roadmap.md) | Implemented production features and deferred AWS scope |
 | [Release Checklist](docs/release-checklist.md) | Production readiness checks before tagging |
+| [Changelog](CHANGELOG.md) | Versioned release history and upgrade scope |
 | [Production Deployment](docs/deployment.md) | TLS, scaling, monitoring, backups |
 | [Architecture](docs/architecture.md) | Internals, middleware stack, design decisions |
 | [Development](docs/development.md) | Running tests, contributing, extending |

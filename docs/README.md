@@ -43,5 +43,6 @@ available on request.
 
 - [Production Deployment](deployment.md) — TLS, scaling, monitoring, health checks, backups
 - [Release Checklist](release-checklist.md) — Production readiness checks before tagging
+- [Changelog](../CHANGELOG.md) — Versioned release history and upgrade scope
 - [Architecture](architecture.md) — Internals, middleware stack, async design
 - [Development](development.md) — Running tests, extending handlers, contributing
