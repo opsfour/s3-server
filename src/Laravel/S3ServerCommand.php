@@ -111,6 +111,10 @@ class S3ServerCommand extends Command
                 externalIamConfig: config('s3-server.external_iam', []),
                 adminToken: is_string($adminToken) ? $adminToken : null,
             );
+        } catch (\InvalidArgumentException $e) {
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
         } catch (\Throwable $e) {
             $logger->error('S3 server bootstrap failed: {error}', ['error' => $e->getMessage()]);
             $this->error($e->getMessage());
