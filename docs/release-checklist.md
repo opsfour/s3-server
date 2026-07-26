@@ -37,7 +37,7 @@ Validated on 2026-07-24 with PHP 8.4.8:
 | Five-minute production soak | Passed; 598 assertions; 5:20.138; 44 MB |
 | Full-stack soak harness smoke | Passed against Linode Flysystem plus PostgreSQL; 75 batches, 1,265 assertions; 1:03.040; 28 MB |
 | Docker-isolated full-stack smoke | Passed against Linode Flysystem plus PostgreSQL; 1,675 assertions; 1:01.406; 30 MB PHPUnit; 1 GiB cgroup; no swap; no OOM; remote cleanup passed |
-| Detached 12-hour full-stack gate | Pending repeat; the first attempt was rejected after a 9-hour-21-minute host suspension interrupted continuous load |
+| Detached 12-hour full-stack gate | Passed against Linode Flysystem plus PostgreSQL; 12:00:04.186; 209,852 assertions; 1 GiB cgroup; no swap; no OOM; continuity and remote cleanup passed |
 | External Linode Flysystem backend | Passed; 64 MiB object plus 3 x 8 MiB multipart; 2 tests, 11 assertions; 50.830 seconds; 86.05 MB; Path-Style |
 | PostgreSQL 16 + MySQL 8.0 metadata integration | Passed; 6 tests, 82 assertions, 2 expected migration-profile skips; fresh schema, queues, stale-lease recovery, long-key tags, and quota concurrency |
 | PostgreSQL 16 + MySQL 8.0 destructive migration | Passed; 2 tests, 6 assertions; v11-to-v15 |
