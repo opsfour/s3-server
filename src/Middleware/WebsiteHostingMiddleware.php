@@ -9,9 +9,15 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Dto\BucketInfo;
+use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Http\WebsiteRedirectHost;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Security\RequestNetworkContext;
+use OpsFour\S3Server\Storage\LimitedReadableStream;
+use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
@@ -43,35 +49,37 @@ final class WebsiteHostingMiddleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
+        // Website paths contain only an object key; the bucket is in Host.
+        // Set attributes here because website requests bypass API route parsing.
+        $path = rawurldecode(ltrim($request->getUri()->getPath(), '/'));
+        $request->setAttribute('s3.bucket', $bucket);
+        $request->setAttribute('s3.key', $path);
+        $request->setAttribute('s3.operation', $request->getMethod() === 'HEAD' ? S3Operation::HeadObject : S3Operation::GetObject);
+        $request->setAttribute('s3.website', true);
+        $bucketInfo = $this->metadata->getBucket($bucket);
+        $request->setAttribute('s3.cachedBucketOwner', $bucketInfo?->ownerId);
+        $request->setAttribute('s3.cachedBucketGeneration', $bucketInfo?->generation);
+
         // Check website config.
         $websiteConfig = $this->metadata->getBucketWebsite($bucket);
 
-        if ($websiteConfig === null) {
+        if ($websiteConfig === null || $bucketInfo === null) {
             return self::htmlError(404, 'NoSuchWebsiteConfiguration', 'The specified bucket does not have a website configuration.');
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Resolve the key.
-        $path = ltrim($request->getUri()->getPath(), '/');
-        // Remove bucket prefix if path-style.
-        if (str_starts_with($path, $bucket . '/')) {
-            $path = substr($path, strlen($bucket) + 1);
-        }
-
         $key = $path;
 
         // Append index document for directory requests.
         if ($key === '' || str_ends_with($key, '/')) {
             $key .= $websiteConfig['indexDocument'];
         }
+        $request->setAttribute('s3.key', $key);
 
-        if (! $this->isPubliclyReadable($request, $bucket, $key)) {
-            return self::htmlError(403, 'AccessDenied', 'The requested website object is not publicly readable.');
-        }
-
-        // Handle redirectAllHost only after public access to the requested key
-        // has been established.
+        // Redirect-only buckets do not need an object at the requested key.
         if (isset($websiteConfig['redirectAllHost'])) {
-            $protocol = $websiteConfig['redirectAllProtocol'] ?? 'http';
+            $protocol = $websiteConfig['redirectAllProtocol'] ?? ($request->getUri()->getScheme() ?: 'http');
             if (!in_array($protocol, ['http', 'https'], true)) {
                 $protocol = 'http';
             }
@@ -80,6 +88,12 @@ final class WebsiteHostingMiddleware implements Middleware
                 return self::htmlError(500, 'InvalidWebsiteConfiguration', 'The website redirect host is invalid.');
             }
             $location = $protocol . '://' . $host . $request->getUri()->getPath();
+            $query = $request->getUri()->getQuery();
+            if ($query !== '') {
+                $location .= '?' . $query;
+            }
+
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
             return new Response(
                 status: 301,
@@ -87,9 +101,42 @@ final class WebsiteHostingMiddleware implements Middleware
             );
         }
 
-        // Try to serve the object.
-        $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+        $routingRules = $websiteConfig['routingRules'] ?? null;
+        if ($routingRules !== null) {
+            foreach ($routingRules as $rule) {
+                $condition = $rule['condition'] ?? [];
+                if (isset($condition['httpErrorCodeReturnedEquals'])) {
+                    continue;
+                }
+                if (! isset($condition['keyPrefixEquals']) || str_starts_with($key, $condition['keyPrefixEquals'])) {
+                    \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                    return self::websiteRuleRedirect($request, $key, $rule);
+                }
+            }
+        }
 
+        $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        $publiclyReadable = $this->isPubliclyReadable($request, $bucket, $key, $objectInfo);
+        // Policy, ACL and tag reads may yield after the object lookup. Do not
+        // let a former bucket's authorization publish its stored bytes.
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        if (! $publiclyReadable) {
+            if ($routingRules !== null) {
+                foreach ($routingRules as $rule) {
+                    $condition = $rule['condition'] ?? [];
+                    if (($condition['httpErrorCodeReturnedEquals'] ?? null) === 403
+                        && (! isset($condition['keyPrefixEquals']) || str_starts_with($key, $condition['keyPrefixEquals']))) {
+                        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                        return self::websiteRuleRedirect($request, $key, $rule);
+                    }
+                }
+            }
+
+            return self::htmlError(403, 'AccessDenied', 'The requested website object is not publicly readable.');
+        }
+
+        // Try to serve the object.
         if ($objectInfo !== null && !$objectInfo->isDeleteMarker) {
             // Serve the object.
             $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
@@ -114,7 +161,9 @@ final class WebsiteHostingMiddleware implements Middleware
                 return self::htmlError(403, 'InvalidObjectState', 'The archived object must be restored before it can be served.');
             }
 
-            $body = $request->getMethod() === 'HEAD' ? '' : $storage->getObjectByPath($storagePath);
+            $body = $request->getMethod() === 'HEAD'
+                ? ''
+                : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $objectInfo->size);
 
             return new Response(
                 status: 200,
@@ -129,11 +178,14 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         // Object not found — check routing rules.
-        $routingRules = $websiteConfig['routingRules'] ?? null;
         if ($routingRules !== null) {
             foreach ($routingRules as $rule) {
                 $condition = $rule['condition'] ?? [];
-                $redirect = $rule['redirect'] ?? [];
+
+                // Prefix-only rules already redirected before object lookup.
+                if (! isset($condition['httpErrorCodeReturnedEquals'])) {
+                    continue;
+                }
 
                 // Match condition.
                 $matchPrefix = true;
@@ -147,35 +199,8 @@ final class WebsiteHostingMiddleware implements Middleware
                 }
 
                 if ($matchPrefix && $matchError) {
-                    // Apply redirect.
-                    $redirectKey = $key;
-                    if (isset($redirect['replaceKeyPrefixWith']) && isset($condition['keyPrefixEquals'])) {
-                        $redirectKey = $redirect['replaceKeyPrefixWith'] . substr($key, strlen($condition['keyPrefixEquals']));
-                    }
-                    if (isset($redirect['replaceKeyWith'])) {
-                        $redirectKey = $redirect['replaceKeyWith'];
-                    }
-
-                    $protocol = $redirect['protocol'] ?? ($request->getUri()->getScheme() ?: 'http');
-                    if (!in_array($protocol, ['http', 'https'], true)) {
-                        $protocol = 'http';
-                    }
-                    $host = self::validatedRedirectHost($redirect['hostName'] ?? $request->getHeader('host') ?? 'localhost');
-                    if ($host === null) {
-                        return self::htmlError(500, 'InvalidWebsiteConfiguration', 'The website redirect host is invalid.');
-                    }
-                    $statusCode = (int) ($redirect['httpRedirectCode'] ?? 301);
-                    if (!in_array($statusCode, [301, 302, 303, 307, 308], true)) {
-                        $statusCode = 301;
-                    }
-                    // Sanitize redirect key to prevent CRLF header injection.
-                    $redirectKey = str_replace(["\r", "\n"], '', $redirectKey);
-                    $location = $protocol . '://' . $host . '/' . ltrim($redirectKey, '/');
-
-                    return new Response(
-                        status: (int) $statusCode,
-                        headers: ['Location' => $location],
-                    );
+                    \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                    return self::websiteRuleRedirect($request, $key, $rule);
                 }
             }
         }
@@ -183,11 +208,13 @@ final class WebsiteHostingMiddleware implements Middleware
         // Try error document.
         if (isset($websiteConfig['errorDocument'])) {
             $errorDocument = $websiteConfig['errorDocument'];
-            if (! $this->isPubliclyReadable($request, $bucket, $errorDocument)) {
+            $errorObjectInfo = $this->metadata->getObjectMetadata($bucket, $errorDocument);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $errorPubliclyReadable = $this->isPubliclyReadable($request, $bucket, $errorDocument, $errorObjectInfo);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if (! $errorPubliclyReadable) {
                 return self::htmlError(403, 'AccessDenied', 'The website error document is not publicly readable.');
             }
-
-            $errorObjectInfo = $this->metadata->getObjectMetadata($bucket, $errorDocument);
 
             if ($errorObjectInfo !== null && !$errorObjectInfo->isDeleteMarker) {
                 $sseAlgo = $errorObjectInfo->userMetadata['__sse-algorithm'] ?? null;
@@ -207,7 +234,9 @@ final class WebsiteHostingMiddleware implements Middleware
                         return self::htmlError(403, 'InvalidObjectState', 'The archived error document must be restored before it can be served.');
                     }
 
-                    $body = $request->getMethod() === 'HEAD' ? '' : $storage->getObjectByPath($storagePath);
+                    $body = $request->getMethod() === 'HEAD'
+                        ? ''
+                        : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo->size);
 
                     return new Response(
                         status: 404,
@@ -224,7 +253,58 @@ final class WebsiteHostingMiddleware implements Middleware
         return self::htmlError(404, 'NoSuchKey', 'The specified key does not exist.');
     }
 
-    private function isPubliclyReadable(Request $request, string $bucket, string $key): bool
+    private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): LimitedReadableStream
+    {
+        $source = $storage->getObjectByPath($path);
+        try {
+            // Opening a remote source can yield. Close it if this bucket name
+            // changed while the backend was opening the old physical path.
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            return new LimitedReadableStream($source, $size);
+        } catch (\Throwable $error) {
+            try {
+                $source->close();
+            } catch (\Throwable) {
+            }
+            throw $error;
+        }
+    }
+
+    /** @param array<string, mixed> $rule */
+    private static function websiteRuleRedirect(Request $request, string $key, array $rule): Response
+    {
+        $condition = $rule['condition'] ?? [];
+        $redirect = $rule['redirect'] ?? [];
+        $redirectKey = $key;
+        if (isset($redirect['replaceKeyPrefixWith'])) {
+            $redirectKey = $redirect['replaceKeyPrefixWith'] . substr($key, strlen($condition['keyPrefixEquals'] ?? ''));
+        }
+        if (isset($redirect['replaceKeyWith'])) {
+            $redirectKey = $redirect['replaceKeyWith'];
+        }
+
+        $protocol = $redirect['protocol'] ?? ($request->getUri()->getScheme() ?: 'http');
+        if (! in_array($protocol, ['http', 'https'], true)) {
+            $protocol = 'http';
+        }
+        $host = self::validatedRedirectHost($redirect['hostName'] ?? $request->getHeader('host') ?? 'localhost');
+        if ($host === null) {
+            return self::htmlError(500, 'InvalidWebsiteConfiguration', 'The website redirect host is invalid.');
+        }
+        $statusCode = (int) ($redirect['httpRedirectCode'] ?? 301);
+        if (! in_array($statusCode, [301, 302, 303, 307, 308], true)) {
+            $statusCode = 301;
+        }
+        $redirectKey = str_replace(["\r", "\n"], '', $redirectKey);
+        $redirectPath = implode('/', array_map('rawurlencode', explode('/', ltrim($redirectKey, '/'))));
+
+        return new Response(
+            status: $statusCode,
+            headers: ['Location' => $protocol . '://' . $host . '/' . $redirectPath],
+        );
+    }
+
+    private function isPubliclyReadable(Request $request, string $bucket, string $key, ?ObjectInfo $object): bool
     {
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
         $policy = $this->metadata->getBucketPolicy($bucket);
@@ -235,7 +315,7 @@ final class WebsiteHostingMiddleware implements Middleware
                 action: 's3:GetObject',
                 resource: "arn:aws:s3:::{$bucket}/{$key}",
                 principal: 'anonymous',
-                conditions: $this->policyConditions($request, $bucket, $key),
+                conditions: $this->policyConditions($request, $object),
             );
 
             if ($policyResult === 'Deny') {
@@ -247,7 +327,6 @@ final class WebsiteHostingMiddleware implements Middleware
             }
         }
 
-        $object = $this->metadata->getObjectMetadata($bucket, $key);
         $grants = $this->metadata->getAcl(
             'object',
             \OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName(
@@ -273,16 +352,16 @@ final class WebsiteHostingMiddleware implements Middleware
     /**
      * @return array<string, string>
      */
-    private function policyConditions(Request $request, string $bucket, string $key): array
+    private function policyConditions(Request $request, ?ObjectInfo $object): array
     {
         $conditions = [
-            'aws:SecureTransport' => $request->getClient()->getTlsInfo() !== null ? 'true' : 'false',
+            'aws:SecureTransport' => RequestNetworkContext::secureTransport($request) ? 'true' : 'false',
             'aws:CurrentTime' => gmdate(\DateTimeInterface::ATOM),
         ];
 
-        $remoteAddress = $request->getClient()->getRemoteAddress();
-        if ($remoteAddress instanceof \Amp\Socket\InternetAddress) {
-            $conditions['aws:SourceIp'] = $remoteAddress->getAddress();
+        $sourceIp = RequestNetworkContext::sourceIp($request);
+        if ($sourceIp !== null) {
+            $conditions['aws:SourceIp'] = $sourceIp;
         }
 
         $userAgent = $request->getHeader('user-agent');
@@ -290,8 +369,10 @@ final class WebsiteHostingMiddleware implements Middleware
             $conditions['aws:UserAgent'] = $userAgent;
         }
 
-        foreach ($this->metadata->getObjectTagging($bucket, $key) as $tag) {
-            $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
+        if ($object !== null) {
+            foreach ($this->metadata->getObjectTagging($object->bucket, $object->key, $object->versionId) as $tag) {
+                $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
+            }
         }
 
         return $conditions;
@@ -351,7 +432,7 @@ final class WebsiteHostingMiddleware implements Middleware
             return [null, $storagePath];
         }
 
-        return [$this->storageTiers->defaultBackend(), $object->restoredStoragePath];
+        return [\OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($object, $this->storageTiers)->backend, $object->restoredStoragePath];
     }
 
     private static function htmlError(int $status, string $code, string $message): Response
@@ -372,7 +453,7 @@ final class WebsiteHostingMiddleware implements Middleware
 
     private static function validatedRedirectHost(mixed $host): ?string
     {
-        if (! is_string($host) || preg_match('/^[a-zA-Z0-9.-]+(?::[0-9]{1,5})?$/D', $host) !== 1) {
+        if (! is_string($host) || ! WebsiteRedirectHost::isValid($host)) {
             return null;
         }
 

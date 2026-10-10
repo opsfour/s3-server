@@ -7,18 +7,32 @@ namespace OpsFour\S3Server\Handler\Multipart;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
+use OpsFour\S3Server\Encryption\BufferedSsePayload;
+use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\CopySourceConditionEvaluator;
+use OpsFour\S3Server\Http\CopySourceParser;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
+use OpsFour\S3Server\Multipart\MultipartPartSize;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Security\ObjectReadAuthorizer;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
+use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class UploadPartCopyHandler implements RequestHandler
@@ -27,11 +41,13 @@ final class UploadPartCopyHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        StorageBackend $storage,
         private readonly ?EncryptionServiceInterface $encryption = null,
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         ?StorageTierRegistry $storageTiers = null,
         private readonly ?QuotaManager $quotas = null,
+        private readonly bool $requireLocalFencedParts = false,
+        private readonly ?LocalFencedMultipartPartWriter $localPartWriter = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
     }
@@ -49,7 +65,8 @@ final class UploadPartCopyHandler implements RequestHandler
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         $uploadId = $queryParams['uploadId'] ?? '';
-        $partNumber = isset($queryParams['partNumber']) ? (int) $queryParams['partNumber'] : 0;
+        $rawPartNumber = $queryParams['partNumber'] ?? '';
+        $partNumber = ctype_digit($rawPartNumber) ? (int) $rawPartNumber : 0;
 
         if ($partNumber < 1 || $partNumber > 10000) {
             throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
@@ -64,7 +81,14 @@ final class UploadPartCopyHandler implements RequestHandler
         if ($upload['owner_id'] !== $ownerId) {
             throw new NoSuchUploadException();
         }
+        if (($upload['bucket_generation'] ?? '') !== $bucketInfo->generation) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
+        $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
+        $uploadStorage = $uploadTier->backend;
+        $storageTier = $uploadTier->name;
         $uploadSseAlgorithm = $upload['user_metadata']['__sse-algorithm'] ?? null;
+        $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
         $destinationCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
             $request,
             $uploadSseAlgorithm === 'SSE-C',
@@ -75,44 +99,128 @@ final class UploadPartCopyHandler implements RequestHandler
                 'SSE-C headers are not valid for this multipart upload.',
             );
         }
+        $partFormat = $upload['user_metadata']['__mpu-part-format'] ?? null;
+        $encryptedV2 = $partFormat === EncryptedMultipartPartCodec::FORMAT;
+        if ($partFormat !== null && $partFormat !== EncryptedMultipartPartCodec::PLAINTEXT_FORMAT && ! $encryptedV2) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Unknown multipart part format.');
+        }
+        if ($uploadSseAlgorithm !== null && ! $encryptedV2) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Legacy encrypted multipart upload must be aborted.');
+        }
+        $partIntentStore = MultipartPartWriteCapabilities::metadata($this->metadata);
+        $plannedPartStorage = MultipartPartWriteCapabilities::storage($uploadStorage);
+        $localFencedPart = MultipartPartWriteCapabilities::localFilesystem($uploadStorage);
+        if (($this->requireLocalFencedParts && ($this->localPartWriter === null || ! $localFencedPart))
+            || ($localFencedPart && (! $partIntentStore instanceof FencedMultipartPartWriteIntentStore || $plannedPartStorage === null))) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Local multipart parts require a fenced filesystem and metadata store.');
+        }
+        if ($this->localPartWriter !== null) {
+            $this->localPartWriter->assertBoundTo($this->metadata, $uploadStorage, $storageTier);
+        }
+        $dispatchId = null;
+        if ($encryptedV2) {
+            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            if ($uploadSseAlgorithm === null || $this->encryption === null) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart upload has no encryption mode.');
+            }
+            if ($this->requireLocalFencedParts && $uploadSseAlgorithm === EncryptionRequestResolver::SSE_S3
+                && (! $this->encryption instanceof ConfigWorkerKeyringCompatible
+                    || $this->encryption->configWorkerKeyringFingerprint() === null)) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                    'Guarded SSE-S3 multipart parts require the injected worker-compatible Config keyring.',
+                );
+            }
+            if ($partIntentStore === null || $plannedPartStorage === null) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart parts require durable planned-path backends.');
+            }
+        }
 
         // Parse copy source.
         $copySource = $request->getHeader('x-amz-copy-source') ?? '';
-        [$srcBucket, $srcKey, $srcVersionId] = self::parseCopySource($copySource);
+        [$srcBucket, $srcKey, $srcVersionId] = CopySourceParser::parse($copySource);
 
         $srcBucketInfo = $this->metadata->getBucket($srcBucket);
         if ($srcBucketInfo === null) {
             throw new NoSuchKeyException();
+        }
+        $srcVersioning = $this->metadata->getBucketVersioning($srcBucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
+        $request->setAttribute('s3.copySourceBucket', $srcBucket);
+        $request->setAttribute('s3.copySourceKey', $srcKey);
+        $request->setAttribute('s3.copySourceVersionId', $srcVersionId);
+        $request->setAttribute('s3.copySourceBucketOwner', $srcBucketInfo->ownerId);
+        $request->setAttribute('s3.copySourceBucketGeneration', $srcBucketInfo->generation);
+        $expectedSourceOwner = $request->getHeader('x-amz-source-expected-bucket-owner');
+        if ($expectedSourceOwner !== null && $expectedSourceOwner !== $srcBucketInfo->ownerId) {
+            $request->setAttribute('s3.copySourceLogEligible', true);
+            throw new \OpsFour\S3Server\Exception\AccessDeniedException('Expected source bucket owner does not match.');
         }
 
         $srcObject = ($srcVersionId !== null)
             ? $this->metadata->getObjectMetadataByVersion($srcBucket, $srcKey, $srcVersionId)
             : $this->metadata->getObjectMetadata($srcBucket, $srcKey);
         if ($srcObject === null || $srcObject->isDeleteMarker) {
+            $request->setAttribute('s3.copySourceLogEligible', true);
+            if ($srcVersionId === null
+                && $srcObject === null
+                && $this->metadata->getCurrentObjectVersion($srcBucket, $srcKey) === null
+                && ! MissingObjectListVisibility::canList($this->metadata, $request, $srcBucket, copySource: true)) {
+                throw new \OpsFour\S3Server\Exception\AccessDeniedException();
+            }
             throw new NoSuchKeyException();
         }
-        (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $srcObject);
+        $request->setAttribute('s3.copySourceVersionId', $srcObject->versionId);
+        $request->setAttribute('s3.copySourceObjectSize', $srcObject->size);
+        try {
+            (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $srcObject, $srcVersionId !== null);
+            CopySourceConditionEvaluator::assertSatisfied($request, $srcObject);
+        } catch (\Throwable $e) {
+            $request->setAttribute('s3.copySourceLogEligible', true);
+            throw $e;
+        }
 
         // Parse optional range.
         $rangeHeader = $request->getHeader('x-amz-copy-source-range');
         $offset = null;
         $length = null;
 
-        if ($rangeHeader !== null && str_starts_with($rangeHeader, 'bytes=')) {
-            $rangeSpec = substr($rangeHeader, 6);
-            $parts = explode('-', $rangeSpec, 2);
-            if (count($parts) === 2) {
-                $start = (int) $parts[0];
-                $end = (int) $parts[1];
-                if ($start > $end || $start >= $srcObject->size || $end >= $srcObject->size) {
+        if ($rangeHeader !== null) {
+            if (preg_match('/\Abytes=([0-9]+)-([0-9]+)\z/', $rangeHeader, $matches) !== 1) {
+                throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                    'Copy source range must use bytes=first-last.',
+                );
+            }
+
+            $maxInteger = (string) PHP_INT_MAX;
+            foreach ([$matches[1], $matches[2]] as $value) {
+                $digits = ltrim($value, '0');
+                if ($digits !== '' && (
+                    strlen($digits) > strlen($maxInteger)
+                    || (strlen($digits) === strlen($maxInteger) && strcmp($digits, $maxInteger) > 0)
+                )) {
                     throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                         'Range specified is not valid for source object size.',
                     );
                 }
-                $offset = $start;
-                $length = $end - $start + 1;
             }
+
+            $start = (int) $matches[1];
+            $end = (int) $matches[2];
+            if ($start > $end || $start >= $srcObject->size || $end >= $srcObject->size) {
+                throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                    'Range specified is not valid for source object size.',
+                );
+            }
+            if ($srcObject->size <= 5 * 1024 * 1024) {
+                throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                    'Ranged copy requires a source object larger than 5 MB.',
+                );
+            }
+            $offset = $start;
+            $length = $end - $start + 1;
         }
+
+        MultipartPartSize::assertStoredSize($length ?? $srcObject->size);
 
         // Read source data — decrypt if the source object is encrypted.
         $srcPath = $srcObject->systemMetadata['storagePath'] ?? null;
@@ -130,7 +238,7 @@ final class UploadPartCopyHandler implements RequestHandler
             ) {
                 throw new InvalidObjectStateException('The source object must be restored before it can be copied.');
             }
-            $sourceStorage = $this->storageTiers->defaultBackend();
+            $sourceStorage = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($srcObject, $this->storageTiers)->backend;
             $srcPath = $srcObject->restoredStoragePath;
         }
         $srcSseAlgo = $srcObject->userMetadata['__sse-algorithm'] ?? null;
@@ -149,9 +257,12 @@ final class UploadPartCopyHandler implements RequestHandler
             );
         }
 
-        $bufferedWorkLock = $srcSseAlgo !== null
+        $bufferedWorkLock = $srcSseAlgo !== null || $encryptedV2
             ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
             : null;
+        $stream = null;
+        $plannedPartPath = null;
+        $request->setAttribute('s3.copySourceLogEligible', true);
         try {
             if ($srcSseAlgo !== null && $this->encryption !== null) {
                 // Size guard: encrypted objects must be fully buffered for decryption.
@@ -162,7 +273,11 @@ final class UploadPartCopyHandler implements RequestHandler
                 }
 
                 // Source is encrypted: read ciphertext, decrypt, then write plaintext as part.
-                $ciphertext = \Amp\ByteStream\buffer($sourceStorage->getObjectByPath($srcPath));
+                [$ciphertext] = BufferedSsePayload::readExpected(
+                    $sourceStorage->getObjectByPath($srcPath),
+                    $srcObject->size,
+                    $this->maxEncryptedObjectSize,
+                );
 
                 if ($srcSseAlgo === 'SSE-C') {
                     \assert($sourceCustomerKey !== null);
@@ -191,29 +306,243 @@ final class UploadPartCopyHandler implements RequestHandler
 
                 $stream = new \Amp\ByteStream\ReadableBuffer($plaintext);
             } else {
-                $stream = $sourceStorage->getObjectByPath($srcPath, $offset, $length);
+                // A corrupt or misbehaving backend must not stage unlimited
+                // physical bytes for a source with small committed metadata.
+                // Read one extra byte for a full-source copy so the existing
+                // post-write size check can reject an oversized source.
+                $expectedSize = $length ?? $srcObject->size;
+                $readLimit = $length ?? ($expectedSize < PHP_INT_MAX ? $expectedSize + 1 : PHP_INT_MAX);
+                $stream = new LimitedReadableStream(
+                    $sourceStorage->getObjectByPath($srcPath, $offset, $length),
+                    $readLimit,
+                );
             }
 
-            // Write as a part.
-            $writeResult = $this->storage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
+            if ($encryptedV2 && $this->encryption !== null && $uploadSseAlgorithm !== null) {
+                $expectedSize = $length ?? $srcObject->size;
+                [$plaintext, $checksums] = BufferedSsePayload::read($stream, $this->maxEncryptedObjectSize, expectedBytes: $expectedSize);
+                $sourceMd5 = [];
+                if ($offset === null && preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
+                    && ! hash_equals(strtolower($sourceMd5[1]), $checksums->md5Hex)) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
+                }
+                if ($offset === null) {
+                    $this->assertSourceChecksums($srcObject, new StorageWriteResult(
+                        '',
+                        $checksums->size,
+                        $checksums->md5Hex,
+                        $checksums->crc32Base64(),
+                        $checksums->crc32cBase64(),
+                        $checksums->sha1Base64(),
+                        $checksums->sha256Base64(),
+                    ), $sourceStorage);
+                }
+                $ciphertext = EncryptedMultipartPartCodec::encode(
+                    $this->encryption,
+                    $uploadSseAlgorithm,
+                    $plaintext,
+                    $destinationCustomerKey,
+                    $bucketInfo->generation,
+                    $bucket,
+                    $uploadId,
+                    $partNumber,
+                );
+                if ($this->localPartWriter !== null) {
+                    $validatedPhysical = null;
+                    $outcome = $this->localPartWriter->publish(
+                        $bucket,
+                        $bucketInfo->generation,
+                        $uploadId,
+                        $partNumber,
+                        new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                        partFormat: EncryptedMultipartPartCodec::FORMAT,
+                        logicalSize: $checksums->size,
+                        validateBeforeArm: static function (\OpsFour\S3Server\Checksum\ChecksumResult $staged) use ($ciphertext, &$validatedPhysical): void {
+                            MultipartPartLogicalValidator::assertEncodedBytes($staged, $ciphertext);
+                            $validatedPhysical = $staged;
+                        },
+                    );
+                    if ($outcome->result === null || $outcome->dispatchId === null || $validatedPhysical === null) {
+                        throw $outcome->error ?? new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted local multipart part copy dispatch did not complete.');
+                    }
+                    MultipartPartLogicalValidator::assertPhysicalMatches($validatedPhysical, $outcome->result);
+                    $plannedPartPath = $outcome->path;
+                    $dispatchId = $outcome->dispatchId;
+                    $physical = $outcome->result;
+                } else {
+                    if ($plannedPartStorage === null || $partIntentStore === null) {
+                        throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart parts require durable planned-path backends.');
+                    }
+                    $plannedPartPath = $plannedPartStorage->planMultipartPartPath(
+                        $bucket,
+                        $bucketInfo->generation,
+                        $uploadId,
+                        $partNumber,
+                        bin2hex(random_bytes(16)),
+                    );
+                    $dispatchId = $this->startWriteIntent(
+                        $partIntentStore,
+                        $bucket,
+                        $bucketInfo->generation,
+                        $storageTier,
+                        $uploadId,
+                        $plannedPartPath,
+                        $localFencedPart,
+                    );
+                    try {
+                        $physical = $plannedPartStorage->putPartAtPath(
+                            $bucket,
+                            $key,
+                            $uploadId,
+                            $partNumber,
+                            new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                            $plannedPartPath,
+                        );
+                    } catch (\Throwable $e) {
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        throw $e;
+                    }
+                }
+                if ($physical->path !== $plannedPartPath
+                    || $physical->size !== strlen($ciphertext)
+                    || ! hash_equals(md5($ciphertext), strtolower($physical->md5Hex))) {
+                    $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId);
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart part copy write does not match its payload.');
+                }
+                $writeResult = new StorageWriteResult(
+                    $physical->path,
+                    $checksums->size,
+                    $checksums->md5Hex,
+                    $checksums->crc32Base64(),
+                    $checksums->crc32cBase64(),
+                    $checksums->sha1Base64(),
+                    $checksums->sha256Base64(),
+                );
+            } else {
+                if ($this->localPartWriter !== null) {
+                    $validated = null;
+                    $expectedSize = $length ?? $srcObject->size;
+                    $outcome = $this->localPartWriter->publish(
+                        $bucket,
+                        $bucketInfo->generation,
+                        $uploadId,
+                        $partNumber,
+                        $stream,
+                        validateBeforeArm: function (\OpsFour\S3Server\Checksum\ChecksumResult $checksums) use ($expectedSize, $offset, $srcObject, $sourceStorage, &$validated): void {
+                            if ($checksums->size !== $expectedSize) {
+                                throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
+                            }
+                            $sourceMd5 = [];
+                            if ($offset === null) {
+                                if (preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
+                                    && ! hash_equals(strtolower($sourceMd5[1]), $checksums->md5Hex)) {
+                                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
+                                }
+                                $this->assertSourceChecksums($srcObject, MultipartPartLogicalValidator::stagedResult($checksums), $sourceStorage);
+                            }
+                            $validated = $checksums;
+                        },
+                    );
+                    if ($outcome->result === null || $outcome->dispatchId === null || $validated === null) {
+                        throw $outcome->error ?? new \OpsFour\S3Server\Exception\InternalErrorException('Local multipart part copy dispatch did not complete.');
+                    }
+                    MultipartPartLogicalValidator::assertPhysicalMatches($validated, $outcome->result);
+                    $plannedPartPath = $outcome->path;
+                    $dispatchId = $outcome->dispatchId;
+                    $writeResult = $outcome->result;
+                } elseif ($partIntentStore !== null && $plannedPartStorage !== null) {
+                    $plannedPartPath = $plannedPartStorage->planMultipartPartPath(
+                        $bucket,
+                        $bucketInfo->generation,
+                        $uploadId,
+                        $partNumber,
+                        bin2hex(random_bytes(16)),
+                    );
+                    $dispatchId = $this->startWriteIntent(
+                        $partIntentStore,
+                        $bucket,
+                        $bucketInfo->generation,
+                        $storageTier,
+                        $uploadId,
+                        $plannedPartPath,
+                        $localFencedPart,
+                    );
+                    try {
+                        $writeResult = $plannedPartStorage->putPartAtPath($bucket, $key, $uploadId, $partNumber, $stream, $plannedPartPath);
+                    } catch (\Throwable $e) {
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        throw $e;
+                    }
+                    if ($writeResult->path !== $plannedPartPath) {
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart part copy did not use its planned path.');
+                    }
+                } else {
+                    $writeResult = $uploadStorage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
+                }
+            }
         } finally {
-            $bufferedWorkLock?->release();
+            try {
+                $stream?->close();
+            } finally {
+                $bufferedWorkLock?->release();
+            }
         }
+
+        $expectedSize = $length ?? $srcObject->size;
+        $sourceMd5 = [];
+        if (
+            $writeResult->size !== $expectedSize
+            || (
+                $offset === null
+                && preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
+                && ! hash_equals(strtolower($sourceMd5[1]), strtolower($writeResult->md5Hex))
+            )
+        ) {
+            $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
+        }
+        if ($offset === null) {
+            try {
+                $this->assertSourceChecksums($srcObject, $writeResult, $uploadStorage);
+            } catch (\Throwable $e) {
+                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+                throw $e;
+            }
+        }
+        $request->setAttribute('s3.copySourceReadComplete', true);
+        $request->setAttribute('s3.copySourceBytesTransferred', $expectedSize);
 
         $etag = '"' . $writeResult->md5Hex . '"';
 
         $previousPartPath = null;
+        $commitCallbackCompleted = false;
         try {
-            $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, &$previousPartPath): void {
-                \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $srcBucketInfo, $srcObject, $srcVersionId, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $plannedPartPath, $dispatchId, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
+                \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId, $srcBucketInfo->ownerId);
+                \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
+                \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
+                (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+                (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $srcObject, $srcVersionId !== null);
                 $activeUpload = $this->metadata->getMultipartUpload($uploadId);
                 if (
                     $activeUpload === null
                     || $activeUpload['bucket'] !== $bucket
                     || $activeUpload['key_name'] !== $key
                     || $activeUpload['owner_id'] !== $ownerId
+                    || ($activeUpload['bucket_generation'] ?? '') !== $bucketInfo->generation
                 ) {
                     throw new NoSuchUploadException();
+                }
+                if (($activeUpload['user_metadata']['__mpu-part-format'] ?? null) !== $partFormat) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload format changed during part copy.');
+                }
+                if (($activeUpload['user_metadata']['__sse-algorithm'] ?? null) !== $uploadSseAlgorithm) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload encryption changed during part copy.');
+                }
+                if (($activeUpload['storage_tier'] ?? null) !== $storageTier) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload storage tier changed during part copy.');
                 }
                 foreach ($this->metadata->getParts($uploadId) as $part) {
                     if ($part['part_number'] === $partNumber) {
@@ -229,60 +558,193 @@ final class UploadPartCopyHandler implements RequestHandler
                     $writeResult->size,
                 );
                 $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+                if ($plannedPartPath !== null && ($dispatchId !== null
+                    ? ! $this->consumeFencedIntent($bucket, $uploadId, $plannedPartPath, $dispatchId)
+                    : ! $this->consumePlannedIntent($bucket, $uploadId, $plannedPartPath))) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart part write intent expired.');
+                }
+                if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
+                    $this->metadata->enqueueStorageGarbage($bucket, $storageTier, $previousPartPath);
+                }
+                $commitCallbackCompleted = true;
             });
         } catch (\Throwable $e) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $this->storage,
-                $bucket,
-                $this->storageTiers->defaultTier()->name,
-                $writeResult->path,
-            );
+            // Keep a potentially committed part when COMMIT's outcome is unknown.
+            if (FailedPartCommitCleanup::shouldDelete($commitCallbackCompleted, $this->metadata, $uploadId, $partNumber, $writeResult->path)) {
+                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+            }
             throw $e;
         }
 
         if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $this->storage,
-                $bucket,
-                $this->storageTiers->defaultTier()->name,
-                $previousPartPath,
-            );
+            try {
+                \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
+                    $this->metadata,
+                    $uploadStorage,
+                    $bucket,
+                    $storageTier,
+                    $previousPartPath,
+                );
+            } catch (\Throwable) {
+                // The committed exact-path job remains for the collector.
+            }
         }
 
         $lastModified = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
             ->format('Y-m-d\TH:i:s.000\Z');
 
-        $xml = XmlResponseBuilder::copyObjectResult($etag, $lastModified);
+        $xml = XmlResponseBuilder::copyPartResult($etag, $lastModified);
+
+        $responseHeaders = ['Content-Type' => 'application/xml'];
+        if ($srcObject->versionId !== null || $srcVersioning !== '') {
+            $responseHeaders['x-amz-copy-source-version-id'] = $srcObject->versionId ?? 'null';
+        }
+        if ($uploadSseAlgorithm === EncryptionRequestResolver::SSE_C) {
+            $responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+            $responseHeaders['x-amz-server-side-encryption-customer-key-MD5']
+                = $upload['user_metadata']['__sse-customer-key-md5'];
+        } elseif ($uploadSseAlgorithm === EncryptionRequestResolver::SSE_S3) {
+            $responseHeaders['x-amz-server-side-encryption'] = 'AES256';
+        }
 
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'application/xml'],
+            headers: $responseHeaders,
             body: $xml,
         );
     }
 
-    /** @return array{0: string, 1: string, 2: string|null} */
-    private static function parseCopySource(string $copySource): array
+    private function consumeFencedIntent(string $bucket, string $uploadId, string $path, string $dispatchId): bool
     {
-        $versionId = null;
-        $qPos = strpos($copySource, '?');
-        if ($qPos !== false) {
-            parse_str(substr($copySource, $qPos + 1), $queryParams);
-            $versionId = isset($queryParams['versionId']) && is_string($queryParams['versionId'])
-                ? $queryParams['versionId']
-                : null;
-            $copySource = substr($copySource, 0, $qPos);
+        return $this->metadata instanceof FencedMultipartPartWriteIntentStore
+            && $this->metadata->consumeLocalMultipartPartWriteIntent($bucket, $uploadId, $path, $dispatchId);
+    }
+
+    private function consumePlannedIntent(string $bucket, string $uploadId, string $path): bool
+    {
+        return $this->metadata instanceof MultipartPartWriteIntentStore
+            && $this->metadata->consumeMultipartPartWriteIntent($bucket, $uploadId, $path);
+    }
+
+    private function deleteUncommittedPart(StorageBackend $storage, string $storageTier, string $bucket, string $path, ?string $confirmedUploadId = null): void
+    {
+        if (MultipartPartWriteCapabilities::localFilesystem($storage)) {
+            // A late create-only worker can still publish after an unknown ACK.
+            // Keep its armed SQL tombstone for same-path sealing.
+            return;
         }
-        $copySource = rawurldecode(ltrim($copySource, '/'));
-        $slashPos = strpos($copySource, '/');
-        if ($slashPos === false) {
-            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
-                'Invalid x-amz-copy-source format.',
-            );
+        \OpsFour\S3Server\Storage\DurableStorageDelete::run(
+            $this->metadata,
+            $storage,
+            $bucket,
+            $storageTier,
+            $path,
+        );
+        if ($confirmedUploadId === null || ! $this->metadata instanceof MultipartPartWriteIntentStore) {
+            return;
+        }
+        try {
+            $stream = $storage->getObjectByPath($path);
+            $stream->close();
+        } catch (\OpsFour\S3Server\Exception\NoSuchKeyException) {
+            try {
+                $this->metadata->consumeMultipartPartWriteIntent($bucket, $confirmedUploadId, $path);
+            } catch (\Throwable) {
+                // Keep the intent for the collector if metadata is unavailable.
+            }
+        }
+    }
+
+    private function startWriteIntent(
+        MultipartPartWriteIntentStore $store,
+        string $bucket,
+        string $bucketGeneration,
+        string $storageTier,
+        string $uploadId,
+        string $path,
+        bool $local,
+    ): ?string {
+        if (! $local) {
+            $store->createMultipartPartWriteIntent($bucket, $bucketGeneration, $storageTier, $uploadId, $path);
+
+            return null;
+        }
+        if (! $store instanceof FencedMultipartPartWriteIntentStore) {
+            throw new \LogicException('Local multipart part fence is unavailable.');
+        }
+        $store->reserveLocalMultipartPartWriteIntent($bucket, $bucketGeneration, $storageTier, $uploadId, $path);
+        $dispatchId = bin2hex(random_bytes(16));
+        if (! $store->armLocalMultipartPartWriteIntent($bucket, $uploadId, $path, $dispatchId)) {
+            $store->retireUndispatchedLocalMultipartPartWriteIntent($bucket, $uploadId, $path);
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Local multipart part dispatch could not be armed.');
         }
 
-        return [substr($copySource, 0, $slashPos), substr($copySource, $slashPos + 1), $versionId];
+        return $dispatchId;
     }
+
+    private function assertPlainUploadAllowed(string $bucket, ?string $uploadSseAlgorithm): void
+    {
+        $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
+        \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
+        if ($uploadSseAlgorithm === null && $bucketEncryption !== null) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Bucket default encryption changed before multipart part copy.',
+            );
+        }
+    }
+
+    private function assertSourceChecksums(\OpsFour\S3Server\Dto\ObjectInfo $source, StorageWriteResult $write, StorageBackend $storage): void
+    {
+        $expected = [
+            'crc32' => $source->systemMetadata['checksum-crc32'] ?? null,
+            'crc32c' => $source->systemMetadata['checksum-crc32c'] ?? null,
+            'sha1' => $source->systemMetadata['checksum-sha1'] ?? null,
+            'sha256' => $source->systemMetadata['checksum-sha256'] ?? null,
+        ];
+        if ($expected === ['crc32' => null, 'crc32c' => null, 'sha1' => null, 'sha256' => null]) {
+            return;
+        }
+
+        $actual = [
+            'crc32' => $write->crc32Base64,
+            'crc32c' => $write->crc32cBase64,
+            'sha1' => $write->sha1Base64,
+            'sha256' => $write->sha256Base64,
+        ];
+        foreach ($expected as $algorithm => $value) {
+            if ($value === null || $actual[$algorithm] !== null) {
+                continue;
+            }
+            // Custom storage backends may report only size and MD5. Rehash
+            // their bounded staged part before accepting the source bytes.
+            $calculator = new ChecksumCalculator();
+            $readLimit = $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX;
+            $stream = new LimitedReadableStream($storage->getObjectByPath($write->path), $readLimit);
+            try {
+                while (($chunk = $stream->read()) !== null) {
+                    $calculator->update($chunk);
+                }
+            } finally {
+                $stream->close();
+            }
+            $checksums = $calculator->finalize();
+            if ($checksums->size !== $source->size) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source size does not match its metadata.');
+            }
+            $actual = [
+                'crc32' => $checksums->crc32Base64(),
+                'crc32c' => $checksums->crc32cBase64(),
+                'sha1' => $checksums->sha1Base64(),
+                'sha256' => $checksums->sha256Base64(),
+            ];
+            break;
+        }
+
+        foreach ($expected as $algorithm => $value) {
+            if ($value !== null && ($actual[$algorithm] === null || ! hash_equals($value, $actual[$algorithm]))) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source checksum does not match its payload.');
+            }
+        }
+    }
+
 }

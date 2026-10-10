@@ -9,14 +9,18 @@ use Amp\Log\ConsoleFormatter;
 use Amp\Log\StreamHandler;
 use Monolog\Logger;
 use Monolog\Processor\PsrLogMessageProcessor;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
+use OpsFour\S3Server\Runtime\ServeFailureMessage;
+use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -79,25 +83,25 @@ final class S3ServerServeCommand extends Command
                 notificationListeners: $this->notificationListeners,
             );
         } catch (\Throwable $e) {
-            $output->writeln("<error>Error: {$e->getMessage()}</error>");
+            $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'bootstrap') . '</error>');
 
             return Command::FAILURE;
         }
 
-        $output->writeln("OpsFour S3 Server starting on {$config->host}:{$config->port}");
-        $output->writeln("Storage: {$config->storagePath}");
-        if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
-            $output->writeln("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");
-        }
-        if ($config->encryptionWorkerPoolSize > 0) {
-            $output->writeln("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers");
-        }
-        if ($config->selectWorkerPoolSize > 0) {
-            $output->writeln("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
-        }
-        $output->writeln('Press Ctrl+C to stop.');
-
+        $failed = false;
         try {
+            $output->writeln("OpsFour S3 Server starting on {$config->host}:{$config->port}");
+            $output->writeln("Storage: {$config->storagePath}");
+            if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
+                $output->writeln("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");
+            }
+            if ($config->encryptionWorkerPoolSize > 0) {
+                $output->writeln("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers");
+            }
+            if ($config->selectWorkerPoolSize > 0) {
+                $output->writeln("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
+            }
+            $output->writeln('Press Ctrl+C to stop.');
             $runtime->server->start();
 
             $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
@@ -105,12 +109,19 @@ final class S3ServerServeCommand extends Command
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);
         } catch (\Throwable $e) {
-            $logger->error('S3 server runtime failed: {error}', ['error' => $e->getMessage()]);
-            $output->writeln("<error>Error: {$e->getMessage()}</error>");
-
-            return Command::FAILURE;
+            $logger->error('S3 server runtime failed.', ['exception' => $e::class]);
+            $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'runtime') . '</error>');
+            $failed = true;
         } finally {
-            $runtime->stop();
+            $shutdownError = ServeRuntimeShutdown::stop($runtime, $logger);
+            if ($shutdownError !== null) {
+                $output->writeln('<error>Error: ' . $shutdownError . '</error>');
+                $failed = true;
+            }
+        }
+
+        if ($failed) {
+            return Command::FAILURE;
         }
 
         $output->writeln('Server stopped.');
@@ -129,13 +140,17 @@ final class S3ServerServeCommand extends Command
 
         $port = $input->getOption('port');
         if ($port !== null && $port !== '') {
-            $overrides['port'] = (int) $port;
+            if ((! is_string($port) && ! is_int($port))
+                || ($parsedPort = filter_var($port, FILTER_VALIDATE_INT)) === false) {
+                throw new \InvalidArgumentException('--port must be a decimal integer within the supported range.');
+            }
+            $overrides['port'] = $parsedPort;
         }
 
         return $overrides === [] ? $this->config : $this->config->with($overrides);
     }
 
-    private function logger(): Logger
+    private function logger(): LoggerInterface
     {
         $logHandler = new StreamHandler(ByteStream\getStdout());
         $logHandler->pushProcessor(new PsrLogMessageProcessor());
@@ -143,6 +158,7 @@ final class S3ServerServeCommand extends Command
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
+        $logger = new FailureIsolatingLogger($logger);
 
         return $logger;
     }

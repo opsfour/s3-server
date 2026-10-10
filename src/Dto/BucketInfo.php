@@ -14,5 +14,6 @@ final readonly class BucketInfo
         public string $ownerId,
         public string $region = 'us-east-1',
         public \DateTimeImmutable $creationDate = new \DateTimeImmutable(),
+        public string $generation = '',
     ) {}
 }

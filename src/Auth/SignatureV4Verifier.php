@@ -11,6 +11,7 @@ use OpsFour\S3Server\Exception\AuthorizationHeaderMalformedException;
 use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\S3Exception;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
+use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
  * Verifies AWS Signature Version 4 (header-based) authentication.
@@ -51,6 +52,10 @@ final class SignatureV4Verifier
      */
     public function verify(Request $request, CredentialProvider $credentialProvider, string $region): AuthResult
     {
+        if (QueryStringParser::hasConflictingValues($request->getUri()->getQuery())) {
+            throw new AccessDeniedException('Conflicting duplicate query parameter.');
+        }
+
         // 1. Parse the Authorization header.
         $authHeader = $request->getHeader('authorization');
         if ($authHeader === null) {
@@ -94,7 +99,10 @@ final class SignatureV4Verifier
         self::validateClockSkew($timestamp);
 
         // 5. Get hashed payload from x-amz-content-sha256 header.
-        $hashedPayload = $request->getHeader('x-amz-content-sha256') ?? 'UNSIGNED-PAYLOAD';
+        $hashedPayload = $request->getHeader('x-amz-content-sha256');
+        if ($hashedPayload === null) {
+            throw new AccessDeniedException('Missing x-amz-content-sha256 header.');
+        }
 
         // 6. Build the canonical request.
         $signedHeaders = explode(';', $parsed['signedHeaders']);
@@ -106,6 +114,7 @@ final class SignatureV4Verifier
                 'Authorization header requires "host" to be a signed header.',
             );
         }
+        self::assertMutationHeadersSigned($request, $signedHeaders, allowPayloadHashHeader: true);
 
         $canonicalRequest = CanonicalRequest::build(
             method: $request->getMethod(),
@@ -194,17 +203,12 @@ final class SignatureV4Verifier
 
         $dateHeader = $request->getHeader('date');
         if ($dateHeader !== null) {
-            // Convert RFC 7231 date to ISO 8601 basic format.
-            $dt = \DateTimeImmutable::createFromFormat(\DateTimeInterface::RFC7231, $dateHeader);
-            if ($dt !== false) {
-                return $dt->format('Ymd\THis\Z');
+            // S3 requires the basic UTC timestamp when Date signs SigV4.
+            if (preg_match('/\A[0-9]{8}T[0-9]{6}Z\z/', $dateHeader) !== 1) {
+                throw new AccessDeniedException('Date header must use ISO 8601 basic UTC format.');
             }
 
-            // Try RFC 2822 format as fallback.
-            $dt = \DateTimeImmutable::createFromFormat(\DateTimeInterface::RFC2822, $dateHeader);
-            if ($dt !== false) {
-                return $dt->format('Ymd\THis\Z');
-            }
+            return $dateHeader;
         }
 
         throw new AccessDeniedException(
@@ -219,7 +223,7 @@ final class SignatureV4Verifier
      */
     private static function validateClockSkew(string $timestamp): void
     {
-        if (strlen($timestamp) !== 16 || $timestamp[8] !== 'T' || $timestamp[15] !== 'Z') {
+        if (preg_match('/\A[0-9]{8}T[0-9]{6}Z\z/', $timestamp) !== 1) {
             throw new AccessDeniedException(
                 'Invalid date format in request. Expected ISO 8601 basic format (YYYYMMDD\'T\'HHMMSS\'Z\').',
             );
@@ -277,6 +281,19 @@ final class SignatureV4Verifier
         }
 
         return $headers;
+    }
+
+    /** @param list<string> $signedHeaders */
+    public static function assertMutationHeadersSigned(Request $request, array $signedHeaders, bool $allowPayloadHashHeader = false): void
+    {
+        foreach ($request->getHeaders() as $name => $_values) {
+            $name = strtolower($name);
+            if (($name === 'content-md5' || str_starts_with($name, 'x-amz-'))
+                && ! ($allowPayloadHashHeader && $name === 'x-amz-content-sha256')
+                && ! in_array($name, $signedHeaders, true)) {
+                throw new AccessDeniedException('Request contains an unsigned S3 header.');
+            }
+        }
     }
 
     /**

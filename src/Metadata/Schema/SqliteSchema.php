@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class SqliteSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 14;
+    public const int VERSION = 39;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -45,12 +45,19 @@ final class SqliteSchema
             name TEXT PRIMARY KEY,
             owner_id TEXT NOT NULL,
             region TEXT NOT NULL DEFAULT 'us-east-1',
+            generation TEXT NOT NULL DEFAULT '',
             versioning TEXT NOT NULL DEFAULT '',
             object_lock_enabled INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner ON s3_buckets(owner_id);
+        CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner_name ON s3_buckets(owner_id, name);
+
+        CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (
+            bucket TEXT PRIMARY KEY,
+            object_ownership TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS s3_account_quotas (
             owner_id TEXT PRIMARY KEY,
@@ -106,6 +113,9 @@ final class SqliteSchema
             target_tier TEXT NOT NULL,
             target_storage_class TEXT NOT NULL,
             source_storage_path TEXT NOT NULL,
+            origin TEXT NOT NULL DEFAULT 'legacy',
+            lifecycle_rule_id TEXT,
+            expected_is_latest INTEGER,
             target_storage_path TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -161,6 +171,7 @@ final class SqliteSchema
             transition_error TEXT,
             restore_status TEXT,
             restored_storage_path TEXT,
+            restored_storage_tier TEXT,
             restore_expires_at TEXT,
             storage_path TEXT NOT NULL,
             user_metadata TEXT NOT NULL DEFAULT '{}',
@@ -169,6 +180,7 @@ final class SqliteSchema
             checksum_sha1 TEXT,
             checksum_sha256 TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            noncurrent_at TEXT,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             UNIQUE(bucket, key_name, version_id)
         );
@@ -176,19 +188,25 @@ final class SqliteSchema
         CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_key ON s3_objects(bucket, key_name);
         CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_latest ON s3_objects(bucket, is_latest, is_delete_marker);
         CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_prefix ON s3_objects(bucket, key_name, is_latest, is_delete_marker);
+        CREATE INDEX IF NOT EXISTS idx_s3_objects_owner ON s3_objects(owner_id, is_delete_marker);
         CREATE INDEX IF NOT EXISTS idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status);
+        CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier);
+        CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at);
 
         CREATE TABLE IF NOT EXISTS s3_multipart_uploads (
             upload_id TEXT PRIMARY KEY,
             bucket TEXT NOT NULL,
+            bucket_generation TEXT NOT NULL DEFAULT '',
             key_name TEXT NOT NULL,
             owner_id TEXT NOT NULL,
+            storage_tier TEXT,
             content_type TEXT DEFAULT 'application/octet-stream',
             user_metadata TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_bucket ON s3_multipart_uploads(bucket);
+        CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_owner ON s3_multipart_uploads(owner_id);
         CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_bucket_key ON s3_multipart_uploads(bucket, key_name);
 
         CREATE TABLE IF NOT EXISTS s3_parts (
@@ -198,6 +216,8 @@ final class SqliteSchema
             etag TEXT NOT NULL,
             size INTEGER NOT NULL,
             storage_path TEXT NOT NULL,
+            checksum_algorithm TEXT,
+            checksum_value TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             UNIQUE(upload_id, part_number),
             FOREIGN KEY (upload_id) REFERENCES s3_multipart_uploads(upload_id) ON DELETE CASCADE
@@ -247,11 +267,12 @@ final class SqliteSchema
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             bucket TEXT NOT NULL,
             rule_order INTEGER NOT NULL DEFAULT 0,
+            rule_id TEXT,
             allowed_origins TEXT NOT NULL DEFAULT '[]',
             allowed_methods TEXT NOT NULL DEFAULT '[]',
             allowed_headers TEXT NOT NULL DEFAULT '[]',
             expose_headers TEXT NOT NULL DEFAULT '[]',
-            max_age_seconds INTEGER NOT NULL DEFAULT 0,
+            max_age_seconds INTEGER NOT NULL DEFAULT -1,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
 
@@ -268,7 +289,12 @@ final class SqliteSchema
             kms_master_key_id TEXT,
             bucket_key_enabled INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                sse_algorithm COLLATE BINARY = 'AES256'
+                AND kms_master_key_id IS NULL
+                AND bucket_key_enabled = 0
+            )
         );
 
         CREATE TABLE IF NOT EXISTS s3_lifecycle_rules (

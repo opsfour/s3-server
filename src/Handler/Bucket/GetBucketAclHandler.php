@@ -8,6 +8,8 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -36,7 +38,13 @@ final class GetBucketAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $grants = $this->metadata->getAcl('bucket', $bucket);
+        $grants = BucketOwnership::isEnforced($this->metadata, $bucket)
+            ? [] : $this->metadata->getAcl('bucket', $bucket);
+        $grants = AclGrantResolver::effectiveGrants(
+            $grants,
+            $this->metadata->getPublicAccessBlock($bucket)['ignorePublicAcls'] ?? false,
+        );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Default: owner gets FULL_CONTROL if no ACL stored.
         $bucketOwner = $bucketInfo->ownerId;

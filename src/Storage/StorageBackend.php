@@ -45,13 +45,18 @@ interface StorageBackend
 
     /**
      * Create a bucket's storage directory/namespace.
+     * Must be idempotent and preserve any existing contents: CreateBucket may
+     * retry after this call partly succeeded and then threw, or after a later
+     * metadata transaction failed.
      *
      * @param  string  $bucket  The bucket name.
      */
     public function createBucket(string $bucket): void;
 
     /**
-     * Remove a bucket's storage directory/namespace.
+     * Legacy name-only bucket namespace removal. An implementation may reject
+     * this call because the name does not identify one immutable generation.
+     * API DeleteBucket never calls it; cleanup uses recorded physical paths.
      *
      * @param  string  $bucket  The bucket name.
      */

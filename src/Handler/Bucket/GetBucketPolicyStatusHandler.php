@@ -29,6 +29,7 @@ final class GetBucketPolicyStatusHandler implements RequestHandler
         }
 
         $policyJson = $this->metadata->getBucketPolicy($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($policyJson === null) {
             throw new NoSuchBucketPolicyException();
         }

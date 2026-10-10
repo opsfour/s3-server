@@ -8,28 +8,49 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Encryption\EncryptionService;
+use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
+use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class CreateMultipartUploadHandler implements RequestHandler
 {
+    private readonly ?StorageTierRegistry $storageTiers;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly ?EncryptionServiceInterface $encryption = null,
         private readonly ?QuotaManager $quotas = null,
-    ) {}
+        private readonly ?StorageBackend $storage = null,
+        ?StorageTierRegistry $storageTiers = null,
+        private readonly bool $requireWorkerCompatibleSseS3 = false,
+    ) {
+        $this->storageTiers = $storageTiers ?? ($storage === null ? null : StorageTierRegistry::single($storage));
+    }
 
     public function handleRequest(Request $request): Response
     {
+        if ($request->getHeader('x-amz-checksum-algorithm') !== null
+            || $request->getHeader('x-amz-checksum-type') !== null) {
+            throw new NotImplementedException(
+                'Multipart additional checksums are not supported.',
+            );
+        }
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -44,6 +65,30 @@ final class CreateMultipartUploadHandler implements RequestHandler
             $bucket,
             $this->encryption,
         );
+        if ($this->requireWorkerCompatibleSseS3 && $encryptionMode === EncryptionRequestResolver::SSE_S3
+            && (! $this->encryption instanceof ConfigWorkerKeyringCompatible
+                || $this->encryption->configWorkerKeyringFingerprint() === null)) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                'Guarded SSE-S3 multipart creation requires the injected worker-compatible Config keyring.',
+            );
+        }
+        $writeStorage = $this->storageTiers?->defaultBackend() ?? $this->storage;
+        if ($encryptionMode !== null && $writeStorage !== null
+            && (MultipartPartWriteCapabilities::storage($writeStorage) === null
+                || MultipartPartWriteCapabilities::metadata($this->metadata) === null)) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'Encrypted multipart uploads require durable planned-part storage and metadata backends.',
+            );
+        }
+        if (! $this->metadata instanceof MultipartUploadTierStore) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'Multipart upload creation requires tier-aware metadata persistence.',
+            );
+        }
+        $tierStore = $this->metadata;
+        // Direct handler construction without a storage registry retains the
+        // historical STANDARD tier. Registered runtimes pass their actual tier.
+        $storageTier = $this->storageTiers?->defaultTier()->name ?? 'STANDARD';
         (new ObjectLockRequestApplier($this->metadata))->validate($request, $bucket);
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId)
             ?? AclGrantResolver::privateAcl($ownerId);
@@ -61,13 +106,14 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $uploadId = bin2hex(random_bytes(16));
         $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
         $userMetadata = UserMetadataExtractor::extract($request);
+        $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT;
         $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
 
         // Preserve standard HTTP metadata for CompleteMultipartUpload.
         $contentEncoding = $request->getHeader('content-encoding');
         $contentDisposition = $request->getHeader('content-disposition');
         $cacheControl = $request->getHeader('cache-control');
-        $storageClass = $request->getHeader('x-amz-storage-class') ?? 'STANDARD';
+        $storageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($request->getHeader('x-amz-storage-class'));
 
         if ($contentEncoding !== null) {
             $userMetadata['__mpu-content-encoding'] = $contentEncoding;
@@ -103,6 +149,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
         // Store encryption context in upload metadata for CompleteMultipartUpload.
         $sseAlgo = $encryptionMode;
         if ($encryptionMode !== null) {
+            $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::FORMAT;
             $sseCAlgorithm = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
             $sseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
             $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
@@ -118,8 +165,20 @@ final class CreateMultipartUploadHandler implements RequestHandler
             }
         }
 
-        $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants): void {
+        $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants, $request, $encryptionMode, $tierStore, $storageTier): void {
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
+            \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
+            if ($encryptionMode === null && $bucketEncryption !== null) {
+                throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                    'Bucket default encryption changed while multipart upload was being initiated.',
+                );
+            }
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+            if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
+                BucketOwnership::assertWriteAclAllowed($request);
+            }
             $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
             if (
                 $publicAccessBlock !== null
@@ -129,11 +188,12 @@ final class CreateMultipartUploadHandler implements RequestHandler
                 throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
             }
             $this->quotas?->assertCanCreateMultipart($ownerId, $bucket);
-            $this->metadata->createMultipartUpload(
+            $tierStore->createMultipartUploadWithTier(
                 uploadId: $uploadId,
                 bucket: $bucket,
                 key: $key,
                 ownerId: $ownerId,
+                storageTier: $storageTier,
                 contentType: $contentType,
                 userMetadata: $userMetadata,
             );

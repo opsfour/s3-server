@@ -8,12 +8,16 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\AccessControlListNotSupportedException;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -41,32 +45,44 @@ final class PutObjectAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId);
-        if ($grants === null) {
-            // Parse XML body.
-            $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
-            $parsed = XmlRequestParser::parseAccessControlPolicy($body);
-            $grants = AclGrantResolver::validateGrants($parsed['grants']);
-        }
-
-        $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $grants): ?string {
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
+        $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $body): ?string {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+            if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
+                throw new AccessControlListNotSupportedException();
+            }
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $objectOwnerId = $object->ownerId !== '' ? $object->ownerId : $bucketInfo->ownerId;
+            $grants = AclGrantResolver::fromHeaders($request, $objectOwnerId, 'object', $bucketInfo->ownerId);
+            if ($grants !== null && $body !== '') {
+                throw new InvalidArgumentException('ACL permissions cannot be specified in both headers and the body.');
+            }
+            if ($grants === null) {
+                $parsed = XmlRequestParser::parseAccessControlPolicy($body);
+                $grants = AclGrantResolver::validateGrants($parsed['grants']);
+            }
+
             $pab = $this->metadata->getPublicAccessBlock($bucket);
             if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
                 throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
             }
 
-            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
             $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $object->versionId);
-            $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
-            $this->metadata->putAcl('object', $resourceName, $ownerId, $grants);
+            $this->metadata->putAcl('object', $bucket . '/' . $key, $objectOwnerId, []);
+            $this->metadata->putAcl('object', $resourceName, $objectOwnerId, $grants);
 
-            return $object->versionId;
+            return $object->versionId
+                ?? ($this->metadata->getBucketVersioning($bucket) !== '' ? 'null' : null);
         });
 
         return new Response(
             status: 200,
-            headers: array_filter(['x-amz-version-id' => $versionId]),
+            headers: array_filter(
+                ['x-amz-version-id' => $versionId],
+                static fn(?string $value): bool => $value !== null,
+            ),
         );
     }
 }

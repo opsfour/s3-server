@@ -28,6 +28,7 @@ final class GetPublicAccessBlockHandler implements RequestHandler
         }
 
         $config = $this->metadata->getPublicAccessBlock($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($config === null) {
             throw new NoSuchPublicAccessBlockConfigurationException();
         }

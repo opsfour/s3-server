@@ -58,6 +58,9 @@ enum S3Operation: string
     case GetBucketPolicyStatus = 'GetBucketPolicyStatus';
     case GetBucketLogging = 'GetBucketLogging';
     case PutBucketLogging = 'PutBucketLogging';
+    case GetBucketOwnershipControls = 'GetBucketOwnershipControls';
+    case PutBucketOwnershipControls = 'PutBucketOwnershipControls';
+    case DeleteBucketOwnershipControls = 'DeleteBucketOwnershipControls';
 
     // ── Object operations ────────────────────────────────────────────
     case PutObject = 'PutObject';
@@ -85,4 +88,31 @@ enum S3Operation: string
     case CompleteMultipartUpload = 'CompleteMultipartUpload';
     case AbortMultipartUpload = 'AbortMultipartUpload';
     case ListParts = 'ListParts';
+
+    public function usesExistingObjectOwner(): bool
+    {
+        return match ($this) {
+            self::GetObject, self::HeadObject, self::GetObjectAttributes,
+            self::SelectObjectContent, self::GetObjectAcl, self::PutObjectAcl,
+            self::GetObjectTagging, self::PutObjectTagging, self::DeleteObjectTagging,
+            self::GetObjectRetention, self::PutObjectRetention,
+            self::GetObjectLegalHold, self::PutObjectLegalHold,
+            self::RestoreObject => true,
+            default => false,
+        };
+    }
+
+    /** Whether the handler actually selects an existing object version from the query. */
+    public function selectsObjectVersion(): bool
+    {
+        return match ($this) {
+            self::GetObject, self::HeadObject, self::GetObjectAttributes,
+            self::GetObjectAcl, self::PutObjectAcl,
+            self::GetObjectTagging, self::PutObjectTagging, self::DeleteObjectTagging,
+            self::GetObjectRetention, self::PutObjectRetention,
+            self::GetObjectLegalHold, self::PutObjectLegalHold,
+            self::DeleteObject, self::RestoreObject => true,
+            default => false,
+        };
+    }
 }

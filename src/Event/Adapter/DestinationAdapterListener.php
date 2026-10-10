@@ -11,7 +11,8 @@ use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
 /**
- * Bridges internal S3 events to a durable destination adapter.
+ * Bridges internal S3 events to an optional destination adapter in-process.
+ * The bridge does not persist or retry failed deliveries.
  */
 final readonly class DestinationAdapterListener
 {
@@ -28,7 +29,6 @@ final readonly class DestinationAdapterListener
             $this->logger->error('Notification destination adapter failed.', $this->context($event, [
                 'event' => 'destination_adapter_failed',
                 'exception' => $e::class,
-                'error' => $e->getMessage(),
             ]));
 
             throw $e;
@@ -37,8 +37,7 @@ final readonly class DestinationAdapterListener
         $context = $this->context($event, [
             'event' => 'destination_delivery_result',
             'status' => $result->status->value,
-            'reason' => $result->reason,
-        ] + $result->context);
+        ]);
 
         match ($result->status) {
             NotificationDeliveryStatus::Sent => $this->logger->info('Notification destination delivery completed.', $context),

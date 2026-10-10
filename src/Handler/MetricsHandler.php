@@ -8,6 +8,8 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MultipartCompletionCapacityReader;
+use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 
@@ -22,7 +24,8 @@ final class MetricsHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         if ($this->bearerToken !== null && $this->bearerToken !== '') {
-            $authorization = $request->getHeader('authorization') ?? '';
+            $headers = $request->getHeaderArray('authorization');
+            $authorization = count($headers) === 1 ? $headers[0] : '';
             $provided = str_starts_with(strtolower($authorization), 'bearer ')
                 ? trim(substr($authorization, 7))
                 : '';
@@ -31,6 +34,7 @@ final class MetricsHandler implements RequestHandler
                     status: 401,
                     headers: [
                         'Content-Type' => 'text/plain; charset=utf-8',
+                        'Cache-Control' => 'no-store',
                         'WWW-Authenticate' => 'Bearer',
                     ],
                     body: 'Unauthorized',
@@ -41,31 +45,31 @@ final class MetricsHandler implements RequestHandler
         if ($this->metadata !== null) {
             if ($this->metadata instanceof ObservedMetadataStore) {
                 $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
+            } else {
+                $startedAt = hrtime(true);
+                try {
+                    $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
+                    $this->metrics->recordBackendOperation(
+                        backend: 'metadata',
+                        driver: $this->metadataDriver(),
+                        operation: 'getNotificationQueueStats',
+                        durationNs: hrtime(true) - $startedAt,
+                    );
+                } catch (\Throwable $e) {
+                    $this->metrics->recordBackendOperation(
+                        backend: 'metadata',
+                        driver: $this->metadataDriver(),
+                        operation: 'getNotificationQueueStats',
+                        durationNs: hrtime(true) - $startedAt,
+                        success: false,
+                        exception: $e::class,
+                    );
 
-                return $this->response();
+                    throw $e;
+                }
             }
-
-            $startedAt = hrtime(true);
-            try {
-                $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
-                $this->metrics->recordBackendOperation(
-                    backend: 'metadata',
-                    driver: $this->metadataDriver(),
-                    operation: 'getNotificationQueueStats',
-                    durationNs: hrtime(true) - $startedAt,
-                );
-            } catch (\Throwable $e) {
-                $this->metrics->recordBackendOperation(
-                    backend: 'metadata',
-                    driver: $this->metadataDriver(),
-                    operation: 'getNotificationQueueStats',
-                    durationNs: hrtime(true) - $startedAt,
-                    success: false,
-                    exception: $e::class,
-                );
-
-                throw $e;
-            }
+            $this->refreshMultipartCompletionCapacity();
+            $this->refreshWriteIntentCapacity();
         }
 
         return $this->response();
@@ -75,9 +79,80 @@ final class MetricsHandler implements RequestHandler
     {
         return new Response(
             status: 200,
-            headers: ['Content-Type' => 'text/plain; version=0.0.4; charset=utf-8'],
+            headers: [
+                'Content-Type' => 'text/plain; version=0.0.4; charset=utf-8',
+                'Cache-Control' => 'no-store',
+            ],
             body: $this->metrics->renderPrometheus(),
         );
+    }
+
+    private function refreshMultipartCompletionCapacity(): void
+    {
+        if (! $this->metadata instanceof MultipartCompletionCapacityReader) {
+            return;
+        }
+        if ($this->metadata instanceof ObservedMetadataStore) {
+            $count = $this->metadata->getMultipartCompletionIntentCount();
+        } else {
+            $startedAt = hrtime(true);
+            try {
+                $count = $this->metadata->getMultipartCompletionIntentCount();
+                $this->metrics->recordBackendOperation(
+                    backend: 'metadata',
+                    driver: $this->metadataDriver(),
+                    operation: 'getMultipartCompletionIntentCount',
+                    durationNs: hrtime(true) - $startedAt,
+                );
+            } catch (\Throwable $e) {
+                $this->metrics->recordBackendOperation(
+                    backend: 'metadata',
+                    driver: $this->metadataDriver(),
+                    operation: 'getMultipartCompletionIntentCount',
+                    durationNs: hrtime(true) - $startedAt,
+                    success: false,
+                    exception: $e::class,
+                );
+
+                throw $e;
+            }
+        }
+        $this->metrics->setMultipartCompletionIntentCount($count);
+    }
+
+    private function refreshWriteIntentCapacity(): void
+    {
+        if (! $this->metadata instanceof WriteIntentCapacityReader) {
+            $this->metrics->setWriteIntentCapacityCounts(null);
+
+            return;
+        }
+        if ($this->metadata instanceof ObservedMetadataStore) {
+            $counts = $this->metadata->getWriteIntentCapacityCounts();
+        } else {
+            $startedAt = hrtime(true);
+            try {
+                $counts = $this->metadata->getWriteIntentCapacityCounts();
+                $this->metrics->recordBackendOperation(
+                    backend: 'metadata',
+                    driver: $this->metadataDriver(),
+                    operation: 'getWriteIntentCapacityCounts',
+                    durationNs: hrtime(true) - $startedAt,
+                );
+            } catch (\Throwable $e) {
+                $this->metrics->recordBackendOperation(
+                    backend: 'metadata',
+                    driver: $this->metadataDriver(),
+                    operation: 'getWriteIntentCapacityCounts',
+                    durationNs: hrtime(true) - $startedAt,
+                    success: false,
+                    exception: $e::class,
+                );
+
+                throw $e;
+            }
+        }
+        $this->metrics->setWriteIntentCapacityCounts($counts);
     }
 
     private function metadataDriver(): string

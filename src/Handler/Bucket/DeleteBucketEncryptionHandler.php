@@ -26,7 +26,13 @@ final class DeleteBucketEncryptionHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $this->metadata->deleteBucketEncryption($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->deleteBucketEncryption($bucket),
+            $request,
+        );
 
         return new Response(status: 204);
     }

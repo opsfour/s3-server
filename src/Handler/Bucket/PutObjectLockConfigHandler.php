@@ -39,8 +39,10 @@ final class PutObjectLockConfigHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseObjectLockConfiguration($body);
 
-        $this->metadata->transaction(function () use ($bucketInfo, $bucket, $ownerId, $config): void {
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $bucket, $ownerId, $config): void {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             if ($this->metadata->getBucketVersioning($bucket) !== 'Enabled') {
                 throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                     'Object Lock requires bucket versioning to be enabled.',

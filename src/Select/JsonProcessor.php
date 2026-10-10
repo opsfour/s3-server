@@ -16,13 +16,14 @@ final class JsonProcessor
      * @param string $jsonType 'LINES' or 'DOCUMENT'.
      * @return list<array<string, mixed>>
      */
-    public static function parse(string $data, string $jsonType = 'LINES'): array
+    public static function parse(string $data, string $jsonType = 'LINES', ?SelectMemoryGuard $memoryGuard = null): array
     {
+        $memoryGuard ??= SelectMemoryGuard::start();
         if ($jsonType === 'LINES') {
-            return self::parseLines($data);
+            return self::parseLines($data, $memoryGuard);
         }
 
-        return self::parseDocument($data);
+        return self::parseDocument($data, $memoryGuard);
     }
 
     /**
@@ -30,11 +31,17 @@ final class JsonProcessor
      *
      * @param list<array<string, mixed>> $rows
      */
-    public static function format(array $rows): string
+    public static function format(array $rows, ?SelectMemoryGuard $memoryGuard = null): string
     {
+        $memoryGuard ??= SelectMemoryGuard::start();
         $output = '';
         foreach ($rows as $row) {
-            $output .= json_encode($row, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n";
+            $memoryGuard->check();
+            $record = json_encode((object) $row, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            SelectRecordSizeException::assertLength(strlen($record));
+            $memoryGuard->assertOutputSize(strlen($output), strlen($record) + 1);
+            $output .= $record . "\n";
+            $memoryGuard->check();
         }
         return $output;
     }
@@ -42,39 +49,54 @@ final class JsonProcessor
     /** Maximum number of parsed rows to prevent memory exhaustion. */
     private const int MAX_ROWS = 1_000_000;
 
+    /** Bound PHP array/object expansion before decoding a JSON document. */
+    private const int MAX_DOCUMENT_STRUCTURE_TOKENS = 50_000;
+
     /**
      * @return list<array<string, mixed>>
      */
-    private static function parseLines(string $data): array
+    private static function parseLines(string $data, SelectMemoryGuard $memoryGuard): array
     {
         $rows = [];
-        $data = trim($data);
         $dataLen = strlen($data);
         $pos = 0;
 
         // Iterate line-by-line using strpos() to avoid doubling memory with explode().
         while ($pos < $dataLen) {
+            $memoryGuard->check();
+            $lineStart = $pos;
             $end = strpos($data, "\n", $pos);
             if ($end === false) {
-                $line = trim(substr($data, $pos));
+                $lineEnd = $dataLen;
                 $pos = $dataLen;
             } else {
-                $line = trim(substr($data, $pos, $end - $pos));
+                $lineEnd = $end;
                 $pos = $end + 1;
             }
 
-            if ($line === '') {
+            while ($lineStart < $lineEnd && str_contains(" \t\n\r\0\x0B", $data[$lineStart])) {
+                ++$lineStart;
+            }
+            while ($lineEnd > $lineStart && str_contains(" \t\n\r\0\x0B", $data[$lineEnd - 1])) {
+                --$lineEnd;
+            }
+
+            $lineLength = $lineEnd - $lineStart;
+            if ($lineLength === 0) {
                 continue;
             }
+            SelectRecordSizeException::assertLength($lineLength);
             if (count($rows) >= self::MAX_ROWS) {
                 throw new \RuntimeException(
                     'S3 Select: JSON input exceeds maximum row count (' . self::MAX_ROWS . ').',
                 );
             }
-            $decoded = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-            if (is_array($decoded) && !array_is_list($decoded)) {
-                $rows[] = $decoded;
+            $decoded = json_decode(substr($data, $lineStart, $lineLength), false, 512, JSON_THROW_ON_ERROR);
+            if (! $decoded instanceof \stdClass) {
+                throw new \JsonException('S3 Select JSON lines must contain objects.');
             }
+            $rows[] = get_object_vars($decoded);
+            $memoryGuard->check();
         }
         return $rows;
     }
@@ -82,26 +104,80 @@ final class JsonProcessor
     /**
      * @return list<array<string, mixed>>
      */
-    private static function parseDocument(string $data): array
+    private static function parseDocument(string $data, SelectMemoryGuard $memoryGuard): array
     {
-        $decoded = json_decode(trim($data), true, 512, JSON_THROW_ON_ERROR);
+        $memoryGuard->assertJsonDocumentSize(strlen($data));
+        self::assertDocumentStructureBudget($data, $memoryGuard);
+        $decoded = json_decode($data, false, 512, JSON_THROW_ON_ERROR);
+        $memoryGuard->check();
 
-        if (!is_array($decoded)) {
-            return [];
+        if ($decoded instanceof \stdClass) {
+            self::assertDecodedRecordSize($decoded);
+            return [get_object_vars($decoded)];
         }
-
-        // If it's a list of objects, return as-is (with row count guard).
-        if (array_is_list($decoded)) {
-            if (count($decoded) > self::MAX_ROWS) {
-                throw new \RuntimeException(
-                    'S3 Select: JSON document exceeds maximum row count (' . self::MAX_ROWS . ').',
-                );
+        if (! is_array($decoded)) {
+            throw new \JsonException('S3 Select JSON document must contain an object or array of objects.');
+        }
+        if (count($decoded) > self::MAX_ROWS) {
+            throw new \RuntimeException(
+                'S3 Select: JSON document exceeds maximum row count (' . self::MAX_ROWS . ').',
+            );
+        }
+        $rows = [];
+        foreach ($decoded as $row) {
+            if (! $row instanceof \stdClass) {
+                throw new \JsonException('S3 Select JSON document array must contain only objects.');
             }
-            return array_values(array_filter($decoded, static fn(mixed $row): bool => is_array($row) && !array_is_list($row)));
+            self::assertDecodedRecordSize($row);
+            $rows[] = get_object_vars($row);
+            $memoryGuard->check();
         }
 
-        // Single object — wrap in a list.
-        return [$decoded];
+        return $rows;
+    }
+
+    private static function assertDocumentStructureBudget(string $data, SelectMemoryGuard $memoryGuard): void
+    {
+        $tokens = 0;
+        $insideString = false;
+        $escaped = false;
+        $length = strlen($data);
+
+        for ($i = 0; $i < $length; ++$i) {
+            $byte = $data[$i];
+            if ($insideString) {
+                if ($escaped) {
+                    $escaped = false;
+                } elseif ($byte === '\\') {
+                    $escaped = true;
+                } elseif ($byte === '"') {
+                    $insideString = false;
+                }
+
+                continue;
+            }
+            if ($byte === '"') {
+                $insideString = true;
+
+                continue;
+            }
+            if ($byte === '{' || $byte === '}' || $byte === '[' || $byte === ']'
+                || $byte === ',' || $byte === ':') {
+                if (++$tokens > self::MAX_DOCUMENT_STRUCTURE_TOKENS) {
+                    throw new SelectMemoryLimitException('S3 Select JSON document exceeds the structure budget.');
+                }
+            }
+        }
+
+        // Decoded PHP objects and hash-table entries can cost far more than
+        // their JSON syntax. Reserve a conservative allowance before json_decode.
+        $memoryGuard->check($tokens * 512 + $length * 2);
+    }
+
+    private static function assertDecodedRecordSize(\stdClass $row): void
+    {
+        $encoded = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        SelectRecordSizeException::assertLength(strlen($encoded));
     }
 
     /**
@@ -117,6 +193,8 @@ final class JsonProcessor
         foreach ($parts as $part) {
             if (is_array($current) && array_key_exists($part, $current)) {
                 $current = $current[$part];
+            } elseif ($current instanceof \stdClass && property_exists($current, $part)) {
+                $current = $current->{$part};
             } else {
                 return null;
             }

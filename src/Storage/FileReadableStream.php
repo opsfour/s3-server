@@ -27,9 +27,12 @@ final class FileReadableStream implements \IteratorAggregate, ReadableStream
         }
     }
 
-    public function read(?Cancellation $cancellation = null): ?string
+    public function read(?Cancellation $cancellation = null, ?int $limit = null): ?string
     {
-        $chunk = $this->file->read($cancellation, $this->chunkSize);
+        if ($limit !== null && $limit < 1) {
+            throw new \ValueError('File stream read limit must be positive.');
+        }
+        $chunk = $this->file->read($cancellation, $limit === null ? $this->chunkSize : min($this->chunkSize, $limit));
         if ($chunk === null) {
             $this->file->close();
         }

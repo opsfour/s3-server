@@ -12,11 +12,20 @@ use Monolog\Processor\PsrLogMessageProcessor;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Runtime\EfsStorageStartupPreflight;
+use OpsFour\S3Server\Runtime\BootstrapResourceCleanup;
+use OpsFour\S3Server\Runtime\EfsStartupIdentityFactory;
+use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
+use OpsFour\S3Server\Runtime\ProductionEfsIdentityFileReader;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
+use OpsFour\S3Server\Runtime\ServeFailureMessage;
+use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -29,50 +38,76 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'serve', description: 'Start the OpsFour S3-compatible server')]
 final class ServeCommand extends Command
 {
+    /** Internal only: there is no CLI or environment switch for EFS serving. */
+    public function __construct(
+        ?string $name = null,
+        private readonly ?EfsStorageStartupPreflight $efsStartupPreflight = null,
+        private readonly ?EfsStartupIdentityFactory $efsStartupIdentityFactory = null,
+    ) {
+        parent::__construct($name);
+    }
+
     protected function configure(): void
     {
         $this
             ->addOption('host', null, InputOption::VALUE_REQUIRED, 'Listen address', getenv('S3_HOST') ?: '0.0.0.0')
-            ->addOption('port', 'p', InputOption::VALUE_REQUIRED, 'Listen port', getenv('S3_PORT') ?: '9000')
+            ->addOption('port', 'p', InputOption::VALUE_REQUIRED, 'Listen port', self::envOption('S3_PORT', '9000'))
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Root directory for object storage', getenv('S3_STORAGE_PATH') ?: null)
+            ->addOption('efs-identity-file', null, InputOption::VALUE_REQUIRED, 'Production EFS candidate: local root-owned identity file; serving is not admitted')
+            ->addOption('efs-evidence-directory', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: local evidence directory')
+            ->addOption('efs-run-id', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: exact run ID')
+            ->addOption('efs-id', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: exact filesystem ID')
+            ->addOption('efs-node', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: API node identity')
+            ->addOption('efs-source-sha256', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: deployed source SHA-256')
+            ->addOption('efs-scratch-path', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: private node-local scratch')
             ->addOption('storage-driver', null, InputOption::VALUE_REQUIRED, 'Storage backend: filesystem|flysystem|memory', getenv('S3_STORAGE_DRIVER') ?: 'filesystem')
+            ->addOption('allow-unfenced-storage-for-tests', null, InputOption::VALUE_REQUIRED, 'UNSAFE TEST ONLY: allow storage without a verified late-write fence (true|false)', self::envOption('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'false'))
             ->addOption('storage-temp-dir', null, InputOption::VALUE_REQUIRED, 'Local staging directory for remote storage transfers', getenv('S3_STORAGE_TEMP_DIR') ?: sys_get_temp_dir())
+            ->addOption('storage-temp-budget', null, InputOption::VALUE_REQUIRED, 'Shared local Flysystem staging budget in bytes', getenv('S3_STORAGE_TEMP_BUDGET') === false ? '10737418240' : getenv('S3_STORAGE_TEMP_BUDGET'))
             ->addOption('flysystem-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for remote Flysystem operations', getenv('S3_FLYSYSTEM_WORKERS') ?: '0')
+            ->addOption('flysystem-first-byte-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to wait for the first remote read byte', self::envOption('S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS', '20'))
             ->addOption('backing-bucket', null, InputOption::VALUE_REQUIRED, 'Backing S3 bucket for standalone Flysystem mode', getenv('S3_BACKING_BUCKET') ?: null)
             ->addOption('backing-region', null, InputOption::VALUE_REQUIRED, 'Backing S3 region', getenv('S3_BACKING_REGION') ?: null)
             ->addOption('backing-access-key', null, InputOption::VALUE_REQUIRED, 'Backing S3 access key', getenv('S3_BACKING_ACCESS_KEY') ?: null)
             ->addOption('backing-secret-key', null, InputOption::VALUE_REQUIRED, 'Backing S3 secret key', getenv('S3_BACKING_SECRET_KEY') ?: null)
             ->addOption('backing-endpoint', null, InputOption::VALUE_REQUIRED, 'Backing S3-compatible endpoint', getenv('S3_BACKING_ENDPOINT') ?: null)
+            ->addOption('backing-allow-insecure-http-for-tests', null, InputOption::VALUE_REQUIRED, 'UNSAFE TEST ONLY: allow an HTTP backing S3 endpoint (true|false)', self::envOption('S3_BACKING_ALLOW_INSECURE_HTTP_FOR_TESTS', 'false'))
             ->addOption('backing-path-style', null, InputOption::VALUE_REQUIRED, 'Use path-style requests for backing S3 (true|false)', getenv('S3_BACKING_PATH_STYLE') === false ? 'false' : getenv('S3_BACKING_PATH_STYLE'))
             ->addOption('backing-prefix', null, InputOption::VALUE_REQUIRED, 'Optional key prefix in the backing S3 bucket', getenv('S3_BACKING_PREFIX') ?: '')
+            ->addOption('backing-connect-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 connection timeout in seconds', self::envOption('S3_BACKING_CONNECT_TIMEOUT_SECONDS', '5'))
+            ->addOption('backing-read-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 streamed-read idle timeout in seconds', self::envOption('S3_BACKING_READ_TIMEOUT_SECONDS', '15'))
+            ->addOption('backing-request-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 total request timeout in seconds (0 disables)', self::envOption('S3_BACKING_REQUEST_TIMEOUT_SECONDS', '0'))
             ->addOption('region', null, InputOption::VALUE_REQUIRED, 'AWS region identifier', getenv('S3_REGION') ?: 'us-east-1')
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
             ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
-            ->addOption('metadata-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Metadata read cache TTL in seconds (0 disables)', getenv('S3_METADATA_CACHE_TTL') ?: '5')
+            ->addOption('metadata-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Metadata read cache TTL in seconds (0 disables)', getenv('S3_METADATA_CACHE_TTL') === false ? '5' : getenv('S3_METADATA_CACHE_TTL'))
             ->addOption('tls-cert', null, InputOption::VALUE_REQUIRED, 'Path to TLS certificate file', getenv('S3_TLS_CERT') ?: null)
             ->addOption('tls-key', null, InputOption::VALUE_REQUIRED, 'Path to TLS private key file', getenv('S3_TLS_KEY') ?: null)
-            ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum concurrent connections', getenv('S3_MAX_CONNECTIONS') ?: '10000')
-            ->addOption('connection-idle-timeout', null, InputOption::VALUE_REQUIRED, 'Idle connection timeout in seconds', getenv('S3_CONNECTION_IDLE_TIMEOUT') ?: '60')
-            ->addOption('body-size-limit', null, InputOption::VALUE_REQUIRED, 'Maximum request body size in bytes', getenv('S3_BODY_SIZE_LIMIT') ?: '5368709120')
-            ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', getenv('S3_READ_TIMEOUT') ?: '300')
-            ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', getenv('S3_WRITE_TIMEOUT') ?: '300')
-            ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Seconds before warning that graceful shutdown is still draining', getenv('S3_SHUTDOWN_DRAIN_TIMEOUT') ?: '30')
-            ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', getenv('S3_REQUEST_BODY_SPOOL_WORKERS') ?: '8')
+            ->addOption('trusted-proxy-cidrs', null, InputOption::VALUE_REQUIRED, 'Comma-separated CIDRs of trusted proxy peers (default: none)', getenv('S3_TRUSTED_PROXY_CIDRS') === false ? '' : getenv('S3_TRUSTED_PROXY_CIDRS'))
+            ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum concurrent connections', self::envOption('S3_MAX_CONNECTIONS', '10000'))
+            ->addOption('connection-idle-timeout', null, InputOption::VALUE_REQUIRED, 'HTTP/2 idle connection timeout in seconds; HTTP/1 uses the stream timeout', self::envOption('S3_CONNECTION_IDLE_TIMEOUT', '60'))
+            ->addOption('body-size-limit', null, InputOption::VALUE_REQUIRED, 'Maximum request body size in bytes', self::envOption('S3_BODY_SIZE_LIMIT', '5368709120'))
+            ->addOption('post-spool-budget', null, InputOption::VALUE_REQUIRED, 'Concurrent browser POST temporary bytes shared by processes using one local temp directory', getenv('S3_POST_SPOOL_BUDGET') === false ? '10737418240' : getenv('S3_POST_SPOOL_BUDGET'))
+            ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', self::envOption('S3_READ_TIMEOUT', '300'))
+            ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', self::envOption('S3_WRITE_TIMEOUT', '300'))
+            ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Seconds before warning that graceful shutdown is still draining', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
+            ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', self::envOption('S3_REQUEST_BODY_SPOOL_WORKERS', '8'))
             ->addOption('sqlite-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for SQLite metadata operations', getenv('S3_SQLITE_WORKERS') ?: '0')
             ->addOption('encryption-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for encryption', getenv('S3_ENCRYPTION_WORKERS') ?: '0')
             ->addOption('select-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for S3 Select', getenv('S3_SELECT_WORKERS') === false ? null : getenv('S3_SELECT_WORKERS'))
-            ->addOption('encryption-threshold', null, InputOption::VALUE_REQUIRED, 'Encryption worker offload threshold in bytes', getenv('S3_ENCRYPTION_THRESHOLD') ?: '65536')
+            ->addOption('encryption-threshold', null, InputOption::VALUE_REQUIRED, 'Encryption worker offload threshold in bytes', self::envOption('S3_ENCRYPTION_THRESHOLD', '65536'))
             ->addOption('enforce-min-part-size', null, InputOption::VALUE_REQUIRED, 'Enforce the S3 5 MiB minimum for non-final multipart parts (true|false)', getenv('S3_ENFORCE_MIN_PART_SIZE') === false ? 'true' : getenv('S3_ENFORCE_MIN_PART_SIZE'))
             ->addOption('notification-require-https', null, InputOption::VALUE_REQUIRED, 'Require HTTPS webhook destinations (true|false)', getenv('S3_NOTIFICATION_REQUIRE_HTTPS') === false ? 'true' : getenv('S3_NOTIFICATION_REQUIRE_HTTPS'))
+            ->addOption('notification-worker', null, InputOption::VALUE_REQUIRED, 'Process queued webhook deliveries on this server (true|false)', getenv('S3_NOTIFICATION_WORKER') === false ? 'true' : getenv('S3_NOTIFICATION_WORKER'))
             ->addOption('base-domain', null, InputOption::VALUE_REQUIRED, 'Base domain for virtual-hosted-style requests', getenv('S3_BASE_DOMAIN') ?: null)
             ->addOption('strict-bucket-naming', null, InputOption::VALUE_REQUIRED, 'Reject AWS-reserved bucket name prefixes and suffixes (true|false)', getenv('S3_STRICT_BUCKET_NAMING') === false ? 'true' : getenv('S3_STRICT_BUCKET_NAMING'))
             ->addOption('website-host-pattern', null, InputOption::VALUE_REQUIRED, 'Dedicated website endpoint host pattern', getenv('S3_WEBSITE_HOST_PATTERN') ?: null)
-            ->addOption('rate-limit', null, InputOption::VALUE_REQUIRED, 'Requests per second per client (0 = unlimited)', getenv('S3_RATE_LIMIT') ?: '1000')
+            ->addOption('rate-limit', null, InputOption::VALUE_REQUIRED, 'Requests per second per client (0 = unlimited)', getenv('S3_RATE_LIMIT') === false ? '1000' : getenv('S3_RATE_LIMIT'))
             ->addOption('master-key-provider', null, InputOption::VALUE_REQUIRED, 'Master key provider: config|redis|vault', getenv('S3_MASTER_KEY_PROVIDER') ?: 'config')
-            ->addOption('max-encrypted-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum encrypted object size in bytes', getenv('S3_MAX_ENCRYPTED_OBJECT_SIZE') ?: '268435456')
-            ->addOption('max-select-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum S3 Select object size in bytes', getenv('S3_MAX_SELECT_OBJECT_SIZE') ?: '268435456')
-            ->addOption('metrics-bearer-token', null, InputOption::VALUE_REQUIRED, 'Bearer token required by the metrics endpoint', getenv('S3_METRICS_BEARER_TOKEN') ?: null)
+            ->addOption('max-encrypted-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum encrypted object size in bytes', self::envOption('S3_MAX_ENCRYPTED_OBJECT_SIZE', '268435456'))
+            ->addOption('max-select-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum S3 Select object size in bytes', self::envOption('S3_MAX_SELECT_OBJECT_SIZE', '268435456'))
+            ->addOption('metrics-bearer-token', null, InputOption::VALUE_REQUIRED, 'Bearer token required by the metrics endpoint', getenv('S3_METRICS_BEARER_TOKEN') === false ? null : getenv('S3_METRICS_BEARER_TOKEN'))
             ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: memory|database|file', getenv('S3_CREDENTIALS_DRIVER') ?: 'memory')
             ->addOption('access-key', null, InputOption::VALUE_REQUIRED, 'Access key ID (memory driver)', getenv('S3_ACCESS_KEY') ?: null)
             ->addOption('secret-key', null, InputOption::VALUE_REQUIRED, 'Secret access key (memory driver)', getenv('S3_SECRET_KEY') ?: null)
@@ -81,7 +116,7 @@ final class ServeCommand extends Command
             ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for credentials database (database driver)', getenv('S3_CREDENTIALS_DSN') ?: null)
             ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Username for credentials database', getenv('S3_CREDENTIALS_USERNAME') ?: null)
             ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Password for credentials database', getenv('S3_CREDENTIALS_PASSWORD') === false ? null : getenv('S3_CREDENTIALS_PASSWORD'))
-            ->addOption('credentials-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Positive credential cache TTL in seconds (0 = disabled)', getenv('S3_CREDENTIALS_CACHE_TTL') ?: '1')
+            ->addOption('credentials-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Positive credential cache TTL in seconds (0 = disabled)', getenv('S3_CREDENTIALS_CACHE_TTL') === false ? '1' : getenv('S3_CREDENTIALS_CACHE_TTL'))
             ->addOption('credentials-file', null, InputOption::VALUE_REQUIRED, 'Path to credentials JSON file (file driver)', getenv('S3_CREDENTIALS_PATH') ?: null)
             ->addOption('quota-max-buckets-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum buckets per owner (0 = unlimited)', getenv('S3_QUOTA_MAX_BUCKETS_PER_OWNER') ?: '0')
             ->addOption('quota-max-objects-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum objects per bucket (0 = unlimited)', getenv('S3_QUOTA_MAX_OBJECTS_PER_BUCKET') ?: '0')
@@ -91,11 +126,18 @@ final class ServeCommand extends Command
             ->addOption('quota-max-multipart-uploads-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum active multipart uploads per owner (0 = unlimited)', getenv('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER') ?: '0')
             ->addOption('quota-max-multipart-bytes-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum multipart staging bytes per bucket (0 = unlimited)', getenv('S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET') ?: '0')
             ->addOption('quota-max-multipart-bytes-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum multipart staging bytes per owner (0 = unlimited)', getenv('S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER') ?: '0')
-            ->addOption('lifecycle-interval-seconds', null, InputOption::VALUE_REQUIRED, 'Seconds between lifecycle sweeps', getenv('S3_LIFECYCLE_INTERVAL_SECONDS') ?: '60')
-            ->addOption('lifecycle-batch-size', null, InputOption::VALUE_REQUIRED, 'Maximum rows fetched per lifecycle query', getenv('S3_LIFECYCLE_BATCH_SIZE') ?: '1000')
-            ->addOption('lifecycle-max-actions-per-run', null, InputOption::VALUE_REQUIRED, 'Maximum lifecycle actions per sweep', getenv('S3_LIFECYCLE_MAX_ACTIONS_PER_RUN') ?: '1000')
-            ->addOption('lifecycle-lock-ttl-seconds', null, InputOption::VALUE_REQUIRED, 'Seconds before a lifecycle lock is considered stale', getenv('S3_LIFECYCLE_LOCK_TTL_SECONDS') ?: '300')
-            ->addOption('multipart-max-age-seconds', null, InputOption::VALUE_REQUIRED, 'Global maximum age for incomplete multipart uploads (0 disables cleanup)', getenv('S3_MULTIPART_MAX_AGE_SECONDS') ?: '604800');
+            ->addOption('lifecycle-interval-seconds', null, InputOption::VALUE_REQUIRED, 'Seconds between lifecycle sweeps', self::envOption('S3_LIFECYCLE_INTERVAL_SECONDS', '60'))
+            ->addOption('lifecycle-batch-size', null, InputOption::VALUE_REQUIRED, 'Maximum rows fetched per lifecycle query', self::envOption('S3_LIFECYCLE_BATCH_SIZE', '1000'))
+            ->addOption('lifecycle-max-actions-per-run', null, InputOption::VALUE_REQUIRED, 'Maximum lifecycle actions per sweep', self::envOption('S3_LIFECYCLE_MAX_ACTIONS_PER_RUN', '1000'))
+            ->addOption('lifecycle-lock-ttl-seconds', null, InputOption::VALUE_REQUIRED, 'Seconds before a lifecycle lock is considered stale', self::envOption('S3_LIFECYCLE_LOCK_TTL_SECONDS', '300'))
+            ->addOption('multipart-max-age-seconds', null, InputOption::VALUE_REQUIRED, 'Global maximum age for incomplete multipart uploads (0 disables cleanup)', getenv('S3_MULTIPART_MAX_AGE_SECONDS') === false ? '604800' : getenv('S3_MULTIPART_MAX_AGE_SECONDS'));
+    }
+
+    private static function envOption(string $name, string $default): string
+    {
+        $value = getenv($name);
+
+        return $value === false ? $default : $value;
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -109,15 +151,105 @@ final class ServeCommand extends Command
             return Command::FAILURE;
         }
 
-        $host = (string) $input->getOption('host');
-        $port = (int) $input->getOption('port');
         $region = (string) $input->getOption('region');
         $metadataDriver = (string) $input->getOption('metadata-driver');
         $metadataDsn = (string) $input->getOption('metadata-dsn');
         $metrics = new MetricsCollector();
 
-        // Only the local filesystem backend owns and creates storagePath.
-        if ($storageDriver === 'filesystem' && $storagePath !== null && $storagePath !== '') {
+        // Any explicit EFS identity option selects the internal candidate
+        // path. Validate all inputs before looking at the NFS root, opening a
+        // metadata connection or binding a socket. This path deliberately
+        // stops after identity qualification until runtime admission exists.
+        $efsNames = [
+            'efs-evidence-directory', 'efs-run-id', 'efs-id',
+            'efs-node', 'efs-source-sha256', 'efs-scratch-path',
+        ];
+        $efsValues = [];
+        $efsRequested = false;
+        foreach ($efsNames as $name) {
+            $value = $input->getOption($name);
+            $efsValues[$name] = $value;
+            $efsRequested = $efsRequested || $value !== null;
+        }
+        $productionIdentityPath = $input->getOption('efs-identity-file');
+        if ($productionIdentityPath !== null) {
+            try {
+                if ($efsRequested || $this->efsStartupPreflight !== null || $this->efsStartupIdentityFactory !== null
+                    || $storageDriver !== 'filesystem'
+                    || ! is_string($storagePath) || $storagePath === ''
+                    || ! is_string($productionIdentityPath) || $productionIdentityPath === ''
+                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
+                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
+                    || trim($metadataDsn) === ''
+                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
+                    throw new \RuntimeException('Invalid production EFS startup profile.');
+                }
+                $identity = (new ProductionEfsIdentityFileReader($productionIdentityPath))->read();
+                if ($identity->storageRoot !== $storagePath || $identity->metadataDriver !== $metadataDriver) {
+                    throw new \RuntimeException('Production EFS identity differs from the CLI profile.');
+                }
+
+                // Schema v2 alone cannot prove a live watcher, host mount or
+                // full runtime graph. Do not touch the EFS root or serve.
+                throw new \RuntimeException('Production EFS serving is not yet admitted.');
+            } catch (\Throwable) {
+                $output->writeln('<error>Error: EFS production identity or runtime admission failed.</error>');
+
+                return Command::FAILURE;
+            }
+        }
+        if ($efsRequested) {
+            try {
+                if ($this->efsStartupPreflight !== null || $storageDriver !== 'filesystem'
+                    || ! is_string($storagePath) || $storagePath === ''
+                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
+                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
+                    || trim($metadataDsn) === ''
+                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
+                    throw new \RuntimeException('Invalid internal EFS startup profile.');
+                }
+                foreach ($efsValues as $value) {
+                    if (! is_string($value) || $value === '' || trim($value) !== $value) {
+                        throw new \RuntimeException('Incomplete internal EFS startup identity.');
+                    }
+                }
+                $identity = ($this->efsStartupIdentityFactory ?? new EfsStartupIdentityFactory())->qualify(
+                    (string) $efsValues['efs-evidence-directory'],
+                    $storagePath,
+                    (string) $efsValues['efs-run-id'],
+                    (string) $efsValues['efs-id'],
+                    (string) $efsValues['efs-node'],
+                    $metadataDriver,
+                    (string) $efsValues['efs-source-sha256'],
+                    (string) $efsValues['efs-scratch-path'],
+                );
+                $identity->scratch->assertBoundTo($identity->context);
+                throw new \RuntimeException('Qualified EFS candidate serving is not yet admitted.');
+            } catch (\Throwable) {
+                $output->writeln('<error>Error: EFS startup identity or runtime admission failed.</error>');
+
+                return Command::FAILURE;
+            }
+        }
+
+        // The internal EFS candidate must reject before any storage-root path
+        // operation or backend construction. Ordinary local serving is unchanged.
+        if ($this->efsStartupPreflight !== null) {
+            try {
+                if ($storageDriver !== 'filesystem'
+                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
+                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
+                    || trim($metadataDsn) === ''
+                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
+                    throw new \RuntimeException('Invalid internal EFS startup profile.');
+                }
+                $storagePath = $this->efsStartupPreflight->assertExistingRoot((string) $storagePath);
+            } catch (\Throwable) {
+                $output->writeln('<error>Error: EFS startup preflight failed.</error>');
+
+                return Command::FAILURE;
+            }
+        } elseif ($storageDriver === 'filesystem' && $storagePath !== null && $storagePath !== '') {
             $storagePath = realpath($storagePath) ?: $storagePath;
             if (! is_dir($storagePath)) {
                 if (! @mkdir($storagePath, 0o755, true) && ! is_dir($storagePath)) {
@@ -135,12 +267,16 @@ final class ServeCommand extends Command
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
+        $logger = new FailureIsolatingLogger($logger);
 
+        $storageTierRegistry = null;
+        $metadata = null;
         try {
             $config = $this->configFromInput(
                 $input,
                 $storageDriver === 'filesystem' ? $storagePath : null,
             );
+            PostgresApiDriverGuard::assertAvailable($config);
             $storageTierRegistry = $this->buildStorageTierRegistry($input, $storageDriver, $storagePath, $metrics);
             $storage = $storageTierRegistry->defaultBackend();
             $metadata = $this->buildMetadataStore(
@@ -152,6 +288,8 @@ final class ServeCommand extends Command
             );
             $credentialProvider = $this->buildCredentialProvider($input, $output);
             if ($credentialProvider === null) {
+                BootstrapResourceCleanup::release($metadata, $storageTierRegistry);
+
                 return Command::FAILURE;
             }
 
@@ -166,19 +304,22 @@ final class ServeCommand extends Command
                 externalIamConfig: $this->externalIamConfigFromEnv(),
                 adminToken: $this->adminApiTokenFromEnv(),
             );
+            $storageTierRegistry = null;
+            $metadata = null;
         } catch (\Throwable $e) {
-            $output->writeln("<error>Error: {$e->getMessage()}</error>");
+            BootstrapResourceCleanup::release($metadata, $storageTierRegistry);
+            $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'bootstrap') . '</error>');
 
             return Command::FAILURE;
         }
 
-        $logger->info('OpsFour S3 Server starting', [
-            'storage' => "{$storageDriver}" . ($storagePath ? ":{$storagePath}" : ''),
-            'region' => $region,
-            'metadata' => $metadataDriver,
-        ]);
-
+        $failed = false;
         try {
+            $logger->info('OpsFour S3 Server starting', [
+                'storage' => "{$storageDriver}" . ($storagePath ? ":{$storagePath}" : ''),
+                'region' => $region,
+                'metadata' => $metadataDriver,
+            ]);
             $runtime->server->start();
 
             // Wait for termination signal.
@@ -187,12 +328,19 @@ final class ServeCommand extends Command
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);
         } catch (\Throwable $e) {
-            $logger->error('S3 server runtime failed: {error}', ['error' => $e->getMessage()]);
-            $output->writeln("<error>Error: {$e->getMessage()}</error>");
-
-            return Command::FAILURE;
+            $logger->error('S3 server runtime failed.', ['exception' => $e::class]);
+            $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'runtime') . '</error>');
+            $failed = true;
         } finally {
-            $runtime->stop();
+            $shutdownError = ServeRuntimeShutdown::stop($runtime, $logger);
+            if ($shutdownError !== null) {
+                $output->writeln('<error>Error: ' . $shutdownError . '</error>');
+                $failed = true;
+            }
+        }
+
+        if ($failed) {
+            return Command::FAILURE;
         }
 
         $logger->info('Server stopped gracefully.');
@@ -204,52 +352,86 @@ final class ServeCommand extends Command
     {
         return new S3ServerConfig(
             host: (string) $input->getOption('host'),
-            port: (int) $input->getOption('port'),
+            port: $this->integerOption($input, 'port'),
             region: (string) $input->getOption('region'),
             storagePath: $storagePath ?? (string) $input->getOption('storage-temp-dir'),
+            allowUnfencedStorageForTests: $this->booleanOption($input, 'allow-unfenced-storage-for-tests'),
             metadataDriver: (string) $input->getOption('metadata-driver'),
             metadataDsn: (string) $input->getOption('metadata-dsn'),
             tlsCertPath: $this->nullableString($input->getOption('tls-cert')),
             tlsKeyPath: $this->nullableString($input->getOption('tls-key')),
-            maxConcurrentConnections: (int) $input->getOption('max-connections'),
-            connectionIdleTimeout: (int) $input->getOption('connection-idle-timeout'),
-            requestBodySizeLimit: (int) $input->getOption('body-size-limit'),
-            readTimeout: (int) $input->getOption('read-timeout'),
-            writeTimeout: (int) $input->getOption('write-timeout'),
-            perClientRateLimit: (int) $input->getOption('rate-limit'),
+            trustedProxyCidrs: TrustedProxyMiddleware::parseCidrs((string) $input->getOption('trusted-proxy-cidrs')),
+            maxConcurrentConnections: $this->integerOption($input, 'max-connections'),
+            connectionIdleTimeout: $this->integerOption($input, 'connection-idle-timeout'),
+            requestBodySizeLimit: $this->integerOption($input, 'body-size-limit'),
+            postSpoolBudgetBytes: $this->integerOption($input, 'post-spool-budget'),
+            readTimeout: $this->integerOption($input, 'read-timeout'),
+            writeTimeout: $this->integerOption($input, 'write-timeout'),
+            perClientRateLimit: $this->integerOption($input, 'rate-limit'),
             baseDomain: $this->nullableString($input->getOption('base-domain')),
             strictBucketNaming: $this->booleanOption($input, 'strict-bucket-naming'),
             websiteHostPattern: $this->nullableString($input->getOption('website-host-pattern')),
             masterKeyProvider: (string) $input->getOption('master-key-provider'),
             enforceMinPartSize: $this->booleanOption($input, 'enforce-min-part-size'),
-            maxEncryptedObjectSize: (int) $input->getOption('max-encrypted-object-size'),
-            maxSelectObjectSize: (int) $input->getOption('max-select-object-size'),
-            shutdownDrainTimeout: (int) $input->getOption('shutdown-drain-timeout'),
+            maxEncryptedObjectSize: $this->integerOption($input, 'max-encrypted-object-size'),
+            maxSelectObjectSize: $this->integerOption($input, 'max-select-object-size'),
+            shutdownDrainTimeout: $this->integerOption($input, 'shutdown-drain-timeout'),
             notificationRequireHttps: $this->booleanOption($input, 'notification-require-https'),
-            sqliteWorkerPoolSize: (int) $input->getOption('sqlite-workers'),
-            encryptionWorkerPoolSize: (int) $input->getOption('encryption-workers'),
+            notificationWorkerEnabled: $this->booleanOption($input, 'notification-worker'),
+            sqliteWorkerPoolSize: $this->integerOption($input, 'sqlite-workers'),
+            encryptionWorkerPoolSize: $this->integerOption($input, 'encryption-workers'),
             selectWorkerPoolSize: $input->getOption('select-workers') === null
                 ? null
-                : (int) $input->getOption('select-workers'),
-            requestBodySpoolWorkerPoolSize: (int) $input->getOption('request-body-spool-workers'),
-            encryptionParallelThreshold: (int) $input->getOption('encryption-threshold'),
+                : $this->integerOption($input, 'select-workers'),
+            requestBodySpoolWorkerPoolSize: $this->integerOption($input, 'request-body-spool-workers'),
+            encryptionParallelThreshold: $this->integerOption($input, 'encryption-threshold'),
             quota: new QuotaConfig(
-                maxBucketsPerOwner: (int) $input->getOption('quota-max-buckets-per-owner'),
-                maxObjectsPerBucket: (int) $input->getOption('quota-max-objects-per-bucket'),
-                maxBytesPerBucket: (int) $input->getOption('quota-max-bytes-per-bucket'),
-                maxBytesPerOwner: (int) $input->getOption('quota-max-bytes-per-owner'),
-                maxMultipartUploadsPerBucket: (int) $input->getOption('quota-max-multipart-uploads-per-bucket'),
-                maxMultipartUploadsPerOwner: (int) $input->getOption('quota-max-multipart-uploads-per-owner'),
-                maxMultipartBytesPerBucket: (int) $input->getOption('quota-max-multipart-bytes-per-bucket'),
-                maxMultipartBytesPerOwner: (int) $input->getOption('quota-max-multipart-bytes-per-owner'),
+                maxBucketsPerOwner: $this->integerOption($input, 'quota-max-buckets-per-owner'),
+                maxObjectsPerBucket: $this->integerOption($input, 'quota-max-objects-per-bucket'),
+                maxBytesPerBucket: $this->integerOption($input, 'quota-max-bytes-per-bucket'),
+                maxBytesPerOwner: $this->integerOption($input, 'quota-max-bytes-per-owner'),
+                maxMultipartUploadsPerBucket: $this->integerOption($input, 'quota-max-multipart-uploads-per-bucket'),
+                maxMultipartUploadsPerOwner: $this->integerOption($input, 'quota-max-multipart-uploads-per-owner'),
+                maxMultipartBytesPerBucket: $this->integerOption($input, 'quota-max-multipart-bytes-per-bucket'),
+                maxMultipartBytesPerOwner: $this->integerOption($input, 'quota-max-multipart-bytes-per-owner'),
             ),
-            lifecycleIntervalSeconds: (float) $input->getOption('lifecycle-interval-seconds'),
-            lifecycleBatchSize: (int) $input->getOption('lifecycle-batch-size'),
-            lifecycleMaxActionsPerRun: (int) $input->getOption('lifecycle-max-actions-per-run'),
-            lifecycleLockTtlSeconds: (int) $input->getOption('lifecycle-lock-ttl-seconds'),
-            multipartMaxAgeSeconds: (int) $input->getOption('multipart-max-age-seconds'),
-            metricsBearerToken: $this->nullableString($input->getOption('metrics-bearer-token')),
+            lifecycleIntervalSeconds: $this->floatOption($input, 'lifecycle-interval-seconds'),
+            lifecycleBatchSize: $this->integerOption($input, 'lifecycle-batch-size'),
+            lifecycleMaxActionsPerRun: $this->integerOption($input, 'lifecycle-max-actions-per-run'),
+            lifecycleLockTtlSeconds: $this->integerOption($input, 'lifecycle-lock-ttl-seconds'),
+            multipartMaxAgeSeconds: $this->integerOption($input, 'multipart-max-age-seconds'),
+            metricsBearerToken: $this->optionalTokenOption($input, 'metrics-bearer-token'),
         );
+    }
+
+    private function integerOption(InputInterface $input, string $name): int
+    {
+        $raw = $input->getOption($name);
+        if (! is_string($raw) && ! is_int($raw)) {
+            throw new \InvalidArgumentException("--{$name} must be a decimal integer.");
+        }
+
+        $value = filter_var($raw, FILTER_VALIDATE_INT);
+        if ($value === false) {
+            throw new \InvalidArgumentException("--{$name} must be a decimal integer within the supported range.");
+        }
+
+        return $value;
+    }
+
+    private function floatOption(InputInterface $input, string $name): float
+    {
+        $raw = $input->getOption($name);
+        if ((! is_string($raw) && ! is_int($raw) && ! is_float($raw)) || ! is_numeric($raw)) {
+            throw new \InvalidArgumentException("--{$name} must be a finite number.");
+        }
+
+        $value = (float) $raw;
+        if (! is_finite($value)) {
+            throw new \InvalidArgumentException("--{$name} must be a finite number.");
+        }
+
+        return $value;
     }
 
     private function buildStorageTierRegistry(
@@ -267,7 +449,7 @@ final class ServeCommand extends Command
             $tempDir = (string) $input->getOption('storage-temp-dir');
             $this->ensureDirectory($tempDir, 'storage staging');
 
-            $workers = (int) $input->getOption('flysystem-workers');
+            $workers = $this->integerOption($input, 'flysystem-workers');
             if ($workers < 1) {
                 throw new \InvalidArgumentException(
                     'Standalone Flysystem storage requires --flysystem-workers >= 1.',
@@ -283,9 +465,15 @@ final class ServeCommand extends Command
                     endpoint: $this->nullableString($input->getOption('backing-endpoint')),
                     pathStyle: $this->booleanOption($input, 'backing-path-style'),
                     prefix: (string) $input->getOption('backing-prefix'),
+                    connectTimeoutSeconds: $this->integerOption($input, 'backing-connect-timeout'),
+                    readTimeoutSeconds: $this->integerOption($input, 'backing-read-timeout'),
+                    requestTimeoutSeconds: $this->integerOption($input, 'backing-request-timeout'),
+                    allowInsecureHttpForTests: $this->booleanOption($input, 'backing-allow-insecure-http-for-tests'),
                 ),
                 'worker_pool_size' => $workers,
+                'read_first_byte_timeout_seconds' => $this->integerOption($input, 'flysystem-first-byte-timeout'),
                 'temp_dir' => $tempDir,
+                'temp_budget_bytes' => $this->integerOption($input, 'storage-temp-budget'),
             ];
         }
 
@@ -301,7 +489,7 @@ final class ServeCommand extends Command
     ): \OpsFour\S3Server\Metadata\MetadataStore {
         $metadataConfig = [
             'dsn' => $metadataDsn,
-            'worker_pool_size' => (int) $input->getOption('sqlite-workers'),
+            'worker_pool_size' => $this->integerOption($input, 'sqlite-workers'),
         ];
         if ($metadataDriver === 'sqlite') {
             $path = $this->nullableString($input->getOption('metadata-path'))
@@ -310,8 +498,8 @@ final class ServeCommand extends Command
             $metadataConfig['path'] = $path;
         }
 
-        $metadata = MetadataStoreFactory::create($metadataDriver, $metadataConfig, metrics: $metrics);
-        $cacheTtl = (float) $input->getOption('metadata-cache-ttl');
+        $metadata = MetadataStoreFactory::create($metadataDriver, $metadataConfig, metrics: $metrics, migrate: $metadataDriver === 'sqlite');
+        $cacheTtl = $this->floatOption($input, 'metadata-cache-ttl');
         if ($cacheTtl < 0) {
             throw new \InvalidArgumentException('--metadata-cache-ttl must be >= 0.');
         }
@@ -345,6 +533,19 @@ final class ServeCommand extends Command
     private function nullableString(mixed $value): ?string
     {
         return is_string($value) && trim($value) !== '' ? trim($value) : null;
+    }
+
+    private function optionalTokenOption(InputInterface $input, string $name): ?string
+    {
+        $value = $input->getOption($name);
+        if ($value === null) {
+            return null;
+        }
+        if (! is_string($value)) {
+            throw new \InvalidArgumentException("--{$name} must be a string.");
+        }
+
+        return $value;
     }
 
     private function ensureDirectory(string $path, string $purpose): void
@@ -386,7 +587,7 @@ final class ServeCommand extends Command
         try {
             return CredentialProviderFactory::create($driver, $config);
         } catch (\InvalidArgumentException $e) {
-            $output->writeln("<error>Error: {$e->getMessage()}</error>");
+            $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'bootstrap') . '</error>');
 
             return null;
         }
@@ -398,21 +599,28 @@ final class ServeCommand extends Command
     private function externalIamConfigFromEnv(): array
     {
         return [
-            'enabled' => getenv('S3_EXTERNAL_IAM_ENABLED') ?: false,
-            'admin_token' => getenv('S3_EXTERNAL_IAM_ADMIN_TOKEN') ?: null,
-            'issuer' => getenv('S3_EXTERNAL_IAM_ISSUER') ?: null,
-            'audience' => getenv('S3_EXTERNAL_IAM_AUDIENCE') ?: null,
-            'jwks_path' => getenv('S3_EXTERNAL_IAM_JWKS_PATH') ?: null,
-            'public_key_path' => getenv('S3_EXTERNAL_IAM_PUBLIC_KEY_PATH') ?: null,
-            'public_key' => getenv('S3_EXTERNAL_IAM_PUBLIC_KEY') ?: null,
-            'owner_claim' => getenv('S3_EXTERNAL_IAM_OWNER_CLAIM') ?: 'sub',
-            'display_name_claim' => getenv('S3_EXTERNAL_IAM_DISPLAY_NAME_CLAIM') ?: 'preferred_username',
-            'groups_claim' => getenv('S3_EXTERNAL_IAM_GROUPS_CLAIM') ?: 'groups',
-            'policy_names_claim' => getenv('S3_EXTERNAL_IAM_POLICY_NAMES_CLAIM') ?: null,
-            'allowed_prefixes_claim' => getenv('S3_EXTERNAL_IAM_ALLOWED_PREFIXES_CLAIM') ?: null,
-            'owner_prefix' => getenv('S3_EXTERNAL_IAM_OWNER_PREFIX') ?: '',
-            'clock_skew_seconds' => getenv('S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS') ?: 60,
+            'enabled' => self::environmentValue('S3_EXTERNAL_IAM_ENABLED', false),
+            'admin_token' => self::environmentValue('S3_EXTERNAL_IAM_ADMIN_TOKEN'),
+            'issuer' => self::environmentValue('S3_EXTERNAL_IAM_ISSUER'),
+            'audience' => self::environmentValue('S3_EXTERNAL_IAM_AUDIENCE'),
+            'jwks_path' => self::environmentValue('S3_EXTERNAL_IAM_JWKS_PATH'),
+            'public_key_path' => self::environmentValue('S3_EXTERNAL_IAM_PUBLIC_KEY_PATH'),
+            'public_key' => self::environmentValue('S3_EXTERNAL_IAM_PUBLIC_KEY'),
+            'owner_claim' => self::environmentValue('S3_EXTERNAL_IAM_OWNER_CLAIM', 'sub'),
+            'display_name_claim' => self::environmentValue('S3_EXTERNAL_IAM_DISPLAY_NAME_CLAIM', 'preferred_username'),
+            'groups_claim' => self::environmentValue('S3_EXTERNAL_IAM_GROUPS_CLAIM', 'groups'),
+            'policy_names_claim' => self::environmentValue('S3_EXTERNAL_IAM_POLICY_NAMES_CLAIM'),
+            'allowed_prefixes_claim' => self::environmentValue('S3_EXTERNAL_IAM_ALLOWED_PREFIXES_CLAIM'),
+            'owner_prefix' => self::environmentValue('S3_EXTERNAL_IAM_OWNER_PREFIX', ''),
+            'clock_skew_seconds' => self::environmentValue('S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS', 60),
         ];
+    }
+
+    private static function environmentValue(string $name, string|bool|int|null $default = null): string|bool|int|null
+    {
+        $value = getenv($name);
+
+        return $value === false ? $default : $value;
     }
 
     private function adminApiTokenFromEnv(): ?string

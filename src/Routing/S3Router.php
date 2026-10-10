@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Http\Server\Router;
+use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
  * S3-specific request handler implementing the second tier of two-tier routing.
@@ -54,13 +55,11 @@ final class S3Router implements RequestHandler
         // 2. Determine bucket and key.
         //    Virtual-hosted style takes precedence if baseDomain is set and Host header
         //    matches. Otherwise, fall back to path-style (from Amp Router args).
-        $bucket = $this->extractBucket($request, $routeArgs);
-        $key = $routeArgs['key'] ?? null;
-
-        // Decode URI-encoded key (S3 keys may contain special characters).
-        if ($key !== null && $key !== '') {
-            $key = \rawurldecode($key);
-        }
+        $virtualBucket = BucketNameExtractor::extractVirtualHosted($request, $this->baseDomain);
+        $bucket = $virtualBucket ?? $this->extractBucket($request, $routeArgs);
+        $key = $virtualBucket !== null
+            ? rawurldecode(ltrim($request->getUri()->getPath(), '/'))
+            : ($routeArgs['key'] ?? null);
 
         // 3. Determine scope.
         $scope = self::determineScope($bucket, $key);
@@ -142,36 +141,7 @@ final class S3Router implements RequestHandler
      */
     private static function extractQueryParams(Request $request): array
     {
-        $rawQuery = $request->getUri()->getQuery();
-
-        if ($rawQuery === '') {
-            return [];
-        }
-
-        $result = [];
-        $pairs = \explode('&', $rawQuery);
-
-        foreach ($pairs as $pair) {
-            if ($pair === '') {
-                continue;
-            }
-
-            $eqPos = \strpos($pair, '=');
-
-            if ($eqPos === false) {
-                // Key only, no value (e.g., "acl", "uploads").
-                $result[\rawurldecode($pair)] = '';
-            } else {
-                $key = \rawurldecode(\substr($pair, 0, $eqPos));
-                $value = \rawurldecode(\substr($pair, $eqPos + 1));
-                // First occurrence wins (consistent with S3 behavior).
-                if (! \array_key_exists($key, $result)) {
-                    $result[$key] = $value;
-                }
-            }
-        }
-
-        return $result;
+        return QueryStringParser::parse($request->getUri()->getQuery());
     }
 
     /**

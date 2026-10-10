@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
 use OpsFour\S3Server\Exception\BucketAlreadyOwnedByYouException;
 use OpsFour\S3Server\Exception\InvalidBucketNameException;
@@ -54,20 +55,58 @@ final class CreateBucketHandler implements RequestHandler
         }
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'bucket')
             ?? AclGrantResolver::privateAcl($ownerId);
-        $objectLockEnabled = strtolower(
-            $request->getHeader('x-amz-bucket-object-lock-enabled') ?? 'false',
-        ) === 'true';
+        $objectOwnership = BucketOwnership::validateMode(
+            $request->getHeader('x-amz-object-ownership') ?? BucketOwnership::OBJECT_WRITER,
+        );
+        $objectOwnershipHeader = $request->getHeader('x-amz-object-ownership');
+        if ($objectOwnership === BucketOwnership::BUCKET_OWNER_ENFORCED) {
+            foreach ($aclGrants as $grant) {
+                if ($grant['granteeType'] !== 'CanonicalUser'
+                    || $grant['granteeId'] !== $ownerId
+                    || $grant['permission'] !== 'FULL_CONTROL') {
+                    throw new \OpsFour\S3Server\Exception\InvalidBucketAclWithObjectOwnershipException();
+                }
+            }
+        }
+        $objectLockHeader = $request->getHeader('x-amz-bucket-object-lock-enabled');
+        if ($objectLockHeader !== null && ! in_array($objectLockHeader, ['true', 'false'], true)) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'x-amz-bucket-object-lock-enabled must be true or false.',
+            );
+        }
+        $objectLockEnabled = $objectLockHeader === 'true';
 
-        // 3. Serialize same-account quota checks and metadata creation.
-        $alreadyOwned = false;
-        $this->metadata->transaction(function () use ($ownerId, $bucket, $region, $aclGrants, $objectLockEnabled, &$alreadyOwned): void {
+        // 3. Reject known name conflicts and quota violations before touching
+        // storage. The checks run again at commit because another request can
+        // create the bucket while the backend operation is in progress.
+        $this->metadata->transaction(function () use ($ownerId, $bucket, $objectLockHeader, $objectOwnershipHeader): void {
             $this->metadata->lockOwnerForUpdate($ownerId);
+            $existingOwner = $this->metadata->getBucketOwner($bucket);
+            if ($existingOwner !== null && $existingOwner !== $ownerId) {
+                throw new BucketAlreadyExistsException();
+            }
+            if ($existingOwner === $ownerId) {
+                $this->assertExistingBucketSettings($bucket, $objectLockHeader, $objectOwnershipHeader);
+            }
+            if ($existingOwner === null) {
+                $this->quotas?->assertCanCreateBucket($ownerId);
+            }
+        });
 
+        // 4. Provision the idempotent backend namespace before publishing the
+        // bucket in metadata. A failed first provision then stays invisible to
+        // HeadBucket and object requests; a retry can safely run this again.
+        $this->storage->createBucket($bucket);
+
+        // 5. Publish metadata only after storage succeeded. Keep the owner
+        // lock for the final name/quota check and all initial configuration.
+        $this->metadata->transaction(function () use ($request, $ownerId, $bucket, $region, $aclGrants, $objectLockEnabled, $objectOwnership, $objectLockHeader, $objectOwnershipHeader): void {
+            $this->metadata->lockOwnerForUpdate($ownerId);
+            (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $existingOwner = $this->metadata->getBucketOwner($bucket);
             if ($existingOwner !== null) {
                 if ($existingOwner === $ownerId) {
-                    $alreadyOwned = true;
-
+                    $this->assertExistingBucketSettings($bucket, $objectLockHeader, $objectOwnershipHeader);
                     return;
                 }
                 throw new BucketAlreadyExistsException();
@@ -76,6 +115,7 @@ final class CreateBucketHandler implements RequestHandler
             $this->quotas?->assertCanCreateBucket($ownerId);
             $this->metadata->createBucket($ownerId, $bucket, $region);
             $this->metadata->putAcl('bucket', $bucket, $ownerId, $aclGrants);
+            $this->metadata->putBucketOwnershipControls($bucket, $objectOwnership);
             if ($objectLockEnabled) {
                 $this->metadata->setBucketVersioning($bucket, 'Enabled');
                 $this->metadata->putObjectLockConfig($bucket, [
@@ -84,32 +124,24 @@ final class CreateBucketHandler implements RequestHandler
             }
         });
 
-        if ($alreadyOwned) {
-            // A previous attempt may have committed metadata before storage
-            // provisioning failed. Re-run the idempotent backend operation so a
-            // retry repairs that partial state.
-            $this->storage->createBucket($bucket);
-
-            return new Response(status: 200, headers: ['Location' => '/' . $bucket]);
-        }
-
-        // 4. Create in storage backend.
-        try {
-            $this->storage->createBucket($bucket);
-        } catch (\Throwable $e) {
-            // Rollback metadata on storage failure to avoid orphaned records.
-            try {
-                $this->metadata->deleteBucket($ownerId, $bucket);
-            } catch (\Throwable) {
-            }
-            throw $e;
-        }
-
-        // 5. Return 200 with Location header.
+        // 6. Return 200 with Location header.
         return new Response(
             status: 200,
             headers: ['Location' => '/' . $bucket],
         );
+    }
+
+    private function assertExistingBucketSettings(string $bucket, ?string $objectLockHeader, ?string $objectOwnershipHeader): void
+    {
+        if ($objectLockHeader !== null
+            && ($this->metadata->getObjectLockConfig($bucket) !== null) !== ($objectLockHeader === 'true')) {
+            throw new BucketAlreadyOwnedByYouException('The existing bucket has different Object Lock settings.');
+        }
+
+        if ($objectOwnershipHeader !== null
+            && ($this->metadata->getBucketOwnershipControls($bucket) ?? BucketOwnership::OBJECT_WRITER) !== $objectOwnershipHeader) {
+            throw new BucketAlreadyOwnedByYouException('The existing bucket has different Object Ownership settings.');
+        }
     }
 
     /**

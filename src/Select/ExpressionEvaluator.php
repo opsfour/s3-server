@@ -25,22 +25,24 @@ final class ExpressionEvaluator
 
         $tokens = $where['tokens'] ?? [];
         if ($tokens === []) {
-            return true;
+            throw new SelectSqlException('Incomplete S3 Select WHERE expression.');
         }
 
-        return self::evaluateTokens($tokens, $row, $alias);
+        // SQL's UNKNOWN value filters a row just like FALSE. Keep it distinct
+        // internally so NOT, AND and OR preserve NULL comparison semantics.
+        return self::evaluateTokens($tokens, $row, $alias) === true;
     }
 
     /**
      * @param list<array{type: string, value: string}> $tokens
      * @param array<string, mixed> $row
      */
-    private static function evaluateTokens(array $tokens, array $row, string $alias): bool
+    private static function evaluateTokens(array $tokens, array $row, string $alias): ?bool
     {
         // Simple evaluation: find comparison operators and evaluate.
         $len = count($tokens);
         if ($len === 0) {
-            return true;
+            throw new SelectSqlException('Incomplete S3 Select WHERE expression.');
         }
 
         // Look for OR first (lowest precedence), then AND (higher precedence).
@@ -58,7 +60,12 @@ final class ExpressionEvaluator
             if ($depth === 0 && $tokens[$i]['type'] === 'KEYWORD' && $tokens[$i]['value'] === 'OR') {
                 $left = array_slice($tokens, 0, $i);
                 $right = array_slice($tokens, $i + 1);
-                return self::evaluateTokens($left, $row, $alias) || self::evaluateTokens($right, $row, $alias);
+                $leftResult = self::evaluateTokens($left, $row, $alias);
+                if ($leftResult === true) {
+                    return true;
+                }
+                $rightResult = self::evaluateTokens($right, $row, $alias);
+                return $rightResult === true ? true : ($leftResult === null || $rightResult === null ? null : false);
             }
         }
 
@@ -83,14 +90,20 @@ final class ExpressionEvaluator
                     }
                     $left = array_slice($tokens, 0, $i);
                     $right = array_slice($tokens, $i + 1);
-                    return self::evaluateTokens($left, $row, $alias) && self::evaluateTokens($right, $row, $alias);
+                    $leftResult = self::evaluateTokens($left, $row, $alias);
+                    if ($leftResult === false) {
+                        return false;
+                    }
+                    $rightResult = self::evaluateTokens($right, $row, $alias);
+                    return $rightResult === false ? false : ($leftResult === null || $rightResult === null ? null : true);
                 }
             }
         }
 
         // Handle NOT.
         if ($tokens[0]['type'] === 'KEYWORD' && $tokens[0]['value'] === 'NOT') {
-            return !self::evaluateTokens(array_slice($tokens, 1), $row, $alias);
+            $result = self::evaluateTokens(array_slice($tokens, 1), $row, $alias);
+            return $result === null ? null : ! $result;
         }
 
         // Handle parentheses.
@@ -106,7 +119,7 @@ final class ExpressionEvaluator
      * @param list<array{type: string, value: string}> $tokens
      * @param array<string, mixed> $row
      */
-    private static function evaluateComparison(array $tokens, array $row, string $alias): bool
+    private static function evaluateComparison(array $tokens, array $row, string $alias): ?bool
     {
         $len = count($tokens);
 
@@ -133,7 +146,7 @@ final class ExpressionEvaluator
                 $leftVal = self::resolveValue(array_slice($tokens, 0, $leftEnd), $row, $alias);
                 $rightVal = self::resolveValue(array_slice($tokens, $i + 1), $row, $alias);
                 if ($leftVal === null || $rightVal === null) {
-                    return false;
+                    return null;
                 }
                 $pattern = implode('.*', array_map(
                     fn(string $p) => implode('.', array_map(fn(string $q) => preg_quote($q, '/'), explode('_', $p))),
@@ -154,6 +167,9 @@ final class ExpressionEvaluator
                         $val = self::resolveValue(array_slice($tokens, 0, $leftEnd), $row, $alias);
                         $low = self::resolveValue(array_slice($tokens, $i + 1, $j - $i - 1), $row, $alias);
                         $high = self::resolveValue(array_slice($tokens, $j + 1), $row, $alias);
+                        if ($val === null || $low === null || $high === null) {
+                            return null;
+                        }
                         $result = $val >= $low && $val <= $high;
                         return $negate ? !$result : $result;
                     }
@@ -167,13 +183,22 @@ final class ExpressionEvaluator
                 $negate = ($i > 0 && $tokens[$i - 1]['type'] === 'KEYWORD' && $tokens[$i - 1]['value'] === 'NOT');
                 $leftEnd = $negate ? $i - 1 : $i;
                 $val = self::resolveValue(array_slice($tokens, 0, $leftEnd), $row, $alias);
+                if ($val === null) {
+                    return null;
+                }
                 $inValues = [];
+                $hasNull = false;
                 for ($j = $i + 1; $j < $len; $j++) {
                     if ($tokens[$j]['type'] === 'STRING' || $tokens[$j]['type'] === 'NUMBER') {
                         $inValues[] = $tokens[$j]['value'];
+                    } elseif ($tokens[$j]['type'] === 'KEYWORD' && $tokens[$j]['value'] === 'NULL') {
+                        $hasNull = true;
                     }
                 }
                 $result = in_array((string) $val, $inValues, true);
+                if (! $result && $hasNull) {
+                    return null;
+                }
                 return $negate ? !$result : $result;
             }
         }
@@ -181,8 +206,14 @@ final class ExpressionEvaluator
         // Standard comparison: find the operator.
         for ($i = 0; $i < $len; $i++) {
             if ($tokens[$i]['type'] === 'OP' && in_array($tokens[$i]['value'], ['=', '!=', '<', '>', '<=', '>='], true)) {
+                if ($i === 0 || $i === $len - 1) {
+                    throw new SelectSqlException('Incomplete S3 Select comparison.');
+                }
                 $leftVal = self::resolveValue(array_slice($tokens, 0, $i), $row, $alias);
                 $rightVal = self::resolveValue(array_slice($tokens, $i + 1), $row, $alias);
+                if ($leftVal === null || $rightVal === null) {
+                    return null;
+                }
 
                 return match ($tokens[$i]['value']) {
                     '=' => $leftVal == $rightVal,
@@ -195,7 +226,7 @@ final class ExpressionEvaluator
             }
         }
 
-        return true;
+        throw new SelectSqlException('Unsupported S3 Select WHERE expression.');
     }
 
     /**
@@ -322,7 +353,7 @@ final class ExpressionEvaluator
             };
         }
 
-        return $tokens[0]['value'];
+        throw new SelectSqlException('Unsupported S3 Select SQL operand.');
     }
 
     /**

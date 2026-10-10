@@ -11,9 +11,29 @@ use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ListObjectsResult;
 use OpsFour\S3Server\Dto\ObjectInfo;
-use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
+use OpsFour\S3Server\Metadata\GenerationBoundBucketMultipartCleanupStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
+use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
+use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
+use OpsFour\S3Server\Metadata\FencedQueueStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\MultipartCompletionCapacityReader;
+use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
+use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\LocalMultipartPartSealGuard;
+use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
+use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
+use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
+use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Quota\QuotaConfig;
 
 /**
  * Async MetadataStore decorator that offloads all SQLite PDO calls to
@@ -27,7 +47,7 @@ use OpsFour\S3Server\Observability\MetricsCollector;
  * calling Fiber to a dedicated worker via WeakMap<Fiber, Worker>.
  * A TransactionGuard ensures abandoned fibers trigger a rollback.
  */
-final class ParallelSqliteMetadataStore implements MetadataStore
+final class ParallelSqliteMetadataStore implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private readonly WorkerPool $pool;
 
@@ -89,7 +109,6 @@ final class ParallelSqliteMetadataStore implements MetadataStore
      * so handlers get the correct HTTP status code and error XML.
      *
      * @throws \Throwable Always throws.
-     * @return never
      */
     private function rethrowS3Exception(TaskFailureThrowable $e): never
     {
@@ -126,6 +145,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->submit('initialize');
     }
 
+    public function assertSupportedBucketEncryptionInventory(): void
+    {
+        $this->submit('assertSupportedBucketEncryptionInventory');
+    }
+
     // ---------------------------------------------------------------
     // Bucket operations
     // ---------------------------------------------------------------
@@ -150,6 +174,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('getBucketStorageStats', [$bucket]);
     }
 
+    public function getOwnerStorageStats(string $ownerId): array
+    {
+        return $this->submit('getOwnerStorageStats', [$ownerId]);
+    }
+
     public function getAccountQuota(string $ownerId): ?QuotaConfig
     {
         return $this->submit('getAccountQuota', [$ownerId]);
@@ -158,6 +187,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     public function listAccountQuotas(): array
     {
         return $this->submit('listAccountQuotas');
+    }
+
+    public function listAccountQuotasPage(?string $after, int $limit): array
+    {
+        return $this->submit('listAccountQuotasPage', [$after, $limit]);
     }
 
     public function putAccountQuota(string $ownerId, QuotaConfig $quota): void
@@ -190,6 +224,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('getNamedPolicy', [$policyName]);
     }
 
+    public function lockNamedPoliciesForUpdate(array $policyNames): array
+    {
+        return $this->submit('lockNamedPoliciesForUpdate', [$policyNames]);
+    }
+
     public function putNamedPolicy(string $policyName, string $policyJson): void
     {
         $this->submit('putNamedPolicy', [$policyName, $policyJson]);
@@ -208,6 +247,16 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     public function listBuckets(string $ownerId): array
     {
         return $this->submit('listBuckets', [$ownerId]);
+    }
+
+    public function countBuckets(string $ownerId): int
+    {
+        return $this->submit('countBuckets', [$ownerId]);
+    }
+
+    public function listBucketsPage(string $ownerId, ?string $after, ?string $prefix, ?string $region, int $maxBuckets): array
+    {
+        return $this->submit('listBucketsPage', [$ownerId, $after, $prefix, $region, $maxBuckets]);
     }
 
     public function listAllBuckets(): array
@@ -259,6 +308,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('getObjectMetadata', [$bucket, $key]);
     }
 
+    public function getCurrentObjectVersion(string $bucket, string $key): ?ObjectInfo
+    {
+        return $this->submit('getCurrentObjectVersion', [$bucket, $key]);
+    }
+
     public function deleteObjectMetadata(string $bucket, string $key): void
     {
         $this->submit('deleteObjectMetadata', [$bucket, $key]);
@@ -292,6 +346,18 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ?\DateTimeImmutable $restoreExpiresAt = null,
     ): void {
         $this->submit('updateObjectRestoreState', [$bucket, $key, $versionId, $restoreStatus, $restoredStoragePath, $restoreExpiresAt]);
+    }
+
+    public function updateObjectRestoreStateWithTier(
+        string $bucket,
+        string $key,
+        ?string $versionId,
+        ?string $restoreStatus,
+        ?string $restoredStoragePath = null,
+        ?\DateTimeImmutable $restoreExpiresAt = null,
+        ?string $restoredStorageTier = null,
+    ): void {
+        $this->submit('updateObjectRestoreStateWithTier', [$bucket, $key, $versionId, $restoreStatus, $restoredStoragePath, $restoreExpiresAt, $restoredStorageTier]);
     }
 
     public function countObjects(string $bucket): int
@@ -333,6 +399,95 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ]);
     }
 
+    public function createMultipartUploadWithTier(
+        string $uploadId,
+        string $bucket,
+        string $key,
+        string $ownerId,
+        string $storageTier,
+        ?string $contentType = null,
+        array $userMetadata = [],
+    ): void {
+        $this->submit('createMultipartUploadWithTier', [
+            $uploadId, $bucket, $key, $ownerId, $storageTier, $contentType, $userMetadata,
+        ]);
+    }
+
+    public function createMultipartWriteIntent(MultipartWriteIntent $intent): void
+    {
+        $this->submit('createMultipartWriteIntent', [$intent]);
+    }
+
+    public function multipartWriteIntentNow(): float
+    {
+        return $this->submit('multipartWriteIntentNow', []);
+    }
+
+    public function getMultipartWriteIntent(string $attemptId): ?MultipartWriteIntent
+    {
+        return $this->submit('getMultipartWriteIntent', [$attemptId]);
+    }
+
+    public function renewMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $newLeaseUntil): bool
+    {
+        return $this->submit('renewMultipartWriteIntent', [$attemptId, $expectedLeaseUntil, $newLeaseUntil]);
+    }
+
+    public function abandonMultipartWriteIntent(string $attemptId, float $nextAttemptAt): bool
+    {
+        return $this->submit('abandonMultipartWriteIntent', [$attemptId, $nextAttemptAt]);
+    }
+
+    public function abandonMultipartWriteIntentsForUpload(string $uploadId, float $nextAttemptAt): int
+    {
+        return $this->submit('abandonMultipartWriteIntentsForUpload', [$uploadId, $nextAttemptAt]);
+    }
+
+    public function consumeMultipartWriteIntent(string $attemptId): bool
+    {
+        return $this->submit('consumeMultipartWriteIntent', [$attemptId]);
+    }
+
+    public function armMultipartWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $newLeaseUntil): bool
+    {
+        return $this->submit('armMultipartWriteIntent', [$attemptId, $dispatchId, $expectedLeaseUntil, $newLeaseUntil]);
+    }
+
+    public function retireLocalMultipartWriteIntentBeforeDispatch(string $attemptId, string $dispatchId): bool
+    {
+        return $this->submit('retireLocalMultipartWriteIntentBeforeDispatch', [$attemptId, $dispatchId]);
+    }
+
+    public function retireDueUndispatchedLocalMultipartWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->submit('retireDueUndispatchedLocalMultipartWriteIntents', [$storageTier, $limit]);
+    }
+
+    public function consumeMultipartWriteIntentWithDispatch(string $attemptId, string $dispatchId): bool
+    {
+        return $this->submit('consumeMultipartWriteIntentWithDispatch', [$attemptId, $dispatchId]);
+    }
+
+    public function claimDueMultipartWriteIntents(int $limit, float $now, float $leaseUntil): array
+    {
+        return $this->submit('claimDueMultipartWriteIntents', [$limit, $now, $leaseUntil]);
+    }
+
+    public function retryMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $nextAttemptAt): bool
+    {
+        return $this->submit('retryMultipartWriteIntent', [$attemptId, $expectedLeaseUntil, $nextAttemptAt]);
+    }
+
+    public function renewMultipartCollectorClaim(string $attemptId, float $newLeaseUntil, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        return $this->submit('renewMultipartCollectorClaim', [$attemptId, $newLeaseUntil, $expectedLeaseUntil, $claimGeneration]);
+    }
+
+    public function retryMultipartCollectorClaim(string $attemptId, float $nextAttemptAt, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        return $this->submit('retryMultipartCollectorClaim', [$attemptId, $nextAttemptAt, $expectedLeaseUntil, $claimGeneration]);
+    }
+
     public function getMultipartUpload(string $uploadId): ?array
     {
         return $this->submit('getMultipartUpload', [$uploadId]);
@@ -356,7 +511,20 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ]);
     }
 
-    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    public function listMultipartUploadsForBucket(
+        BucketInfo $bucket,
+        ?string $prefix = null,
+        ?string $delimiter = null,
+        int $maxUploads = 1000,
+        ?string $keyMarker = null,
+        ?string $uploadIdMarker = null,
+    ): array {
+        return $this->submit('listMultipartUploadsForBucket', [
+            $bucket, $prefix, $delimiter, $maxUploads, $keyMarker, $uploadIdMarker,
+        ]);
+    }
+
+    public function getMultipartStorageStats(?string $ownerId, ?string $bucket = null): array
     {
         return $this->submit('getMultipartStorageStats', [$ownerId, $bucket]);
     }
@@ -366,9 +534,24 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->submit('putPart', [$uploadId, $partNumber, $etag, $size, $storagePath]);
     }
 
+    public function supportsMultipartPartChecksums(): bool
+    {
+        return true;
+    }
+
+    public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
+    {
+        $this->submit('putPartWithChecksum', [$uploadId, $partNumber, $etag, $size, $storagePath, $checksumAlgorithm, $checksumValue]);
+    }
+
     public function getParts(string $uploadId): array
     {
         return $this->submit('getParts', [$uploadId]);
+    }
+
+    public function listPartsPage(string $uploadId, int $afterPartNumber, int $limit): array
+    {
+        return $this->submit('listPartsPage', [$uploadId, $afterPartNumber, $limit]);
     }
 
     public function deleteParts(string $uploadId): void
@@ -595,6 +778,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('getBucketLifecycle', [$bucket]);
     }
 
+    public function listReferencedStorageTiers(): array
+    {
+        return $this->submit('listReferencedStorageTiers', []);
+    }
+
     public function putBucketLifecycle(string $bucket, array $rules): void
     {
         $this->submit('putBucketLifecycle', [$bucket, $rules]);
@@ -614,6 +802,9 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         string $targetStorageClass,
         string $sourceStoragePath,
         int $maxAttempts = 10,
+        string $origin = 'direct',
+        ?string $lifecycleRuleId = null,
+        ?bool $expectedIsLatest = null,
     ): int {
         return $this->submit('enqueueTierTransitionJob', [
             $bucket,
@@ -624,6 +815,9 @@ final class ParallelSqliteMetadataStore implements MetadataStore
             $targetStorageClass,
             $sourceStoragePath,
             $maxAttempts,
+            $origin,
+            $lifecycleRuleId,
+            $expectedIsLatest,
         ]);
     }
 
@@ -639,13 +833,14 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $targetStoragePath = null,
-    ): void {
-        $this->submit('updateTierTransitionJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath]);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->submit('updateTierTransitionJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath, $expectedLeaseExpiresAt]);
     }
 
-    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        return $this->submit('renewTierTransitionJobLease', [$id, $leaseExpiresAt]);
+        return $this->submit('renewTierTransitionJobLease', [$id, $leaseExpiresAt, $expectedLeaseExpiresAt]);
     }
 
     public function getTierTransitionJob(int $id): ?array
@@ -677,13 +872,14 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $restoredStoragePath = null,
-    ): void {
-        $this->submit('updateRestoreJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath]);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->submit('updateRestoreJobStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath, $expectedLeaseExpiresAt]);
     }
 
-    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        return $this->submit('renewRestoreJobLease', [$id, $leaseExpiresAt]);
+        return $this->submit('renewRestoreJobLease', [$id, $leaseExpiresAt, $expectedLeaseExpiresAt]);
     }
 
     public function getRestoreJob(int $id): ?array
@@ -712,6 +908,21 @@ final class ParallelSqliteMetadataStore implements MetadataStore
     public function getPublicAccessBlock(string $bucket): ?array
     {
         return $this->submit('getPublicAccessBlock', [$bucket]);
+    }
+
+    public function getBucketOwnershipControls(string $bucket): ?string
+    {
+        return $this->submit('getBucketOwnershipControls', [$bucket]);
+    }
+
+    public function putBucketOwnershipControls(string $bucket, string $objectOwnership): void
+    {
+        $this->submit('putBucketOwnershipControls', [$bucket, $objectOwnership]);
+    }
+
+    public function deleteBucketOwnershipControls(string $bucket): void
+    {
+        $this->submit('deleteBucketOwnershipControls', [$bucket]);
     }
 
     public function putPublicAccessBlock(string $bucket, bool $blockPublicAcls, bool $ignorePublicAcls, bool $blockPublicPolicy, bool $restrictPublicBuckets): void
@@ -855,8 +1066,13 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         string $destinationUrl,
         string $payloadJson,
         int $maxAttempts = 10,
-    ): void {
-        $this->submit('enqueueNotification', [$bucket, $key, $eventName, $destinationUrl, $payloadJson, $maxAttempts]);
+    ): int {
+        return $this->submit('enqueueNotification', [$bucket, $key, $eventName, $destinationUrl, $payloadJson, $maxAttempts]);
+    }
+
+    public function updateNotificationPayload(int $id, string $payloadJson): void
+    {
+        $this->submit('updateNotificationPayload', [$id, $payloadJson]);
     }
 
     public function dequeueNotifications(int $limit): array
@@ -869,14 +1085,25 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('getNotificationQueueStats', []);
     }
 
+    public function getMultipartCompletionIntentCount(): ?int
+    {
+        return $this->submit('getMultipartCompletionIntentCount', []);
+    }
+
+    public function getWriteIntentCapacityCounts(): ?array
+    {
+        return $this->submit('getWriteIntentCapacityCounts', []);
+    }
+
     public function updateNotificationStatus(
         int $id,
         string $status,
         ?string $error = null,
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
-    ): void {
-        $this->submit('updateNotificationStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts]);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->submit('updateNotificationStatus', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $expectedLeaseExpiresAt]);
     }
 
     public function cleanupOldNotifications(int $maxAgeSeconds): void
@@ -889,6 +1116,141 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         $this->submit('enqueueStorageGarbage', [$bucket, $storageTier, $storagePath]);
     }
 
+    public function createMultipartPartWriteIntent(
+        string $bucket,
+        string $bucketGeneration,
+        string $storageTier,
+        string $uploadId,
+        string $storagePath,
+    ): void {
+        $this->submit('createMultipartPartWriteIntent', [$bucket, $bucketGeneration, $storageTier, $uploadId, $storagePath]);
+    }
+
+    public function consumeMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath): bool
+    {
+        return $this->submit('consumeMultipartPartWriteIntent', [$bucket, $uploadId, $storagePath]);
+    }
+
+    public function reserveLocalMultipartPartWriteIntent(string $bucket, string $bucketGeneration, string $storageTier, string $uploadId, string $storagePath): void
+    {
+        $this->submit('reserveLocalMultipartPartWriteIntent', [$bucket, $bucketGeneration, $storageTier, $uploadId, $storagePath]);
+    }
+
+    public function canSealLocalMultipartPartClaim(int $garbageId, string $storagePath, int $leaseGeneration): bool
+    {
+        return $this->submit('canSealLocalMultipartPartClaim', [$garbageId, $storagePath, $leaseGeneration]);
+    }
+
+    public function armLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->submit('armLocalMultipartPartWriteIntent', [$bucket, $uploadId, $storagePath, $dispatchId]);
+    }
+
+    public function consumeLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->submit('consumeLocalMultipartPartWriteIntent', [$bucket, $uploadId, $storagePath, $dispatchId]);
+    }
+
+    public function retireUndispatchedLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath): bool
+    {
+        return $this->submit('retireUndispatchedLocalMultipartPartWriteIntent', [$bucket, $uploadId, $storagePath]);
+    }
+
+    public function retireTerminalLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->submit('retireTerminalLocalMultipartPartWriteIntent', [$bucket, $uploadId, $storagePath, $dispatchId]);
+    }
+
+    public function retireExpiredUndispatchedLocalMultipartPartWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->submit('retireExpiredUndispatchedLocalMultipartPartWriteIntents', [$storageTier, $limit]);
+    }
+
+    public function assertNoLegacyLocalMultipartIntents(string $storageTier): void
+    {
+        $this->submit(__FUNCTION__, [$storageTier]);
+    }
+
+    public function assertNoUnsafeRecursiveCleanup(string $storageTier): void
+    {
+        $this->submit(__FUNCTION__, [$storageTier]);
+    }
+
+    public function reserveObjectWriteIntent(ObjectWriteIntent $intent, float $leaseSeconds): ObjectWriteIntent
+    {
+        return $this->submit('reserveObjectWriteIntent', [$intent, $leaseSeconds]);
+    }
+
+    public function getObjectWriteIntent(string $attemptId): ?ObjectWriteIntent
+    {
+        return $this->submit('getObjectWriteIntent', [$attemptId]);
+    }
+
+    public function renewObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->submit('renewObjectWriteIntent', [$attemptId, $expectedLeaseUntil, $leaseSeconds]);
+    }
+
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->submit('armObjectWriteIntent', [$attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds]);
+    }
+
+    public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->submit('retireUndispatchedObjectWriteIntent', [$attemptId]);
+    }
+
+    public function retireTerminalPreLinkObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->submit('retireTerminalPreLinkObjectWriteIntent', [$attemptId, $dispatchId]);
+    }
+
+    public function consumeObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->submit('consumeObjectWriteIntent', [$attemptId]);
+    }
+
+    public function consumeArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->submit('consumeArmedObjectWriteIntent', [$attemptId, $dispatchId]);
+    }
+
+    public function abandonObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->submit('abandonObjectWriteIntent', [$attemptId]);
+    }
+
+    public function claimDueObjectWriteIntents(string $storageTier, int $limit, float $leaseSeconds): array
+    {
+        return $this->submit('claimDueObjectWriteIntents', [$storageTier, $limit, $leaseSeconds]);
+    }
+
+    public function retireExpiredUndispatchedObjectWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->submit('retireExpiredUndispatchedObjectWriteIntents', [$storageTier, $limit]);
+    }
+
+    public function renewObjectWriteClaim(string $attemptId, int $claimGeneration, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->submit('renewObjectWriteClaim', [$attemptId, $claimGeneration, $expectedLeaseUntil, $leaseSeconds]);
+    }
+
+    public function sealObjectWriteIntent(string $attemptId, int $claimGeneration): bool
+    {
+        return $this->submit('sealObjectWriteIntent', [$attemptId, $claimGeneration]);
+    }
+
+    public function stageBucketMultipartCleanup(string $bucket, string $storageTier): void
+    {
+        $this->submit('stageBucketMultipartCleanup', [$bucket, $storageTier]);
+    }
+
+    public function stageBucketMultipartCleanupForBucket(BucketInfo $bucket, string $storageTier): void
+    {
+        $this->submit('stageBucketMultipartCleanupForBucket', [$bucket, $storageTier]);
+    }
+
     public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
         $this->submit('discardStorageGarbage', [$bucket, $storageTier, $storagePath]);
@@ -899,14 +1261,54 @@ final class ParallelSqliteMetadataStore implements MetadataStore
         return $this->submit('dequeueStorageGarbage', [$limit]);
     }
 
-    public function completeStorageGarbage(int $id): void
+    public function completeStorageGarbage(int $id, ?float $expectedLeaseExpiresAt = null): bool
     {
-        $this->submit('completeStorageGarbage', [$id]);
+        return $this->submit('completeStorageGarbage', [$id, $expectedLeaseExpiresAt]);
     }
 
-    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        $this->submit('retryStorageGarbage', [$id, $error, $nextAttemptAt]);
+        return $this->submit('retryStorageGarbage', [$id, $error, $nextAttemptAt, $expectedLeaseExpiresAt]);
+    }
+
+    public function completeStorageGarbageLease(int $id, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('completeStorageGarbageLease', [$id, $leaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function retryStorageGarbageLease(int $id, string $error, float $nextAttemptAt, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('retryStorageGarbageLease', [$id, $error, $nextAttemptAt, $leaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function renewStorageGarbageLease(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('renewStorageGarbageLease', [$id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function updateNotificationStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('updateNotificationStatusLease', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $leaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function updateTierTransitionJobStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, ?string $targetStoragePath, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('updateTierTransitionJobStatusLease', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath, $leaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function renewTierTransitionJobLeaseFenced(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('renewTierTransitionJobLeaseFenced', [$id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function updateRestoreJobStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, ?string $restoredStoragePath, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('updateRestoreJobStatusLease', [$id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath, $leaseExpiresAt, $leaseGeneration]);
+    }
+
+    public function renewRestoreJobLeaseFenced(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->submit('renewRestoreJobLeaseFenced', [$id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration]);
     }
 
     // ---------------------------------------------------------------
@@ -923,47 +1325,95 @@ final class ParallelSqliteMetadataStore implements MetadataStore
             );
         }
         /** @var \Fiber<mixed, mixed, mixed, mixed> $fiber */
-
         if (isset($this->fiberWorkerMap[$fiber])) {
-            // Already in a transaction on this fiber — no-op (nested call guard).
-            return;
+            throw new \LogicException('Nested beginTransaction() is unsupported; use transaction() to join the current transaction.');
         }
 
         $worker = $this->pool->getWorker();
         $guard = new TransactionGuard($worker, $this->databasePath);
         $this->fiberWorkerMap[$fiber] = ['worker' => $worker, 'guard' => $guard];
 
-        $this->submit('beginTransaction');
+        try {
+            $this->submit('beginTransaction');
+        } catch (\Throwable $error) {
+            try {
+                $this->rollbackPinnedAfterFailure();
+            } finally {
+                $this->unpinFiber();
+            }
+            throw $error;
+        }
     }
 
     public function commit(): void
     {
-        $this->submit('commit');
-        $this->unpinFiber();
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || ! isset($this->fiberWorkerMap[$fiber])) {
+            throw new \LogicException('commit() requires an active transaction in the current Fiber.');
+        }
+        try {
+            $this->submit('commit');
+        } catch (\Throwable $error) {
+            $this->rollbackPinnedAfterFailure();
+            throw $error;
+        } finally {
+            $this->unpinFiber();
+        }
     }
 
     public function rollback(): void
     {
-        $this->submit('rollback');
-        $this->unpinFiber();
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || ! isset($this->fiberWorkerMap[$fiber])) {
+            throw new \LogicException('rollback() requires an active transaction in the current Fiber.');
+        }
+        try {
+            $this->submit('rollback');
+        } catch (\Throwable $error) {
+            $this->killPinnedWorker();
+            throw $error;
+        } finally {
+            $this->unpinFiber();
+        }
     }
 
     public function lockOwnerForUpdate(string $ownerId): void
     {
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || ! isset($this->fiberWorkerMap[$fiber])) {
+            throw new \LogicException('lockOwnerForUpdate() requires an active transaction in the current Fiber.');
+        }
         // The pinned SQLite worker transaction already serializes metadata writes.
     }
 
     public function transaction(callable $callback): mixed
     {
-        $this->beginTransaction();
+        if (\Fiber::getCurrent() === null) {
+            return \Amp\async(fn(): mixed => $this->transaction($callback))->await();
+        }
+
+        $fiber = \Fiber::getCurrent();
+        $ownTx = ! isset($this->fiberWorkerMap[$fiber]);
+        if ($ownTx) {
+            $this->beginTransaction();
+        }
 
         try {
             $result = $callback();
-            $this->commit();
+            if ($ownTx) {
+                $this->commit();
+            }
 
             return $result;
         } catch (\Throwable $e) {
-            $this->rollback();
+            if ($ownTx && isset($this->fiberWorkerMap[$fiber])) {
+                try {
+                    $this->rollback();
+                } catch (\Throwable) {
+                    // Preserve the operation failure if the pinned worker is
+                    // already unable to roll the transaction back.
+                }
+            }
 
             throw $e;
         }
@@ -995,6 +1445,29 @@ final class ParallelSqliteMetadataStore implements MetadataStore
             unset($this->fiberWorkerMap[$fiber]);
         }
     }
+
+    private function rollbackPinnedAfterFailure(): void
+    {
+        try {
+            $this->submit('rollback');
+        } catch (\Throwable) {
+            $this->killPinnedWorker();
+        }
+    }
+
+    private function killPinnedWorker(): void
+    {
+        $worker = $this->getPinnedWorker();
+        if ($worker === null) {
+            return;
+        }
+        try {
+            $worker->kill();
+        } catch (\Throwable) {
+            // The worker is already unusable; the pool will discard it once
+            // the pinned wrapper is released.
+        }
+    }
 }
 
 /**
@@ -1019,7 +1492,7 @@ final class TransactionGuard
 
     public function __destruct()
     {
-        if (!$this->armed) {
+        if (! $this->armed) {
             return;
         }
 

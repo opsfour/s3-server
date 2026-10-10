@@ -20,8 +20,9 @@ final class S3ServerCredentialsCommand extends Command
 {
     private const array VALID_ACTIONS = ['create', 'list', 'show', 'activate', 'deactivate', 'delete'];
 
+    /** @param CredentialProvider|(\Closure(): CredentialProvider) $credentialProvider */
     public function __construct(
-        private readonly CredentialProvider $credentialProvider,
+        private readonly CredentialProvider|\Closure $credentialProvider,
     ) {
         parent::__construct();
     }
@@ -48,7 +49,17 @@ final class S3ServerCredentialsCommand extends Command
             return Command::FAILURE;
         }
 
-        if ($this->credentialProvider instanceof InMemoryCredentialProvider) {
+        try {
+            $provider = $this->credentialProvider instanceof \Closure
+                ? ($this->credentialProvider)()
+                : $this->credentialProvider;
+        } catch (\Throwable $e) {
+            $io->error(sprintf('S3 credential provider initialization failed (%s).', $e::class));
+
+            return Command::FAILURE;
+        }
+
+        if ($provider instanceof InMemoryCredentialProvider) {
             $io->error(
                 "The 'memory' credential driver is ephemeral — changes would be lost on restart.\n"
                 . "Use 'database' or 'file' credentials in your Symfony config for credential management.",
@@ -57,16 +68,22 @@ final class S3ServerCredentialsCommand extends Command
             return Command::FAILURE;
         }
 
-        $manager = new CredentialManager($this->credentialProvider);
+        $manager = new CredentialManager($provider);
 
-        return match ($action) {
-            'create' => $this->handleCreate($input, $io, $manager),
-            'list' => $this->handleList($io, $manager),
-            'show' => $this->handleShow($input, $io, $manager),
-            'activate' => $this->handleToggle($input, $io, $manager, true),
-            'deactivate' => $this->handleToggle($input, $io, $manager, false),
-            'delete' => $this->handleDelete($input, $io, $manager),
-        };
+        try {
+            return match ($action) {
+                'create' => $this->handleCreate($input, $io, $manager),
+                'list' => $this->handleList($io, $manager),
+                'show' => $this->handleShow($input, $io, $manager),
+                'activate' => $this->handleToggle($input, $io, $manager, true),
+                'deactivate' => $this->handleToggle($input, $io, $manager, false),
+                'delete' => $this->handleDelete($input, $io, $manager),
+            };
+        } catch (\Throwable $e) {
+            $io->error(sprintf('S3 credential operation failed (%s).', $e::class));
+
+            return Command::FAILURE;
+        }
     }
 
     private function handleCreate(InputInterface $input, SymfonyStyle $io, CredentialManager $manager): int
@@ -161,7 +178,12 @@ final class S3ServerCredentialsCommand extends Command
         try {
             $manager->setActive($accessKeyId, $active);
         } catch (\RuntimeException $e) {
-            $io->error($e->getMessage());
+            $io->error(match ($e->getMessage()) {
+                "Credential not found: {$accessKeyId}" => 'Credential not found.',
+                "Credential changed or was revoked: {$accessKeyId}" => 'Credential changed or was revoked.',
+                'Credential provider does not support atomic status updates.' => 'Credential provider does not support atomic status updates.',
+                default => sprintf('S3 credential operation failed (%s).', $e::class),
+            });
 
             return Command::FAILURE;
         }

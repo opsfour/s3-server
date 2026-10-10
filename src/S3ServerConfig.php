@@ -5,162 +5,103 @@ declare(strict_types=1);
 namespace OpsFour\S3Server;
 
 use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 
 /**
  * Immutable configuration DTO for the S3 server.
  *
- * Uses PHP 8.4 property hooks for validation on construction.
- * All properties are readonly via constructor promotion.
+ * Values are validated during construction. Use with() to derive another config.
  */
-final class S3ServerConfig
+final readonly class S3ServerConfig
 {
     /** @var list<string> Allowed metadata driver values. */
     private const array ALLOWED_METADATA_DRIVERS = ['sqlite', 'postgres', 'mysql'];
 
-    public string $host {
-        get => $this->host;
-    }
+    public string $host;
 
-    public int $port {
-        get => $this->port;
-    }
+    public int $port;
 
-    public string $region {
-        get => $this->region;
-    }
+    public string $region;
 
-    public string $storagePath {
-        get => $this->storagePath;
-    }
+    public string $storagePath;
 
     /** @var array<string, mixed> */
-    public array $storageTiers {
-        get => $this->storageTiers;
-    }
+    public array $storageTiers;
 
-    public string $metadataDriver {
-        get => $this->metadataDriver;
-    }
+    public bool $allowUnfencedStorageForTests;
 
-    public string $metadataDsn {
-        get => $this->metadataDsn;
-    }
+    /** Explicit, isolated PUT/Copy fence wiring exercise; not a cluster admission. */
+    public ?string $localObjectWriteTestScratchPath;
 
-    public ?string $tlsCertPath {
-        get => $this->tlsCertPath;
-    }
 
-    public ?string $tlsKeyPath {
-        get => $this->tlsKeyPath;
-    }
+    public string $metadataDriver;
 
-    public int $maxConcurrentConnections {
-        get => $this->maxConcurrentConnections;
-    }
+    public string $metadataDsn;
 
-    public int $connectionIdleTimeout {
-        get => $this->connectionIdleTimeout;
-    }
+    public ?string $tlsCertPath;
 
-    public int $requestBodySizeLimit {
-        get => $this->requestBodySizeLimit;
-    }
+    public ?string $tlsKeyPath;
 
-    public int $readTimeout {
-        get => $this->readTimeout;
-    }
+    public int $maxConcurrentConnections;
 
-    public int $writeTimeout {
-        get => $this->writeTimeout;
-    }
+    public int $connectionIdleTimeout;
 
-    public int $perClientRateLimit {
-        get => $this->perClientRateLimit;
-    }
+    public int $requestBodySizeLimit;
 
-    public ?string $baseDomain {
-        get => $this->baseDomain;
-    }
+    public int $postSpoolBudgetBytes;
 
-    public bool $strictBucketNaming {
-        get => $this->strictBucketNaming;
-    }
+    public int $readTimeout;
 
-    public ?string $websiteHostPattern {
-        get => $this->websiteHostPattern;
-    }
+    public int $writeTimeout;
 
-    public string $masterKeyProvider {
-        get => $this->masterKeyProvider;
-    }
+    public int $perClientRateLimit;
 
-    public bool $enforceMinPartSize {
-        get => $this->enforceMinPartSize;
-    }
+    /** @var list<string> */
+    public array $trustedProxyCidrs;
 
-    public int $maxEncryptedObjectSize {
-        get => $this->maxEncryptedObjectSize;
-    }
+    public ?string $baseDomain;
 
-    public int $maxSelectObjectSize {
-        get => $this->maxSelectObjectSize;
-    }
+    public bool $strictBucketNaming;
 
-    public int $shutdownDrainTimeout {
-        get => $this->shutdownDrainTimeout;
-    }
+    public ?string $websiteHostPattern;
 
-    public bool $notificationRequireHttps {
-        get => $this->notificationRequireHttps;
-    }
+    public string $masterKeyProvider;
 
-    public int $sqliteWorkerPoolSize {
-        get => $this->sqliteWorkerPoolSize;
-    }
+    public bool $enforceMinPartSize;
 
-    public int $encryptionWorkerPoolSize {
-        get => $this->encryptionWorkerPoolSize;
-    }
+    public int $maxEncryptedObjectSize;
 
-    public int $selectWorkerPoolSize {
-        get => $this->selectWorkerPoolSize;
-    }
+    public int $maxSelectObjectSize;
 
-    public int $requestBodySpoolWorkerPoolSize {
-        get => $this->requestBodySpoolWorkerPoolSize;
-    }
+    public int $shutdownDrainTimeout;
 
-    public int $encryptionParallelThreshold {
-        get => $this->encryptionParallelThreshold;
-    }
+    public bool $notificationRequireHttps;
 
-    public QuotaConfig $quota {
-        get => $this->quota;
-    }
+    public bool $notificationWorkerEnabled;
 
-    public float $lifecycleIntervalSeconds {
-        get => $this->lifecycleIntervalSeconds;
-    }
+    public int $sqliteWorkerPoolSize;
 
-    public int $lifecycleBatchSize {
-        get => $this->lifecycleBatchSize;
-    }
+    public int $encryptionWorkerPoolSize;
 
-    public int $lifecycleMaxActionsPerRun {
-        get => $this->lifecycleMaxActionsPerRun;
-    }
+    public int $selectWorkerPoolSize;
 
-    public int $lifecycleLockTtlSeconds {
-        get => $this->lifecycleLockTtlSeconds;
-    }
+    public int $requestBodySpoolWorkerPoolSize;
 
-    public int $multipartMaxAgeSeconds {
-        get => $this->multipartMaxAgeSeconds;
-    }
+    public int $encryptionParallelThreshold;
 
-    public ?string $metricsBearerToken {
-        get => $this->metricsBearerToken;
-    }
+    public QuotaConfig $quota;
+
+    public float $lifecycleIntervalSeconds;
+
+    public int $lifecycleBatchSize;
+
+    public int $lifecycleMaxActionsPerRun;
+
+    public int $lifecycleLockTtlSeconds;
+
+    public int $multipartMaxAgeSeconds;
+
+    public ?string $metricsBearerToken;
 
     /**
      * @param  string  $host  Listen address.
@@ -173,11 +114,13 @@ final class S3ServerConfig
      * @param  string|null  $tlsCertPath  Path to TLS certificate file.
      * @param  string|null  $tlsKeyPath  Path to TLS private key file.
      * @param  int  $maxConcurrentConnections  Maximum simultaneous connections.
-     * @param  int  $connectionIdleTimeout  Seconds before idle connection is closed.
+     * @param  int  $connectionIdleTimeout  HTTP/2 idle timeout in seconds; Amp HTTP/1 uses the stream inactivity timeout.
      * @param  int  $requestBodySizeLimit  Maximum request body size in bytes (default 5 GiB).
+     * @param  int  $postSpoolBudgetBytes  Concurrent browser POST temporary bytes per node sharing a local temp directory (default 10 GiB).
      * @param  int  $readTimeout  Read timeout in seconds.
      * @param  int  $writeTimeout  Write timeout in seconds.
      * @param  int  $perClientRateLimit  Per-client rate limit (0 = unlimited).
+     * @param  list<string>  $trustedProxyCidrs  Proxy peer CIDRs allowed to supply forwarded transport and client IP.
      * @param  string|null  $baseDomain  Base domain for virtual-hosted-style requests.
      * @param  bool  $strictBucketNaming  Reject AWS-reserved bucket name prefixes and suffixes.
      * @param  string|null  $websiteHostPattern  Glob pattern for website hosting endpoints (e.g., '*.s3-website.example.com').
@@ -197,6 +140,9 @@ final class S3ServerConfig
      * @param  int  $lifecycleLockTtlSeconds  Seconds before a lifecycle lease is considered stale.
      * @param  int  $multipartMaxAgeSeconds  Global maximum age for incomplete multipart uploads (0 disables cleanup).
      * @param  int|null  $selectWorkerPoolSize  Number of amphp/parallel workers for S3 Select (null inherits encryptionWorkerPoolSize for compatibility).
+     * @param  bool  $notificationWorkerEnabled  Process queued webhook deliveries on this server instance.
+     * @param  bool  $allowUnfencedStorageForTests  Unsafe opt-in for storage fault tests; never enable in production.
+     * @param  string|null  $localObjectWriteTestScratchPath  Private node-local scratch for the isolated PUT/Copy fence test profile.
      */
     public function __construct(
         string $host = '0.0.0.0',
@@ -235,9 +181,18 @@ final class S3ServerConfig
         int $multipartMaxAgeSeconds = 604_800,
         ?string $metricsBearerToken = null,
         ?int $selectWorkerPoolSize = null,
+        bool $notificationWorkerEnabled = true,
+        int $postSpoolBudgetBytes = 10_737_418_240,
+        array $trustedProxyCidrs = [],
+        bool $allowUnfencedStorageForTests = false,
+        ?string $localObjectWriteTestScratchPath = null,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
+        }
+
+        if ($baseDomain !== null && trim($baseDomain) === '') {
+            throw new \InvalidArgumentException('baseDomain must be a non-empty domain when configured.');
         }
 
         if ($port < 1 || $port > 65535) {
@@ -281,6 +236,21 @@ final class S3ServerConfig
             throw new \InvalidArgumentException(
                 "requestBodySizeLimit must be >= 0, got {$requestBodySizeLimit}.",
             );
+        }
+
+        if ($postSpoolBudgetBytes < 1) {
+            throw new \InvalidArgumentException('postSpoolBudgetBytes must be positive.');
+        }
+
+        if ($localObjectWriteTestScratchPath !== null && (
+            trim($localObjectWriteTestScratchPath) === '' || ! $allowUnfencedStorageForTests
+        )) {
+            throw new \InvalidArgumentException('Local object write fencing is an isolated test profile and requires the unsafe test-only storage override plus a scratch path.');
+        }
+
+
+        if ($metricsBearerToken !== null && trim($metricsBearerToken) === '') {
+            throw new \InvalidArgumentException('metricsBearerToken must not be empty when configured.');
         }
 
         if ($readTimeout < 0) {
@@ -349,6 +319,8 @@ final class S3ServerConfig
             );
         }
 
+        new TrustedProxyMiddleware($trustedProxyCidrs);
+
         if ($tlsCertPath !== null && $tlsKeyPath === null) {
             throw new \InvalidArgumentException(
                 'tlsKeyPath is required when tlsCertPath is set.',
@@ -361,8 +333,8 @@ final class S3ServerConfig
             );
         }
 
-        if ($lifecycleIntervalSeconds <= 0.0) {
-            throw new \InvalidArgumentException('lifecycleIntervalSeconds must be > 0.');
+        if (! is_finite($lifecycleIntervalSeconds) || $lifecycleIntervalSeconds <= 0.0) {
+            throw new \InvalidArgumentException('lifecycleIntervalSeconds must be finite and > 0.');
         }
 
         if ($lifecycleBatchSize < 1) {
@@ -384,8 +356,10 @@ final class S3ServerConfig
         $this->host = $host;
         $this->port = $port;
         $this->region = $region;
-        $this->storagePath = rtrim($storagePath, '/');
+        $this->storagePath = rtrim($storagePath, '/') ?: '/';
         $this->storageTiers = $storageTiers;
+        $this->allowUnfencedStorageForTests = $allowUnfencedStorageForTests;
+        $this->localObjectWriteTestScratchPath = $localObjectWriteTestScratchPath;
         $this->metadataDriver = $metadataDriver;
         $this->metadataDsn = $metadataDsn;
         $this->tlsCertPath = $tlsCertPath;
@@ -393,9 +367,11 @@ final class S3ServerConfig
         $this->maxConcurrentConnections = $maxConcurrentConnections;
         $this->connectionIdleTimeout = $connectionIdleTimeout;
         $this->requestBodySizeLimit = $requestBodySizeLimit;
+        $this->postSpoolBudgetBytes = $postSpoolBudgetBytes;
         $this->readTimeout = $readTimeout;
         $this->writeTimeout = $writeTimeout;
         $this->perClientRateLimit = $perClientRateLimit;
+        $this->trustedProxyCidrs = $trustedProxyCidrs;
         $this->baseDomain = $baseDomain;
         $this->strictBucketNaming = $strictBucketNaming;
         $this->websiteHostPattern = $websiteHostPattern;
@@ -405,6 +381,7 @@ final class S3ServerConfig
         $this->maxSelectObjectSize = $maxSelectObjectSize;
         $this->shutdownDrainTimeout = $shutdownDrainTimeout;
         $this->notificationRequireHttps = $notificationRequireHttps;
+        $this->notificationWorkerEnabled = $notificationWorkerEnabled;
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
         $this->selectWorkerPoolSize = $selectWorkerPoolSize ?? $encryptionWorkerPoolSize;
@@ -416,7 +393,7 @@ final class S3ServerConfig
         $this->lifecycleMaxActionsPerRun = $lifecycleMaxActionsPerRun;
         $this->lifecycleLockTtlSeconds = $lifecycleLockTtlSeconds;
         $this->multipartMaxAgeSeconds = $multipartMaxAgeSeconds;
-        $this->metricsBearerToken = $metricsBearerToken;
+        $this->metricsBearerToken = $metricsBearerToken !== null ? trim($metricsBearerToken) : null;
     }
 
     /**
@@ -449,6 +426,8 @@ final class S3ServerConfig
             'region' => $this->region,
             'storagePath' => $this->storagePath,
             'storageTiers' => $this->storageTiers,
+            'allowUnfencedStorageForTests' => $this->allowUnfencedStorageForTests,
+            'localObjectWriteTestScratchPath' => $this->localObjectWriteTestScratchPath,
             'metadataDriver' => $this->metadataDriver,
             'metadataDsn' => $this->metadataDsn,
             'tlsCertPath' => $this->tlsCertPath,
@@ -456,9 +435,11 @@ final class S3ServerConfig
             'maxConcurrentConnections' => $this->maxConcurrentConnections,
             'connectionIdleTimeout' => $this->connectionIdleTimeout,
             'requestBodySizeLimit' => $this->requestBodySizeLimit,
+            'postSpoolBudgetBytes' => $this->postSpoolBudgetBytes,
             'readTimeout' => $this->readTimeout,
             'writeTimeout' => $this->writeTimeout,
             'perClientRateLimit' => $this->perClientRateLimit,
+            'trustedProxyCidrs' => $this->trustedProxyCidrs,
             'baseDomain' => $this->baseDomain,
             'strictBucketNaming' => $this->strictBucketNaming,
             'websiteHostPattern' => $this->websiteHostPattern,
@@ -480,6 +461,7 @@ final class S3ServerConfig
             'lifecycleLockTtlSeconds' => $this->lifecycleLockTtlSeconds,
             'multipartMaxAgeSeconds' => $this->multipartMaxAgeSeconds,
             'metricsBearerToken' => $this->metricsBearerToken,
+            'notificationWorkerEnabled' => $this->notificationWorkerEnabled,
         ];
 
         $merged = array_merge($defaults, $overrides);

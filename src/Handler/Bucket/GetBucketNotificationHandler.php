@@ -29,6 +29,7 @@ final class GetBucketNotificationHandler implements RequestHandler
 
         // S3 always returns 200 for notification config, even when empty.
         $configs = $this->metadata->getBucketNotification($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         return new Response(
             status: 200,

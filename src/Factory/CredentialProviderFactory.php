@@ -22,15 +22,15 @@ final class CredentialProviderFactory
      * @param  string  $driver  One of: memory, database, file, chain.
      * @param  array<string, mixed>  $config  Driver-specific configuration.
      */
-    public static function create(string $driver, array $config = []): CredentialProvider
+    public static function create(string $driver, array $config = [], bool $bootstrap = false): CredentialProvider
     {
         return match ($driver) {
             'memory' => self::createInMemory($config),
-            'database' => self::createDatabase($config),
+            'database' => self::createDatabase($config, $bootstrap),
             'file' => new ConfigFileCredentialProvider(
                 $config['path'] ?? throw new \InvalidArgumentException('File credentials requires "path"'),
             ),
-            'chain' => self::createChain($config),
+            'chain' => self::createChain($config, $bootstrap),
             default => throw new \InvalidArgumentException("Unknown credentials driver: {$driver}"),
         };
     }
@@ -61,11 +61,11 @@ final class CredentialProviderFactory
     /**
      * @param  array<string, mixed>  $config
      */
-    private static function createDatabase(array $config): DatabaseCredentialProvider
+    private static function createDatabase(array $config, bool $bootstrap): DatabaseCredentialProvider
     {
         $cacheTtl = $config['cache_ttl'] ?? 1.0;
-        if (! is_numeric($cacheTtl) || (float) $cacheTtl < 0.0) {
-            throw new \InvalidArgumentException('Database credentials "cache_ttl" must be a number >= 0.');
+        if (! is_numeric($cacheTtl) || ! is_finite((float) $cacheTtl) || (float) $cacheTtl < 0.0) {
+            throw new \InvalidArgumentException('Database credentials "cache_ttl" must be a finite number >= 0.');
         }
 
         return DatabaseCredentialProvider::fromDsn(
@@ -77,20 +77,35 @@ final class CredentialProviderFactory
                 ? $config['password']
                 : null,
             (float) $cacheTtl,
+            $bootstrap,
         );
     }
 
     /**
      * @param  array<string, mixed>  $config
      */
-    private static function createChain(array $config): ChainCredentialProvider
+    private static function createChain(array $config, bool $bootstrap): ChainCredentialProvider
     {
-        if (! isset($config['providers']) || ! is_array($config['providers']) || count($config['providers']) === 0) {
-            throw new \InvalidArgumentException('Chain credentials requires a non-empty "providers" array');
+        if (! isset($config['providers']) || ! is_array($config['providers'])
+            || ! array_is_list($config['providers']) || count($config['providers']) === 0) {
+            throw new \InvalidArgumentException('Chain credentials requires a non-empty provider list.');
         }
 
-        /** @var list<CredentialProvider> $providers */
-        $providers = $config['providers'];
+        $providers = [];
+        foreach ($config['providers'] as $index => $provider) {
+            if ($provider instanceof CredentialProvider) {
+                $providers[] = $provider;
+
+                continue;
+            }
+            if (! is_array($provider) || ! is_string($provider['driver'] ?? null) || $provider['driver'] === '') {
+                throw new \InvalidArgumentException("Chain credentials provider {$index} requires a provider instance or non-empty driver.");
+            }
+
+            $driver = $provider['driver'];
+            unset($provider['driver']);
+            $providers[] = self::create($driver, $provider, $bootstrap);
+        }
 
         return new ChainCredentialProvider(...$providers);
     }

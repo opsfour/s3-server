@@ -29,6 +29,7 @@ final class GetBucketLifecycleHandler implements RequestHandler
         }
 
         $rules = $this->metadata->getBucketLifecycle($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if (empty($rules)) {
             throw new NoSuchLifecycleConfigurationException();
         }

@@ -8,6 +8,7 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use Psr\Log\LoggerInterface;
 
@@ -53,14 +54,31 @@ final class CorsMiddleware implements Middleware
             }
 
             // No matching CORS rule — return 403 for preflight.
-            return new Response(status: 403, body: '');
+            return new Response(
+                status: 403,
+                headers: ['Vary' => 'Origin, Access-Control-Request-Headers, Access-Control-Request-Method'],
+                body: '',
+            );
         }
 
         // Regular request with Origin — process then add CORS headers.
         $response = $requestHandler->handleRequest($request);
 
         if ($corsHeaders !== null) {
+            $existingVary = $response->getHeader('Vary');
             foreach ($corsHeaders as $name => $value) {
+                if ($name === 'Vary' && $existingVary !== null && trim($existingVary) !== '*') {
+                    $varyNames = array_map('trim', explode(',', $existingVary));
+                    foreach (explode(',', $value) as $newName) {
+                        $newName = trim($newName);
+                        if (! in_array(strtolower($newName), array_map('strtolower', $varyNames), true)) {
+                            $varyNames[] = $newName;
+                        }
+                    }
+                    $value = implode(', ', $varyNames);
+                } elseif ($name === 'Vary' && $existingVary !== null) {
+                    $value = '*';
+                }
                 $response->setHeader($name, $value);
             }
         }
@@ -75,15 +93,30 @@ final class CorsMiddleware implements Middleware
      */
     private function matchCorsRules(?string $bucket, string $origin, Request $request): ?array
     {
-        if ($this->metadata === null || $bucket === null) {
+        if ($this->metadata === null || $bucket === null || $bucket === '') {
             // No metadata store or bucket — no CORS rules, no CORS headers (S3 default).
             return null;
         }
 
         try {
-            $rules = $this->metadata->getBucketCors($bucket);
+            // Browser permissions must not outlive a bucket deletion on another
+            // node. The general CORS cache is keyed by name, not generation.
+            $metadata = $this->metadata;
+            while ($metadata instanceof CachedMetadataStoreDecorator) {
+                $metadata = $metadata->innerStore();
+            }
+            $observedBucket = $metadata->getBucket($bucket);
+            if ($observedBucket === null) {
+                return null;
+            }
+            $rules = $metadata->getBucketCors($bucket);
+            if ($metadata->getBucket($bucket)?->generation !== $observedBucket->generation) {
+                return null;
+            }
         } catch (\Throwable $e) {
-            $this->logger?->warning("CORS: failed to fetch rules for bucket '{$bucket}': {$e->getMessage()}");
+            $this->logger?->warning('CORS rule lookup failed.', [
+                'exception' => $e::class,
+            ]);
 
             return null;
         }
@@ -95,6 +128,11 @@ final class CorsMiddleware implements Middleware
 
         $method = $request->getMethod();
         $requestedHeaders = $request->getHeader('access-control-request-headers');
+        $requestedHeaderNames = $requestedHeaders === null ? [] : array_map('trim', explode(',', strtolower($requestedHeaders)));
+        if ($method === 'OPTIONS' && ($request->getHeader('access-control-request-method') === null
+            || ($requestedHeaders !== null && in_array('', $requestedHeaderNames, true)))) {
+            return null;
+        }
 
         foreach ($rules as $rule) {
             // 1. Match Origin.
@@ -112,26 +150,21 @@ final class CorsMiddleware implements Middleware
             }
 
             // 3. For preflight: match Access-Control-Request-Headers.
-            if ($method === 'OPTIONS' && $requestedHeaders !== null) {
-                $reqHeaders = array_map('trim', explode(',', strtolower($requestedHeaders)));
-                $allowedLower = array_map('strtolower', $rule['allowedHeaders']);
-
-                if (! in_array('*', $allowedLower, true)) {
-                    $allMatch = true;
-                    foreach ($reqHeaders as $rh) {
-                        if ($rh !== '' && ! in_array($rh, $allowedLower, true)) {
-                            $allMatch = false;
-                            break;
-                        }
+            if ($method === 'OPTIONS') {
+                $allMatch = true;
+                foreach ($requestedHeaderNames as $headerName) {
+                    if (! self::headerMatches($headerName, $rule['allowedHeaders'])) {
+                        $allMatch = false;
+                        break;
                     }
-                    if (! $allMatch) {
-                        continue;
-                    }
+                }
+                if (! $allMatch) {
+                    continue;
                 }
             }
 
             // First matching rule wins.
-            return self::buildCorsHeaders($origin, $rule);
+            return self::buildCorsHeaders($origin, $rule, $method === 'OPTIONS' ? $requestedHeaderNames : null);
         }
 
         return null;
@@ -145,10 +178,7 @@ final class CorsMiddleware implements Middleware
     private static function originMatches(string $origin, array $allowedOrigins): bool
     {
         foreach ($allowedOrigins as $allowed) {
-            if ($allowed === '*') {
-                return true;
-            }
-            if (fnmatch($allowed, $origin)) {
+            if (self::singleWildcardMatches($origin, $allowed)) {
                 return true;
             }
         }
@@ -156,13 +186,39 @@ final class CorsMiddleware implements Middleware
         return false;
     }
 
+    /** @param list<string> $allowedHeaders */
+    private static function headerMatches(string $header, array $allowedHeaders): bool
+    {
+        foreach ($allowedHeaders as $allowed) {
+            if (self::singleWildcardMatches($header, strtolower($allowed))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function singleWildcardMatches(string $value, string $pattern): bool
+    {
+        $star = strpos($pattern, '*');
+        if ($star === false) {
+            return $value === $pattern;
+        }
+
+        return strpos($pattern, '*', $star + 1) === false
+            && strlen($value) >= strlen($pattern) - 1
+            && str_starts_with($value, substr($pattern, 0, $star))
+            && str_ends_with($value, substr($pattern, $star + 1));
+    }
+
     /**
      * Build CORS response headers from a matched rule.
      *
-     * @param  array{allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}  $rule
+     * @param  array{id?: string, allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}  $rule
+     * @param list<string>|null $requestedHeaders
      * @return array<non-empty-string, string>
      */
-    private static function buildCorsHeaders(string $origin, array $rule): array
+    private static function buildCorsHeaders(string $origin, array $rule, ?array $requestedHeaders): array
     {
         // Sanitize origin to prevent CRLF injection in response headers.
         $safeOrigin = str_replace(["\r", "\n"], '', $origin);
@@ -172,7 +228,7 @@ final class CorsMiddleware implements Middleware
         $headers = [
             'Access-Control-Allow-Origin' => $isWildcard ? '*' : $safeOrigin,
             'Access-Control-Allow-Methods' => implode(', ', $rule['allowedMethods']),
-            'Vary' => 'Origin',
+            'Vary' => $requestedHeaders === null ? 'Origin' : 'Origin, Access-Control-Request-Headers, Access-Control-Request-Method',
         ];
 
         // Credentialed cross-origin requests require this header when origin is specific.
@@ -180,8 +236,8 @@ final class CorsMiddleware implements Middleware
             $headers['Access-Control-Allow-Credentials'] = 'true';
         }
 
-        if (! empty($rule['allowedHeaders'])) {
-            $headers['Access-Control-Allow-Headers'] = implode(', ', $rule['allowedHeaders']);
+        if ($requestedHeaders !== null && $requestedHeaders !== []) {
+            $headers['Access-Control-Allow-Headers'] = implode(', ', $requestedHeaders);
         }
 
         if (! empty($rule['exposeHeaders'])) {

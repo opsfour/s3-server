@@ -9,29 +9,32 @@ use OpsFour\S3Server\Auth\CredentialManager;
 /**
  * Issues regular SigV4 credentials for identities authenticated by an external IdP.
  *
- * Revocation is enforced through the backing CredentialProvider immediately.
- * When a TTL is provided the issued credential includes an STS-style session
- * token and expiration timestamp that SigV4 authentication enforces.
+ * Revocation is enforced through the backing CredentialProvider. Other nodes
+ * observe it after their configured positive-lookup cache TTL; TTL 0 checks
+ * the shared store on every authentication.
+ * Issued credentials always include an STS-style session token and an
+ * expiration timestamp that SigV4 authentication enforces.
  */
 final readonly class ExternalCredentialIssuer
 {
+    public const int DEFAULT_TTL_SECONDS = 3_600;
+
+    public const int MAX_TTL_SECONDS = 43_200;
+
     public function __construct(
         private CredentialManager $credentials,
     ) {}
 
     public function issue(ExternalIdentity $identity, ?int $ttlSeconds = null): IssuedS3Credential
     {
-        if ($ttlSeconds !== null && $ttlSeconds < 1) {
-            throw new \InvalidArgumentException('Credential TTL must be at least one second.');
+        $ttlSeconds ??= self::DEFAULT_TTL_SECONDS;
+        if ($ttlSeconds < self::DEFAULT_TTL_SECONDS || $ttlSeconds > self::MAX_TTL_SECONDS) {
+            throw new \InvalidArgumentException('Credential TTL must be between 3600 and 43200 seconds.');
         }
 
-        $expiresAt = null;
-        $sessionToken = null;
-        if ($ttlSeconds !== null) {
-            $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
-                ->modify("+{$ttlSeconds} seconds");
-            $sessionToken = $this->credentials->generateSessionToken();
-        }
+        $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+            ->modify("+{$ttlSeconds} seconds");
+        $sessionToken = $this->credentials->generateSessionToken();
 
         $credential = $this->credentials->createCredential(
             ownerId: $identity->ownerId,

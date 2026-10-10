@@ -26,7 +26,13 @@ final class DeletePublicAccessBlockHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $this->metadata->deletePublicAccessBlock($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->deletePublicAccessBlock($bucket),
+            $request,
+        );
 
         return new Response(status: 204);
     }

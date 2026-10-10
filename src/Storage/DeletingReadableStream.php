@@ -33,7 +33,16 @@ final class DeletingReadableStream implements \IteratorAggregate, ReadableStream
             return null;
         }
 
-        $chunk = $this->inner->read($cancellation);
+        try {
+            $chunk = $this->inner->read($cancellation);
+        } catch (\Throwable $error) {
+            try {
+                $this->close();
+            } catch (\Throwable) {
+                // Preserve the original read failure.
+            }
+            throw $error;
+        }
         if ($chunk === null) {
             $this->close();
         }
@@ -53,13 +62,15 @@ final class DeletingReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $this->closed = true;
-        $this->inner->close();
-        @unlink($this->path);
-
-        foreach ($this->onCloseCallbacks as $callback) {
-            $callback();
+        try {
+            $this->inner->close();
+        } finally {
+            @unlink($this->path);
+            foreach ($this->onCloseCallbacks as $callback) {
+                $callback();
+            }
+            $this->onCloseCallbacks = [];
         }
-        $this->onCloseCallbacks = [];
     }
 
     public function isClosed(): bool

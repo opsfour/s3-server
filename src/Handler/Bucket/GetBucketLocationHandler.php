@@ -36,6 +36,7 @@ final class GetBucketLocationHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Build the LocationConstraint XML response.
         // Per S3 spec: us-east-1 is represented as an empty LocationConstraint,

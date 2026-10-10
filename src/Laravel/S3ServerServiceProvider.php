@@ -14,6 +14,7 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -43,6 +44,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 region: $config['region'] ?? 'us-east-1',
                 storagePath: $config['storage']['path'] ?? storage_path('s3'),
                 storageTiers: $config['storage']['tiers'] ?? [],
+                allowUnfencedStorageForTests: $config['allow_unfenced_storage_for_tests'] ?? false,
                 metadataDriver: $config['metadata']['driver'] ?? 'sqlite',
                 metadataDsn: $config['metadata']['dsn'] ?? '',
                 tlsCertPath: $config['tls_cert_path'] ?? null,
@@ -50,9 +52,11 @@ class S3ServerServiceProvider extends ServiceProvider
                 maxConcurrentConnections: $config['max_connections'] ?? 10000,
                 connectionIdleTimeout: $config['connection_idle_timeout'] ?? 60,
                 requestBodySizeLimit: $config['body_size_limit'] ?? 5_368_709_120,
+                postSpoolBudgetBytes: $config['post_spool_budget'] ?? 10_737_418_240,
                 readTimeout: $config['read_timeout'] ?? 300,
                 writeTimeout: $config['write_timeout'] ?? 300,
                 perClientRateLimit: $config['rate_limit'] ?? 1000,
+                trustedProxyCidrs: TrustedProxyMiddleware::parseCidrs($config['trusted_proxy_cidrs'] ?? ''),
                 baseDomain: $config['base_domain'] ?? null,
                 strictBucketNaming: $config['strict_bucket_naming'] ?? true,
                 websiteHostPattern: $config['website_host_pattern'] ?? null,
@@ -62,6 +66,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 maxSelectObjectSize: $config['max_select_object_size'] ?? 268_435_456,
                 shutdownDrainTimeout: $config['shutdown_drain_timeout'] ?? 30,
                 notificationRequireHttps: $config['notifications']['require_https'] ?? true,
+                notificationWorkerEnabled: $config['notifications']['worker_enabled'] ?? true,
                 sqliteWorkerPoolSize: $config['parallel']['sqlite_workers'] ?? 0,
                 encryptionWorkerPoolSize: $config['parallel']['encryption_workers'] ?? 0,
                 selectWorkerPoolSize: $config['parallel']['select_workers'] ?? null,
@@ -118,10 +123,17 @@ class S3ServerServiceProvider extends ServiceProvider
                 $metadataConfig['driver'] ?? 'sqlite',
                 $metadataConfig,
                 metrics: $app->make(MetricsCollector::class),
+                migrate: ($metadataConfig['driver'] ?? 'sqlite') === 'sqlite',
             );
 
             // Wrap with TTL cache decorator if configured (default 5s).
-            $cacheTtl = (float) ($metadataConfig['cache_ttl'] ?? 5.0);
+            $cacheTtlValue = $metadataConfig['cache_ttl'] ?? 5.0;
+            if ((! is_int($cacheTtlValue) && ! is_float($cacheTtlValue) && ! is_string($cacheTtlValue))
+                || ! is_numeric($cacheTtlValue)
+                || ! is_finite($cacheTtl = (float) $cacheTtlValue)
+                || $cacheTtl < 0.0) {
+                throw new \InvalidArgumentException('Metadata cache TTL must be a finite number >= 0.');
+            }
             if ($cacheTtl > 0) {
                 $store = new CachedMetadataStoreDecorator($store, $cacheTtl);
             }
@@ -159,6 +171,11 @@ class S3ServerServiceProvider extends ServiceProvider
      */
     private static function resolveLaravelStorageServices(array &$storageConfig, mixed $app): void
     {
+        $filesystemService = $storageConfig['filesystem_service'] ?? null;
+        if (is_string($filesystemService) && $filesystemService !== '') {
+            $storageConfig['filesystem'] = $app->make($filesystemService);
+        }
+
         $factoryService = $storageConfig['filesystem_factory_service'] ?? null;
         if (is_string($factoryService) && $factoryService !== '') {
             $storageConfig['filesystem_factory'] = $app->make($factoryService);

@@ -27,6 +27,17 @@ final class PolicyDocumentValidator
 
     public static function validateBucketPolicy(string $policyJson): void
     {
+        self::validate($policyJson, false);
+    }
+
+    /** Validate an account or named policy, where Principal may be omitted. */
+    public static function validateIdentityPolicy(string $policyJson): void
+    {
+        self::validate($policyJson, true);
+    }
+
+    private static function validate(string $policyJson, bool $identityPolicy): void
+    {
         try {
             $policy = json_decode($policyJson, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException) {
@@ -48,7 +59,7 @@ final class PolicyDocumentValidator
         $statements = array_is_list($policy['Statement'])
             ? $policy['Statement']
             : [$policy['Statement']];
-        if ($statements === []) {
+        if ($statements === [] && ! $identityPolicy) {
             throw new MalformedPolicyException('Policy Statement list must not be empty.');
         }
 
@@ -57,14 +68,14 @@ final class PolicyDocumentValidator
                 throw new MalformedPolicyException("Policy Statement {$index} must be a JSON object.");
             }
 
-            self::validateStatement($statement, $index);
+            self::validateStatement($statement, $index, $identityPolicy);
         }
     }
 
     /**
      * @param array<string, mixed> $statement
      */
-    private static function validateStatement(array $statement, int $index): void
+    private static function validateStatement(array $statement, int $index, bool $identityPolicy): void
     {
         self::rejectUnknownFields($statement, self::STATEMENT_FIELDS, "Statement {$index}");
         self::optionalString($statement, 'Sid', "Statement {$index} Sid");
@@ -73,11 +84,13 @@ final class PolicyDocumentValidator
             throw new MalformedPolicyException("Statement {$index} Effect must be Allow or Deny.");
         }
 
-        self::requireExactlyOne($statement, 'Principal', 'NotPrincipal', $index);
+        if (! $identityPolicy || array_key_exists('Principal', $statement) || array_key_exists('NotPrincipal', $statement)) {
+            self::requireExactlyOne($statement, 'Principal', 'NotPrincipal', $index);
+            self::validatePrincipal($statement[array_key_exists('Principal', $statement) ? 'Principal' : 'NotPrincipal'], $index);
+        }
         self::requireExactlyOne($statement, 'Action', 'NotAction', $index);
         self::requireExactlyOne($statement, 'Resource', 'NotResource', $index);
 
-        self::validatePrincipal($statement[array_key_exists('Principal', $statement) ? 'Principal' : 'NotPrincipal'], $index);
         self::validateStringOrList($statement[array_key_exists('Action', $statement) ? 'Action' : 'NotAction'], "Statement {$index} action");
         self::validateStringOrList($statement[array_key_exists('Resource', $statement) ? 'Resource' : 'NotResource'], "Statement {$index} resource");
 
@@ -150,13 +163,21 @@ final class PolicyDocumentValidator
                     throw new MalformedPolicyException("Statement {$index} Condition keys must be non-empty strings.");
                 }
 
-                self::validateConditionValue($expected, $index, $key);
+                if (!PolicyEvaluator::supportsCondition($operator, $key)) {
+                    throw new MalformedPolicyException("Statement {$index} uses unsupported Condition operator or key: {$operator}/{$key}.");
+                }
+
+                self::validateConditionValue($operator, $expected, $index, $key);
             }
         }
     }
 
-    private static function validateConditionValue(mixed $value, int $index, string $key): void
+    private static function validateConditionValue(string $operator, mixed $value, int $index, string $key): void
     {
+        if (!PolicyEvaluator::supportsConditionValue($operator, $value)) {
+            throw new MalformedPolicyException("Statement {$index} Condition '{$key}' has an invalid {$operator} value.");
+        }
+
         if (is_scalar($value)) {
             return;
         }

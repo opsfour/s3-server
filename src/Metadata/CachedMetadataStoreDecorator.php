@@ -12,15 +12,15 @@ use OpsFour\S3Server\Quota\QuotaConfig;
 /**
  * TTL cache decorator for MetadataStore.
  *
- * Caches read-only bucket-level configuration that changes rarely
- * (owner, policy, CORS, PAB, encryption). Object-level data, listings,
- * and multipart operations are NOT cached.
+ * Caches CORS configuration only. Authorization, encryption, and versioning
+ * state must be read from the shared store so a change on another server is
+ * effective on the next request.
  *
  * Write operations invalidate the relevant cache entries immediately.
- * The cache is per-process — multi-server deployments see up to TTL
- * seconds of staleness for cross-server changes.
+ * The CORS cache is per-process and can remain stale for up to the TTL after
+ * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore
+final class CachedMetadataStoreDecorator implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -34,8 +34,8 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         private readonly float $ttlSeconds = 5.0,
         private readonly int $maxCacheEntries = self::MAX_CACHE_ENTRIES,
     ) {
-        if ($ttlSeconds < 0.0) {
-            throw new \InvalidArgumentException('Metadata cache TTL must be >= 0 seconds.');
+        if (! is_finite($ttlSeconds) || $ttlSeconds < 0.0) {
+            throw new \InvalidArgumentException('Metadata cache TTL must be finite and >= 0 seconds.');
         }
         if ($maxCacheEntries < 1) {
             throw new \InvalidArgumentException('Metadata cache entry limit must be >= 1.');
@@ -53,7 +53,22 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketOwner(string $bucket): ?string
     {
-        return $this->cached("owner:{$bucket}", fn() => $this->inner->getBucketOwner($bucket));
+        return $this->inner->getBucketOwner($bucket);
+    }
+
+    public function getBucketOwnershipControls(string $bucket): ?string
+    {
+        return $this->inner->getBucketOwnershipControls($bucket);
+    }
+
+    public function putBucketOwnershipControls(string $bucket, string $objectOwnership): void
+    {
+        $this->inner->putBucketOwnershipControls($bucket, $objectOwnership);
+    }
+
+    public function deleteBucketOwnershipControls(string $bucket): void
+    {
+        $this->inner->deleteBucketOwnershipControls($bucket);
     }
 
     public function bucketExists(string $bucket): bool
@@ -63,17 +78,22 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketPolicy(string $bucket): ?string
     {
-        return $this->cached("policy:{$bucket}", fn() => $this->inner->getBucketPolicy($bucket));
+        return $this->inner->getBucketPolicy($bucket);
     }
 
     public function getAccountPolicy(string $ownerId): ?string
     {
-        return $this->cached("account-policy:{$ownerId}", fn() => $this->inner->getAccountPolicy($ownerId));
+        return $this->inner->getAccountPolicy($ownerId);
     }
 
     public function getNamedPolicy(string $policyName): ?string
     {
-        return $this->cached("named-policy:{$policyName}", fn() => $this->inner->getNamedPolicy($policyName));
+        return $this->inner->getNamedPolicy($policyName);
+    }
+
+    public function lockNamedPoliciesForUpdate(array $policyNames): array
+    {
+        return $this->inner->lockNamedPoliciesForUpdate($policyNames);
     }
 
     public function getBucketCors(string $bucket): array
@@ -83,12 +103,12 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getPublicAccessBlock(string $bucket): ?array
     {
-        return $this->cached("pab:{$bucket}", fn() => $this->inner->getPublicAccessBlock($bucket));
+        return $this->inner->getPublicAccessBlock($bucket);
     }
 
     public function getBucketEncryption(string $bucket): ?array
     {
-        return $this->cached("enc:{$bucket}", fn() => $this->inner->getBucketEncryption($bucket));
+        return $this->inner->getBucketEncryption($bucket);
     }
 
     // ---------------------------------------------------------------
@@ -110,13 +130,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function putBucketPolicy(string $bucket, string $policyJson): void
     {
         $this->inner->putBucketPolicy($bucket, $policyJson);
-        $this->invalidate("policy:{$bucket}");
     }
 
     public function deleteBucketPolicy(string $bucket): void
     {
         $this->inner->deleteBucketPolicy($bucket);
-        $this->invalidate("policy:{$bucket}");
     }
 
     public function putBucketCors(string $bucket, array $rules): void
@@ -134,25 +152,21 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function putPublicAccessBlock(string $bucket, bool $blockPublicAcls, bool $ignorePublicAcls, bool $blockPublicPolicy, bool $restrictPublicBuckets): void
     {
         $this->inner->putPublicAccessBlock($bucket, $blockPublicAcls, $ignorePublicAcls, $blockPublicPolicy, $restrictPublicBuckets);
-        $this->invalidate("pab:{$bucket}");
     }
 
     public function deletePublicAccessBlock(string $bucket): void
     {
         $this->inner->deletePublicAccessBlock($bucket);
-        $this->invalidate("pab:{$bucket}");
     }
 
     public function putBucketEncryption(string $bucket, string $sseAlgorithm, ?string $kmsMasterKeyId = null, bool $bucketKeyEnabled = false): void
     {
         $this->inner->putBucketEncryption($bucket, $sseAlgorithm, $kmsMasterKeyId, $bucketKeyEnabled);
-        $this->invalidate("enc:{$bucket}");
     }
 
     public function deleteBucketEncryption(string $bucket): void
     {
         $this->inner->deleteBucketEncryption($bucket);
-        $this->invalidate("enc:{$bucket}");
     }
 
     // ---------------------------------------------------------------
@@ -179,6 +193,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->getBucketStorageStats($bucket);
     }
 
+    public function getOwnerStorageStats(string $ownerId): array
+    {
+        return $this->inner->getOwnerStorageStats($ownerId);
+    }
+
     public function getAccountQuota(string $ownerId): ?QuotaConfig
     {
         return $this->inner->getAccountQuota($ownerId);
@@ -187,6 +206,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function listAccountQuotas(): array
     {
         return $this->inner->listAccountQuotas();
+    }
+
+    public function listAccountQuotasPage(?string $after, int $limit): array
+    {
+        return $this->inner->listAccountQuotasPage($after, $limit);
     }
 
     public function putAccountQuota(string $ownerId, QuotaConfig $quota): void
@@ -202,30 +226,36 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function putAccountPolicy(string $ownerId, string $policyJson): void
     {
         $this->inner->putAccountPolicy($ownerId, $policyJson);
-        $this->invalidate("account-policy:{$ownerId}");
     }
 
     public function deleteAccountPolicy(string $ownerId): void
     {
         $this->inner->deleteAccountPolicy($ownerId);
-        $this->invalidate("account-policy:{$ownerId}");
     }
 
     public function putNamedPolicy(string $policyName, string $policyJson): void
     {
         $this->inner->putNamedPolicy($policyName, $policyJson);
-        $this->invalidate("named-policy:{$policyName}");
     }
 
     public function deleteNamedPolicy(string $policyName): void
     {
         $this->inner->deleteNamedPolicy($policyName);
-        $this->invalidate("named-policy:{$policyName}");
     }
 
     public function listBuckets(string $ownerId): array
     {
         return $this->inner->listBuckets($ownerId);
+    }
+
+    public function countBuckets(string $ownerId): int
+    {
+        return $this->inner->countBuckets($ownerId);
+    }
+
+    public function listBucketsPage(string $ownerId, ?string $after, ?string $prefix, ?string $region, int $maxBuckets): array
+    {
+        return $this->inner->listBucketsPage($ownerId, $after, $prefix, $region, $maxBuckets);
     }
 
     public function listAllBuckets(): array
@@ -257,6 +287,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
     {
         return $this->inner->getObjectMetadata($bucket, $key);
+    }
+
+    public function getCurrentObjectVersion(string $bucket, string $key): ?ObjectInfo
+    {
+        return $this->inner->getCurrentObjectVersion($bucket, $key);
     }
 
     public function deleteObjectMetadata(string $bucket, string $key): void
@@ -294,6 +329,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->updateObjectRestoreState($bucket, $key, $versionId, $restoreStatus, $restoredStoragePath, $restoreExpiresAt);
     }
 
+    public function updateObjectRestoreStateWithTier(string $bucket, string $key, ?string $versionId, ?string $restoreStatus, ?string $restoredStoragePath = null, ?\DateTimeImmutable $restoreExpiresAt = null, ?string $restoredStorageTier = null): void
+    {
+        if (! $this->inner instanceof RestoredCopyTierStore) {
+            throw new \LogicException('Metadata backend does not support pinned restored-copy tiers.');
+        }
+        $this->inner->updateObjectRestoreStateWithTier($bucket, $key, $versionId, $restoreStatus, $restoredStoragePath, $restoreExpiresAt, $restoredStorageTier);
+    }
+
     public function countObjects(string $bucket): int
     {
         return $this->inner->countObjects($bucket);
@@ -313,6 +356,196 @@ final class CachedMetadataStoreDecorator implements MetadataStore
     public function createMultipartUpload(string $uploadId, string $bucket, string $key, string $ownerId, ?string $contentType = null, array $userMetadata = []): void
     {
         $this->inner->createMultipartUpload($uploadId, $bucket, $key, $ownerId, $contentType, $userMetadata);
+    }
+
+    public function createMultipartUploadWithTier(string $uploadId, string $bucket, string $key, string $ownerId, string $storageTier, ?string $contentType = null, array $userMetadata = []): void
+    {
+        if (! $this->inner instanceof MultipartUploadTierStore) {
+            throw new \LogicException('Metadata backend does not support pinned multipart upload tiers.');
+        }
+        $this->inner->createMultipartUploadWithTier($uploadId, $bucket, $key, $ownerId, $storageTier, $contentType, $userMetadata);
+    }
+
+    public function createMultipartWriteIntent(MultipartWriteIntent $intent): void
+    {
+        $this->intentStore()->createMultipartWriteIntent($intent);
+    }
+
+    public function multipartWriteIntentNow(): float
+    {
+        return $this->intentStore()->multipartWriteIntentNow();
+    }
+
+    public function getMultipartWriteIntent(string $attemptId): ?MultipartWriteIntent
+    {
+        return $this->intentStore()->getMultipartWriteIntent($attemptId);
+    }
+
+    public function renewMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $newLeaseUntil): bool
+    {
+        return $this->intentStore()->renewMultipartWriteIntent($attemptId, $expectedLeaseUntil, $newLeaseUntil);
+    }
+
+    public function abandonMultipartWriteIntent(string $attemptId, float $nextAttemptAt): bool
+    {
+        return $this->intentStore()->abandonMultipartWriteIntent($attemptId, $nextAttemptAt);
+    }
+
+    public function abandonMultipartWriteIntentsForUpload(string $uploadId, float $nextAttemptAt): int
+    {
+        return $this->intentStore()->abandonMultipartWriteIntentsForUpload($uploadId, $nextAttemptAt);
+    }
+
+    public function consumeMultipartWriteIntent(string $attemptId): bool
+    {
+        return $this->intentStore()->consumeMultipartWriteIntent($attemptId);
+    }
+
+    public function armMultipartWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $newLeaseUntil): bool
+    {
+        if (! $this->inner instanceof LocalMultipartCompletionIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support local multipart completion fencing.');
+        }
+
+        return $this->inner->armMultipartWriteIntent($attemptId, $dispatchId, $expectedLeaseUntil, $newLeaseUntil);
+    }
+
+    public function retireLocalMultipartWriteIntentBeforeDispatch(string $attemptId, string $dispatchId): bool
+    {
+        if (! $this->inner instanceof LocalMultipartCompletionIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support local multipart completion fencing.');
+        }
+
+        return $this->inner->retireLocalMultipartWriteIntentBeforeDispatch($attemptId, $dispatchId);
+    }
+
+    public function retireDueUndispatchedLocalMultipartWriteIntents(string $storageTier, int $limit): int
+    {
+        if (! $this->inner instanceof LocalMultipartCompletionIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support local multipart completion fencing.');
+        }
+
+        return $this->inner->retireDueUndispatchedLocalMultipartWriteIntents($storageTier, $limit);
+    }
+
+    public function consumeMultipartWriteIntentWithDispatch(string $attemptId, string $dispatchId): bool
+    {
+        if (! $this->inner instanceof LocalMultipartCompletionIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support local multipart completion fencing.');
+        }
+
+        return $this->inner->consumeMultipartWriteIntentWithDispatch($attemptId, $dispatchId);
+    }
+
+    public function claimDueMultipartWriteIntents(int $limit, float $now, float $leaseUntil): array
+    {
+        return $this->intentStore()->claimDueMultipartWriteIntents($limit, $now, $leaseUntil);
+    }
+
+    public function retryMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $nextAttemptAt): bool
+    {
+        return $this->intentStore()->retryMultipartWriteIntent($attemptId, $expectedLeaseUntil, $nextAttemptAt);
+    }
+
+    public function renewMultipartCollectorClaim(string $attemptId, float $newLeaseUntil, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        if (! $this->inner instanceof FencedMultipartWriteIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support fenced multipart collector claims.');
+        }
+
+        return $this->inner->renewMultipartCollectorClaim($attemptId, $newLeaseUntil, $expectedLeaseUntil, $claimGeneration);
+    }
+
+    public function retryMultipartCollectorClaim(string $attemptId, float $nextAttemptAt, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        if (! $this->inner instanceof FencedMultipartWriteIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support fenced multipart collector claims.');
+        }
+
+        return $this->inner->retryMultipartCollectorClaim($attemptId, $nextAttemptAt, $expectedLeaseUntil, $claimGeneration);
+    }
+
+    private function intentStore(): MultipartWriteIntentStore
+    {
+        if (! $this->inner instanceof MultipartWriteIntentStore) {
+            throw new \LogicException('Metadata backend does not support durable multipart write intents.');
+        }
+
+        return $this->inner;
+    }
+
+    public function reserveObjectWriteIntent(ObjectWriteIntent $intent, float $leaseSeconds): ObjectWriteIntent
+    {
+        return $this->objectIntentStore()->reserveObjectWriteIntent($intent, $leaseSeconds);
+    }
+
+    public function getObjectWriteIntent(string $attemptId): ?ObjectWriteIntent
+    {
+        return $this->objectIntentStore()->getObjectWriteIntent($attemptId);
+    }
+
+    public function renewObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->objectIntentStore()->renewObjectWriteIntent($attemptId, $expectedLeaseUntil, $leaseSeconds);
+    }
+
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->objectIntentStore()->armObjectWriteIntent($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds);
+    }
+
+    public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->objectIntentStore()->retireUndispatchedObjectWriteIntent($attemptId);
+    }
+
+    public function retireTerminalPreLinkObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->objectIntentStore()->retireTerminalPreLinkObjectWriteIntent($attemptId, $dispatchId);
+    }
+
+    public function consumeObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->objectIntentStore()->consumeObjectWriteIntent($attemptId);
+    }
+
+    public function consumeArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->objectIntentStore()->consumeArmedObjectWriteIntent($attemptId, $dispatchId);
+    }
+
+    public function abandonObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->objectIntentStore()->abandonObjectWriteIntent($attemptId);
+    }
+
+    public function claimDueObjectWriteIntents(string $storageTier, int $limit, float $leaseSeconds): array
+    {
+        return $this->objectIntentStore()->claimDueObjectWriteIntents($storageTier, $limit, $leaseSeconds);
+    }
+
+    public function retireExpiredUndispatchedObjectWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->objectIntentStore()->retireExpiredUndispatchedObjectWriteIntents($storageTier, $limit);
+    }
+
+    public function renewObjectWriteClaim(string $attemptId, int $claimGeneration, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->objectIntentStore()->renewObjectWriteClaim($attemptId, $claimGeneration, $expectedLeaseUntil, $leaseSeconds);
+    }
+
+    public function sealObjectWriteIntent(string $attemptId, int $claimGeneration): bool
+    {
+        return $this->objectIntentStore()->sealObjectWriteIntent($attemptId, $claimGeneration);
+    }
+
+    private function objectIntentStore(): ObjectWriteIntentStore
+    {
+        if (! $this->inner instanceof ObjectWriteIntentStore) {
+            throw new \LogicException('Metadata backend does not support durable object write intents.');
+        }
+
+        return $this->inner;
     }
 
     public function getMultipartUpload(string $uploadId): ?array
@@ -336,7 +569,22 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->listMultipartUploads($bucket, $prefix, $delimiter, $maxUploads, $keyMarker, $uploadIdMarker);
     }
 
-    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array
+    public function listMultipartUploadsForBucket(
+        BucketInfo $bucket,
+        ?string $prefix = null,
+        ?string $delimiter = null,
+        int $maxUploads = 1000,
+        ?string $keyMarker = null,
+        ?string $uploadIdMarker = null,
+    ): array {
+        if (! $this->inner instanceof GenerationBoundMultipartListingStore) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('Generation-bound multipart listing is unavailable for this metadata backend.');
+        }
+
+        return $this->inner->listMultipartUploadsForBucket($bucket, $prefix, $delimiter, $maxUploads, $keyMarker, $uploadIdMarker);
+    }
+
+    public function getMultipartStorageStats(?string $ownerId, ?string $bucket = null): array
     {
         return $this->inner->getMultipartStorageStats($ownerId, $bucket);
     }
@@ -346,9 +594,41 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->putPart($uploadId, $partNumber, $etag, $size, $storagePath);
     }
 
+    public function supportsMultipartPartChecksums(): bool
+    {
+        return $this->inner instanceof MultipartPartChecksumStore
+            && $this->inner->supportsMultipartPartChecksums();
+    }
+
+    public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
+    {
+        $inner = $this->inner;
+        if (! $inner instanceof MultipartPartChecksumStore || ! $inner->supportsMultipartPartChecksums()) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('Multipart part checksum persistence is unavailable.');
+        }
+        $inner->putPartWithChecksum($uploadId, $partNumber, $etag, $size, $storagePath, $checksumAlgorithm, $checksumValue);
+    }
+
     public function getParts(string $uploadId): array
     {
         return $this->inner->getParts($uploadId);
+    }
+
+    public function listPartsPage(string $uploadId, int $afterPartNumber, int $limit): array
+    {
+        if ($this->inner instanceof PagedMultipartPartsStore) {
+            return $this->inner->listPartsPage($uploadId, $afterPartNumber, $limit);
+        }
+        if ($limit < 1 || $limit > 1001) {
+            throw new \InvalidArgumentException('Multipart part page limit must be between 1 and 1001.');
+        }
+
+        $parts = array_values(array_filter(
+            $this->inner->getParts($uploadId),
+            static fn(array $part): bool => $part['part_number'] > $afterPartNumber,
+        ));
+
+        return array_slice($parts, 0, $limit);
     }
 
     public function deleteParts(string $uploadId): void
@@ -358,13 +638,12 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function getBucketVersioning(string $bucket): string
     {
-        return $this->cached("ver:{$bucket}", fn() => $this->inner->getBucketVersioning($bucket));
+        return $this->inner->getBucketVersioning($bucket);
     }
 
     public function setBucketVersioning(string $bucket, string $status): void
     {
         $this->inner->setBucketVersioning($bucket, $status);
-        $this->invalidate("ver:{$bucket}");
     }
 
     public function putObjectVersioned(
@@ -489,6 +768,11 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->getBucketLifecycle($bucket);
     }
 
+    public function listReferencedStorageTiers(): array
+    {
+        return $this->inner->listReferencedStorageTiers();
+    }
+
     public function putBucketLifecycle(string $bucket, array $rules): void
     {
         $this->inner->putBucketLifecycle($bucket, $rules);
@@ -508,6 +792,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         string $targetStorageClass,
         string $sourceStoragePath,
         int $maxAttempts = 10,
+        string $origin = 'direct',
+        ?string $lifecycleRuleId = null,
+        ?bool $expectedIsLatest = null,
     ): int {
         return $this->inner->enqueueTierTransitionJob(
             $bucket,
@@ -518,6 +805,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore
             $targetStorageClass,
             $sourceStoragePath,
             $maxAttempts,
+            $origin,
+            $lifecycleRuleId,
+            $expectedIsLatest,
         );
     }
 
@@ -533,13 +823,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $targetStoragePath = null,
-    ): void {
-        $this->inner->updateTierTransitionJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->inner->updateTierTransitionJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath, $expectedLeaseExpiresAt);
     }
 
-    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        return $this->inner->renewTierTransitionJobLease($id, $leaseExpiresAt);
+        return $this->inner->renewTierTransitionJobLease($id, $leaseExpiresAt, $expectedLeaseExpiresAt);
     }
 
     public function getTierTransitionJob(int $id): ?array
@@ -571,13 +862,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $restoredStoragePath = null,
-    ): void {
-        $this->inner->updateRestoreJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->inner->updateRestoreJobStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath, $expectedLeaseExpiresAt);
     }
 
-    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        return $this->inner->renewRestoreJobLease($id, $leaseExpiresAt);
+        return $this->inner->renewRestoreJobLease($id, $leaseExpiresAt, $expectedLeaseExpiresAt);
     }
 
     public function getRestoreJob(int $id): ?array
@@ -698,8 +990,13 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         string $destinationUrl,
         string $payloadJson,
         int $maxAttempts = 10,
-    ): void {
-        $this->inner->enqueueNotification($bucket, $key, $eventName, $destinationUrl, $payloadJson, $maxAttempts);
+    ): int {
+        return $this->inner->enqueueNotification($bucket, $key, $eventName, $destinationUrl, $payloadJson, $maxAttempts);
+    }
+
+    public function updateNotificationPayload(int $id, string $payloadJson): void
+    {
+        $this->inner->updateNotificationPayload($id, $payloadJson);
     }
 
     public function dequeueNotifications(int $limit): array
@@ -712,14 +1009,29 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->getNotificationQueueStats();
     }
 
+    public function getMultipartCompletionIntentCount(): ?int
+    {
+        return $this->inner instanceof MultipartCompletionCapacityReader
+            ? $this->inner->getMultipartCompletionIntentCount()
+            : null;
+    }
+
+    public function getWriteIntentCapacityCounts(): ?array
+    {
+        return $this->inner instanceof WriteIntentCapacityReader
+            ? $this->inner->getWriteIntentCapacityCounts()
+            : null;
+    }
+
     public function updateNotificationStatus(
         int $id,
         string $status,
         ?string $error = null,
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
-    ): void {
-        $this->inner->updateNotificationStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts);
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        return $this->inner->updateNotificationStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $expectedLeaseExpiresAt);
     }
 
     public function cleanupOldNotifications(int $maxAgeSeconds): void
@@ -732,6 +1044,107 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath);
     }
 
+    public function createMultipartPartWriteIntent(
+        string $bucket,
+        string $bucketGeneration,
+        string $storageTier,
+        string $uploadId,
+        string $storagePath,
+    ): void {
+        $store = $this->inner;
+        if (! $store instanceof MultipartPartWriteIntentStore) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart part write intents are unavailable.');
+        }
+        $store->createMultipartPartWriteIntent($bucket, $bucketGeneration, $storageTier, $uploadId, $storagePath);
+    }
+
+    public function consumeMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath): bool
+    {
+        $store = $this->inner;
+        if (! $store instanceof MultipartPartWriteIntentStore) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart part write intents are unavailable.');
+        }
+
+        return $store->consumeMultipartPartWriteIntent($bucket, $uploadId, $storagePath);
+    }
+
+    public function reserveLocalMultipartPartWriteIntent(string $bucket, string $bucketGeneration, string $storageTier, string $uploadId, string $storagePath): void
+    {
+        $this->fencedPartStore()->reserveLocalMultipartPartWriteIntent($bucket, $bucketGeneration, $storageTier, $uploadId, $storagePath);
+    }
+
+    public function canSealLocalMultipartPartClaim(int $garbageId, string $storagePath, int $leaseGeneration): bool
+    {
+        if (! $this->inner instanceof LocalMultipartPartSealGuard) {
+            return false;
+        }
+
+        return $this->inner->canSealLocalMultipartPartClaim($garbageId, $storagePath, $leaseGeneration);
+    }
+
+    public function armLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->fencedPartStore()->armLocalMultipartPartWriteIntent($bucket, $uploadId, $storagePath, $dispatchId);
+    }
+
+    public function consumeLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->fencedPartStore()->consumeLocalMultipartPartWriteIntent($bucket, $uploadId, $storagePath, $dispatchId);
+    }
+
+    public function retireUndispatchedLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath): bool
+    {
+        return $this->fencedPartStore()->retireUndispatchedLocalMultipartPartWriteIntent($bucket, $uploadId, $storagePath);
+    }
+
+    public function retireTerminalLocalMultipartPartWriteIntent(string $bucket, string $uploadId, string $storagePath, string $dispatchId): bool
+    {
+        return $this->fencedPartStore()->retireTerminalLocalMultipartPartWriteIntent($bucket, $uploadId, $storagePath, $dispatchId);
+    }
+
+    public function retireExpiredUndispatchedLocalMultipartPartWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->fencedPartStore()->retireExpiredUndispatchedLocalMultipartPartWriteIntents($storageTier, $limit);
+    }
+
+    public function assertNoLegacyLocalMultipartIntents(string $storageTier): void
+    {
+        if (! $this->inner instanceof LocalMultipartFenceAdmissionStore) {
+            throw new \LogicException('Inner metadata store lacks local multipart fence admission.');
+        }
+        $this->inner->assertNoLegacyLocalMultipartIntents($storageTier);
+    }
+
+    public function assertNoUnsafeRecursiveCleanup(string $storageTier): void
+    {
+        if (! $this->inner instanceof RecursiveCleanupAdmissionStore) {
+            throw new \LogicException('Inner metadata store lacks recursive cleanup admission.');
+        }
+        $this->inner->assertNoUnsafeRecursiveCleanup($storageTier);
+    }
+
+    private function fencedPartStore(): FencedMultipartPartWriteIntentStore
+    {
+        if (! $this->inner instanceof FencedMultipartPartWriteIntentStore) {
+            throw new \LogicException('Wrapped metadata store does not support local multipart part fencing.');
+        }
+
+        return $this->inner;
+    }
+
+    public function stageBucketMultipartCleanup(string $bucket, string $storageTier): void
+    {
+        $this->inner->stageBucketMultipartCleanup($bucket, $storageTier);
+    }
+
+    public function stageBucketMultipartCleanupForBucket(BucketInfo $bucket, string $storageTier): void
+    {
+        if (! $this->inner instanceof GenerationBoundBucketMultipartCleanupStore) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('Generation-bound multipart cleanup is unavailable for this metadata backend.');
+        }
+        $this->inner->stageBucketMultipartCleanupForBucket($bucket, $storageTier);
+    }
+
     public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
         $this->inner->discardStorageGarbage($bucket, $storageTier, $storagePath);
@@ -742,14 +1155,75 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         return $this->inner->dequeueStorageGarbage($limit);
     }
 
-    public function completeStorageGarbage(int $id): void
+    public function completeStorageGarbage(int $id, ?float $expectedLeaseExpiresAt = null): bool
     {
-        $this->inner->completeStorageGarbage($id);
+        return $this->inner->completeStorageGarbage($id, $expectedLeaseExpiresAt);
     }
 
-    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt, ?float $expectedLeaseExpiresAt = null): bool
     {
-        $this->inner->retryStorageGarbage($id, $error, $nextAttemptAt);
+        return $this->inner->retryStorageGarbage($id, $error, $nextAttemptAt, $expectedLeaseExpiresAt);
+    }
+
+    public function completeStorageGarbageLease(int $id, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        if (! $this->inner instanceof FencedStorageGarbageStore) {
+            throw new \LogicException('Wrapped metadata store does not support garbage claim generations.');
+        }
+
+        return $this->inner->completeStorageGarbageLease($id, $leaseExpiresAt, $leaseGeneration);
+    }
+
+    public function retryStorageGarbageLease(int $id, string $error, float $nextAttemptAt, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        if (! $this->inner instanceof FencedStorageGarbageStore) {
+            throw new \LogicException('Wrapped metadata store does not support garbage claim generations.');
+        }
+
+        return $this->inner->retryStorageGarbageLease($id, $error, $nextAttemptAt, $leaseExpiresAt, $leaseGeneration);
+    }
+
+    public function renewStorageGarbageLease(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        if (! $this->inner instanceof StorageGarbageLeaseStore) {
+            throw new \LogicException('Wrapped metadata store does not support garbage claim renewal.');
+        }
+
+        return $this->inner->renewStorageGarbageLease($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration);
+    }
+
+    private function fencedQueueStore(): FencedQueueStore
+    {
+        if (! $this->inner instanceof FencedQueueStore) {
+            throw new \LogicException('Wrapped metadata store does not support queue claim generations.');
+        }
+
+        return $this->inner;
+    }
+
+    public function updateNotificationStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->fencedQueueStore()->updateNotificationStatusLease($id, $status, $error, $nextAttemptAt, $incrementAttempts, $leaseExpiresAt, $leaseGeneration);
+    }
+
+    public function updateTierTransitionJobStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, ?string $targetStoragePath, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->fencedQueueStore()->updateTierTransitionJobStatusLease($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath, $leaseExpiresAt, $leaseGeneration);
+    }
+
+    public function renewTierTransitionJobLeaseFenced(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->fencedQueueStore()->renewTierTransitionJobLeaseFenced($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration);
+    }
+
+    public function updateRestoreJobStatusLease(int $id, string $status, ?string $error, ?float $nextAttemptAt, bool $incrementAttempts, ?string $restoredStoragePath, float $leaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->fencedQueueStore()->updateRestoreJobStatusLease($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath, $leaseExpiresAt, $leaseGeneration);
+    }
+
+    public function renewRestoreJobLeaseFenced(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool
+    {
+        return $this->fencedQueueStore()->renewRestoreJobLeaseFenced($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration);
     }
 
     public function beginTransaction(): void
@@ -759,7 +1233,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     public function commit(): void
     {
-        $this->inner->commit();
+        try {
+            $this->inner->commit();
+        } catch (\Throwable $error) {
+            // The transaction outcome can be unknown; no value read inside it
+            // is safe to retain in the process cache.
+            $this->clearCache();
+            throw $error;
+        }
     }
 
     public function rollback(): void
@@ -794,6 +1275,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     /**
      * @template T
+     *
      * @param  string  $key  Cache key.
      * @param  callable(): T  $loader  Callback to load on cache miss.
      * @return T
@@ -809,7 +1291,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
         $value = $loader();
 
         // Enforce hard cap to prevent memory exhaustion.
-        if ($this->cacheSize >= $this->maxCacheEntries && !isset($this->cache[$key])) {
+        if ($this->cacheSize >= $this->maxCacheEntries && ! isset($this->cache[$key])) {
             $this->evictExpired($now);
             if ($this->cacheSize >= $this->maxCacheEntries) {
                 $oldest = array_key_first($this->cache);
@@ -820,7 +1302,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
             }
         }
 
-        if (!isset($this->cache[$key])) {
+        if (! isset($this->cache[$key])) {
             $this->cacheSize++;
         }
 
@@ -842,11 +1324,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore
 
     private function invalidateBucket(string $bucket): void
     {
-        $prefixes = ["owner:{$bucket}", "policy:{$bucket}", "cors:{$bucket}", "pab:{$bucket}", "enc:{$bucket}", "ver:{$bucket}"];
-
-        foreach ($prefixes as $key) {
-            $this->invalidate($key);
-        }
+        $this->invalidate("cors:{$bucket}");
     }
 
     private function evictExpired(float $now): void

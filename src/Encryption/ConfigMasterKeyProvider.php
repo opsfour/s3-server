@@ -48,7 +48,9 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
             }
 
             $this->keys = $keys;
-            $this->activeKeyId = array_key_first($keys);
+            // PHP turns numeric string array keys into integers during JSON
+            // decoding and array insertion. Keep the public key ID a string.
+            $this->activeKeyId = (string) array_key_first($keys);
 
             return;
         }
@@ -81,5 +83,33 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
     public function getMasterKeyById(string $keyId): string
     {
         return $this->keys[$keyId] ?? throw new \RuntimeException("Unknown key ID: {$keyId}");
+    }
+
+    /** @internal Compare worker keyrings without sending master keys over IPC. */
+    public function keyringFingerprint(): string
+    {
+        $hash = hash_init('sha256');
+        hash_update($hash, "opsfour-s3-config-keyring-v1\0");
+        hash_update($hash, pack('N', strlen($this->activeKeyId)) . $this->activeKeyId);
+        $keys = $this->keys;
+        ksort($keys, SORT_STRING);
+        foreach ($keys as $keyId => $key) {
+            $id = (string) $keyId;
+            hash_update($hash, pack('N', strlen($id)) . $id . pack('N', strlen($key)) . $key);
+        }
+
+        return hash_final($hash);
+    }
+
+    /** @internal Explicit constructor keys may differ from a child process's inherited environment. */
+    public function matchesCurrentEnvironmentKeyring(): bool
+    {
+        try {
+            $environment = new self();
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return hash_equals($this->keyringFingerprint(), $environment->keyringFingerprint());
     }
 }

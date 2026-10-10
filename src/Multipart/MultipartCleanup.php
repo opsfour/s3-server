@@ -4,12 +4,24 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Multipart;
 
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
 
 final class MultipartCleanup
 {
+    /** @param array<string, mixed> $upload */
+    public static function pinnedStorageTier(array $upload): string
+    {
+        $storageTier = $upload['storage_tier'] ?? null;
+        if (! is_string($storageTier) || $storageTier === '') {
+            throw new InternalErrorException('Multipart upload has no pinned storage tier.');
+        }
+
+        return $storageTier;
+    }
+
     /**
      * Atomically consumes an upload and persists cleanup work.
      *
@@ -24,6 +36,7 @@ final class MultipartCleanup
         string $uploadId,
         string $ownerId,
         string $storageTier,
+        ?string $bucketGeneration = null,
     ): array {
         $upload = $metadata->getMultipartUpload($uploadId);
         if (
@@ -33,6 +46,12 @@ final class MultipartCleanup
             || $upload['owner_id'] !== $ownerId
         ) {
             throw new NoSuchUploadException();
+        }
+        if ($bucketGeneration !== null && ($upload['bucket_generation'] ?? '') !== $bucketGeneration) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
+        if (self::pinnedStorageTier($upload) !== $storageTier) {
+            throw new InternalErrorException('Multipart cleanup storage tier does not match the upload.');
         }
 
         $parts = $metadata->getParts($uploadId);
@@ -56,17 +75,21 @@ final class MultipartCleanup
         string $storageTier,
         array $parts,
     ): void {
-        try {
-            $storage->abortMultipartUpload($bucket, $key, $uploadId);
-        } catch (\Throwable) {
-            return;
-        }
-
         foreach ($parts as $part) {
             try {
-                $metadata->discardStorageGarbage($bucket, $storageTier, $part['storage_path']);
+                // Only committed parts were staged above. Other files in this
+                // upload directory may belong to an in-flight write attempt;
+                // its own write intent remains responsible for those bytes.
+                \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
+                    $metadata,
+                    $storage,
+                    $bucket,
+                    $storageTier,
+                    $part['storage_path'],
+                );
             } catch (\Throwable) {
-                // The collector will remove an already-deleted path idempotently.
+                // The staged delete_path job remains for the collector.
+                continue;
             }
         }
     }

@@ -29,6 +29,7 @@ final readonly class ObjectInfo
      * @param  array<string, string>  $userMetadata  User-defined x-amz-meta-* headers.
      * @param  array<string, string>  $systemMetadata  System metadata (checksums, encryption, version flags, etc.).
      * @param  \DateTimeImmutable  $lastModified  The last modified timestamp.
+     * @param  string|null  $restoredStorageTier  Physical tier holding the temporary restored copy.
      */
     public function __construct(
         public string $bucket,
@@ -50,5 +51,6 @@ final readonly class ObjectInfo
         public array $userMetadata = [],
         public array $systemMetadata = [],
         public \DateTimeImmutable $lastModified = new \DateTimeImmutable(),
+        public ?string $restoredStorageTier = null,
     ) {}
 }

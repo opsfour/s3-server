@@ -16,6 +16,9 @@ use Amp\Socket\DnsSocketConnector;
 use Amp\Socket\StaticSocketConnector;
 use League\Uri\BaseUri;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\FencedQueueStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -29,6 +32,8 @@ use Psr\Log\NullLogger;
 final class NotificationProcessor
 {
     private bool $running = false;
+
+    private bool $stopping = false;
 
     private const int MAX_REDIRECTS = 3;
 
@@ -48,21 +53,32 @@ final class NotificationProcessor
 
     private const int MAX_CIRCUIT_BREAKERS = 10_000;
 
+    private readonly LoggerInterface $logger;
+
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly LoggerInterface $logger = new NullLogger(),
+        LoggerInterface $logger = new NullLogger(),
         private readonly float $pollInterval = 2.0,
         ?HttpClient $httpClient = null,
         private readonly ?MetricsCollector $metrics = null,
         private readonly bool $requireHttps = true,
     ) {
         $this->httpClient = $httpClient;
+        $this->logger = new FailureIsolatingLogger($logger);
     }
 
     public function start(): void
     {
+        if ($this->stopping) {
+            throw new \LogicException('Notification processor cannot start before its previous loop has stopped.');
+        }
         if ($this->running) {
-            return;
+            if ($this->loopFuture !== null && ! $this->loopFuture->isComplete()) {
+                return;
+            }
+            $this->running = false;
+            $this->loopFuture = null;
+            $this->deferredCancellation = null;
         }
 
         $this->running = true;
@@ -71,15 +87,28 @@ final class NotificationProcessor
             $this->loop(...),
             $this->deferredCancellation->getCancellation(),
         );
+        $this->loopFuture->ignore();
+    }
+
+    public function isRunning(): bool
+    {
+        return $this->running && ! $this->stopping
+            && $this->loopFuture !== null && ! $this->loopFuture->isComplete();
     }
 
     public function stop(float $timeoutSeconds = 10): void
     {
+        if ($this->stopping) {
+            throw new \LogicException('Notification processor stop is already in progress.');
+        }
+        $this->stopping = true;
         $this->running = false;
-        $this->deferredCancellation?->cancel();
+        $loopFuture = $this->loopFuture;
+        $deferredCancellation = $this->deferredCancellation;
 
         try {
-            $this->loopFuture?->await(new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds)));
+            $deferredCancellation?->cancel();
+            $loopFuture?->await(new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds)));
         } catch (\Amp\CancelledException) {
             $this->logger->warning('Notification processor did not stop within {timeout}s; waiting before dependency shutdown.', $this->logContext([
                 'event' => 'processor_stop_timeout',
@@ -87,23 +116,24 @@ final class NotificationProcessor
             ]));
 
             try {
-                $this->loopFuture->await();
+                $loopFuture?->await();
             } catch (\Throwable $e) {
                 $this->logger->error('Notification processor did not stop cleanly.', $this->logContext([
                     'event' => 'processor_stop_failed',
                     'exception' => $e::class,
-                    'error' => $e->getMessage(),
                 ]));
             }
         } catch (\Throwable $e) {
             $this->logger->error('Notification processor did not stop cleanly.', $this->logContext([
                 'event' => 'processor_stop_failed',
                 'exception' => $e::class,
-                'error' => $e->getMessage(),
             ]));
         } finally {
-            $this->loopFuture = null;
-            $this->deferredCancellation = null;
+            if ($loopFuture === null || $loopFuture->isComplete()) {
+                $this->loopFuture = null;
+                $this->deferredCancellation = null;
+                $this->stopping = false;
+            }
         }
     }
 
@@ -121,9 +151,9 @@ final class NotificationProcessor
                     $this->logger->error('Notification dequeue failed.', $this->logContext([
                         'event' => 'dequeue_failed',
                         'exception' => $e::class,
-                        'error' => $e->getMessage(),
                     ]));
                     \Amp\delay($this->pollInterval * 5, cancellation: $cancellation);
+
                     continue;
                 }
 
@@ -132,6 +162,7 @@ final class NotificationProcessor
                     $idleCount = min($idleCount + 1, 10);
                     $delay = min(30.0, $this->pollInterval * (2 ** min($idleCount - 1, 4)));
                     \Amp\delay($delay, cancellation: $cancellation);
+
                     continue;
                 }
 
@@ -142,15 +173,14 @@ final class NotificationProcessor
                     $futures[] = \Amp\async(fn() => $this->process($item, $cancellation));
                 }
 
-                try {
-                    \Amp\Future\await($futures, $cancellation);
-                } catch (\Amp\CancelledException $e) {
-                    throw $e;
-                } catch (\Throwable $e) {
+                // Cancellation reaches each delivery. Keep the loop alive
+                // until every started delivery has returned its leased row
+                // or committed its status; stop() must not abandon children.
+                [$errors] = \Amp\Future\awaitAll($futures);
+                foreach ($errors as $error) {
                     $this->logger->error('Notification batch processing failed.', $this->logContext([
                         'event' => 'batch_failed',
-                        'exception' => $e::class,
-                        'error' => $e->getMessage(),
+                        'exception' => $error::class,
                     ]));
                 }
             }
@@ -159,19 +189,22 @@ final class NotificationProcessor
         }
     }
 
-    /** @param array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int} $item */
+    /** @param array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int, lease_expires_at: float} $item */
     private function process(array $item, ?Cancellation $cancellation = null): void
     {
         $id = (int) $item['id'];
         $destination = $item['destination_url'];
         $attempts = (int) $item['attempts'];
         $maxAttempts = (int) $item['max_attempts'];
+        $leaseExpiresAt = $item['lease_expires_at'];
 
         // Check circuit breaker.
         if ($this->isCircuitOpen($destination)) {
             // Put back as pending with backoff — do NOT increment attempts (no delivery was attempted).
-            $nextAttempt = microtime(true) + min(300, 2 ** $attempts);
-            $this->metadata->updateNotificationStatus($id, 'pending', 'Circuit breaker open', $nextAttempt, incrementAttempts: false);
+            $nextAttempt = $this->queueNow() + min(300, 2 ** $attempts);
+            if (! $this->updateClaimStatus($id, $item, 'pending', 'Circuit breaker open', $nextAttempt, incrementAttempts: false, expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                return;
+            }
             $this->metrics?->recordNotificationDelivery('circuit_open');
             $this->logger->warning('Notification delivery deferred because the circuit breaker is open.', $this->itemLogContext($item, [
                 'event' => 'delivery_deferred_circuit_open',
@@ -179,6 +212,7 @@ final class NotificationProcessor
                 'attempts' => $attempts,
                 'max_attempts' => $maxAttempts,
             ]));
+
             return;
         }
 
@@ -186,7 +220,9 @@ final class NotificationProcessor
             $success = $this->sendWebhook($destination, $item['payload_json'], cancellation: $cancellation);
 
             if ($success) {
-                $this->metadata->updateNotificationStatus($id, 'sent');
+                if (! $this->updateClaimStatus($id, $item, 'sent', expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                    return;
+                }
                 $this->recordSuccess($destination);
                 $this->metrics?->recordNotificationDelivery('sent');
                 $this->logger->info('Notification delivered.', $this->itemLogContext($item, [
@@ -199,7 +235,9 @@ final class NotificationProcessor
                 $this->recordFailure($destination);
                 $nextAttempts = $attempts + 1;
                 if ($nextAttempts >= $maxAttempts) {
-                    $this->metadata->updateNotificationStatus($id, 'dead_letter', 'Max attempts exceeded');
+                    if (! $this->updateClaimStatus($id, $item, 'dead_letter', 'Max attempts exceeded', expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                        return;
+                    }
                     $this->metrics?->recordNotificationDelivery('dead_letter');
                     $this->logger->warning('Notification moved to dead letter.', $this->itemLogContext($item, [
                         'event' => 'delivery_dead_letter',
@@ -210,13 +248,17 @@ final class NotificationProcessor
                     ]));
                 } else {
                     $backoff = min(300.0, 2 ** $nextAttempts);
-                    $nextAttemptAt = microtime(true) + $backoff;
-                    $this->metadata->updateNotificationStatus(
+                    $nextAttemptAt = $this->queueNow() + $backoff;
+                    if (! $this->updateClaimStatus(
                         $id,
+                        $item,
                         'pending',
                         'Delivery failed',
                         $nextAttemptAt,
-                    );
+                        expectedLeaseExpiresAt: $leaseExpiresAt,
+                    )) {
+                        return;
+                    }
                     $this->metrics?->recordNotificationDelivery('retry');
                     $this->logger->warning('Notification delivery failed and will be retried.', $this->itemLogContext($item, [
                         'event' => 'delivery_retry_scheduled',
@@ -229,9 +271,27 @@ final class NotificationProcessor
                     ]));
                 }
             }
+        } catch (\Amp\CancelledException) {
+            // Shutdown can interrupt an in-flight request without telling us
+            // whether the receiver accepted it. Keep the message retriable
+            // without exhausting its delivery budget.
+            $nextAttemptAt = $this->queueNow() + max(1.0, $this->pollInterval);
+            $this->updateClaimStatus(
+                $id,
+                $item,
+                'pending',
+                'Delivery interrupted',
+                $nextAttemptAt,
+                incrementAttempts: false,
+                expectedLeaseExpiresAt: $leaseExpiresAt,
+            );
+
+            return;
         } catch (UnsafeNotificationDestination $e) {
             $this->recordFailure($destination);
-            $this->metadata->updateNotificationStatus($id, 'dead_letter', $e->getMessage());
+            if (! $this->updateClaimStatus($id, $item, 'dead_letter', $e->getMessage(), expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                return;
+            }
             $this->metrics?->recordNotificationDelivery('blocked');
             $this->metrics?->recordNotificationDelivery('dead_letter');
             $this->logger->warning('Notification delivery blocked by destination safety policy.', $this->itemLogContext($item, [
@@ -243,7 +303,9 @@ final class NotificationProcessor
         } catch (\Throwable $e) {
             $nextAttempts = $attempts + 1;
             if ($nextAttempts >= $maxAttempts) {
-                $this->metadata->updateNotificationStatus($id, 'dead_letter', $e->getMessage());
+                if (! $this->updateClaimStatus($id, $item, 'dead_letter', 'Notification processing failed.', expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                    return;
+                }
                 $this->metrics?->recordNotificationDelivery('dead_letter');
                 $this->logger->error('Notification processing failed and moved to dead letter.', $this->itemLogContext($item, [
                     'event' => 'delivery_dead_letter',
@@ -252,12 +314,13 @@ final class NotificationProcessor
                     'attempt' => $nextAttempts,
                     'max_attempts' => $maxAttempts,
                     'exception' => $e::class,
-                    'error' => $e->getMessage(),
                 ]));
             } else {
                 $backoff = min(300.0, 2 ** $nextAttempts);
-                $nextAttemptAt = microtime(true) + $backoff;
-                $this->metadata->updateNotificationStatus($id, 'pending', $e->getMessage(), $nextAttemptAt);
+                $nextAttemptAt = $this->queueNow() + $backoff;
+                if (! $this->updateClaimStatus($id, $item, 'pending', 'Notification processing failed.', $nextAttemptAt, expectedLeaseExpiresAt: $leaseExpiresAt)) {
+                    return;
+                }
                 $this->metrics?->recordNotificationDelivery('retry');
                 $this->logger->error('Notification processing failed and will be retried.', $this->itemLogContext($item, [
                     'event' => 'delivery_retry_scheduled',
@@ -268,7 +331,6 @@ final class NotificationProcessor
                     'backoff_seconds' => $backoff,
                     'next_attempt_at' => $nextAttemptAt,
                     'exception' => $e::class,
-                    'error' => $e->getMessage(),
                 ]));
             }
         }
@@ -280,16 +342,13 @@ final class NotificationProcessor
         ?Cancellation $cancellation = null,
     ): bool {
         $currentUrl = $url;
-        $method = 'POST';
 
         try {
             for ($redirects = 0; $redirects <= self::MAX_REDIRECTS; $redirects++) {
                 $resolvedIp = $this->resolveAndValidateUrl($currentUrl, $cancellation);
-                $request = new HttpRequest($currentUrl, $method);
-                if ($method === 'POST') {
-                    $request->setBody($payload);
-                    $request->setHeader('Content-Type', 'application/json');
-                }
+                $request = new HttpRequest($currentUrl, 'POST');
+                $request->setBody($payload);
+                $request->setHeader('Content-Type', 'application/json');
                 $request->setTransferTimeout(10);
                 $request->setTcpConnectTimeout(5);
                 $request->setTlsHandshakeTimeout(5);
@@ -304,7 +363,9 @@ final class NotificationProcessor
                     return true;
                 }
 
-                if (! in_array($status, [301, 302, 303, 307, 308], true)) {
+                // Only 307/308 preserve POST and its body. A 2xx response to
+                // a redirected GET does not prove the event was delivered.
+                if (! in_array($status, [307, 308], true)) {
                     $response->getBody()->close();
 
                     return false;
@@ -317,18 +378,16 @@ final class NotificationProcessor
                 }
 
                 $currentUrl = BaseUri::from($currentUrl)->resolve($locations[0])->getUriString();
-                if (in_array($status, [301, 302, 303], true)) {
-                    $method = 'GET';
-                }
             }
         } catch (UnsafeNotificationDestination $e) {
+            throw $e;
+        } catch (\Amp\CancelledException $e) {
             throw $e;
         } catch (\Throwable $e) {
             $this->logger->warning('Webhook request failed.', $this->logContext([
                 'event' => 'webhook_request_failed',
                 'destination' => $this->sanitizeUrlForLog($currentUrl),
                 'exception' => $e::class,
-                'error' => $e->getMessage(),
             ]));
         }
 
@@ -360,8 +419,20 @@ final class NotificationProcessor
             throw new UnsafeNotificationDestination('Notification destination host is empty.');
         }
 
+        // parse_url() retains the brackets around IPv6 URL literals. Validate
+        // their contents as an address instead of sending them to DNS as a name.
+        if (str_starts_with($host, '[')) {
+            if (! str_ends_with($host, ']')) {
+                throw new UnsafeNotificationDestination('Notification destination IP address is invalid.');
+            }
+            $host = substr($host, 1, -1);
+            if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) === false) {
+                throw new UnsafeNotificationDestination('Notification destination IP address is invalid.');
+            }
+        }
+
         if (filter_var($host, FILTER_VALIDATE_IP)) {
-            if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            if (self::isUnsafeIp($host)) {
                 throw new UnsafeNotificationDestination('Notification destination resolves to a private or reserved IP address.');
             }
 
@@ -369,7 +440,10 @@ final class NotificationProcessor
         }
 
         try {
+            $cancellation?->throwIfRequested();
             $records = \Amp\Dns\resolve($host, cancellation: $cancellation);
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
         } catch (\Throwable $e) {
             throw new \RuntimeException('Notification destination DNS resolution failed.', 0, $e);
         }
@@ -380,12 +454,56 @@ final class NotificationProcessor
 
         foreach ($records as $record) {
             $ip = $record->getValue();
-            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            if (self::isUnsafeIp($ip)) {
                 throw new UnsafeNotificationDestination('Notification destination resolves to a private or reserved IP address.');
             }
         }
 
         return $records[0]->getValue();
+    }
+
+    private static function isUnsafeIp(string $ip): bool
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return true;
+        }
+
+        $binary = inet_pton($ip);
+        if ($binary === false) {
+            return true;
+        }
+        if (strlen($binary) === 4) {
+            $first = ord($binary[0]);
+            $second = ord($binary[1]);
+            $third = ord($binary[2]);
+
+            // PHP's range flags leave several IANA non-global blocks open.
+            // Shared and benchmark networks may be routed inside a cluster;
+            // documentation addresses must never be webhook targets.
+            return ($first === 100 && $second >= 64 && $second <= 127)
+                || ($first === 198 && ($second === 18 || $second === 19))
+                || ($first === 192 && $second === 0 && ($third === 0 || $third === 2))
+                || ($first === 198 && $second === 51 && $third === 100)
+                || ($first === 203 && $second === 0 && $third === 113);
+        }
+
+        // PHP's range flags accept these IPv6 prefixes. 6to4, Teredo, and
+        // NAT64 can carry an IPv4 destination that bypasses a plain IPv6
+        // public-address check. Documentation addresses are not deliverable.
+        foreach ([
+            ['64:ff9b::', 12],
+            ['64:ff9b:1::', 6],
+            ['2002::', 2],
+            ['2001::', 4],
+            ['2001:db8::', 4],
+        ] as [$prefix, $bytes]) {
+            $prefixBytes = inet_pton($prefix);
+            if ($prefixBytes !== false && substr($binary, 0, $bytes) === substr($prefixBytes, 0, $bytes)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function createPinnedHttpClient(string $url, string $ip): HttpClient
@@ -412,22 +530,22 @@ final class NotificationProcessor
     private function sanitizeUrlForLog(string $url): string
     {
         $parts = parse_url($url);
-        if ($parts === false || !isset($parts['user'])) {
-            return $url;
+        if ($parts === false || ! isset($parts['scheme'], $parts['host'])) {
+            return '[invalid notification destination]';
         }
 
-        $scheme = ($parts['scheme'] ?? 'https') . '://';
-        $host = $parts['host'] ?? '';
+        $scheme = $parts['scheme'] . '://';
+        $host = $parts['host'];
         $port = isset($parts['port']) ? ':' . $parts['port'] : '';
-        $path = $parts['path'] ?? '';
-        $query = isset($parts['query']) ? '?' . $parts['query'] : '';
 
-        return $scheme . $host . $port . $path . $query;
+        // A webhook path may contain a bearer token just like its query.
+        // The origin is enough to identify the failing destination in logs.
+        return $scheme . $host . $port;
     }
 
     private function isCircuitOpen(string $destination): bool
     {
-        if (!isset($this->circuitBreakers[$destination])) {
+        if (! isset($this->circuitBreakers[$destination])) {
             return false;
         }
 
@@ -439,6 +557,7 @@ final class NotificationProcessor
 
         if (microtime(true) >= $cb['cooldownUntil']) {
             unset($this->circuitBreakers[$destination]);
+
             return false;
         }
 
@@ -447,7 +566,7 @@ final class NotificationProcessor
 
     private function recordFailure(string $destination): void
     {
-        if (!isset($this->circuitBreakers[$destination])) {
+        if (! isset($this->circuitBreakers[$destination])) {
             if (count($this->circuitBreakers) >= self::MAX_CIRCUIT_BREAKERS) {
                 array_shift($this->circuitBreakers);
                 $this->metrics?->recordNotificationEvent('circuit_breaker', 'evicted');
@@ -475,10 +594,47 @@ final class NotificationProcessor
         unset($this->circuitBreakers[$destination]);
     }
 
+    private function queueNow(): float
+    {
+        return $this->metadata instanceof MultipartWriteIntentStore
+            ? $this->metadata->multipartWriteIntentNow() : microtime(true);
+    }
+
+    /** @param array<string, mixed> $item */
+    private function updateClaimStatus(
+        int $id,
+        array $item,
+        string $status,
+        ?string $error = null,
+        ?float $nextAttemptAt = null,
+        bool $incrementAttempts = true,
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool {
+        if ($expectedLeaseExpiresAt !== null && $this->metadata instanceof FencedQueueStore && isset($item['lease_generation'])) {
+            return $this->metadata->updateNotificationStatusLease(
+                $id,
+                $status,
+                $error,
+                $nextAttemptAt,
+                $incrementAttempts,
+                $expectedLeaseExpiresAt,
+                (int) $item['lease_generation'],
+            );
+        }
+
+        return $this->metadata->updateNotificationStatus(
+            $id,
+            $status,
+            $error,
+            $nextAttemptAt,
+            $incrementAttempts,
+            $expectedLeaseExpiresAt,
+        );
+    }
+
     /**
-     * @param array<string, mixed> $item
-     * @param array<string, mixed> $context
-     *
+     * @param  array<string, mixed>  $item
+     * @param  array<string, mixed>  $context
      * @return array<string, mixed>
      */
     private function itemLogContext(array $item, array $context = []): array
@@ -493,8 +649,7 @@ final class NotificationProcessor
     }
 
     /**
-     * @param array<string, mixed> $context
-     *
+     * @param  array<string, mixed>  $context
      * @return array<string, mixed>
      */
     private function logContext(array $context = []): array

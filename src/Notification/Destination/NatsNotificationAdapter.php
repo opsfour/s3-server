@@ -36,10 +36,13 @@ final readonly class NatsNotificationAdapter implements NotificationDestinationA
         try {
             $result = $this->publish($payload, $event);
         } catch (\Throwable $e) {
-            return NotificationDeliveryResult::retryableFailure($e->getMessage(), [
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'subject' => $this->subject,
                 'exception' => $e::class,
             ]);
+        }
+        if ($result === false || $result === null) {
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', ['subject' => $this->subject]);
         }
 
         return NotificationDeliveryResult::sent([

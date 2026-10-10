@@ -40,11 +40,17 @@ final class PutBucketEncryptionHandler implements RequestHandler
         }
         EncryptionRequestResolver::requireEncryptionService($this->encryption);
 
-        $this->metadata->putBucketEncryption(
-            $bucket,
-            $config['sseAlgorithm'],
-            $config['kmsMasterKeyId'],
-            $config['bucketKeyEnabled'],
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->putBucketEncryption(
+                $bucket,
+                $config['sseAlgorithm'],
+                $config['kmsMasterKeyId'],
+                $config['bucketKeyEnabled'],
+            ),
+            $request,
         );
 
         return new Response(status: 200);

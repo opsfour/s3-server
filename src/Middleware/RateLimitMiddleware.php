@@ -9,7 +9,11 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
+use OpsFour\S3Server\Security\RequestNetworkContext;
 use OpsFour\S3Server\Xml\ErrorResponseBuilder;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 
 /**
  * Per-client token bucket rate limiter backed by the metadata store.
@@ -17,14 +21,19 @@ use OpsFour\S3Server\Xml\ErrorResponseBuilder;
  * Rate limit state is persisted in the database so it survives restarts
  * and works across multi-node deployments (Postgres/MySQL).
  * Returns S3 SlowDown (503) when the bucket is empty.
- * Fails open on database errors (allows the request through).
+ * Fails closed with SlowDown when the configured limit cannot be checked.
  */
 final class RateLimitMiddleware implements Middleware
 {
+    private readonly LoggerInterface $logger;
+
     public function __construct(
         private readonly ?MetadataStore $metadata,
         private readonly float $maxRequestsPerSecond = 1000.0,
-    ) {}
+        LoggerInterface $logger = new NullLogger(),
+    ) {
+        $this->logger = new FailureIsolatingLogger($logger);
+    }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
@@ -32,42 +41,43 @@ final class RateLimitMiddleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
-        $remoteAddr = $request->getClient()->getRemoteAddress();
-        $ip = $remoteAddr instanceof \Amp\Socket\InternetAddress
-            ? $remoteAddr->getAddress()
-            : $remoteAddr->toString();
+        $ip = RequestNetworkContext::rateLimitIp($request);
 
         try {
             $allowed = $this->metadata->rateLimitCheck($ip, $this->maxRequestsPerSecond, $this->maxRequestsPerSecond);
-        } catch (\Throwable) {
-            // Fail open: allow the request if the database is unreachable.
-            return $requestHandler->handleRequest($request);
+        } catch (\Throwable $error) {
+            $this->logger->error('Rate-limit metadata check failed.', ['exception' => $error::class]);
+
+            return $this->slowDownResponse($request);
         }
 
         if (!$allowed) {
-            $requestId = $request->hasAttribute('requestId')
-                ? (string) $request->getAttribute('requestId')
-                : '';
-            $resource = $request->getUri()->getPath();
-
-            $xml = ErrorResponseBuilder::build(
-                'SlowDown',
-                'Please reduce your request rate.',
-                $resource,
-                $requestId,
-            );
-
-            return new Response(
-                status: 503,
-                headers: [
-                    'Content-Type' => 'application/xml',
-                    'Retry-After' => '1',
-                    'x-amz-request-id' => $requestId,
-                ],
-                body: $xml,
-            );
+            return $this->slowDownResponse($request);
         }
 
         return $requestHandler->handleRequest($request);
+    }
+
+    private function slowDownResponse(Request $request): Response
+    {
+        $requestId = $request->hasAttribute('requestId')
+            ? (string) $request->getAttribute('requestId')
+            : '';
+        $xml = ErrorResponseBuilder::build(
+            'SlowDown',
+            'Please reduce your request rate.',
+            $request->getUri()->getPath(),
+            $requestId,
+        );
+
+        return new Response(
+            status: 503,
+            headers: [
+                'Content-Type' => 'application/xml',
+                'Retry-After' => '1',
+                'x-amz-request-id' => $requestId,
+            ],
+            body: $xml,
+        );
     }
 }

@@ -11,7 +11,9 @@ use OpsFour\S3Server\Select\CsvProcessor;
 use OpsFour\S3Server\Select\EventStreamEncoder;
 use OpsFour\S3Server\Select\ExpressionEvaluator;
 use OpsFour\S3Server\Select\JsonProcessor;
+use OpsFour\S3Server\Select\SelectMemoryGuard;
 use OpsFour\S3Server\Select\SqlParser;
+use OpsFour\S3Server\Select\SelectSqlException;
 
 /**
  * Worker task for executing S3 Select queries in a child process.
@@ -40,10 +42,16 @@ final class SelectProcessingTask implements Task
      */
     public function run(Channel $channel, Cancellation $cancellation): mixed
     {
+        $memoryGuard = SelectMemoryGuard::start();
+        $memoryGuard->assertInputSize(strlen($this->objectData));
         $bytesScanned = strlen($this->objectData);
 
         // Parse SQL.
-        $parsed = SqlParser::parse($this->expression);
+        try {
+            $parsed = SqlParser::parse($this->expression);
+        } catch (\RuntimeException $e) {
+            throw new SelectSqlException($e->getMessage(), 0, $e);
+        }
 
         // Parse input data.
         $inputFormat = $this->inputSerialization['format'] ?? 'CSV';
@@ -54,13 +62,16 @@ final class SelectProcessingTask implements Task
                 $this->inputSerialization['recordDelimiter'] ?? "\n",
                 $this->inputSerialization['quoteCharacter'] ?? '"',
                 $this->inputSerialization['fileHeaderInfo'] ?? 'NONE',
+                $memoryGuard,
             )['rows'],
             'JSON' => JsonProcessor::parse(
                 $this->objectData,
                 $this->inputSerialization['jsonType'] ?? 'LINES',
+                $memoryGuard,
             ),
             default => throw new \RuntimeException("Unsupported input format: {$inputFormat}"),
         };
+        $memoryGuard->check();
 
         // Apply WHERE filter.
         $filtered = array_filter(
@@ -69,13 +80,17 @@ final class SelectProcessingTask implements Task
             => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
         );
         $filtered = array_values($filtered);
+        $memoryGuard->check();
+        unset($rows);
 
         // Project columns.
         if (ExpressionEvaluator::isAggregate($parsed['columns'])) {
             $projected = ExpressionEvaluator::computeAggregates($parsed['columns'], $filtered, $parsed['alias']);
         } else {
-            $projected = self::projectColumns($filtered, $parsed['columns'], $parsed['alias']);
+            $projected = self::projectColumns($filtered, $parsed['columns'], $parsed['alias'], $memoryGuard);
         }
+        unset($filtered);
+        $memoryGuard->check();
 
         // Format output.
         $outputFormat = $this->outputSerialization['format'] ?? 'CSV';
@@ -86,10 +101,13 @@ final class SelectProcessingTask implements Task
                 $this->outputSerialization['fieldDelimiter'] ?? ',',
                 $this->outputSerialization['recordDelimiter'] ?? "\n",
                 $this->outputSerialization['quoteCharacter'] ?? '"',
+                $memoryGuard,
             ),
-            'JSON' => JsonProcessor::format($projected),
+            'JSON' => JsonProcessor::format($projected, $memoryGuard),
             default => throw new \RuntimeException("Unsupported output format: {$outputFormat}"),
         };
+        unset($projected);
+        $memoryGuard->check();
 
         $bytesProcessed = $bytesScanned; // No decompression; processed = scanned.
         $bytesReturned = strlen($outputData);
@@ -100,6 +118,7 @@ final class SelectProcessingTask implements Task
             $bytesScanned,
             $bytesProcessed,
             $bytesReturned,
+            $memoryGuard,
         );
 
         return [
@@ -114,7 +133,7 @@ final class SelectProcessingTask implements Task
      * @param  list<array{expr: string, alias: ?string}>  $columns
      * @return list<array<string, mixed>>
      */
-    private static function projectColumns(array $rows, array $columns, string $alias): array
+    private static function projectColumns(array $rows, array $columns, string $alias, SelectMemoryGuard $memoryGuard): array
     {
         if (count($columns) === 1 && $columns[0]['expr'] === '*') {
             return $rows;
@@ -123,7 +142,11 @@ final class SelectProcessingTask implements Task
         $result = [];
         foreach ($rows as $row) {
             $projected = [];
+            $columnIndex = 0;
             foreach ($columns as $col) {
+                if (($columnIndex++ & 63) === 0) {
+                    $memoryGuard->check();
+                }
                 $expr = $col['expr'];
                 $key = $col['alias'] ?? $expr;
 
@@ -136,6 +159,7 @@ final class SelectProcessingTask implements Task
                 }
             }
             $result[] = $projected;
+            $memoryGuard->check();
         }
 
         return $result;

@@ -33,7 +33,13 @@ final class DeleteBucketPolicyHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $this->metadata->deleteBucketPolicy($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->deleteBucketPolicy($bucket),
+            $request,
+        );
 
         return new Response(status: 204);
     }

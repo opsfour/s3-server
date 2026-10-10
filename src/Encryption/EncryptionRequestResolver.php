@@ -27,6 +27,8 @@ final class EncryptionRequestResolver
         string $bucket,
         ?EncryptionServiceInterface $encryption,
     ): ?string {
+        $bucketEncryption = $metadata->getBucketEncryption($bucket);
+        StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
         $algorithm = $request->getHeader('x-amz-server-side-encryption');
         $kmsKeyId = $request->getHeader('x-amz-server-side-encryption-aws-kms-key-id');
         $kmsContext = $request->getHeader('x-amz-server-side-encryption-context');
@@ -56,7 +58,6 @@ final class EncryptionRequestResolver
         }
 
         if ($algorithm === null) {
-            $bucketEncryption = $metadata->getBucketEncryption($bucket);
             $algorithm = $bucketEncryption['sseAlgorithm'] ?? null;
         }
 

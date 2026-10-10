@@ -11,6 +11,11 @@ namespace OpsFour\S3Server\Select;
  */
 final class SqlParser
 {
+    private const int MAX_SQL_BYTES = 8_192;
+    private const int MAX_TOKENS = 512;
+    private const int MAX_WHERE_TOKENS = 128;
+    private const int MAX_WHERE_NESTING = 16;
+
     /** @var list<array{type: string, value: string}> */
     private array $tokens = [];
     private int $pos = 0;
@@ -22,6 +27,10 @@ final class SqlParser
      */
     public static function parse(string $sql): array
     {
+        if (strlen($sql) > self::MAX_SQL_BYTES) {
+            throw new SelectSqlException('S3 Select SQL expression is too long.');
+        }
+
         $parser = new self();
         $parser->tokenize($sql);
         return $parser->parseSelect();
@@ -54,6 +63,9 @@ final class SqlParser
                         $value .= $sql[$j];
                         $j++;
                     }
+                }
+                if ($j >= $len) {
+                    throw new SelectSqlException('Unterminated S3 Select SQL string literal.');
                 }
                 $this->tokens[] = ['type' => 'STRING', 'value' => $value];
                 $i = $j + 1;
@@ -112,7 +124,11 @@ final class SqlParser
                 continue;
             }
 
-            $i++;
+            throw new SelectSqlException('Unsupported character in S3 Select SQL expression.');
+        }
+
+        if (count($this->tokens) > self::MAX_TOKENS) {
+            throw new SelectSqlException('S3 Select SQL expression has too many tokens.');
         }
     }
 
@@ -128,6 +144,9 @@ final class SqlParser
 
         // Parse table (S3Object).
         $tableName = $this->consume('IDENT')['value'];
+        if (strcasecmp($tableName, 's3object') !== 0) {
+            throw new SelectSqlException('S3 Select SQL must query s3object.');
+        }
 
         $alias = 's';
         if ($this->peek()['type'] === 'KEYWORD' && $this->peek()['value'] === 'AS') {
@@ -137,11 +156,37 @@ final class SqlParser
             $alias = $this->consume('IDENT')['value'];
         }
 
+        $aggregate = null;
+        foreach ($columns as $column) {
+            $expr = $column['expr'];
+            $isAggregate = preg_match('/^(?:COUNT|SUM|AVG|MIN|MAX)\(/', $expr) === 1;
+            if ($aggregate !== null && $aggregate !== $isAggregate) {
+                throw new SelectSqlException('S3 Select cannot mix aggregate and non-aggregate projections.');
+            }
+            $aggregate = $isAggregate;
+
+            $field = $isAggregate ? substr($expr, strpos($expr, '(') + 1, -1) : $expr;
+            if ($field === '*') {
+                continue;
+            }
+            $parts = explode('.', $field);
+            if (count($parts) > 1 && strcasecmp($parts[0], $alias) !== 0) {
+                throw new SelectSqlException('S3 Select projection must use the table alias for qualified fields.');
+            }
+            if ($isAggregate && count($parts) > 2) {
+                throw new SelectSqlException('S3 Select aggregate fields cannot use nested paths.');
+            }
+        }
+
         // Parse WHERE.
         $where = null;
         if ($this->pos < count($this->tokens) && $this->peek()['type'] === 'KEYWORD' && $this->peek()['value'] === 'WHERE') {
             $this->consume('KEYWORD');
             $where = $this->parseExpression();
+        }
+
+        if ($this->pos !== count($this->tokens)) {
+            throw new SelectSqlException('Unexpected tokens after S3 Select SQL expression.');
         }
 
         return [
@@ -180,7 +225,7 @@ final class SqlParser
 
     private function parseColumnExpr(): string
     {
-        $parts = [];
+        $tokens = [];
         $depth = 0;
         while ($this->pos < count($this->tokens)) {
             $token = $this->peek();
@@ -198,9 +243,52 @@ final class SqlParser
                     break;
                 } $depth--;
             }
-            $parts[] = $this->tokens[$this->pos++]['value'];
+            $tokens[] = $this->tokens[$this->pos++];
         }
-        return implode(' ', $parts);
+
+        if ($tokens !== [] && $tokens[0]['type'] === 'IDENT') {
+            $field = self::parseProjectionField($tokens);
+            if ($field !== null) {
+                return $field;
+            }
+        }
+
+        if (count($tokens) >= 4 && $tokens[0]['type'] === 'KEYWORD'
+            && in_array($tokens[0]['value'], ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'], true)
+            && $tokens[1]['value'] === '(' && $tokens[array_key_last($tokens)]['value'] === ')') {
+            $operand = array_slice($tokens, 2, -1);
+            if ($tokens[0]['value'] === 'COUNT' && count($operand) === 1 && $operand[0]['value'] === '*') {
+                return 'COUNT(*)';
+            }
+            $field = self::parseProjectionField($operand);
+            if ($field !== null) {
+                return $tokens[0]['value'] . '(' . $field . ')';
+            }
+        }
+
+        throw new SelectSqlException('Unsupported S3 Select projection expression.');
+    }
+
+    /** @param list<array{type: string, value: string}> $tokens */
+    private static function parseProjectionField(array $tokens): ?string
+    {
+        if ($tokens === [] || count($tokens) % 2 === 0) {
+            return null;
+        }
+
+        $parts = [];
+        foreach ($tokens as $index => $token) {
+            if ($index % 2 === 0) {
+                if ($token['type'] !== 'IDENT') {
+                    return null;
+                }
+                $parts[] = $token['value'];
+            } elseif ($token['value'] !== '.') {
+                return null;
+            }
+        }
+
+        return implode('.', $parts);
     }
 
     /** @return array{tokens: list<array{type: string, value: string}>} */
@@ -208,10 +296,32 @@ final class SqlParser
     {
         // Simple expression parser — returns a structured array.
         $tokens = [];
+        $depth = 0;
         while ($this->pos < count($this->tokens)) {
-            $tokens[] = $this->tokens[$this->pos++];
+            $token = $this->tokens[$this->pos++];
+            if ($token['value'] === '(') {
+                self::assertWhereDepth(++$depth);
+            } elseif ($token['value'] === ')' && --$depth < 0) {
+                throw new SelectSqlException('Unbalanced parentheses in S3 Select WHERE expression.');
+            }
+            $tokens[] = $token;
+            if (count($tokens) > self::MAX_WHERE_TOKENS) {
+                throw new SelectSqlException('S3 Select WHERE expression has too many tokens.');
+            }
         }
+        if ($tokens === [] || $depth !== 0) {
+            throw new SelectSqlException('Incomplete S3 Select WHERE expression.');
+        }
+        WhereSyntaxValidator::validate($tokens);
+
         return ['tokens' => $tokens];
+    }
+
+    private static function assertWhereDepth(int $depth): void
+    {
+        if ($depth > self::MAX_WHERE_NESTING) {
+            throw new SelectSqlException('S3 Select WHERE nesting exceeds the supported limit.');
+        }
     }
 
     /** @return array{type: string, value: string} */

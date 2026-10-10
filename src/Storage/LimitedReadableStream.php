@@ -6,14 +6,14 @@ namespace OpsFour\S3Server\Storage;
 
 use Amp\ByteStream\ReadableStream;
 use Amp\ByteStream\ReadableStreamIteratorAggregate;
+use Amp\ByteStream\ReadableResourceStream;
 use Amp\Cancellation;
 
 /**
  * Wraps a ReadableStream and limits the total bytes returned.
  *
- * Used for S3 range-GET requests where the underlying file has been
- * seeked to the correct offset and we need to cap the number of
- * bytes delivered to the client.
+ * Used to cap bytes read from storage or delivered to an S3 client,
+ * including range and full-object reads.
  *
  * Once the byte limit is reached, read() returns null (signalling
  * end-of-stream) and the inner stream is closed.
@@ -38,6 +38,7 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
     public function __construct(
         private readonly ReadableStream $inner,
         int $limit,
+        private readonly bool $requireExactLength = false,
     ) {
         if ($limit < 0) {
             throw new \InvalidArgumentException('Limit must be non-negative, got ' . $limit);
@@ -57,15 +58,33 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
             return null;
         }
 
-        $chunk = $this->inner->read($cancellation);
+        // Built-in file and Flysystem streams accept a per-read limit. Ask for
+        // only the remaining bytes, although a PHP stream adapter may still
+        // prefetch a larger chunk internally before returning them.
+        if ($this->inner instanceof FileReadableStream) {
+            $chunk = $this->inner->read($cancellation, min($this->remaining, 1_048_576));
+        } elseif ($this->inner instanceof ReadableResourceStream) {
+            $chunk = $this->inner->read($cancellation, min($this->remaining, ReadableResourceStream::DEFAULT_CHUNK_SIZE));
+        } else {
+            $chunk = $this->inner->read($cancellation);
+        }
 
         if ($chunk === null) {
             $this->close();
+
+            if ($this->requireExactLength) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object size does not match metadata.');
+            }
 
             return null;
         }
 
         $chunkLen = strlen($chunk);
+
+        if ($chunkLen === 0 && $this->requireExactLength) {
+            $this->close();
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object size does not match metadata.');
+        }
 
         if ($chunkLen > $this->remaining) {
             $chunk = substr($chunk, 0, $this->remaining);

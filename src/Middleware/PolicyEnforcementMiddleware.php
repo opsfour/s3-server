@@ -9,11 +9,15 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
+use OpsFour\S3Server\Policy\AdditionalActionAuthorizer;
+use OpsFour\S3Server\Policy\ExistingObjectTagResolver;
+use OpsFour\S3Server\Policy\NamedPolicySnapshot;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
@@ -29,6 +33,41 @@ final class PolicyEnforcementMiddleware implements Middleware
         private readonly MetadataStore $metadata,
     ) {}
 
+    /** Recheck current policy and object tags under the write transaction. */
+    public function assertAllowedAtCommit(Request $request): void
+    {
+        // Direct handler callers do not pass through this middleware. Keep
+        // their established contract; HTTP requests carry the first decision.
+        if (! $request->hasAttribute('s3.policyResult')) {
+            return;
+        }
+
+        $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
+        if ($credential instanceof Credential && $credential->policyNames !== []) {
+            NamedPolicySnapshot::attach(
+                $request,
+                $this->metadata->lockNamedPoliciesForUpdate($credential->policyNames),
+            );
+        }
+
+        $this->handleRequest($request, new class ($this->metadata) implements RequestHandler {
+            public function __construct(private readonly MetadataStore $metadata) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                return (new AclEnforcementMiddleware($this->metadata))->handleRequest(
+                    $request,
+                    new class implements RequestHandler {
+                        public function handleRequest(Request $request): Response
+                        {
+                            return new Response(204);
+                        }
+                    },
+                );
+            }
+        });
+    }
+
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
         $bucket = $request->hasAttribute('s3.bucket') ? $request->getAttribute('s3.bucket') : null;
@@ -39,19 +78,71 @@ final class PolicyEnforcementMiddleware implements Middleware
         $ownerId = $request->hasAttribute('ownerId') ? $request->getAttribute('ownerId') : '';
         $operation = $request->hasAttribute('s3.operation') ? $request->getAttribute('s3.operation') : null;
 
+        if ($operation === S3Operation::ListBuckets) {
+            $this->assertListBucketsAllowed($request, (string) $ownerId);
+
+            return $requestHandler->handleRequest($request);
+        }
+
         if ($bucket === null || $bucket === '' || $operation === null) {
             return $requestHandler->handleRequest($request);
         }
 
-        $bucketOwner = $this->metadata->getBucketOwner($bucket);
+        $bucketInfo = $this->metadata->getBucket($bucket);
+        $bucketOwner = $bucketInfo?->ownerId;
+        $expectedBucketOwner = $request->getHeader('x-amz-expected-bucket-owner');
+        if ($expectedBucketOwner !== null && $bucketOwner !== null && $expectedBucketOwner !== $bucketOwner) {
+            throw new AccessDeniedException('Expected bucket owner does not match.');
+        }
         // Cache for downstream middleware (AclEnforcementMiddleware) to avoid re-querying.
         $request->setAttribute('s3.cachedBucketOwner', $bucketOwner);
+        $request->setAttribute('s3.cachedBucketGeneration', $bucketInfo?->generation);
+        if (in_array($operation, [S3Operation::PutBucketPolicy, S3Operation::DeleteBucketPolicy, S3Operation::PutBucketLogging], true)
+            && ($ownerId === '' || $bucketOwner !== $ownerId)) {
+            throw new AccessDeniedException();
+        }
         $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
-        if ($credential instanceof Credential && !$this->credentialScopeAllows($credential, $key, $request)) {
+        if ($credential instanceof Credential
+            && $operation !== S3Operation::DeleteObjects
+            && !$this->credentialScopeAllows($credential, $key, $request)) {
             throw new AccessDeniedException();
         }
 
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        if ($operation === S3Operation::SelectObjectContent && array_key_exists('versionId', $queryParams)) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'versionId is not supported for S3 Select.',
+            );
+        }
+        $requestedVersionId = $operation->selectsObjectVersion() ? ($queryParams['versionId'] ?? null) : null;
+        $objectOwner = null;
+        if ($key !== null && $operation->usesExistingObjectOwner()) {
+            $object = $requestedVersionId !== null
+                ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $requestedVersionId)
+                : $this->metadata->getObjectMetadata($bucket, $key);
+            $objectOwner = $object?->ownerId;
+            if ($objectOwner !== null && BucketOwnership::isEnforced($this->metadata, $bucket)) {
+                $objectOwner = $bucketOwner;
+            }
+            $request->setAttribute('s3.cachedObjectOwner', $objectOwner);
+        }
         $action = self::operationToAction($operation);
+        if ($requestedVersionId !== null) {
+            $action = match ($operation) {
+                S3Operation::GetObject, S3Operation::HeadObject,
+                S3Operation::GetObjectAttributes => 's3:GetObjectVersion',
+                S3Operation::DeleteObject => 's3:DeleteObjectVersion',
+                S3Operation::GetObjectAcl => 's3:GetObjectVersionAcl',
+                S3Operation::PutObjectAcl => 's3:PutObjectVersionAcl',
+                S3Operation::GetObjectTagging => 's3:GetObjectVersionTagging',
+                S3Operation::PutObjectTagging => 's3:PutObjectVersionTagging',
+                S3Operation::DeleteObjectTagging => 's3:DeleteObjectVersionTagging',
+                default => $action,
+            };
+        }
+        $attributesAction = $operation === S3Operation::GetObjectAttributes
+            ? ($requestedVersionId !== null ? 's3:GetObjectVersionAttributes' : 's3:GetObjectAttributes')
+            : null;
         $resource = $key !== null
             ? "arn:aws:s3:::{$bucket}/{$key}"
             : "arn:aws:s3:::{$bucket}";
@@ -60,18 +151,17 @@ final class PolicyEnforcementMiddleware implements Middleware
         if ($ownerId !== '') {
             $conditions['aws:PrincipalArn'] = $ownerId;
         }
-        $remoteAddress = $request->getClient()->getRemoteAddress();
-        if ($remoteAddress instanceof \Amp\Socket\InternetAddress) {
-            $conditions['aws:SourceIp'] = $remoteAddress->getAddress();
+        $sourceIp = \OpsFour\S3Server\Security\RequestNetworkContext::sourceIp($request);
+        if ($sourceIp !== null) {
+            $conditions['aws:SourceIp'] = $sourceIp;
         }
-        $conditions['aws:SecureTransport'] = $request->getClient()->getTlsInfo() !== null ? 'true' : 'false';
+        $conditions['aws:SecureTransport'] = \OpsFour\S3Server\Security\RequestNetworkContext::secureTransport($request) ? 'true' : 'false';
 
         $userAgent = $request->getHeader('user-agent');
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
 
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         if (isset($queryParams['prefix'])) {
             $conditions['s3:prefix'] = $queryParams['prefix'];
         }
@@ -81,8 +171,8 @@ final class PolicyEnforcementMiddleware implements Middleware
         if (isset($queryParams['max-keys'])) {
             $conditions['s3:max-keys'] = $queryParams['max-keys'];
         }
-        if (isset($queryParams['versionId'])) {
-            $conditions['s3:VersionId'] = $queryParams['versionId'];
+        if ($requestedVersionId !== null) {
+            $conditions['s3:VersionId'] = $requestedVersionId;
         }
 
         foreach (['x-amz-acl', 'x-amz-server-side-encryption', 'x-amz-storage-class'] as $header) {
@@ -93,14 +183,19 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
         $conditions['aws:CurrentTime'] = gmdate(\DateTimeInterface::ATOM);
 
-        foreach ($this->requestObjectTags($request, $operation) as $tagKey => $tagValue) {
+        $requestTags = $this->requestObjectTags($request, $operation);
+        foreach ($requestTags as $tagKey => $tagValue) {
             $conditions['s3:RequestObjectTag/' . $tagKey] = $tagValue;
         }
 
         if ($key !== null) {
-            $tagVersionId = $queryParams['versionId']
-                ?? $this->metadata->getObjectMetadata($bucket, $key)?->versionId;
-            foreach ($this->metadata->getObjectTagging($bucket, $key, $tagVersionId) as $tag) {
+            foreach (ExistingObjectTagResolver::forRequest(
+                $this->metadata,
+                $bucket,
+                $key,
+                $operation,
+                $requestedVersionId,
+            ) as $tag) {
                 $conditions['s3:ExistingObjectTag/' . $tag['key']] = $tag['value'];
             }
         }
@@ -117,7 +212,7 @@ final class PolicyEnforcementMiddleware implements Middleware
                 if ($policyName === '') {
                     continue;
                 }
-                $namedPolicy = $this->metadata->getNamedPolicy($policyName);
+                $namedPolicy = NamedPolicySnapshot::get($request, $this->metadata, $policyName);
                 if ($namedPolicy === null) {
                     throw new AccessDeniedException('Named policy attached to credential does not exist.');
                 }
@@ -129,16 +224,88 @@ final class PolicyEnforcementMiddleware implements Middleware
         if ($identityResult === 'Deny') {
             throw new AccessDeniedException();
         }
-
-        $policyJson = $this->metadata->getBucketPolicy($bucket);
-        $resourceResult = $policyJson !== null
-            ? PolicyEvaluator::evaluate($policyJson, $action, $resource, $ownerId, $conditions)
-            : 'Neutral';
-
-        // Explicit resource-policy deny also applies to the bucket owner.
-        if ($resourceResult === 'Deny') {
+        $attributesIdentityResult = $attributesAction !== null
+            ? self::evaluatePolicies($identityPolicies, $attributesAction, $resource, $ownerId, $conditions)
+            : null;
+        if ($attributesIdentityResult === 'Deny') {
             throw new AccessDeniedException();
         }
+
+        if ($operation === S3Operation::CreateBucket
+            && $request->getHeader('x-amz-bucket-object-lock-enabled') === 'true') {
+            foreach (['s3:PutBucketVersioning', 's3:PutBucketObjectLockConfiguration'] as $additionalAction) {
+                if (self::evaluatePolicies($identityPolicies, $additionalAction, $resource, $ownerId, $conditions) === 'Deny') {
+                    throw new AccessDeniedException();
+                }
+            }
+        }
+
+        if ($operation === S3Operation::CreateBucket) {
+            $additionalActions = [];
+            if ($request->getHeader('x-amz-object-ownership') !== null) {
+                $additionalActions[] = 's3:PutBucketOwnershipControls';
+            }
+            if ($request->getHeader('x-amz-acl') !== null) {
+                $additionalActions[] = 's3:PutBucketAcl';
+            } else {
+                foreach ($request->getHeaders() as $header => $_values) {
+                    if (str_starts_with(strtolower($header), 'x-amz-grant-')) {
+                        $additionalActions[] = 's3:PutBucketAcl';
+                        break;
+                    }
+                }
+            }
+            foreach ($additionalActions as $additionalAction) {
+                if (self::evaluatePolicies($identityPolicies, $additionalAction, $resource, $ownerId, $conditions) === 'Deny') {
+                    throw new AccessDeniedException();
+                }
+            }
+        }
+
+        $policyJson = $this->metadata->getBucketPolicy($bucket);
+        // Allow only the bucket owner to remove a legacy invalid policy that
+        // would otherwise deny every request, including policy deletion.
+        $recoveringInvalidPolicy = $operation === S3Operation::DeleteBucketPolicy
+            && $ownerId !== ''
+            && $ownerId === $bucketOwner
+            && $policyJson !== null
+            && PolicyEvaluator::hasUnsupportedConditionsInDocument($policyJson);
+        $resourceResult = $policyJson !== null && ! $recoveringInvalidPolicy
+            ? PolicyEvaluator::evaluate($policyJson, $action, $resource, $ownerId, $conditions)
+            : 'Neutral';
+        $attributesResourceResult = $attributesAction !== null && $policyJson !== null
+            ? PolicyEvaluator::evaluate($policyJson, $attributesAction, $resource, $ownerId, $conditions)
+            : null;
+
+        // Explicit resource-policy deny also applies to the bucket owner.
+        if ($resourceResult === 'Deny' || $attributesResourceResult === 'Deny') {
+            throw new AccessDeniedException();
+        }
+
+        // A bucket policy cannot grant access to an object owned by another
+        // account. Its explicit Deny still applies in bucket context.
+        if ($objectOwner !== null && $objectOwner !== $bucketOwner) {
+            $resourceResult = 'Neutral';
+            if ($attributesResourceResult !== null) {
+                $attributesResourceResult = 'Neutral';
+            }
+        }
+
+        // Attributes need both read and attributes actions. Object READ ACLs
+        // grant the base GetObject action but do not grant the attributes
+        // action, so a non-owner needs an explicit bucket-policy allow for it.
+        if ($attributesAction !== null && $ownerId !== ''
+            && ($bucketOwner !== $ownerId || ($objectOwner !== null && $objectOwner !== $ownerId))
+            && $attributesIdentityResult !== 'Allow') {
+            throw new AccessDeniedException();
+        }
+        if ($attributesAction !== null
+            && ($ownerId === '' || ($objectOwner ?? $bucketOwner) !== $ownerId)
+            && $attributesResourceResult !== 'Allow') {
+            throw new AccessDeniedException();
+        }
+
+        $this->assertAdditionalWriteActions($request, $operation, $bucket, $key, $requestTags);
 
         $canBypassGovernance = false;
         if (strtolower($request->getHeader('x-amz-bypass-governance-retention') ?? '') === 'true') {
@@ -161,7 +328,7 @@ final class PolicyEnforcementMiddleware implements Middleware
             $isBucketOwner = $ownerId !== '' && $bucketOwner === $ownerId;
             $canBypassGovernance = $bypassIdentityResult !== 'Deny'
                 && $bypassResourceResult !== 'Deny'
-                && ($isBucketOwner || $bypassIdentityResult === 'Allow' || $bypassResourceResult === 'Allow');
+                && ($isBucketOwner || ($bypassIdentityResult === 'Allow' && $bypassResourceResult === 'Allow'));
         }
         $request->setAttribute('s3.canBypassGovernanceRetention', $canBypassGovernance);
 
@@ -177,9 +344,18 @@ final class PolicyEnforcementMiddleware implements Middleware
             }
         }
 
-        // Bucket owner bypass applies only after every explicit deny has been
-        // evaluated. Guard the empty ID so anonymous never matches.
-        if ($ownerId !== '' && $bucketOwner !== null && $bucketOwner === $ownerId) {
+        // Existing object operations use the object owner for implicit access.
+        // Bucket operations and new writes use the bucket owner.
+        $resourceOwner = $objectOwner ?? $bucketOwner;
+        // Object ownership inside someone else's bucket does not grant the
+        // requester's account an IAM permission to act in that bucket.
+        // DeleteObjects applies the same rule to each requested key.
+        if ($ownerId !== '' && $bucketOwner !== null
+            && ($ownerId !== $bucketOwner || ($resourceOwner !== null && $ownerId !== $resourceOwner))
+            && $operation !== S3Operation::DeleteObjects && $identityResult !== 'Allow') {
+            throw new AccessDeniedException();
+        }
+        if ($ownerId !== '' && $resourceOwner !== null && $resourceOwner === $ownerId) {
             $request->setAttribute(
                 's3.policyResult',
                 $identityResult === 'Allow' || $resourceResult === 'Allow' ? 'Allow' : 'OwnerBypass',
@@ -188,7 +364,10 @@ final class PolicyEnforcementMiddleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
-        $result = self::mergePolicyResults($identityResult, $resourceResult);
+        // An identity policy owned by another account cannot grant access to
+        // this bucket by itself. Resource policy or ACL permission must come
+        // from the bucket side; identity policies still provide explicit Deny.
+        $result = $resourceResult;
 
         if ($result === 'Deny') {
             throw new AccessDeniedException();
@@ -197,6 +376,50 @@ final class PolicyEnforcementMiddleware implements Middleware
         $request->setAttribute('s3.policyResult', $result);
 
         return $requestHandler->handleRequest($request);
+    }
+
+    private function assertListBucketsAllowed(Request $request, string $ownerId): void
+    {
+        if ($ownerId === '') {
+            throw new AccessDeniedException();
+        }
+
+        $conditions = [
+            'aws:PrincipalArn' => $ownerId,
+            'aws:CurrentTime' => gmdate(\DateTimeInterface::ATOM),
+            'aws:SecureTransport' => \OpsFour\S3Server\Security\RequestNetworkContext::secureTransport($request) ? 'true' : 'false',
+        ];
+        $sourceIp = \OpsFour\S3Server\Security\RequestNetworkContext::sourceIp($request);
+        if ($sourceIp !== null) {
+            $conditions['aws:SourceIp'] = $sourceIp;
+        }
+        $userAgent = $request->getHeader('user-agent');
+        if ($userAgent !== null && $userAgent !== '') {
+            $conditions['aws:UserAgent'] = $userAgent;
+        }
+
+        $policies = [];
+        $accountPolicy = $this->metadata->getAccountPolicy($ownerId);
+        if ($accountPolicy !== null) {
+            $policies[] = $accountPolicy;
+        }
+        $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
+        if ($credential instanceof Credential) {
+            foreach ($credential->policyNames as $policyName) {
+                if ($policyName === '') {
+                    continue;
+                }
+                $policy = NamedPolicySnapshot::get($request, $this->metadata, $policyName);
+                if ($policy === null) {
+                    throw new AccessDeniedException('Named policy attached to credential does not exist.');
+                }
+                $policies[] = $policy;
+            }
+        }
+
+        if (self::evaluatePolicies($policies, 's3:ListAllMyBuckets', '*', $ownerId, $conditions) === 'Deny') {
+            throw new AccessDeniedException();
+        }
     }
 
     /**
@@ -263,6 +486,44 @@ final class PolicyEnforcementMiddleware implements Middleware
         return false;
     }
 
+    /** @param array<string, string> $requestTags */
+    private function assertAdditionalWriteActions(Request $request, S3Operation $operation, string $bucket, ?string $key, array $requestTags): void
+    {
+        if ($key === null || !in_array($operation, [
+            S3Operation::PutObject,
+            S3Operation::PostObject,
+            S3Operation::CopyObject,
+            S3Operation::CreateMultipartUpload,
+            S3Operation::CompleteMultipartUpload,
+        ], true)) {
+            return;
+        }
+
+        $authorizer = new AdditionalActionAuthorizer($this->metadata);
+        $tags = [];
+        foreach ($requestTags as $tagKey => $tagValue) {
+            $tags[] = ['key' => $tagKey, 'value' => $tagValue];
+        }
+        if ($tags !== [] && $operation !== S3Operation::CopyObject) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectTagging', $tags);
+        }
+        if ($request->getHeader('x-amz-acl') !== null
+            || $request->getHeader('x-amz-grant-read') !== null
+            || $request->getHeader('x-amz-grant-write') !== null
+            || $request->getHeader('x-amz-grant-full-control') !== null
+            || $request->getHeader('x-amz-grant-read-acp') !== null
+            || $request->getHeader('x-amz-grant-write-acp') !== null) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectAcl', $tags);
+        }
+        if ($request->getHeader('x-amz-object-lock-mode') !== null
+            || $request->getHeader('x-amz-object-lock-retain-until-date') !== null) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectRetention', $tags);
+        }
+        if ($request->getHeader('x-amz-object-lock-legal-hold') !== null) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectLegalHold', $tags);
+        }
+    }
+
     /**
      * @return array<string, string>
      */
@@ -271,7 +532,11 @@ final class PolicyEnforcementMiddleware implements Middleware
         $tags = [];
 
         $taggingHeader = $request->getHeader('x-amz-tagging');
-        if ($taggingHeader !== null && $taggingHeader !== '') {
+        // CopyObject ignores this header unless tagging is explicitly replaced.
+        // An ignored value must not satisfy a RequestObjectTag condition.
+        $usesTaggingHeader = $operation !== S3Operation::CopyObject
+            || strtoupper($request->getHeader('x-amz-tagging-directive') ?? 'COPY') === 'REPLACE';
+        if ($usesTaggingHeader && $taggingHeader !== null && $taggingHeader !== '') {
             foreach (ObjectTagValidator::parseHeader($taggingHeader) as $tag) {
                 $tags[$tag['key']] = $tag['value'];
             }
@@ -349,13 +614,15 @@ final class PolicyEnforcementMiddleware implements Middleware
             S3Operation::DeleteBucketWebsite => 's3:DeleteBucketWebsite',
             S3Operation::GetPublicAccessBlock => 's3:GetBucketPublicAccessBlock',
             S3Operation::PutPublicAccessBlock => 's3:PutBucketPublicAccessBlock',
-            S3Operation::DeletePublicAccessBlock => 's3:DeleteBucketPublicAccessBlock',
+            S3Operation::DeletePublicAccessBlock => 's3:PutBucketPublicAccessBlock',
             S3Operation::RestoreObject => 's3:RestoreObject',
             S3Operation::SelectObjectContent => 's3:GetObject',
-            S3Operation::GetObjectAttributes => 's3:GetObjectAttributes',
+            S3Operation::GetObjectAttributes => 's3:GetObject',
             S3Operation::GetBucketPolicyStatus => 's3:GetBucketPolicyStatus',
             S3Operation::GetBucketLogging => 's3:GetBucketLogging',
             S3Operation::PutBucketLogging => 's3:PutBucketLogging',
+            S3Operation::GetBucketOwnershipControls => 's3:GetBucketOwnershipControls',
+            S3Operation::PutBucketOwnershipControls, S3Operation::DeleteBucketOwnershipControls => 's3:PutBucketOwnershipControls',
         };
     }
 }

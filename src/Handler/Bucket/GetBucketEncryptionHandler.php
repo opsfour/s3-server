@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchEncryptionConfigurationException;
+use OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -29,9 +30,11 @@ final class GetBucketEncryptionHandler implements RequestHandler
         }
 
         $config = $this->metadata->getBucketEncryption($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($config === null) {
             throw new NoSuchEncryptionConfigurationException();
         }
+        StoredBucketEncryptionConfiguration::assertSupported($config);
 
         /** @var array{sseAlgorithm: string, kmsMasterKeyId?: string, bucketKeyEnabled?: bool} $encConfig */
         $encConfig = array_filter($config, fn($v) => $v !== null);

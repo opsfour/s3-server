@@ -8,9 +8,12 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
-use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Http\ListingQuery;
+use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class ListPartsHandler implements RequestHandler
@@ -32,27 +35,47 @@ final class ListPartsHandler implements RequestHandler
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         $uploadId = $queryParams['uploadId'] ?? '';
-        $maxParts = isset($queryParams['max-parts']) ? max(0, min((int) $queryParams['max-parts'], 1000)) : 1000;
-        $partNumberMarker = isset($queryParams['part-number-marker']) ? (int) $queryParams['part-number-marker'] : 0;
+        $maxParts = ListingQuery::limit($queryParams, 'max-parts');
+        $partNumberMarker = ListingQuery::marker($queryParams, 'part-number-marker');
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
             throw new NoSuchUploadException();
         }
-        if ($upload['owner_id'] !== $ownerId) {
+        if (
+            $upload['owner_id'] !== $ownerId
+            && $bucketInfo->ownerId !== $ownerId
+            && $request->getAttribute('s3.policyResult') !== 'Allow'
+        ) {
             throw new NoSuchUploadException();
         }
+        $uploadGeneration = $upload['bucket_generation'] ?? '';
+        if ($uploadGeneration !== $bucketInfo->generation && $upload['owner_id'] !== $bucketInfo->ownerId) {
+            throw new NoSuchUploadException();
+        }
+        // Pre-migration uploads have no generation. Keep their owner-only drain
+        // path, but never expose them to a later or delegated bucket owner.
+        if ($uploadGeneration !== $bucketInfo->generation
+            && ! ($uploadGeneration === '' && $upload['owner_id'] === $ownerId && $bucketInfo->ownerId === $ownerId)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
 
-        $allParts = $this->metadata->getParts($uploadId);
+        if ($maxParts === 0 || $partNumberMarker >= 10000) {
+            $page = [];
+        } elseif ($this->metadata instanceof PagedMultipartPartsStore) {
+            $page = $this->metadata->listPartsPage($uploadId, $partNumberMarker, $maxParts + 1);
+        } else {
+            // Preserve support for application-provided MetadataStore implementations.
+            $page = array_values(array_filter(
+                $this->metadata->getParts($uploadId),
+                static fn(array $part): bool => $part['part_number'] > $partNumberMarker,
+            ));
+        }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
-        // Filter by part number marker.
-        $filteredParts = array_values(array_filter(
-            $allParts,
-            fn($p) => $p['part_number'] > $partNumberMarker,
-        ));
-
-        $isTruncated = count($filteredParts) > $maxParts;
-        $parts = array_slice($filteredParts, 0, $maxParts);
+        $isTruncated = $maxParts > 0 && count($page) > $maxParts;
+        $parts = array_slice($page, 0, $maxParts);
 
         $nextPartNumberMarker = 0;
         if ($isTruncated && count($parts) > 0) {
@@ -64,7 +87,11 @@ final class ListPartsHandler implements RequestHandler
             'lastModified' => rtrim(str_replace(' ', 'T', $p['created_at']), 'Z') . 'Z',
             'etag' => $p['etag'],
             'size' => $p['size'],
+            'checksumAlgorithm' => $p['checksum_algorithm'] ?? null,
+            'checksumValue' => $p['checksum_value'] ?? null,
         ], $parts);
+        $bucketOwnsObjects = BucketOwnership::isEnforced($this->metadata, $bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $xml = XmlResponseBuilder::listPartsResult([
             'bucket' => $bucket,
@@ -74,7 +101,9 @@ final class ListPartsHandler implements RequestHandler
             'nextPartNumberMarker' => $nextPartNumberMarker,
             'maxParts' => $maxParts,
             'isTruncated' => $isTruncated,
-            'ownerId' => $ownerId,
+            'initiatorId' => $upload['owner_id'],
+            'ownerId' => $bucketOwnsObjects ? $bucketInfo->ownerId : $upload['owner_id'],
+            'storageClass' => $upload['user_metadata']['__mpu-storage-class'] ?? 'STANDARD',
             'parts' => $xmlParts,
         ]);
 

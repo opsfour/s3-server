@@ -41,10 +41,13 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
         try {
             $messageId = $this->publish($fields);
         } catch (\Throwable $e) {
-            return NotificationDeliveryResult::retryableFailure($e->getMessage(), [
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'stream' => $this->stream,
                 'exception' => $e::class,
             ]);
+        }
+        if ($messageId === false || $messageId === null) {
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', ['stream' => $this->stream]);
         }
 
         return NotificationDeliveryResult::sent([

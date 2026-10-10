@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Notification;
 
 /**
- * Builds standard AWS S3 event notification JSON payloads.
+ * Builds S3-style event notification JSON payloads from available event data.
  */
 final class S3EventPayload
 {
@@ -19,6 +19,8 @@ final class S3EventPayload
      * @param string $etag The object ETag.
      * @param string $ownerId The request principal.
      * @param string $region The server region.
+     * @param string $bucketOwnerId The bucket owner identity.
+     * @param string $configurationId The matching bucket notification configuration ID.
      * @return string JSON-encoded event payload.
      */
     public static function build(
@@ -29,45 +31,79 @@ final class S3EventPayload
         string $etag = '',
         string $ownerId = '',
         string $region = 'us-east-1',
+        string $bucketOwnerId = '',
+        string $configurationId = '',
+        ?string $sourceIp = null,
+        ?string $requestId = null,
+        ?string $hostId = null,
+        ?string $versionId = null,
+        ?string $sequencer = null,
+        ?string $eventTime = null,
+        bool $sizeKnown = false,
+        ?string $restoreExpiresAt = null,
+        ?string $sourceStorageClass = null,
     ): string {
+        $object = ['key' => urlencode($key)];
+        if (str_starts_with($eventName, 's3:ObjectCreated:') || $size > 0 || $sizeKnown) {
+            $object['size'] = $size;
+        }
+        if ($etag !== '') {
+            $object['eTag'] = trim($etag, '"');
+        }
+        if ($versionId !== null && $versionId !== '' && $versionId !== 'null') {
+            $object['versionId'] = $versionId;
+        }
+        if ($sequencer !== null) {
+            $object['sequencer'] = $sequencer;
+        }
+
         $payload = [
             'Records' => [
                 [
                     'eventVersion' => '2.1',
                     'eventSource' => 'aws:s3',
                     'awsRegion' => $region,
-                    'eventTime' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.000\Z'),
-                    'eventName' => $eventName,
+                    'eventTime' => $eventTime ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.v\Z'),
+                    'eventName' => str_starts_with($eventName, 's3:') ? substr($eventName, 3) : $eventName,
                     'userIdentity' => [
                         'principalId' => $ownerId,
                     ],
-                    'requestParameters' => [
-                        'sourceIPAddress' => '127.0.0.1',
-                    ],
-                    'responseElements' => [
-                        'x-amz-request-id' => bin2hex(random_bytes(8)),
-                        'x-amz-id-2' => base64_encode(random_bytes(16)),
-                    ],
                     's3' => [
                         's3SchemaVersion' => '1.0',
-                        'configurationId' => '',
+                        'configurationId' => $configurationId,
                         'bucket' => [
                             'name' => $bucket,
                             'ownerIdentity' => [
-                                'principalId' => $ownerId,
+                                'principalId' => $bucketOwnerId !== '' ? $bucketOwnerId : $ownerId,
                             ],
                             'arn' => "arn:aws:s3:::{$bucket}",
                         ],
-                        'object' => [
-                            'key' => rawurlencode($key),
-                            'size' => $size,
-                            'eTag' => trim($etag, '"'),
-                            'sequencer' => bin2hex(random_bytes(8)),
-                        ],
+                        'object' => $object,
                     ],
                 ],
             ],
         ];
+
+        $record = &$payload['Records'][0];
+        if ($sourceIp !== null && $sourceIp !== '') {
+            $record['requestParameters'] = ['sourceIPAddress' => $sourceIp];
+        }
+        if ($requestId !== null && $requestId !== '') {
+            $record['responseElements'] = ['x-amz-request-id' => $requestId];
+            if ($hostId !== null && $hostId !== '') {
+                $record['responseElements']['x-amz-id-2'] = $hostId;
+            }
+        }
+        if ($eventName === 's3:ObjectRestore:Completed'
+            && $restoreExpiresAt !== null && $sourceStorageClass !== null) {
+            $record['glacierEventData'] = [
+                'restoreEventData' => [
+                    'lifecycleRestorationExpiryTime' => $restoreExpiresAt,
+                    'lifecycleRestoreStorageClass' => $sourceStorageClass,
+                ],
+            ];
+        }
+        unset($record);
 
         return json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     }

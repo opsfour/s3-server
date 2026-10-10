@@ -37,6 +37,7 @@ final class GetBucketTaggingHandler implements RequestHandler
         }
 
         $tags = $this->metadata->getBucketTagging($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Real S3 throws NoSuchTagSet for bucket tagging when no tags exist.
         if ($tags === []) {

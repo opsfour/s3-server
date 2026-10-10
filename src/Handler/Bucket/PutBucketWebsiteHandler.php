@@ -30,13 +30,19 @@ final class PutBucketWebsiteHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseWebsiteConfiguration($body);
 
-        $this->metadata->putBucketWebsite(
-            $bucket,
-            $config['indexDocument'],
-            $config['errorDocument'],
-            $config['redirectAllHost'],
-            $config['redirectAllProtocol'],
-            $config['routingRules'],
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->putBucketWebsite(
+                $bucket,
+                $config['indexDocument'],
+                $config['errorDocument'],
+                $config['redirectAllHost'],
+                $config['redirectAllProtocol'],
+                $config['routingRules'],
+            ),
+            $request,
         );
 
         return new Response(status: 200);

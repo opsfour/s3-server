@@ -32,7 +32,33 @@ final class BucketNameExtractor
      */
     public static function extract(Request $request, ?string $baseDomain): ?string
     {
-        // Try virtual-hosted style first when baseDomain is configured.
+        $virtualBucket = self::extractVirtualHosted($request, $baseDomain);
+        if ($virtualBucket !== null) {
+            return $virtualBucket;
+        }
+
+        // Path-style: extract bucket from the first path segment.
+        $path = $request->getUri()->getPath();
+        $path = \ltrim($path, '/');
+
+        if ($path === '') {
+            return null;
+        }
+
+        // The first segment before '/' is the bucket name.
+        $slashPos = \strpos($path, '/');
+
+        if ($slashPos === false) {
+            return self::sanitize(\rawurldecode($path));
+        }
+
+        $bucket = \substr($path, 0, $slashPos);
+
+        return $bucket !== '' ? self::sanitize(\rawurldecode($bucket)) : null;
+    }
+
+    public static function extractVirtualHosted(Request $request, ?string $baseDomain): ?string
+    {
         if ($baseDomain !== null && $baseDomain !== '') {
             $host = $request->getHeader('host');
 
@@ -63,24 +89,7 @@ final class BucketNameExtractor
             }
         }
 
-        // Path-style: extract bucket from the first path segment.
-        $path = $request->getUri()->getPath();
-        $path = \ltrim($path, '/');
-
-        if ($path === '') {
-            return null;
-        }
-
-        // The first segment before '/' is the bucket name.
-        $slashPos = \strpos($path, '/');
-
-        if ($slashPos === false) {
-            return self::sanitize(\rawurldecode($path));
-        }
-
-        $bucket = \substr($path, 0, $slashPos);
-
-        return $bucket !== '' ? self::sanitize(\rawurldecode($bucket)) : null;
+        return null;
     }
 
     /**

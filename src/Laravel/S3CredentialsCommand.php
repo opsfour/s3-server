@@ -39,7 +39,13 @@ final class S3CredentialsCommand extends Command
             return self::FAILURE;
         }
 
-        $provider = app(CredentialProvider::class);
+        try {
+            $provider = app(CredentialProvider::class);
+        } catch (\Throwable $e) {
+            $this->error(sprintf('S3 credential provider initialization failed (%s).', $e::class));
+
+            return self::FAILURE;
+        }
 
         if ($provider instanceof InMemoryCredentialProvider) {
             $this->error(
@@ -52,14 +58,20 @@ final class S3CredentialsCommand extends Command
 
         $manager = new CredentialManager($provider);
 
-        return match ($action) {
-            'create' => $this->handleCreate($manager),
-            'list' => $this->handleList($manager),
-            'show' => $this->handleShow($manager),
-            'activate' => $this->handleToggle($manager, true),
-            'deactivate' => $this->handleToggle($manager, false),
-            'delete' => $this->handleDelete($manager),
-        };
+        try {
+            return match ($action) {
+                'create' => $this->handleCreate($manager),
+                'list' => $this->handleList($manager),
+                'show' => $this->handleShow($manager),
+                'activate' => $this->handleToggle($manager, true),
+                'deactivate' => $this->handleToggle($manager, false),
+                'delete' => $this->handleDelete($manager),
+            };
+        } catch (\Throwable $e) {
+            $this->error(sprintf('S3 credential operation failed (%s).', $e::class));
+
+            return self::FAILURE;
+        }
     }
 
     private function handleCreate(CredentialManager $manager): int
@@ -152,7 +164,12 @@ final class S3CredentialsCommand extends Command
         try {
             $manager->setActive($accessKeyId, $active);
         } catch (\RuntimeException $e) {
-            $this->error($e->getMessage());
+            $this->error(match ($e->getMessage()) {
+                "Credential not found: {$accessKeyId}" => 'Credential not found.',
+                "Credential changed or was revoked: {$accessKeyId}" => 'Credential changed or was revoked.',
+                'Credential provider does not support atomic status updates.' => 'Credential provider does not support atomic status updates.',
+                default => sprintf('S3 credential operation failed (%s).', $e::class),
+            });
 
             return self::FAILURE;
         }

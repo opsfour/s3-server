@@ -6,10 +6,16 @@ namespace OpsFour\S3Server\Auth;
 
 use Amp\Sync\LocalMutex;
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
+use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
 
 use function Amp\File\changePermissions;
+use function Amp\File\createDirectory;
 use function Amp\File\createDirectoryRecursively;
+use function Amp\File\deleteDirectory;
 use function Amp\File\deleteFile;
+use function Amp\File\getSize;
 use function Amp\File\isDirectory;
 use function Amp\File\move;
 use function Amp\File\write;
@@ -27,7 +33,7 @@ use function Amp\File\write;
  * (safe for pre-event-loop contexts). Write operations (put/delete) update
  * both the in-memory store and the file using Amp\File async I/O.
  */
-final class ConfigFileCredentialProvider implements CredentialProvider
+final class ConfigFileCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater
 {
     private const int MAX_FILE_BYTES = 16_777_216;
 
@@ -55,14 +61,110 @@ final class ConfigFileCredentialProvider implements CredentialProvider
 
     public function putCredential(Credential $credential): void
     {
-        $this->credentials[$credential->accessKeyId] = $credential;
-        $this->saveToFile();
+        $lock = $this->writeMutex->acquire();
+
+        try {
+            $credentials = $this->credentials;
+            $credentials[$credential->accessKeyId] = $credential;
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function createCredentialIfAbsent(Credential $credential): bool
+    {
+        $lock = $this->writeMutex->acquire();
+
+        try {
+            if (isset($this->credentials[$credential->accessKeyId])) {
+                return false;
+            }
+
+            $credentials = $this->credentials;
+            $credentials[$credential->accessKeyId] = $credential;
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+
+            return true;
+        } finally {
+            $lock->release();
+        }
     }
 
     public function deleteCredential(string $accessKeyId): void
     {
-        unset($this->credentials[$accessKeyId]);
-        $this->saveToFile();
+        $lock = $this->writeMutex->acquire();
+
+        try {
+            $credentials = $this->credentials;
+            unset($credentials[$accessKeyId]);
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function deleteCredentialIfCurrent(Credential $expected): bool
+    {
+        $lock = $this->writeMutex->acquire();
+
+        try {
+            $current = $this->credentials[$expected->accessKeyId] ?? null;
+            if ($current === null
+                || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
+                || $current->ownerId !== $expected->ownerId
+                || $current->sessionToken !== $expected->sessionToken
+                || $current->isActive !== $expected->isActive) {
+                return false;
+            }
+
+            $credentials = $this->credentials;
+            unset($credentials[$expected->accessKeyId]);
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+
+            return true;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function setActiveIfCurrent(Credential $expected, bool $active): bool
+    {
+        $lock = $this->writeMutex->acquire();
+
+        try {
+            $current = $this->credentials[$expected->accessKeyId] ?? null;
+            if ($current === null
+                || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
+                || $current->ownerId !== $expected->ownerId
+                || $current->sessionToken !== $expected->sessionToken
+                || $current->isActive !== $expected->isActive) {
+                return false;
+            }
+
+            $credentials = $this->credentials;
+            $credentials[$expected->accessKeyId] = new Credential(
+                accessKeyId: $current->accessKeyId,
+                secretAccessKey: $current->secretAccessKey,
+                ownerId: $current->ownerId,
+                displayName: $current->displayName,
+                isActive: $active,
+                sessionToken: $current->sessionToken,
+                expiresAt: $current->expiresAt,
+                policyNames: $current->policyNames,
+                allowedPrefixes: $current->allowedPrefixes,
+            );
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+
+            return true;
+        } finally {
+            $lock->release();
+        }
     }
 
     private function loadFromFile(): void
@@ -102,69 +204,159 @@ final class ConfigFileCredentialProvider implements CredentialProvider
                 }
             }
 
+            if (array_key_exists('isActive', $entry) && ! is_bool($entry['isActive'])) {
+                throw new \RuntimeException("Credentials file entry {$index} isActive must be a boolean.");
+            }
+            if (array_key_exists('sessionToken', $entry)
+                && $entry['sessionToken'] !== null
+                && ! is_string($entry['sessionToken'])) {
+                throw new \RuntimeException("Credentials file entry {$index} sessionToken must be a string or null.");
+            }
+            if (array_key_exists('expiresAt', $entry)
+                && $entry['expiresAt'] !== null
+                && ! is_string($entry['expiresAt'])) {
+                throw new \RuntimeException("Credentials file entry {$index} expiresAt must be a timestamp or null.");
+            }
+            $policyNames = self::stringListField($entry, 'policyNames', $index);
+            $allowedPrefixes = self::stringListField($entry, 'allowedPrefixes', $index);
+            try {
+                $expiresAt = isset($entry['expiresAt'])
+                    ? new \DateTimeImmutable($entry['expiresAt'])
+                    : null;
+            } catch (\Exception $error) {
+                throw new \RuntimeException("Credentials file entry {$index} expiresAt is invalid.", 0, $error);
+            }
+
             $credential = new Credential(
                 accessKeyId: $entry['accessKeyId'],
                 secretAccessKey: $entry['secretAccessKey'],
                 ownerId: $entry['ownerId'],
                 displayName: is_string($entry['displayName'] ?? null) ? $entry['displayName'] : '',
-                isActive: is_bool($entry['isActive'] ?? null) ? $entry['isActive'] : true,
-                sessionToken: is_string($entry['sessionToken'] ?? null) ? $entry['sessionToken'] : null,
-                expiresAt: isset($entry['expiresAt']) && is_string($entry['expiresAt'])
-                    ? new \DateTimeImmutable($entry['expiresAt'])
-                    : null,
-                policyNames: isset($entry['policyNames']) && is_array($entry['policyNames'])
-                    ? array_values(array_filter($entry['policyNames'], is_string(...)))
-                    : [],
-                allowedPrefixes: isset($entry['allowedPrefixes']) && is_array($entry['allowedPrefixes'])
-                    ? array_values(array_filter($entry['allowedPrefixes'], is_string(...)))
-                    : [],
+                isActive: $entry['isActive'] ?? true,
+                sessionToken: $entry['sessionToken'] ?? null,
+                expiresAt: $expiresAt,
+                policyNames: $policyNames,
+                allowedPrefixes: $allowedPrefixes,
             );
+            if (isset($this->credentials[$credential->accessKeyId])) {
+                throw new \RuntimeException("Credentials file contains duplicate accessKeyId at entry {$index}.");
+            }
             $this->credentials[$credential->accessKeyId] = $credential;
         }
     }
 
-    private function saveToFile(): void
+    /**
+     * @param array<string, mixed> $entry
+     * @return list<string>
+     */
+    private static function stringListField(array $entry, string $name, int $index): array
     {
-        $lock = $this->writeMutex->acquire();
+        if (! array_key_exists($name, $entry)) {
+            return [];
+        }
+
+        $value = $entry[$name];
+        if (! is_array($value) || ! array_is_list($value)) {
+            throw new \RuntimeException("Credentials file entry {$index} {$name} must be a string list.");
+        }
+        foreach ($value as $item) {
+            if (! is_string($item) || $item === '') {
+                throw new \RuntimeException("Credentials file entry {$index} {$name} must contain only non-empty strings.");
+            }
+        }
+
+        return $value;
+    }
+
+    /** @param array<string, Credential> $credentials */
+    private function saveToFile(array $credentials): void
+    {
+        $entries = [];
+
+        foreach ($credentials as $credential) {
+            $entries[] = [
+                'accessKeyId' => $credential->accessKeyId,
+                'secretAccessKey' => $credential->secretAccessKey,
+                'ownerId' => $credential->ownerId,
+                'displayName' => $credential->displayName,
+                'isActive' => $credential->isActive,
+                'sessionToken' => $credential->sessionToken,
+                'expiresAt' => $credential->expiresAt?->format(\DateTimeInterface::ATOM),
+                'policyNames' => $credential->policyNames,
+                'allowedPrefixes' => $credential->allowedPrefixes,
+            ];
+        }
+
+        $dir = dirname($this->filePath);
+        if (! isDirectory($dir)) {
+            createDirectoryRecursively($dir, 0o700);
+        }
+
+        $dir = $this->trustedCredentialDirectory($dir);
+        $targetPath = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . basename($this->filePath);
+
+        $json = json_encode($entries, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR);
+        $tempDir = $targetPath . '.tmp.' . bin2hex(random_bytes(16));
+        createDirectory($tempDir, 0o700);
+        $tempPath = $tempDir . '/credentials.json';
 
         try {
-            $entries = [];
-
-            foreach ($this->credentials as $credential) {
-                $entries[] = [
-                    'accessKeyId' => $credential->accessKeyId,
-                    'secretAccessKey' => $credential->secretAccessKey,
-                    'ownerId' => $credential->ownerId,
-                    'displayName' => $credential->displayName,
-                    'isActive' => $credential->isActive,
-                    'sessionToken' => $credential->sessionToken,
-                    'expiresAt' => $credential->expiresAt?->format(\DateTimeInterface::ATOM),
-                    'policyNames' => $credential->policyNames,
-                    'allowedPrefixes' => $credential->allowedPrefixes,
-                ];
+            // Amp\File\write() creates with the process umask. Keep every
+            // secret byte inside an exclusively created private directory
+            // until the file has its final owner-only permissions.
+            write($tempPath, $json);
+            if (getSize($tempPath) !== strlen($json)) {
+                throw new \RuntimeException('Credential file write was incomplete.');
             }
-
-            $dir = dirname($this->filePath);
-            if (! isDirectory($dir)) {
-                createDirectoryRecursively($dir, 0o700);
+            changePermissions($tempPath, 0o600);
+            clearstatcache(true, $tempPath);
+            $tempPermissions = @fileperms($tempPath);
+            if ($tempPermissions === false || ($tempPermissions & 0o077) !== 0) {
+                throw new \RuntimeException('Credential file permissions are not private.');
             }
-
-            $json = json_encode($entries, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR);
-            $tempPath = $this->filePath . '.tmp.' . bin2hex(random_bytes(8));
-
+            move($tempPath, $targetPath);
+        } catch (\Throwable $e) {
             try {
-                write($tempPath, $json);
-                changePermissions($tempPath, 0o600);
-                move($tempPath, $this->filePath);
-            } catch (\Throwable $e) {
-                try {
-                    deleteFile($tempPath);
-                } catch (\Throwable) {
-                }
-                throw $e;
+                deleteFile($tempPath);
+            } catch (\Throwable) {
             }
+            throw $e;
         } finally {
-            $lock->release();
+            try {
+                deleteDirectory($tempDir);
+            } catch (\Throwable) {
+                // A failed cleanup retains only a private empty directory.
+            }
         }
+    }
+
+    private function trustedCredentialDirectory(string $directory): string
+    {
+        $canonical = realpath($directory);
+        if ($canonical === false) {
+            throw new \RuntimeException('Credentials directory is unavailable.');
+        }
+        if (DIRECTORY_SEPARATOR === '/' && ! function_exists('posix_geteuid')) {
+            throw new \RuntimeException('Credential file writes require POSIX ownership verification.');
+        }
+        $effectiveUid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+
+        // An attacker who owns any ancestor can rename a private child and
+        // replace it between the permission check and the secret write.
+        for ($path = $canonical; ; $path = dirname($path)) {
+            clearstatcache(true, $path);
+            $permissions = @fileperms($path);
+            $owner = @fileowner($path);
+            if ($permissions === false
+                || (($permissions & 0o022) !== 0 && ($permissions & 0o1000) === 0)
+                || ($effectiveUid !== null && ($owner === false || ($owner !== 0 && $owner !== $effectiveUid)))) {
+                throw new \RuntimeException('Credentials directory must have trusted, private or sticky ancestors.');
+            }
+            if ($path === dirname($path)) {
+                break;
+            }
+        }
+
+        return $canonical;
     }
 }

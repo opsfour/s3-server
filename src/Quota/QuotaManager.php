@@ -30,7 +30,7 @@ final readonly class QuotaManager
             return;
         }
 
-        $bucketCount = count($this->metadata->listBuckets($ownerId));
+        $bucketCount = $this->metadata->countBuckets($ownerId);
         if ($bucketCount >= $quota->maxBucketsPerOwner) {
             throw new QuotaExceededException(sprintf(
                 'Bucket quota exceeded: owner %s is limited to %d bucket(s).',
@@ -47,21 +47,29 @@ final readonly class QuotaManager
         int $newObjectSize,
         bool $versioningEnabled,
         ?string $completingUploadId = null,
+        ?string $stagingOwnerId = null,
     ): void {
-        $quota = $this->quotas->quotaForOwner($ownerId);
-        if (! $quota->enabled()) {
+        $ownerQuota = $this->quotas->quotaForOwner($ownerId);
+        $bucketQuota = $this->quotas->quotaForOwner($this->metadata->getBucketOwner($bucket) ?? $ownerId);
+        if (! $ownerQuota->enabled() && ! $bucketQuota->enabled()) {
             return;
         }
 
         $stats = $this->metadata->getBucketStorageStats($bucket);
-        $bucketMultipart = $this->metadata->getMultipartStorageStats($ownerId, $bucket);
+        $bucketMultipart = $this->metadata->getMultipartStorageStats(null, $bucket);
         $completedStagingBytes = $completingUploadId !== null
             ? $this->partBytes($completingUploadId)
             : 0;
-        $objectCountDelta = ($versioningEnabled || $existingObject === null) ? 1 : 0;
-        $bytesDelta = $versioningEnabled
-            ? $newObjectSize
-            : $newObjectSize - ($existingObject !== null ? $existingObject->size : 0);
+        // A suspended write replaces only an existing null version. The
+        // latest numbered version remains stored and must still count toward
+        // bucket and owner quotas, even if a caller passes it here.
+        $replacedObject = ($versioningEnabled
+            || $existingObject?->versionId !== null
+            || $existingObject?->isDeleteMarker === true)
+            ? null
+            : $existingObject;
+        $objectCountDelta = $replacedObject === null ? 1 : 0;
+        $bytesDelta = $newObjectSize - ($replacedObject === null ? 0 : $replacedObject->size);
 
         $newBucketObjectCount = $stats['objectCount'] + $objectCountDelta;
         $newBucketBytes = $stats['bytesUsed']
@@ -69,31 +77,33 @@ final readonly class QuotaManager
             - $completedStagingBytes
             + $bytesDelta;
 
-        if ($quota->maxObjectsPerBucket > 0 && $newBucketObjectCount > $quota->maxObjectsPerBucket) {
+        if ($bucketQuota->maxObjectsPerBucket > 0 && $newBucketObjectCount > $bucketQuota->maxObjectsPerBucket) {
             throw new QuotaExceededException(sprintf(
                 'Object quota exceeded: bucket %s is limited to %d object(s).',
                 $bucket,
-                $quota->maxObjectsPerBucket,
+                $bucketQuota->maxObjectsPerBucket,
             ));
         }
 
-        if ($quota->maxBytesPerBucket > 0 && $newBucketBytes > $quota->maxBytesPerBucket) {
+        if ($bucketQuota->maxBytesPerBucket > 0 && $newBucketBytes > $bucketQuota->maxBytesPerBucket) {
             throw new QuotaExceededException(sprintf(
                 'Storage quota exceeded: bucket %s is limited to %d byte(s).',
                 $bucket,
-                $quota->maxBytesPerBucket,
+                $bucketQuota->maxBytesPerBucket,
             ));
         }
 
-        if ($quota->maxBytesPerOwner > 0) {
-            $ownerBytes = $this->ownerBytesUsed($ownerId)
+        if ($ownerQuota->maxBytesPerOwner > 0) {
+            $ownerDelta = $newObjectSize
+                - ($replacedObject?->ownerId === $ownerId ? $replacedObject->size : 0);
+            $ownerBytes = $this->metadata->getOwnerStorageStats($ownerId)['bytesUsed']
                 + $this->metadata->getMultipartStorageStats($ownerId)['bytesUsed']
-                - $completedStagingBytes;
-            if ($ownerBytes + $bytesDelta > $quota->maxBytesPerOwner) {
+                - ($stagingOwnerId === null || $stagingOwnerId === $ownerId ? $completedStagingBytes : 0);
+            if ($ownerBytes + $ownerDelta > $ownerQuota->maxBytesPerOwner) {
                 throw new QuotaExceededException(sprintf(
                     'Storage quota exceeded: owner %s is limited to %d byte(s).',
                     $ownerId,
-                    $quota->maxBytesPerOwner,
+                    $ownerQuota->maxBytesPerOwner,
                 ));
             }
         }
@@ -101,19 +111,20 @@ final readonly class QuotaManager
 
     public function assertCanCreateMultipart(string $ownerId, string $bucket): void
     {
-        $quota = $this->quotas->quotaForOwner($ownerId);
-        $bucketStats = $this->metadata->getMultipartStorageStats($ownerId, $bucket);
+        $ownerQuota = $this->quotas->quotaForOwner($ownerId);
+        $bucketQuota = $this->quotas->quotaForOwner($this->metadata->getBucketOwner($bucket) ?? $ownerId);
+        $bucketStats = $this->metadata->getMultipartStorageStats(null, $bucket);
         $ownerStats = $this->metadata->getMultipartStorageStats($ownerId);
 
         if (
-            $quota->maxMultipartUploadsPerBucket > 0
-            && $bucketStats['uploadCount'] >= $quota->maxMultipartUploadsPerBucket
+            $bucketQuota->maxMultipartUploadsPerBucket > 0
+            && $bucketStats['uploadCount'] >= $bucketQuota->maxMultipartUploadsPerBucket
         ) {
             throw new QuotaExceededException('Multipart upload count quota exceeded for bucket.');
         }
         if (
-            $quota->maxMultipartUploadsPerOwner > 0
-            && $ownerStats['uploadCount'] >= $quota->maxMultipartUploadsPerOwner
+            $ownerQuota->maxMultipartUploadsPerOwner > 0
+            && $ownerStats['uploadCount'] >= $ownerQuota->maxMultipartUploadsPerOwner
         ) {
             throw new QuotaExceededException('Multipart upload count quota exceeded for owner.');
         }
@@ -126,7 +137,8 @@ final readonly class QuotaManager
         int $partNumber,
         int $newSize,
     ): void {
-        $quota = $this->quotas->quotaForOwner($ownerId);
+        $ownerQuota = $this->quotas->quotaForOwner($ownerId);
+        $bucketQuota = $this->quotas->quotaForOwner($this->metadata->getBucketOwner($bucket) ?? $ownerId);
         $existingSize = 0;
         foreach ($this->metadata->getParts($uploadId) as $part) {
             if ($part['part_number'] === $partNumber) {
@@ -135,37 +147,25 @@ final readonly class QuotaManager
             }
         }
         $delta = $newSize - $existingSize;
-        $bucketStaging = $this->metadata->getMultipartStorageStats($ownerId, $bucket)['bytesUsed'] + $delta;
+        $bucketStaging = $this->metadata->getMultipartStorageStats(null, $bucket)['bytesUsed'] + $delta;
         $ownerStaging = $this->metadata->getMultipartStorageStats($ownerId)['bytesUsed'] + $delta;
 
-        if ($quota->maxMultipartBytesPerBucket > 0 && $bucketStaging > $quota->maxMultipartBytesPerBucket) {
+        if ($bucketQuota->maxMultipartBytesPerBucket > 0 && $bucketStaging > $bucketQuota->maxMultipartBytesPerBucket) {
             throw new QuotaExceededException('Multipart staging byte quota exceeded for bucket.');
         }
-        if ($quota->maxMultipartBytesPerOwner > 0 && $ownerStaging > $quota->maxMultipartBytesPerOwner) {
+        if ($ownerQuota->maxMultipartBytesPerOwner > 0 && $ownerStaging > $ownerQuota->maxMultipartBytesPerOwner) {
             throw new QuotaExceededException('Multipart staging byte quota exceeded for owner.');
         }
         $bucketStored = $this->metadata->getBucketStorageStats($bucket)['bytesUsed'];
-        if ($quota->maxBytesPerBucket > 0 && $bucketStored + $bucketStaging > $quota->maxBytesPerBucket) {
+        if ($bucketQuota->maxBytesPerBucket > 0 && $bucketStored + $bucketStaging > $bucketQuota->maxBytesPerBucket) {
             throw new QuotaExceededException('Storage quota exceeded by multipart staging data.');
         }
         if (
-            $quota->maxBytesPerOwner > 0
-            && $this->ownerBytesUsed($ownerId) + $ownerStaging > $quota->maxBytesPerOwner
+            $ownerQuota->maxBytesPerOwner > 0
+            && $this->metadata->getOwnerStorageStats($ownerId)['bytesUsed'] + $ownerStaging > $ownerQuota->maxBytesPerOwner
         ) {
             throw new QuotaExceededException('Owner storage quota exceeded by multipart staging data.');
         }
-    }
-
-    private function ownerBytesUsed(string $ownerId): int
-    {
-        $bytes = 0;
-
-        foreach ($this->metadata->listBuckets($ownerId) as $bucketInfo) {
-            $stats = $this->metadata->getBucketStorageStats($bucketInfo->name);
-            $bytes += $stats['bytesUsed'];
-        }
-
-        return $bytes;
     }
 
     private function partBytes(string $uploadId): int

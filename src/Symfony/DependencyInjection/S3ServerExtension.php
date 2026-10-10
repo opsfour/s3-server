@@ -23,6 +23,7 @@ use OpsFour\S3Server\Symfony\Encryption\SymfonyEncryptionFactory;
 use OpsFour\S3Server\Symfony\Event\SymfonyEventDispatcherListener;
 use OpsFour\S3Server\Symfony\S3ServerConfigFactory;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Argument\ServiceClosureArgument;
 use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Reference;
@@ -75,6 +76,7 @@ final class S3ServerExtension extends Extension
                 $metadataConfig,
                 null,
                 new Reference(MetricsCollector::class),
+                $metadataConfig['driver'] === 'sqlite',
             ])
             ->setPublic(false));
 
@@ -111,7 +113,7 @@ final class S3ServerExtension extends Extension
                 new Reference(StorageTierRegistry::class),
                 new Reference(S3ServerRuntimeFactory::class),
                 $config['external_iam'],
-                $config['admin']['token'],
+                $config['admin']['token'] ?? $config['external_iam']['admin_token'] ?? null,
                 $notificationListeners,
                 $encryptionReference,
             ])
@@ -120,14 +122,14 @@ final class S3ServerExtension extends Extension
 
         $container->setDefinition(S3ServerCredentialsCommand::class, (new Definition(S3ServerCredentialsCommand::class))
             ->setArguments([
-                new Reference(CredentialProvider::class),
+                new ServiceClosureArgument(new Reference(CredentialProvider::class)),
             ])
             ->addTag('console.command', ['command' => 'opsfour:s3:credentials'])
             ->setPublic(true));
 
         $container->setDefinition(S3ServerQuotaCommand::class, (new Definition(S3ServerQuotaCommand::class))
             ->setArguments([
-                new Reference(MetadataStore::class),
+                new ServiceClosureArgument(new Reference(MetadataStore::class)),
             ])
             ->addTag('console.command', ['command' => 'opsfour:s3:quotas'])
             ->setPublic(true));

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Symfony\Command;
 
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -19,8 +20,11 @@ final class S3ServerQuotaCommand extends Command
 {
     private const array VALID_ACTIONS = ['set', 'show', 'list', 'delete'];
 
+    private MetadataStore $metadata;
+
+    /** @param MetadataStore|(\Closure(): MetadataStore) $metadataSource */
     public function __construct(
-        private readonly MetadataStore $metadata,
+        private readonly MetadataStore|\Closure $metadataSource,
     ) {
         parent::__construct();
     }
@@ -51,12 +55,22 @@ final class S3ServerQuotaCommand extends Command
             return Command::FAILURE;
         }
 
-        return match ($action) {
-            'set' => $this->handleSet($input, $io),
-            'show' => $this->handleShow($input, $io),
-            'list' => $this->handleList($io),
-            'delete' => $this->handleDelete($input, $io),
-        };
+        try {
+            $this->metadata = $this->metadataSource instanceof \Closure
+                ? ($this->metadataSource)()
+                : $this->metadataSource;
+
+            return match ($action) {
+                'set' => $this->handleSet($input, $io),
+                'show' => $this->handleShow($input, $io),
+                'list' => $this->handleList($io),
+                'delete' => $this->handleDelete($input, $io),
+            };
+        } catch (\Throwable $e) {
+            $io->error(sprintf('S3 quota operation failed (%s).', $e::class));
+
+            return Command::FAILURE;
+        }
     }
 
     private function handleSet(InputInterface $input, SymfonyStyle $io): int
@@ -83,7 +97,7 @@ final class S3ServerQuotaCommand extends Command
             return Command::FAILURE;
         }
 
-        $this->metadata->putAccountQuota($ownerId, $quota);
+        AccountQuotaWriter::put($this->metadata, $ownerId, $quota);
         $io->success("Quota saved for owner {$ownerId}.");
         $this->renderQuota($io, $ownerId, $quota);
 
@@ -144,7 +158,7 @@ final class S3ServerQuotaCommand extends Command
             return Command::FAILURE;
         }
 
-        $this->metadata->deleteAccountQuota($ownerId);
+        AccountQuotaWriter::delete($this->metadata, $ownerId);
         $io->success("Quota deleted for owner {$ownerId}.");
 
         return Command::SUCCESS;

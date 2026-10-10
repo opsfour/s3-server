@@ -6,6 +6,8 @@ namespace OpsFour\S3Server\Symfony;
 
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
+use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 
 final class S3ServerConfigFactory
 {
@@ -22,12 +24,13 @@ final class S3ServerConfigFactory
         $lifecycle = $config['lifecycle'];
         $notifications = $config['notifications'];
 
-        return new S3ServerConfig(
+        $serverConfig = new S3ServerConfig(
             host: $server['host'],
             port: $server['port'],
             region: $server['region'],
             storagePath: $storage['path'],
             storageTiers: $storage['tiers'],
+            allowUnfencedStorageForTests: $server['allow_unfenced_storage_for_tests'],
             metadataDriver: $metadata['driver'],
             metadataDsn: $metadata['dsn'],
             tlsCertPath: $server['tls_cert_path'],
@@ -35,9 +38,11 @@ final class S3ServerConfigFactory
             maxConcurrentConnections: $server['max_connections'],
             connectionIdleTimeout: $server['connection_idle_timeout'],
             requestBodySizeLimit: $server['body_size_limit'],
+            postSpoolBudgetBytes: $server['post_spool_budget'] ?? 10_737_418_240,
             readTimeout: $server['read_timeout'],
             writeTimeout: $server['write_timeout'],
             perClientRateLimit: $server['rate_limit'],
+            trustedProxyCidrs: TrustedProxyMiddleware::parseCidrs($server['trusted_proxy_cidrs']),
             baseDomain: $server['base_domain'],
             strictBucketNaming: $server['strict_bucket_naming'],
             websiteHostPattern: $server['website_host_pattern'],
@@ -48,6 +53,7 @@ final class S3ServerConfigFactory
             shutdownDrainTimeout: $server['shutdown_drain_timeout'],
             metricsBearerToken: $server['metrics_bearer_token'],
             notificationRequireHttps: $notifications['require_https'],
+            notificationWorkerEnabled: $notifications['worker_enabled'],
             sqliteWorkerPoolSize: $parallel['sqlite_workers'],
             encryptionWorkerPoolSize: $parallel['encryption_workers'],
             selectWorkerPoolSize: $parallel['select_workers'],
@@ -69,5 +75,9 @@ final class S3ServerConfigFactory
             lifecycleLockTtlSeconds: $lifecycle['lock_ttl_seconds'],
             multipartMaxAgeSeconds: $lifecycle['multipart_max_age_seconds'],
         );
+
+        PostgresApiDriverGuard::assertAvailable($serverConfig);
+
+        return $serverConfig;
     }
 }

@@ -9,11 +9,28 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\QuotaConfig;
 
 final readonly class AdminQuotaApiHandler implements RequestHandler
 {
     private const int MAX_BODY_BYTES = 4096;
+
+    private const int DEFAULT_PAGE_LIMIT = 100;
+
+    private const int MAX_PAGE_LIMIT = 1000;
+
+    private const int MAX_CURSOR_BYTES = 32768;
+
+    private const array QUOTA_FIELDS = [
+        'maxBucketsPerOwner', 'maxBuckets',
+        'maxObjectsPerBucket',
+        'maxBytesPerBucket',
+        'maxBytesPerOwner', 'maxBytes',
+        'maxMultipartUploadsPerBucket', 'maxMultipartUploadsPerOwner',
+        'maxMultipartBytesPerBucket', 'maxMultipartBytesPerOwner',
+    ];
 
     public function __construct(
         private MetadataStore $metadata,
@@ -40,14 +57,60 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
 
     private function handleGet(Request $request): Response
     {
-        $ownerId = $this->ownerIdFromPath($request);
+        try {
+            $ownerId = $this->ownerIdFromPath($request);
+        } catch (\InvalidArgumentException $e) {
+            return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
+        }
         if ($ownerId === null) {
-            $quotas = [];
-            foreach ($this->metadata->listAccountQuotas() as $ownerId => $quota) {
-                $quotas[] = ['ownerId' => $ownerId] + self::quotaPayload($quota);
+            $rawQuery = $request->getUri()->getQuery();
+            if (QueryStringParser::hasConflictingValues($rawQuery)) {
+                return $this->json(['error' => 'invalid_request', 'message' => 'Conflicting query parameters.'], 400);
+            }
+            $params = QueryStringParser::parse($rawQuery);
+            foreach (array_keys($params) as $name) {
+                if ($name !== 'limit' && $name !== 'cursor') {
+                    return $this->json(['error' => 'invalid_request', 'message' => 'Unknown query parameter.'], 400);
+                }
             }
 
-            return $this->json(['quotas' => $quotas]);
+            $paged = array_key_exists('limit', $params) || array_key_exists('cursor', $params);
+            $limit = self::DEFAULT_PAGE_LIMIT;
+            if (array_key_exists('limit', $params)) {
+                $rawLimit = $params['limit'];
+                if (!preg_match('/^[1-9][0-9]{0,3}$/D', $rawLimit) || (int) $rawLimit > self::MAX_PAGE_LIMIT) {
+                    return $this->json(['error' => 'invalid_request', 'message' => 'Limit must be an integer between 1 and 1000.'], 400);
+                }
+                $limit = (int) $rawLimit;
+            }
+
+            $after = null;
+            if (array_key_exists('cursor', $params)) {
+                try {
+                    $after = self::decodeCursor($params['cursor']);
+                } catch (\InvalidArgumentException $e) {
+                    return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
+                }
+            }
+
+            $rows = $this->metadata->listAccountQuotasPage($after, ($paged ? $limit : self::MAX_PAGE_LIMIT) + 1);
+            if (!$paged && count($rows) > self::MAX_PAGE_LIMIT) {
+                return $this->json(['error' => 'pagination_required', 'message' => 'Use limit and cursor to list more than 1000 quotas.'], 400);
+            }
+            $hasMore = count($rows) > $limit;
+            $quotas = [];
+            foreach (array_slice($rows, 0, $paged ? $limit : self::MAX_PAGE_LIMIT) as $row) {
+                $quotas[] = ['ownerId' => $row['ownerId']] + self::quotaPayload($row['quota']);
+            }
+
+            if (!$paged) {
+                return $this->json(['quotas' => $quotas]);
+            }
+
+            $last = end($quotas);
+            $nextCursor = $hasMore && is_array($last) ? self::encodeCursor($last['ownerId']) : null;
+
+            return $this->json(['quotas' => $quotas, 'nextCursor' => $nextCursor]);
         }
 
         $quota = $this->metadata->getAccountQuota($ownerId);
@@ -60,7 +123,11 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
 
     private function handlePut(Request $request): Response
     {
-        $ownerId = $this->ownerIdFromPath($request);
+        try {
+            $ownerId = $this->ownerIdFromPath($request);
+        } catch (\InvalidArgumentException $e) {
+            return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
+        }
         if ($ownerId === null || $ownerId === '') {
             return $this->json(['error' => 'invalid_request', 'message' => 'Owner ID is required.'], 400);
         }
@@ -81,21 +148,25 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
         }
 
-        $this->metadata->putAccountQuota($ownerId, $quota);
+        AccountQuotaWriter::put($this->metadata, $ownerId, $quota);
 
         return $this->json(['ownerId' => $ownerId] + self::quotaPayload($quota));
     }
 
     private function handleDelete(Request $request): Response
     {
-        $ownerId = $this->ownerIdFromPath($request);
+        try {
+            $ownerId = $this->ownerIdFromPath($request);
+        } catch (\InvalidArgumentException $e) {
+            return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
+        }
         if ($ownerId === null || $ownerId === '') {
             return $this->json(['error' => 'invalid_request', 'message' => 'Owner ID is required.'], 400);
         }
 
-        $this->metadata->deleteAccountQuota($ownerId);
+        AccountQuotaWriter::delete($this->metadata, $ownerId);
 
-        return new Response(status: 204);
+        return new Response(status: 204, headers: ['cache-control' => 'no-store']);
     }
 
     private function ownerIdFromPath(Request $request): ?string
@@ -109,12 +180,25 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             return null;
         }
 
-        return rawurldecode(substr($path, strlen($prefix)));
+        $encoded = substr($path, strlen($prefix));
+        if ($encoded === '' || preg_match('/%(?![0-9A-Fa-f]{2})/', $encoded)) {
+            throw new \InvalidArgumentException('Owner ID is invalid.');
+        }
+        $ownerId = rawurldecode($encoded);
+        if (strlen($ownerId) > 255 || preg_match('//u', $ownerId) !== 1) {
+            throw new \InvalidArgumentException('Owner ID is invalid.');
+        }
+
+        return $ownerId;
     }
 
     private function isAuthorized(Request $request): bool
     {
-        $authorization = $request->getHeader('authorization') ?? '';
+        $headers = $request->getHeaderArray('authorization');
+        if (count($headers) !== 1) {
+            return false;
+        }
+        $authorization = $headers[0];
         if (!str_starts_with(strtolower($authorization), 'bearer ')) {
             return false;
         }
@@ -133,12 +217,27 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             throw new \InvalidArgumentException('Request body is too large.');
         }
 
-        $decoded = json_decode($raw, true);
-        if (!is_array($decoded)) {
+        $decoded = json_decode($raw);
+        if (! $decoded instanceof \stdClass) {
             throw new \InvalidArgumentException('Request body must be a JSON object.');
         }
 
-        return $decoded;
+        $body = get_object_vars($decoded);
+        if ($body === []) {
+            throw new \InvalidArgumentException('Request body must specify at least one quota field.');
+        }
+        foreach (array_keys($body) as $field) {
+            if (! in_array($field, self::QUOTA_FIELDS, true)) {
+                throw new \InvalidArgumentException("Unknown quota field '{$field}'.");
+            }
+        }
+        foreach ([['maxBucketsPerOwner', 'maxBuckets'], ['maxBytesPerOwner', 'maxBytes']] as [$name, $alias]) {
+            if (array_key_exists($name, $body) && array_key_exists($alias, $body)) {
+                throw new \InvalidArgumentException("Fields '{$name}' and '{$alias}' cannot be combined.");
+            }
+        }
+
+        return $body;
     }
 
     /**
@@ -146,15 +245,33 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
      */
     private function quotaInt(array $body, string $name, ?string $alias = null): int
     {
-        $value = $body[$name] ?? ($alias !== null ? ($body[$alias] ?? null) : null);
-        if ($value === null) {
-            return 0;
+        if (!array_key_exists($name, $body) && ($alias === null || !array_key_exists($alias, $body))) {
+            throw new \InvalidArgumentException("Field '{$name}' is required.");
         }
+        $value = $body[$name] ?? ($alias !== null ? ($body[$alias] ?? null) : null);
         if (!is_int($value) || $value < 0) {
             throw new \InvalidArgumentException("Field '{$name}' must be an integer >= 0.");
         }
 
         return $value;
+    }
+
+    private static function encodeCursor(string $ownerId): string
+    {
+        return rtrim(strtr(base64_encode($ownerId), '+/', '-_'), '=');
+    }
+
+    private static function decodeCursor(string $cursor): string
+    {
+        if ($cursor === '' || strlen($cursor) > self::MAX_CURSOR_BYTES || !preg_match('/^[A-Za-z0-9_-]+$/D', $cursor)) {
+            throw new \InvalidArgumentException('Invalid quota cursor.');
+        }
+        $after = base64_decode(strtr($cursor, '-_', '+/'), true);
+        if ($after === false || $after === '' || preg_match('//u', $after) !== 1 || self::encodeCursor($after) !== $cursor) {
+            throw new \InvalidArgumentException('Invalid quota cursor.');
+        }
+
+        return $after;
     }
 
     /**
@@ -182,7 +299,7 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
     {
         return new Response(
             status: $status,
-            headers: ['content-type' => 'application/json'] + $headers,
+            headers: ['content-type' => 'application/json', 'cache-control' => 'no-store'] + $headers,
             body: json_encode($payload, JSON_THROW_ON_ERROR),
         );
     }

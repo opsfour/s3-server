@@ -68,6 +68,14 @@ interface MetadataStore
     public function getBucketStorageStats(string $bucket): array;
 
     /**
+     * Get stored object bytes owned by an account across all buckets and versions.
+     * Delete markers are excluded.
+     *
+     * @return array{objectCount: int, bytesUsed: int}
+     */
+    public function getOwnerStorageStats(string $ownerId): array;
+
+    /**
      * Get account-specific quota limits for an owner.
      */
     public function getAccountQuota(string $ownerId): ?QuotaConfig;
@@ -78,6 +86,13 @@ interface MetadataStore
      * @return array<string, QuotaConfig> Quotas keyed by owner ID.
      */
     public function listAccountQuotas(): array;
+
+    /**
+     * Read at most $limit quota overrides ordered by owner ID, strictly after $after.
+     *
+     * @return list<array{ownerId: string, quota: QuotaConfig}>
+     */
+    public function listAccountQuotasPage(?string $after, int $limit): array;
 
     /**
      * Store account-specific quota limits for an owner.
@@ -96,6 +111,7 @@ interface MetadataStore
 
     /**
      * Store an account-level IAM policy JSON string for an owner.
+     * Reject malformed or unsupported identity policies before mutation.
      */
     public function putAccountPolicy(string $ownerId, string $policyJson): void;
 
@@ -110,7 +126,17 @@ interface MetadataStore
     public function getNamedPolicy(string $policyName): ?string;
 
     /**
+     * Lock existing named policies in sorted order for the current write transaction.
+     * Missing names are still rejected by the subsequent policy lookup.
+     *
+     * @param list<string> $policyNames
+     * @return array<string, string> Current JSON documents keyed by existing policy name.
+     */
+    public function lockNamedPoliciesForUpdate(array $policyNames): array;
+
+    /**
      * Store a reusable named IAM policy JSON string.
+     * Reject malformed or unsupported identity policies before mutation.
      */
     public function putNamedPolicy(string $policyName, string $policyJson): void;
 
@@ -120,7 +146,9 @@ interface MetadataStore
     public function deleteNamedPolicy(string $policyName): void;
 
     /**
-     * Get bucket metadata.
+     * Get bucket metadata, including its immutable creation generation.
+     * Implementations must persist a new generation on every name reuse so
+     * buffered access logs cannot cross bucket lifetimes.
      *
      * @param  string  $bucket  The bucket name.
      * @return BucketInfo|null The bucket info or null if not found.
@@ -134,6 +162,16 @@ interface MetadataStore
      * @return list<BucketInfo> The list of buckets.
      */
     public function listBuckets(string $ownerId): array;
+
+    /** Count buckets owned by one account without loading their metadata. */
+    public function countBuckets(string $ownerId): int;
+
+    /**
+     * List at most maxBuckets owned buckets after a name marker.
+     *
+     * @return array{buckets: list<BucketInfo>, nextMarker: ?string}
+     */
+    public function listBucketsPage(string $ownerId, ?string $after, ?string $prefix, ?string $region, int $maxBuckets): array;
 
     /**
      * List all buckets across all owners.
@@ -160,6 +198,15 @@ interface MetadataStore
      * @return string|null The owner ID, or null if the bucket does not exist.
      */
     public function getBucketOwner(string $bucket): ?string;
+
+    /** Get the explicit Object Ownership setting, or null for a legacy bucket without controls. */
+    public function getBucketOwnershipControls(string $bucket): ?string;
+
+    /** Store an explicit Object Ownership setting for a bucket. */
+    public function putBucketOwnershipControls(string $bucket, string $ownership): void;
+
+    /** Remove explicit controls; the package's effective default is ObjectWriter. */
+    public function deleteBucketOwnershipControls(string $bucket): void;
 
     // ---------------------------------------------------------------
     // Object operations
@@ -212,6 +259,9 @@ interface MetadataStore
      * @return ObjectInfo|null The object metadata or null if not found.
      */
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo;
+
+    /** Retrieve the current version, including a delete marker. */
+    public function getCurrentObjectVersion(string $bucket, string $key): ?ObjectInfo;
 
     /**
      * Delete object metadata.
@@ -330,7 +380,7 @@ interface MetadataStore
      * Get a multipart upload record.
      *
      * @param  string  $uploadId  The upload ID.
-     * @return array{upload_id: string, bucket: string, key_name: string, owner_id: string, content_type: string, user_metadata: array<string, string>, created_at: string}|null
+     * @return array{upload_id: string, bucket: string, bucket_generation: string, key_name: string, owner_id: string, storage_tier: ?string, content_type: string, user_metadata: array<string, string>, created_at: string}|null
      */
     public function getMultipartUpload(string $uploadId): ?array;
 
@@ -350,7 +400,7 @@ interface MetadataStore
      * @param  int  $maxUploads  Maximum number of uploads to return.
      * @param  string|null  $keyMarker  Start listing after this key.
      * @param  string|null  $uploadIdMarker  Start listing after this upload ID (used with keyMarker).
-     * @return array{uploads: list<array{upload_id: string, bucket: string, key_name: string, owner_id: string, content_type: string, created_at: string}>, isTruncated: bool, nextKeyMarker: ?string, nextUploadIdMarker: ?string, commonPrefixes: list<string>}
+     * @return array{uploads: list<array{upload_id: string, bucket: string, key_name: string, owner_id: string, content_type: string, user_metadata?: string, created_at: string}>, isTruncated: bool, nextKeyMarker: ?string, nextUploadIdMarker: ?string, commonPrefixes: list<string>}
      */
     public function listMultipartUploads(
         string $bucket,
@@ -362,9 +412,12 @@ interface MetadataStore
     ): array;
 
     /**
+     * Get staged multipart usage for an owner, optionally within one bucket.
+     * A null owner includes every account (for bucket-wide limits).
+     *
      * @return array{uploadCount: int, bytesUsed: int}
      */
-    public function getMultipartStorageStats(string $ownerId, ?string $bucket = null): array;
+    public function getMultipartStorageStats(?string $ownerId, ?string $bucket = null): array;
 
     /**
      * Store a part record for a multipart upload.
@@ -381,7 +434,7 @@ interface MetadataStore
      * Get all parts for a multipart upload, ordered by part number.
      *
      * @param  string  $uploadId  The upload ID.
-     * @return list<array{part_number: int, etag: string, size: int, storage_path: string, created_at: string}>
+     * @return list<array{part_number: int, etag: string, size: int, storage_path: string, checksum_algorithm?: ?string, checksum_value?: ?string, created_at: string}>
      */
     public function getParts(string $uploadId): array;
 
@@ -643,7 +696,7 @@ interface MetadataStore
      * Get the CORS rules for a bucket.
      *
      * @param  string  $bucket  The bucket name.
-     * @return list<array{allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>
+     * @return list<array{id?: string, allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>
      */
     public function getBucketCors(string $bucket): array;
 
@@ -651,7 +704,7 @@ interface MetadataStore
      * Replace all CORS rules for a bucket.
      *
      * @param  string  $bucket  The bucket name.
-     * @param  list<array{allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>  $rules
+     * @param  list<array{id?: string, allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>  $rules
      */
     public function putBucketCors(string $bucket, array $rules): void;
 
@@ -697,6 +750,14 @@ interface MetadataStore
     public function getBucketLifecycle(string $bucket): array;
 
     /**
+     * Names of physical tiers referenced by stored objects, queued work,
+     * garbage entries, or lifecycle transition rules.
+     *
+     * @return list<string>
+     */
+    public function listReferencedStorageTiers(): array;
+
+    /**
      * Replace all lifecycle rules for a bucket.
      *
      * @param  string  $bucket  The bucket name.
@@ -722,13 +783,23 @@ interface MetadataStore
         string $targetStorageClass,
         string $sourceStoragePath,
         int $maxAttempts = 10,
+        string $origin = 'direct',
+        ?string $lifecycleRuleId = null,
+        ?bool $expectedIsLatest = null,
     ): int;
 
     /**
+     * Claim 1..1000 jobs in a dedicated committed transaction; calling this
+     * inside an existing transaction is unsupported.
+     *
      * @return list<array<string, mixed>>
      */
     public function dequeueTierTransitionJobs(int $limit): array;
 
+    /**
+     * Update a job only while the expected processing lease is still held.
+     * Omit the lease for administrative state changes. Returns whether a row changed.
+     */
     public function updateTierTransitionJobStatus(
         int $id,
         string $status,
@@ -736,12 +807,13 @@ interface MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $targetStoragePath = null,
-    ): void;
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool;
 
     /**
      * Extend a processing lease. Returns false if the job is no longer processing.
      */
-    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt): bool;
+    public function renewTierTransitionJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool;
 
     /**
      * @return array<string, mixed>|null
@@ -763,10 +835,17 @@ interface MetadataStore
     ): int;
 
     /**
+     * Claim 1..1000 jobs in a dedicated committed transaction; calling this
+     * inside an existing transaction is unsupported.
+     *
      * @return list<array<string, mixed>>
      */
     public function dequeueRestoreJobs(int $limit): array;
 
+    /**
+     * Update a job only while the expected processing lease is still held.
+     * Omit the lease for administrative state changes. Returns whether a row changed.
+     */
     public function updateRestoreJobStatus(
         int $id,
         string $status,
@@ -774,12 +853,13 @@ interface MetadataStore
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
         ?string $restoredStoragePath = null,
-    ): void;
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool;
 
     /**
      * Extend a processing lease. Returns false if the job is no longer processing.
      */
-    public function renewRestoreJobLease(int $id, float $leaseExpiresAt): bool;
+    public function renewRestoreJobLease(int $id, float $leaseExpiresAt, ?float $expectedLeaseExpiresAt = null): bool;
 
     /**
      * @return array<string, mixed>|null
@@ -975,7 +1055,8 @@ interface MetadataStore
     // ---------------------------------------------------------------
 
     /**
-     * Enqueue a notification for asynchronous delivery.
+     * Enqueue a notification for asynchronous delivery and return its durable queue ID.
+     * The ID can be used as an ordering token while the caller's transaction is held.
      */
     public function enqueueNotification(
         string $bucket,
@@ -984,26 +1065,35 @@ interface MetadataStore
         string $destinationUrl,
         string $payloadJson,
         int $maxAttempts = 10,
-    ): void;
+    ): int;
+
+    /** Replace a queued notification's payload before the enclosing transaction commits. */
+    public function updateNotificationPayload(int $id, string $payloadJson): void;
 
     /**
-     * Dequeue pending notifications ready for delivery.
+     * Dequeue 1..1000 pending notifications in a dedicated committed
+     * transaction. Calling this inside an existing transaction is unsupported.
      *
-     * @return list<array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int}>
+     * @return list<array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int, lease_expires_at: float, lease_generation?: int}>
      */
     public function dequeueNotifications(int $limit): array;
 
     /**
      * Return notification queue counts by status.
      *
+     * @phpstan-impure
+     *
      * @return array<string, int>
      */
     public function getNotificationQueueStats(): array;
+
 
     /**
      * Update the status of a notification queue item.
      *
      * @param bool $incrementAttempts Whether to increment the attempts counter. False for non-delivery deferrals (e.g., circuit breaker).
+     * @param float|null $expectedLeaseExpiresAt When set, update only while this exact processing lease is still held.
+     * @return bool Whether the queue row was updated.
      */
     public function updateNotificationStatus(
         int $id,
@@ -1011,7 +1101,8 @@ interface MetadataStore
         ?string $error = null,
         ?float $nextAttemptAt = null,
         bool $incrementAttempts = true,
-    ): void;
+        ?float $expectedLeaseExpiresAt = null,
+    ): bool;
 
     /**
      * Remove old completed/dead-letter notifications.
@@ -1024,16 +1115,22 @@ interface MetadataStore
 
     public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void;
 
+    /** Stage incomplete uploads for durable abort in the same transaction that deletes the bucket. */
+    public function stageBucketMultipartCleanup(string $bucket, string $storageTier): void;
+
     public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void;
 
     /**
-     * @return list<array{id: int, bucket: string, storage_tier: string, storage_path: string, attempts: int}>
+     * Claim 1..1000 rows in a dedicated committed transaction. Calling this
+     * inside an existing transaction is unsupported.
+     *
+     * @return list<array{id: int, bucket: string, storage_tier: string, storage_path: string, operation: string, key_name: ?string, upload_id: ?string, attempts: int, lease_expires_at: float, lease_generation?: int, dispatch_id?: ?string}>
      */
     public function dequeueStorageGarbage(int $limit): array;
 
-    public function completeStorageGarbage(int $id): void;
+    public function completeStorageGarbage(int $id, ?float $expectedLeaseExpiresAt = null): bool;
 
-    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt): void;
+    public function retryStorageGarbage(int $id, string $error, float $nextAttemptAt, ?float $expectedLeaseExpiresAt = null): bool;
 
     // ---------------------------------------------------------------
     // Transaction support
@@ -1041,6 +1138,11 @@ interface MetadataStore
 
     /**
      * Begin a database transaction.
+     *
+     * Direct nested transaction boundaries are unsupported and fail without
+     * changing the active transaction. commit() and rollback() likewise fail
+     * without the matching active transaction. Use transaction() for joined
+     * nesting.
      */
     public function beginTransaction(): void;
 
@@ -1062,7 +1164,9 @@ interface MetadataStore
     /**
      * Execute a callback within a database transaction.
      *
-     * Automatically commits on success or rolls back on exception.
+     * The outermost call owns commit or rollback. Nested calls join its
+     * transaction without a savepoint; only an exception escaping the owning
+     * outer call triggers rollback.
      *
      * @template T
      * @param  callable(): T  $callback

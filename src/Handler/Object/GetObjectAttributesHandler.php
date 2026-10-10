@@ -8,10 +8,14 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
-use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -36,15 +40,22 @@ final class GetObjectAttributesHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $versionId = $queryParams['versionId'] ?? null;
-
-        $objectInfo = ($versionId !== null)
-            ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
-            : $this->metadata->getObjectMetadata($bucket, $key);
-        if ($objectInfo === null || $objectInfo->isDeleteMarker) {
-            throw new NoSuchKeyException();
+        try {
+            $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        } catch (NoSuchKeyException|NoSuchVersionException $exception) {
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            // A current delete marker keeps its established 404 response.
+            $denyMissingObject = ! isset(QueryStringParser::parse($request->getUri()->getQuery())['versionId'])
+                && $this->metadata->getCurrentObjectVersion($bucket, $key) === null
+                && ! MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+            // Both lookups can yield after the first generation check.
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if ($denyMissingObject) {
+                throw new \OpsFour\S3Server\Exception\AccessDeniedException();
+            }
+            throw $exception;
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $sseAlgorithm = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
         $customerKey = EncryptionRequestResolver::resolveCustomerKey(
@@ -59,7 +70,7 @@ final class GetObjectAttributesHandler implements RequestHandler
         // Parse requested attributes.
         $attrHeaders = $request->getHeaderArray('x-amz-object-attributes');
         if ($attrHeaders === []) {
-            $attrHeaders = ['ETag,ObjectSize,StorageClass'];
+            throw new InvalidArgumentException('x-amz-object-attributes header is required.');
         }
 
         $requestedAttrs = [];
@@ -67,41 +78,61 @@ final class GetObjectAttributesHandler implements RequestHandler
             foreach (explode(',', $attrHeader) as $attr) {
                 $attr = trim($attr);
                 if ($attr !== '') {
-                    $requestedAttrs[] = $attr;
+                    if (!in_array($attr, ['ETag', 'ObjectSize', 'StorageClass', 'Checksum', 'ObjectParts'], true)) {
+                        throw new InvalidArgumentException('Invalid x-amz-object-attributes value.');
+                    }
+                    $requestedAttrs[$attr] = true;
                 }
             }
         }
+        if ($requestedAttrs === []) {
+            throw new InvalidArgumentException('x-amz-object-attributes header is required.');
+        }
+
+        $emitNullVersion = $objectInfo->versionId === null
+            && $this->metadata->getBucketVersioning($bucket) !== '';
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
         $writer = new \XMLWriter();
         $writer->openMemory();
         $writer->startDocument('1.0', 'UTF-8');
         $writer->startElementNs(null, 'GetObjectAttributesResponse', 'http://s3.amazonaws.com/doc/2006-03-01/');
 
-        foreach ($requestedAttrs as $attr) {
+        foreach (['ETag', 'Checksum', 'ObjectParts', 'StorageClass', 'ObjectSize'] as $attr) {
+            if (! isset($requestedAttrs[$attr])) {
+                continue;
+            }
             match ($attr) {
                 'ETag' => $writer->writeElement('ETag', trim($objectInfo->etag, '"')),
                 'ObjectSize' => $writer->writeElement('ObjectSize', (string) $objectInfo->size),
                 'StorageClass' => $writer->writeElement('StorageClass', $objectInfo->storageClass),
                 'Checksum' => self::writeChecksum($writer, $objectInfo),
                 'ObjectParts' => self::writeObjectParts($writer, $objectInfo),
-                default => null,
             };
         }
-
-        $writer->writeElement('LastModified', $objectInfo->lastModified->format('Y-m-d\TH:i:s.000\Z'));
 
         $writer->endElement();
         $writer->endDocument();
 
-        $headers = ['Content-Type' => 'application/xml'];
+        $headers = [
+            'Content-Type' => 'application/xml',
+            'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \G\M\T'),
+        ];
         if ($objectInfo->versionId !== null) {
             $headers['x-amz-version-id'] = $objectInfo->versionId;
+        } elseif ($emitNullVersion) {
+            $headers['x-amz-version-id'] = 'null';
         }
         if ($sseAlgorithm === 'SSE-C') {
             $headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
             $headers['x-amz-server-side-encryption-customer-key-MD5']
                 = $objectInfo->userMetadata['__sse-customer-key-md5'];
         }
+
+        // The versioning lookup above can yield after the earlier generation
+        // check. Never return old-owner attributes if the bucket was reused.
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         return new Response(
             status: 200,
@@ -137,6 +168,7 @@ final class GetObjectAttributesHandler implements RequestHandler
         if (isset($obj->systemMetadata['checksum-sha256']) && $obj->systemMetadata['checksum-sha256'] !== '') {
             $writer->writeElement('ChecksumSHA256', $obj->systemMetadata['checksum-sha256']);
         }
+        $writer->writeElement('ChecksumType', 'FULL_OBJECT');
         $writer->endElement();
     }
 

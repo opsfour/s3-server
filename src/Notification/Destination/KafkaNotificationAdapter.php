@@ -40,10 +40,13 @@ final readonly class KafkaNotificationAdapter implements NotificationDestination
         try {
             $result = $this->publish($payload, $key, $event);
         } catch (\Throwable $e) {
-            return NotificationDeliveryResult::retryableFailure($e->getMessage(), [
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'topic' => $this->topic,
                 'exception' => $e::class,
             ]);
+        }
+        if ($result === false || $result === null) {
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', ['topic' => $this->topic]);
         }
 
         return NotificationDeliveryResult::sent([

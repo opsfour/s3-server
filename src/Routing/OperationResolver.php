@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Routing;
 
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 
 /**
  * Resolves an HTTP method + scope + query params + headers to an S3Operation.
@@ -85,6 +86,9 @@ final class OperationResolver
      */
     private static function resolveBucketPut(array $queryParams): S3Operation
     {
+        if (\array_key_exists('ownershipControls', $queryParams)) {
+            return S3Operation::PutBucketOwnershipControls;
+        }
         if (\array_key_exists('versioning', $queryParams)) {
             return S3Operation::PutBucketVersioning;
         }
@@ -131,6 +135,9 @@ final class OperationResolver
      */
     private static function resolveBucketDelete(array $queryParams): S3Operation
     {
+        if (\array_key_exists('ownershipControls', $queryParams)) {
+            return S3Operation::DeleteBucketOwnershipControls;
+        }
         if (\array_key_exists('policy', $queryParams)) {
             return S3Operation::DeleteBucketPolicy;
         }
@@ -162,6 +169,9 @@ final class OperationResolver
      */
     private static function resolveBucketGet(array $queryParams): S3Operation
     {
+        if (\array_key_exists('ownershipControls', $queryParams)) {
+            return S3Operation::GetBucketOwnershipControls;
+        }
         if (\array_key_exists('location', $queryParams)) {
             return S3Operation::GetBucketLocation;
         }
@@ -210,7 +220,11 @@ final class OperationResolver
         if (\array_key_exists('logging', $queryParams)) {
             return S3Operation::GetBucketLogging;
         }
-        if (\array_key_exists('list-type', $queryParams) && (string) ($queryParams['list-type'] ?? '') === '2') {
+        if (\array_key_exists('list-type', $queryParams)) {
+            if (! is_string($queryParams['list-type']) || $queryParams['list-type'] !== '2') {
+                throw new InvalidArgumentException('list-type must be 2.');
+            }
+
             return S3Operation::ListObjectsV2;
         }
 
@@ -297,7 +311,12 @@ final class OperationResolver
         if (\array_key_exists('legal-hold', $queryParams)) {
             return S3Operation::PutObjectLegalHold;
         }
-        if (\array_key_exists('partNumber', $queryParams) && \array_key_exists('uploadId', $queryParams)) {
+        $hasPartNumber = \array_key_exists('partNumber', $queryParams);
+        $hasUploadId = \array_key_exists('uploadId', $queryParams);
+        if ($hasPartNumber !== $hasUploadId) {
+            throw new InvalidArgumentException('UploadPart requires both partNumber and uploadId.');
+        }
+        if ($hasPartNumber) {
             // UploadPartCopy vs UploadPart: distinguished by x-amz-copy-source header
             if (\array_key_exists('x-amz-copy-source', $headers)) {
                 return S3Operation::UploadPartCopy;

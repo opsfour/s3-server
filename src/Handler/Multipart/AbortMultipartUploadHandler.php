@@ -11,7 +11,9 @@ use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -45,36 +47,57 @@ final class AbortMultipartUploadHandler implements RequestHandler
         $uploadId = $queryParams['uploadId'] ?? '';
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
             throw new NoSuchUploadException();
         }
-        if ($upload['owner_id'] !== $ownerId) {
+        $policyAllowed = $request->hasAttribute('s3.policyResult')
+            && $request->getAttribute('s3.policyResult') === 'Allow';
+        if ($ownerId !== $upload['owner_id'] && $ownerId !== $bucketInfo->ownerId && !$policyAllowed) {
             throw new NoSuchUploadException();
         }
+        $uploadGeneration = $upload['bucket_generation'] ?? '';
+        if ($uploadGeneration !== $bucketInfo->generation && $upload['owner_id'] !== $bucketInfo->ownerId) {
+            throw new NoSuchUploadException();
+        }
+        // Pre-migration uploads have no generation. Keep their owner-only drain
+        // path, but never let a later or delegated bucket owner consume them.
+        if ($uploadGeneration !== $bucketInfo->generation
+            && ! ($uploadGeneration === '' && $upload['owner_id'] === $ownerId && $bucketInfo->ownerId === $ownerId)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
+        $tier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
 
-        $event = $this->notifications?->createEvent('s3:MultipartUpload:Aborted', $bucket, $key, ownerId: $ownerId)
+        $event = $this->notifications?->createEvent('s3:MultipartUpload:Aborted', $bucket, $key, ownerId: $ownerId, bucketGeneration: $bucketInfo->generation)
             ?? new S3Event('s3:MultipartUpload:Aborted', $bucket, $key, ownerId: $ownerId);
-        $parts = $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $event): array {
-            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+        $uploadOwner = $upload['owner_id'];
+        $parts = $this->metadata->transaction(function () use ($request, $uploadId, $bucketInfo, $bucket, $key, $ownerId, $uploadOwner, $uploadGeneration, $event, $tier): array {
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $uploadOwner, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $parts = MultipartCleanup::stage(
                 $this->metadata,
                 $bucket,
                 $key,
                 $uploadId,
-                $ownerId,
-                $this->storageTiers->defaultTier()->name,
+                $uploadOwner,
+                $tier->name,
+                $uploadGeneration,
             );
+            if ($this->metadata instanceof MultipartWriteIntentStore) {
+                $this->metadata->abandonMultipartWriteIntentsForUpload($uploadId, $this->metadata->multipartWriteIntentNow());
+            }
             $this->notifications?->enqueueWebhooks($event);
 
             return $parts;
         });
         MultipartCleanup::clean(
             $this->metadata,
-            $this->storage,
+            $tier->backend,
             $bucket,
             $key,
             $uploadId,
-            $this->storageTiers->defaultTier()->name,
+            $tier->name,
             $parts,
         );
         $this->notifications?->dispatchInternalEvent($event);

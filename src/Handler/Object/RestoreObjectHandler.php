@@ -10,11 +10,16 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
-use OpsFour\S3Server\Exception\OperationAbortedException;
-use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
+use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Exception\RestoreAlreadyInProgressException;
+use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\RestoredCopyTierResolver;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 final class RestoreObjectHandler implements RequestHandler
@@ -28,22 +33,20 @@ final class RestoreObjectHandler implements RequestHandler
     {
         $bucket = (string) $request->getAttribute('s3.bucket');
         $key = (string) $request->getAttribute('s3.key');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
 
-        $queryString = $request->getUri()->getQuery();
-        $queryParams = $queryString !== '' ? QueryStringParser::parse($queryString) : [];
-        $versionId = $queryParams['versionId'] ?? null;
-        $object = $versionId !== null
-            ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
-            : $this->metadata->getObjectMetadata($bucket, $key);
-
-        if ($object === null || $object->isDeleteMarker) {
-            throw new NoSuchKeyException();
+        try {
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        } catch (NoSuchKeyException|NoSuchVersionException $error) {
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            throw $error;
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $tier = $this->storageTiers->has($object->storageTier)
             ? $this->storageTiers->tier($object->storageTier)
@@ -54,14 +57,16 @@ final class RestoreObjectHandler implements RequestHandler
 
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 65_536);
         $restore = XmlRequestParser::parseRestoreRequest($body);
-        $alreadyRestored = $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $versionId, $object, $restore): bool {
-            OwnerWriteLock::acquire($this->metadata, $bucketInfo->ownerId, $object->ownerId);
-            $current = $versionId !== null
-                ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)
-                : $this->metadata->getObjectMetadata($bucket, $key);
-            if ($current === null || $current->isDeleteMarker) {
-                throw new NoSuchKeyException();
-            }
+        if ($restore['tier'] !== null && $restore['tier'] !== 'Standard') {
+            throw new NotImplementedException(
+                "Restore retrieval tier {$restore['tier']} is not supported; use Standard.",
+            );
+        }
+        $alreadyRestored = $this->metadata->transaction(function () use ($request, $bucketInfo, $bucket, $key, $object, $restore, $ownerId): bool {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId, $object->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+            $current = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
 
             $tier = $this->storageTiers->has($current->storageTier)
                 ? $this->storageTiers->tier($current->storageTier)
@@ -70,13 +75,30 @@ final class RestoreObjectHandler implements RequestHandler
                 throw new InvalidObjectStateException('RestoreObject is only valid for objects in restore-required storage tiers.');
             }
             if ($current->restoreStatus === 'pending') {
-                throw new OperationAbortedException('Restore is already in progress for this object.');
+                throw new RestoreAlreadyInProgressException();
             }
             if (
                 $current->restoreStatus === 'restored'
                 && $current->restoreExpiresAt !== null
                 && $current->restoreExpiresAt > new \DateTimeImmutable('now', new \DateTimeZone('UTC'))
             ) {
+                if (! $this->metadata instanceof RestoredCopyTierStore
+                    || $current->restoredStoragePath === null) {
+                    throw new InvalidObjectStateException('Restored object copy has incomplete physical metadata.');
+                }
+                $restoredTier = RestoredCopyTierResolver::resolve($current, $this->storageTiers);
+                $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+                    ->modify('+' . $restore['days'] . ' days');
+                $this->metadata->updateObjectRestoreStateWithTier(
+                    bucket: $current->bucket,
+                    key: $current->key,
+                    versionId: $current->versionId ?? 'null',
+                    restoreStatus: 'restored',
+                    restoredStoragePath: $current->restoredStoragePath,
+                    restoreExpiresAt: $expiresAt,
+                    restoredStorageTier: $restoredTier->name,
+                );
+
                 return true;
             }
 
@@ -84,11 +106,23 @@ final class RestoreObjectHandler implements RequestHandler
             if ($sourceStoragePath === null || $sourceStoragePath === '') {
                 throw new InvalidObjectStateException('Object storage path is missing.');
             }
+            $targetVersionId = $current->versionId ?? 'null';
+
+            // Replacing an expired restore must retain its exact physical
+            // location for cleanup before the pending state clears the path.
+            if ($current->restoredStoragePath !== null) {
+                $restoredTier = RestoredCopyTierResolver::resolve($current, $this->storageTiers);
+                $this->metadata->enqueueStorageGarbage(
+                    $current->bucket,
+                    $restoredTier->name,
+                    $current->restoredStoragePath,
+                );
+            }
 
             $this->metadata->enqueueRestoreJob(
                 bucket: $current->bucket,
                 key: $current->key,
-                versionId: $current->versionId,
+                versionId: $targetVersionId,
                 sourceTier: $current->storageTier,
                 sourceStoragePath: $sourceStoragePath,
                 restoreDays: $restore['days'],
@@ -96,7 +130,7 @@ final class RestoreObjectHandler implements RequestHandler
             $this->metadata->updateObjectRestoreState(
                 bucket: $current->bucket,
                 key: $current->key,
-                versionId: $current->versionId,
+                versionId: $targetVersionId,
                 restoreStatus: 'pending',
             );
 

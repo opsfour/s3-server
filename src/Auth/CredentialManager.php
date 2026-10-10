@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Auth;
 
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
+use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
 
 /**
  * Shared service for managing S3 credentials.
@@ -14,6 +17,8 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
  */
 final class CredentialManager
 {
+    private const int MAX_GENERATED_KEY_ATTEMPTS = 5;
+
     public function __construct(
         private readonly CredentialProvider $provider,
     ) {}
@@ -57,21 +62,33 @@ final class CredentialManager
         array $policyNames = [],
         array $allowedPrefixes = [],
     ): Credential {
-        $credential = new Credential(
-            accessKeyId: $accessKeyId ?? $this->generateAccessKeyId(),
-            secretAccessKey: $secretAccessKey ?? $this->generateSecretAccessKey(),
-            ownerId: $ownerId,
-            displayName: $displayName,
-            isActive: true,
-            sessionToken: $sessionToken,
-            expiresAt: $expiresAt,
-            policyNames: $policyNames,
-            allowedPrefixes: $allowedPrefixes,
-        );
+        if (! $this->provider instanceof AtomicCredentialCreator) {
+            throw new \RuntimeException('Credential provider does not support atomic creation.');
+        }
 
-        $this->provider->putCredential($credential);
+        $secretAccessKey ??= $this->generateSecretAccessKey();
+        $attempts = $accessKeyId === null ? self::MAX_GENERATED_KEY_ATTEMPTS : 1;
+        for ($attempt = 0; $attempt < $attempts; $attempt++) {
+            $credential = new Credential(
+                accessKeyId: $accessKeyId ?? $this->generateAccessKeyId(),
+                secretAccessKey: $secretAccessKey,
+                ownerId: $ownerId,
+                displayName: $displayName,
+                isActive: true,
+                sessionToken: $sessionToken,
+                expiresAt: $expiresAt,
+                policyNames: $policyNames,
+                allowedPrefixes: $allowedPrefixes,
+            );
 
-        return $credential;
+            if ($this->provider->createCredentialIfAbsent($credential)) {
+                return $credential;
+            }
+        }
+
+        throw new \RuntimeException($accessKeyId !== null
+            ? "Credential already exists: {$accessKeyId}"
+            : 'Could not generate an unused credential access key ID.');
     }
 
     /**
@@ -112,7 +129,12 @@ final class CredentialManager
             allowedPrefixes: $existing->allowedPrefixes,
         );
 
-        $this->provider->putCredential($updated);
+        if (! $this->provider instanceof AtomicCredentialStatusUpdater) {
+            throw new \RuntimeException('Credential provider does not support atomic status updates.');
+        }
+        if (! $this->provider->setActiveIfCurrent($existing, $active)) {
+            throw new \RuntimeException("Credential changed or was revoked: {$accessKeyId}");
+        }
 
         return $updated;
     }
@@ -124,13 +146,16 @@ final class CredentialManager
      */
     public function deleteCredential(string $accessKeyId): bool
     {
-        if ($this->provider->getCredential($accessKeyId) === null) {
+        $expected = $this->provider->getCredential($accessKeyId);
+        if ($expected === null) {
             return false;
         }
 
-        $this->provider->deleteCredential($accessKeyId);
+        if (! $this->provider instanceof AtomicCredentialDeleter) {
+            throw new \RuntimeException('Credential provider does not support atomic deletion.');
+        }
 
-        return true;
+        return $this->provider->deleteCredentialIfCurrent($expected);
     }
 
     /**

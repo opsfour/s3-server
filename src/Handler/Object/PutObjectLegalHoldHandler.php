@@ -8,8 +8,11 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -28,7 +31,7 @@ final class PutObjectLegalHoldHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -40,7 +43,7 @@ final class PutObjectLegalHoldHandler implements RequestHandler
         // Object Lock must be enabled on the bucket.
         $lockConfig = $this->metadata->getObjectLockConfig($bucket);
         if ($lockConfig === null) {
-            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+            throw new InvalidRequestException(
                 'Bucket is missing Object Lock Configuration',
             );
         }
@@ -49,8 +52,10 @@ final class PutObjectLegalHoldHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $legalHold = XmlRequestParser::parseLegalHold($body);
 
-        $this->metadata->transaction(function () use ($bucketInfo, $request, $bucket, $key, $legalHold): void {
-            $this->metadata->lockOwnerForUpdate($bucketInfo->ownerId);
+        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $legalHold): void {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
             $this->metadata->putObjectLegalHold(
                 $bucket,

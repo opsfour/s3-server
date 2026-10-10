@@ -14,6 +14,7 @@ use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -48,17 +49,24 @@ final class PutObjectTaggingHandler implements RequestHandler
         $tags = XmlRequestParser::parseTagging($body);
 
         $tags = ObjectTagValidator::validate($tags, self::MAX_OBJECT_TAGS);
+        $request->setBody($body);
 
         $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $tags): ?string {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
             $this->metadata->putObjectTagging($bucket, $key, $tags, $object->versionId);
 
-            return $object->versionId;
+            return $object->versionId
+                ?? ($this->metadata->getBucketVersioning($bucket) !== '' ? 'null' : null);
         });
         return new Response(
             status: 200,
-            headers: array_filter(['x-amz-version-id' => $versionId]),
+            headers: array_filter(
+                ['x-amz-version-id' => $versionId],
+                static fn(?string $value): bool => $value !== null,
+            ),
         );
     }
 }

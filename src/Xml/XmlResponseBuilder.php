@@ -35,17 +35,17 @@ final class XmlResponseBuilder
      * @param  string  $ownerId  The owner ID.
      * @param  string  $displayName  The owner display name.
      */
-    public static function listBucketsResult(array $buckets, string $ownerId = '', string $displayName = ''): string
-    {
+    public static function listBucketsResult(
+        array $buckets,
+        string $ownerId = '',
+        string $displayName = '',
+        bool $includeRegion = false,
+        ?string $prefix = null,
+        ?string $continuationToken = null,
+    ): string {
         $writer = self::createWriter();
 
         $writer->startElementNs(null, 'ListAllMyBucketsResult', self::S3_NAMESPACE);
-
-        // Owner
-        $writer->startElement('Owner');
-        $writer->writeElement('ID', $ownerId);
-        $writer->writeElement('DisplayName', $displayName);
-        $writer->endElement();
 
         // Buckets
         $writer->startElement('Buckets');
@@ -53,9 +53,24 @@ final class XmlResponseBuilder
             $writer->startElement('Bucket');
             $writer->writeElement('Name', $bucket->name);
             $writer->writeElement('CreationDate', $bucket->creationDate->format('Y-m-d\TH:i:s.000\Z'));
+            if ($includeRegion) {
+                $writer->writeElement('BucketRegion', $bucket->region);
+            }
             $writer->endElement();
         }
         $writer->endElement(); // Buckets
+
+        $writer->startElement('Owner');
+        $writer->writeElement('ID', $ownerId);
+        $writer->writeElement('DisplayName', $displayName);
+        $writer->endElement();
+
+        if ($continuationToken !== null) {
+            $writer->writeElement('ContinuationToken', $continuationToken);
+        }
+        if ($prefix !== null) {
+            $writer->writeElement('Prefix', $prefix);
+        }
 
         $writer->endElement(); // ListAllMyBucketsResult
         $writer->endDocument();
@@ -66,16 +81,50 @@ final class XmlResponseBuilder
     /**
      * Build a CopyObjectResult XML response.
      */
-    public static function copyObjectResult(string $etag, string $lastModified): string
-    {
+    public static function copyObjectResult(
+        string $etag,
+        string $lastModified,
+        ?string $checksumCrc32 = null,
+        ?string $checksumCrc32c = null,
+        ?string $checksumSha1 = null,
+        ?string $checksumSha256 = null,
+    ): string {
         $writer = self::createWriter();
 
         $writer->startElementNs(null, 'CopyObjectResult', self::S3_NAMESPACE);
         $writer->writeElement('ETag', $etag);
         $writer->writeElement('LastModified', $lastModified);
+        if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumSha1 !== null || $checksumSha256 !== null) {
+            $writer->writeElement('ChecksumType', 'FULL_OBJECT');
+        }
+        if ($checksumCrc32 !== null) {
+            $writer->writeElement('ChecksumCRC32', $checksumCrc32);
+        }
+        if ($checksumCrc32c !== null) {
+            $writer->writeElement('ChecksumCRC32C', $checksumCrc32c);
+        }
+        if ($checksumSha1 !== null) {
+            $writer->writeElement('ChecksumSHA1', $checksumSha1);
+        }
+        if ($checksumSha256 !== null) {
+            $writer->writeElement('ChecksumSHA256', $checksumSha256);
+        }
         $writer->endElement();
 
         $writer->endDocument();
+
+        return $writer->outputMemory();
+    }
+
+    /** Build a CopyPartResult XML response. */
+    public static function copyPartResult(string $etag, string $lastModified): string
+    {
+        $writer = self::createWriter();
+
+        $writer->startElementNs(null, 'CopyPartResult', self::S3_NAMESPACE);
+        $writer->writeElement('ETag', $etag);
+        $writer->writeElement('LastModified', $lastModified);
+        $writer->endElement();
 
         return $writer->outputMemory();
     }
@@ -293,9 +342,10 @@ final class XmlResponseBuilder
      *     nextPartNumberMarker?: int,
      *     maxParts?: int,
      *     isTruncated?: bool,
+     *     initiatorId?: string,
      *     ownerId?: string,
      *     displayName?: string,
-     *     parts: list<array{partNumber: int, lastModified: string, etag: string, size: int}>,
+     *     parts: list<array{partNumber: int, lastModified: string, etag: string, size: int, checksumAlgorithm?: ?string, checksumValue?: ?string}>,
      * } $params
      */
     public static function listPartsResult(array $params): string
@@ -309,12 +359,15 @@ final class XmlResponseBuilder
         $writer->writeElement('UploadId', $params['uploadId']);
 
         // Initiator and Owner
-        if (isset($params['ownerId'])) {
+        $initiatorId = $params['initiatorId'] ?? $params['ownerId'] ?? null;
+        if ($initiatorId !== null) {
             $writer->startElement('Initiator');
-            $writer->writeElement('ID', $params['ownerId']);
+            $writer->writeElement('ID', $initiatorId);
             $writer->writeElement('DisplayName', $params['displayName'] ?? '');
             $writer->endElement();
+        }
 
+        if (isset($params['ownerId'])) {
             $writer->startElement('Owner');
             $writer->writeElement('ID', $params['ownerId']);
             $writer->writeElement('DisplayName', $params['displayName'] ?? '');
@@ -333,6 +386,9 @@ final class XmlResponseBuilder
             $writer->writeElement('LastModified', $part['lastModified']);
             $writer->writeElement('ETag', $part['etag']);
             $writer->writeElement('Size', (string) $part['size']);
+            if (($part['checksumAlgorithm'] ?? null) !== null && ($part['checksumValue'] ?? null) !== null) {
+                $writer->writeElement('Checksum' . strtoupper($part['checksumAlgorithm']), $part['checksumValue']);
+            }
             $writer->endElement();
         }
 
@@ -356,7 +412,7 @@ final class XmlResponseBuilder
      *     maxUploads?: int,
      *     isTruncated?: bool,
      *     encodingType?: string,
-     *     uploads: list<array{key: string, uploadId: string, initiated: string, storageClass?: string, ownerId?: string, displayName?: string}>,
+     *     uploads: list<array{key: string, uploadId: string, initiated: string, storageClass?: string, initiatorId?: string, ownerId?: string, displayName?: string}>,
      *     commonPrefixes?: list<string>,
      * } $params
      */
@@ -398,12 +454,15 @@ final class XmlResponseBuilder
             $writer->writeElement('Key', self::safeXmlValue($upload['key'], $urlEncode));
             $writer->writeElement('UploadId', $upload['uploadId']);
 
-            if (isset($upload['ownerId'])) {
+            $initiatorId = $upload['initiatorId'] ?? $upload['ownerId'] ?? null;
+            if ($initiatorId !== null) {
                 $writer->startElement('Initiator');
-                $writer->writeElement('ID', $upload['ownerId']);
+                $writer->writeElement('ID', $initiatorId);
                 $writer->writeElement('DisplayName', $upload['displayName'] ?? '');
                 $writer->endElement();
+            }
 
+            if (isset($upload['ownerId'])) {
                 $writer->startElement('Owner');
                 $writer->writeElement('ID', $upload['ownerId']);
                 $writer->writeElement('DisplayName', $upload['displayName'] ?? '');
@@ -699,7 +758,7 @@ final class XmlResponseBuilder
     /**
      * Build a CORSConfiguration XML response.
      *
-     * @param  list<array{allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>  $rules
+     * @param  list<array{id?: string, allowedOrigins: list<string>, allowedMethods: list<string>, allowedHeaders: list<string>, exposeHeaders: list<string>, maxAgeSeconds: int|null}>  $rules
      */
     public static function corsConfiguration(array $rules): string
     {
@@ -709,6 +768,10 @@ final class XmlResponseBuilder
 
         foreach ($rules as $rule) {
             $writer->startElement('CORSRule');
+
+            if (($rule['id'] ?? null) !== null) {
+                $writer->writeElement('ID', $rule['id']);
+            }
 
             foreach ($rule['allowedOrigins'] as $origin) {
                 $writer->writeElement('AllowedOrigin', $origin);

@@ -23,7 +23,7 @@ final class QueueLeaseHeartbeat
         \Closure $renew,
         float $intervalSeconds = QueueLease::RENEWAL_INTERVAL_SECONDS,
     ) {
-        if ($intervalSeconds <= 0.0) {
+        if (! is_finite($intervalSeconds) || $intervalSeconds <= 0.0) {
             throw new \InvalidArgumentException('Queue lease renewal interval must be greater than zero.');
         }
 

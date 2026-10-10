@@ -6,14 +6,21 @@ namespace OpsFour\S3Server\Parallel;
 
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\Parallel\Worker\Task;
 use Amp\Sync\Channel;
+use Amp\TimeoutCancellation;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\NoSuchKeyException;
 
 /**
- * @implements Task<StorageWriteResult|bool|null, never, never>
+ * @implements Task<StorageWriteResult|bool|null, string, string|null>
  */
 final class FlysystemStorageTask implements Task
 {
@@ -28,90 +35,172 @@ final class FlysystemStorageTask implements Task
         private readonly string $tempDir,
         private readonly string $operation,
         private readonly array $arguments = [],
+        private readonly int $tempBudgetBytes = 10_737_418_240,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): StorageWriteResult|bool|null
     {
-        $backendKey = $this->factory->cacheKey() . ':' . hash('sha256', $this->tempDir);
-        $backend = self::$backends[$backendKey] ??= new FlysystemBackend(
-            $this->factory->createFilesystem(),
-            $this->tempDir,
-        );
+        try {
+            $backendKey = $this->factory->cacheKey() . ':' . hash('sha256', $this->tempDir) . ':' . $this->tempBudgetBytes;
+            $backend = self::$backends[$backendKey] ??= new FlysystemBackend(
+                $this->factory->createFilesystem(),
+                $this->tempDir,
+                new StorageTempBudgetCoordinator($this->tempDir, $this->tempBudgetBytes),
+            );
 
-        return match ($this->operation) {
-            'putObject' => $backend->putObject(
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                self::fileStream($this->stringArgument(2)),
-            ),
-            'getObject' => $this->download(
-                $backend,
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                $this->nullableIntArgument(2),
-                $this->nullableIntArgument(3),
-                $cancellation,
-            ),
-            'deleteObject' => $this->deleteObject(
-                $backend,
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-            ),
-            'createBucket' => $this->createBucket($backend, $this->stringArgument(0)),
-            'deleteBucket' => $this->deleteBucket($backend, $this->stringArgument(0)),
-            'bucketExists' => $backend->bucketExists($this->stringArgument(0)),
-            'putPart' => $backend->putPart(
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                $this->stringArgument(2),
-                $this->intArgument(3),
-                self::fileStream($this->stringArgument(4)),
-            ),
-            'assembleMultipartUpload' => $backend->assembleMultipartUpload(
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                $this->stringArgument(2),
-                $this->partsArgument(3),
-            ),
-            'abortMultipartUpload' => $this->abortMultipartUpload(
-                $backend,
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                $this->stringArgument(2),
-            ),
-            'copyObject' => $backend->copyObject(
-                $this->stringArgument(0),
-                $this->stringArgument(1),
-                $this->stringArgument(2),
-            ),
-            default => throw new \LogicException("Unknown Flysystem worker operation: {$this->operation}."),
-        };
+            return match ($this->operation) {
+                'putObject' => $backend->putObject(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    self::fileStream($this->stringArgument(2)),
+                ),
+                'putObjectAtPath' => $backend->putObjectAtPath(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    self::fileStream($this->stringArgument(2)),
+                    $this->stringArgument(3),
+                ),
+                'streamObject' => $this->streamObject(
+                    $backend,
+                    $this->stringArgument(0),
+                    $this->nullableIntArgument(1),
+                    $this->nullableIntArgument(2),
+                    $this->intArgument(3),
+                    $this->intArgument(4),
+                    $channel,
+                    $cancellation,
+                ),
+                'deleteObject' => $this->deleteObject(
+                    $backend,
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                ),
+                'createBucket' => $this->createBucket($backend, $this->stringArgument(0)),
+                'deleteBucket' => $this->deleteBucket($backend, $this->stringArgument(0)),
+                'bucketExists' => $backend->bucketExists($this->stringArgument(0)),
+                'putPart' => $backend->putPart(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->intArgument(3),
+                    self::fileStream($this->stringArgument(4)),
+                ),
+                'putPartAtPath' => $backend->putPartAtPath(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->intArgument(3),
+                    self::fileStream($this->stringArgument(4)),
+                    $this->stringArgument(5),
+                ),
+                'assembleMultipartUpload' => $backend->assembleMultipartUpload(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->partsArgument(3),
+                ),
+                'assembleMultipartUploadAtPath' => $backend->assembleMultipartUploadAtPath(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->partsArgument(3),
+                    $this->stringArgument(4),
+                ),
+                'abortMultipartUpload' => $this->abortMultipartUpload(
+                    $backend,
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                ),
+                'copyObject' => $backend->copyObject(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                ),
+                'copyObjectBounded' => $backend->copyObjectBounded(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->intArgument(3),
+                ),
+                default => throw new \LogicException("Unknown Flysystem worker operation: {$this->operation}."),
+            };
+        } catch (CancelledException) {
+            throw new CancelledException();
+        } catch (NoSuchKeyException) {
+            throw new NoSuchKeyException();
+        } catch (SlowDownException) {
+            throw new SlowDownException('Flysystem worker operation was throttled.');
+        } catch (\Throwable) {
+            // Flysystem/AWS exceptions can retain a PHP stream resource in a
+            // nested backtrace. Amp's cross-process TaskFailure serializer
+            // cannot flatten that resource and would crash the worker.
+            throw new InternalErrorException('Flysystem worker operation failed.');
+        }
     }
 
-    private function download(
+    /** @param Channel<string, string|null> $channel */
+    private function streamObject(
         FlysystemBackend $backend,
         string $storagePath,
-        string $targetPath,
         ?int $offset,
         ?int $length,
+        int $idleTimeoutSeconds,
+        int $sourceReadTimeoutSeconds,
+        Channel $channel,
         Cancellation $cancellation,
     ): null {
         $source = $backend->getObjectByPath($storagePath, $offset, $length);
-        $target = fopen($targetPath, 'wb');
-        if ($target === false) {
-            throw new \RuntimeException("Unable to open worker download target: {$targetPath}.");
-        }
-
         try {
-            while (($chunk = $source->read($cancellation)) !== null) {
-                self::writeAll($target, $chunk);
+            $buffer = '';
+            while (true) {
+                // Guzzle's PHP stream timeout does not bound Amp's event-loop
+                // wait on a detached response resource. Reset this deadline
+                // for each source chunk, not for the whole object.
+                $sourceReadDeadline = new TimeoutCancellation($sourceReadTimeoutSeconds);
+                try {
+                    $chunk = $source->read(new CompositeCancellation($cancellation, $sourceReadDeadline));
+                } catch (CancelledException $error) {
+                    if ($sourceReadDeadline->isRequested() && ! $cancellation->isRequested()) {
+                        throw new SlowDownException('Backing storage read was idle for too long.');
+                    }
+                    throw $error;
+                }
+                if ($chunk === null) {
+                    break;
+                }
+                $buffer .= $chunk;
+                if (strlen($buffer) >= 65_536 && ! self::sendChunk($channel, $buffer, $idleTimeoutSeconds, $cancellation)) {
+                    return null;
+                }
+                if (strlen($buffer) >= 65_536) {
+                    $buffer = '';
+                }
             }
+            if ($buffer !== '' && ! self::sendChunk($channel, $buffer, $idleTimeoutSeconds, $cancellation)) {
+                return null;
+            }
+            $channel->send(null);
         } finally {
             $source->close();
-            fclose($target);
         }
 
         return null;
+    }
+
+    /** @param Channel<string, string|null> $channel */
+    private static function sendChunk(
+        Channel $channel,
+        string $chunk,
+        int $idleTimeoutSeconds,
+        Cancellation $cancellation,
+    ): bool {
+        $channel->send($chunk);
+
+        return $channel->receive(new CompositeCancellation(
+            $cancellation,
+            new TimeoutCancellation($idleTimeoutSeconds),
+        )) === 'next';
     }
 
     private function deleteObject(FlysystemBackend $backend, string $storagePath, string $bucket): null
@@ -154,21 +243,6 @@ final class FlysystemStorageTask implements Task
         }
 
         return new ReadableResourceStream($resource);
-    }
-
-    /**
-     * @param resource $resource
-     */
-    private static function writeAll($resource, string $data): void
-    {
-        $offset = 0;
-        while ($offset < strlen($data)) {
-            $written = fwrite($resource, substr($data, $offset));
-            if ($written === false || $written === 0) {
-                throw new \RuntimeException('Unable to write worker download data.');
-            }
-            $offset += $written;
-        }
     }
 
     private function stringArgument(int $offset): string

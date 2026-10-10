@@ -4,21 +4,33 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler\Object;
 
+use Amp\ByteStream\ReadableStream;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Auth\AwsChunkedContentLength;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\BufferedSsePayload;
 use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Exception\BadDigestException;
+use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\ObjectTagValidator;
+use OpsFour\S3Server\Handler\Multipart\MultipartPartLogicalValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Multipart\MultipartPartSize;
+use OpsFour\S3Server\Metadata\BucketGenerationGuard;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
@@ -26,33 +38,29 @@ use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
+use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuard;
+use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
+use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
+use OpsFour\S3Server\Storage\LocalObjectWriteOutcome;
+use OpsFour\S3Server\Storage\StoragePath;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
 /**
  * Handles PutObject (PUT /{bucket}/{key}).
  *
- * Streams the request body into the storage backend, computes the
- * MD5 ETag, and writes object metadata. Supports all standard S3
+ * Streams unencrypted requests into storage; direct SSE requests are bounded
+ * in process memory and encrypted before the destination write. Computes the
+ * plaintext MD5 ETag and writes object metadata. Supports standard S3
  * headers including Content-Type, Content-Encoding, Content-Disposition,
  * Cache-Control, x-amz-storage-class, and x-amz-meta-* user metadata.
  *
- * The storage backend is responsible for atomic writes (temp file +
- * rename) and MD5 computation during streaming.
+ * The storage backend is responsible for atomic writes (temp file + rename).
  */
 final class PutObjectHandler implements RequestHandler
 {
     private readonly StorageTierRegistry $storageTiers;
-
-    /** @var list<string> Valid S3 storage class values. */
-    private const array VALID_STORAGE_CLASSES = [
-        'STANDARD',
-        'REDUCED_REDUNDANCY',
-        'STANDARD_IA',
-        'ONEZONE_IA',
-        'INTELLIGENT_TIERING',
-        'GLACIER',
-        'DEEP_ARCHIVE',
-        'GLACIER_IR',
-    ];
 
     public function __construct(
         private readonly MetadataStore $metadata,
@@ -62,12 +70,38 @@ final class PutObjectHandler implements RequestHandler
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         private readonly ?QuotaManager $quotas = null,
         ?StorageTierRegistry $storageTiers = null,
+        private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
+        private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+        if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
+            throw new \InvalidArgumentException('Local object writer and lease factory must be configured together.');
+        }
+        if ($localFencedWriter !== null) {
+            if (! $metadata instanceof ObjectWriteIntentStore) {
+                throw new \InvalidArgumentException('Local object writes require durable metadata intents.');
+            }
+            $default = $this->storageTiers->defaultTier();
+            $backend = $default->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if (! $backend instanceof FilesystemBackend || $storage !== $default->backend
+                || $default->name !== $localFencedWriter->storageTierName()
+                || ($backend->hostEvidenceReader() !== null
+                    ? $backend->getBasePath()
+                    : realpath($backend->getBasePath())) !== $localFencedWriter->storageRoot()) {
+                throw new \InvalidArgumentException('Local object writer must match the default filesystem tier and root.');
+            }
+        }
     }
 
     public function handleRequest(Request $request): Response
     {
+        // Validate the complete checksum declaration before any resource
+        // lookup or storage write. Verified streaming trailers are attached
+        // after the request body has been consumed and are checked again then.
+        $expectedChecksumAlgorithm = MultipartPartLogicalValidator::expectedClientChecksumAlgorithm($request);
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -103,10 +137,7 @@ final class PutObjectHandler implements RequestHandler
         $expires = $request->getHeader('expires');
 
         // Storage class (default STANDARD).
-        $storageClass = $request->getHeader('x-amz-storage-class') ?? 'STANDARD';
-        if (! in_array($storageClass, self::VALID_STORAGE_CLASSES, true)) {
-            $storageClass = 'STANDARD';
-        }
+        $storageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($request->getHeader('x-amz-storage-class'));
 
         // User metadata (x-amz-meta-* headers).
         $userMetadata = UserMetadataExtractor::extract($request);
@@ -116,368 +147,493 @@ final class PutObjectHandler implements RequestHandler
             $userMetadata['__expires'] = $expires;
         }
 
-        // 3. Stream body to storage backend (computes all checksums during write).
-        $result = $this->storage->putObject($bucket, $key, $request->getBody());
-
-        // Trailer checksums are attached to the mutable request only after the
-        // verified aws-chunked body reaches its signed trailer block.
-        $checksumCrc32 = $request->getHeader('x-amz-checksum-crc32');
-        $checksumCrc32c = $request->getHeader('x-amz-checksum-crc32c');
-        $checksumSha1 = $request->getHeader('x-amz-checksum-sha1');
-        $checksumSha256 = $request->getHeader('x-amz-checksum-sha256');
-
-        // 3b. Verify client-sent checksum against computed value.
-        $clientChecksums = array_filter([
-            'crc32' => $checksumCrc32,
-            'crc32c' => $checksumCrc32c,
-            'sha1' => $checksumSha1,
-            'sha256' => $checksumSha256,
-        ]);
-
-        if (count($clientChecksums) > 1) {
-            $this->deleteUncommittedPath($bucket, $result->path);
-            throw new InvalidArgumentException('Only one x-amz-checksum-* header may be specified.');
-        }
-
-        foreach ($clientChecksums as $algo => $clientValue) {
-            $computedValue = match ($algo) {
-                'crc32' => $result->crc32Base64,
-                'crc32c' => $result->crc32cBase64,
-                'sha1' => $result->sha1Base64,
-                'sha256' => $result->sha256Base64,
-            };
-
-            if ($computedValue === null) {
-                $this->deleteUncommittedPath($bucket, $result->path);
-                throw new \OpsFour\S3Server\Exception\InternalErrorException(
-                    "Storage backend did not compute checksum for algorithm: {$algo}",
-                );
-            }
-
-            if (!hash_equals($computedValue, $clientValue)) {
-                $this->deleteUncommittedPath($bucket, $result->path);
-                throw new BadDigestException(
-                    "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
-                );
-            }
-
-            // Store the computed (verified) value, not the client-sent one.
-            match ($algo) {
-                'crc32' => $checksumCrc32 = $computedValue,
-                'crc32c' => $checksumCrc32c = $computedValue,
-                'sha1' => $checksumSha1 = $computedValue,
-                'sha256' => $checksumSha256 = $computedValue,
-            };
-        }
-
-        // 4. Content-Length mismatch detection (before encryption to avoid wasted work).
-        // For chunked SigV4 uploads, Content-Length reflects the encoded body size (with
-        // chunk framing). The actual payload size is in x-amz-decoded-content-length.
-        $contentSha = $request->getHeader('x-amz-content-sha256');
-        $isChunkedSigV4 = ($contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
-            || $contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER'
-            || $contentSha === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER');
-
-        $declaredLength = $isChunkedSigV4
-            ? $request->getHeader('x-amz-decoded-content-length')
-            : $request->getHeader('content-length');
-
-        if ($declaredLength !== null && (int) $declaredLength !== $result->size) {
-            $this->deleteUncommittedPath($bucket, $result->path);
-            throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
-                'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $result->size,
-            );
-        }
-
-        // 5. Encryption: encrypt data at rest if SSE-C or SSE-S3 is requested.
-        $bufferedWorkLock = null;
+        $localLease = null;
         try {
-            $bufferedWorkLock = $encryptionMode !== null
-                ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
-                : null;
-            [$encMeta, $encryptedWrite] = $this->applyEncryption(
-                $request,
-                $result,
-                $key,
-                $bucket,
-                $this->encryption,
-                $this->storage,
-                $result->size,
-                $this->maxEncryptedObjectSize,
-                $encryptionMode,
-            );
-            $bufferedWorkLock?->release();
-            $bufferedWorkLock = null;
-            if ($encryptedWrite !== null) {
-                $result = new StorageWriteResult(
-                    path: $encryptedWrite->path,
-                    size: $result->size,
-                    md5Hex: $result->md5Hex,
-                    crc32Base64: $result->crc32Base64,
-                    crc32cBase64: $result->crc32cBase64,
-                    sha1Base64: $result->sha1Base64,
-                    sha256Base64: $result->sha256Base64,
-                );
-            }
-        } catch (\Throwable $e) {
-            $bufferedWorkLock?->release();
-            $this->deleteUncommittedPath($bucket, $result->path);
-            throw $e;
-        }
-
-        // Merge encryption metadata into user metadata.
-        if ($encMeta !== []) {
-            foreach ($encMeta as $k => $v) {
-                $userMetadata['__' . $k] = $v;
-            }
-        }
-
-        // 6. Build the quoted ETag (S3 ETags are always quoted MD5 hex).
-        $etag = '"' . $result->md5Hex . '"';
-        $eventName = $request->getAttribute('s3.operation') === \OpsFour\S3Server\Routing\S3Operation::PostObject
-            ? 's3:ObjectCreated:Post'
-            : 's3:ObjectCreated:Put';
-        $event = $this->notifications?->createEvent($eventName, $bucket, $key, $result->size, $etag, $ownerId)
-            ?? new S3Event($eventName, $bucket, $key, $result->size, $etag, $ownerId);
-
-        // 5b. Write metadata (versioning-aware) and handle old-object cleanup.
-        $versioning = $this->metadata->getBucketVersioning($bucket);
-        $versionId = null;
-        $oldObjectToClean = null;
-
-        try {
-            if ($versioning === 'Enabled') {
-                // Versioning is enabled: create a new version.
-                $this->metadata->transaction(function () use (
-                    $bucket,
+            $declaredLength = self::declaredObjectLength($request);
+            // 3. SSE payloads are encrypted before the first object-storage write.
+            // Other payloads retain the storage backend's streaming checksum path.
+            $encMeta = [];
+            if ($encryptionMode === null) {
+                $result = $this->writeObject(
                     $bucketInfo,
                     $key,
                     $ownerId,
-                    $result,
-                    $etag,
-                    $contentType,
-                    $storageClass,
-                    $contentEncoding,
-                    $contentDisposition,
-                    $cacheControl,
-                    $userMetadata,
-                    $checksumCrc32,
-                    $checksumCrc32c,
-                    $checksumSha1,
-                    $checksumSha256,
-                    $aclGrants,
-                    $tagging,
-                    $request,
-                    $ifMatch,
-                    $ifNoneMatch,
-                    $event,
-                    $versioning,
-                    &$versionId,
-                ) {
-                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
-                        $this->metadata,
-                        $ownerId,
-                        $bucketInfo->ownerId,
-                    );
-                    if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
-                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
-                            'Bucket versioning changed while the object write was being committed.',
-                        );
-                    }
-                    $this->assertPublicAclAllowed($bucket, $aclGrants);
-                    $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
-                    $this->quotas?->assertCanWriteObject($ownerId, $bucket, null, $result->size, true);
-
-                    $versionId = $this->metadata->putObjectVersioned(
-                        bucket: $bucket,
-                        key: $key,
-                        ownerId: $ownerId,
-                        size: $result->size,
-                        etag: $etag,
-                        contentType: $contentType,
-                        storagePath: $result->path,
-                        storageClass: $storageClass,
-                        contentEncoding: $contentEncoding,
-                        contentDisposition: $contentDisposition,
-                        cacheControl: $cacheControl,
-                        userMetadata: $userMetadata,
-                        checksumCrc32: $checksumCrc32,
-                        checksumCrc32c: $checksumCrc32c,
-                        checksumSha1: $checksumSha1,
-                        checksumSha256: $checksumSha256,
-                    );
-                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
-                    $this->metadata->putAcl(
-                        'object',
-                        ObjectVersionResolver::aclResourceName($bucket, $key, $versionId),
-                        $ownerId,
-                        $aclGrants,
-                    );
-                    $this->metadata->putObjectTagging($bucket, $key, $tagging ?? [], $versionId);
-                    (new ObjectLockRequestApplier($this->metadata))->apply(
-                        $request,
-                        $bucket,
-                        $key,
-                        $versionId,
-                    );
-                    $this->notifications?->enqueueWebhooks($event);
-                });
+                    MultipartPartSize::boundedBody($request->getBody()),
+                    $localLease,
+                );
             } else {
-                // Versioning suspended or never enabled: overwrite with version_id='null'.
-                // Wrap read-old + write-new in a transaction to prevent concurrent
-                // overwrites from orphaning storage files (SQLite single-writer
-                // serializes, Postgres/MySQL use row locks).
-                $this->metadata->transaction(function () use (
-                    $bucket,
-                    $bucketInfo,
-                    $key,
-                    $ownerId,
-                    $result,
-                    $etag,
-                    $contentType,
-                    $storageClass,
-                    $contentEncoding,
-                    $contentDisposition,
-                    $cacheControl,
-                    $userMetadata,
-                    $checksumCrc32,
-                    $checksumCrc32c,
-                    $checksumSha1,
-                    $checksumSha256,
-                    $aclGrants,
-                    $tagging,
-                    $request,
-                    $ifMatch,
-                    $ifNoneMatch,
-                    $event,
-                    $versioning,
-                    &$oldObjectToClean,
-                ) {
-                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
-                        $this->metadata,
-                        $ownerId,
-                        $bucketInfo->ownerId,
-                    );
-                    if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
-                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
-                            'Bucket versioning changed while the object write was being committed.',
-                        );
+                $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+                try {
+                    [$plaintext, $plainChecksums] = BufferedSsePayload::read($request->getBody(), $this->maxEncryptedObjectSize);
+                    [$encMeta, $ciphertext] = $this->encryptPayload($request, $plaintext, $encryptionMode);
+                    $encryptedWrite = $this->writeObject($bucketInfo, $key, $ownerId, new \Amp\ByteStream\ReadableBuffer($ciphertext), $localLease);
+                    if ($encryptedWrite->size !== strlen($ciphertext)
+                        || ! hash_equals(md5($ciphertext), strtolower($encryptedWrite->md5Hex))) {
+                        $this->deleteUncommittedPath($bucket, $encryptedWrite->path);
+                        throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted object write does not match its payload.');
                     }
-                    $this->assertPublicAclAllowed($bucket, $aclGrants);
-                    $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
-                    $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-                    $oldObjectToClean = $existingObj;
-
-                    $this->quotas?->assertCanWriteObject($ownerId, $bucket, $existingObj, $result->size, false);
-
-                    $this->metadata->putObjectMetadata(
-                        bucket: $bucket,
-                        key: $key,
-                        ownerId: $ownerId,
-                        size: $result->size,
-                        etag: $etag,
-                        contentType: $contentType,
-                        storagePath: $result->path,
-                        storageClass: $storageClass,
-                        contentEncoding: $contentEncoding,
-                        contentDisposition: $contentDisposition,
-                        cacheControl: $cacheControl,
-                        userMetadata: $userMetadata,
-                        checksumCrc32: $checksumCrc32,
-                        checksumCrc32c: $checksumCrc32c,
-                        checksumSha1: $checksumSha1,
-                        checksumSha256: $checksumSha256,
+                    $result = new StorageWriteResult(
+                        path: $encryptedWrite->path,
+                        size: $plainChecksums->size,
+                        md5Hex: $plainChecksums->md5Hex,
+                        crc32Base64: $plainChecksums->crc32Base64(),
+                        crc32cBase64: $plainChecksums->crc32cBase64(),
+                        sha1Base64: $plainChecksums->sha1Base64(),
+                        sha256Base64: $plainChecksums->sha256Base64(),
                     );
-                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
-                    $this->metadata->putAcl(
-                        'object',
-                        ObjectVersionResolver::aclResourceName($bucket, $key, null),
-                        $ownerId,
-                        $aclGrants,
+                } finally {
+                    $bufferedWorkLock->release();
+                }
+            }
+
+            // Trailer checksums are attached to the mutable request only after the
+            // verified aws-chunked body reaches its signed trailer block.
+            $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums(
+                $request,
+                $expectedChecksumAlgorithm,
+            );
+            $checksumCrc32 = $clientChecksums['crc32'] ?? null;
+            $checksumCrc32c = $clientChecksums['crc32c'] ?? null;
+            $checksumSha1 = $clientChecksums['sha1'] ?? null;
+            $checksumSha256 = $clientChecksums['sha256'] ?? null;
+
+            // 3b. Verify client-sent checksum against computed value.
+            foreach ($clientChecksums as $algo => $clientValue) {
+                $computedValue = MultipartPartLogicalValidator::checksum($result, $algo);
+
+                if ($computedValue === null) {
+                    $this->deleteUncommittedPath($bucket, $result->path);
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                        "Storage backend did not compute checksum for algorithm: {$algo}",
                     );
-                    $this->metadata->putObjectTagging($bucket, $key, $tagging ?? []);
-                    (new ObjectLockRequestApplier($this->metadata))->apply(
-                        $request,
+                }
+
+                if (!hash_equals($computedValue, $clientValue)) {
+                    $this->deleteUncommittedPath($bucket, $result->path);
+                    throw new BadDigestException(
+                        "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
+                    );
+                }
+
+                // Store the computed (verified) value, not the client-sent one.
+                match ($algo) {
+                    'crc32' => $checksumCrc32 = $computedValue,
+                    'crc32c' => $checksumCrc32c = $computedValue,
+                    'sha1' => $checksumSha1 = $computedValue,
+                    'sha256' => $checksumSha256 = $computedValue,
+                    default => throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                        "Unexpected validated checksum algorithm: {$algo}",
+                    ),
+                };
+            }
+
+            // 4. Content-Length mismatch detection; clean up the uncommitted write on failure.
+            // For chunked SigV4 uploads, Content-Length reflects the encoded body size (with
+            // chunk framing). The actual payload size is in x-amz-decoded-content-length.
+            if ($result->size > MultipartPartSize::MAX_BYTES) {
+                $this->deleteUncommittedPath($bucket, $result->path);
+                throw new EntityTooLargeException('PutObject exceeds the 5 GiB maximum.');
+            }
+
+            if ($declaredLength !== null && $declaredLength !== $result->size) {
+                $this->deleteUncommittedPath($bucket, $result->path);
+                throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
+                    'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $result->size,
+                );
+            }
+
+            // Merge encryption metadata into user metadata.
+            if ($encMeta !== []) {
+                foreach ($encMeta as $k => $v) {
+                    $userMetadata['__' . $k] = $v;
+                }
+            }
+
+            // 6. Build the quoted ETag (S3 ETags are always quoted MD5 hex).
+            $etag = '"' . $result->md5Hex . '"';
+            $eventName = $request->getAttribute('s3.operation') === \OpsFour\S3Server\Routing\S3Operation::PostObject
+                ? 's3:ObjectCreated:Post'
+                : 's3:ObjectCreated:Put';
+            $event = $this->notifications?->createEvent($eventName, $bucket, $key, $result->size, $etag, $ownerId, request: $request, bucketGeneration: $bucketInfo->generation)
+                ?? new S3Event($eventName, $bucket, $key, $result->size, $etag, $ownerId);
+
+            // 5b. Write metadata (versioning-aware) and handle old-object cleanup.
+            $versionId = null;
+            $versioning = null;
+            $oldObjectToClean = null;
+            $oldPathsToClean = [];
+            $publicationCallbackCompleted = false;
+            $metadataWriteAttempted = false;
+            $dispatchToken = $localLease?->stopForCommit();
+
+            try {
+                $versioning = $this->metadata->getBucketVersioning($bucket);
+                if ($versioning === 'Enabled') {
+                    // Versioning is enabled: create a new version.
+                    $this->metadata->transaction(function () use (
                         $bucket,
+                        $bucketInfo,
                         $key,
-                        null,
-                    );
-                    $this->notifications?->enqueueWebhooks($event);
-                });
+                        $ownerId,
+                        $result,
+                        $etag,
+                        $contentType,
+                        $storageClass,
+                        $contentEncoding,
+                        $contentDisposition,
+                        $cacheControl,
+                        $userMetadata,
+                        $checksumCrc32,
+                        $checksumCrc32c,
+                        $checksumSha1,
+                        $checksumSha256,
+                        $aclGrants,
+                        $tagging,
+                        $request,
+                        $encryptionMode,
+                        $ifMatch,
+                        $ifNoneMatch,
+                        $dispatchToken,
+                        &$event,
+                        $versioning,
+                        &$versionId,
+                        &$publicationCallbackCompleted,
+                        &$metadataWriteAttempted,
+                    ) {
+                        \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                            $this->metadata,
+                            $ownerId,
+                            $bucketInfo->ownerId,
+                        );
+                        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                        $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
+                        \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
+                        if ($encryptionMode === null && $bucketEncryption !== null) {
+                            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                                'Bucket default encryption changed while the object write was being committed.',
+                            );
+                        }
+                        if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
+                            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                                'Bucket versioning changed while the object write was being committed.',
+                            );
+                        }
+                        (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+                        $this->assertPublicAclAllowed($bucket, $aclGrants, $request);
+                        $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
+                            ? $bucketInfo->ownerId : $ownerId;
+                        $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
+                            ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                        $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
+                        $this->quotas?->assertCanWriteObject($storedOwnerId, $bucket, null, $result->size, true);
+
+                        $this->consumeLocalWriteIntent($dispatchToken);
+                        $metadataWriteAttempted = true;
+                        $versionId = $this->metadata->putObjectVersioned(
+                            bucket: $bucket,
+                            key: $key,
+                            ownerId: $storedOwnerId,
+                            size: $result->size,
+                            etag: $etag,
+                            contentType: $contentType,
+                            storagePath: $result->path,
+                            storageClass: $storageClass,
+                            contentEncoding: $contentEncoding,
+                            contentDisposition: $contentDisposition,
+                            cacheControl: $cacheControl,
+                            userMetadata: $userMetadata,
+                            checksumCrc32: $checksumCrc32,
+                            checksumCrc32c: $checksumCrc32c,
+                            checksumSha1: $checksumSha1,
+                            checksumSha256: $checksumSha256,
+                        );
+                        $this->metadata->updateObjectPlacement(
+                            $bucket,
+                            $key,
+                            $versionId,
+                            $storageClass,
+                            $this->storageTiers->defaultTier()->name,
+                            $result->path,
+                        );
+                        $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
+                        $this->metadata->putAcl(
+                            'object',
+                            ObjectVersionResolver::aclResourceName($bucket, $key, $versionId),
+                            $storedOwnerId,
+                            $storedAclGrants,
+                        );
+                        $this->metadata->putObjectTagging($bucket, $key, $tagging ?? [], $versionId);
+                        (new ObjectLockRequestApplier($this->metadata))->apply(
+                            $request,
+                            $bucket,
+                            $key,
+                            $versionId,
+                        );
+                        $event = $event->withVersionId($versionId);
+                        $this->notifications?->enqueueWebhooks($event);
+                        $publicationCallbackCompleted = true;
+                    });
+                } else {
+                    // Versioning suspended or never enabled: overwrite with version_id='null'.
+                    // Wrap read-old + write-new in a transaction to prevent concurrent
+                    // overwrites from orphaning storage files (SQLite single-writer
+                    // serializes, Postgres/MySQL use row locks).
+                    $this->metadata->transaction(function () use (
+                        $bucket,
+                        $bucketInfo,
+                        $key,
+                        $ownerId,
+                        $result,
+                        $etag,
+                        $contentType,
+                        $storageClass,
+                        $contentEncoding,
+                        $contentDisposition,
+                        $cacheControl,
+                        $userMetadata,
+                        $checksumCrc32,
+                        $checksumCrc32c,
+                        $checksumSha1,
+                        $checksumSha256,
+                        $aclGrants,
+                        $tagging,
+                        $request,
+                        $encryptionMode,
+                        $ifMatch,
+                        $ifNoneMatch,
+                        $dispatchToken,
+                        $event,
+                        $versioning,
+                        &$oldObjectToClean,
+                        &$oldPathsToClean,
+                        &$publicationCallbackCompleted,
+                        &$metadataWriteAttempted,
+                    ) {
+                        \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                            $this->metadata,
+                            $ownerId,
+                            $bucketInfo->ownerId,
+                        );
+                        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                        $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
+                        \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
+                        if ($encryptionMode === null && $bucketEncryption !== null) {
+                            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                                'Bucket default encryption changed while the object write was being committed.',
+                            );
+                        }
+                        if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
+                            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                                'Bucket versioning changed while the object write was being committed.',
+                            );
+                        }
+                        (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+                        $this->assertPublicAclAllowed($bucket, $aclGrants, $request);
+                        $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
+                            ? $bucketInfo->ownerId : $ownerId;
+                        $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
+                            ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                        $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
+                        $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+                        $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+                        if ($oldObjectToClean !== null) {
+                            (new \OpsFour\S3Server\ObjectLock\ObjectLockChecker($this->metadata))
+                                ->checkProtection($bucket, $key, 'null');
+                            if ($oldObjectToClean->restoredStoragePath !== null) {
+                                \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($oldObjectToClean, $this->storageTiers);
+                            }
+                        }
+
+                        $this->quotas?->assertCanWriteObject($storedOwnerId, $bucket, $oldObjectToClean, $result->size, false);
+
+                        $this->consumeLocalWriteIntent($dispatchToken);
+                        $metadataWriteAttempted = true;
+                        $this->metadata->putObjectMetadata(
+                            bucket: $bucket,
+                            key: $key,
+                            ownerId: $storedOwnerId,
+                            size: $result->size,
+                            etag: $etag,
+                            contentType: $contentType,
+                            storagePath: $result->path,
+                            storageClass: $storageClass,
+                            contentEncoding: $contentEncoding,
+                            contentDisposition: $contentDisposition,
+                            cacheControl: $cacheControl,
+                            userMetadata: $userMetadata,
+                            checksumCrc32: $checksumCrc32,
+                            checksumCrc32c: $checksumCrc32c,
+                            checksumSha1: $checksumSha1,
+                            checksumSha256: $checksumSha256,
+                        );
+                        $this->metadata->updateObjectPlacement(
+                            $bucket,
+                            $key,
+                            null,
+                            $storageClass,
+                            $this->storageTiers->defaultTier()->name,
+                            $result->path,
+                        );
+                        $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
+                        $this->metadata->putAcl(
+                            'object',
+                            ObjectVersionResolver::aclResourceName($bucket, $key, null),
+                            $storedOwnerId,
+                            $storedAclGrants,
+                        );
+                        $this->metadata->putObjectTagging($bucket, $key, $tagging ?? []);
+                        (new ObjectLockRequestApplier($this->metadata))->apply(
+                            $request,
+                            $bucket,
+                            $key,
+                            null,
+                        );
+                        if ($oldObjectToClean !== null) {
+                            $oldPathsToClean = $this->stageReplacedData($oldObjectToClean, $this->storageTiers->defaultTier()->name, $result->path);
+                        }
+                        $this->notifications?->enqueueWebhooks($event);
+                        $publicationCallbackCompleted = true;
+                    });
+                }
+            } catch (\Throwable $e) {
+                // A failed COMMIT acknowledgment does not prove that the SQL
+                // transaction rolled back. Preserve any path now referenced by
+                // metadata; if that lookup fails, defer cleanup instead of
+                // deleting a possibly published object.
+                if (! $publicationCallbackCompleted
+                    && ! $this->mayBePublishedAfterCommitFailure($bucket, $key, $result->path, $versionId, $versioning, $metadataWriteAttempted)) {
+                    $this->deleteUncommittedPath($bucket, $result->path);
+                }
+                throw $e;
             }
-        } catch (\Throwable $e) {
-            $this->deleteUncommittedPath($bucket, $result->path);
-            throw $e;
-        }
 
-        // Clean up old storage file on overwrite (non-versioned only).
-        if ($oldObjectToClean !== null) {
-            $this->deleteStoredData($oldObjectToClean, $result->path);
-        }
+            // Clean up old storage file on overwrite (non-versioned only).
+            $this->deleteStagedData($bucket, $oldPathsToClean);
 
-        // 7. Build response headers.
-        $headers = ['ETag' => $etag];
+            // 7. Build response headers.
+            $headers = ['ETag' => $etag];
 
-        if ($versionId !== null) {
-            $headers['x-amz-version-id'] = $versionId;
-        }
-
-        // Encryption response headers.
-        $sseAlgo = $encMeta['sse-algorithm'] ?? null;
-        if ($sseAlgo === 'SSE-C') {
-            $headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
-            $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
-            if ($sseCKeyMd5 !== null) {
-                $headers['x-amz-server-side-encryption-customer-key-MD5'] = $sseCKeyMd5;
+            if ($versionId !== null || $versioning === 'Suspended') {
+                $headers['x-amz-version-id'] = $versionId ?? 'null';
             }
-        } elseif ($sseAlgo === 'AES256') {
-            $headers['x-amz-server-side-encryption'] = 'AES256';
-        }
 
-        // Echo back any checksum headers the client sent.
-        if ($checksumCrc32 !== null) {
-            $headers['x-amz-checksum-crc32'] = $checksumCrc32;
-        }
-        if ($checksumCrc32c !== null) {
-            $headers['x-amz-checksum-crc32c'] = $checksumCrc32c;
-        }
-        if ($checksumSha1 !== null) {
-            $headers['x-amz-checksum-sha1'] = $checksumSha1;
-        }
-        if ($checksumSha256 !== null) {
-            $headers['x-amz-checksum-sha256'] = $checksumSha256;
-        }
+            // Encryption response headers.
+            $sseAlgo = $encMeta['sse-algorithm'] ?? null;
+            if ($sseAlgo === 'SSE-C') {
+                $headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+                $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+                if ($sseCKeyMd5 !== null) {
+                    $headers['x-amz-server-side-encryption-customer-key-MD5'] = $sseCKeyMd5;
+                }
+            } elseif ($sseAlgo === 'AES256') {
+                $headers['x-amz-server-side-encryption'] = 'AES256';
+            }
 
-        // 8. Dispatch event notification.
-        $this->notifications?->dispatchInternalEvent($event);
+            // Echo back any checksum headers the client sent.
+            if ($checksumCrc32 !== null) {
+                $headers['x-amz-checksum-crc32'] = $checksumCrc32;
+            }
+            if ($checksumCrc32c !== null) {
+                $headers['x-amz-checksum-crc32c'] = $checksumCrc32c;
+            }
+            if ($checksumSha1 !== null) {
+                $headers['x-amz-checksum-sha1'] = $checksumSha1;
+            }
+            if ($checksumSha256 !== null) {
+                $headers['x-amz-checksum-sha256'] = $checksumSha256;
+            }
+            if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumSha1 !== null || $checksumSha256 !== null) {
+                $headers['x-amz-checksum-type'] = 'FULL_OBJECT';
+            }
 
-        return new Response(
-            status: 200,
-            headers: $headers,
-        );
+            // 8. Dispatch event notification.
+            $this->notifications?->dispatchInternalEvent($event);
+
+            return new Response(
+                status: 200,
+                headers: $headers,
+            );
+        } finally {
+            $localLease?->close();
+        }
     }
 
-    private function deleteStoredData(ObjectInfo $object, string $preservePath): void
+    /** @return list<array{tier: string, path: string}> */
+    private function stageReplacedData(ObjectInfo $object, string $preserveTier, string $preservePath): array
     {
+        $paths = [];
         $path = $object->systemMetadata['storagePath'] ?? null;
-        if ($path !== null && $path !== '' && $path !== $preservePath) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $this->storageTiers->tier($object->storageTier)->backend,
-                $object->bucket,
-                $object->storageTier,
-                $path,
-            );
+        if ($path !== null && $path !== '' && ($path !== $preservePath || $object->storageTier !== $preserveTier)) {
+            $this->storageTiers->tier($object->storageTier);
+            $paths[] = ['tier' => $object->storageTier, 'path' => $path];
         }
 
-        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '' && $object->restoredStoragePath !== $preservePath) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $this->storageTiers->defaultBackend(),
-                $object->bucket,
-                $this->storageTiers->defaultTier()->name,
-                $object->restoredStoragePath,
-            );
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            $restoredTier = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($object, $this->storageTiers);
+            if ($object->restoredStoragePath !== $preservePath || $restoredTier->name !== $preserveTier) {
+                $duplicate = false;
+                foreach ($paths as $candidate) {
+                    if ($candidate['tier'] === $restoredTier->name && $candidate['path'] === $object->restoredStoragePath) {
+                        $duplicate = true;
+                        break;
+                    }
+                }
+                if (! $duplicate) {
+                    $paths[] = ['tier' => $restoredTier->name, 'path' => $object->restoredStoragePath];
+                }
+            }
+        }
+        foreach ($paths as $entry) {
+            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path']);
+        }
+
+        return $paths;
+    }
+
+    /** @param list<array{tier: string, path: string}> $paths */
+    private function deleteStagedData(string $bucket, array $paths): void
+    {
+        foreach ($paths as $entry) {
+            try {
+                \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
+                    $this->metadata,
+                    $this->storageTiers->tier($entry['tier'])->backend,
+                    $bucket,
+                    $entry['tier'],
+                    $entry['path'],
+                );
+            } catch (\Throwable) {
+                // The exact cleanup job was committed with the replacement.
+            }
+        }
+    }
+
+    private function mayBePublishedAfterCommitFailure(
+        string $bucket,
+        string $key,
+        string $path,
+        ?string $versionId,
+        ?string $versioning,
+        bool $metadataWriteAttempted,
+    ): bool {
+        try {
+            if ($versionId !== null) {
+                $version = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
+                if (($version?->systemMetadata['storagePath'] ?? null) === $path) {
+                    return true;
+                }
+            } elseif ($versioning === 'Enabled' && $metadataWriteAttempted) {
+                // A version insert may have committed even if its ID was not
+                // returned to this process. There is no bounded lookup by
+                // physical path, so leave this attempt for reconciliation.
+                return true;
+            }
+
+            $current = $this->metadata->getObjectMetadata($bucket, $key);
+
+            return ($current?->systemMetadata['storagePath'] ?? null) === $path;
+        } catch (\Throwable) {
+            return true;
         }
     }
 
@@ -493,7 +649,7 @@ final class PutObjectHandler implements RequestHandler
         $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketOwnerId)
             ?? AclGrantResolver::privateAcl($ownerId);
 
-        $this->assertPublicAclAllowed((string) $request->getAttribute('s3.bucket'), $grants);
+        $this->assertPublicAclAllowed((string) $request->getAttribute('s3.bucket'), $grants, $request);
 
         return $grants;
     }
@@ -501,8 +657,11 @@ final class PutObjectHandler implements RequestHandler
     /**
      * @param list<array{granteeType: string, granteeId: string, permission: string}> $grants
      */
-    private function assertPublicAclAllowed(string $bucket, array $grants): void
+    private function assertPublicAclAllowed(string $bucket, array $grants, ?Request $request = null): void
     {
+        if ($request !== null && BucketOwnership::isEnforced($this->metadata, $bucket)) {
+            BucketOwnership::assertWriteAclAllowed($request);
+        }
         $pab = $this->metadata->getPublicAccessBlock($bucket);
         if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
             throw new \OpsFour\S3Server\Exception\AccessDeniedException(
@@ -520,143 +679,48 @@ final class PutObjectHandler implements RequestHandler
             return null;
         }
 
-        $tags = [];
-        if (str_starts_with(ltrim($tagging), '<')) {
-            try {
-                $xml = new \SimpleXMLElement($tagging);
-            } catch (\Throwable) {
-                throw new InvalidArgumentException('x-amz-tagging contains invalid XML.');
-            }
-            foreach ($xml->TagSet->Tag ?? [] as $tag) {
-                $tags[] = ['key' => (string) $tag->Key, 'value' => (string) $tag->Value];
-            }
-        } else {
-            return ObjectTagValidator::parseHeader($tagging);
-        }
-
-        return ObjectTagValidator::validate($tags, 10);
+        return ObjectTagValidator::parseHeader($tagging);
     }
 
-    /**
-     * Apply server-side encryption if requested.
-     *
-     * Reads the stored plaintext from storage, encrypts it in-place,
-     * and returns encryption metadata to be stored with the object.
-     *
-     * @return array{0: array<string, string>, 1: StorageWriteResult|null}
-     */
-    private function applyEncryption(
-        Request $request,
-        StorageWriteResult $originalWrite,
-        string $key,
-        string $bucket,
-        ?EncryptionServiceInterface $encryption,
-        StorageBackend $storage,
-        int $objectSize = 0,
-        int $maxEncryptedObjectSize = 268_435_456,
-        ?string $encryptionMode = null,
-    ): array {
-        if ($encryptionMode === null) {
-            return [[], null];
-        }
-        EncryptionRequestResolver::requireEncryptionService($encryption);
-        \assert($encryption !== null);
-
-        $sseCAlgorithm = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
-        $sseCKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
-        $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+    /** @return array{array<string, string>, string} */
+    private function encryptPayload(Request $request, string $plaintext, string $encryptionMode): array
+    {
+        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        \assert($this->encryption !== null);
 
         if ($encryptionMode === EncryptionRequestResolver::SSE_C) {
-            \assert($sseCAlgorithm !== null && $sseCKey !== null && $sseCKeyMd5 !== null);
-            // SSE-C: customer-provided key.
-            if ($objectSize > $maxEncryptedObjectSize) {
-                throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                    'Object exceeds max size for server-side encryption (' . $maxEncryptedObjectSize . ' bytes).',
-                );
-            }
-            $customerKey = EncryptionService::validateSseCHeaders($sseCAlgorithm, $sseCKey, $sseCKeyMd5);
-            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($originalWrite->path));
-            $enc = $encryption->encryptSseC($plaintext, $customerKey);
-            $encryptedWrite = $this->replaceStoredPayload(
-                $storage,
-                $bucket,
-                $key,
-                $originalWrite->path,
-                $enc['ciphertext'],
-            );
+            $algorithm = $request->getHeader('x-amz-server-side-encryption-customer-algorithm');
+            $encodedKey = $request->getHeader('x-amz-server-side-encryption-customer-key');
+            $keyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+            \assert($algorithm !== null && $encodedKey !== null && $keyMd5 !== null);
+            $customerKey = EncryptionService::validateSseCHeaders($algorithm, $encodedKey, $keyMd5);
+            $encrypted = $this->encryption->encryptSseC($plaintext, $customerKey);
 
             return [[
                 'sse-algorithm' => 'SSE-C',
-                'sse-iv' => $enc['iv'],
-                'sse-tag' => $enc['tag'],
-                'sse-customer-key-md5' => $sseCKeyMd5,
-            ], $encryptedWrite];
+                'sse-iv' => $encrypted['iv'],
+                'sse-tag' => $encrypted['tag'],
+                'sse-customer-key-md5' => $keyMd5,
+            ], $encrypted['ciphertext']];
         }
 
-        if ($encryptionMode === EncryptionRequestResolver::SSE_S3) {
-            if ($objectSize > $maxEncryptedObjectSize) {
-                throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                    'Object exceeds max size for server-side encryption (' . $maxEncryptedObjectSize . ' bytes).',
-                );
-            }
-            $plaintext = \Amp\ByteStream\buffer($storage->getObjectByPath($originalWrite->path));
-            $enc = $encryption->encryptSseS3($plaintext);
-            $encryptedWrite = $this->replaceStoredPayload(
-                $storage,
-                $bucket,
-                $key,
-                $originalWrite->path,
-                $enc['ciphertext'],
-            );
+        $encrypted = $this->encryption->encryptSseS3($plaintext);
 
-            return [[
-                'sse-algorithm' => 'AES256',
-                'sse-key' => $enc['encryptedDataKey'],
-                'sse-iv' => $enc['iv'],
-                'sse-tag' => $enc['tag'],
-            ], $encryptedWrite];
-        }
-
-        return [[], null];
-    }
-
-    private function replaceStoredPayload(
-        StorageBackend $storage,
-        string $bucket,
-        string $key,
-        string $oldPath,
-        string $payload,
-    ): StorageWriteResult {
-        $replacement = $storage->putObject(
-            $bucket,
-            $key,
-            new \Amp\ByteStream\ReadableBuffer($payload),
-        );
-
-        try {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $storage,
-                $bucket,
-                $this->storageTiers->defaultTier()->name,
-                $oldPath,
-            );
-        } catch (\Throwable $e) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run(
-                $this->metadata,
-                $storage,
-                $bucket,
-                $this->storageTiers->defaultTier()->name,
-                $replacement->path,
-            );
-            throw $e;
-        }
-
-        return $replacement;
+        return [[
+            'sse-algorithm' => 'AES256',
+            'sse-key' => $encrypted['encryptedDataKey'],
+            'sse-iv' => $encrypted['iv'],
+            'sse-tag' => $encrypted['tag'],
+        ], $encrypted['ciphertext']];
     }
 
     private function deleteUncommittedPath(string $bucket, string $path): void
     {
+        if ($this->localFencedWriter !== null) {
+            // An armed worker may still link this path after the request ends.
+            // The intent collector seals it before any physical reclamation.
+            return;
+        }
         \OpsFour\S3Server\Storage\DurableStorageDelete::run(
             $this->metadata,
             $this->storage,
@@ -664,6 +728,87 @@ final class PutObjectHandler implements RequestHandler
             $this->storageTiers->defaultTier()->name,
             $path,
         );
+    }
+
+    private static function declaredObjectLength(Request $request): ?int
+    {
+        $decodedLength = AwsChunkedContentLength::fromRequest($request);
+        if ($decodedLength !== null) {
+            if ($decodedLength > MultipartPartSize::MAX_BYTES) {
+                throw new EntityTooLargeException('PutObject exceeds the 5 GiB maximum.');
+            }
+
+            return $decodedLength;
+        }
+
+        $value = $request->getHeader('content-length');
+        if ($value === null) {
+            return null;
+        }
+        if ($value === '' || ! ctype_digit($value)) {
+            throw new InvalidArgumentException('Content-Length must be a non-negative decimal integer.');
+        }
+        $normalized = ltrim($value, '0');
+        $maximum = (string) MultipartPartSize::MAX_BYTES;
+        if (strlen($normalized) > strlen($maximum)
+            || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+            throw new EntityTooLargeException('PutObject exceeds the 5 GiB maximum.');
+        }
+
+        return (int) $value;
+    }
+
+    private function writeObject(
+        BucketInfo $bucket,
+        string $key,
+        string $ownerId,
+        ReadableStream $body,
+        ?LocalObjectWriteLeaseGuard &$localLease,
+    ): StorageWriteResult {
+        if ($this->localFencedWriter === null || $this->localLeaseFactory === null) {
+            return $this->storage->putObject($bucket->name, $key, $body);
+        }
+        $tierName = $this->storageTiers->defaultTier()->name;
+        if ($tierName !== $this->localFencedWriter->storageTierName()) {
+            throw new \RuntimeException('Local object writer is no longer configured for the default tier.');
+        }
+        $attemptId = bin2hex(random_bytes(16));
+        $planned = new ObjectWriteIntent(
+            attemptId: $attemptId,
+            bucket: $bucket->name,
+            bucketGeneration: $bucket->generation,
+            ownerId: $ownerId,
+            storageTier: $tierName,
+            storagePath: StoragePath::forPlannedObject(
+                $this->localFencedWriter->storageRoot(),
+                $bucket->name,
+                $key,
+                $bucket->generation,
+                $attemptId,
+            ),
+            purpose: 'put_object',
+        );
+        $localLease = $this->localLeaseFactory->reserve($planned);
+        $outcome = $this->localFencedWriter->publishWithLease($localLease->reservedIntent(), $key, $body, $localLease);
+        if ($outcome->state !== LocalObjectWriteOutcome::COMPLETED || $outcome->result === null) {
+            throw $outcome->error ?? new \RuntimeException('Local object publication did not return a definite result.');
+        }
+
+        return $outcome->result;
+    }
+
+    private function consumeLocalWriteIntent(?LocalObjectWriteDispatchToken $token): void
+    {
+        if ($token === null) {
+            return;
+        }
+        $this->localFencedWriter?->assertHostEvidenceFresh();
+        if (! $this->metadata instanceof ObjectWriteIntentStore
+            || ! $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Local object write lease was lost before metadata publication.',
+            );
+        }
     }
 
     /**

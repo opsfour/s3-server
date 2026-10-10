@@ -4,11 +4,16 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Notification;
 
-use Amp\Sync\LocalSemaphore;
 use Amp\Future;
+use Amp\Http\Server\Request;
+use Amp\Sync\LocalSemaphore;
 use OpsFour\S3Server\Event\S3Event;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
+use OpsFour\S3Server\Security\RequestNetworkContext;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -38,13 +43,18 @@ final class NotificationDispatcher
 
     private int $nextListenerTaskId = 0;
 
+    private bool $efsCandidateSealed = false;
+
+    private readonly LoggerInterface $logger;
+
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly LoggerInterface $logger = new NullLogger(),
+        LoggerInterface $logger = new NullLogger(),
         private readonly string $region = 'us-east-1',
         private readonly int $maxConcurrentListeners = 100,
         private readonly int $maxQueuedListenerTasks = 10_000,
         private readonly ?MetricsCollector $metrics = null,
+        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         if ($this->maxConcurrentListeners < 1) {
             throw new \InvalidArgumentException('Notification listener concurrency must be >= 1.');
@@ -55,6 +65,17 @@ final class NotificationDispatcher
         }
 
         $this->listenerSemaphore = new LocalSemaphore($this->maxConcurrentListeners);
+        $this->logger = new FailureIsolatingLogger($logger);
+    }
+
+    /** Prove that an inert EFS candidate uses the exact SQL facade and watcher. */
+    public function assertBoundTo(MetadataStore $metadata, EfsHostEvidenceReader $evidence): void
+    {
+        if ($this->metadata !== $metadata || $this->efsEvidence !== $evidence || $this->listeners !== []) {
+            throw new \RuntimeException('Notification dispatcher differs from the EFS candidate resources.');
+        }
+        $evidence->assertFresh();
+        $this->efsCandidateSealed = true;
     }
 
     /**
@@ -65,15 +86,21 @@ final class NotificationDispatcher
      * - `s3:ObjectCreated:*`
      * - `s3:*`
      *
-     * @param callable(S3Event): void $listener
+     * @param  callable(S3Event): void  $listener
      */
     public function listen(string $eventPattern, callable $listener): void
     {
+        if ($this->efsEvidence !== null) {
+            throw new \LogicException('Internal listeners are unavailable for the EFS candidate.');
+        }
         $this->listeners[$eventPattern][] = $listener;
     }
 
     public function removeListeners(?string $eventPattern = null): void
     {
+        if ($this->efsEvidence !== null) {
+            throw new \LogicException('EFS candidate listener registrations are frozen.');
+        }
         if ($eventPattern === null) {
             $this->listeners = [];
 
@@ -86,12 +113,12 @@ final class NotificationDispatcher
     /**
      * Enqueue event notifications for a bucket/key operation.
      *
-     * @param string $eventName e.g., 's3:ObjectCreated:Put'
-     * @param string $bucket The bucket name.
-     * @param string $key The object key.
-     * @param int $size Object size.
-     * @param string $etag Object ETag.
-     * @param string $ownerId The requester.
+     * @param  string  $eventName  e.g., 's3:ObjectCreated:Put'
+     * @param  string  $bucket  The bucket name.
+     * @param  string  $key  The object key.
+     * @param  int  $size  Object size.
+     * @param  string  $etag  Object ETag.
+     * @param  string  $ownerId  The requester.
      */
     public function dispatch(
         string $eventName,
@@ -100,7 +127,9 @@ final class NotificationDispatcher
         int $size = 0,
         string $etag = '',
         string $ownerId = '',
+        string $bucketGeneration = '',
     ): void {
+        $this->assertCandidateReady();
         $event = $this->createEvent(
             name: $eventName,
             bucket: $bucket,
@@ -108,6 +137,7 @@ final class NotificationDispatcher
             size: $size,
             etag: $etag,
             ownerId: $ownerId,
+            bucketGeneration: $bucketGeneration,
         );
         $this->dispatchEvent($event);
     }
@@ -121,7 +151,22 @@ final class NotificationDispatcher
         string $etag = '',
         string $ownerId = '',
         array $attributes = [],
+        ?Request $request = null,
+        string $bucketGeneration = '',
     ): S3Event {
+        if ($request !== null) {
+            $sourceIp = RequestNetworkContext::sourceIp($request);
+            if ($sourceIp !== null) {
+                $attributes['sourceIp'] = $sourceIp;
+            }
+            if ($request->hasAttribute('requestId')) {
+                $attributes['requestId'] = (string) $request->getAttribute('requestId');
+            }
+            if ($request->hasAttribute('amzId2')) {
+                $attributes['hostId'] = (string) $request->getAttribute('amzId2');
+            }
+        }
+
         return new S3Event(
             name: $name,
             bucket: $bucket,
@@ -131,6 +176,7 @@ final class NotificationDispatcher
             ownerId: $ownerId,
             region: $this->region,
             attributes: $attributes,
+            bucketGeneration: $bucketGeneration,
         );
     }
 
@@ -144,54 +190,130 @@ final class NotificationDispatcher
 
     public function enqueueWebhooks(S3Event $event): void
     {
-        $configs = $this->metadata->getBucketNotification($event->bucket);
-
-        if ($configs === []) {
+        $this->assertCandidateReady();
+        // A delayed event must not use the notification configuration of a
+        // later bucket with the same name. Unscoped external events can still
+        // reach internal listeners, but cannot enqueue a webhook.
+        if ($event->bucketGeneration === '') {
             return;
         }
+        $this->assertCandidateReady();
+        $bucketInfo = $this->metadata->getBucket($event->bucket);
+        if ($bucketInfo === null || $bucketInfo->generation !== $event->bucketGeneration) {
+            return;
+        }
+        $bucketOwnerId = $bucketInfo->ownerId;
 
-        foreach ($configs as $config) {
-            if (!$this->eventsMatch($event->name, $config['events'])) {
-                continue;
+        // Object writes acquire this same owner lock before committing metadata.
+        // It makes queue IDs comparable for one key even when different nodes
+        // enqueue the events. Re-read the bucket and its config after locking:
+        // both may have changed since the event was created.
+        $this->assertCandidateReady();
+        $queued = $this->metadata->transaction(function () use ($event, $bucketOwnerId): int {
+            $this->assertCandidateReady();
+            OwnerWriteLock::acquire($this->metadata, $bucketOwnerId);
+            $this->assertCandidateReady();
+            $current = $this->metadata->getBucket($event->bucket);
+            if ($current === null || $current->ownerId !== $bucketOwnerId
+                || $current->generation !== $event->bucketGeneration) {
+                return 0;
             }
 
-            if (!$this->keyMatchesFilters($event->key, array_values($config['filterRules'] ?? []))) {
-                continue;
+            $destinations = [];
+            $this->assertCandidateReady();
+            foreach ($this->metadata->getBucketNotification($event->bucket) as $config) {
+                if (! $this->eventsMatch($event->name, $config['events'])) {
+                    continue;
+                }
+
+                if (! $this->keyMatchesFilters($event->key, array_values($config['filterRules'] ?? []))) {
+                    continue;
+                }
+
+                $destination = $config['destinationArn'];
+                if (! str_starts_with($destination, 'http://') && ! str_starts_with($destination, 'https://')) {
+                    $this->logger->debug('Skipping non-URL notification destination.', [
+                        'component' => 'notification',
+                        'event' => 'destination_skipped',
+                        'bucket' => $event->bucket,
+                        'key' => $event->key,
+                        'event_name' => $event->name,
+                        'destination_type' => $config['destinationType'],
+                    ]);
+                    $this->metrics?->recordNotificationEvent('webhook_destination', 'skipped');
+
+                    continue;
+                }
+
+                $destinations[] = $config;
+            }
+            if ($destinations === []) {
+                return 0;
             }
 
-            $destination = $config['destinationArn'];
-
-            // Only enqueue HTTP(S) URL destinations.
-            if (!str_starts_with($destination, 'http://') && !str_starts_with($destination, 'https://')) {
-                $this->logger->debug('Skipping non-URL notification destination.', [
-                    'component' => 'notification',
-                    'event' => 'destination_skipped',
-                    'bucket' => $event->bucket,
-                    'key' => $event->key,
-                    'event_name' => $event->name,
-                    'destination_type' => $config['destinationType'],
-                ]);
-                $this->metrics?->recordNotificationEvent('webhook_destination', 'skipped');
-                continue;
+            $eventTime = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.v\Z');
+            $orderedEvent = str_starts_with($event->name, 's3:ObjectCreated:')
+                || str_starts_with($event->name, 's3:ObjectRemoved:');
+            $sequencer = null;
+            foreach ($destinations as $config) {
+                $payload = $this->eventPayload($event, $bucketOwnerId, $config['id'], $sequencer, $eventTime);
+                $this->assertCandidateReady();
+                $id = $this->metadata->enqueueNotification(
+                    $event->bucket,
+                    $event->key,
+                    $event->name,
+                    $config['destinationArn'],
+                    $payload,
+                );
+                if ($orderedEvent && $sequencer === null) {
+                    $sequencer = strtoupper(str_pad(dechex($id), 16, '0', STR_PAD_LEFT));
+                    $this->assertCandidateReady();
+                    $this->metadata->updateNotificationPayload(
+                        $id,
+                        $this->eventPayload($event, $bucketOwnerId, $config['id'], $sequencer, $eventTime),
+                    );
+                }
             }
-
-            $payload = S3EventPayload::build(
-                $event->name,
-                $event->bucket,
-                $event->key,
-                $event->size,
-                $event->etag,
-                $event->ownerId,
-                $event->region,
-            );
-
-            $this->metadata->enqueueNotification($event->bucket, $event->key, $event->name, $destination, $payload);
+            return count($destinations);
+        });
+        for ($i = 0; $i < $queued; $i++) {
             $this->metrics?->recordNotificationEvent('webhook_enqueue', 'success');
         }
     }
 
+    private function eventPayload(S3Event $event, string $bucketOwnerId, string $configurationId, ?string $sequencer, string $eventTime): string
+    {
+        return S3EventPayload::build(
+            eventName: $event->name,
+            bucket: $event->bucket,
+            key: $event->key,
+            size: $event->size,
+            etag: $event->etag,
+            ownerId: $event->ownerId,
+            region: $event->region,
+            bucketOwnerId: $bucketOwnerId,
+            configurationId: $configurationId,
+            sourceIp: is_string($event->attributes['sourceIp'] ?? null) ? $event->attributes['sourceIp'] : null,
+            requestId: is_string($event->attributes['requestId'] ?? null) ? $event->attributes['requestId'] : null,
+            hostId: is_string($event->attributes['hostId'] ?? null) ? $event->attributes['hostId'] : null,
+            versionId: is_string($event->attributes['versionId'] ?? null) ? $event->attributes['versionId'] : null,
+            sequencer: $sequencer,
+            eventTime: $eventTime,
+            sizeKnown: ($event->attributes['sizeKnown'] ?? false) === true,
+            restoreExpiresAt: is_string($event->attributes['restoreExpiresAt'] ?? null) ? $event->attributes['restoreExpiresAt'] : null,
+            sourceStorageClass: is_string($event->attributes['sourceTier'] ?? null) ? $event->attributes['sourceTier'] : null,
+        );
+    }
+
     public function dispatchInternalEvent(S3Event $event): void
     {
+        // Qualified candidates never admit internal listeners. There is no
+        // callback or SQL to protect here, and post-commit notification cleanup
+        // must not turn an already committed S3 write into an error response.
+        if ($this->efsEvidence !== null && $this->listeners === []) {
+            return;
+        }
+        $this->assertCandidateReady();
         foreach ($this->matchingListeners($event->name) as $pattern => $listener) {
             if ($this->queuedListenerTasks >= $this->maxQueuedListenerTasks) {
                 $this->metrics?->recordNotificationEvent('listener', 'dropped');
@@ -216,6 +338,7 @@ final class NotificationDispatcher
                 $lock = null;
                 try {
                     $lock = $this->listenerSemaphore->acquire();
+                    $this->assertCandidateReady();
                     $listener($event);
                     $this->metrics?->recordNotificationEvent('listener', 'success');
                 } catch (\Throwable $e) {
@@ -228,7 +351,6 @@ final class NotificationDispatcher
                         'key' => $event->key,
                         'listener_pattern' => $pattern,
                         'exception' => $e::class,
-                        'error' => $e->getMessage(),
                     ]);
                 } finally {
                     $lock?->release();
@@ -241,13 +363,16 @@ final class NotificationDispatcher
 
     public function shutdown(float $timeoutSeconds = 30): void
     {
-        if ($this->listenerFutures === []) {
-            return;
-        }
-
         $cancellation = new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds));
         $timedOut = false;
-        foreach ($this->listenerFutures as $future) {
+        // A listener may dispatch another event before it returns. Keep
+        // draining the live set instead of iterating a snapshot that misses
+        // those newly queued callbacks.
+        while (true) {
+            $future = reset($this->listenerFutures);
+            if ($future === false) {
+                return;
+            }
             try {
                 $future->await($timedOut ? null : $cancellation);
             } catch (\Amp\CancelledException) {
@@ -268,7 +393,6 @@ final class NotificationDispatcher
                         'component' => 'notification',
                         'event' => 'listener_shutdown_failed',
                         'exception' => $e::class,
-                        'error' => $e->getMessage(),
                     ]);
                 }
             } catch (\Throwable $e) {
@@ -276,7 +400,6 @@ final class NotificationDispatcher
                     'component' => 'notification',
                     'event' => 'listener_shutdown_failed',
                     'exception' => $e::class,
-                    'error' => $e->getMessage(),
                 ]);
             }
         }
@@ -288,7 +411,7 @@ final class NotificationDispatcher
     private function matchingListeners(string $eventName): iterable
     {
         foreach ($this->listeners as $pattern => $listeners) {
-            if (!$this->eventMatches($eventName, $pattern)) {
+            if (! $this->eventMatches($eventName, $pattern)) {
                 continue;
             }
 
@@ -301,7 +424,7 @@ final class NotificationDispatcher
     /**
      * Check if the event matches any event in the config's events list.
      *
-     * @param list<string> $events
+     * @param  list<string>  $events
      */
     private function eventsMatch(string $eventName, array $events): bool
     {
@@ -324,6 +447,7 @@ final class NotificationDispatcher
         // Also handles s3:* (matches everything starting with "s3:")
         if (str_ends_with($configEventType, ':*')) {
             $prefix = substr($configEventType, 0, -1);
+
             return str_starts_with($eventName, $prefix);
         }
 
@@ -331,22 +455,35 @@ final class NotificationDispatcher
     }
 
     /**
-     * @param list<array{name: string, value: string}> $filterRules
+     * @param  list<array{name: string, value: string}>  $filterRules
      */
     private function keyMatchesFilters(string $key, array $filterRules): bool
     {
         foreach ($filterRules as $rule) {
             $name = strtolower($rule['name']);
-            $value = $rule['value'];
+            // S3 stores notification filter values in form-encoded form:
+            // '+' means space and a literal plus is represented as '%2B'.
+            $value = urldecode($rule['value']);
 
-            if ($name === 'prefix' && !str_starts_with($key, $value)) {
+            if ($name === 'prefix' && ! str_starts_with($key, $value)) {
                 return false;
             }
-            if ($name === 'suffix' && !str_ends_with($key, $value)) {
+            if ($name === 'suffix' && ! str_ends_with($key, $value)) {
                 return false;
             }
         }
 
         return true;
+    }
+
+    private function assertCandidateReady(): void
+    {
+        if ($this->efsEvidence === null) {
+            return;
+        }
+        if (! $this->efsCandidateSealed) {
+            throw new \LogicException('EFS candidate notification dispatcher is not sealed.');
+        }
+        $this->efsEvidence->assertFresh();
     }
 }

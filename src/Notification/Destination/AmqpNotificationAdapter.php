@@ -45,10 +45,16 @@ final readonly class AmqpNotificationAdapter implements NotificationDestinationA
         try {
             $result = $this->publish($payload, $event);
         } catch (\Throwable $e) {
-            return NotificationDeliveryResult::retryableFailure($e->getMessage(), [
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'exchange' => $this->exchange,
                 'routing_key' => $this->routingKey,
                 'exception' => $e::class,
+            ]);
+        }
+        if ($result === false || $result === null) {
+            return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
+                'exchange' => $this->exchange,
+                'routing_key' => $this->routingKey,
             ]);
         }
 

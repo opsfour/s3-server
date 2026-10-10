@@ -34,7 +34,13 @@ final class DeleteBucketTaggingHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $this->metadata->deleteBucketTagging($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->deleteBucketTagging($bucket),
+            $request,
+        );
 
         return new Response(status: 204);
     }

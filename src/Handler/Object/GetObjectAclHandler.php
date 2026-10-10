@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler\Object;
 
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -39,40 +42,56 @@ final class GetObjectAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        try {
+            $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+        } catch (NoSuchKeyException|NoSuchVersionException $error) {
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            throw $error;
+        }
+        $enforced = BucketOwnership::isEnforced($this->metadata, $bucket);
+        $objectOwnerId = $enforced ? $bucketInfo->ownerId
+            : ($object->ownerId !== '' ? $object->ownerId : $bucketInfo->ownerId);
         $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $object->versionId);
-        $grants = $this->metadata->getAcl('object', $resourceName);
-        if ($grants === [] && ($object->versionId === null || $object->versionId === 'null')) {
+        $grants = $enforced ? [] : $this->metadata->getAcl('object', $resourceName);
+        if (!$enforced && $grants === [] && ($object->versionId === null || $object->versionId === 'null')) {
             $grants = $this->metadata->getAcl('object', $bucket . '/' . $key);
         }
+        $grants = AclGrantResolver::effectiveGrants(
+            $grants,
+            $this->metadata->getPublicAccessBlock($bucket)['ignorePublicAcls'] ?? false,
+        );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Default: owner gets FULL_CONTROL if no ACL stored.
         if ($grants === []) {
             $grants = [
                 [
                     'granteeType' => 'CanonicalUser',
-                    'granteeId' => $ownerId,
+                    'granteeId' => $objectOwnerId,
                     'permission' => 'FULL_CONTROL',
                 ],
             ];
         }
 
         $credential = $request->getAttribute('credential');
-        $displayName = ($credential !== null && $credential->ownerId === $ownerId)
+        $displayName = ($credential !== null && $credential->ownerId === $objectOwnerId)
             ? $credential->displayName
             : '';
 
         $displayNameMap = ($credential !== null && $credential->ownerId !== '')
             ? [$credential->ownerId => $credential->displayName]
             : [];
-        $xml = XmlResponseBuilder::aclResult($ownerId, $displayName, $grants, $displayNameMap);
+        $xml = XmlResponseBuilder::aclResult($objectOwnerId, $displayName, $grants, $displayNameMap);
+        $versionId = $object->versionId
+            ?? ($this->metadata->getBucketVersioning($bucket) !== '' ? 'null' : null);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         return new Response(
             status: 200,
             headers: array_filter([
                 'Content-Type' => 'application/xml',
-                'x-amz-version-id' => $object->versionId,
-            ]),
+                'x-amz-version-id' => $versionId,
+            ], static fn(?string $value): bool => $value !== null),
             body: $xml,
         );
     }

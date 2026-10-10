@@ -11,6 +11,7 @@ use OpsFour\S3Server\Exception\AuthorizationHeaderMalformedException;
 use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\S3Exception;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
+use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
  * Validates AWS SigV4 presigned URL authentication.
@@ -42,8 +43,22 @@ final class PresignedUrlValidator
      */
     public function validate(Request $request, CredentialProvider $credentialProvider, string $region): AuthResult
     {
+        $query = QueryStringParser::parse($request->getUri()->getQuery());
+        // The AWS SDK moves the read-only x-amz-object-attributes header list
+        // into repeated query pairs when presigning. The handler still reads
+        // the signed header as a set, so their query order has no effect.
+        $orderInsensitiveNames = $request->hasHeader('x-amz-object-attributes')
+            && in_array(
+                'x-amz-object-attributes',
+                explode(';', $query['X-Amz-SignedHeaders'] ?? ''),
+                true,
+            ) ? ['x-amz-object-attributes'] : [];
+        if (QueryStringParser::hasConflictingValues($request->getUri()->getQuery(), $orderInsensitiveNames)) {
+            throw new AccessDeniedException('Conflicting duplicate query parameter.');
+        }
+
         // 1. Extract and validate all required presign query parameters.
-        $params = self::extractPresignParams($request);
+        $params = self::extractPresignParams($query);
 
         // 2. Validate algorithm.
         if ($params['algorithm'] !== 'AWS4-HMAC-SHA256') {
@@ -97,9 +112,15 @@ final class PresignedUrlValidator
                 'The AWS Access Key Id you provided does not exist in our records.',
             );
         }
-        SessionCredentialValidator::validate($credential, $request->getQueryParameter('X-Amz-Security-Token'));
+        SessionCredentialValidator::validate($credential, $query['X-Amz-Security-Token'] ?? null);
 
         // 6. Validate expiry.
+        if (! ctype_digit($params['expires'])) {
+            throw new AccessDeniedException(
+                sprintf('X-Amz-Expires must be a decimal integer between 1 and %d seconds.', self::MAX_EXPIRES_SECONDS),
+            );
+        }
+
         $expires = (int) $params['expires'];
         if ($expires < 1 || $expires > self::MAX_EXPIRES_SECONDS) {
             throw new AccessDeniedException(
@@ -127,6 +148,7 @@ final class PresignedUrlValidator
                 'Presigned URL requires "host" to be a signed header.',
             );
         }
+        SignatureV4Verifier::assertMutationHeadersSigned($request, $signedHeaders);
 
         $canonicalRequest = CanonicalRequest::build(
             method: $request->getMethod(),
@@ -171,12 +193,13 @@ final class PresignedUrlValidator
      *
      * @return array{algorithm: string, credential: string, date: string, expires: string, signedHeaders: string, signature: string}
      *
+     * @param array<string, string> $query
      * @throws S3Exception If any required parameter is missing.
      */
-    private static function extractPresignParams(Request $request): array
+    private static function extractPresignParams(array $query): array
     {
-        $requiredParameter = static function (string $queryParam) use ($request): string {
-            $value = $request->getQueryParameter($queryParam);
+        $requiredParameter = static function (string $queryParam) use ($query): string {
+            $value = $query[$queryParam] ?? null;
             if ($value === null || $value === '') {
                 throw new AuthorizationHeaderMalformedException(
                     sprintf('Missing required query parameter: %s.', $queryParam),
@@ -206,7 +229,7 @@ final class PresignedUrlValidator
      */
     private static function validateExpiry(string $amzDate, int $expires): void
     {
-        if (strlen($amzDate) !== 16 || $amzDate[8] !== 'T' || $amzDate[15] !== 'Z') {
+        if (preg_match('/\A[0-9]{8}T[0-9]{6}Z\z/', $amzDate) !== 1) {
             throw new AccessDeniedException(
                 'Invalid X-Amz-Date format. Expected ISO 8601 basic format (YYYYMMDD\'T\'HHMMSS\'Z\').',
             );

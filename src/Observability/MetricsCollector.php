@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Observability;
 
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+
 final class MetricsCollector
 {
     private const array REQUEST_DURATION_BUCKETS = [
@@ -18,6 +22,18 @@ final class MetricsCollector
         2.5,
         5.0,
         10.0,
+        30.0,
+    ];
+
+    private const array FLYSYSTEM_READ_FIRST_BYTE_BUCKETS = [
+        0.005,
+        0.025,
+        0.1,
+        0.5,
+        1.0,
+        5.0,
+        10.0,
+        20.0,
         30.0,
     ];
 
@@ -57,6 +73,11 @@ final class MetricsCollector
     /** @var array<string, int> */
     private array $notificationQueueDepth = [];
 
+    private ?int $multipartCompletionIntentCount = null;
+
+    /** @var array{object: int, part: int}|null */
+    private ?array $writeIntentCapacityCounts = null;
+
     /** @var array<string, int> */
     private array $notificationDeliveryTotals = [];
 
@@ -74,6 +95,24 @@ final class MetricsCollector
 
     /** @var array<string, int> */
     private array $workerPoolShutdownFailures = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadFirstByteTotals = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadFirstByteDurationNs = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadFirstByteBuckets = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadStageTotals = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadStageDurationNs = [];
+
+    /** @var array<string, int> */
+    private array $flysystemReadStageBuckets = [];
 
     private int $lifecycleRunning = 0;
 
@@ -203,6 +242,33 @@ final class MetricsCollector
         }
     }
 
+    public function setMultipartCompletionIntentCount(?int $count): void
+    {
+        if ($count === null) {
+            $this->multipartCompletionIntentCount = null;
+
+            return;
+        }
+        if ($count < 0 || $count > MultipartWriteIntentStore::MAX_OUTSTANDING_COMPLETION_INTENTS_GLOBAL) {
+            throw new \UnexpectedValueException('Multipart completion recovery capacity counter is out of range.');
+        }
+
+        $this->multipartCompletionIntentCount = $count;
+    }
+
+    /** @param array{object: int, part: int}|null $counts */
+    public function setWriteIntentCapacityCounts(?array $counts): void
+    {
+        if ($counts !== null && (
+            $counts['object'] < 0 || $counts['object'] > ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL
+            || $counts['part'] < 0 || $counts['part'] > MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS
+        )) {
+            throw new \UnexpectedValueException('Write intent recovery capacity counter is out of range.');
+        }
+
+        $this->writeIntentCapacityCounts = $counts;
+    }
+
     public function recordNotificationDelivery(string $status, int $count = 1): void
     {
         if ($count < 1) {
@@ -264,6 +330,52 @@ final class MetricsCollector
             'pool' => $pool,
         ]);
         $this->workerPoolShutdownFailures[$key] = ($this->workerPoolShutdownFailures[$key] ?? 0) + 1;
+    }
+
+    public function recordFlysystemReadFirstByte(string $result, int $durationNs): void
+    {
+        if (! in_array($result, ['ready', 'admission_timeout', 'admission_rejected', 'first_byte_timeout', 'error'], true)) {
+            throw new \InvalidArgumentException('Invalid Flysystem read first-byte result.');
+        }
+
+        $key = $this->key(['result' => $result]);
+        $durationNs = max(0, $durationNs);
+        $this->flysystemReadFirstByteTotals[$key] = ($this->flysystemReadFirstByteTotals[$key] ?? 0) + 1;
+        $this->flysystemReadFirstByteDurationNs[$key] = ($this->flysystemReadFirstByteDurationNs[$key] ?? 0) + $durationNs;
+
+        $durationSeconds = $durationNs / 1_000_000_000;
+        foreach (self::FLYSYSTEM_READ_FIRST_BYTE_BUCKETS as $bucket) {
+            if ($durationSeconds <= $bucket) {
+                $bucketKey = $this->key(['le' => self::formatFloat($bucket), 'result' => $result]);
+                $this->flysystemReadFirstByteBuckets[$bucketKey] = ($this->flysystemReadFirstByteBuckets[$bucketKey] ?? 0) + 1;
+            }
+        }
+        $bucketKey = $this->key(['le' => '+Inf', 'result' => $result]);
+        $this->flysystemReadFirstByteBuckets[$bucketKey] = ($this->flysystemReadFirstByteBuckets[$bucketKey] ?? 0) + 1;
+    }
+
+    public function recordFlysystemReadStage(string $stage, string $result, int $durationNs): void
+    {
+        if (! in_array($stage, ['admission', 'worker'], true)
+            || ! in_array($result, ['ready', 'timeout', 'rejected', 'error'], true)) {
+            throw new \InvalidArgumentException('Invalid Flysystem read stage or result.');
+        }
+
+        $labels = ['result' => $result, 'stage' => $stage];
+        $key = $this->key($labels);
+        $durationNs = max(0, $durationNs);
+        $this->flysystemReadStageTotals[$key] = ($this->flysystemReadStageTotals[$key] ?? 0) + 1;
+        $this->flysystemReadStageDurationNs[$key] = ($this->flysystemReadStageDurationNs[$key] ?? 0) + $durationNs;
+
+        $durationSeconds = $durationNs / 1_000_000_000;
+        foreach (self::FLYSYSTEM_READ_FIRST_BYTE_BUCKETS as $bucket) {
+            if ($durationSeconds <= $bucket) {
+                $bucketKey = $this->key(['le' => self::formatFloat($bucket)] + $labels);
+                $this->flysystemReadStageBuckets[$bucketKey] = ($this->flysystemReadStageBuckets[$bucketKey] ?? 0) + 1;
+            }
+        }
+        $bucketKey = $this->key(['le' => '+Inf'] + $labels);
+        $this->flysystemReadStageBuckets[$bucketKey] = ($this->flysystemReadStageBuckets[$bucketKey] ?? 0) + 1;
     }
 
     public function renderPrometheus(): string
@@ -369,6 +481,33 @@ final class MetricsCollector
             $lines[] = 's3_server_notification_queue_depth{' . $key . '} ' . $value;
         }
 
+        $lines[] = '# HELP s3_server_multipart_completion_intents Retained multipart completion recovery intents across all owners.';
+        $lines[] = '# TYPE s3_server_multipart_completion_intents gauge';
+        $lines[] = '# HELP s3_server_multipart_completion_capacity_remaining Unreserved global multipart completion recovery slots.';
+        $lines[] = '# TYPE s3_server_multipart_completion_capacity_remaining gauge';
+        if ($this->multipartCompletionIntentCount !== null) {
+            $lines[] = 's3_server_multipart_completion_intents ' . $this->multipartCompletionIntentCount;
+            $lines[] = 's3_server_multipart_completion_capacity_remaining '
+                . (MultipartWriteIntentStore::MAX_OUTSTANDING_COMPLETION_INTENTS_GLOBAL - $this->multipartCompletionIntentCount);
+        }
+
+        $lines[] = '# HELP s3_server_object_write_intents Retained object write recovery intents across all owners.';
+        $lines[] = '# TYPE s3_server_object_write_intents gauge';
+        $lines[] = '# HELP s3_server_object_write_capacity_remaining Unreserved global object write recovery slots.';
+        $lines[] = '# TYPE s3_server_object_write_capacity_remaining gauge';
+        $lines[] = '# HELP s3_server_multipart_part_write_intents Retained multipart part write recovery intents across all owners.';
+        $lines[] = '# TYPE s3_server_multipart_part_write_intents gauge';
+        $lines[] = '# HELP s3_server_multipart_part_write_capacity_remaining Unreserved global multipart part write recovery slots.';
+        $lines[] = '# TYPE s3_server_multipart_part_write_capacity_remaining gauge';
+        if ($this->writeIntentCapacityCounts !== null) {
+            $lines[] = 's3_server_object_write_intents ' . $this->writeIntentCapacityCounts['object'];
+            $lines[] = 's3_server_object_write_capacity_remaining '
+                . (ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL - $this->writeIntentCapacityCounts['object']);
+            $lines[] = 's3_server_multipart_part_write_intents ' . $this->writeIntentCapacityCounts['part'];
+            $lines[] = 's3_server_multipart_part_write_capacity_remaining '
+                . (MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS - $this->writeIntentCapacityCounts['part']);
+        }
+
         $lines[] = '# HELP s3_server_notification_deliveries_total Total notification delivery outcomes by status.';
         $lines[] = '# TYPE s3_server_notification_deliveries_total counter';
         foreach ($this->notificationDeliveryTotals as $key => $value) {
@@ -403,6 +542,30 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_worker_pool_shutdown_failures_total counter';
         foreach ($this->workerPoolShutdownFailures as $key => $value) {
             $lines[] = 's3_server_worker_pool_shutdown_failures_total{' . $key . '} ' . $value;
+        }
+
+        $lines[] = '# HELP s3_server_flysystem_read_first_byte_seconds Time from GET storage read request to primed stream, including read worker admission.';
+        $lines[] = '# TYPE s3_server_flysystem_read_first_byte_seconds histogram';
+        foreach ($this->flysystemReadFirstByteBuckets as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_first_byte_seconds_bucket{' . $key . '} ' . $value;
+        }
+        foreach ($this->flysystemReadFirstByteDurationNs as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_first_byte_seconds_sum{' . $key . '} ' . self::formatFloat($value / 1_000_000_000);
+        }
+        foreach ($this->flysystemReadFirstByteTotals as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_first_byte_seconds_count{' . $key . '} ' . $value;
+        }
+
+        $lines[] = '# HELP s3_server_flysystem_read_stage_seconds GET read-worker admission or post-admission time to the primed first byte.';
+        $lines[] = '# TYPE s3_server_flysystem_read_stage_seconds histogram';
+        foreach ($this->flysystemReadStageBuckets as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_stage_seconds_bucket{' . $key . '} ' . $value;
+        }
+        foreach ($this->flysystemReadStageDurationNs as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_stage_seconds_sum{' . $key . '} ' . self::formatFloat($value / 1_000_000_000);
+        }
+        foreach ($this->flysystemReadStageTotals as $key => $value) {
+            $lines[] = 's3_server_flysystem_read_stage_seconds_count{' . $key . '} ' . $value;
         }
 
         return implode("\n", $lines) . "\n";

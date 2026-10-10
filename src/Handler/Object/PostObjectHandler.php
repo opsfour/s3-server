@@ -8,10 +8,14 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\PostObjectForm;
+use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\EntityTooLargeException;
+use OpsFour\S3Server\Exception\EntityTooSmallException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Security\RequestNetworkContext;
 
 /**
  * Handles browser-style POST Object after streaming form authentication.
@@ -51,6 +55,19 @@ final class PostObjectHandler implements RequestHandler
             }
         }
 
+        $successRedirect = $form->value('success_action_redirect');
+        if ($successRedirect !== null && $successRedirect !== '') {
+            $parts = preg_match('/[\x00-\x1F\x7F]/', $successRedirect) === 1
+                ? false
+                : parse_url($successRedirect);
+            if ($parts === false || ! isset($parts['scheme'], $parts['host'])
+                || $parts['host'] === '' || ! in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+                // S3 treats an uninterpretable redirect as absent and returns
+                // success_action_status after storing the object.
+                $successRedirect = null;
+            }
+        }
+
         // Anonymous writes are authorized by the bucket WRITE ACL. Objects
         // created this way belong to the bucket owner.
         $ownerId = $request->hasAttribute('ownerId') ? $request->getAttribute('ownerId') : '';
@@ -61,30 +78,24 @@ final class PostObjectHandler implements RequestHandler
         $putResponse = $this->putObject->handleRequest($request);
         $etag = $putResponse->getHeader('etag') ?? '""';
 
-        $successRedirect = $form->value('success_action_redirect');
         if ($successRedirect !== null && $successRedirect !== '') {
-            if (str_contains($successRedirect, "\r") || str_contains($successRedirect, "\n")) {
-                throw new InvalidArgumentException('success_action_redirect contains invalid characters.');
-            }
-
-            $scheme = parse_url($successRedirect, PHP_URL_SCHEME);
-            if (!is_string($scheme) || !in_array(strtolower($scheme), ['http', 'https'], true)) {
-                throw new InvalidArgumentException('success_action_redirect must use HTTP or HTTPS.');
-            }
-
-            $separator = str_contains($successRedirect, '?') ? '&' : '?';
-            $redirectUrl = $successRedirect . $separator
+            $redirectParts = explode('#', $successRedirect, 2);
+            $redirectBase = $redirectParts[0];
+            $fragment = $redirectParts[1] ?? null;
+            $separator = str_contains($redirectBase, '?') ? '&' : '?';
+            $redirectUrl = $redirectBase . $separator
                 . 'bucket=' . rawurlencode($bucket)
                 . '&key=' . rawurlencode($form->key)
-                . '&etag=' . rawurlencode($etag);
+                . '&etag=' . rawurlencode($etag)
+                . ($fragment !== null ? '#' . $fragment : '');
 
-            return new Response(
-                status: 303,
-                headers: [
-                    'Location' => $redirectUrl,
-                    'ETag' => $etag,
-                ],
-            );
+            $headers = ['Location' => $redirectUrl, 'ETag' => $etag];
+            $versionId = $putResponse->getHeader('x-amz-version-id');
+            if ($versionId !== null) {
+                $headers['x-amz-version-id'] = $versionId;
+            }
+
+            return new Response(status: 303, headers: $headers);
         }
 
         $status = $this->resolveSuccessStatus($form->value('success_action_status'));
@@ -92,7 +103,7 @@ final class PostObjectHandler implements RequestHandler
 
         if ($status === 201) {
             $host = $request->getHeader('host') ?? 'localhost';
-            $scheme = $request->getClient()->getTlsInfo() !== null ? 'https' : 'http';
+            $scheme = RequestNetworkContext::secureTransport($request) ? 'https' : 'http';
             $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n"
                 . '<PostResponse>'
                 . '<Location>' . $scheme . '://' . htmlspecialchars($host, ENT_XML1, 'UTF-8')
@@ -241,18 +252,14 @@ final class PostObjectHandler implements RequestHandler
         };
     }
 
-    private function errorResponse(int $status, string $code, string $message): Response
+    private function errorResponse(int $status, string $code, string $message): never
     {
-        $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n"
-            . '<Error>'
-            . '<Code>' . htmlspecialchars($code, ENT_XML1, 'UTF-8') . '</Code>'
-            . '<Message>' . htmlspecialchars($message, ENT_XML1, 'UTF-8') . '</Message>'
-            . '</Error>';
-
-        return new Response(
-            status: $status,
-            headers: ['Content-Type' => 'application/xml'],
-            body: $xml,
-        );
+        throw match ([$status, $code]) {
+            [400, 'InvalidArgument'] => new InvalidArgumentException($message),
+            [400, 'EntityTooSmall'] => new EntityTooSmallException($message),
+            [400, 'EntityTooLarge'] => new EntityTooLargeException($message),
+            [403, 'AccessDenied'] => new AccessDeniedException($message),
+            default => new \LogicException("Unsupported POST Object error mapping: {$status} {$code}"),
+        };
     }
 }

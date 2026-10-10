@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Auth;
 
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
+use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
 
 /**
  * In-memory credential store.
@@ -13,7 +16,7 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
  * Suitable for testing, development, and single-process deployments
  * where credentials are known at startup.
  */
-final class InMemoryCredentialProvider implements CredentialProvider
+final class InMemoryCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater
 {
     /**
      * @var array<string, Credential> Credentials keyed by accessKeyId.
@@ -56,11 +59,64 @@ final class InMemoryCredentialProvider implements CredentialProvider
         $this->credentials[$credential->accessKeyId] = $credential;
     }
 
+    public function createCredentialIfAbsent(Credential $credential): bool
+    {
+        if (isset($this->credentials[$credential->accessKeyId])) {
+            return false;
+        }
+
+        $this->credentials[$credential->accessKeyId] = $credential;
+
+        return true;
+    }
+
     /**
      * {@inheritDoc}
      */
     public function deleteCredential(string $accessKeyId): void
     {
         unset($this->credentials[$accessKeyId]);
+    }
+
+    public function deleteCredentialIfCurrent(Credential $expected): bool
+    {
+        $current = $this->credentials[$expected->accessKeyId] ?? null;
+        if ($current === null
+            || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
+            || $current->ownerId !== $expected->ownerId
+            || $current->sessionToken !== $expected->sessionToken
+            || $current->isActive !== $expected->isActive) {
+            return false;
+        }
+
+        unset($this->credentials[$expected->accessKeyId]);
+
+        return true;
+    }
+
+    public function setActiveIfCurrent(Credential $expected, bool $active): bool
+    {
+        $current = $this->credentials[$expected->accessKeyId] ?? null;
+        if ($current === null
+            || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
+            || $current->ownerId !== $expected->ownerId
+            || $current->sessionToken !== $expected->sessionToken
+            || $current->isActive !== $expected->isActive) {
+            return false;
+        }
+
+        $this->credentials[$expected->accessKeyId] = new Credential(
+            accessKeyId: $current->accessKeyId,
+            secretAccessKey: $current->secretAccessKey,
+            ownerId: $current->ownerId,
+            displayName: $current->displayName,
+            isActive: $active,
+            sessionToken: $current->sessionToken,
+            expiresAt: $current->expiresAt,
+            policyNames: $current->policyNames,
+            allowedPrefixes: $current->allowedPrefixes,
+        );
+
+        return true;
     }
 }

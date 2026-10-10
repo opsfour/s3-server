@@ -13,6 +13,178 @@ namespace OpsFour\S3Server\Storage;
  */
 final class StoragePath
 {
+    /** Validate a bucket as one physical path segment at the backend boundary. */
+    public static function assertBucketPathSegment(string $bucket): void
+    {
+        if ($bucket === '' || $bucket === '.' || $bucket === '..'
+            || in_array($bucket, ['.parts', '.assemblies', '.tmp'], true)
+            || str_contains($bucket, '/') || str_contains($bucket, '\\')
+            || preg_match('/[\x00-\x1F\x7F:]/', $bucket)
+        ) {
+            throw new \InvalidArgumentException('Invalid bucket storage path segment.');
+        }
+    }
+
+    /** Reject upload IDs that could escape or normalize away a part directory. */
+    public static function assertSafeUploadIdSegment(string $uploadId): void
+    {
+        if (! preg_match('/^[A-Za-z0-9][A-Za-z0-9._+=-]{0,254}$/D', $uploadId)) {
+            throw new \InvalidArgumentException('Invalid multipart upload ID path segment.');
+        }
+    }
+
+    public static function forPlannedPart(
+        string $root,
+        string $bucket,
+        string $bucketGeneration,
+        string $uploadId,
+        int $partNumber,
+        string $attemptId,
+    ): string {
+        if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $bucketGeneration)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $uploadId)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)
+            || $partNumber < 1 || $partNumber > 10000
+        ) {
+            throw new \InvalidArgumentException('Invalid planned multipart part path scope.');
+        }
+
+        return self::completionRoot($root) . '.parts/' . $uploadId . '/'
+            . $partNumber . '-' . $bucketGeneration . '-' . $attemptId;
+    }
+
+    public static function assertPlannedPartPath(string $root, string $path, string $uploadId, int $partNumber): void
+    {
+        if (! preg_match('/^[a-f0-9]{32}$/D', $uploadId) || $partNumber < 1 || $partNumber > 10000) {
+            throw new \InvalidArgumentException('Invalid planned multipart part path.');
+        }
+
+        $prefix = self::completionRoot($root) . '.parts/' . $uploadId . '/' . $partNumber . '-';
+        if (! str_starts_with($path, $prefix)
+            || ! preg_match('/^[a-f0-9]{32}-[a-f0-9]{32}$/D', substr($path, strlen($prefix)))) {
+            throw new \InvalidArgumentException('Invalid planned multipart part path.');
+        }
+    }
+
+    public static function forPlannedObject(
+        string $root,
+        string $bucket,
+        string $key,
+        string $bucketGeneration,
+        string $attemptId,
+    ): string {
+        if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $bucketGeneration)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)
+        ) {
+            throw new \InvalidArgumentException('Invalid planned object path scope.');
+        }
+
+        $hash = hash('sha256', $key);
+
+        return self::completionRoot($root) . $bucket . '/' . substr($hash, 0, 2) . '/'
+            . substr($hash, 2, 2) . '/' . $bucketGeneration . '-' . $attemptId;
+    }
+
+    public static function assertPlannedObjectPath(string $root, string $path, string $bucket, string $key): void
+    {
+        if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)) {
+            throw new \InvalidArgumentException('Invalid planned object path.');
+        }
+
+        $hash = hash('sha256', $key);
+        $prefix = self::completionRoot($root) . $bucket . '/' . substr($hash, 0, 2) . '/' . substr($hash, 2, 2) . '/';
+        if (! str_starts_with($path, $prefix)
+            || ! preg_match('/^[a-f0-9]{32}-[a-f0-9]{32}$/D', substr($path, strlen($prefix)))) {
+            throw new \InvalidArgumentException('Invalid planned object path.');
+        }
+    }
+
+    /**
+     * Validate a persisted object-attempt path when the original object key
+     * is unavailable to a recovery collector. The two hash shards are
+     * structural; the writer must separately verify the complete key hash.
+     */
+    public static function assertPlannedObjectIntentPath(
+        string $root,
+        string $path,
+        string $bucket,
+        string $bucketGeneration,
+        string $attemptId,
+    ): void {
+        if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $bucketGeneration)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)) {
+            throw new \InvalidArgumentException('Invalid planned object intent path.');
+        }
+
+        $prefix = self::completionRoot($root) . $bucket . '/';
+        $relative = str_starts_with($path, $prefix) ? substr($path, strlen($prefix)) : '';
+        if (! preg_match('~^[a-f0-9]{2}/[a-f0-9]{2}/' . $bucketGeneration . '-' . $attemptId . '$~D', $relative)) {
+            throw new \InvalidArgumentException('Planned object intent path does not match its scope.');
+        }
+    }
+
+    public static function assertObjectWritePath(string $root, string $path, string $bucket, string $key): void
+    {
+        $completionPrefix = self::completionRoot($root) . '.assemblies/';
+        if (str_starts_with($path, $completionPrefix)) {
+            self::assertMultipartCompletionPath($root, $path);
+            $components = explode('/', substr($path, strlen($completionPrefix)));
+            if ($components[0] !== $bucket || ! hash_equals(hash('sha256', $key), $components[2])) {
+                throw new \InvalidArgumentException('Multipart completion path does not match the object scope.');
+            }
+
+            return;
+        }
+
+        self::assertPlannedObjectPath($root, $path, $bucket, $key);
+    }
+    /**
+     * Planned completion paths are outside the bucket's recursively deleted
+     * namespace and fenced by its immutable generation and an attempt ID.
+     *
+     * @return array{assembly: string, final: string}
+     */
+    public static function forMultipartCompletion(
+        string $root,
+        string $bucket,
+        string $key,
+        string $bucketGeneration,
+        string $attemptId,
+    ): array {
+        if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $bucketGeneration)
+            || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)
+        ) {
+            throw new \InvalidArgumentException('Invalid multipart completion path scope.');
+        }
+
+        $prefix = self::completionRoot($root) . '.assemblies/' . $bucket . '/' . $bucketGeneration
+            . '/' . hash('sha256', $key) . '/' . $attemptId;
+
+        return ['assembly' => $prefix . '/assembly', 'final' => $prefix . '/final'];
+    }
+
+    public static function assertMultipartCompletionPath(string $root, string $path): void
+    {
+        $prefix = self::completionRoot($root) . '.assemblies/';
+        $relative = str_starts_with($path, $prefix) ? substr($path, strlen($prefix)) : '';
+        if (! preg_match('~^[a-z0-9][a-z0-9.-]{1,62}/[a-f0-9]{32}/[a-f0-9]{64}/[a-f0-9]{32}/(?:assembly|final)$~D', $relative)) {
+            throw new \InvalidArgumentException('Invalid planned multipart completion path.');
+        }
+    }
+
+    private static function completionRoot(string $root): string
+    {
+        if ($root === '' || str_ends_with($root, '://')) {
+            return $root;
+        }
+
+        return rtrim($root, '/') . '/';
+    }
+
     /**
      * Compute the storage path for an object.
      *
@@ -25,6 +197,7 @@ final class StoragePath
      */
     public static function forObject(string $basePath, string $bucket, string $key): string
     {
+        self::assertBucketPathSegment($bucket);
         $hash = hash('sha256', $key);
         $uuid = bin2hex(random_bytes(16));
 
@@ -91,6 +264,7 @@ final class StoragePath
      */
     public static function directoryForObject(string $basePath, string $bucket, string $key): string
     {
+        self::assertBucketPathSegment($bucket);
         $hash = hash('sha256', $key);
 
         return sprintf(

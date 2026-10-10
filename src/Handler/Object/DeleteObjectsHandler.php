@@ -16,7 +16,10 @@ use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\RestoredCopyTierResolver;
 use OpsFour\S3Server\Exception\MalformedXmlException;
+use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Policy\ObjectDeletePolicyGuard;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -39,12 +42,15 @@ final class DeleteObjectsHandler implements RequestHandler
 {
     private readonly ObjectLockChecker $lockChecker;
 
+    private readonly ObjectDeletePolicyGuard $policyGuard;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageTierRegistry $storageTiers,
         private readonly ?NotificationDispatcher $notifications = null,
     ) {
         $this->lockChecker = new ObjectLockChecker($metadata);
+        $this->policyGuard = new ObjectDeletePolicyGuard($metadata);
     }
 
     public function handleRequest(Request $request): Response
@@ -82,6 +88,7 @@ final class DeleteObjectsHandler implements RequestHandler
         // Wrap all metadata deletions in a transaction for atomicity.
         $this->metadata->transaction(function () use ($parsed, $bucketInfo, $bucket, $ownerId, $versioning, $quiet, $request, &$deleted, &$errors, &$objectsToClean, &$notificationEvents): void {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                 throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                     'Bucket versioning changed while the batch delete was being committed.',
@@ -92,20 +99,30 @@ final class DeleteObjectsHandler implements RequestHandler
                 $versionId = $obj['versionId'] ?? null;
 
                 try {
+                    $request->setAttribute(
+                        's3.canBypassGovernanceRetention',
+                        $this->policyGuard->check($request, $bucket, $key, $versionId, $ownerId, $bucketInfo->ownerId),
+                    );
                     if ($versionId !== null) {
                         // Permanently delete a specific version.
                         // Check Object Lock before allowing deletion.
                         $this->lockChecker->check($bucket, $key, $versionId, $request);
+
+                        $existing = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
+                        if ($existing !== null && $existing->restoredStoragePath !== null) {
+                            RestoredCopyTierResolver::resolve($existing, $this->storageTiers);
+                        }
 
                         $deletedInfo = $this->metadata->deleteObjectVersion($bucket, $key, $versionId);
 
                         if ($deletedInfo !== null) {
                             // Collect storage path for deferred deletion (after commit).
                             if (! $deletedInfo->isDeleteMarker) {
+                                $this->queueStoredData($deletedInfo);
                                 $objectsToClean[] = $deletedInfo;
                             }
 
-                            $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
+                            $notificationEvents[] = $this->removalEvent($request, $bucket, $key, $ownerId, versionId: $versionId, bucketGeneration: $bucketInfo->generation);
 
                             if (! $quiet) {
                                 $entry = ['key' => $key, 'versionId' => $versionId];
@@ -124,12 +141,17 @@ final class DeleteObjectsHandler implements RequestHandler
                     } elseif ($versioning === 'Enabled' || $versioning === 'Suspended') {
                         $isSuspended = ($versioning === 'Suspended');
 
-                        // Suspended: fetch existing null version for cleanup after metadata write.
+                        // Suspended: only the null version is replaced. A
+                        // numbered latest version remains readable by ID.
                         $oldSuspendedObject = null;
                         if ($isSuspended) {
-                            $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-                            if ($existingObj !== null && !$existingObj->isDeleteMarker) {
-                                $oldSuspendedObject = $existingObj;
+                            $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+                            if ($nullVersion !== null && ! $nullVersion->isDeleteMarker) {
+                                $this->lockChecker->check($bucket, $key, 'null', $request);
+                                if ($nullVersion->restoredStoragePath !== null) {
+                                    RestoredCopyTierResolver::resolve($nullVersion, $this->storageTiers);
+                                }
+                                $oldSuspendedObject = $nullVersion;
                             }
                         }
 
@@ -138,9 +160,10 @@ final class DeleteObjectsHandler implements RequestHandler
 
                         // Only queue path for deletion after successful metadata write.
                         if ($oldSuspendedObject !== null) {
+                            $this->queueStoredData($oldSuspendedObject);
                             $objectsToClean[] = $oldSuspendedObject;
                         }
-                        $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
+                        $notificationEvents[] = $this->removalEvent($request, $bucket, $key, $ownerId, 's3:ObjectRemoved:DeleteMarkerCreated', $deleteMarkerVersionId, $bucketInfo->generation);
 
                         if (! $quiet) {
                             $deleted[] = [
@@ -154,12 +177,16 @@ final class DeleteObjectsHandler implements RequestHandler
                         $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
 
                         if ($objectInfo !== null) {
+                            if ($objectInfo->restoredStoragePath !== null) {
+                                RestoredCopyTierResolver::resolve($objectInfo, $this->storageTiers);
+                            }
                             $this->metadata->deleteObjectMetadata($bucket, $key);
+                            $this->queueStoredData($objectInfo);
 
                             // Collect path AFTER metadata delete succeeds to avoid
                             // deleting storage for objects whose metadata wasn't removed.
                             $objectsToClean[] = $objectInfo;
-                            $notificationEvents[] = $this->removalEvent($bucket, $key, $ownerId);
+                            $notificationEvents[] = $this->removalEvent($request, $bucket, $key, $ownerId, bucketGeneration: $bucketInfo->generation);
                         }
 
                         // S3 returns success even if the object didn't exist.
@@ -167,19 +194,16 @@ final class DeleteObjectsHandler implements RequestHandler
                             $deleted[] = ['key' => $key];
                         }
                     }
-                } catch (\OpsFour\S3Server\Exception\ObjectLockedException) {
-                    $errors[] = [
+                } catch (AccessDeniedException|\OpsFour\S3Server\Exception\ObjectLockedException) {
+                    $error = [
                         'key' => $key,
-                        'versionId' => $versionId,
                         'code' => 'AccessDenied',
                         'message' => 'Access Denied',
                     ];
-                } catch (\Throwable $e) {
-                    $errors[] = [
-                        'key' => $key,
-                        'code' => 'InternalError',
-                        'message' => 'Failed to delete object.',
-                    ];
+                    if ($versionId !== null) {
+                        $error['versionId'] = $versionId;
+                    }
+                    $errors[] = $error;
                 }
             }
 
@@ -211,18 +235,51 @@ final class DeleteObjectsHandler implements RequestHandler
     {
         $path = $object->systemMetadata['storagePath'] ?? null;
         if ($path !== null && $path !== '') {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->tier($object->storageTier)->backend, $object->bucket, $object->storageTier, $path);
+            $this->deleteQueuedPath($object->bucket, $object->storageTier, $path);
         }
 
         if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->defaultBackend(), $object->bucket, $this->storageTiers->defaultTier()->name, $object->restoredStoragePath);
+            $restoredTier = RestoredCopyTierResolver::resolve($object, $this->storageTiers);
+            $this->deleteQueuedPath($object->bucket, $restoredTier->name, $object->restoredStoragePath);
         }
     }
 
-    private function removalEvent(string $bucket, string $key, string $ownerId): S3Event
+    /** Must run inside the batch deletion transaction. */
+    private function queueStoredData(ObjectInfo $object): void
     {
-        return $this->notifications?->createEvent('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId)
-            ?? new S3Event('s3:ObjectRemoved:Delete', $bucket, $key, ownerId: $ownerId);
+        $path = $object->systemMetadata['storagePath'] ?? null;
+        if ($path !== null && $path !== '') {
+            $this->metadata->enqueueStorageGarbage($object->bucket, $object->storageTier, $path);
+        }
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            $restoreTier = RestoredCopyTierResolver::resolve($object, $this->storageTiers);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $restoreTier->name, $object->restoredStoragePath);
+        }
+    }
+
+    private function deleteQueuedPath(string $bucket, string $tier, string $path): void
+    {
+        try {
+            \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
+                $this->metadata,
+                $this->storageTiers->tier($tier)->backend,
+                $bucket,
+                $tier,
+                $path,
+            );
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            // The exact path remains in the durable garbage queue for retry.
+        }
+    }
+
+    private function removalEvent(Request $request, string $bucket, string $key, string $ownerId, string $eventName = 's3:ObjectRemoved:Delete', ?string $versionId = null, string $bucketGeneration = ''): S3Event
+    {
+        $event = $this->notifications?->createEvent($eventName, $bucket, $key, ownerId: $ownerId, request: $request, bucketGeneration: $bucketGeneration)
+            ?? new S3Event($eventName, $bucket, $key, ownerId: $ownerId);
+
+        return $versionId !== null && $versionId !== 'null' ? $event->withVersionId($versionId) : $event;
     }
 
 }

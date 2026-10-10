@@ -11,6 +11,8 @@ use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\S3Exception;
+use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 
 /**
@@ -46,6 +48,11 @@ final class AuthMiddleware implements AuthenticationMiddleware
         private readonly CredentialProvider $credentialProvider,
         private readonly string $region,
         int $requestBodySizeLimit = 5_368_709_120,
+        ?MetadataStore $metadata = null,
+        int $postSpoolBudgetBytes = 10_737_418_240,
+        ?string $postSpoolTempDir = null,
+        ?PostObjectTempFileSweeper $postSpoolSweeper = null,
+        ?PostObjectSpoolCoordinator $postSpoolCoordinator = null,
     ) {
         $this->sigV4Verifier = new SignatureV4Verifier();
         $this->presignedValidator = new PresignedUrlValidator();
@@ -54,13 +61,43 @@ final class AuthMiddleware implements AuthenticationMiddleware
             $credentialProvider,
             $region,
             $requestBodySizeLimit,
+            authorizationPreflight: $metadata === null ? null : new PostObjectAuthorizationPreflight($metadata),
+            spoolBudgetBytes: $postSpoolBudgetBytes,
+            tempFileSweeper: $postSpoolSweeper,
+            spoolCoordinator: $postSpoolCoordinator,
+            tempDir: $postSpoolTempDir,
         );
+    }
+
+    /** @internal Prove the inert EFS candidate has no default temp fallback. */
+    public function assertQualifiedIngressBinding(
+        string $tempDir,
+        int $budgetBytes,
+        PostObjectTempFileSweeper $sweeper,
+        PostObjectSpoolCoordinator $coordinator,
+    ): void {
+        $this->postObjectFormParser->assertQualifiedBinding($tempDir, $budgetBytes, $sweeper, $coordinator);
+    }
+
+    /** @internal SigV4 and browser POST must share the exact ingress provider. */
+    public function assertQualifiedCredentialProviderBinding(CredentialProvider $credentialProvider): void
+    {
+        if ($this->credentialProvider !== $credentialProvider) {
+            throw new \RuntimeException('EFS authentication credential provider differs from qualified ingress.');
+        }
+        $this->postObjectFormParser->assertQualifiedCredentialProviderBinding($credentialProvider);
+    }
+
+    /** @internal The server binds readiness to the exact provider used for authentication. */
+    public function credentialProvider(): CredentialProvider
+    {
+        return $this->credentialProvider;
     }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
         // POST Object (HTML form upload) uses its own authentication via form fields.
-        // Skip normal SigV4 auth — the PostObjectHandler handles V2 signature verification.
+        // Skip header SigV4 auth — the form parser verifies V2/V4 policy signatures.
         // Set empty defaults so downstream middleware doesn't crash on missing attributes.
         $operation = $request->hasAttribute('s3.operation')
             ? $request->getAttribute('s3.operation')
@@ -96,6 +133,7 @@ final class AuthMiddleware implements AuthenticationMiddleware
 
         // If chunked SigV4 streaming, wrap the body with signature verification.
         $contentSha = $request->getHeader('x-amz-content-sha256');
+        AwsChunkedContentLength::fromRequest($request);
         if ($contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD') {
             $this->wrapChunkedBody($request, $authResult);
         } elseif ($contentSha === 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER') {
@@ -126,8 +164,8 @@ final class AuthMiddleware implements AuthenticationMiddleware
         }
 
         // 2. Check for presigned URL (X-Amz-Algorithm query parameter).
-        $algorithm = $request->getQueryParameter('X-Amz-Algorithm');
-        if ($algorithm !== null && $algorithm !== '') {
+        $query = QueryStringParser::parse($request->getUri()->getQuery());
+        if (array_key_exists('X-Amz-Algorithm', $query)) {
             return $this->presignedValidator->validate($request, $this->credentialProvider, $this->region);
         }
 
@@ -223,12 +261,16 @@ final class AuthMiddleware implements AuthenticationMiddleware
     private function trailerCallback(Request $request): \Closure
     {
         return static function (array $trailers) use ($request): void {
+            $verified = [];
             foreach ($trailers as $name => $value) {
                 if (! is_string($name) || $name === '' || ! is_string($value)) {
                     throw new \LogicException('Verified trailer callback received malformed headers.');
                 }
                 $request->setHeader($name, $value);
+                $verified[] = strtolower($name);
             }
+            sort($verified, SORT_STRING);
+            $request->setAttribute('s3.verifiedChecksumTrailers', $verified);
         };
     }
 

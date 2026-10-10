@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Http\Server\Router;
+use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
  * Lightweight middleware that parses the request and sets s3.bucket,
@@ -29,11 +30,14 @@ final class S3AttributeMiddleware implements Middleware
             ? $request->getAttribute(Router::class)
             : [];
 
-        $bucket = $this->extractBucket($request, $routeArgs);
-        $key = $routeArgs['key'] ?? null;
+        $virtualBucket = BucketNameExtractor::extractVirtualHosted($request, $this->baseDomain);
+        $bucket = $virtualBucket ?? $this->extractBucket($request, $routeArgs);
+        $key = $virtualBucket !== null
+            ? rawurldecode(ltrim($request->getUri()->getPath(), '/'))
+            : ($routeArgs['key'] ?? null);
 
-        // Note: Amp Router already rawurldecode()s the path before matching.
-        // Do NOT decode again here — double-decoding breaks keys with literal % characters.
+        // Amp Router already decodes path-style route arguments. For virtual
+        // hosting the full URI path is the key, so decode that path once.
 
         // Short-circuit OPTIONS requests before operation resolution.
         // OperationResolver does not recognize OPTIONS, so let CORS middleware handle it.
@@ -102,34 +106,7 @@ final class S3AttributeMiddleware implements Middleware
      */
     private static function extractQueryParams(Request $request): array
     {
-        $rawQuery = $request->getUri()->getQuery();
-
-        if ($rawQuery === '') {
-            return [];
-        }
-
-        $result = [];
-        $pairs = \explode('&', $rawQuery);
-
-        foreach ($pairs as $pair) {
-            if ($pair === '') {
-                continue;
-            }
-
-            $eqPos = \strpos($pair, '=');
-
-            if ($eqPos === false) {
-                $result[\rawurldecode($pair)] = '';
-            } else {
-                $key = \rawurldecode(\substr($pair, 0, $eqPos));
-                $value = \rawurldecode(\substr($pair, $eqPos + 1));
-                if (!\array_key_exists($key, $result)) {
-                    $result[$key] = $value;
-                }
-            }
-        }
-
-        return $result;
+        return QueryStringParser::parse($request->getUri()->getQuery());
     }
 
     /**

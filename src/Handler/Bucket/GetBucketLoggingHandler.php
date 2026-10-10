@@ -27,6 +27,7 @@ final class GetBucketLoggingHandler implements RequestHandler
         }
 
         $config = $this->metadata->getBucketLogging($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $writer = new \XMLWriter();
         $writer->openMemory();

@@ -12,14 +12,18 @@ use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\InvalidRangeException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
@@ -35,16 +39,6 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
  */
 final class GetObjectHandler implements RequestHandler
 {
-    /** @var array<string, string> Query parameter overrides for response headers. */
-    private const array RESPONSE_HEADER_OVERRIDES = [
-        'response-content-type' => 'Content-Type',
-        'response-content-language' => 'Content-Language',
-        'response-content-disposition' => 'Content-Disposition',
-        'response-content-encoding' => 'Content-Encoding',
-        'response-cache-control' => 'Cache-Control',
-        'response-expires' => 'Expires',
-    ];
-
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -55,6 +49,12 @@ final class GetObjectHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        $includeChecksums = S3ResponseHeaders::checksumModeEnabled($request->getHeader('x-amz-checksum-mode'));
+        $queryString = $request->getUri()->getQuery();
+        $queryParams = $queryString !== '' ? QueryStringParser::parse($queryString) : [];
+        if (array_key_exists('partNumber', $queryParams)) {
+            throw new NotImplementedException('GetObject partNumber is not supported.');
+        }
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -67,37 +67,60 @@ final class GetObjectHandler implements RequestHandler
         }
 
         // 2. Get object metadata (version-aware).
-        $queryString = $request->getUri()->getQuery();
-        $queryParams = $queryString !== '' ? QueryStringParser::parse($queryString) : [];
         $versionId = $queryParams['versionId'] ?? null;
 
         if ($versionId !== null) {
             $objectInfo = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
         } else {
-            $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+            $objectInfo = $this->metadata->getCurrentObjectVersion($bucket, $key);
         }
 
         if ($objectInfo === null) {
+            BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if ($versionId === null) {
+                $canList = MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+                BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                if (! $canList) {
+                    throw new \OpsFour\S3Server\Exception\AccessDeniedException();
+                }
+            }
             throw new NoSuchKeyException();
         }
+        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Delete markers: return error with x-amz-delete-marker header.
         // With versionId → 405 Method Not Allowed; without → 404 Not Found.
         if ($objectInfo->isDeleteMarker) {
-            $dmHeaders = ['x-amz-delete-marker' => 'true'];
-            if ($objectInfo->versionId !== null) {
-                $dmHeaders['x-amz-version-id'] = $objectInfo->versionId;
-            }
+            $dmHeaders = [
+                'x-amz-delete-marker' => 'true',
+                'x-amz-version-id' => $objectInfo->versionId ?? 'null',
+            ];
 
             if ($versionId !== null) {
+                $dmHeaders['Last-Modified'] = $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T');
                 throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException())->withExtraHeaders($dmHeaders);
             }
 
             throw (new NoSuchKeyException())->withExtraHeaders($dmHeaders);
         }
 
+        // SSE-C headers are required even if a conditional request would
+        // otherwise return 304/412 without reading the object body.
+        $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        $customerKey = \OpsFour\S3Server\Encryption\EncryptionRequestResolver::resolveCustomerKey(
+            $request,
+            $sseAlgo === 'SSE-C',
+            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+        );
+        if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
+            throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
+        }
+
         // 3. Evaluate conditional headers (must be done before range processing).
-        ConditionalHeaderEvaluator::evaluate($request, $objectInfo);
+        $emitNullVersion = $objectInfo->versionId === null
+            && $this->metadata->getBucketVersioning($bucket) !== '';
+        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
         // 4. Parse Range header if present.
         $rangeHeader = $request->getHeader('range');
@@ -107,7 +130,7 @@ final class GetObjectHandler implements RequestHandler
         $contentRangeHeader = null;
         $contentLength = $objectInfo->size;
 
-        if ($rangeHeader !== null && $objectInfo->size > 0) {
+        if ($rangeHeader !== null) {
             $range = self::parseRangeHeader($rangeHeader, $objectInfo->size);
 
             if ($range !== null) {
@@ -125,16 +148,6 @@ final class GetObjectHandler implements RequestHandler
         }
 
         // 5. Stream body from storage — handle decryption if encrypted.
-        $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
-        $customerKey = \OpsFour\S3Server\Encryption\EncryptionRequestResolver::resolveCustomerKey(
-            $request,
-            $sseAlgo === 'SSE-C',
-            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
-        );
-        if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
-            throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
-        }
-
         [$readStorage, $storagePath] = $this->resolveReadableStorage($objectInfo);
         if ($storagePath === null || $storagePath === '') {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Object storage path missing.');
@@ -153,8 +166,9 @@ final class GetObjectHandler implements RequestHandler
                 }
 
                 // Encrypted objects: read full ciphertext, decrypt, then apply range.
-                $ciphertext = \Amp\ByteStream\buffer(
+                $ciphertext = self::bufferCiphertext(
                     $readStorage->getObjectByPath($storagePath),
+                    $objectInfo->size,
                 );
 
                 if ($sseAlgo === 'SSE-C') {
@@ -195,40 +209,55 @@ final class GetObjectHandler implements RequestHandler
                 $bufferedWorkLock->release();
             }
         } else {
-            // Non-encrypted: stream directly from storage.
-            $body = $readStorage->getObjectByPath($storagePath, $offset, $length);
-        }
-
-        // 6. Build response headers.
-        $headers = S3ResponseHeaders::build($objectInfo, $contentLength);
-
-        // Add Content-Range for partial content and strip checksums — AWS S3
-        // does not return object checksums on range responses because they were
-        // computed over the full object, not the partial content.
-        if ($isPartialContent && $contentRangeHeader !== null) {
-            $headers['Content-Range'] = $contentRangeHeader;
-            unset(
-                $headers['x-amz-checksum-crc32'],
-                $headers['x-amz-checksum-crc32c'],
-                $headers['x-amz-checksum-sha1'],
-                $headers['x-amz-checksum-sha256'],
+            // A corrupt or custom backend must not send more bytes than the
+            // Content-Length derived from committed object metadata. A short
+            // backend read must fail instead of reporting a clean response.
+            $body = new LimitedReadableStream(
+                $readStorage->getObjectByPath($storagePath, $offset, $length ?? $objectInfo->size),
+                $contentLength,
+                requireExactLength: true,
             );
         }
 
-        // 7. Apply response-* query parameter overrides (authenticated requests only).
-        //    Per S3 spec, response-* overrides require authentication (presigned URL or Authorization header).
-        $isAuthenticated = isset($queryParams['X-Amz-Signature'])
-            || isset($queryParams['Signature'])
-            || $request->getHeader('authorization') !== null;
-        if ($isAuthenticated) {
-            foreach (self::RESPONSE_HEADER_OVERRIDES as $param => $header) {
-                if (isset($queryParams[$param]) && $queryParams[$param] !== '') {
-                    $headers[$header] = $queryParams[$param];
+        try {
+            // 6. Build response headers. The versioning lookup can yield, so
+            // keep the storage stream owned until the final generation check.
+            $headers = S3ResponseHeaders::build(
+                $objectInfo,
+                $contentLength,
+                $emitNullVersion,
+                $includeChecksums && ! $isPartialContent,
+            );
+
+            // A range response never carries the checksum of the full object.
+            if ($isPartialContent && $contentRangeHeader !== null) {
+                $headers['Content-Range'] = $contentRangeHeader;
+            }
+
+            // 7. Apply response-* query parameter overrides only after the auth
+            // middleware has resolved a real identity. A bare, unsigned
+            // X-Amz-Signature query parameter must not enable overrides.
+            $headers = S3ResponseHeaders::withAuthenticatedOverrides(
+                $headers,
+                $queryParams,
+                $ownerId !== null && $ownerId !== '',
+            );
+
+            BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        } catch (\Throwable $error) {
+            if ($body instanceof \Amp\ByteStream\ReadableStream) {
+                try {
+                    $body->close();
+                } catch (\Throwable) {
+                    // Keep the generation failure as the request outcome.
                 }
             }
+            throw $error;
         }
 
         // 8. Return the response.
+        $request->setAttribute('s3.objectSize', $objectInfo->size);
+
         return new Response(
             status: $isPartialContent ? 206 : 200,
             headers: $headers,
@@ -271,9 +300,13 @@ final class GetObjectHandler implements RequestHandler
 
         // Suffix range: bytes=-N (last N bytes).
         if (str_starts_with($rangeSpec, '-')) {
-            $suffix = (int) substr($rangeSpec, 1);
+            $suffixText = substr($rangeSpec, 1);
+            if ($suffixText === '' || !ctype_digit($suffixText)) {
+                return null;
+            }
+            $suffix = (int) $suffixText;
 
-            if ($suffix <= 0) {
+            if ($suffix <= 0 || $objectSize === 0) {
                 throw new InvalidRangeException();
             }
 
@@ -297,7 +330,7 @@ final class GetObjectHandler implements RequestHandler
         $startStr = $parts[0];
         $endStr = $parts[1];
 
-        if ($startStr === '') {
+        if ($startStr === '' || !ctype_digit($startStr) || ($endStr !== '' && !ctype_digit($endStr))) {
             return null;
         }
 
@@ -328,14 +361,38 @@ final class GetObjectHandler implements RequestHandler
         return ['start' => $start, 'end' => $end];
     }
 
+    private static function bufferCiphertext(\Amp\ByteStream\ReadableStream $source, int $expectedSize): string
+    {
+        $chunks = [];
+        $readBytes = 0;
+        try {
+            while (($chunk = $source->read()) !== null) {
+                $chunkSize = strlen($chunk);
+                if ($chunkSize === 0 || $chunkSize > $expectedSize - $readBytes) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored encrypted object size does not match metadata.');
+                }
+                $chunks[] = $chunk;
+                $readBytes += $chunkSize;
+            }
+        } finally {
+            $source->close();
+        }
+
+        if ($readBytes !== $expectedSize) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored encrypted object size does not match metadata.');
+        }
+
+        return implode($chunks);
+    }
+
     /**
      * @return array{0: StorageBackend, 1: string|null}
      */
     private function resolveReadableStorage(ObjectInfo $objectInfo): array
     {
-        $registry = $this->storageTiers;
-        if ($registry === null || ! $registry->has($objectInfo->storageTier)) {
-            return [$this->storage, $objectInfo->systemMetadata['storagePath'] ?? null];
+        $registry = $this->storageTiers ?? StorageTierRegistry::single($this->storage);
+        if (! $registry->has($objectInfo->storageTier)) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Object storage tier is not configured.');
         }
 
         $tier = $registry->tier($objectInfo->storageTier);
@@ -344,7 +401,7 @@ final class GetObjectHandler implements RequestHandler
         }
 
         if ($this->hasReadableRestore($objectInfo)) {
-            return [$registry->defaultBackend(), $objectInfo->restoredStoragePath];
+            return [\OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($objectInfo, $registry)->backend, $objectInfo->restoredStoragePath];
         }
 
         throw new InvalidObjectStateException();

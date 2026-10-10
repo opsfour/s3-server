@@ -61,10 +61,11 @@ final class ObjectLockChecker
                     throw new ObjectLockedException();
                 }
 
-                if ($mode === 'GOVERNANCE') {
-                    if (! $canBypassGovernance) {
-                        throw new ObjectLockedException();
-                    }
+                // Stored metadata may predate current validation rules or be
+                // corrupted. An unknown mode must never make a retained
+                // version deletable.
+                if ($mode !== 'GOVERNANCE' || ! $canBypassGovernance) {
+                    throw new ObjectLockedException();
                 }
             }
         }

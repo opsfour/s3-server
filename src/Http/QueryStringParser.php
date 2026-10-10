@@ -11,6 +11,40 @@ namespace OpsFour\S3Server\Http;
  */
 final class QueryStringParser
 {
+    /**
+     * SigV4 sorts query pairs before signing, while S3 handlers consume the
+     * first value. Different values for one decoded name would let the same
+     * signature authorize different requests by changing only pair order.
+     */
+    /** @param list<string> $orderInsensitiveNames */
+    public static function hasConflictingValues(string $queryString, array $orderInsensitiveNames = []): bool
+    {
+        if ($queryString === '') {
+            return false;
+        }
+
+        $values = [];
+        foreach (explode('&', $queryString) as $pair) {
+            if ($pair === '') {
+                continue;
+            }
+
+            $eqPos = strpos($pair, '=');
+            $key = rawurldecode($eqPos === false ? $pair : substr($pair, 0, $eqPos));
+            $value = $eqPos === false ? '' : rawurldecode(substr($pair, $eqPos + 1));
+
+            if (array_key_exists($key, $values)) {
+                if ($values[$key] !== $value && ! in_array($key, $orderInsensitiveNames, true)) {
+                    return true;
+                }
+            } else {
+                $values[$key] = $value;
+            }
+        }
+
+        return false;
+    }
+
     /** @return array<string, string> */
     public static function parse(string $queryString): array
     {
@@ -28,7 +62,10 @@ final class QueryStringParser
             $eqPos = strpos($pair, '=');
 
             if ($eqPos === false) {
-                $params[rawurldecode($pair)] = '';
+                $key = rawurldecode($pair);
+                if (! array_key_exists($key, $params)) {
+                    $params[$key] = '';
+                }
             } else {
                 $key = rawurldecode(substr($pair, 0, $eqPos));
                 $value = rawurldecode(substr($pair, $eqPos + 1));

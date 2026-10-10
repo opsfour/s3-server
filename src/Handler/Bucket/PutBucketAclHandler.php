@@ -8,7 +8,10 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\AccessControlListNotSupportedException;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
@@ -44,21 +47,29 @@ final class PutBucketAclHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'bucket');
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
+        $grants = AclGrantResolver::fromHeaders($request, $bucketInfo->ownerId, 'bucket');
+        if ($grants !== null && $body !== '') {
+            throw new InvalidArgumentException('ACL permissions cannot be specified in both headers and the body.');
+        }
         if ($grants === null) {
             // Parse XML body.
-            $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
             $parsed = XmlRequestParser::parseAccessControlPolicy($body);
             $grants = AclGrantResolver::validateGrants($parsed['grants']);
         }
 
-        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $bucket, $grants): void {
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $ownerId, $bucket, $grants): void {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+            if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
+                throw new AccessControlListNotSupportedException();
+            }
             $pab = $this->metadata->getPublicAccessBlock($bucket);
             if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
                 throw new AccessDeniedException('The bucket policy does not allow the specified public access.');
             }
-            $this->metadata->putAcl('bucket', $bucket, $ownerId, $grants);
+            $this->metadata->putAcl('bucket', $bucket, $bucketInfo->ownerId, $grants);
         });
 
         return new Response(status: 200);

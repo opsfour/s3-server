@@ -7,6 +7,8 @@ namespace OpsFour\S3Server\Parallel;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\TaskFailureThrowable;
 use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
+use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\MasterKeyProvider;
@@ -19,11 +21,13 @@ use OpsFour\S3Server\Observability\MetricsCollector;
  * Below the size threshold, operations run inline (no IPC overhead).
  * Above the threshold, operations are submitted to a worker pool.
  */
-final class ParallelEncryptionService implements EncryptionServiceInterface
+final class ParallelEncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible
 {
     private readonly WorkerPool $pool;
 
     private readonly EncryptionService $localService;
+
+    private readonly ?string $keyringFingerprint;
 
     /**
      * @param  MasterKeyProvider|null  $masterKeyProvider  For inline (below-threshold) operations.
@@ -37,6 +41,12 @@ final class ParallelEncryptionService implements EncryptionServiceInterface
         private readonly ?MetricsCollector $metrics = null,
         private readonly string $poolName = 'encryption',
     ) {
+        // A non-matching provider must be used in this process for SSE-S3.
+        // SSE-C does not use a master key and may still offload safely.
+        $this->keyringFingerprint = $masterKeyProvider instanceof ConfigMasterKeyProvider
+            && $masterKeyProvider->matchesCurrentEnvironmentKeyring()
+                ? $masterKeyProvider->keyringFingerprint()
+                : null;
         $this->pool = new ContextWorkerPool($workerLimit);
         $this->localService = new EncryptionService($masterKeyProvider);
         $this->metrics?->registerWorkerPool($this->poolName, $workerLimit);
@@ -44,16 +54,30 @@ final class ParallelEncryptionService implements EncryptionServiceInterface
 
     public function encryptSseS3(string $plaintext): array
     {
-        if (strlen($plaintext) < $this->sizeThreshold) {
+        if ($this->keyringFingerprint === null || strlen($plaintext) < $this->sizeThreshold) {
             return $this->localService->encryptSseS3($plaintext);
         }
 
         return $this->submitTask('encryptSseS3', [$plaintext]);
     }
 
+    public function configWorkerKeyringFingerprint(): ?string
+    {
+        if ($this->keyringFingerprint === null) {
+            return null;
+        }
+        try {
+            $current = (new ConfigMasterKeyProvider())->keyringFingerprint();
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return hash_equals($this->keyringFingerprint, $current) ? $this->keyringFingerprint : null;
+    }
+
     public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string
     {
-        if (strlen($ciphertext) < $this->sizeThreshold) {
+        if ($this->keyringFingerprint === null || strlen($ciphertext) < $this->sizeThreshold) {
             return $this->localService->decryptSseS3($ciphertext, $encryptedDataKeyB64, $ivB64, $tagB64);
         }
 
@@ -66,6 +90,8 @@ final class ParallelEncryptionService implements EncryptionServiceInterface
             return $this->localService->encryptSseC($plaintext, $customerKey);
         }
 
+        // The customer key crosses local worker IPC in memory. No master key
+        // is serialized; deployment must forbid IPC logging, swap and dumps.
         return $this->submitTask('encryptSseC', [$plaintext, $customerKey]);
     }
 
@@ -91,7 +117,10 @@ final class ParallelEncryptionService implements EncryptionServiceInterface
     /** @param list<mixed> $args */
     private function submitTask(string $method, array $args): mixed
     {
-        $task = new EncryptionTask($method, $args);
+        $fingerprint = in_array($method, ['encryptSseS3', 'decryptSseS3'], true)
+            ? $this->keyringFingerprint ?? throw new \LogicException('SSE-S3 worker keyring is unavailable.')
+            : '';
+        $task = new EncryptionTask($method, $args, $fingerprint);
 
         try {
             $result = $this->pool->submit($task)->await();

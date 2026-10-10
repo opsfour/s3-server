@@ -43,9 +43,8 @@ final class AclEvaluator
 
         $requiredPermission = self::operationToPermission($operation);
         if ($requiredPermission === null) {
-            // Operations without an ACL permission are owner/policy-only.
-            // The owner bypass and explicit policy allow are handled before
-            // this evaluator is called.
+            // Operations without a simple ACL permission are either
+            // owner/policy-only or authorized separately with more context.
             return false;
         }
 
@@ -78,14 +77,13 @@ final class AclEvaluator
             S3Operation::SelectObjectContent, S3Operation::GetObjectAttributes,
             S3Operation::HeadBucket,
             S3Operation::ListObjectsV2, S3Operation::ListObjects,
-            S3Operation::ListObjectVersions => 'READ',
+            S3Operation::ListObjectVersions,
+            S3Operation::ListMultipartUploads => 'READ',
 
             S3Operation::PutObject, S3Operation::PostObject,
-            S3Operation::DeleteObject,
-            S3Operation::DeleteObjects, S3Operation::CopyObject,
+            S3Operation::CopyObject,
             S3Operation::CreateMultipartUpload, S3Operation::UploadPart,
-            S3Operation::UploadPartCopy, S3Operation::CompleteMultipartUpload,
-            S3Operation::AbortMultipartUpload => 'WRITE',
+            S3Operation::UploadPartCopy, S3Operation::CompleteMultipartUpload => 'WRITE',
 
             S3Operation::GetBucketAcl, S3Operation::GetObjectAcl => 'READ_ACP',
             S3Operation::PutBucketAcl, S3Operation::PutObjectAcl => 'WRITE_ACP',
@@ -95,6 +93,8 @@ final class AclEvaluator
             // identity/resource policy allow. Listing every case makes a newly
             // added operation fail loudly until its authorization is defined.
             S3Operation::ListBuckets,
+            S3Operation::DeleteObject, S3Operation::DeleteObjects,
+            S3Operation::AbortMultipartUpload,
             S3Operation::CreateBucket,
             S3Operation::DeleteBucket,
             S3Operation::GetBucketLocation,
@@ -119,7 +119,6 @@ final class AclEvaluator
             S3Operation::DeleteBucketEncryption,
             S3Operation::GetObjectLockConfig,
             S3Operation::PutObjectLockConfig,
-            S3Operation::ListMultipartUploads,
             S3Operation::GetBucketWebsite,
             S3Operation::PutBucketWebsite,
             S3Operation::DeleteBucketWebsite,
@@ -129,6 +128,9 @@ final class AclEvaluator
             S3Operation::GetBucketPolicyStatus,
             S3Operation::GetBucketLogging,
             S3Operation::PutBucketLogging,
+            S3Operation::GetBucketOwnershipControls,
+            S3Operation::PutBucketOwnershipControls,
+            S3Operation::DeleteBucketOwnershipControls,
             S3Operation::GetObjectTagging,
             S3Operation::PutObjectTagging,
             S3Operation::DeleteObjectTagging,

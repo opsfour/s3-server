@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Http;
 
 use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 
 /**
  * Builds the standard S3 response headers for an object.
@@ -14,8 +15,30 @@ use OpsFour\S3Server\Dto\ObjectInfo;
  */
 final class S3ResponseHeaders
 {
+    /** @var array<string, string> */
+    private const array RESPONSE_HEADER_OVERRIDES = [
+        'response-content-type' => 'Content-Type',
+        'response-content-language' => 'Content-Language',
+        'response-content-disposition' => 'Content-Disposition',
+        'response-content-encoding' => 'Content-Encoding',
+        'response-cache-control' => 'Cache-Control',
+        'response-expires' => 'Expires',
+    ];
+
+    public static function checksumModeEnabled(?string $mode): bool
+    {
+        if ($mode === null || $mode === '') {
+            return false;
+        }
+        if ($mode !== 'ENABLED') {
+            throw new InvalidArgumentException('x-amz-checksum-mode must be ENABLED.');
+        }
+
+        return true;
+    }
+
     /** @return array<non-empty-string, string> */
-    public static function build(ObjectInfo $objectInfo, int $contentLength): array
+    public static function build(ObjectInfo $objectInfo, int $contentLength, bool $includeNullVersionId = false, bool $includeChecksums = false): array
     {
         $headers = [
             'ETag' => $objectInfo->etag,
@@ -45,8 +68,8 @@ final class S3ResponseHeaders
         }
 
         // Version ID.
-        if ($objectInfo->versionId !== null) {
-            $headers['x-amz-version-id'] = $objectInfo->versionId;
+        if ($objectInfo->versionId !== null || $includeNullVersionId) {
+            $headers['x-amz-version-id'] = $objectInfo->versionId ?? 'null';
         }
 
         // Delete marker flag.
@@ -54,25 +77,34 @@ final class S3ResponseHeaders
             $headers['x-amz-delete-marker'] = 'true';
         }
 
-        if ($objectInfo->restoreStatus !== null) {
+        if (in_array($objectInfo->restoreStatus, ['pending', 'restored'], true)) {
             $headers['x-amz-restore'] = self::restoreHeader($objectInfo);
         }
 
-        // Checksum headers.
-        if (isset($objectInfo->systemMetadata['checksum-crc32']) && $objectInfo->systemMetadata['checksum-crc32'] !== '') {
+        // Object checksums are opt-in and describe only the complete object.
+        $hasFullObjectChecksum = false;
+        if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-crc32']) && $objectInfo->systemMetadata['checksum-crc32'] !== '') {
             $headers['x-amz-checksum-crc32'] = $objectInfo->systemMetadata['checksum-crc32'];
+            $hasFullObjectChecksum = true;
         }
 
-        if (isset($objectInfo->systemMetadata['checksum-crc32c']) && $objectInfo->systemMetadata['checksum-crc32c'] !== '') {
+        if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-crc32c']) && $objectInfo->systemMetadata['checksum-crc32c'] !== '') {
             $headers['x-amz-checksum-crc32c'] = $objectInfo->systemMetadata['checksum-crc32c'];
+            $hasFullObjectChecksum = true;
         }
 
-        if (isset($objectInfo->systemMetadata['checksum-sha1']) && $objectInfo->systemMetadata['checksum-sha1'] !== '') {
+        if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-sha1']) && $objectInfo->systemMetadata['checksum-sha1'] !== '') {
             $headers['x-amz-checksum-sha1'] = $objectInfo->systemMetadata['checksum-sha1'];
+            $hasFullObjectChecksum = true;
         }
 
-        if (isset($objectInfo->systemMetadata['checksum-sha256']) && $objectInfo->systemMetadata['checksum-sha256'] !== '') {
+        if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-sha256']) && $objectInfo->systemMetadata['checksum-sha256'] !== '') {
             $headers['x-amz-checksum-sha256'] = $objectInfo->systemMetadata['checksum-sha256'];
+            $hasFullObjectChecksum = true;
+        }
+
+        if ($hasFullObjectChecksum) {
+            $headers['x-amz-checksum-type'] = 'FULL_OBJECT';
         }
 
         // Encryption headers.
@@ -92,6 +124,33 @@ final class S3ResponseHeaders
                 continue;
             }
             $headers['x-amz-meta-' . $metaKey] = $metaValue;
+        }
+
+        return $headers;
+    }
+
+    /**
+     * @param array<non-empty-string, string> $headers
+     * @param array<string, string> $queryParams
+     * @return array<non-empty-string, string>
+     */
+    public static function withAuthenticatedOverrides(array $headers, array $queryParams, bool $isAuthenticated): array
+    {
+        if (! $isAuthenticated) {
+            return $headers;
+        }
+
+        foreach (self::RESPONSE_HEADER_OVERRIDES as $parameter => $header) {
+            $value = $queryParams[$parameter] ?? '';
+            if ($value === '') {
+                continue;
+            }
+
+            if (preg_match('/[\x00-\x1F\x7F]/', $value) === 1) {
+                throw new InvalidArgumentException('Invalid response header override.');
+            }
+
+            $headers[$header] = $value;
         }
 
         return $headers;

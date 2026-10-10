@@ -26,7 +26,13 @@ final class DeleteBucketLifecycleHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $this->metadata->deleteBucketLifecycle($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->deleteBucketLifecycle($bucket),
+            $request,
+        );
 
         return new Response(status: 204);
     }

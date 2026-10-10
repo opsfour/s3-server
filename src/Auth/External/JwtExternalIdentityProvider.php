@@ -15,6 +15,7 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
      * @param array<string, string|array<string, mixed>> $keys
      * @param list<string> $allowedIssuers
      * @param list<string> $allowedAudiences
+     * @param array<string, array<string, string|array<string, mixed>>> $keysByIssuer
      */
     public function __construct(
         private OidcClaimMapper $mapper,
@@ -22,13 +23,112 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
         private array $allowedIssuers = [],
         private array $allowedAudiences = [],
         private int $clockSkewSeconds = 60,
+        private array $keysByIssuer = [],
     ) {
-        if ($this->keys === []) {
-            throw new \InvalidArgumentException('At least one JWT verification key is required.');
+        if ($this->allowedIssuers === [] || $this->allowedAudiences === []) {
+            throw new \InvalidArgumentException('JWT verification requires expected issuer and audience values.');
         }
 
-        if ($this->clockSkewSeconds < 0) {
-            throw new \InvalidArgumentException('Clock skew must not be negative.');
+        foreach (array_merge($this->allowedIssuers, $this->allowedAudiences) as $value) {
+            if (! is_string($value) || trim($value) === '') {
+                throw new \InvalidArgumentException('JWT verification requires non-empty issuer and audience values.');
+            }
+        }
+
+        if ($this->multipleIssuers()) {
+            $this->mapper->assertIssuerScopedOwnerIdFits();
+            if ($this->keys !== []) {
+                throw new \InvalidArgumentException('Multi-issuer JWT verification cannot use a global key pool.');
+            }
+            foreach ($this->allowedIssuers as $issuer) {
+                if (! isset($this->keysByIssuer[$issuer]) || $this->keysByIssuer[$issuer] === []) {
+                    throw new \InvalidArgumentException("JWT verification keys are required for issuer {$issuer}.");
+                }
+            }
+            foreach ($this->keysByIssuer as $issuer => $issuerKeys) {
+                if (! in_array($issuer, $this->allowedIssuers, true) || ! is_array($issuerKeys) || $issuerKeys === []) {
+                    throw new \InvalidArgumentException('JWT issuer key sets must match the allowed issuers.');
+                }
+            }
+            $fingerprintOwners = [];
+            foreach ($this->keysByIssuer as $issuer => $issuerKeys) {
+                foreach ($this->keyFingerprints($issuerKeys, 'JWT issuer key material') as $fingerprint) {
+                    if (isset($fingerprintOwners[$fingerprint]) && $fingerprintOwners[$fingerprint] !== $issuer) {
+                        throw new \InvalidArgumentException('JWT verification key is shared by multiple issuers.');
+                    }
+                    $fingerprintOwners[$fingerprint] = $issuer;
+                }
+            }
+        } elseif ($this->keys === []) {
+            throw new \InvalidArgumentException('At least one JWT verification key is required.');
+        } else {
+            $this->keyFingerprints($this->keys, 'JWT verification key material');
+        }
+
+        if ($this->clockSkewSeconds < 0 || $this->clockSkewSeconds > 3_600) {
+            throw new \InvalidArgumentException('Clock skew must be between 0 and 3600 seconds.');
+        }
+    }
+
+    /**
+     * @param array<string, string|array<string, mixed>> $keys
+     * @return list<string>
+     */
+    private function keyFingerprints(array $keys, string $label): array
+    {
+        $fingerprints = [];
+        foreach ($keys as $keyMaterial) {
+            if (! is_string($keyMaterial) && ! is_array($keyMaterial)) {
+                throw new \InvalidArgumentException("{$label} is invalid.");
+            }
+            if (is_array($keyMaterial)) {
+                $this->assertJwkUsage($keyMaterial, $label);
+            }
+
+            try {
+                $pem = $this->keyToPem($keyMaterial);
+            } catch (ExternalIdentityAuthenticationException $exception) {
+                throw new \InvalidArgumentException("{$label} is not a valid public key.", 0, $exception);
+            }
+
+            $publicKey = @openssl_pkey_get_public($pem);
+            $details = $publicKey !== false ? openssl_pkey_get_details($publicKey) : false;
+            if (
+                ! is_array($details)
+                || ($details['type'] ?? null) !== OPENSSL_KEYTYPE_RSA
+                || ! is_int($details['bits'] ?? null)
+                || $details['bits'] < 2_048
+                || ! is_string($details['key'] ?? null)
+            ) {
+                throw new \InvalidArgumentException("{$label} must be a valid RSA public key with at least 2048 bits.");
+            }
+            $fingerprints[] = hash('sha256', $details['key']);
+        }
+
+        return $fingerprints;
+    }
+
+    /** @param array<string, mixed> $key */
+    private function assertJwkUsage(array $key, string $label): void
+    {
+        if (array_key_exists('use', $key) && $key['use'] !== 'sig') {
+            throw new \InvalidArgumentException("{$label} JWK use must be sig.");
+        }
+        if (array_key_exists('alg', $key) && $key['alg'] !== 'RS256') {
+            throw new \InvalidArgumentException("{$label} JWK alg must be RS256.");
+        }
+        if (array_key_exists('key_ops', $key)) {
+            if (! is_array($key['key_ops']) || ! array_is_list($key['key_ops'])) {
+                throw new \InvalidArgumentException("{$label} JWK key_ops must be a list containing verify.");
+            }
+            foreach ($key['key_ops'] as $operation) {
+                if (! is_string($operation)) {
+                    throw new \InvalidArgumentException("{$label} JWK key_ops must be a list containing verify.");
+                }
+            }
+            if (! in_array('verify', $key['key_ops'], true)) {
+                throw new \InvalidArgumentException("{$label} JWK key_ops must contain verify.");
+            }
         }
     }
 
@@ -42,7 +142,7 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
             throw new ExternalIdentityAuthenticationException('JWT algorithm is not supported.');
         }
 
-        $key = $this->resolveKey($header);
+        $key = $this->resolveKey($header, $claims['iss'] ?? null);
         $verified = openssl_verify($signingInput, $signature, $key, OPENSSL_ALGO_SHA256);
         if ($verified !== 1) {
             throw new ExternalIdentityAuthenticationException('JWT signature is invalid.');
@@ -50,7 +150,7 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
 
         $this->validateClaims($claims);
 
-        return $this->mapper->map($claims);
+        return $this->mapper->map($claims, scopeOwnerByIssuer: $this->multipleIssuers());
     }
 
     private function normalizeBearerToken(string $bearerToken): string
@@ -88,19 +188,30 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
     /**
      * @param array<string, mixed> $header
      */
-    private function resolveKey(array $header): string
+    private function resolveKey(array $header, mixed $claimedIssuer): string
     {
+        $keys = $this->keys;
+        if ($this->multipleIssuers()) {
+            if (! is_string($claimedIssuer) || ! in_array($claimedIssuer, $this->allowedIssuers, true)) {
+                throw new ExternalIdentityAuthenticationException('JWT issuer is not allowed.');
+            }
+            $keys = $this->keysByIssuer[$claimedIssuer];
+        }
         $kid = $header['kid'] ?? null;
-        if (is_string($kid) && isset($this->keys[$kid])) {
-            return $this->keyToPem($this->keys[$kid]);
+        if (is_string($kid) && isset($keys[$kid])) {
+            return $this->keyToPem($keys[$kid]);
         }
 
-        if (count($this->keys) === 1) {
-            $keys = $this->keys;
+        if (count($keys) === 1) {
             return $this->keyToPem(reset($keys));
         }
 
         throw new ExternalIdentityAuthenticationException('JWT key ID is unknown.');
+    }
+
+    private function multipleIssuers(): bool
+    {
+        return count(array_unique($this->allowedIssuers)) > 1;
     }
 
     /**
@@ -126,14 +237,12 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
             throw new ExternalIdentityAuthenticationException('JWT issued-at timestamp is in the future.');
         }
 
-        if ($this->allowedIssuers !== []) {
-            $issuer = $claims['iss'] ?? null;
-            if (!is_string($issuer) || !in_array($issuer, $this->allowedIssuers, true)) {
-                throw new ExternalIdentityAuthenticationException('JWT issuer is not allowed.');
-            }
+        $issuer = $claims['iss'] ?? null;
+        if (!is_string($issuer) || !in_array($issuer, $this->allowedIssuers, true)) {
+            throw new ExternalIdentityAuthenticationException('JWT issuer is not allowed.');
         }
 
-        if ($this->allowedAudiences !== [] && !$this->audienceMatches($claims['aud'] ?? null)) {
+        if (!$this->audienceMatches($claims['aud'] ?? null)) {
             throw new ExternalIdentityAuthenticationException('JWT audience is not allowed.');
         }
     }
@@ -262,16 +371,20 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
 
     private function derLength(int $length): string
     {
+        if ($length < 0) {
+            throw new \InvalidArgumentException('DER length must not be negative.');
+        }
+
         if ($length < 128) {
-            return chr($length);
+            return pack('C', $length);
         }
 
         $encoded = '';
         while ($length > 0) {
-            $encoded = chr($length & 0xff) . $encoded;
+            $encoded = pack('C', $length & 0xff) . $encoded;
             $length >>= 8;
         }
 
-        return chr(0x80 | strlen($encoded)) . $encoded;
+        return pack('C', 0x80 | strlen($encoded)) . $encoded;
     }
 }

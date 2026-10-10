@@ -12,7 +12,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
  */
 final class StorageTierRegistry
 {
-    /** @var array<string, StorageTier> */
+    /** @var array<string, StorageTier> Tier name prefixed to prevent PHP from casting numeric string keys. */
     private array $tiers = [];
 
     private string $defaultTierName;
@@ -39,7 +39,7 @@ final class StorageTierRegistry
             throw new \InvalidArgumentException('Only one storage tier can be marked as the default write tier.');
         }
 
-        $this->defaultTierName = $defaults[0]->name ?? array_key_first($this->tiers);
+        $this->defaultTierName = $defaults[0]->name ?? array_values($this->tiers)[0]->name;
     }
 
     public static function single(StorageBackend $backend, string $name = 'STANDARD'): self
@@ -61,20 +61,20 @@ final class StorageTierRegistry
 
     public function tier(string $name): StorageTier
     {
-        return $this->tiers[$name] ?? throw new \InvalidArgumentException("Unknown storage tier: {$name}");
+        return $this->tiers[self::key($name)] ?? throw new \InvalidArgumentException("Unknown storage tier: {$name}");
     }
 
     public function has(string $name): bool
     {
-        return isset($this->tiers[$name]);
+        return isset($this->tiers[self::key($name)]);
     }
 
     /**
-     * @return array<string, StorageTier>
+     * @return list<StorageTier>
      */
     public function all(): array
     {
-        return $this->tiers;
+        return array_values($this->tiers);
     }
 
     public function withObservability(MetricsCollector $metrics): self
@@ -115,10 +115,19 @@ final class StorageTierRegistry
 
     private function add(StorageTier $tier): void
     {
-        if (isset($this->tiers[$tier->name])) {
+        if (strlen($tier->name) > 64) {
+            throw new \InvalidArgumentException('Storage tier names must be at most 64 bytes.');
+        }
+        $key = self::key($tier->name);
+        if (isset($this->tiers[$key])) {
             throw new \InvalidArgumentException("Duplicate storage tier: {$tier->name}");
         }
 
-        $this->tiers[$tier->name] = $tier;
+        $this->tiers[$key] = $tier;
+    }
+
+    private static function key(string $name): string
+    {
+        return "tier\0{$name}";
     }
 }

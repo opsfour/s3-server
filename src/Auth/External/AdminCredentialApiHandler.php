@@ -16,8 +16,12 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
     public function __construct(
         private ExternalIdentityProvider $identityProvider,
         private ExternalCredentialIssuer $credentialIssuer,
-        private ?string $adminToken = null,
-    ) {}
+        private string $adminToken,
+    ) {
+        if ($adminToken === '') {
+            throw new \InvalidArgumentException('External IAM admin API requires a non-empty admin token.');
+        }
+    }
 
     public function handleRequest(Request $request): Response
     {
@@ -74,16 +78,16 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
             return $this->json(['error' => 'not_found'], 404);
         }
 
-        return new Response(status: 204);
+        return new Response(status: 204, headers: ['cache-control' => 'no-store']);
     }
 
     private function isAuthorized(Request $request): bool
     {
-        if ($this->adminToken === null || $this->adminToken === '') {
-            return true;
+        $headers = $request->getHeaderArray('authorization');
+        if (count($headers) !== 1) {
+            return false;
         }
-
-        $authorization = $request->getHeader('authorization') ?? '';
+        $authorization = $headers[0];
         if (!str_starts_with(strtolower($authorization), 'bearer ')) {
             return false;
         }
@@ -148,7 +152,7 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
     {
         return new Response(
             status: $status,
-            headers: ['content-type' => 'application/json'] + $headers,
+            headers: ['content-type' => 'application/json', 'cache-control' => 'no-store'] + $headers,
             body: json_encode($payload, JSON_THROW_ON_ERROR),
         );
     }

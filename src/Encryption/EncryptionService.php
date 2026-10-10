@@ -17,7 +17,7 @@ namespace OpsFour\S3Server\Encryption;
  *
  * For SSE-C: uses the customer-provided key directly.
  */
-final class EncryptionService implements EncryptionServiceInterface
+final class EncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible
 {
     private const string CIPHER = 'aes-256-gcm';
     private const int IV_LENGTH = 12; // GCM standard
@@ -29,6 +29,14 @@ final class EncryptionService implements EncryptionServiceInterface
     public function __construct(
         private readonly ?MasterKeyProvider $masterKeyProvider = null,
     ) {}
+
+    public function configWorkerKeyringFingerprint(): ?string
+    {
+        return $this->masterKeyProvider instanceof ConfigMasterKeyProvider
+            && $this->masterKeyProvider->matchesCurrentEnvironmentKeyring()
+                ? $this->masterKeyProvider->keyringFingerprint()
+                : null;
+    }
 
     /**
      * Encrypt data using SSE-S3 (server-managed key).
@@ -61,8 +69,17 @@ final class EncryptionService implements EncryptionServiceInterface
             throw new \RuntimeException('Encryption failed.');
         }
 
-        // Encrypt the data key with master key.
-        $masterKey = $this->masterKeyProvider->getMasterKey();
+        // Resolve the key by the ID that will be stored in the blob. An active
+        // key change between two independent provider calls must not label a
+        // data key with a different master key than the one that encrypted it.
+        $keyId = $this->masterKeyProvider->getKeyId();
+        if ($keyId === '' || strlen($keyId) > 255) {
+            throw new \RuntimeException('Master key ID must contain between 1 and 255 bytes.');
+        }
+        $masterKey = $this->masterKeyProvider->getMasterKeyById($keyId);
+        if (strlen($masterKey) !== 32) {
+            throw new \RuntimeException('Master key must be exactly 32 bytes.');
+        }
         $dkIv = random_bytes(self::IV_LENGTH);
         $dkTag = '';
 
@@ -82,7 +99,6 @@ final class EncryptionService implements EncryptionServiceInterface
         }
 
         // Build V1 blob with key ID for key rotation support.
-        $keyId = $this->masterKeyProvider->getKeyId();
         $keyIdBytes = $keyId;
         $blob = chr(0x01) . pack('v', strlen($keyIdBytes)) . $keyIdBytes . $dkIv . $dkTag . $encryptedDataKey;
 
@@ -109,6 +125,7 @@ final class EncryptionService implements EncryptionServiceInterface
         }
 
         // Detect blob format and extract master key + remainder.
+        $legacyFormat = false;
         if (strlen($raw) > self::LEGACY_BLOB_SIZE && ord($raw[0]) === 0x01) {
             // V1 format: extract key ID to resolve the correct master key.
             /** @var array{1: int}|false $unpacked */
@@ -124,14 +141,20 @@ final class EncryptionService implements EncryptionServiceInterface
             $remainder = substr($raw, 3 + $keyIdLen);
             $masterKey = $this->masterKeyProvider->getMasterKeyById($keyId);
         } else {
-            // Legacy format: use active master key.
+            // Legacy blobs have no key ID. Try the active key first for
+            // existing installations, then the historical "default" key that
+            // single-key installations retain during rotation.
+            $legacyFormat = true;
             $remainder = $raw;
             $masterKey = $this->masterKeyProvider->getMasterKey();
         }
+        if (strlen($masterKey) !== 32) {
+            throw new \RuntimeException('Master key must be exactly 32 bytes.');
+        }
 
-        // Parse remainder: IV(12) + Tag(16) + EncDK(32+).
-        if (strlen($remainder) < self::IV_LENGTH + self::TAG_LENGTH + 1) {
-            throw new \RuntimeException('Invalid encrypted data key: remainder too short.');
+        // AES-GCM preserves the 32-byte data-key length.
+        if (strlen($remainder) !== self::IV_LENGTH + self::TAG_LENGTH + 32) {
+            throw new \RuntimeException('Invalid encrypted data key length.');
         }
 
         $dkIv = substr($remainder, 0, self::IV_LENGTH);
@@ -147,8 +170,32 @@ final class EncryptionService implements EncryptionServiceInterface
             $dkTag,
         );
 
+        if ($dataKey === false && $legacyFormat) {
+            try {
+                $historicalKey = $this->masterKeyProvider->getMasterKeyById('default');
+            } catch (\RuntimeException) {
+                $historicalKey = null;
+            }
+            if ($historicalKey !== null && $historicalKey !== $masterKey) {
+                if (strlen($historicalKey) !== 32) {
+                    throw new \RuntimeException('Master key must be exactly 32 bytes.');
+                }
+                $dataKey = openssl_decrypt(
+                    $dkCiphertext,
+                    self::CIPHER,
+                    $historicalKey,
+                    OPENSSL_RAW_DATA,
+                    $dkIv,
+                    $dkTag,
+                );
+            }
+        }
+
         if ($dataKey === false) {
             throw new \RuntimeException('Data key decryption failed.');
+        }
+        if (strlen($dataKey) !== 32) {
+            throw new \RuntimeException('Decrypted data key must be exactly 32 bytes.');
         }
 
         // Decrypt the data.
@@ -187,6 +234,10 @@ final class EncryptionService implements EncryptionServiceInterface
      */
     public function encryptSseC(string $plaintext, string $customerKey): array
     {
+        if (strlen($customerKey) !== 32) {
+            throw new \InvalidArgumentException('SSE-C key must be exactly 32 bytes.');
+        }
+
         $iv = random_bytes(self::IV_LENGTH);
         $tag = '';
 
@@ -217,6 +268,10 @@ final class EncryptionService implements EncryptionServiceInterface
      */
     public function decryptSseC(string $ciphertext, string $customerKey, string $ivB64, string $tagB64): string
     {
+        if (strlen($customerKey) !== 32) {
+            throw new \InvalidArgumentException('SSE-C key must be exactly 32 bytes.');
+        }
+
         $iv = base64_decode($ivB64, true);
         $tag = base64_decode($tagB64, true);
 

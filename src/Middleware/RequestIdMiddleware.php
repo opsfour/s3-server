@@ -34,12 +34,28 @@ final class RequestIdMiddleware implements Middleware
         $amzId2 = base64_encode(substr($randomBytes, 16, 36));
 
         $request->setAttribute('requestId', $requestId);
+        $request->setAttribute('amzId2', $amzId2);
 
         $response = $requestHandler->handleRequest($request);
 
         $response->setHeader('x-amz-request-id', $requestId);
         $response->setHeader('x-amz-id-2', $amzId2);
         $response->setHeader('Server', 'AmazonS3');
+
+        // Amp's HTTP/1 writer does not special-case bodyless statuses. An
+        // absent length on a persistent 204/304 response makes it append a
+        // chunk terminator, which a client can parse as the next status line.
+        // Content-Length is also forbidden on 204 by RFC 9110. Closing only
+        // HTTP/1 connections gives these responses unambiguous framing;
+        // HTTP/2 forbids the hop-by-hop Connection header.
+        if (in_array($response->getStatus(), [204, 304], true)) {
+            $response->setBody('');
+            $response->removeHeader('Content-Length');
+            $response->removeHeader('Transfer-Encoding');
+            if (str_starts_with($request->getProtocolVersion(), '1.')) {
+                $response->setHeader('Connection', 'close');
+            }
+        }
 
         return $response;
     }

@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Laravel;
 
 use Illuminate\Console\Command;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\QuotaConfig;
 
 /**
@@ -31,11 +32,7 @@ final class S3QuotaCommand extends Command
 
     private const array VALID_ACTIONS = ['set', 'show', 'list', 'delete'];
 
-    public function __construct(
-        private readonly MetadataStore $metadata,
-    ) {
-        parent::__construct();
-    }
+    private MetadataStore $metadata;
 
     public function handle(): int
     {
@@ -47,12 +44,20 @@ final class S3QuotaCommand extends Command
             return self::FAILURE;
         }
 
-        return match ($action) {
-            'set' => $this->handleSet(),
-            'show' => $this->handleShow(),
-            'list' => $this->handleList(),
-            'delete' => $this->handleDelete(),
-        };
+        try {
+            $this->metadata = app(MetadataStore::class);
+
+            return match ($action) {
+                'set' => $this->handleSet(),
+                'show' => $this->handleShow(),
+                'list' => $this->handleList(),
+                'delete' => $this->handleDelete(),
+            };
+        } catch (\Throwable $e) {
+            $this->error(sprintf('S3 quota operation failed (%s).', $e::class));
+
+            return self::FAILURE;
+        }
     }
 
     private function handleSet(): int
@@ -79,7 +84,7 @@ final class S3QuotaCommand extends Command
             return self::FAILURE;
         }
 
-        $this->metadata->putAccountQuota($ownerId, $quota);
+        AccountQuotaWriter::put($this->metadata, $ownerId, $quota);
         $this->info("Quota saved for owner {$ownerId}.");
         $this->renderQuota($ownerId, $quota);
 
@@ -139,7 +144,7 @@ final class S3QuotaCommand extends Command
             return self::FAILURE;
         }
 
-        $this->metadata->deleteAccountQuota($ownerId);
+        AccountQuotaWriter::delete($this->metadata, $ownerId);
         $this->info("Quota deleted for owner {$ownerId}.");
 
         return self::SUCCESS;

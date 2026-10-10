@@ -38,7 +38,13 @@ final class PutBucketCorsHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $rules = XmlRequestParser::parseCorsConfiguration($body);
 
-        $this->metadata->putBucketCors($bucket, $rules);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->putBucketCors($bucket, $rules),
+            $request,
+        );
 
         return new Response(status: 200);
     }

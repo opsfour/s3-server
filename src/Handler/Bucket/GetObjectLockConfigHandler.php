@@ -16,7 +16,7 @@ use OpsFour\S3Server\Xml\XmlResponseBuilder;
  * Handles GetObjectLockConfiguration (GET /{bucket}?object-lock).
  *
  * Returns the Object Lock configuration for the bucket.
- * If no configuration exists, returns a default disabled config.
+ * If Object Lock was never enabled, returns ObjectLockConfigurationNotFoundError.
  */
 final class GetObjectLockConfigHandler implements RequestHandler
 {
@@ -37,6 +37,7 @@ final class GetObjectLockConfigHandler implements RequestHandler
         }
 
         $config = $this->metadata->getObjectLockConfig($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // If no config exists, Object Lock was never enabled for this bucket.
         if ($config === null) {

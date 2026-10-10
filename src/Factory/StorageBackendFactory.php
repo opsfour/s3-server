@@ -12,7 +12,9 @@ use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
+use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -23,7 +25,7 @@ final class StorageBackendFactory
 {
     /**
      * @param  string  $driver  One of: filesystem, flysystem, memory.
-     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, worker_pool_size?: int, pool_name?: string} $config
+     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
      */
     public static function create(
         string $driver,
@@ -46,11 +48,19 @@ final class StorageBackendFactory
     }
 
     /**
-     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, worker_pool_size?: int, pool_name?: string} $config
+     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
      */
     private static function createFlysystem(array $config, ?MetricsCollector $metrics): StorageBackend
     {
         $tempDir = $config['temp_dir'] ?? sys_get_temp_dir();
+        $tempBudgetBytes = filter_var(
+            $config['temp_budget_bytes'] ?? 10_737_418_240,
+            FILTER_VALIDATE_INT,
+            ['options' => ['min_range' => 1]],
+        );
+        if ($tempBudgetBytes === false) {
+            throw new \InvalidArgumentException('Flysystem temp_budget_bytes must be a positive decimal integer.');
+        }
         $workerPoolSize = (int) ($config['worker_pool_size'] ?? 0);
         if ($workerPoolSize > 0) {
             return new ParallelFlysystemBackend(
@@ -61,6 +71,8 @@ final class StorageBackendFactory
                 $workerPoolSize,
                 $metrics,
                 poolName: (string) ($config['pool_name'] ?? 'flysystem'),
+                tempBudgetBytes: $tempBudgetBytes,
+                firstByteTimeoutSeconds: (int) ($config['read_first_byte_timeout_seconds'] ?? 20),
             );
         }
 
@@ -70,6 +82,7 @@ final class StorageBackendFactory
                 . 'Register it in your service provider: $this->app->when(StorageBackendFactory::class)->give(["filesystem" => $operator]);',
             ),
             $tempDir,
+            new StorageTempBudgetCoordinator($tempDir, $tempBudgetBytes),
         );
     }
 
@@ -83,30 +96,58 @@ final class StorageBackendFactory
         $tiers = $storageConfig['tiers'] ?? null;
         if (is_array($tiers) && $tiers !== []) {
             $configured = [];
-            foreach ($tiers as $name => $tierConfig) {
-                if (!is_array($tierConfig)) {
-                    throw new \InvalidArgumentException("Storage tier {$name} must be configured as an array.");
+            $created = [];
+            try {
+                foreach ($tiers as $name => $tierConfig) {
+                    if (!is_array($tierConfig)) {
+                        throw new \InvalidArgumentException("Storage tier {$name} must be configured as an array.");
+                    }
+
+                    $tierName = is_string($name) ? $name : (string) ($tierConfig['name'] ?? '');
+                    $driver = (string) ($tierConfig['driver'] ?? $storageConfig['driver'] ?? 'filesystem');
+                    $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
+                    $tierConfig['temp_budget_bytes'] ??= $storageConfig['temp_budget_bytes'] ?? 10_737_418_240;
+                    $tierConfig['read_first_byte_timeout_seconds'] ??= $storageConfig['read_first_byte_timeout_seconds'] ?? 20;
+                    $backend = self::create($driver, $tierConfig, $metrics, "{$driver}:{$tierName}");
+                    $created[] = $backend;
+                    $configured[] = new StorageTier(
+                        name: $tierName,
+                        backend: $backend,
+                        restoreRequired: (bool) ($tierConfig['restore_required'] ?? false),
+                        defaultWriteTier: (bool) ($tierConfig['default'] ?? false),
+                    );
                 }
 
-                $tierName = is_string($name) ? $name : (string) ($tierConfig['name'] ?? '');
-                $driver = (string) ($tierConfig['driver'] ?? $storageConfig['driver'] ?? 'filesystem');
-                $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
-                $configured[] = new StorageTier(
-                    name: $tierName,
-                    backend: self::create($driver, $tierConfig, $metrics, "{$driver}:{$tierName}"),
-                    restoreRequired: (bool) ($tierConfig['restore_required'] ?? false),
-                    defaultWriteTier: (bool) ($tierConfig['default'] ?? false),
-                );
+                return new StorageTierRegistry($configured);
+            } catch (\Throwable $error) {
+                foreach (array_reverse($created) as $backend) {
+                    if ($backend instanceof ShutdownAwareStorageBackend) {
+                        try {
+                            $backend->shutdown();
+                        } catch (\Throwable) {
+                        }
+                    }
+                }
+                throw $error;
             }
-
-            return new StorageTierRegistry($configured);
         }
 
         $driver = (string) ($storageConfig['driver'] ?? 'filesystem');
+        $backend = self::create($driver, $storageConfig, $metrics);
 
-        return StorageTierRegistry::single(
-            self::create($driver, $storageConfig, $metrics),
-            (string) ($storageConfig['tier'] ?? 'STANDARD'),
-        );
+        try {
+            return StorageTierRegistry::single(
+                $backend,
+                (string) ($storageConfig['tier'] ?? 'STANDARD'),
+            );
+        } catch (\Throwable $error) {
+            if ($backend instanceof ShutdownAwareStorageBackend) {
+                try {
+                    $backend->shutdown();
+                } catch (\Throwable) {
+                }
+            }
+            throw $error;
+        }
     }
 }

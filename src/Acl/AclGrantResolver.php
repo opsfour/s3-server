@@ -143,6 +143,24 @@ final class AclGrantResolver
         return false;
     }
 
+    /**
+     * Public Access Block masks public grants without changing the stored ACL.
+     *
+     * @param list<array{granteeType: string, granteeId: string, permission: string}> $grants
+     * @return list<array{granteeType: string, granteeId: string, permission: string}>
+     */
+    public static function effectiveGrants(array $grants, bool $ignorePublicAcls): array
+    {
+        if (! $ignorePublicAcls) {
+            return $grants;
+        }
+
+        return array_values(array_filter($grants, static fn(array $grant): bool => ! (
+            $grant['granteeType'] === 'Group'
+            && in_array($grant['granteeId'], [self::ALL_USERS_URI, self::AUTHENTICATED_USERS_URI], true)
+        )));
+    }
+
     private static function hasGrantHeaders(Request $request): bool
     {
         foreach (array_keys(self::GRANT_HEADERS) as $header) {

@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -38,9 +39,9 @@ final class ListObjectsHandler implements RequestHandler
 
         $prefix = $queryParams['prefix'] ?? null;
         $delimiter = $queryParams['delimiter'] ?? null;
-        $maxKeys = isset($queryParams['max-keys']) ? max(0, min((int) $queryParams['max-keys'], 1000)) : 1000;
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
         $marker = $queryParams['marker'] ?? null;
-        $encodingType = $queryParams['encoding-type'] ?? null;
+        $encodingType = ListingQuery::encodingType($queryParams);
 
         // V1 uses marker as startAfter.
         $result = $this->metadata->listObjects(
@@ -50,11 +51,12 @@ final class ListObjectsHandler implements RequestHandler
             maxKeys: $maxKeys,
             startAfter: $marker,
         );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Determine nextMarker: take the lexicographically greatest of the last
         // object key and the last common prefix so pagination doesn't skip entries.
         $nextMarker = null;
-        if ($result->isTruncated) {
+        if ($result->isTruncated && $delimiter !== null) {
             $lastKey = count($result->objects) > 0
                 ? $result->objects[count($result->objects) - 1]->key
                 : null;
@@ -63,7 +65,7 @@ final class ListObjectsHandler implements RequestHandler
                 : null;
 
             if ($lastKey !== null && $lastPrefix !== null) {
-                $nextMarker = $lastKey > $lastPrefix ? $lastKey : $lastPrefix;
+                $nextMarker = strcmp($lastKey, $lastPrefix) > 0 ? $lastKey : $lastPrefix;
             } else {
                 $nextMarker = $lastKey ?? $lastPrefix;
             }

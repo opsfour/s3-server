@@ -20,6 +20,7 @@ final readonly class S3Event
         public \DateTimeImmutable $occurredAt = new \DateTimeImmutable('now', new \DateTimeZone('UTC')),
         /** @var array<string, mixed> */
         public array $attributes = [],
+        public string $bucketGeneration = '',
     ) {}
 
     /**
@@ -37,6 +38,23 @@ final readonly class S3Event
             'region' => $this->region,
             'occurredAt' => $this->occurredAt->format('Y-m-d\TH:i:s.u\Z'),
             'attributes' => $this->attributes,
+            'bucketGeneration' => $this->bucketGeneration,
         ];
+    }
+
+    public function withVersionId(string $versionId): self
+    {
+        return new self(
+            name: $this->name,
+            bucket: $this->bucket,
+            key: $this->key,
+            size: $this->size,
+            etag: $this->etag,
+            ownerId: $this->ownerId,
+            region: $this->region,
+            occurredAt: $this->occurredAt,
+            attributes: [...$this->attributes, 'versionId' => $versionId],
+            bucketGeneration: $this->bucketGeneration,
+        );
     }
 }

@@ -35,6 +35,7 @@ final class GetBucketVersioningHandler implements RequestHandler
         }
 
         $status = $this->metadata->getBucketVersioning($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         $xml = XmlResponseBuilder::versioningConfiguration($status);
 
         return new Response(

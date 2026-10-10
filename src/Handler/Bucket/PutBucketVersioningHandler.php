@@ -41,12 +41,18 @@ final class PutBucketVersioningHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = XmlRequestParser::parseVersioningConfiguration($body);
 
+        if (isset($config['mfaDelete'])) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('MFA Delete configuration is not supported.');
+        }
+
         if ($config['status'] !== '') {
             if (!in_array($config['status'], ['Enabled', 'Suspended'], true)) {
                 throw new MalformedXmlException('Invalid versioning status. Must be "Enabled" or "Suspended".');
             }
-            $this->metadata->transaction(function () use ($bucketInfo, $bucket, $ownerId, $config): void {
+            $this->metadata->transaction(function () use ($request, $bucketInfo, $bucket, $ownerId, $config): void {
                 OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
                 if ($config['status'] === 'Suspended' && $this->metadata->getObjectLockConfig($bucket) !== null) {
                     throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                         'Versioning cannot be suspended while Object Lock is enabled.',

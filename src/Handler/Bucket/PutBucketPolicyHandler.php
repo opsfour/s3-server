@@ -39,7 +39,7 @@ final class PutBucketPolicyHandler implements RequestHandler
         }
 
         // Read raw JSON body.
-        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 131_072);
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 20_480);
 
         if (trim($body) === '') {
             throw new MalformedXmlException('Request body is empty.');
@@ -47,8 +47,10 @@ final class PutBucketPolicyHandler implements RequestHandler
 
         PolicyDocumentValidator::validateBucketPolicy($body);
 
-        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $bucket, $body): void {
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $ownerId, $bucket, $body): void {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $pab = $this->metadata->getPublicAccessBlock($bucket);
             if ($pab !== null && $pab['blockPublicPolicy'] && PolicyEvaluator::isPublicPolicy($body)) {
                 throw new AccessDeniedException('The bucket policy does not allow the specified public access.');

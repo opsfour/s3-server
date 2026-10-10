@@ -37,6 +37,7 @@ final class GetBucketCorsHandler implements RequestHandler
         }
 
         $rules = $this->metadata->getBucketCors($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         if ($rules === []) {
             throw new NoSuchCORSConfigurationException();

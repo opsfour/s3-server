@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 15;
+    public const int VERSION = 41;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -39,12 +39,20 @@ final class PostgresSchema
                 name TEXT PRIMARY KEY,
                 owner_id TEXT NOT NULL,
                 region TEXT NOT NULL DEFAULT 'us-east-1',
+                generation TEXT NOT NULL DEFAULT '',
                 versioning TEXT NOT NULL DEFAULT '',
                 object_lock_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
             'CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner ON s3_buckets(owner_id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner_name ON s3_buckets(owner_id, name)',
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (
+                bucket TEXT PRIMARY KEY,
+                object_ownership TEXT NOT NULL
+            )
+            SQL,
 
             // Account quotas
             <<<'SQL'
@@ -127,8 +135,12 @@ final class PostgresSchema
                 target_tier TEXT NOT NULL,
                 target_storage_class TEXT NOT NULL,
                 source_storage_path TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'legacy',
+                lifecycle_rule_id TEXT,
+                expected_is_latest SMALLINT,
                 target_storage_path TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -152,6 +164,7 @@ final class PostgresSchema
                 restored_storage_path TEXT,
                 restore_days INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -186,6 +199,7 @@ final class PostgresSchema
                 transition_error TEXT,
                 restore_status TEXT,
                 restored_storage_path TEXT,
+                restored_storage_tier TEXT,
                 restore_expires_at TIMESTAMPTZ,
                 storage_path TEXT NOT NULL,
                 user_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -194,6 +208,7 @@ final class PostgresSchema
                 checksum_sha1 TEXT,
                 checksum_sha256 TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                noncurrent_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(bucket, key_name, version_id)
             )
@@ -201,21 +216,32 @@ final class PostgresSchema
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_key ON s3_objects(bucket, key_name)',
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_latest ON s3_objects(bucket, is_latest, is_delete_marker)',
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_bucket_prefix ON s3_objects(bucket, key_name, is_latest, is_delete_marker)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_latest_listing_c ON s3_objects(bucket, key_name COLLATE "C") WHERE is_latest = TRUE AND is_delete_marker = FALSE',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_versions_listing_c ON s3_objects(bucket, key_name COLLATE "C", is_latest DESC, created_at DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_lifecycle_listing_c ON s3_objects(bucket, key_name COLLATE "C", version_id COLLATE "C")',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_owner ON s3_objects(owner_id, is_delete_marker)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at)',
 
             // Multipart uploads
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_multipart_uploads (
                 upload_id TEXT PRIMARY KEY,
                 bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL DEFAULT '',
                 key_name TEXT NOT NULL,
                 owner_id TEXT NOT NULL,
+                storage_tier TEXT,
                 content_type TEXT DEFAULT 'application/octet-stream',
                 user_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
             'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_bucket ON s3_multipart_uploads(bucket)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_owner ON s3_multipart_uploads(owner_id)',
             'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_bucket_key ON s3_multipart_uploads(bucket, key_name)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_listing_c ON s3_multipart_uploads(bucket, key_name COLLATE "C", upload_id COLLATE "C")',
 
             // Parts
             <<<'SQL'
@@ -226,6 +252,8 @@ final class PostgresSchema
                 etag TEXT NOT NULL,
                 size BIGINT NOT NULL,
                 storage_path TEXT NOT NULL,
+                checksum_algorithm TEXT,
+                checksum_value TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(upload_id, part_number)
             )
@@ -279,11 +307,12 @@ final class PostgresSchema
                 id BIGSERIAL PRIMARY KEY,
                 bucket TEXT NOT NULL,
                 rule_order INTEGER NOT NULL DEFAULT 0,
+                rule_id TEXT,
                 allowed_origins JSONB NOT NULL DEFAULT '[]'::jsonb,
                 allowed_methods JSONB NOT NULL DEFAULT '[]'::jsonb,
                 allowed_headers JSONB NOT NULL DEFAULT '[]'::jsonb,
                 expose_headers JSONB NOT NULL DEFAULT '[]'::jsonb,
-                max_age_seconds INTEGER NOT NULL DEFAULT 0,
+                max_age_seconds INTEGER NOT NULL DEFAULT -1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
@@ -298,7 +327,12 @@ final class PostgresSchema
                 kms_master_key_id TEXT,
                 bucket_key_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                    sse_algorithm COLLATE "C" = 'AES256'
+                    AND kms_master_key_id IS NULL
+                    AND bucket_key_enabled = FALSE
+                )
             )
             SQL,
 
@@ -444,6 +478,7 @@ final class PostgresSchema
                 destination_url TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -461,6 +496,12 @@ final class PostgresSchema
                 bucket TEXT NOT NULL,
                 storage_tier TEXT NOT NULL,
                 storage_path TEXT NOT NULL,
+                operation TEXT NOT NULL DEFAULT 'delete_path',
+                key_name TEXT,
+                upload_id TEXT,
+                owner_id TEXT,
+                lease_generation BIGINT NOT NULL DEFAULT 0,
+                dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -469,7 +510,59 @@ final class PostgresSchema
             )
             SQL,
             'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_status ON s3_storage_garbage(status, next_attempt_at)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_operation_owner ON s3_storage_garbage(operation, owner_id)',
+            "CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_recursive_unsafe ON s3_storage_garbage(storage_tier, operation) WHERE CASE WHEN operation IN ('delete_path', 'part_write_intent') THEN 0 ELSE 1 END = 1",
 
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_write_intents (
+                attempt_id TEXT PRIMARY KEY,
+                upload_id TEXT NOT NULL,
+                active_upload_id TEXT UNIQUE,
+                bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                assembly_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                part_digest TEXT NOT NULL,
+                sse_mode TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                lease_until DOUBLE PRECISION NOT NULL,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                claim_generation BIGINT NOT NULL DEFAULT 0,
+                dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL,
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_due ON s3_multipart_write_intents(state, next_attempt_at)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_upload ON s3_multipart_write_intents(upload_id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_tier ON s3_multipart_write_intents(storage_tier)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_owner ON s3_multipart_write_intents(owner_id)',
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_write_intents (
+                attempt_id TEXT PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                path_digest TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                lease_until DOUBLE PRECISION NOT NULL,
+                claim_generation BIGINT NOT NULL DEFAULT 0,
+                dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(storage_tier, path_digest)
+            )
+            SQL,
+            'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner ON s3_object_write_intents(owner_id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_due ON s3_object_write_intents(state, lease_until)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_tier ON s3_object_write_intents(storage_tier)',
+
+            ...self::completionCapacityStatements(),
+            ...self::writeIntentCapacityStatements(),
         ];
     }
 
@@ -662,6 +755,297 @@ final class PostgresSchema
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_status ON s3_storage_garbage(status, next_attempt_at)';
         }
 
+        if ($fromVersion < 16) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_owner ON s3_objects(owner_id, is_delete_marker)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_owner ON s3_multipart_uploads(owner_id)';
+        }
+
+        if ($fromVersion < 17) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner_name ON s3_buckets(owner_id, name)';
+        }
+
+        if ($fromVersion < 18) {
+            $statements[] = 'CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (bucket TEXT PRIMARY KEY, object_ownership TEXT NOT NULL)';
+        }
+
+        if ($fromVersion < 19) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier)';
+        }
+
+        if ($fromVersion < 20) {
+            $statements[] = "ALTER TABLE s3_buckets ADD COLUMN IF NOT EXISTS generation TEXT NOT NULL DEFAULT ''";
+            $statements[] = "UPDATE s3_buckets SET generation = md5(name || random()::text || clock_timestamp()::text) WHERE generation = ''";
+        }
+
+        if ($fromVersion < 21) {
+            $statements[] = "ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'delete_path'";
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS key_name TEXT';
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS upload_id TEXT';
+        }
+
+        if ($fromVersion < 22) {
+            $statements[] = "ALTER TABLE s3_tier_transition_jobs ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'legacy'";
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs ADD COLUMN IF NOT EXISTS lifecycle_rule_id TEXT';
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs ADD COLUMN IF NOT EXISTS expected_is_latest SMALLINT';
+        }
+
+        if ($fromVersion < 23) {
+            $statements[] = "ALTER TABLE s3_multipart_uploads ADD COLUMN IF NOT EXISTS bucket_generation TEXT NOT NULL DEFAULT ''";
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_write_intents (
+                attempt_id TEXT PRIMARY KEY,
+                upload_id TEXT NOT NULL,
+                active_upload_id TEXT UNIQUE,
+                bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                assembly_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                part_digest TEXT NOT NULL,
+                sse_mode TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                lease_until DOUBLE PRECISION NOT NULL,
+                next_attempt_at DOUBLE PRECISION NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL;
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_due ON s3_multipart_write_intents(state, next_attempt_at)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_upload ON s3_multipart_write_intents(upload_id)';
+        }
+
+        if ($fromVersion < 24) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_tier ON s3_multipart_write_intents(storage_tier)';
+        }
+
+        if ($fromVersion < 25) {
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS owner_id TEXT';
+            $statements[] = <<<'SQL'
+                UPDATE s3_storage_garbage AS garbage
+                SET owner_id = upload.owner_id
+                FROM s3_multipart_uploads AS upload
+                WHERE garbage.operation = 'part_write_intent'
+                  AND garbage.owner_id IS NULL
+                  AND garbage.upload_id = upload.upload_id
+                  AND garbage.bucket = upload.bucket
+                  AND substring(garbage.storage_path from char_length(garbage.storage_path) - 64 for 32) = upload.bucket_generation
+                SQL;
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_operation_owner ON s3_storage_garbage(operation, owner_id)';
+        }
+
+        if ($fromVersion < 26) {
+            foreach (['s3_storage_garbage', 's3_tier_transition_jobs', 's3_restore_jobs', 's3_notification_queue'] as $table) {
+                $statements[] = "ALTER TABLE {$table} ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0";
+            }
+        }
+
+        if ($fromVersion < 27) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_owner ON s3_multipart_write_intents(owner_id)';
+        }
+
+        if ($fromVersion < 28) {
+            $statements[] = <<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_object_write_intents (
+                    attempt_id TEXT PRIMARY KEY,
+                    bucket TEXT NOT NULL,
+                    bucket_generation TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    storage_tier TEXT NOT NULL,
+                    storage_path TEXT NOT NULL,
+                    path_digest TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    lease_until DOUBLE PRECISION NOT NULL,
+                    claim_generation BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(storage_tier, path_digest)
+                )
+                SQL;
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner ON s3_object_write_intents(owner_id)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_due ON s3_object_write_intents(state, lease_until)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_tier ON s3_object_write_intents(storage_tier)';
+        }
+
+        if ($fromVersion < 29) {
+            // Build bytewise keyset indexes before a v29 API node serves listings.
+            // These statements run outside an explicit transaction, but regular
+            // CREATE INDEX intentionally keeps retries free of invalid indexes.
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_latest_listing_c ON s3_objects(bucket, key_name COLLATE "C") WHERE is_latest = TRUE AND is_delete_marker = FALSE';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_versions_listing_c ON s3_objects(bucket, key_name COLLATE "C", is_latest DESC, created_at DESC, id DESC)';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_lifecycle_listing_c ON s3_objects(bucket, key_name COLLATE "C", version_id COLLATE "C")';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_listing_c ON s3_multipart_uploads(bucket, key_name COLLATE "C", upload_id COLLATE "C")';
+        }
+
+        if ($fromVersion < 30) {
+            $statements[] = "ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS dispatch_id TEXT DEFAULT '00000000000000000000000000000000'";
+        }
+        if ($fromVersion < 31) {
+            $statements[] = 'ALTER TABLE s3_multipart_uploads ADD COLUMN IF NOT EXISTS storage_tier TEXT';
+        }
+        if ($fromVersion < 32) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS restored_storage_tier TEXT';
+        }
+        if ($fromVersion < 33) {
+            $statements[] = 'ALTER TABLE s3_multipart_write_intents ADD COLUMN IF NOT EXISTS claim_generation BIGINT NOT NULL DEFAULT 0';
+        }
+        if ($fromVersion < 34) {
+            $statements[] = "ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS dispatch_id TEXT DEFAULT '00000000000000000000000000000000'";
+            $statements[] = "ALTER TABLE s3_multipart_write_intents ADD COLUMN IF NOT EXISTS dispatch_id TEXT DEFAULT '00000000000000000000000000000000'";
+        }
+        if ($fromVersion < 35) {
+            array_push($statements, ...self::completionCapacityStatements());
+        }
+        if ($fromVersion < 36) {
+            array_push($statements, ...self::writeIntentCapacityStatements());
+        }
+        if ($fromVersion < 37) {
+            $statements[] = <<<'SQL'
+                DO $$
+                BEGIN
+                    -- One transactional table lock makes a retry or concurrent
+                    -- migrator replace the exact named invariant atomically.
+                    LOCK TABLE s3_encryption_configs IN ACCESS EXCLUSIVE MODE;
+                    ALTER TABLE s3_encryption_configs
+                        DROP CONSTRAINT IF EXISTS chk_s3_encryption_configs_supported;
+                    ALTER TABLE s3_encryption_configs
+                        ADD CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                            sse_algorithm COLLATE "C" = 'AES256'
+                            AND kms_master_key_id IS NULL
+                            AND bucket_key_enabled = FALSE
+                        );
+                END
+                $$
+                SQL;
+        }
+        if ($fromVersion < 38) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS noncurrent_at TIMESTAMPTZ';
+            $statements[] = 'UPDATE s3_objects SET noncurrent_at = NOW() WHERE is_latest = FALSE AND noncurrent_at IS NULL';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at)';
+        }
+        if ($fromVersion < 39) {
+            $statements[] = "CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_recursive_unsafe ON s3_storage_garbage(storage_tier, operation) WHERE CASE WHEN operation IN ('delete_path', 'part_write_intent') THEN 0 ELSE 1 END = 1";
+        }
+        if ($fromVersion < 40) {
+            $statements[] = 'ALTER TABLE s3_parts ADD COLUMN IF NOT EXISTS checksum_algorithm TEXT';
+            $statements[] = 'ALTER TABLE s3_parts ADD COLUMN IF NOT EXISTS checksum_value TEXT';
+        }
+        if ($fromVersion < 41) {
+            $statements[] = 'ALTER TABLE s3_cors_rules ADD COLUMN IF NOT EXISTS rule_id TEXT';
+            $statements[] = 'UPDATE s3_cors_rules SET max_age_seconds = -1 WHERE max_age_seconds = 0';
+            $statements[] = 'ALTER TABLE s3_cors_rules ALTER COLUMN max_age_seconds SET DEFAULT -1';
+        }
+
         return $statements;
+    }
+
+    /** @return list<string> */
+    private static function completionCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_completion_capacity (
+                id SMALLINT PRIMARY KEY CHECK (id = 1),
+                retained_count BIGINT NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
+            )
+            SQL,
+            'INSERT INTO s3_multipart_completion_capacity (id, retained_count) SELECT 1, (SELECT COUNT(*) FROM s3_multipart_write_intents) WHERE NOT EXISTS (SELECT 1 FROM s3_multipart_completion_capacity WHERE id = 1)',
+            <<<'SQL'
+            CREATE OR REPLACE FUNCTION s3_multipart_completion_capacity_insert_fn() RETURNS trigger AS $$
+            BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count + 1
+                WHERE id = 1 AND retained_count < 1000000;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Multipart completion recovery capacity is exhausted.';
+                END IF;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+            SQL,
+            <<<'SQL'
+            CREATE OR REPLACE FUNCTION s3_multipart_completion_capacity_delete_fn() RETURNS trigger AS $$
+            BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count - 1
+                WHERE id = 1 AND retained_count > 0;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'Multipart completion recovery capacity is inconsistent.';
+                END IF;
+                RETURN OLD;
+            END
+            $$ LANGUAGE plpgsql
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_multipart_completion_capacity_insert ON s3_multipart_write_intents',
+            'CREATE TRIGGER s3_multipart_completion_capacity_insert BEFORE INSERT ON s3_multipart_write_intents FOR EACH ROW EXECUTE FUNCTION s3_multipart_completion_capacity_insert_fn()',
+            'DROP TRIGGER IF EXISTS s3_multipart_completion_capacity_delete ON s3_multipart_write_intents',
+            'CREATE TRIGGER s3_multipart_completion_capacity_delete BEFORE DELETE ON s3_multipart_write_intents FOR EACH ROW EXECUTE FUNCTION s3_multipart_completion_capacity_delete_fn()',
+        ];
+    }
+
+    /** @return list<string> */
+    private static function writeIntentCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_write_intent_capacity (
+                kind TEXT PRIMARY KEY CHECK (kind IN ('object', 'part')),
+                retained_count BIGINT NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
+            )
+            SQL,
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'object', (SELECT COUNT(*) FROM s3_object_write_intents)
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object')",
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent')
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')",
+            <<<'SQL'
+            CREATE OR REPLACE FUNCTION s3_write_intent_capacity_object_fn() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                    WHERE kind = 'object' AND retained_count < 1000000;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is exhausted or unavailable.'; END IF;
+                    RETURN NEW;
+                END IF;
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object' AND retained_count > 0;
+                IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is inconsistent.'; END IF;
+                RETURN OLD;
+            END
+            $$ LANGUAGE plpgsql
+            SQL,
+            <<<'SQL'
+            CREATE OR REPLACE FUNCTION s3_write_intent_capacity_part_fn() RETURNS trigger AS $$
+            DECLARE delta INTEGER := 0;
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    IF NEW.operation = 'part_write_intent' THEN delta := 1; END IF;
+                ELSIF TG_OP = 'DELETE' THEN
+                    IF OLD.operation = 'part_write_intent' THEN delta := -1; END IF;
+                ELSIF OLD.operation <> NEW.operation THEN
+                    IF NEW.operation = 'part_write_intent' THEN delta := 1;
+                    ELSIF OLD.operation = 'part_write_intent' THEN delta := -1;
+                    END IF;
+                END IF;
+                IF delta <> 0 THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count + delta
+                    WHERE kind = 'part' AND retained_count + delta BETWEEN 0 AND 1000000;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Multipart part recovery capacity is exhausted or inconsistent.'; END IF;
+                END IF;
+                IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_insert ON s3_object_write_intents',
+            'CREATE TRIGGER s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_object_fn()',
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_delete ON s3_object_write_intents',
+            'CREATE TRIGGER s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_object_fn()',
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_insert ON s3_storage_garbage',
+            'CREATE TRIGGER s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_delete ON s3_storage_garbage',
+            'CREATE TRIGGER s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_update ON s3_storage_garbage',
+            'CREATE TRIGGER s3_write_intent_capacity_part_update BEFORE UPDATE OF operation ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
+        ];
     }
 }

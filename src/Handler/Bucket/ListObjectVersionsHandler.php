@@ -8,7 +8,9 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -44,8 +46,11 @@ final class ListObjectVersionsHandler implements RequestHandler
         $delimiter = $queryParams['delimiter'] ?? null;
         $keyMarker = $queryParams['key-marker'] ?? null;
         $versionIdMarker = $queryParams['version-id-marker'] ?? null;
-        $maxKeys = isset($queryParams['max-keys']) ? max(0, min((int) $queryParams['max-keys'], 1000)) : 1000;
-        $encodingType = $queryParams['encoding-type'] ?? null;
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
+        $encodingType = ListingQuery::encodingType($queryParams);
+        if ($versionIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {
+            throw new InvalidArgumentException('version-id-marker requires key-marker.');
+        }
 
         // Delegate to metadata store.
         $result = $this->metadata->listObjectVersions(
@@ -56,6 +61,7 @@ final class ListObjectVersionsHandler implements RequestHandler
             keyMarker: $keyMarker,
             versionIdMarker: $versionIdMarker,
         );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $credential = $request->getAttribute('credential');
         $displayNameMap = ($credential !== null) ? [$credential->ownerId => $credential->displayName] : [];

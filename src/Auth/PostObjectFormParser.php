@@ -5,13 +5,14 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Auth;
 
 use Amp\Http\Server\FormParser\StreamedField;
-use Amp\Http\Server\FormParser\StreamingFormParser;
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
+use OpsFour\S3Server\Http\Iso8601Timestamp;
 
 /**
  * Streams an S3 POST Object form to a temporary file and authenticates it.
@@ -20,46 +21,188 @@ final class PostObjectFormParser
 {
     private const int FIELD_SIZE_LIMIT = 65_536;
 
+    private readonly PostObjectTempFileSweeper $tempFileSweeper;
+
+    private readonly PostObjectSpoolCoordinator $spoolCoordinator;
+
     public function __construct(
         private readonly CredentialProvider $credentialProvider,
         private readonly string $region,
         private readonly int $bodySizeLimit,
-    ) {}
+        ?PostObjectTempFileSweeper $tempFileSweeper = null,
+        private readonly ?PostObjectAuthorizationPreflight $authorizationPreflight = null,
+        private readonly int $spoolBudgetBytes = 10_737_418_240,
+        ?PostObjectSpoolCoordinator $spoolCoordinator = null,
+        ?string $tempDir = null,
+    ) {
+        if ($spoolBudgetBytes < 1) {
+            throw new \InvalidArgumentException('Browser POST spool budget must be positive.');
+        }
+        if ($tempDir !== null && ($tempFileSweeper !== null || $spoolCoordinator !== null)) {
+            throw new \InvalidArgumentException('Explicit browser POST temp directory cannot be mixed with injected spool components.');
+        }
+        $this->tempFileSweeper = $tempFileSweeper ?? new PostObjectTempFileSweeper(tempDir: $tempDir);
+        $this->spoolCoordinator = $spoolCoordinator ?? new PostObjectSpoolCoordinator($tempDir);
+    }
+
+    /** @internal Prove the form parser shares the exact qualified ingress components. */
+    public function assertQualifiedBinding(
+        string $tempDir,
+        int $budgetBytes,
+        PostObjectTempFileSweeper $sweeper,
+        PostObjectSpoolCoordinator $coordinator,
+    ): void {
+        if ($this->spoolBudgetBytes !== $budgetBytes
+            || $this->tempFileSweeper !== $sweeper
+            || $this->spoolCoordinator !== $coordinator) {
+            throw new \RuntimeException('EFS browser POST parser differs from qualified ingress components.');
+        }
+        $coordinator->assertQualifiedBinding($tempDir);
+    }
+
+    /** @internal Browser POST must use the same provider as SigV4 admission. */
+    public function assertQualifiedCredentialProviderBinding(CredentialProvider $credentialProvider): void
+    {
+        if ($this->credentialProvider !== $credentialProvider) {
+            throw new \RuntimeException('EFS browser POST credential provider differs from qualified ingress.');
+        }
+    }
 
     public function parse(Request $request): PostObjectForm
     {
         $contentType = $request->getHeader('content-type') ?? '';
+        // The multipart boundary itself is limited to 70 bytes by RFC 2046.
+        // Bound the whole header before the upstream boundary regex sees it.
+        if (strlen($contentType) > 1_024) {
+            throw new InvalidArgumentException('POST Object requires a valid multipart boundary.');
+        }
         if (!str_starts_with(strtolower($contentType), 'multipart/form-data')) {
             throw new InvalidArgumentException('POST Object requires multipart/form-data.');
         }
+
+        if (preg_match('/;\s*boundary\s*=/', $contentType) !== 1) {
+            throw new InvalidArgumentException('POST Object requires a multipart boundary.');
+        }
+        $boundary = \Amp\Http\Server\FormParser\parseContentBoundary($contentType);
+        if ($boundary === null || $boundary === '') {
+            throw new InvalidArgumentException('POST Object requires a multipart boundary.');
+        }
+        if (strlen($boundary) > 70) {
+            throw new InvalidArgumentException('POST Object requires a valid multipart boundary.');
+        }
+
+        // Browser POST authorizes object options through signed policy form
+        // fields. Raw request headers are outside that policy and must not be
+        // carried into the synthesized PutObject request below.
+        foreach ($request->getHeaders() as $name => $_values) {
+            $name = strtolower($name);
+            if (str_starts_with($name, 'x-amz-')
+                || ($name !== 'content-type' && $name !== 'content-length' && str_starts_with($name, 'content-'))
+                || in_array($name, ['cache-control', 'expires', 'if-match', 'if-none-match'], true)) {
+                throw new AccessDeniedException('POST Object options must be provided as policy-covered form fields.');
+            }
+        }
+
+        // Keep the HTTP driver's body limit and Content-Length unchanged.
+        $request->getBody()->increaseSizeLimit($this->bodySizeLimit);
+
+        $this->tempFileSweeper->sweepIfDue();
 
         $fields = [];
         $filePath = null;
         $filename = null;
         $fileSize = 0;
         $seenFile = false;
+        $key = null;
+        $credential = null;
+        $policy = null;
+        $policyMaxFileSize = null;
+        $reservation = null;
+        $spoolKey = null;
+        $activeField = null;
 
         try {
-            $parser = new StreamingFormParser(fieldCountLimit: 100);
-            foreach ($parser->parseForm($request, $this->bodySizeLimit) as $field) {
+            $parser = new BoundedMultipartFormParser($request->getBody(), $boundary, $this->bodySizeLimit);
+            foreach ($parser->parse() as $field) {
+                $activeField = $field;
                 if ($field->isFile()) {
                     if ($seenFile || strtolower($field->getName()) !== 'file') {
                         throw new InvalidArgumentException('POST Object requires exactly one file field named "file".');
                     }
 
-                    $seenFile = true;
                     $filename = self::safeFilename($field);
+                    $keyField = self::value($fields, 'key');
+                    if ($keyField === null || $keyField === '') {
+                        throw new InvalidArgumentException('Bucket POST must contain a field named "key".');
+                    }
+                    $key = str_replace('${filename}', $filename, $keyField);
+                    self::setValue($fields, 'key', $key);
+
+                    // The file field must be last, so all signature fields are
+                    // available now. Reject bad credentials before spooling an
+                    // attacker-controlled body to temporary disk.
+                    [$credential, $policy] = $this->authenticate($fields);
+                    if ($credential !== null) {
+                        $request->setAttribute(
+                            's3.signatureVersion',
+                            self::value($fields, 'x-amz-algorithm') !== null ? 'SigV4' : 'SigV2',
+                        );
+                    }
+                    $bucket = $request->getAttribute('s3.bucket');
+                    $policyMaxFileSize = self::preflightPolicy(
+                        $policy,
+                        $fields,
+                        is_string($bucket) ? $bucket : null,
+                    );
+                    $this->authorizationPreflight?->check($request, $credential, $fields, $key);
+                    $seenFile = true;
+                    $spoolKey = random_bytes(32);
                     $filePath = $this->createTempPath();
-                    $file = \Amp\File\openFile($filePath, 'x');
+                    $createdStat = @lstat($filePath);
+                    if ($createdStat === false) {
+                        throw new \RuntimeException('Browser POST temporary file disappeared before writing.');
+                    }
+                    $reservation = $this->spoolCoordinator->start($filePath);
+                    $file = \Amp\File\openFile($filePath, 'c');
+                    // Amp's writable modes create a missing file. Detect a
+                    // replacement before any upload bytes reach that handle.
+                    clearstatcache(true, $filePath);
+                    $openedStat = @lstat($filePath);
+                    if ($openedStat === false
+                        || ($openedStat['mode'] & 0o170000) !== 0o100000
+                        || $openedStat['dev'] !== $createdStat['dev']
+                        || $openedStat['ino'] !== $createdStat['ino']
+                        || ($openedStat['mode'] & 0o077) !== 0) {
+                        $file->close();
+                        throw new \RuntimeException('Browser POST temporary file changed before writing.');
+                    }
                     try {
+                        $frameIndex = 0;
+                        $fileBytes = 0;
                         while (($chunk = $field->read()) !== null) {
-                            $fileSize += strlen($chunk);
-                            $file->write($chunk);
+                            $chunkBytes = strlen($chunk);
+                            $fileSize += $chunkBytes;
+                            if ($policyMaxFileSize !== null && $fileSize > $policyMaxFileSize) {
+                                throw new EntityTooLargeException('Upload exceeds the policy maximum.');
+                            }
+                            for ($offset = 0; $offset < $chunkBytes; $offset += EncryptedTempFrames::MAX_PLAINTEXT_BYTES) {
+                                $plaintext = substr($chunk, $offset, EncryptedTempFrames::MAX_PLAINTEXT_BYTES);
+                                $frame = EncryptedTempFrames::encode($spoolKey, $frameIndex++, $plaintext);
+                                $frameBytes = strlen($frame);
+                                $this->spoolCoordinator->reserve($reservation, $frameBytes, $this->spoolBudgetBytes);
+                                $file->write($frame);
+                                $fileBytes += $frameBytes;
+                            }
                         }
                     } finally {
                         $file->close();
                     }
+                    clearstatcache(true, $filePath);
+                    if (@filesize($filePath) !== $fileBytes) {
+                        throw new \RuntimeException('Browser POST temporary file is incomplete.');
+                    }
 
+                    $activeField = null;
                     continue;
                 }
 
@@ -73,21 +216,12 @@ final class PostObjectFormParser
                     throw new InvalidArgumentException('POST Object form field names must be non-empty and unique.');
                 }
                 $fields[$name] = $field->buffer(limit: self::FIELD_SIZE_LIMIT);
+                $activeField = null;
             }
 
-            if ($filePath === null || $filename === null) {
+            if ($filePath === null || $filename === null || $key === null || $spoolKey === null) {
                 throw new InvalidArgumentException('POST Object requires a file field.');
             }
-
-            $keyField = self::value($fields, 'key');
-            if ($keyField === null || $keyField === '') {
-                throw new InvalidArgumentException('Bucket POST must contain a field named "key".');
-            }
-
-            $key = str_replace('${filename}', $filename, $keyField);
-            self::setValue($fields, 'key', $key);
-
-            [$credential, $policy] = $this->authenticate($fields);
 
             $form = new PostObjectForm(
                 fields: $fields,
@@ -95,23 +229,142 @@ final class PostObjectFormParser
                 filename: $filename,
                 filePath: $filePath,
                 fileSize: $fileSize,
+                spoolKey: $spoolKey,
                 credential: $credential,
                 policy: $policy,
+                onCleanup: function () use ($reservation, $filePath): void {
+                    if ($reservation !== null) {
+                        $this->spoolCoordinator->release($reservation, !file_exists($filePath));
+                    }
+                },
             );
 
             $this->prepareRequestForAuthorizationAndWrite($request, $form);
 
             return $form;
         } catch (\Throwable $e) {
-            if ($filePath !== null) {
-                try {
+            $activeField?->close();
+            try {
+                if ($filePath !== null) {
                     \Amp\File\deleteFile($filePath);
-                } catch (\Throwable) {
+                }
+            } catch (\Throwable) {
+            } finally {
+                if ($reservation !== null) {
+                    $this->spoolCoordinator->release($reservation, $filePath === null || !file_exists($filePath));
                 }
             }
 
             throw $e;
         }
+    }
+
+    /**
+     * Reject signed forms whose non-file conditions cannot succeed before
+     * writing their file to disk. The handler checks again after parsing.
+     *
+     * @param array<string, mixed>|null $policy
+     * @param array<string, string> $fields
+     */
+    private static function preflightPolicy(?array $policy, array $fields, ?string $bucket): ?int
+    {
+        if ($policy === null) {
+            return null;
+        }
+
+        $expiration = $policy['expiration'] ?? null;
+        if (!is_string($expiration)) {
+            throw new InvalidArgumentException('Policy must contain a string expiration.');
+        }
+        $expiresAt = Iso8601Timestamp::parse($expiration, requireUtc: true);
+        if ($expiresAt === null) {
+            throw new InvalidArgumentException('Invalid expiration date format in policy.');
+        }
+        if (new \DateTimeImmutable('now', new \DateTimeZone('UTC')) > $expiresAt) {
+            throw new AccessDeniedException('Invalid according to Policy: Policy expired.');
+        }
+
+        $maxFileSize = null;
+        $conditions = $policy['conditions'] ?? null;
+        if (!is_array($conditions) || $conditions === []) {
+            throw new InvalidArgumentException('Policy conditions must be a non-empty array.');
+        }
+        $coveredFields = [];
+        foreach ($conditions as $condition) {
+            if (!is_array($condition) || $condition === []) {
+                throw new InvalidArgumentException('Invalid Policy: empty or invalid condition.');
+            }
+            if (!array_is_list($condition)) {
+                foreach ($condition as $field => $expectedValue) {
+                    if (!is_string($field) || !is_scalar($expectedValue)) {
+                        throw new InvalidArgumentException('Invalid exact-match policy condition.');
+                    }
+                    $coveredFields[] = strtolower($field);
+                    if (strtolower($field) === 'bucket') {
+                        if ($bucket === null) {
+                            continue;
+                        }
+                        $actual = $bucket;
+                    } else {
+                        $actual = self::value($fields, $field) ?? '';
+                    }
+                    if ($actual !== (string) $expectedValue) {
+                        throw new AccessDeniedException('Invalid according to Policy: exact-match condition failed.');
+                    }
+                }
+                continue;
+            }
+            if (count($condition) !== 3) {
+                throw new InvalidArgumentException('Invalid Policy: condition arrays require 3 elements.');
+            }
+            if (!is_scalar($condition[0]) || !is_scalar($condition[1]) || !is_scalar($condition[2])) {
+                throw new InvalidArgumentException('Invalid Policy: condition values must be scalar.');
+            }
+            $operator = strtolower((string) $condition[0]);
+            if ($operator !== 'content-length-range') {
+                if (!in_array($operator, ['eq', 'starts-with'], true)) {
+                    throw new InvalidArgumentException('Unsupported POST policy condition operator.');
+                }
+                $field = ltrim((string) $condition[1], '$');
+                if ($field === '') {
+                    throw new InvalidArgumentException('POST policy condition field is empty.');
+                }
+                $coveredFields[] = strtolower($field);
+                if (strtolower($field) === 'bucket') {
+                    if ($bucket === null) {
+                        continue;
+                    }
+                    $actual = $bucket;
+                } else {
+                    $actual = self::value($fields, $field) ?? '';
+                }
+                $expected = (string) $condition[2];
+                if (($operator === 'eq' && $actual !== $expected)
+                    || ($operator === 'starts-with' && !str_starts_with($actual, $expected))) {
+                    throw new AccessDeniedException('Invalid according to Policy: form field condition failed.');
+                }
+                continue;
+            }
+            $min = filter_var($condition[1], FILTER_VALIDATE_INT);
+            $max = filter_var($condition[2], FILTER_VALIDATE_INT);
+            if ($min === false || $max === false || $min < 0 || $max < $min) {
+                throw new InvalidArgumentException('Invalid content-length-range policy condition.');
+            }
+            $maxFileSize = $maxFileSize === null ? $max : min($maxFileSize, $max);
+        }
+
+        foreach ($fields as $field => $_) {
+            $field = strtolower($field);
+            if (in_array($field, ['policy', 'signature', 'x-amz-signature'], true)
+                || str_starts_with($field, 'x-ignore-')) {
+                continue;
+            }
+            if (!in_array($field, $coveredFields, true)) {
+                throw new AccessDeniedException("Invalid according to Policy: extra field '{$field}' is not covered by a condition.");
+            }
+        }
+
+        return $maxFileSize;
     }
 
     /**
@@ -202,7 +455,7 @@ final class PostObjectFormParser
 
     private static function isValidAmzDate(string $dateTime): bool
     {
-        if (!preg_match('/^\d{8}T\d{6}Z$/', $dateTime)) {
+        if (preg_match('/\A[0-9]{8}T[0-9]{6}Z\z/', $dateTime) !== 1) {
             return false;
         }
 
@@ -260,10 +513,15 @@ final class PostObjectFormParser
         $request->setBody($form->openFile());
         $request->setHeader('content-length', (string) $form->fileSize);
 
-        $contentType = $form->value('Content-Type') ?? 'application/octet-stream';
-        $request->setHeader('content-type', $contentType);
+        self::applyFormHeaders($request, $form->fields);
+    }
 
-        foreach ($form->fields as $name => $value) {
+    /** @param array<string, string> $fields */
+    public static function applyFormHeaders(Request $request, array $fields): void
+    {
+        $request->setHeader('content-type', self::value($fields, 'Content-Type') ?? 'application/octet-stream');
+
+        foreach ($fields as $name => $value) {
             $lower = strtolower($name);
             if ($lower === 'acl') {
                 $request->setHeader('x-amz-acl', $value);
@@ -272,6 +530,8 @@ final class PostObjectFormParser
             } elseif (str_starts_with($lower, 'x-amz-meta-')
                 || str_starts_with($lower, 'x-amz-checksum-')
                 || str_starts_with($lower, 'x-amz-server-side-encryption')
+                || str_starts_with($lower, 'x-amz-object-lock-')
+                || $lower === 'x-amz-storage-class'
                 || in_array($lower, ['cache-control', 'content-encoding', 'content-disposition', 'expires'], true)) {
                 $request->setHeader($lower, $value);
             }
@@ -280,9 +540,23 @@ final class PostObjectFormParser
 
     private function createTempPath(): string
     {
-        return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
-            . DIRECTORY_SEPARATOR
-            . 's3-post-' . bin2hex(random_bytes(16)) . '.tmp';
+        $directory = $this->spoolCoordinator->tempDir();
+        $path = @tempnam($directory, 's3-post-' . bin2hex(random_bytes(16)) . '-');
+        if ($path === false) {
+            throw new \RuntimeException('Cannot create browser POST temporary file.');
+        }
+
+        // Create the ciphertext spool privately before any bytes are
+        // accepted, even with umask 0.
+        clearstatcache(true, $path);
+        $permissions = @fileperms($path);
+        if (realpath(dirname($path)) !== realpath($directory)
+            || $permissions === false || ($permissions & 0077) !== 0) {
+            @unlink($path);
+            throw new \RuntimeException('Cannot create private browser POST temporary file.');
+        }
+
+        return $directory . DIRECTORY_SEPARATOR . basename($path);
     }
 
     private static function safeFilename(StreamedField $field): string

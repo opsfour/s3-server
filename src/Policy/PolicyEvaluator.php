@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Policy;
 
+use OpsFour\S3Server\Http\Iso8601Timestamp;
+
 /**
  * Evaluates S3 bucket policies against requests.
  *
@@ -12,6 +14,11 @@ namespace OpsFour\S3Server\Policy;
  */
 final class PolicyEvaluator
 {
+    private const array SUPPORTED_STATEMENT_FIELDS = [
+        'Action', 'Condition', 'Effect', 'NotAction', 'NotPrincipal',
+        'NotResource', 'Principal', 'Resource', 'Sid',
+    ];
+
     private const array SUPPORTED_CONDITION_OPERATORS = [
         'Bool',
         'DateGreaterThan',
@@ -71,13 +78,15 @@ final class PolicyEvaluator
             // Corrupted policy must fail closed — deny access.
             return 'Deny';
         }
-        if (!is_array($policy) || !isset($policy['Statement'])) {
-            return 'Neutral';
+        if (! is_array($policy)
+            || ! array_key_exists('Statement', $policy)
+            || ! is_array($policy['Statement'])) {
+            return 'Deny';
         }
 
         $statements = self::normalizeStatements($policy['Statement']);
 
-        if (self::hasUnsupportedConditions($statements)) {
+        if (self::hasUnsupportedConditions($statements) || self::hasMalformedSelectors($statements)) {
             return 'Deny';
         }
 
@@ -156,7 +165,8 @@ final class PolicyEvaluator
                 continue;
             }
 
-            if (isset($statement['Principal']) && self::principalValueIncludesWildcard($statement['Principal'])) {
+            if (isset($statement['Principal']) && self::principalValueIncludesWildcard($statement['Principal'])
+                && ! self::hasNarrowSourceIpBoundary($statement)) {
                 return true;
             }
 
@@ -165,12 +175,48 @@ final class PolicyEvaluator
             if (
                 isset($statement['NotPrincipal'])
                 && ! self::principalValueIncludesWildcard($statement['NotPrincipal'])
+                && ! self::hasNarrowSourceIpBoundary($statement)
             ) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /** @param array<string, mixed> $statement */
+    private static function hasNarrowSourceIpBoundary(array $statement): bool
+    {
+        $ranges = $statement['Condition']['IpAddress']['aws:SourceIp'] ?? null;
+        if (is_string($ranges)) {
+            $ranges = [$ranges];
+        }
+        if (! is_array($ranges) || $ranges === []) {
+            return false;
+        }
+
+        foreach ($ranges as $range) {
+            if (! is_string($range)) {
+                return false;
+            }
+            $parts = explode('/', $range, 2);
+            $address = $parts[0];
+            $prefix = $parts[1] ?? null;
+            if ($prefix === null) {
+                return false;
+            }
+            $binary = @inet_pton($address);
+            if ($binary === false) {
+                return false;
+            }
+            $maxBits = strlen($binary) * 8;
+            $minimumBits = $maxBits === 32 ? 8 : 32;
+            if (! ctype_digit($prefix) || (int) $prefix < $minimumBits || (int) $prefix > $maxBits) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function principalValueIncludesWildcard(mixed $principal): bool
@@ -236,18 +282,34 @@ final class PolicyEvaluator
             }
             if (is_array($aws)) {
                 foreach ($aws as $p) {
-                    if ($p === '*' || $p === $principal || str_ends_with($p, ':root') && str_starts_with($principal, 'arn:')) {
+                    if ($p === '*' || $p === $principal || self::matchesAccountPrincipal($p, $principal)) {
                         return true;
                     }
                 }
             }
         }
 
-        if (is_string($statementPrincipal) && $statementPrincipal === $principal) {
-            return true;
+        return is_string($statementPrincipal)
+            && ($statementPrincipal === $principal || self::matchesAccountPrincipal($statementPrincipal, $principal));
+    }
+
+    private static function matchesAccountPrincipal(string $policyPrincipal, string $requestPrincipal): bool
+    {
+        $account = explode(':', $policyPrincipal, 6);
+        $identity = explode(':', $requestPrincipal, 6);
+        if (count($account) !== 6 || count($identity) !== 6
+            || $account[0] !== 'arn' || $identity[0] !== 'arn'
+            || $account[1] !== $identity[1]
+            || $account[2] !== 'iam' || !in_array($identity[2], ['iam', 'sts'], true)
+            || $account[3] !== '' || $identity[3] !== ''
+            || preg_match('/^[0-9]{12}$/D', $account[4]) !== 1
+            || $account[4] !== $identity[4] || $account[5] !== 'root') {
+            return false;
         }
 
-        return false;
+        return $identity[2] === 'iam'
+            ? $identity[5] === 'root' || preg_match('~^(?:user|role)/.+$~D', $identity[5]) === 1
+            : preg_match('~^(?:assumed-role|federated-user)/.+$~D', $identity[5]) === 1;
     }
 
     /** @param array<string, mixed> $statement */
@@ -281,7 +343,7 @@ final class PolicyEvaluator
             if ($pattern === '*' || $pattern === 's3:*') {
                 return true;
             }
-            if (fnmatch($pattern, $action, FNM_CASEFOLD)) {
+            if (self::wildcardMatches($pattern, $action, true)) {
                 return true;
             }
         }
@@ -320,7 +382,7 @@ final class PolicyEvaluator
             if ($pattern === '*') {
                 return true;
             }
-            if (fnmatch($pattern, $resource)) {
+            if (self::wildcardMatches($pattern, $resource)) {
                 return true;
             }
         }
@@ -356,17 +418,23 @@ final class PolicyEvaluator
                     continue;
                 }
 
-                if (!array_key_exists($key, $context)) {
-                    return false;
-                }
-
-                $actualValues = self::stringValues($context[$key]);
-                if ($actualValues === []) {
-                    return false;
-                }
-
                 $expectedValues = self::stringValues($expected);
                 if ($expectedValues === []) {
+                    return false;
+                }
+
+                $actualValues = array_key_exists($key, $context)
+                    ? self::stringValues($context[$key])
+                    : [];
+                if ($actualValues === []) {
+                    // A missing context key satisfies a negated condition.
+                    // Set modifiers override this: ForAllValues is vacuously
+                    // true and ForAnyValue is false for an empty value set.
+                    if ($setModifier === 'ForAllValues'
+                        || ($setModifier === null && in_array($baseOperator, ['StringNotEquals', 'StringNotLike', 'NotIpAddress'], true))) {
+                        continue;
+                    }
+
                     return false;
                 }
 
@@ -388,26 +456,27 @@ final class PolicyEvaluator
         }
 
         foreach ($statements as $statement) {
-            if (!is_array($statement) || !isset($statement['Condition'])) {
+            if (!is_array($statement) || !array_key_exists('Condition', $statement)) {
                 continue;
             }
 
-            if (!is_array($statement['Condition'])) {
+            if (!is_array($statement['Condition']) || $statement['Condition'] === [] || array_is_list($statement['Condition'])) {
                 return true;
             }
 
             foreach ($statement['Condition'] as $operator => $conditionBlock) {
-                if (!is_string($operator) || !is_array($conditionBlock)) {
+                if (!is_string($operator) || !is_array($conditionBlock) || $conditionBlock === [] || array_is_list($conditionBlock)) {
                     return true;
                 }
 
                 [, $baseOperator] = self::parseOperator($operator);
-                if (!in_array($baseOperator, self::SUPPORTED_CONDITION_OPERATORS, true)) {
+                if (! in_array($baseOperator, self::SUPPORTED_CONDITION_OPERATORS, true)) {
                     return true;
                 }
 
-                foreach ($conditionBlock as $key => $_) {
-                    if (!is_string($key) || !self::isSupportedConditionKey($key)) {
+                foreach ($conditionBlock as $key => $expected) {
+                    if (!is_string($key) || !self::supportsCondition($operator, $key)
+                        || !self::supportsConditionValue($operator, $expected)) {
                         return true;
                     }
                 }
@@ -415,6 +484,163 @@ final class PolicyEvaluator
         }
 
         return false;
+    }
+
+    /**
+     * Stored account and named policies do not pass through the bucket-policy
+     * validator. Missing or invalid action/resource selectors must not turn
+     * into unrestricted Allows or silently disable Denies when written directly.
+     *
+     * @param list<mixed> $statements
+     */
+    private static function hasMalformedSelectors(array $statements): bool
+    {
+        foreach ($statements as $statement) {
+            if (! is_array($statement)
+                || ! in_array($statement['Effect'] ?? null, ['Allow', 'Deny'], true)) {
+                return true;
+            }
+            foreach (array_keys($statement) as $field) {
+                if (! is_string($field) || ! in_array($field, self::SUPPORTED_STATEMENT_FIELDS, true)) {
+                    return true;
+                }
+            }
+
+            if (array_key_exists('Principal', $statement)
+                && ! self::validPrincipalSelector($statement['Principal'])) {
+                return true;
+            }
+            if (array_key_exists('NotPrincipal', $statement)
+                && (array_key_exists('Principal', $statement)
+                    || ! self::validPrincipalSelector($statement['NotPrincipal']))) {
+                return true;
+            }
+            if ((int) array_key_exists('Action', $statement) + (int) array_key_exists('NotAction', $statement) !== 1
+                || (array_key_exists('Action', $statement) && ! self::validSelectorStrings($statement['Action']))) {
+                return true;
+            }
+            if ((int) array_key_exists('Resource', $statement) + (int) array_key_exists('NotResource', $statement) !== 1) {
+                return true;
+            }
+            foreach (['NotAction' => 'Action', 'NotResource' => 'Resource'] as $negative => $positive) {
+                if (array_key_exists($negative, $statement)
+                    && (array_key_exists($positive, $statement)
+                        || ! self::validSelectorStrings($statement[$negative]))) {
+                    return true;
+                }
+            }
+            if (array_key_exists('Resource', $statement) && ! self::validSelectorStrings($statement['Resource'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function validPrincipalSelector(mixed $principal): bool
+    {
+        if (is_string($principal)) {
+            return $principal !== '';
+        }
+
+        return is_array($principal)
+            && array_keys($principal) === ['AWS']
+            && self::validSelectorStrings($principal['AWS']);
+    }
+
+    private static function validSelectorStrings(mixed $selector): bool
+    {
+        if (is_string($selector)) {
+            return $selector !== '';
+        }
+
+        if (! is_array($selector) || ! array_is_list($selector) || $selector === []) {
+            return false;
+        }
+
+        foreach ($selector as $item) {
+            if (! is_string($item) || $item === '') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public static function supportsCondition(string $operator, string $key): bool
+    {
+        [, $baseOperator] = self::parseOperator($operator);
+
+        return in_array($baseOperator, self::SUPPORTED_CONDITION_OPERATORS, true)
+            && self::isSupportedConditionKey($key);
+    }
+
+    public static function supportsConditionValue(string $operator, mixed $value): bool
+    {
+        [, $baseOperator] = self::parseOperator($operator);
+        // Account and named policies can be stored without passing through
+        // PolicyDocumentValidator. Reject the same malformed value shapes here
+        // so an invalid Deny condition cannot silently stop matching.
+        if (!is_scalar($value)) {
+            if (!is_array($value) || !array_is_list($value) || $value === []) {
+                return false;
+            }
+            foreach ($value as $item) {
+                if (!is_scalar($item)) {
+                    return false;
+                }
+            }
+        }
+        if (!in_array($baseOperator, ['Bool', 'Null', 'IpAddress', 'NotIpAddress'], true)
+            && !str_starts_with($baseOperator, 'Numeric')
+            && !str_starts_with($baseOperator, 'Date')) {
+            return true;
+        }
+
+        if ($baseOperator === 'Null' && is_array($value)) {
+            return false;
+        }
+
+        $values = is_array($value) ? $value : [$value];
+        foreach ($values as $item) {
+            if (in_array($baseOperator, ['IpAddress', 'NotIpAddress'], true)) {
+                if (!is_string($item)
+                    || !(str_contains($item, '/') ? self::validCidr($item) : @inet_pton($item) !== false)) {
+                    return false;
+                }
+            } elseif (str_starts_with($baseOperator, 'Numeric')) {
+                if ((!is_int($item) && !is_float($item) && !is_string($item))
+                    || !is_numeric($item) || !is_finite((float) $item)) {
+                    return false;
+                }
+            } elseif (str_starts_with($baseOperator, 'Date')) {
+                if ((!is_int($item) && !is_float($item) && !is_string($item))
+                    || self::parseDateValue((string) $item) === null) {
+                    return false;
+                }
+            } elseif (!is_bool($item) && (!is_string($item) || !in_array(strtolower($item), ['true', 'false'], true))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public static function hasUnsupportedConditionsInDocument(string $policyJson): bool
+    {
+        try {
+            $policy = json_decode($policyJson, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException) {
+            return true;
+        }
+
+        if (! is_array($policy) || ! isset($policy['Statement'])) {
+            return true;
+        }
+
+        $statements = self::normalizeStatements($policy['Statement']);
+
+        return self::hasUnsupportedConditions($statements) || self::hasMalformedSelectors($statements);
     }
 
     private static function isSupportedConditionKey(string $key): bool
@@ -457,8 +683,8 @@ final class PolicyEvaluator
             'NumericLessThanEquals' => self::numericCompare($actual, $expectedValues, static fn(int $cmp): bool => $cmp <= 0),
             'StringEquals' => in_array($actual, $expectedValues, true),
             'StringNotEquals' => !in_array($actual, $expectedValues, true),
-            'StringLike' => self::anyFnmatch($expectedValues, $actual),
-            'StringNotLike' => !self::anyFnmatch($expectedValues, $actual),
+            'StringLike' => self::anyWildcardMatch($expectedValues, $actual),
+            'StringNotLike' => !self::anyWildcardMatch($expectedValues, $actual),
             'IpAddress' => self::ipConditionMatches($actual, $expectedValues),
             'NotIpAddress' => self::ipConditionMatches($actual, $expectedValues, true),
             default => false,
@@ -489,7 +715,7 @@ final class PolicyEvaluator
     private static function stringValues(mixed $value): array
     {
         if (is_string($value) || is_int($value) || is_float($value) || is_bool($value)) {
-            return [(string) $value];
+            return [is_bool($value) ? ($value ? 'true' : 'false') : (string) $value];
         }
 
         if (!is_array($value)) {
@@ -499,7 +725,7 @@ final class PolicyEvaluator
         $values = [];
         foreach ($value as $item) {
             if (is_string($item) || is_int($item) || is_float($item) || is_bool($item)) {
-                $values[] = (string) $item;
+                $values[] = is_bool($item) ? ($item ? 'true' : 'false') : (string) $item;
             }
         }
 
@@ -509,11 +735,15 @@ final class PolicyEvaluator
     private static function nullMatches(bool $exists, mixed $expected): bool
     {
         $expectedValues = self::stringValues($expected);
-        if ($expectedValues === []) {
+        if (count($expectedValues) !== 1) {
             return false;
         }
 
-        return in_array(strtolower($expectedValues[0]), ['true', '1'], true) ? !$exists : $exists;
+        return match (strtolower($expectedValues[0])) {
+            'true' => !$exists,
+            'false' => $exists,
+            default => false,
+        };
     }
 
     /** @param list<string> $expectedValues */
@@ -559,14 +789,14 @@ final class PolicyEvaluator
      */
     private static function dateCompare(string $actual, array $expectedValues, callable $compare): bool
     {
-        $actualTime = strtotime($actual);
-        if ($actualTime === false) {
+        $actualTime = self::parseDateValue($actual);
+        if ($actualTime === null) {
             return false;
         }
 
         foreach ($expectedValues as $expected) {
-            $expectedTime = strtotime($expected);
-            if ($expectedTime === false) {
+            $expectedTime = self::parseDateValue($expected);
+            if ($expectedTime === null) {
                 continue;
             }
 
@@ -579,15 +809,83 @@ final class PolicyEvaluator
         return false;
     }
 
+    private static function parseDateValue(string $value): ?float
+    {
+        if (is_numeric($value)) {
+            $epoch = (float) $value;
+
+            return is_finite($epoch) ? $epoch : null;
+        }
+
+        $timestamp = Iso8601Timestamp::parse($value);
+        if ($timestamp !== null) {
+            return (float) $timestamp->format('U.u');
+        }
+
+        if (preg_match('/^(?<year>\d{4})-(?<month>\d{2})(?:-(?<day>\d{2}))?$/D', $value, $parts) !== 1) {
+            return null;
+        }
+        $year = (int) $parts['year'];
+        $month = (int) $parts['month'];
+        $day = isset($parts['day']) ? (int) $parts['day'] : 1;
+        if (!checkdate($month, $day, $year)) {
+            return null;
+        }
+
+        return (float) (new \DateTimeImmutable(
+            sprintf('%04d-%02d-%02dT00:00:00Z', $year, $month, $day),
+        ))->getTimestamp();
+    }
+
     /** @param list<string> $patterns */
-    private static function anyFnmatch(array $patterns, string $value): bool
+    private static function anyWildcardMatch(array $patterns, string $value): bool
     {
         foreach ($patterns as $pattern) {
-            if (fnmatch($pattern, $value)) {
+            if (self::wildcardMatches($pattern, $value)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static function wildcardMatches(string $pattern, string $value, bool $caseInsensitive = false): bool
+    {
+        if ($caseInsensitive) {
+            $pattern = strtolower($pattern);
+            $value = strtolower($value);
+        }
+
+        $patternLength = strlen($pattern);
+        $valueLength = strlen($value);
+        $patternIndex = 0;
+        $valueIndex = 0;
+        $lastStar = -1;
+        $afterStar = 0;
+
+        while ($valueIndex < $valueLength) {
+            if ($patternIndex < $patternLength
+                && ($pattern[$patternIndex] === '?' || $pattern[$patternIndex] === $value[$valueIndex])) {
+                ++$patternIndex;
+                ++$valueIndex;
+                continue;
+            }
+            if ($patternIndex < $patternLength && $pattern[$patternIndex] === '*') {
+                $lastStar = $patternIndex++;
+                $afterStar = $valueIndex;
+                continue;
+            }
+            if ($lastStar < 0) {
+                return false;
+            }
+            $patternIndex = $lastStar + 1;
+            $valueIndex = ++$afterStar;
+        }
+
+        while ($patternIndex < $patternLength && $pattern[$patternIndex] === '*') {
+            ++$patternIndex;
+        }
+
+        return $patternIndex === $patternLength;
     }
 
     /** @param list<string> $ranges */
@@ -662,7 +960,7 @@ final class PolicyEvaluator
 
         $mask = str_repeat("\xff", intdiv($bits, 8));
         if ($bits % 8) {
-            $mask .= chr(0xff << (8 - ($bits % 8)));
+            $mask .= pack('C', (0xff << (8 - ($bits % 8))) & 0xff);
         }
         $mask = str_pad($mask, strlen($ipBin), "\x00");
 

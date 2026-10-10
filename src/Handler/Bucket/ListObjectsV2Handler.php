@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -40,11 +41,11 @@ final class ListObjectsV2Handler implements RequestHandler
 
         $prefix = $queryParams['prefix'] ?? null;
         $delimiter = $queryParams['delimiter'] ?? null;
-        $maxKeys = isset($queryParams['max-keys']) ? max(0, min((int) $queryParams['max-keys'], 1000)) : 1000;
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
         $continuationToken = $queryParams['continuation-token'] ?? null;
         $startAfter = $queryParams['start-after'] ?? null;
-        $fetchOwner = isset($queryParams['fetch-owner']) && strtolower($queryParams['fetch-owner']) === 'true';
-        $encodingType = $queryParams['encoding-type'] ?? null;
+        $fetchOwner = ListingQuery::boolean($queryParams, 'fetch-owner');
+        $encodingType = ListingQuery::encodingType($queryParams);
 
         // Delegate to metadata store.
         $result = $this->metadata->listObjects(
@@ -55,6 +56,7 @@ final class ListObjectsV2Handler implements RequestHandler
             startAfter: $startAfter,
             continuationToken: $continuationToken,
         );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $credential = $request->getAttribute('credential');
         $displayNameMap = ($credential !== null) ? [$credential->ownerId => $credential->displayName] : [];

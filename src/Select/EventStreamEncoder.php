@@ -15,6 +15,9 @@ namespace OpsFour\S3Server\Select;
  */
 final class EventStreamEncoder
 {
+    /** Keep individual Records frames small enough for incremental SDK decoding. */
+    private const int RECORD_PAYLOAD_BYTES = 64 * 1024;
+
     /**
      * Encode a complete S3 Select response as event stream messages.
      *
@@ -29,31 +32,40 @@ final class EventStreamEncoder
         int $bytesScanned = 0,
         int $bytesProcessed = 0,
         int $bytesReturned = 0,
+        ?SelectMemoryGuard $memoryGuard = null,
     ): string {
         $output = '';
 
-        // Records message.
-        if ($data !== '') {
-            $output .= self::encodeMessage(
+        // AWS permits partial records across Records frames. Bound each frame
+        // rather than sending a potentially hundreds-of-megabytes-long message.
+        for ($offset = 0, $length = strlen($data); $offset < $length; $offset += self::RECORD_PAYLOAD_BYTES) {
+            $frame = self::encodeMessage(
                 [':message-type' => 'event', ':event-type' => 'Records', ':content-type' => 'application/octet-stream'],
-                $data,
+                substr($data, $offset, self::RECORD_PAYLOAD_BYTES),
             );
+            $memoryGuard?->assertOutputSize(strlen($output), strlen($frame));
+            $output .= $frame;
+            $memoryGuard?->check();
         }
 
         // Stats message.
         $statsXml = <<<XML
         <Stats><BytesScanned>{$bytesScanned}</BytesScanned><BytesProcessed>{$bytesProcessed}</BytesProcessed><BytesReturned>{$bytesReturned}</BytesReturned></Stats>
         XML;
-        $output .= self::encodeMessage(
+        $stats = self::encodeMessage(
             [':message-type' => 'event', ':event-type' => 'Stats', ':content-type' => 'text/xml'],
             $statsXml,
         );
+        $memoryGuard?->assertOutputSize(strlen($output), strlen($stats));
+        $output .= $stats;
 
         // End message.
-        $output .= self::encodeMessage(
+        $end = self::encodeMessage(
             [':message-type' => 'event', ':event-type' => 'End'],
             '',
         );
+        $memoryGuard?->assertOutputSize(strlen($output), strlen($end));
+        $output .= $end;
 
         return $output;
     }
@@ -70,7 +82,11 @@ final class EventStreamEncoder
         // Encode headers.
         $headerBytes = '';
         foreach ($headers as $key => $value) {
-            $headerBytes .= chr(strlen($key));
+            if (strlen($key) > 255 || strlen($value) > 65_535) {
+                throw new \InvalidArgumentException('Event stream header exceeds its encoded length limit.');
+            }
+
+            $headerBytes .= pack('C', strlen($key));
             $headerBytes .= $key;
             $headerBytes .= chr(7); // String type.
             $headerBytes .= pack('n', strlen($value));

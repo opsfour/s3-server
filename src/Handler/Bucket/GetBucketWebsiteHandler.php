@@ -29,6 +29,7 @@ final class GetBucketWebsiteHandler implements RequestHandler
         }
 
         $config = $this->metadata->getBucketWebsite($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($config === null) {
             throw new NoSuchWebsiteConfigurationException();
         }

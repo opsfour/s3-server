@@ -4,14 +4,16 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler\Multipart;
 
-use Amp\ByteStream;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
-use OpsFour\S3Server\Encryption\EncryptionService;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\BufferedSsePayload;
+use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
+use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\EntityTooSmallException;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -22,14 +24,23 @@ use OpsFour\S3Server\Exception\InvalidPartOrderException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
+use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
+use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -46,12 +57,28 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         private readonly ?QuotaManager $quotas = null,
         ?StorageTierRegistry $storageTiers = null,
+        private readonly float $intentLeaseSeconds = 43_200.0,
+        private readonly float $intentRenewalSeconds = 300.0,
+        private readonly bool $requireLocalFencedCompletion = false,
     ) {
+        if (! is_finite($this->intentLeaseSeconds) || ! is_finite($this->intentRenewalSeconds)
+            || $this->intentLeaseSeconds <= 0.0 || $this->intentRenewalSeconds <= 0.0
+            || $this->intentRenewalSeconds * 3 > $this->intentLeaseSeconds) {
+            throw new \InvalidArgumentException('Multipart completion renewal interval must fit within its lease.');
+        }
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
     }
 
     public function handleRequest(Request $request): Response
     {
+        foreach (array_keys($request->getHeaders()) as $header) {
+            $header = strtolower($header);
+            if ($header === 'x-amz-sdk-checksum-algorithm' || str_starts_with($header, 'x-amz-checksum-')) {
+                throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                    'Multipart additional checksums are not supported.',
+                );
+            }
+        }
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -65,13 +92,39 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $uploadId = $queryParams['uploadId'] ?? '';
 
         $upload = $this->metadata->getMultipartUpload($uploadId);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         if ($upload === null || $upload['bucket'] !== $bucket || $upload['key_name'] !== $key) {
             throw new NoSuchUploadException();
         }
         if ($upload['owner_id'] !== $ownerId) {
             throw new NoSuchUploadException();
         }
+        if (($upload['bucket_generation'] ?? '') !== $bucketInfo->generation) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Multipart upload belongs to an unverified bucket generation.',
+            );
+        }
+        $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
+        $uploadStorage = $uploadTier->backend;
+        if ($this->requireLocalFencedCompletion
+            && (! self::isLocalFilesystem($uploadStorage)
+                || ! $this->metadata instanceof LocalMultipartCompletionIntentStore)) {
+            throw new InternalErrorException('Local multipart completion requires a qualified filesystem backend and fenced metadata store.');
+        }
+        $storageTier = $uploadTier->name;
         $uploadEncryptionMode = $upload['user_metadata']['__sse-algorithm'] ?? null;
+        $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
+        $partFormat = $upload['user_metadata']['__mpu-part-format'] ?? null;
+        $encryptedV2 = $partFormat === EncryptedMultipartPartCodec::FORMAT;
+        if ($partFormat !== null && $partFormat !== EncryptedMultipartPartCodec::PLAINTEXT_FORMAT && ! $encryptedV2) {
+            throw new InternalErrorException('Unknown multipart part format.');
+        }
+        if ($uploadEncryptionMode !== null && ! $encryptedV2) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException('Legacy encrypted multipart upload must be aborted.');
+        }
+        $guardedEncryptedBackend = $encryptedV2 && $this->requireLocalFencedCompletion
+            && self::localFilesystemBackend($uploadStorage)?->hostEvidenceReader() !== null
+                ? self::localFilesystemBackend($uploadStorage) : null;
         if ($uploadEncryptionMode !== null) {
             EncryptionRequestResolver::requireEncryptionService($this->encryption);
         }
@@ -84,6 +137,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                 'SSE-C headers are not valid for this multipart upload.',
             );
+        }
+        $workerKeyringFingerprint = '';
+        if ($guardedEncryptedBackend !== null) {
+            if ($uploadEncryptionMode === EncryptionRequestResolver::SSE_S3) {
+                $workerKeyringFingerprint = $this->encryption instanceof ConfigWorkerKeyringCompatible
+                    ? $this->encryption->configWorkerKeyringFingerprint() : null;
+                if ($workerKeyringFingerprint === null) {
+                    throw new InternalErrorException('Guarded SSE-S3 completion requires the injected worker-compatible Config keyring.');
+                }
+            } elseif ($uploadEncryptionMode !== EncryptionRequestResolver::SSE_C || $completionCustomerKey === null) {
+                throw new InternalErrorException('Guarded encrypted multipart completion has no valid encryption mode.');
+            }
         }
 
         // Parse XML body for parts list.
@@ -134,6 +199,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             ];
         }
 
+        // Reject an object larger than S3's 5-TiB limit before creating a
+        // durable attempt or invoking any storage assembly. The subtraction
+        // inside sumObjectBytes() keeps the accumulation overflow-safe.
+        $expectedSize = MultipartPartSize::sumObjectBytes(array_column($validatedParts, 'size'));
+
         // Validate minimum part size: all parts except the last must be >= 5 MiB.
         if ($this->enforceMinPartSize) {
             $minPartSize = 5 * 1024 * 1024;
@@ -149,86 +219,214 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
         }
 
-        // Assemble parts in storage.
-        try {
-            $writeResult = $this->storage->assembleMultipartUpload($bucket, $key, $uploadId, $validatedParts);
-        } catch (InternalErrorException $e) {
-            // If assembly fails, check whether a concurrent AbortMultipartUpload
-            // deleted the upload. Give the client a clear 404 instead of a 500.
-            if ($this->metadata->getMultipartUpload($uploadId) === null) {
-                throw new NoSuchUploadException();
-            }
-            throw $e;
+        // Reject oversized encrypted uploads before assembly writes a
+        // persistent plaintext object. Subtraction also avoids integer
+        // overflow when summing part sizes from metadata.
+        if ($uploadEncryptionMode !== null && $expectedSize > $this->maxEncryptedObjectSize) {
+            throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+            );
         }
 
-        // Composite ETag: md5-of-concatenated-part-md5s + "-" + partCount (AWS S3 format).
+        // A malformed part ETag must fail before assembly creates storage
+        // data. The ETag is also part of the durable attempt's part digest.
         $partMd5s = '';
-        foreach ($validatedParts as $vp) {
-            $hexEtag = trim($vp['etag'], '"');
-            $bin = ctype_xdigit($hexEtag) ? hex2bin($hexEtag) : false;
-            if ($bin === false) {
-                throw new InternalErrorException(
-                    'Part ETag is not a valid hex string.',
-                );
+        foreach ($validatedParts as $part) {
+            $hexEtag = trim($part['etag'], '"');
+            $binaryEtag = ctype_xdigit($hexEtag) ? hex2bin($hexEtag) : false;
+            if ($binaryEtag === false || strlen($binaryEtag) !== 16) {
+                throw new InternalErrorException('Part ETag is not a valid MD5 hex string.');
             }
-            $partMd5s .= $bin;
+            $partMd5s .= $binaryEtag;
         }
         $etag = '"' . md5($partMd5s) . '-' . count($validatedParts) . '"';
 
-        // Encrypt the assembled object if encryption was specified in the upload metadata.
-        $userMetadata = $upload['user_metadata'];
-        $encMeta = [];
-        $bufferedWorkLock = $uploadEncryptionMode !== null
-            ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
-            : null;
+        if (! $this->metadata instanceof MultipartWriteIntentStore
+            || ! $uploadStorage instanceof RecoverableMultipartAssemblyBackend
+        ) {
+            throw new InternalErrorException('Multipart completion requires durable write-intent capable backends.');
+        }
+
+        $attemptId = bin2hex(random_bytes(16));
+        $plannedPaths = $uploadStorage->planMultipartCompletionPaths(
+            $bucket,
+            $key,
+            $bucketInfo->generation,
+            $attemptId,
+        );
+        $intentNow = $this->metadata->multipartWriteIntentNow();
+        $intent = new MultipartWriteIntent(
+            attemptId: $attemptId,
+            uploadId: $uploadId,
+            bucket: $bucket,
+            bucketGeneration: $bucketInfo->generation,
+            ownerId: $ownerId,
+            storageTier: $storageTier,
+            assemblyPath: $plannedPaths['assembly'],
+            finalPath: $plannedPaths['final'],
+            partDigest: MultipartWriteIntent::digestParts($validatedParts),
+            sseMode: $uploadEncryptionMode,
+            leaseUntil: $intentNow + $this->intentLeaseSeconds,
+            nextAttemptAt: $intentNow + $this->intentLeaseSeconds,
+        );
+        $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $request, $uploadId, $bucket, $key, $validatedParts, $intent, $uploadEncryptionMode): void {
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
+            $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
+            $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
+            \assert($this->metadata instanceof MultipartWriteIntentStore);
+            $this->metadata->createMultipartWriteIntent($intent);
+        });
+
+        // The local filesystem publisher is create-only, but the one-shot SQL
+        // token must be durable before a worker can attempt its hard link.
+        // Arm before starting the heartbeat so its expected-lease CAS cannot
+        // race with a renewal of the same intent.
+        $localDispatchId = null;
+        $currentLease = $intent->leaseUntil;
+        if (self::isLocalFilesystem($uploadStorage)) {
+            if (! $this->metadata instanceof LocalMultipartCompletionIntentStore) {
+                $this->abandonAttempt($intent);
+                throw new InternalErrorException('Local multipart completion requires a fenced metadata store.');
+            }
+            $localDispatchId = bin2hex(random_bytes(16));
+        }
 
         try {
-            if ($this->encryption !== null) {
-                $uploadSseAlgo = $uploadEncryptionMode;
+            if ($localDispatchId !== null) {
+                \assert($this->metadata instanceof LocalMultipartCompletionIntentStore);
+                $nextLease = max($currentLease + 0.001, $this->metadata->multipartWriteIntentNow() + $this->intentLeaseSeconds);
+                if (! $this->metadata->armMultipartWriteIntent($intent->attemptId, $localDispatchId, $currentLease, $nextLease)) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Local multipart completion attempt could not be armed.');
+                }
+                $currentLease = $nextLease;
+            }
 
-                if ($uploadSseAlgo === 'SSE-C') {
-                    $sseCKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
-                    \assert($completionCustomerKey !== null && $sseCKeyMd5 !== null);
+            // Renew while an asynchronous storage worker assembles or writes the
+            // object. The database clock and CAS prevent renewal after Abort,
+            // collector takeover, or expiry. Stop before the publish transaction.
+            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$currentLease): bool {
+                \assert($this->metadata instanceof MultipartWriteIntentStore);
+                $nextLease = $this->metadata->multipartWriteIntentNow() + $this->intentLeaseSeconds;
+                if (! $this->metadata->renewMultipartWriteIntent($intent->attemptId, $currentLease, $nextLease)) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart completion attempt lost its lease.');
+                }
+                $currentLease = $nextLease;
 
-                    if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                        throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                            'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                        );
-                    }
-                    $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                    $enc = $this->encryption->encryptSseC($plaintext, $completionCustomerKey);
-                    $writeResult = $this->replaceStoredPayload($bucket, $key, $writeResult, $enc['ciphertext']);
-
-                    $encMeta = [
-                        'sse-algorithm' => 'SSE-C',
-                        'sse-iv' => $enc['iv'],
-                        'sse-tag' => $enc['tag'],
-                        'sse-customer-key-md5' => $sseCKeyMd5,
-                    ];
-                } elseif ($uploadSseAlgo === 'AES256') {
-                    // SSE-S3.
-                    if ($writeResult->size > $this->maxEncryptedObjectSize) {
-                        throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                            'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                        );
-                    }
-                    $plaintext = \Amp\ByteStream\buffer($this->storage->getObjectByPath($writeResult->path));
-                    $enc = $this->encryption->encryptSseS3($plaintext);
-                    $writeResult = $this->replaceStoredPayload($bucket, $key, $writeResult, $enc['ciphertext']);
-
-                    $encMeta = [
-                        'sse-algorithm' => 'AES256',
-                        'sse-key' => $enc['encryptedDataKey'],
-                        'sse-iv' => $enc['iv'],
-                        'sse-tag' => $enc['tag'],
-                    ];
+                return true;
+            }, $this->intentRenewalSeconds);
+        } catch (\Throwable $error) {
+            if ($localDispatchId !== null && $this->metadata instanceof LocalMultipartCompletionIntentStore) {
+                try {
+                    $this->metadata->retireLocalMultipartWriteIntentBeforeDispatch($intent->attemptId, $localDispatchId);
+                } catch (\Throwable) {
+                    // Preserve the arming failure. The undispatched collector
+                    // can still retire an unarmed attempt after its lease.
+                }
+            } else {
+                try {
+                    $this->abandonAttempt($intent);
+                } catch (\Throwable) {
+                    // Preserve the failure that prevented worker submission.
                 }
             }
+
+            throw $error;
+        }
+
+        // New SSE uploads authenticate each stored ciphertext part and encrypt
+        // the final object directly. Legacy uploads retain their assembly path.
+        $userMetadata = $upload['user_metadata'];
+        $encMeta = [];
+        try {
+            if ($encryptedV2) {
+                if ($guardedEncryptedBackend !== null) {
+                    if ($localDispatchId === null || $uploadEncryptionMode === null) {
+                        throw new InternalErrorException('Guarded encrypted completion has no armed dispatch or mode.');
+                    }
+                    $completed = $guardedEncryptedBackend->completeEncryptedMultipartUploadFencedAtPath(
+                        $bucket,
+                        $key,
+                        $bucketInfo->generation,
+                        $attemptId,
+                        $uploadId,
+                        $validatedParts,
+                        $intent->finalPath,
+                        $uploadEncryptionMode,
+                        $this->maxEncryptedObjectSize,
+                        $completionCustomerKey,
+                        $workerKeyringFingerprint,
+                    );
+                    $writeResult = $completed->write;
+                    $encMeta = $completed->encryptionMetadata;
+                    $this->assertEncryptedWorkerResult(
+                        $writeResult,
+                        $encMeta,
+                        $intent->finalPath,
+                        $expectedSize,
+                        $etag,
+                        $uploadEncryptionMode,
+                        $completionCustomerKey,
+                    );
+                } else {
+                    [$writeResult, $encMeta] = $this->completeEncryptedParts(
+                        $uploadStorage,
+                        $bucket,
+                        $key,
+                        $uploadId,
+                        $bucketInfo->generation,
+                        $validatedParts,
+                        $expectedSize,
+                        $etag,
+                        $uploadEncryptionMode,
+                        $completionCustomerKey,
+                        $intent->finalPath,
+                        $request,
+                    );
+                }
+            } else {
+                $local = $this->requireLocalFencedCompletion ? self::localFilesystemBackend($uploadStorage) : null;
+                if ($local !== null) {
+                    if ($localDispatchId === null) {
+                        throw new InternalErrorException('Local multipart assembly has no armed dispatch.');
+                    }
+                    $writeResult = $local->assembleMultipartUploadFencedAtPath(
+                        $bucket,
+                        $key,
+                        $bucketInfo->generation,
+                        $attemptId,
+                        $uploadId,
+                        $validatedParts,
+                        $intent->assemblyPath,
+                    );
+                } else {
+                    $writeResult = $uploadStorage->assembleMultipartUploadAtPath(
+                        $bucket,
+                        $key,
+                        $uploadId,
+                        $validatedParts,
+                        $intent->assemblyPath,
+                    );
+                }
+                if ($writeResult->path !== $intent->assemblyPath
+                    || $writeResult->size !== $expectedSize
+                    || ! hash_equals(trim($etag, '"'), strtolower($writeResult->md5Hex))) {
+                    throw new InternalErrorException('Multipart assembly result does not match selected parts.');
+                }
+            }
+            $heartbeat->stop();
         } catch (\Throwable $e) {
-            $this->deleteUncommittedPath($bucket, $writeResult->path);
+            try {
+                $heartbeat->stop();
+            } catch (\Throwable $heartbeatError) {
+                $e = $heartbeatError;
+            }
+            $this->abandonAttempt($intent);
+            if ($e instanceof InternalErrorException && $this->metadata->getMultipartUpload($uploadId) === null) {
+                throw new NoSuchUploadException();
+            }
             throw $e;
-        } finally {
-            $bufferedWorkLock?->release();
         }
 
         // Merge encryption metadata (replace any stubs from CreateMultipartUpload).
@@ -272,7 +470,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 $aclGrants = AclGrantResolver::validateGrants($decodedAclGrants);
             }
         } catch (\Throwable $e) {
-            $this->deleteUncommittedPath($bucket, $writeResult->path);
+            $this->abandonAttempt($intent);
             throw new InternalErrorException('Multipart upload metadata is invalid.', $e);
         }
 
@@ -284,15 +482,16 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $userMetadata['__mpu-storage-class'],
             $userMetadata['__mpu-acl-grants'],
             $userMetadata['__mpu-tags'],
+            $userMetadata['__mpu-part-format'],
             $userMetadata['__object-lock-mode'],
             $userMetadata['__object-lock-retain-until-date'],
             $userMetadata['__object-lock-legal-hold'],
         );
 
         // Store final object metadata (versioning-aware).
-        $versioning = $this->metadata->getBucketVersioning($bucket);
         $versionId = null;
         $oldObjectToClean = null;
+        $oldPathsToClean = [];
         $cleanupParts = [];
         $event = $this->notifications?->createEvent(
             's3:ObjectCreated:CompleteMultipartUpload',
@@ -301,6 +500,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $writeResult->size,
             $etag,
             $ownerId,
+            request: $request,
+            bucketGeneration: $bucketInfo->generation,
         ) ?? new S3Event(
             's3:ObjectCreated:CompleteMultipartUpload',
             $bucket,
@@ -311,6 +512,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         );
 
         try {
+            $versioning = $this->metadata->getBucketVersioning($bucket);
             if ($versioning === 'Enabled') {
                 $this->metadata->transaction(function () use (
                     $bucket,
@@ -330,31 +532,45 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $tags,
                     $objectLockHeaders,
                     $uploadId,
-                    $event,
+                    $validatedParts,
+                    $intent,
+                    $localDispatchId,
+                    &$event,
                     $versioning,
+                    $uploadEncryptionMode,
                     &$versionId,
                     &$cleanupParts,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                    \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                    $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
+                    $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
+                        ? $bucketInfo->ownerId : $ownerId;
+                    $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
+                        ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                    $this->assertCurrentPublicAclAllowed($bucket, $storedAclGrants);
                     if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                         throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                             'Bucket versioning changed while the multipart upload was being committed.',
                         );
                     }
-                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId);
+                    (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
+                    $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
                     $this->quotas?->assertCanWriteObject(
-                        $ownerId,
+                        $storedOwnerId,
                         $bucket,
                         null,
                         $writeResult->size,
                         true,
                         $upload['upload_id'],
+                        $ownerId,
                     );
 
                     $versionId = $this->metadata->putObjectVersioned(
                         bucket: $bucket,
                         key: $key,
-                        ownerId: $ownerId,
+                        ownerId: $storedOwnerId,
                         size: $writeResult->size,
                         etag: $etag,
                         contentType: $upload['content_type'],
@@ -365,12 +581,20 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
-                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
+                    $this->metadata->updateObjectPlacement(
+                        $bucket,
+                        $key,
+                        $versionId,
+                        $storageClass,
+                        $intent->storageTier,
+                        $writeResult->path,
+                    );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
                     $this->metadata->putAcl(
                         'object',
                         ObjectVersionResolver::aclResourceName($bucket, $key, $versionId),
-                        $ownerId,
-                        $aclGrants,
+                        $storedOwnerId,
+                        $storedAclGrants,
                     );
                     $this->metadata->putObjectTagging($bucket, $key, $tags, $versionId);
                     (new ObjectLockRequestApplier($this->metadata))->apply(
@@ -380,6 +604,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         $versionId,
                         $objectLockHeaders,
                     );
+                    $event = $event->withVersionId($versionId);
                     $this->notifications?->enqueueWebhooks($event);
                     $cleanupParts = MultipartCleanup::stage(
                         $this->metadata,
@@ -387,8 +612,12 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         $key,
                         $uploadId,
                         $ownerId,
-                        $this->storageTiers->defaultTier()->name,
+                        $intent->storageTier,
+                        $bucketInfo->generation,
                     );
+                    if (! $this->consumeCompletionIntent($intent, $localDispatchId)) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart completion attempt expired.');
+                    }
                 });
             } else {
                 // Wrap read-old + write-new in a transaction to prevent concurrent
@@ -410,34 +639,56 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $request,
                     $tags,
                     $uploadId,
+                    $validatedParts,
+                    $intent,
+                    $localDispatchId,
                     $event,
                     $versioning,
+                    $uploadEncryptionMode,
                     &$oldObjectToClean,
+                    &$oldPathsToClean,
                     &$cleanupParts,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                    \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                    $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
+                    $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
+                        ? $bucketInfo->ownerId : $ownerId;
+                    $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
+                        ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                    $this->assertCurrentPublicAclAllowed($bucket, $storedAclGrants);
                     if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                         throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                             'Bucket versioning changed while the multipart upload was being committed.',
                         );
                     }
-                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId);
-                    $existingObj = $this->metadata->getObjectMetadata($bucket, $key);
-                    $oldObjectToClean = $existingObj;
+                    (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
+                    $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
+                    $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+                    $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+                    if ($oldObjectToClean !== null) {
+                        (new \OpsFour\S3Server\ObjectLock\ObjectLockChecker($this->metadata))
+                            ->checkProtection($bucket, $key, 'null');
+                        if ($oldObjectToClean->restoredStoragePath !== null) {
+                            \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($oldObjectToClean, $this->storageTiers);
+                        }
+                    }
 
                     $this->quotas?->assertCanWriteObject(
-                        $ownerId,
+                        $storedOwnerId,
                         $bucket,
-                        $existingObj,
+                        $oldObjectToClean,
                         $writeResult->size,
                         false,
                         $upload['upload_id'],
+                        $ownerId,
                     );
 
                     $this->metadata->putObjectMetadata(
                         bucket: $bucket,
                         key: $key,
-                        ownerId: $ownerId,
+                        ownerId: $storedOwnerId,
                         size: $writeResult->size,
                         etag: $etag,
                         contentType: $upload['content_type'],
@@ -448,43 +699,56 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
-                    $this->metadata->putAcl('object', $bucket . '/' . $key, $ownerId, []);
+                    $this->metadata->updateObjectPlacement(
+                        $bucket,
+                        $key,
+                        null,
+                        $storageClass,
+                        $intent->storageTier,
+                        $writeResult->path,
+                    );
+                    $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
                     $this->metadata->putAcl(
                         'object',
                         ObjectVersionResolver::aclResourceName($bucket, $key, null),
-                        $ownerId,
-                        $aclGrants,
+                        $storedOwnerId,
+                        $storedAclGrants,
                     );
                     $this->metadata->putObjectTagging($bucket, $key, $tags);
                     (new ObjectLockRequestApplier($this->metadata))->apply($request, $bucket, $key, null);
                     $this->notifications?->enqueueWebhooks($event);
+                    if ($oldObjectToClean !== null) {
+                        $oldPathsToClean = $this->stageReplacedData($oldObjectToClean, $intent->storageTier, $writeResult->path);
+                    }
                     $cleanupParts = MultipartCleanup::stage(
                         $this->metadata,
                         $bucket,
                         $key,
                         $uploadId,
                         $ownerId,
-                        $this->storageTiers->defaultTier()->name,
+                        $intent->storageTier,
+                        $bucketInfo->generation,
                     );
+                    if (! $this->consumeCompletionIntent($intent, $localDispatchId)) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart completion attempt expired.');
+                    }
                 });
             }
         } catch (\Throwable $e) {
-            $this->deleteUncommittedPath($bucket, $writeResult->path);
+            $this->abandonAttempt($intent);
             throw $e;
         }
 
         // Clean up old storage file on overwrite (non-versioned only).
-        if ($oldObjectToClean !== null) {
-            $this->deleteStoredData($oldObjectToClean, $writeResult->path);
-        }
+        $this->deleteStagedData($bucket, $oldPathsToClean);
 
         MultipartCleanup::clean(
             $this->metadata,
-            $this->storage,
+            $uploadStorage,
             $bucket,
             $key,
             $uploadId,
-            $this->storageTiers->defaultTier()->name,
+            $intent->storageTier,
             $cleanupParts,
         );
 
@@ -492,13 +756,15 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $this->notifications?->dispatchInternalEvent($event);
 
         // Build response.
-        $location = sprintf('/%s/%s', $bucket, $key);
+        $location = (string) $request->getUri()->withQuery('')->withFragment('');
 
         $xml = XmlResponseBuilder::completeMultipartUploadResult($location, $bucket, $key, $etag);
 
         $responseHeaders = ['Content-Type' => 'application/xml'];
 
-        if ($versionId !== null) {
+        if ($versioning === 'Suspended') {
+            $responseHeaders['x-amz-version-id'] = 'null';
+        } elseif ($versionId !== null) {
             $responseHeaders['x-amz-version-id'] = $versionId;
         }
 
@@ -517,57 +783,258 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         );
     }
 
-    private function deleteStoredData(ObjectInfo $object, string $preservePath): void
-    {
-        $path = $object->systemMetadata['storagePath'] ?? null;
-        if ($path !== null && $path !== '' && $path !== $preservePath) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->tier($object->storageTier)->backend, $object->bucket, $object->storageTier, $path);
-        }
-
-        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '' && $object->restoredStoragePath !== $preservePath) {
-            \OpsFour\S3Server\Storage\DurableStorageDelete::run($this->metadata, $this->storageTiers->defaultBackend(), $object->bucket, $this->storageTiers->defaultTier()->name, $object->restoredStoragePath);
-        }
-    }
-
-    private function replaceStoredPayload(
+    /**
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $parts
+     * @return array{StorageWriteResult, array<string, string>}
+     */
+    private function completeEncryptedParts(
+        RecoverableMultipartAssemblyBackend $storage,
         string $bucket,
         string $key,
-        StorageWriteResult $original,
-        string $payload,
-    ): StorageWriteResult {
-        $replacement = $this->storage->putObject(
-            $bucket,
-            $key,
-            new \Amp\ByteStream\ReadableBuffer($payload),
-        );
-
-        try {
-            $this->deleteUncommittedPath($bucket, $original->path);
-        } catch (\Throwable $e) {
-            $this->deleteUncommittedPath($bucket, $replacement->path);
-            throw $e;
+        string $uploadId,
+        string $bucketGeneration,
+        array $parts,
+        int $expectedSize,
+        string $etag,
+        ?string $mode,
+        ?string $customerKey,
+        string $finalPath,
+        Request $request,
+    ): array {
+        if ($mode === null || $this->encryption === null) {
+            throw new InternalErrorException('Encrypted multipart completion is unavailable.');
         }
+        $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+        try {
+            BufferedSsePayload::assertMemoryHeadroom($expectedSize);
+            $plaintext = '';
+            foreach ($parts as $part) {
+                $stream = $storage->getObjectByPath($part['storagePath']);
+                try {
+                    [$stored] = BufferedSsePayload::read(
+                        $stream,
+                        $part['size'] + EncryptedMultipartPartCodec::MAX_OVERHEAD,
+                    );
+                } finally {
+                    $stream->close();
+                }
+                $partPlaintext = EncryptedMultipartPartCodec::decode(
+                    $this->encryption,
+                    $mode,
+                    $stored,
+                    $customerKey,
+                    $bucketGeneration,
+                    $bucket,
+                    $uploadId,
+                    $part['partNumber'],
+                );
+                if (strlen($partPlaintext) !== $part['size']
+                    || ! hash_equals(trim($part['etag'], '"'), md5($partPlaintext))) {
+                    throw new InternalErrorException('Encrypted multipart part does not match its metadata.');
+                }
+                $plaintext .= $partPlaintext;
+            }
+            if (strlen($plaintext) !== $expectedSize) {
+                throw new InternalErrorException('Encrypted multipart object size does not match its parts.');
+            }
 
-        return new StorageWriteResult(
-            path: $replacement->path,
-            size: $original->size,
-            md5Hex: $original->md5Hex,
-            crc32Base64: $original->crc32Base64,
-            crc32cBase64: $original->crc32cBase64,
-            sha1Base64: $original->sha1Base64,
-            sha256Base64: $original->sha256Base64,
-        );
+            if ($mode === EncryptionRequestResolver::SSE_C) {
+                if ($customerKey === null) {
+                    throw new InternalErrorException('Multipart customer key is unavailable.');
+                }
+                $encrypted = $this->encryption->encryptSseC($plaintext, $customerKey);
+                $customerKeyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
+                if ($customerKeyMd5 === null) {
+                    throw new InternalErrorException('Multipart customer key digest is unavailable.');
+                }
+                $encMeta = [
+                    'sse-algorithm' => 'SSE-C',
+                    'sse-iv' => $encrypted['iv'],
+                    'sse-tag' => $encrypted['tag'],
+                    'sse-customer-key-md5' => $customerKeyMd5,
+                ];
+            } elseif ($mode === EncryptionRequestResolver::SSE_S3) {
+                $encrypted = $this->encryption->encryptSseS3($plaintext);
+                $encMeta = [
+                    'sse-algorithm' => 'AES256',
+                    'sse-key' => $encrypted['encryptedDataKey'],
+                    'sse-iv' => $encrypted['iv'],
+                    'sse-tag' => $encrypted['tag'],
+                ];
+            } else {
+                throw new InternalErrorException('Unsupported encrypted multipart mode.');
+            }
+            $ciphertext = $encrypted['ciphertext'];
+            if (strlen($ciphertext) !== $expectedSize) {
+                throw new InternalErrorException('Encrypted multipart final payload size is invalid.');
+            }
+            $physical = $storage->putObjectAtPath(
+                $bucket,
+                $key,
+                new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                $finalPath,
+            );
+            if ($physical->path !== $finalPath || $physical->size !== strlen($ciphertext)
+                || ! hash_equals(md5($ciphertext), strtolower($physical->md5Hex))) {
+                throw new InternalErrorException('Encrypted multipart final write does not match its planned payload.');
+            }
+
+            return [new StorageWriteResult($finalPath, $expectedSize, trim($etag, '"')), $encMeta];
+        } finally {
+            $lock->release();
+        }
     }
 
-    private function deleteUncommittedPath(string $bucket, string $path): void
+    /** @param array<string, string> $metadata */
+    private function assertEncryptedWorkerResult(
+        StorageWriteResult $write,
+        array $metadata,
+        string $plannedPath,
+        int $expectedSize,
+        string $etag,
+        string $mode,
+        ?string $customerKey,
+    ): void {
+        if ($write->path !== $plannedPath || $write->size !== $expectedSize
+            || ! hash_equals(strtolower(trim($etag, '"')), strtolower($write->md5Hex))) {
+            throw new InternalErrorException('Encrypted completion worker result differs from its selected SQL attempt.');
+        }
+        $expectedKeys = $mode === EncryptionRequestResolver::SSE_S3
+            ? ['sse-algorithm', 'sse-iv', 'sse-key', 'sse-tag']
+            : ['sse-algorithm', 'sse-customer-key-md5', 'sse-iv', 'sse-tag'];
+        $actualKeys = array_keys($metadata);
+        sort($actualKeys);
+        if ($actualKeys !== $expectedKeys
+            || ($mode === EncryptionRequestResolver::SSE_S3 && $metadata['sse-algorithm'] !== 'AES256')
+            || ($mode === EncryptionRequestResolver::SSE_C && ($customerKey === null
+                || $metadata['sse-algorithm'] !== 'SSE-C'
+                || ! hash_equals(base64_encode(md5($customerKey, true)), $metadata['sse-customer-key-md5'])))
+            || ! in_array($mode, [EncryptionRequestResolver::SSE_S3, EncryptionRequestResolver::SSE_C], true)
+            || strlen(base64_decode($metadata['sse-iv'], true) ?: '') !== 12
+            || strlen(base64_decode($metadata['sse-tag'], true) ?: '') !== 16
+            || ($mode === EncryptionRequestResolver::SSE_S3
+                && (($wrappedKey = base64_decode($metadata['sse-key'], true)) === false
+                    || strlen($wrappedKey) < 60 || strlen($wrappedKey) > 320))) {
+            throw new InternalErrorException('Encrypted completion worker returned invalid encryption metadata.');
+        }
+    }
+
+    /** @return list<array{tier: string, path: string}> */
+    private function stageReplacedData(ObjectInfo $object, string $preserveTier, string $preservePath): array
+    {
+        $paths = [];
+        $path = $object->systemMetadata['storagePath'] ?? null;
+        if ($path !== null && $path !== '' && ($path !== $preservePath || $object->storageTier !== $preserveTier)) {
+            $this->storageTiers->tier($object->storageTier);
+            $paths[] = ['tier' => $object->storageTier, 'path' => $path];
+        }
+
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
+            $restoredTier = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($object, $this->storageTiers);
+            if ($object->restoredStoragePath !== $preservePath || $restoredTier->name !== $preserveTier) {
+                $duplicate = false;
+                foreach ($paths as $candidate) {
+                    if ($candidate['tier'] === $restoredTier->name && $candidate['path'] === $object->restoredStoragePath) {
+                        $duplicate = true;
+                        break;
+                    }
+                }
+                if (! $duplicate) {
+                    $paths[] = ['tier' => $restoredTier->name, 'path' => $object->restoredStoragePath];
+                }
+            }
+        }
+        foreach ($paths as $entry) {
+            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path']);
+        }
+
+        return $paths;
+    }
+
+    /** @param list<array{tier: string, path: string}> $paths */
+    private function deleteStagedData(string $bucket, array $paths): void
+    {
+        foreach ($paths as $entry) {
+            try {
+                \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
+                    $this->metadata,
+                    $this->storageTiers->tier($entry['tier'])->backend,
+                    $bucket,
+                    $entry['tier'],
+                    $entry['path'],
+                );
+            } catch (\Throwable) {
+                // The committed exact-path job remains for the collector.
+            }
+        }
+    }
+
+    private function deleteUncommittedPath(string $bucket, string $storageTier, string $path): void
     {
         \OpsFour\S3Server\Storage\DurableStorageDelete::run(
             $this->metadata,
-            $this->storage,
+            $this->storageTiers->tier($storageTier)->backend,
             $bucket,
-            $this->storageTiers->defaultTier()->name,
+            $storageTier,
             $path,
         );
+    }
+
+    private function abandonAttempt(MultipartWriteIntent $intent): void
+    {
+        \assert($this->metadata instanceof MultipartWriteIntentStore);
+        if (! $this->metadata->abandonMultipartWriteIntent($intent->attemptId, $this->metadata->multipartWriteIntentNow())) {
+            return;
+        }
+
+        // Only the local collector may replace a dispatched path with its
+        // permanent seal. An inline delete could race after that replacement
+        // and let a late worker publish bytes into the freed name.
+        if (self::isLocalFilesystem($this->storageTiers->tier($intent->storageTier)->backend)) {
+            return;
+        }
+
+        // The durable tombstone remains for later reconciliation, including
+        // remote writes that may finish after this inline delete.
+        foreach (array_unique([$intent->assemblyPath, $intent->finalPath]) as $path) {
+            $this->deleteUncommittedPath($intent->bucket, $intent->storageTier, $path);
+        }
+    }
+
+    private function consumeCompletionIntent(MultipartWriteIntent $intent, ?string $localDispatchId): bool
+    {
+        if ($localDispatchId !== null) {
+            return $this->metadata instanceof LocalMultipartCompletionIntentStore
+                && $this->metadata->consumeMultipartWriteIntentWithDispatch($intent->attemptId, $localDispatchId);
+        }
+
+        return $this->metadata instanceof MultipartWriteIntentStore
+            && $this->metadata->consumeMultipartWriteIntent($intent->attemptId);
+    }
+
+    private static function isLocalFilesystem(StorageBackend $backend): bool
+    {
+        return self::localFilesystemBackend($backend) !== null;
+    }
+
+    private static function localFilesystemBackend(StorageBackend $backend): ?FilesystemBackend
+    {
+        while ($backend instanceof ObservedStorageBackend) {
+            $backend = $backend->innerBackend();
+        }
+
+        return $backend instanceof FilesystemBackend ? $backend : null;
+    }
+
+    private function assertPlainUploadAllowed(string $bucket, ?string $uploadEncryptionMode): void
+    {
+        $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
+        \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
+        if ($uploadEncryptionMode === null && $bucketEncryption !== null) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Bucket default encryption changed before multipart completion.',
+            );
+        }
     }
 
     private function assertUploadIsActive(
@@ -575,6 +1042,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         string $bucket,
         string $key,
         string $ownerId,
+        string $bucketGeneration,
+        string $storageTier,
     ): void {
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if (
@@ -584,6 +1053,50 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             || $upload['owner_id'] !== $ownerId
         ) {
             throw new NoSuchUploadException();
+        }
+        if (($upload['bucket_generation'] ?? '') !== $bucketGeneration) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Multipart upload belongs to an unverified bucket generation.',
+            );
+        }
+        if (($upload['storage_tier'] ?? null) !== $storageTier) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Multipart upload storage tier changed during completion.',
+            );
+        }
+    }
+
+    /**
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $selectedParts
+     */
+    private function assertSelectedPartsUnchanged(string $uploadId, array $selectedParts): void
+    {
+        $currentParts = [];
+        foreach ($this->metadata->getParts($uploadId) as $part) {
+            $currentParts[$part['part_number']] = $part;
+        }
+
+        foreach ($selectedParts as $selected) {
+            $current = $currentParts[$selected['partNumber']] ?? null;
+            if ($current === null
+                || $current['etag'] !== $selected['etag']
+                || $current['size'] !== $selected['size']
+                || $current['storage_path'] !== $selected['storagePath']) {
+                throw new InvalidPartException('A selected part changed while the multipart upload was being assembled.');
+            }
+        }
+    }
+
+    /** @param list<array{granteeType: string, granteeId: string, permission: string}> $grants */
+    private function assertCurrentPublicAclAllowed(string $bucket, array $grants): void
+    {
+        $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
+        if ($publicAccessBlock !== null
+            && $publicAccessBlock['blockPublicAcls']
+            && AclGrantResolver::isPublic($grants)) {
+            throw new \OpsFour\S3Server\Exception\AccessDeniedException(
+                'Public ACLs are blocked by the bucket Public Access Block configuration.',
+            );
         }
     }
 

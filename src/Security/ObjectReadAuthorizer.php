@@ -6,12 +6,14 @@ namespace OpsFour\S3Server\Security;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
+use OpsFour\S3Server\Policy\NamedPolicySnapshot;
 use OpsFour\S3Server\Routing\S3Operation;
 
 final readonly class ObjectReadAuthorizer
@@ -20,7 +22,7 @@ final readonly class ObjectReadAuthorizer
         private MetadataStore $metadata,
     ) {}
 
-    public function assertAllowed(Request $request, ObjectInfo $object): void
+    public function assertAllowed(Request $request, ObjectInfo $object, bool $specificVersion = false): void
     {
         $ownerId = $request->hasAttribute('ownerId')
             ? (string) $request->getAttribute('ownerId')
@@ -32,6 +34,8 @@ final readonly class ObjectReadAuthorizer
         if ($bucketOwner === null) {
             throw new AccessDeniedException();
         }
+        $ownershipEnforced = BucketOwnership::isEnforced($this->metadata, $object->bucket);
+        $effectiveObjectOwner = $ownershipEnforced ? $bucketOwner : $object->ownerId;
 
         if (
             $credential instanceof Credential
@@ -41,8 +45,9 @@ final readonly class ObjectReadAuthorizer
             throw new AccessDeniedException();
         }
 
-        $conditions = $this->conditions($request, $object, $ownerId);
+        $conditions = $this->conditions($request, $object, $ownerId, $specificVersion);
         $resource = "arn:aws:s3:::{$object->bucket}/{$object->key}";
+        $action = $specificVersion ? 's3:GetObjectVersion' : 's3:GetObject';
         $identityPolicies = [];
         if ($ownerId !== '') {
             $accountPolicy = $this->metadata->getAccountPolicy($ownerId);
@@ -55,7 +60,7 @@ final readonly class ObjectReadAuthorizer
                 if ($policyName === '') {
                     continue;
                 }
-                $namedPolicy = $this->metadata->getNamedPolicy($policyName);
+                $namedPolicy = NamedPolicySnapshot::get($request, $this->metadata, $policyName);
                 if ($namedPolicy === null) {
                     throw new AccessDeniedException('Named policy attached to credential does not exist.');
                 }
@@ -68,12 +73,13 @@ final readonly class ObjectReadAuthorizer
             $resource,
             $ownerId,
             $conditions,
+            $action,
         );
         $bucketPolicy = $this->metadata->getBucketPolicy($object->bucket);
         $resourceResult = $bucketPolicy !== null
             ? PolicyEvaluator::evaluate(
                 $bucketPolicy,
-                's3:GetObject',
+                $action,
                 $resource,
                 $ownerId,
                 $conditions,
@@ -81,6 +87,10 @@ final readonly class ObjectReadAuthorizer
             : 'Neutral';
 
         if ($identityResult === 'Deny' || $resourceResult === 'Deny') {
+            throw new AccessDeniedException();
+        }
+
+        if ($ownerId !== '' && ($ownerId !== $bucketOwner || $ownerId !== $effectiveObjectOwner) && $identityResult !== 'Allow') {
             throw new AccessDeniedException();
         }
 
@@ -96,10 +106,11 @@ final readonly class ObjectReadAuthorizer
             throw new AccessDeniedException();
         }
 
+        // The copy source is an object resource. An identity-side Allow alone
+        // cannot grant another account access to an object it does not own.
         if (
-            ($ownerId !== '' && $ownerId === $bucketOwner)
-            || $identityResult === 'Allow'
-            || $resourceResult === 'Allow'
+            ($ownerId !== '' && $ownerId === $effectiveObjectOwner)
+            || ($resourceResult === 'Allow' && $effectiveObjectOwner === $bucketOwner)
         ) {
             return;
         }
@@ -109,8 +120,8 @@ final readonly class ObjectReadAuthorizer
             $object->key,
             $object->versionId,
         );
-        $grants = $this->metadata->getAcl('object', $resourceName);
-        if ($grants === [] && ($object->versionId === null || $object->versionId === 'null')) {
+        $grants = $ownershipEnforced ? [] : $this->metadata->getAcl('object', $resourceName);
+        if (!$ownershipEnforced && $grants === [] && ($object->versionId === null || $object->versionId === 'null')) {
             $grants = $this->metadata->getAcl('object', $object->bucket . '/' . $object->key);
         }
         $ignorePublicAcls = $publicAccessBlock['ignorePublicAcls'] ?? false;
@@ -118,7 +129,7 @@ final readonly class ObjectReadAuthorizer
         if (! AclEvaluator::isAllowed(
             operation: S3Operation::GetObject,
             requesterId: $ownerId,
-            ownerId: $bucketOwner,
+            ownerId: $effectiveObjectOwner,
             grants: $grants,
             isAuthenticated: $ownerId !== '',
             ignorePublicAcls: $ignorePublicAcls,
@@ -136,12 +147,13 @@ final readonly class ObjectReadAuthorizer
         string $resource,
         string $ownerId,
         array $conditions,
+        string $action,
     ): string {
         $result = 'Neutral';
         foreach ($policies as $policy) {
             $current = PolicyEvaluator::evaluate(
                 $policy,
-                's3:GetObject',
+                $action,
                 $resource,
                 $ownerId,
                 $conditions,
@@ -161,24 +173,26 @@ final readonly class ObjectReadAuthorizer
     /**
      * @return array<string, string|list<string>>
      */
-    private function conditions(Request $request, ObjectInfo $object, string $ownerId): array
+    private function conditions(Request $request, ObjectInfo $object, string $ownerId, bool $specificVersion): array
     {
         $conditions = [
             'aws:CurrentTime' => gmdate(\DateTimeInterface::ATOM),
-            'aws:SecureTransport' => $request->getClient()->getTlsInfo() !== null ? 'true' : 'false',
+            'aws:SecureTransport' => RequestNetworkContext::secureTransport($request) ? 'true' : 'false',
         ];
         if ($ownerId !== '') {
             $conditions['aws:PrincipalArn'] = $ownerId;
         }
-        $remoteAddress = $request->getClient()->getRemoteAddress();
-        if ($remoteAddress instanceof \Amp\Socket\InternetAddress) {
-            $conditions['aws:SourceIp'] = $remoteAddress->getAddress();
+        $sourceIp = RequestNetworkContext::sourceIp($request);
+        if ($sourceIp !== null) {
+            $conditions['aws:SourceIp'] = $sourceIp;
         }
         $userAgent = $request->getHeader('user-agent');
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
-        if ($object->versionId !== null) {
+        // s3:VersionId describes the explicit copy-source request parameter,
+        // not the current version that metadata resolved implicitly.
+        if ($specificVersion && $object->versionId !== null) {
             $conditions['s3:VersionId'] = $object->versionId;
         }
         foreach ($this->metadata->getObjectTagging($object->bucket, $object->key, $object->versionId) as $tag) {

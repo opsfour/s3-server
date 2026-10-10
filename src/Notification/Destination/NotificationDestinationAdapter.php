@@ -7,11 +7,12 @@ namespace OpsFour\S3Server\Notification\Destination;
 use OpsFour\S3Server\Event\S3Event;
 
 /**
- * Contract for durable external notification destinations.
+ * Contract for optional external notification destinations.
  *
  * Implementations can wrap Redis Streams, Kafka, AMQP, NATS, or another
- * producer. Transport-specific retry, acknowledgements, and buffering should
- * stay inside the adapter.
+ * producer. Transport-specific retry, acknowledgements, and buffering stay
+ * inside the injected producer/client. The in-process listener bridge does
+ * not persist or retry an adapter result.
  */
 interface NotificationDestinationAdapter
 {

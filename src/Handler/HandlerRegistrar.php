@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler;
 
+use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Handler\Bucket\BucketOwnershipControlsHandler;
 use OpsFour\S3Server\Handler\Bucket\CreateBucketHandler;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketCorsHandler;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketEncryptionHandler;
@@ -62,23 +65,26 @@ use OpsFour\S3Server\Handler\Object\GetObjectLegalHoldHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectRetentionHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectTaggingHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
-use OpsFour\S3Server\Handler\Object\PutObjectAclHandler;
 use OpsFour\S3Server\Handler\Object\PostObjectHandler;
+use OpsFour\S3Server\Handler\Object\PutObjectAclHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectLegalHoldHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectRetentionHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectTaggingHandler;
 use OpsFour\S3Server\Handler\Object\RestoreObjectHandler;
 use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
-use Amp\Parallel\Worker\WorkerPool;
-use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Routing\HandlerRegistry;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Runtime\EfsCandidateRecoveryCapabilities;
+use OpsFour\S3Server\Runtime\EfsCandidateRuntimeResources;
 use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
+use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
+use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -119,9 +125,130 @@ final class HandlerRegistrar
         ?\OpsFour\S3Server\Contracts\CredentialProvider $credentialProvider = null,
         ?MetricsCollector $metrics = null,
         ?StorageTierRegistry $storageTiers = null,
+        ?LocalFencedObjectWriter $localFencedWriter = null,
+        ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
+    ): void {
+        if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
+            throw new \InvalidArgumentException('Local object write test profile needs both writer and lease factory.');
+        }
+        if ($localFencedWriter !== null && ($config->localObjectWriteTestScratchPath === null || ! $config->allowUnfencedStorageForTests)) {
+            throw new \InvalidArgumentException('Local object write fencing is available only in its explicit test profile.');
+        }
+
+        self::registerHandlers(
+            $registry,
+            $metadata,
+            $storage,
+            $config,
+            $encryption,
+            $notifications,
+            $selectWorkerPool,
+            $credentialProvider,
+            $metrics,
+            $storageTiers,
+            $localFencedWriter,
+            $localLeaseFactory,
+        );
+    }
+
+    /**
+     * Attach one qualified EFS resource graph to an inert handler registry.
+     * This seals the registry but does not admit HTTP serving.
+     *
+     * @internal EFS production admission remains closed in S3Server::start().
+     */
+    public static function registerQualifiedEfsCandidate(
+        HandlerRegistry $registry,
+        EfsCandidateRuntimeResources $resources,
+        S3ServerConfig $config,
+        ?EncryptionServiceInterface $encryption = null,
+        ?NotificationDispatcher $notifications = null,
+        ?WorkerPool $selectWorkerPool = null,
+        ?\OpsFour\S3Server\Contracts\CredentialProvider $credentialProvider = null,
+        ?MetricsCollector $metrics = null,
+    ): void {
+        if ($resources->buildConfig !== $config) {
+            throw new \RuntimeException('EFS candidate handlers require the exact resource-graph configuration.');
+        }
+        if ($registry->storageRegistrations() !== []) {
+            throw new \InvalidArgumentException('EFS candidate requires an empty handler registry.');
+        }
+        foreach (S3Operation::cases() as $operation) {
+            if ($registry->has($operation)) {
+                throw new \InvalidArgumentException('EFS candidate requires an empty handler registry.');
+            }
+        }
+
+        if ($encryption !== $resources->accessLogEncryption) {
+            throw new \InvalidArgumentException('EFS candidate handlers require the exact qualified encryption service.');
+        }
+
+        $resources->qualification->assertCandidateRuntimeInputs(
+            $config,
+            $resources->metadata,
+            $resources->backend,
+            $resources->tiers,
+            $resources->scratch,
+        );
+        $tier = $resources->tiers->defaultTier();
+        if ($tier->backend !== $resources->backend) {
+            throw new \RuntimeException('EFS candidate handler backend differs from the qualified tier.');
+        }
+        $resources->objectWriter->assertBoundTo($resources->backend, $tier->name, $resources->qualification->hostEvidenceReader());
+        $resources->objectLeaseFactory->assertBoundTo($resources->rawMetadata, $resources->objectRenewer);
+        $resources->partWriter->assertBoundTo($resources->metadata, $resources->backend, $tier->name);
+        $resources->objectCollector->assertBoundTo($resources->metadata, $resources->objectWriter);
+        $reader = $resources->qualification->hostEvidenceReader();
+        $resources->storageGarbageCollector->assertBoundTo($resources->metadata, $resources->tiers, $reader);
+        $resources->multipartIntentCollector->assertBoundTo(
+            EfsCandidateRecoveryCapabilities::assertReady($resources->metadata),
+            $resources->tiers,
+            $reader,
+        );
+        if ($notifications !== null && $notifications !== $resources->notifications) {
+            throw new \InvalidArgumentException('EFS candidate handlers require the exact qualified notification dispatcher.');
+        }
+        $resources->notifications->assertBoundTo($resources->metadata, $reader);
+
+        self::registerHandlers(
+            $registry,
+            $resources->metadata,
+            $resources->backend,
+            $config,
+            $encryption,
+            $resources->notifications,
+            $selectWorkerPool,
+            $credentialProvider,
+            $metrics,
+            $resources->tiers,
+            $resources->objectWriter,
+            $resources->objectLeaseFactory,
+            $resources->partWriter,
+            true,
+        );
+        $registry->sealForQualifiedEfsCandidate();
+    }
+
+    private static function registerHandlers(
+        HandlerRegistry $registry,
+        MetadataStore $metadata,
+        StorageBackend $storage,
+        S3ServerConfig $config,
+        ?EncryptionServiceInterface $encryption,
+        ?NotificationDispatcher $notifications,
+        ?WorkerPool $selectWorkerPool,
+        ?\OpsFour\S3Server\Contracts\CredentialProvider $credentialProvider,
+        ?MetricsCollector $metrics,
+        ?StorageTierRegistry $storageTiers,
+        ?LocalFencedObjectWriter $localFencedWriter,
+        ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory,
+        ?LocalFencedMultipartPartWriter $localPartWriter = null,
+        bool $qualifiedEfsCandidate = false,
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
+        $requireLocalFencedMultipart = $localFencedWriter !== null;
+        $registry->registerStorage($storage, $storageTiers);
 
         // Bucket operations.
         $registry->register(
@@ -158,6 +285,8 @@ final class HandlerRegistrar
             $config->maxEncryptedObjectSize,
             $quotas,
             $storageTiers,
+            $localFencedWriter,
+            $localLeaseFactory,
         );
         $registry->register(
             S3Operation::PutObject,
@@ -215,23 +344,32 @@ final class HandlerRegistrar
                 $config->maxEncryptedObjectSize,
                 $quotas,
                 $storageTiers,
+                $localFencedWriter,
+                $localLeaseFactory,
             ),
         );
 
         // Phase 4: Multipart upload operations.
         $registry->register(
             S3Operation::CreateMultipartUpload,
-            new CreateMultipartUploadHandler($metadata, $encryption, $quotas),
+            new CreateMultipartUploadHandler(
+                $metadata,
+                $encryption,
+                $quotas,
+                $storage,
+                $storageTiers,
+                requireWorkerCompatibleSseS3: $qualifiedEfsCandidate,
+            ),
         );
 
         $registry->register(
             S3Operation::UploadPart,
-            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers),
+            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, requireLocalFencedParts: $requireLocalFencedMultipart, localPartWriter: $localPartWriter),
         );
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, requireLocalFencedParts: $requireLocalFencedMultipart, localPartWriter: $localPartWriter),
         );
 
         $registry->register(
@@ -245,6 +383,7 @@ final class HandlerRegistrar
                 $config->maxEncryptedObjectSize,
                 $quotas,
                 $storageTiers,
+                requireLocalFencedCompletion: $requireLocalFencedMultipart,
             ),
         );
 
@@ -413,7 +552,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::PutBucketLifecycle,
-            new PutBucketLifecycleHandler($metadata),
+            new PutBucketLifecycleHandler($metadata, $storageTiers),
         );
 
         $registry->register(
@@ -428,7 +567,7 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::PutBucketNotification,
-            new PutBucketNotificationHandler($metadata),
+            new PutBucketNotificationHandler($metadata, $config->notificationRequireHttps),
         );
 
         // Phase 8: Website Hosting operations.
@@ -477,6 +616,11 @@ final class HandlerRegistrar
             S3Operation::PutBucketLogging,
             new PutBucketLoggingHandler($metadata),
         );
+
+        $ownershipControls = new BucketOwnershipControlsHandler($metadata);
+        $registry->register(S3Operation::GetBucketOwnershipControls, $ownershipControls);
+        $registry->register(S3Operation::PutBucketOwnershipControls, $ownershipControls);
+        $registry->register(S3Operation::DeleteBucketOwnershipControls, $ownershipControls);
 
         $registry->register(
             S3Operation::SelectObjectContent,

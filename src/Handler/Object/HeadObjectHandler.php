@@ -13,7 +13,10 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -36,6 +39,11 @@ final class HeadObjectHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        $includeChecksums = S3ResponseHeaders::checksumModeEnabled($request->getHeader('x-amz-checksum-mode'));
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        if (array_key_exists('partNumber', $queryParams)) {
+            throw new NotImplementedException('HeadObject partNumber is not supported.');
+        }
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -48,27 +56,36 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         // 2. Get object metadata (version-aware).
-        $versionId = self::parseVersionId($request);
+        $versionId = $queryParams['versionId'] ?? null;
 
         if ($versionId !== null) {
             $objectInfo = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
         } else {
-            $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+            $objectInfo = $this->metadata->getCurrentObjectVersion($bucket, $key);
         }
 
         if ($objectInfo === null) {
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $denyMissingObject = $versionId === null && ! MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+            // The list-visibility check may yield while the bucket is reused.
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if ($denyMissingObject) {
+                throw new \OpsFour\S3Server\Exception\AccessDeniedException();
+            }
             throw new NoSuchKeyException();
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Delete markers: return error with x-amz-delete-marker header.
         // With versionId → 405 Method Not Allowed; without → 404 Not Found.
         if ($objectInfo->isDeleteMarker) {
-            $dmHeaders = ['x-amz-delete-marker' => 'true'];
-            if ($objectInfo->versionId !== null) {
-                $dmHeaders['x-amz-version-id'] = $objectInfo->versionId;
-            }
+            $dmHeaders = [
+                'x-amz-delete-marker' => 'true',
+                'x-amz-version-id' => $objectInfo->versionId ?? 'null',
+            ];
 
             if ($versionId !== null) {
+                $dmHeaders['Last-Modified'] = $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T');
                 throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException())->withExtraHeaders($dmHeaders);
             }
 
@@ -86,39 +103,53 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         // 3. Evaluate conditional headers.
-        ConditionalHeaderEvaluator::evaluate($request, $objectInfo);
+        $emitNullVersion = $objectInfo->versionId === null
+            && $this->metadata->getBucketVersioning($bucket) !== '';
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
         // 4. Handle Range header for Content-Length calculation.
-        // HEAD requests report the content length that would be returned
-        // by a corresponding GET request with the same Range header.
+        // S3 ranged HEAD changes only Content-Length when satisfiable.
         $rangeHeader = $request->getHeader('range');
         $contentLength = $objectInfo->size;
-        $status = 200;
-        $range = null;
+        $isPartialContent = false;
 
-        if ($rangeHeader !== null && $objectInfo->size > 0) {
+        if ($rangeHeader !== null) {
             $range = self::parseRangeHeader($rangeHeader, $objectInfo->size);
 
             if ($range !== null) {
                 $contentLength = $range['end'] - $range['start'] + 1;
-                $status = 206;
+                $isPartialContent = true;
             }
         }
 
         // 5. Build response headers (same as GetObject, no body).
-        $headers = S3ResponseHeaders::build($objectInfo, $contentLength);
-
-        if ($status === 206 && $range !== null) {
-            $headers['Content-Range'] = sprintf(
-                'bytes %d-%d/%d',
-                $range['start'],
-                $range['end'],
-                $objectInfo->size,
-            );
+        $headers = S3ResponseHeaders::build(
+            $objectInfo,
+            $contentLength,
+            $emitNullVersion,
+            $includeChecksums && ! $isPartialContent,
+        );
+        $headers = S3ResponseHeaders::withAuthenticatedOverrides(
+            $headers,
+            $queryParams,
+            $ownerId !== null && $ownerId !== '',
+        );
+        // Reusing a large pool of concurrent HTTP/1 HEAD sockets caused
+        // subsequent AWS SDK requests to fail with cURL send error 55.
+        // HTTP/2 forbids the hop-by-hop Connection header.
+        if (str_starts_with($request->getProtocolVersion(), '1.')) {
+            $headers['Connection'] = 'close';
         }
 
+        $request->setAttribute('s3.objectSize', $objectInfo->size);
+
+        // Versioning metadata can yield after the first generation check.
+        // Never return a previous owner's headers after bucket-name reuse.
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+
         return new Response(
-            status: $status,
+            status: 200,
             headers: $headers,
         );
     }
@@ -144,10 +175,14 @@ final class HeadObjectHandler implements RequestHandler
 
         // Suffix range: bytes=-N.
         if (str_starts_with($rangeSpec, '-')) {
-            $suffix = (int) substr($rangeSpec, 1);
-
-            if ($suffix <= 0) {
+            $suffixText = substr($rangeSpec, 1);
+            if ($suffixText === '' || !ctype_digit($suffixText)) {
                 return null;
+            }
+            $suffix = (int) $suffixText;
+
+            if ($suffix <= 0 || $objectSize === 0) {
+                throw new InvalidRangeException();
             }
 
             if ($suffix >= $objectSize) {
@@ -162,7 +197,9 @@ final class HeadObjectHandler implements RequestHandler
 
         $parts = explode('-', $rangeSpec, 2);
 
-        if (count($parts) !== 2 || $parts[0] === '') {
+        if (count($parts) !== 2 || $parts[0] === ''
+            || !ctype_digit($parts[0])
+            || ($parts[1] !== '' && !ctype_digit($parts[1]))) {
             return null;
         }
 
@@ -189,32 +226,4 @@ final class HeadObjectHandler implements RequestHandler
         return ['start' => $start, 'end' => $end];
     }
 
-    /**
-     * Parse the versionId query parameter from the request URI.
-     */
-    private static function parseVersionId(Request $request): ?string
-    {
-        $queryString = $request->getUri()->getQuery();
-        if ($queryString === '') {
-            return null;
-        }
-
-        foreach (explode('&', $queryString) as $pair) {
-            if ($pair === '') {
-                continue;
-            }
-
-            $eqPos = strpos($pair, '=');
-            if ($eqPos !== false) {
-                $key = rawurldecode(substr($pair, 0, $eqPos));
-                if ($key === 'versionId') {
-                    $value = rawurldecode(substr($pair, $eqPos + 1));
-
-                    return $value !== '' ? $value : null;
-                }
-            }
-        }
-
-        return null;
-    }
 }

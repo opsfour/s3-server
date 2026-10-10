@@ -1,5 +1,7 @@
 <?php
 
+use OpsFour\S3Server\Laravel\EnvironmentNumber;
+
 return [
     /*
     |--------------------------------------------------------------------------
@@ -11,10 +13,13 @@ return [
     'host' => env('S3_HOST', '0.0.0.0'),
 
     // Listen port.
-    'port' => (int) env('S3_PORT', 9000),
+    'port' => EnvironmentNumber::integer('S3_PORT', 9000),
 
     // AWS region identifier.
     'region' => env('S3_REGION', 'us-east-1'),
+
+    // UNSAFE TEST ONLY: bypass the storage late-write fence startup gate.
+    'allow_unfenced_storage_for_tests' => (bool) env('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', false),
 
     // TLS certificate path (null to disable).
     'tls_cert_path' => env('S3_TLS_CERT'),
@@ -23,10 +28,13 @@ return [
     'tls_key_path' => env('S3_TLS_KEY'),
 
     // Maximum concurrent connections.
-    'max_connections' => (int) env('S3_MAX_CONNECTIONS', 10000),
+    'max_connections' => EnvironmentNumber::integer('S3_MAX_CONNECTIONS', 10000),
 
     // Request body size limit in bytes (default 5 GiB).
-    'body_size_limit' => (int) env('S3_BODY_SIZE_LIMIT', 5_368_709_120),
+    'body_size_limit' => EnvironmentNumber::integer('S3_BODY_SIZE_LIMIT', 5_368_709_120),
+
+    // Concurrent browser POST temporary bytes shared by API processes using one local temp directory (default 10 GiB).
+    'post_spool_budget' => EnvironmentNumber::integer('S3_POST_SPOOL_BUDGET', 10_737_418_240),
 
     // Base domain for virtual-hosted-style bucket addressing.
     'base_domain' => env('S3_BASE_DOMAIN'),
@@ -35,28 +43,31 @@ return [
     'strict_bucket_naming' => (bool) env('S3_STRICT_BUCKET_NAMING', true),
 
     // Per-client rate limit (requests per second, 0 = unlimited).
-    'rate_limit' => (int) env('S3_RATE_LIMIT', 1000),
+    'rate_limit' => EnvironmentNumber::integer('S3_RATE_LIMIT', 1000),
+
+    // Only these directly connected proxy peers may supply X-Forwarded-Proto/For.
+    'trusted_proxy_cidrs' => env('S3_TRUSTED_PROXY_CIDRS', ''),
 
     // Website hosting host pattern (e.g., '*.s3-website.example.com').
     'website_host_pattern' => env('S3_WEBSITE_HOST_PATTERN'),
 
     // Maximum object size for SSE encryption (bytes, default 256 MiB).
-    'max_encrypted_object_size' => (int) env('S3_MAX_ENCRYPTED_OBJECT_SIZE', 268_435_456),
+    'max_encrypted_object_size' => EnvironmentNumber::integer('S3_MAX_ENCRYPTED_OBJECT_SIZE', 268_435_456),
 
     // Maximum object size for S3 Select queries (bytes, default 256 MiB).
-    'max_select_object_size' => (int) env('S3_MAX_SELECT_OBJECT_SIZE', 268_435_456),
+    'max_select_object_size' => EnvironmentNumber::integer('S3_MAX_SELECT_OBJECT_SIZE', 268_435_456),
 
     // Seconds before warning that graceful shutdown is still draining.
-    'shutdown_drain_timeout' => (int) env('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
+    'shutdown_drain_timeout' => EnvironmentNumber::integer('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
 
     // Connection idle timeout in seconds (0 = no timeout).
-    'connection_idle_timeout' => (int) env('S3_CONNECTION_IDLE_TIMEOUT', 60),
+    'connection_idle_timeout' => EnvironmentNumber::integer('S3_CONNECTION_IDLE_TIMEOUT', 60),
 
     // Read timeout in seconds.
-    'read_timeout' => (int) env('S3_READ_TIMEOUT', 300),
+    'read_timeout' => EnvironmentNumber::integer('S3_READ_TIMEOUT', 300),
 
     // Write timeout in seconds.
-    'write_timeout' => (int) env('S3_WRITE_TIMEOUT', 300),
+    'write_timeout' => EnvironmentNumber::integer('S3_WRITE_TIMEOUT', 300),
 
     // Enforce the S3 5 MiB minimum for every non-final multipart part.
     'enforce_min_part_size' => (bool) env('S3_ENFORCE_MIN_PART_SIZE', true),
@@ -64,6 +75,8 @@ return [
     'notifications' => [
         // Reject plaintext HTTP webhook destinations by default.
         'require_https' => (bool) env('S3_NOTIFICATION_REQUIRE_HTTPS', true),
+        // Let this server process drain queued webhook deliveries.
+        'worker_enabled' => (bool) env('S3_NOTIFICATION_WORKER', true),
     ],
 
     'metrics_bearer_token' => env('S3_METRICS_BEARER_TOKEN'),
@@ -82,19 +95,19 @@ return [
     */
     'parallel' => [
         // Number of worker processes for SQLite metadata operations.
-        'sqlite_workers' => (int) env('S3_SQLITE_WORKERS', 0),
+        'sqlite_workers' => EnvironmentNumber::integer('S3_SQLITE_WORKERS', 0),
 
         // Number of worker processes for encryption/decryption.
-        'encryption_workers' => (int) env('S3_ENCRYPTION_WORKERS', 0),
+        'encryption_workers' => EnvironmentNumber::integer('S3_ENCRYPTION_WORKERS', 0),
 
         // Number of worker processes for S3 Select.
-        'select_workers' => (int) env('S3_SELECT_WORKERS', env('S3_ENCRYPTION_WORKERS', 0)),
+        'select_workers' => EnvironmentNumber::integer('S3_SELECT_WORKERS', EnvironmentNumber::integer('S3_ENCRYPTION_WORKERS', 0)),
 
         // Stateless workers for request-body checksum spooling.
-        'request_body_spool_workers' => (int) env('S3_REQUEST_BODY_SPOOL_WORKERS', 8),
+        'request_body_spool_workers' => EnvironmentNumber::integer('S3_REQUEST_BODY_SPOOL_WORKERS', 8),
 
         // Objects smaller than this (bytes) are encrypted inline.
-        'encryption_threshold' => (int) env('S3_ENCRYPTION_THRESHOLD', 65536),
+        'encryption_threshold' => EnvironmentNumber::integer('S3_ENCRYPTION_THRESHOLD', 65536),
     ],
 
     /*
@@ -107,14 +120,14 @@ return [
     |
     */
     'quotas' => [
-        'max_buckets_per_owner' => (int) env('S3_QUOTA_MAX_BUCKETS_PER_OWNER', 0),
-        'max_objects_per_bucket' => (int) env('S3_QUOTA_MAX_OBJECTS_PER_BUCKET', 0),
-        'max_bytes_per_bucket' => (int) env('S3_QUOTA_MAX_BYTES_PER_BUCKET', 0),
-        'max_bytes_per_owner' => (int) env('S3_QUOTA_MAX_BYTES_PER_OWNER', 0),
-        'max_multipart_uploads_per_bucket' => (int) env('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET', 0),
-        'max_multipart_uploads_per_owner' => (int) env('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER', 0),
-        'max_multipart_bytes_per_bucket' => (int) env('S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET', 0),
-        'max_multipart_bytes_per_owner' => (int) env('S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER', 0),
+        'max_buckets_per_owner' => EnvironmentNumber::integer('S3_QUOTA_MAX_BUCKETS_PER_OWNER', 0),
+        'max_objects_per_bucket' => EnvironmentNumber::integer('S3_QUOTA_MAX_OBJECTS_PER_BUCKET', 0),
+        'max_bytes_per_bucket' => EnvironmentNumber::integer('S3_QUOTA_MAX_BYTES_PER_BUCKET', 0),
+        'max_bytes_per_owner' => EnvironmentNumber::integer('S3_QUOTA_MAX_BYTES_PER_OWNER', 0),
+        'max_multipart_uploads_per_bucket' => EnvironmentNumber::integer('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET', 0),
+        'max_multipart_uploads_per_owner' => EnvironmentNumber::integer('S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER', 0),
+        'max_multipart_bytes_per_bucket' => EnvironmentNumber::integer('S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET', 0),
+        'max_multipart_bytes_per_owner' => EnvironmentNumber::integer('S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER', 0),
     ],
 
     /*
@@ -127,11 +140,11 @@ return [
     |
     */
     'lifecycle' => [
-        'interval_seconds' => (float) env('S3_LIFECYCLE_INTERVAL_SECONDS', 60),
-        'batch_size' => (int) env('S3_LIFECYCLE_BATCH_SIZE', 1000),
-        'max_actions_per_run' => (int) env('S3_LIFECYCLE_MAX_ACTIONS_PER_RUN', 1000),
-        'lock_ttl_seconds' => (int) env('S3_LIFECYCLE_LOCK_TTL_SECONDS', 300),
-        'multipart_max_age_seconds' => (int) env('S3_MULTIPART_MAX_AGE_SECONDS', 604800),
+        'interval_seconds' => EnvironmentNumber::finiteFloat('S3_LIFECYCLE_INTERVAL_SECONDS', 60.0),
+        'batch_size' => EnvironmentNumber::integer('S3_LIFECYCLE_BATCH_SIZE', 1000),
+        'max_actions_per_run' => EnvironmentNumber::integer('S3_LIFECYCLE_MAX_ACTIONS_PER_RUN', 1000),
+        'lock_ttl_seconds' => EnvironmentNumber::integer('S3_LIFECYCLE_LOCK_TTL_SECONDS', 300),
+        'multipart_max_age_seconds' => EnvironmentNumber::integer('S3_MULTIPART_MAX_AGE_SECONDS', 604800),
     ],
 
     /*
@@ -146,8 +159,10 @@ return [
         'driver' => env('S3_STORAGE_DRIVER', 'filesystem'),
         'path' => env('S3_STORAGE_PATH', function_exists('storage_path') ? storage_path('s3') : ''),
         'temp_dir' => env('S3_STORAGE_TEMP_DIR', sys_get_temp_dir()),
+        'temp_budget_bytes' => env('S3_STORAGE_TEMP_BUDGET', 10_737_418_240),
         // Remote Flysystem adapters should use a serializable factory and workers.
-        'worker_pool_size' => (int) env('S3_FLYSYSTEM_WORKERS', 0),
+        'worker_pool_size' => EnvironmentNumber::integer('S3_FLYSYSTEM_WORKERS', 0),
+        'read_first_byte_timeout_seconds' => EnvironmentNumber::integer('S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS', 20),
         'filesystem_factory_service' => env('S3_FLYSYSTEM_FACTORY_SERVICE', null),
         /*
         | Optional physical tier registry. When empty, the single backend above is
@@ -184,7 +199,7 @@ return [
         'driver' => env('S3_METADATA_DRIVER', 'sqlite'),
         'dsn' => env('S3_METADATA_DSN', ''),
         // TTL in seconds for bucket-level metadata cache (0 = disabled).
-        'cache_ttl' => (float) env('S3_METADATA_CACHE_TTL', 5.0),
+        'cache_ttl' => EnvironmentNumber::finiteFloat('S3_METADATA_CACHE_TTL', 5.0),
     ],
 
     /*
@@ -192,7 +207,8 @@ return [
     | Credentials
     |--------------------------------------------------------------------------
     |
-    | Supported drivers: "memory", "database", "file", "chain"
+    | Supported configured drivers: "memory", "database", "file".
+    | A chain is available through the programmatic factory API.
     |
     | For "memory" driver: access_key, secret_key, owner_id, display_name are
     | required. No hardcoded defaults — you MUST set these via .env or config.
@@ -210,7 +226,7 @@ return [
         'password' => env('S3_CREDENTIALS_PASSWORD'),
         // Positive credential lookups are refreshed after this many seconds.
         // Set to 0 to disable caching and observe revocations on every request.
-        'cache_ttl' => (float) env('S3_CREDENTIALS_CACHE_TTL', 1.0),
+        'cache_ttl' => EnvironmentNumber::finiteFloat('S3_CREDENTIALS_CACHE_TTL', 1.0),
         // For 'file' driver:
         'path' => env('S3_CREDENTIALS_PATH'),
     ],
@@ -249,7 +265,8 @@ return [
     |
     */
     'external_iam' => [
-        'enabled' => (bool) env('S3_EXTERNAL_IAM_ENABLED', false),
+        // Keep the raw value so the runtime factory can reject malformed booleans.
+        'enabled' => env('S3_EXTERNAL_IAM_ENABLED', false),
         'admin_token' => env('S3_EXTERNAL_IAM_ADMIN_TOKEN'),
         'issuer' => env('S3_EXTERNAL_IAM_ISSUER'),
         'audience' => env('S3_EXTERNAL_IAM_AUDIENCE'),
@@ -262,6 +279,6 @@ return [
         'policy_names_claim' => env('S3_EXTERNAL_IAM_POLICY_NAMES_CLAIM'),
         'allowed_prefixes_claim' => env('S3_EXTERNAL_IAM_ALLOWED_PREFIXES_CLAIM'),
         'owner_prefix' => env('S3_EXTERNAL_IAM_OWNER_PREFIX', ''),
-        'clock_skew_seconds' => (int) env('S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS', 60),
+        'clock_skew_seconds' => env('S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS', 60),
     ],
 ];

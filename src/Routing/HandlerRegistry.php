@@ -6,6 +6,8 @@ namespace OpsFour\S3Server\Routing;
 
 use Amp\Http\Server\RequestHandler;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
  * Maps S3Operation enum cases to Amp RequestHandler instances.
@@ -19,6 +21,13 @@ final class HandlerRegistry
     /** @var array<string, RequestHandler> */
     private array $handlers = [];
 
+    /** @var list<array{storage: StorageBackend, tiers: StorageTierRegistry}> */
+    private array $storageRegistrations = [];
+
+    private ?object $freezeToken = null;
+
+    private bool $qualifiedEfsCandidateSealed = false;
+
     /**
      * Register a handler for an S3 operation.
      *
@@ -27,7 +36,61 @@ final class HandlerRegistry
      */
     public function register(S3Operation $operation, RequestHandler $handler): void
     {
+        if ($this->qualifiedEfsCandidateSealed) {
+            throw new \LogicException('S3 handlers cannot be changed after EFS candidate seal.');
+        }
+        if ($this->freezeToken !== null) {
+            throw new \LogicException('S3 handlers cannot be changed after the server starts.');
+        }
+
         $this->handlers[$operation->value] = $handler;
+    }
+
+    public function registerStorage(StorageBackend $storage, StorageTierRegistry $tiers): void
+    {
+        if ($this->qualifiedEfsCandidateSealed) {
+            throw new \LogicException('S3 handler storage cannot be changed after EFS candidate seal.');
+        }
+        if ($this->freezeToken !== null) {
+            throw new \LogicException('S3 handler storage cannot be changed after the server starts.');
+        }
+
+        $this->storageRegistrations[] = ['storage' => $storage, 'tiers' => $tiers];
+    }
+
+    /** @return list<array{storage: StorageBackend, tiers: StorageTierRegistry}> */
+    public function storageRegistrations(): array
+    {
+        return $this->storageRegistrations;
+    }
+
+    /** @internal Irreversible candidate seal; it does not admit EFS serving. */
+    public function sealForQualifiedEfsCandidate(): void
+    {
+        if ($this->qualifiedEfsCandidateSealed || $this->freezeToken !== null) {
+            throw new \LogicException('S3 handler registry cannot be sealed after an EFS seal or startup freeze.');
+        }
+
+        $this->qualifiedEfsCandidateSealed = true;
+    }
+
+    public function freeze(): object
+    {
+        if ($this->freezeToken !== null) {
+            throw new \LogicException('S3 handler registry is already frozen.');
+        }
+
+        return $this->freezeToken = new \stdClass();
+    }
+
+    /** Roll back only the freeze created by a failed startup attempt. */
+    public function rollbackFreeze(object $token): void
+    {
+        if ($this->freezeToken !== $token) {
+            throw new \LogicException('Invalid S3 handler registry startup token.');
+        }
+
+        $this->freezeToken = null;
     }
 
     /**

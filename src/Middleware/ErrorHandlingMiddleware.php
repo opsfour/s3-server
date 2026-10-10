@@ -11,6 +11,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\S3Exception;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Xml\ErrorResponseBuilder;
 use Psr\Log\LoggerInterface;
 
@@ -22,9 +23,13 @@ use Psr\Log\LoggerInterface;
  */
 final class ErrorHandlingMiddleware implements Middleware
 {
+    private readonly ?FailureIsolatingLogger $logger;
+
     public function __construct(
-        private readonly ?LoggerInterface $logger = null,
-    ) {}
+        ?LoggerInterface $logger = null,
+    ) {
+        $this->logger = $logger === null ? null : new FailureIsolatingLogger($logger);
+    }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
@@ -34,6 +39,14 @@ final class ErrorHandlingMiddleware implements Middleware
             $requestId = $request->getAttribute('requestId') ?? '';
             $resource = $request->getUri()->getPath();
             $status = $e->getHttpStatus();
+            $internalFailure = $status === 500;
+
+            if ($internalFailure) {
+                $this->logger?->error('Internal S3 error', [
+                    'exception' => $e::class,
+                    'requestId' => $requestId,
+                ]);
+            }
 
             if ($e instanceof AccessDeniedException || $e instanceof SignatureDoesNotMatchException) {
                 $this->logger?->warning('Auth failure: ' . $e->getErrorCode(), [
@@ -61,7 +74,7 @@ final class ErrorHandlingMiddleware implements Middleware
 
             $xml = ErrorResponseBuilder::build(
                 $e->getErrorCode(),
-                $e->getMessage(),
+                $internalFailure ? 'We encountered an internal error. Please try again.' : $e->getMessage(),
                 $resource,
                 $requestId,
             );
@@ -70,7 +83,7 @@ final class ErrorHandlingMiddleware implements Middleware
             $headers = [
                 'content-type' => 'application/xml',
                 'x-amz-request-id' => (string) $requestId,
-                ...$e->getExtraHeaders(),
+                ...($internalFailure ? [] : $e->getExtraHeaders()),
             ];
 
             return new Response(
@@ -80,10 +93,7 @@ final class ErrorHandlingMiddleware implements Middleware
             );
         } catch (\Throwable $e) {
             $this->logger?->error('Internal server error', [
-                'exception' => $e,
-                'message' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine(),
+                'exception' => $e::class,
             ]);
 
             $requestId = $request->getAttribute('requestId') ?? '';

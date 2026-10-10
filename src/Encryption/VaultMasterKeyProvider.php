@@ -44,6 +44,13 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         if (!str_starts_with($addr, 'https://')) {
             throw new \RuntimeException('Vault address must use HTTPS to protect the master key in transit.');
         }
+        $addressParts = parse_url($addr);
+        if ($addressParts === false || ($addressParts['scheme'] ?? null) !== 'https'
+            || !isset($addressParts['host']) || $addressParts['host'] === ''
+            || isset($addressParts['user']) || isset($addressParts['pass'])
+            || isset($addressParts['query']) || isset($addressParts['fragment'])) {
+            throw new \RuntimeException('Vault address must be an HTTPS URL without credentials, query, or fragment.');
+        }
 
         $token = $vaultToken ?? (getenv('S3_VAULT_TOKEN') ?: false);
         if ($token === false || $token === '') {
@@ -52,6 +59,9 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
 
         $path = $vaultPath ?? (getenv('S3_VAULT_PATH') ?: 'secret/data/s3-server/master-key');
         $field = $keyField ?? (getenv('S3_VAULT_KEY_FIELD') ?: 'key');
+        if ($path === '' || strpbrk($path, "?#\r\n\0") !== false) {
+            throw new \RuntimeException('Vault secret path must be a non-empty URL path without query or fragment.');
+        }
 
         // Never follow redirects with the Vault token attached. In particular,
         // HTTPS must not redirect the secret header to plaintext HTTP.
@@ -59,30 +69,29 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
             ->followRedirects(0)
             ->build();
 
-        $url = rtrim($addr, '/') . '/v1/' . ltrim($path, '/');
-        $request = new Request($url, 'GET');
-        $request->setHeader('X-Vault-Token', $token);
-
         try {
+            $url = rtrim($addr, '/') . '/v1/' . ltrim($path, '/');
+            $request = new Request($url, 'GET');
+            $request->setHeader('X-Vault-Token', $token);
             $response = $client->request($request);
             $body = $response->getBody()->buffer(limit: 1_048_576);
-        } catch (\Throwable $e) {
-            throw new \RuntimeException("Unable to read master keys from Vault path '{$path}'.", 0, $e);
+        } catch (\Throwable) {
+            throw new \RuntimeException('Unable to read master keys from Vault.');
         }
         $statusCode = $response->getStatus();
 
         if ($statusCode !== 200) {
-            throw new \RuntimeException("Vault returned HTTP {$statusCode} for path '{$path}'.");
+            throw new \RuntimeException("Vault returned HTTP {$statusCode}.");
         }
 
         try {
             $data = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
-            throw new \RuntimeException("Vault returned invalid JSON for path '{$path}'.", 0, $e);
+            throw new \RuntimeException('Vault returned invalid JSON.', 0, $e);
         }
         $secretData = is_array($data) ? ($data['data']['data'] ?? null) : null;
         if (! is_array($secretData)) {
-            throw new \RuntimeException("Vault response for path '{$path}' does not contain KV v2 secret data.");
+            throw new \RuntimeException('Vault response does not contain KV v2 secret data.');
         }
 
         // Try multi-key format first: "keys" field with JSON map.
@@ -94,7 +103,9 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         if (is_array($keysField) && $keysField !== []) {
             $keys = [];
             foreach ($keysField as $keyId => $b64) {
-                if (! is_string($keyId) || $keyId === '' || strlen($keyId) > 255 || ! is_string($b64)) {
+                // JSON numeric property names become integer array keys in PHP.
+                $keyId = (string) $keyId;
+                if ($keyId === '' || strlen($keyId) > 255 || ! is_string($b64)) {
                     throw new \RuntimeException('Vault master key IDs must contain between 1 and 255 bytes and map to strings.');
                 }
                 $decoded = base64_decode($b64, true);
@@ -106,7 +117,7 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
 
             $activeKeyId = $secretData['activeKeyId'] ?? null;
             if (! is_string($activeKeyId) || $activeKeyId === '') {
-                throw new \RuntimeException("Active master key ID field 'activeKeyId' is missing from Vault secret at '{$path}'.");
+                throw new \RuntimeException("Active master key ID field 'activeKeyId' is missing from Vault secret.");
             }
             if (! isset($keys[$activeKeyId])) {
                 throw new \RuntimeException("Active Vault master key ID '{$activeKeyId}' does not exist in the keys map.");
@@ -122,7 +133,7 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         $base64Key = $secretData[$field] ?? null;
 
         if ($base64Key === null || !is_string($base64Key)) {
-            throw new \RuntimeException("Master key field '{$field}' not found in Vault secret at '{$path}'.");
+            throw new \RuntimeException("Master key field '{$field}' not found in Vault secret.");
         }
 
         $decoded = base64_decode($base64Key, true);

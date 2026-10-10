@@ -13,10 +13,15 @@ use Monolog\Processor\PsrLogMessageProcessor;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
+use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
+use OpsFour\S3Server\Runtime\BootstrapResourceCleanup;
+use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
+use OpsFour\S3Server\Runtime\ServeFailureMessage;
+use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -50,7 +55,9 @@ class S3ServerCommand extends Command
 
         $logger = new Logger('s3-server');
         $logger->pushHandler($logHandler);
+        $logger = new FailureIsolatingLogger($logger);
 
+        $ownedStorageTierRegistry = null;
         try {
             $config = app(S3ServerConfig::class);
 
@@ -60,7 +67,12 @@ class S3ServerCommand extends Command
                 $overrides['host'] = $this->option('host');
             }
             if ($this->option('port') !== null) {
-                $overrides['port'] = (int) $this->option('port');
+                $port = $this->option('port');
+                if ((! is_string($port) && ! is_int($port))
+                    || ($parsedPort = filter_var($port, FILTER_VALIDATE_INT)) === false) {
+                    throw new \InvalidArgumentException('--port must be a decimal integer within the supported range.');
+                }
+                $overrides['port'] = $parsedPort;
             }
             if ($this->option('storage-path') !== null) {
                 $overrides['storagePath'] = $this->option('storage-path');
@@ -69,6 +81,8 @@ class S3ServerCommand extends Command
             if (! empty($overrides)) {
                 $config = $config->with($overrides);
             }
+
+            PostgresApiDriverGuard::assertAvailable($config);
 
             $storageDriver = (string) config('s3-server.storage.driver', 'filesystem');
             if ($this->option('storage-path') !== null && $storageDriver !== 'filesystem') {
@@ -89,6 +103,9 @@ class S3ServerCommand extends Command
             // Resolve backends from container (or rebuild with CLI overrides).
             $metrics = app(MetricsCollector::class);
             $storageTierRegistry = $this->resolveStorageTiers($config, $metrics);
+            if ($this->option('storage-path') !== null) {
+                $ownedStorageTierRegistry = $storageTierRegistry;
+            }
             $storage = $storageTierRegistry->defaultBackend();
             $metadata = app(MetadataStore::class);
             $metadata = new ObservedMetadataStore(
@@ -98,8 +115,6 @@ class S3ServerCommand extends Command
             );
             $credentialProvider = $this->resolveCredentials();
 
-            $adminToken = config('s3-server.admin.token')
-                ?: config('s3-server.external_iam.admin_token');
             $runtime = (new S3ServerRuntimeFactory())->create(
                 config: $config,
                 metadata: $metadata,
@@ -109,33 +124,36 @@ class S3ServerCommand extends Command
                 metrics: $metrics,
                 storageTiers: $storageTierRegistry,
                 externalIamConfig: config('s3-server.external_iam', []),
-                adminToken: is_string($adminToken) ? $adminToken : null,
+                adminToken: $this->adminTokenFromConfig(),
             );
+            $ownedStorageTierRegistry = null;
         } catch (\InvalidArgumentException $e) {
-            $this->error($e->getMessage());
+            BootstrapResourceCleanup::release(null, $ownedStorageTierRegistry);
+            $this->error(ServeFailureMessage::format($e, 'bootstrap'));
 
             return self::FAILURE;
         } catch (\Throwable $e) {
-            $logger->error('S3 server bootstrap failed: {error}', ['error' => $e->getMessage()]);
-            $this->error($e->getMessage());
+            BootstrapResourceCleanup::release(null, $ownedStorageTierRegistry);
+            $logger->error('S3 server bootstrap failed.', ['exception' => $e::class]);
+            $this->error(ServeFailureMessage::format($e, 'bootstrap'));
 
             return self::FAILURE;
         }
 
-        $this->info("OpsFour S3 Server starting on {$config->host}:{$config->port}");
-        $this->info("Storage: {$config->storagePath}");
-        if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
-            $this->info("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");
-        }
-        if ($config->encryptionWorkerPoolSize > 0) {
-            $this->info("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers (threshold: {$config->encryptionParallelThreshold} bytes)");
-        }
-        if ($config->selectWorkerPoolSize > 0) {
-            $this->info("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
-        }
-        $this->info('Press Ctrl+C to stop.');
-
+        $failed = false;
         try {
+            $this->info("OpsFour S3 Server starting on {$config->host}:{$config->port}");
+            $this->info("Storage: {$config->storagePath}");
+            if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
+                $this->info("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");
+            }
+            if ($config->encryptionWorkerPoolSize > 0) {
+                $this->info("Encryption worker pool: {$config->encryptionWorkerPoolSize} workers (threshold: {$config->encryptionParallelThreshold} bytes)");
+            }
+            if ($config->selectWorkerPoolSize > 0) {
+                $this->info("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
+            }
+            $this->info('Press Ctrl+C to stop.');
             $runtime->server->start();
 
             // Wait for termination signal.
@@ -144,17 +162,32 @@ class S3ServerCommand extends Command
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);
         } catch (\Throwable $e) {
-            $logger->error('S3 server runtime failed: {error}', ['error' => $e->getMessage()]);
-            $this->error($e->getMessage());
-
-            return self::FAILURE;
+            $logger->error('S3 server runtime failed.', ['exception' => $e::class]);
+            $this->error(ServeFailureMessage::format($e, 'runtime'));
+            $failed = true;
         } finally {
-            $runtime->stop();
+            $shutdownError = ServeRuntimeShutdown::stop($runtime, $logger);
+            if ($shutdownError !== null) {
+                $this->error($shutdownError);
+                $failed = true;
+            }
+        }
+
+        if ($failed) {
+            return self::FAILURE;
         }
 
         $this->info('Server stopped.');
 
         return self::SUCCESS;
+    }
+
+    private function adminTokenFromConfig(): ?string
+    {
+        $adminToken = config('s3-server.admin.token')
+            ?? config('s3-server.external_iam.admin_token');
+
+        return is_string($adminToken) ? $adminToken : null;
     }
 
     /**
@@ -184,11 +217,15 @@ class S3ServerCommand extends Command
         $secretKey = $this->option('secret-key');
 
         if ($accessKey !== null || $secretKey !== null) {
+            if (config('s3-server.credentials.driver', 'memory') !== 'memory') {
+                throw new \InvalidArgumentException('--access-key and --secret-key require the memory credentials driver.');
+            }
+
             $creds = config('s3-server.credentials', []);
 
             return CredentialProviderFactory::create('memory', [
-                'access_key' => $accessKey ?? $creds['access_key'],
-                'secret_key' => $secretKey ?? $creds['secret_key'],
+                'access_key' => $accessKey ?? ($creds['access_key'] ?? null),
+                'secret_key' => $secretKey ?? ($creds['secret_key'] ?? null),
                 'owner_id' => $creds['owner_id'] ?? 'default-owner',
                 'display_name' => $creds['display_name'] ?? 'Default User',
             ]);

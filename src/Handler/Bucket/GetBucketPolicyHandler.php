@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Handler\Bucket;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchBucketPolicyException;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -34,8 +35,15 @@ final class GetBucketPolicyHandler implements RequestHandler
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        if ($ownerId !== $bucketInfo->ownerId) {
+            // S3 returns MethodNotAllowed when an otherwise authorized
+            // caller belongs to an account other than the bucket owner.
+            throw new MethodNotAllowedException();
+        }
 
         $policyJson = $this->metadata->getBucketPolicy($bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         if ($policyJson === null) {
             throw new NoSuchBucketPolicyException();

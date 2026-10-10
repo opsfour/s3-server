@@ -8,8 +8,10 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Xml\S3XmlDocument;
 use OpsFour\S3Server\Xml\SafeXmlParser;
 
 final class PutPublicAccessBlockHandler implements RequestHandler
@@ -31,8 +33,10 @@ final class PutPublicAccessBlockHandler implements RequestHandler
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
         $config = self::parsePublicAccessBlock($body);
 
-        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $bucket, $config): void {
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $ownerId, $bucket, $config): void {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new \OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $this->metadata->putPublicAccessBlock(
                 $bucket,
                 $config['blockPublicAcls'],
@@ -51,12 +55,33 @@ final class PutPublicAccessBlockHandler implements RequestHandler
     private static function parsePublicAccessBlock(string $xml): array
     {
         $element = SafeXmlParser::parse($xml, 'Invalid XML.');
+        S3XmlDocument::assertRoot($element, 'PublicAccessBlockConfiguration');
 
-        return [
-            'blockPublicAcls' => isset($element->BlockPublicAcls) && strtolower((string) $element->BlockPublicAcls) === 'true',
-            'ignorePublicAcls' => isset($element->IgnorePublicAcls) && strtolower((string) $element->IgnorePublicAcls) === 'true',
-            'blockPublicPolicy' => isset($element->BlockPublicPolicy) && strtolower((string) $element->BlockPublicPolicy) === 'true',
-            'restrictPublicBuckets' => isset($element->RestrictPublicBuckets) && strtolower((string) $element->RestrictPublicBuckets) === 'true',
+        $fieldNames = [
+            'BlockPublicAcls' => 'blockPublicAcls',
+            'IgnorePublicAcls' => 'ignorePublicAcls',
+            'BlockPublicPolicy' => 'blockPublicPolicy',
+            'RestrictPublicBuckets' => 'restrictPublicBuckets',
         ];
+        $config = [
+            'blockPublicAcls' => false,
+            'ignorePublicAcls' => false,
+            'blockPublicPolicy' => false,
+            'restrictPublicBuckets' => false,
+        ];
+        $seen = [];
+        foreach (S3XmlDocument::children($element) as $child) {
+            $name = $child->getName();
+            if (!isset($fieldNames[$name]) || isset($seen[$name]) || S3XmlDocument::children($child, allowText: true) !== []) {
+                throw new MalformedXmlException('Invalid PublicAccessBlockConfiguration field.');
+            }
+            $seen[$name] = true;
+            $value = strtolower(trim((string) $child));
+            if (!in_array($value, ['true', 'false', '1', '0'], true)) {
+                throw new MalformedXmlException('Invalid PublicAccessBlockConfiguration boolean value.');
+            }
+            $config[$fieldNames[$name]] = $value === 'true' || $value === '1';
+        }
+        return $config;
     }
 }

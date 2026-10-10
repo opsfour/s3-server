@@ -45,8 +45,14 @@ final class PutBucketTaggingHandler implements RequestHandler
 
         $tags = ObjectTagValidator::validate($tags, self::MAX_BUCKET_TAGS);
 
-        $this->metadata->putBucketTagging($bucket, $tags);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
+            $this->metadata,
+            $bucketInfo,
+            (string) $ownerId,
+            fn() => $this->metadata->putBucketTagging($bucket, $tags),
+            $request,
+        );
 
-        return new Response(status: 204);
+        return new Response(status: 200);
     }
 }

@@ -12,6 +12,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 
 /**
  * Handles DeleteObjectTagging (DELETE /{bucket}/{key}?tagging).
@@ -39,14 +40,20 @@ final class DeleteObjectTaggingHandler implements RequestHandler
 
         $versionId = $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key): ?string {
             OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
             $this->metadata->deleteObjectTagging($bucket, $key, $object->versionId);
 
-            return $object->versionId;
+            return $object->versionId
+                ?? ($this->metadata->getBucketVersioning($bucket) !== '' ? 'null' : null);
         });
         return new Response(
             status: 204,
-            headers: array_filter(['x-amz-version-id' => $versionId]),
+            headers: array_filter(
+                ['x-amz-version-id' => $versionId],
+                static fn(?string $value): bool => $value !== null,
+            ),
         );
     }
 }

@@ -7,8 +7,13 @@ namespace OpsFour\S3Server\Handler\Multipart;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\ListingQuery;
+use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -21,8 +26,6 @@ final class ListMultipartUploadsHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
-        $ownerId = $request->getAttribute('ownerId');
-
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
@@ -31,25 +34,38 @@ final class ListMultipartUploadsHandler implements RequestHandler
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         $prefix = $queryParams['prefix'] ?? null;
         $delimiter = $queryParams['delimiter'] ?? null;
-        $maxUploads = isset($queryParams['max-uploads']) ? max(0, min((int) $queryParams['max-uploads'], 1000)) : 1000;
+        $maxUploads = ListingQuery::limit($queryParams, 'max-uploads');
         $keyMarker = $queryParams['key-marker'] ?? null;
         $uploadIdMarker = $queryParams['upload-id-marker'] ?? null;
-        $encodingType = $queryParams['encoding-type'] ?? null;
+        $encodingType = ListingQuery::encodingType($queryParams);
 
-        $result = $this->metadata->listMultipartUploads(
-            $bucket,
+        if ($uploadIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {
+            throw new InvalidArgumentException('upload-id-marker requires a non-empty key-marker.');
+        }
+
+        if (! $this->metadata instanceof GenerationBoundMultipartListingStore) {
+            throw new NotImplementedException('Generation-bound multipart listing is unavailable for this metadata backend.');
+        }
+
+        $result = $this->metadata->listMultipartUploadsForBucket(
+            $bucketInfo,
             $prefix,
             $delimiter,
             $maxUploads,
             $keyMarker,
             $uploadIdMarker,
         );
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
+        $bucketOwnsObjects = BucketOwnership::isEnforced($this->metadata, $bucket);
+        \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         $xmlUploads = array_map(fn($u) => [
             'key' => $u['key_name'],
             'uploadId' => $u['upload_id'],
             'initiated' => rtrim(str_replace(' ', 'T', $u['created_at']), 'Z') . 'Z',
-            'ownerId' => $u['owner_id'],
+            'initiatorId' => $u['owner_id'],
+            'ownerId' => $bucketOwnsObjects ? $bucketInfo->ownerId : $u['owner_id'],
+            'storageClass' => self::storageClass($u['user_metadata'] ?? null),
         ], $result['uploads']);
 
         $params = [
@@ -82,5 +98,17 @@ final class ListMultipartUploadsHandler implements RequestHandler
             headers: ['content-type' => 'application/xml'],
             body: $xml,
         );
+    }
+
+    private static function storageClass(?string $encodedMetadata): string
+    {
+        if ($encodedMetadata === null) {
+            return 'STANDARD';
+        }
+
+        $metadata = json_decode($encodedMetadata, true);
+        $storageClass = is_array($metadata) ? ($metadata['__mpu-storage-class'] ?? null) : null;
+
+        return is_string($storageClass) && $storageClass !== '' ? $storageClass : 'STANDARD';
     }
 }

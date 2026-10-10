@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -73,13 +74,22 @@ final class AclEnforcementMiddleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
+        // Deletes, multipart aborts, and part listings require context-specific
+        // ownership and policy checks in their handlers.
+        if (in_array($operation, [S3Operation::DeleteObject, S3Operation::DeleteObjects, S3Operation::AbortMultipartUpload, S3Operation::ListParts], true)) {
+            return $requestHandler->handleRequest($request);
+        }
+
         // Determine resource type and name for ACL lookup.
         // For object operations: check object ACL first, then fall back to bucket ACL.
         // Bucket WRITE grants PutObject/DeleteObject; bucket READ grants ListObjects.
         $resourceType = $key !== null ? 'object' : 'bucket';
+        $ownershipEnforced = BucketOwnership::isEnforced($this->metadata, $bucket);
         $resourceName = $bucket;
         if ($key !== null) {
-            $versionId = QueryStringParser::parse($request->getUri()->getQuery())['versionId'] ?? null;
+            $versionId = $operation->selectsObjectVersion()
+                ? (QueryStringParser::parse($request->getUri()->getQuery())['versionId'] ?? null)
+                : null;
             if ($versionId === null) {
                 $versionId = $this->metadata->getObjectMetadata($bucket, $key)?->versionId;
             }
@@ -89,13 +99,21 @@ final class AclEnforcementMiddleware implements Middleware
         // Fetch ACL grants.
         $grants = [];
         try {
-            $grants = $this->metadata->getAcl($resourceType, $resourceName);
-            if (
-                $grants === []
-                && $key !== null
-                && ($versionId === null || $versionId === 'null')
-            ) {
-                $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
+            if ($ownershipEnforced && $key !== null) {
+                // Object ACL grants are disabled. Bucket WRITE grants remain
+                // available to authorize new object writes.
+                $grants = AclEvaluator::operationToPermission($operation) === 'WRITE'
+                    ? $this->metadata->getAcl('bucket', $bucket)
+                    : [];
+            } else {
+                $grants = $this->metadata->getAcl($resourceType, $resourceName);
+                if (
+                    $grants === []
+                    && $key !== null
+                    && ($versionId === null || $versionId === 'null')
+                ) {
+                    $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
+                }
             }
         } catch (\Throwable) {
         }
@@ -113,10 +131,22 @@ final class AclEnforcementMiddleware implements Middleware
             }
         }
 
+        $resourceOwner = $cachedBucketOwner;
+        if ($key !== null && $operation->usesExistingObjectOwner()) {
+            $objectOwner = $request->hasAttribute('s3.cachedObjectOwner')
+                ? $request->getAttribute('s3.cachedObjectOwner')
+                : (isset($versionId)
+                    ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId)?->ownerId
+                    : $this->metadata->getObjectMetadata($bucket, $key)?->ownerId);
+            if ($objectOwner !== null && ! $ownershipEnforced) {
+                $resourceOwner = $objectOwner;
+            }
+        }
+
         // If no explicit grants, check if owner.
         // Guard: ownerId must be non-empty to prevent anonymous users matching empty owner.
         if ($grants === []) {
-            if ($ownerId !== '' && $cachedBucketOwner === $ownerId) {
+            if ($ownerId !== '' && $resourceOwner === $ownerId) {
                 return $requestHandler->handleRequest($request);
             }
         }
@@ -132,9 +162,6 @@ final class AclEnforcementMiddleware implements Middleware
             // Fail-closed: if we can't check PAB, deny access.
             throw new AccessDeniedException('Unable to verify public access block configuration.');
         }
-
-        // Use cached bucket owner.
-        $resourceOwner = $cachedBucketOwner;
 
         if (!AclEvaluator::isAllowed(
             operation: $operation,

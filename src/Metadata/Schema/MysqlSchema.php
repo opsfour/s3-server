@@ -8,17 +8,18 @@ namespace OpsFour\S3Server\Metadata\Schema;
  * Contains all MySQL DDL statements for the S3 metadata store.
  *
  * All tables use the `s3_` prefix to avoid collisions when sharing a database.
- * Engine: InnoDB with utf8mb4_unicode_ci collation.
+ * Engine: InnoDB with utf8mb4_unicode_ci collation for non-key text. S3 object
+ * keys and ACL resource names use binary columns for exact byte identity.
  * The complete schema represents VERSION; incremental migrations are returned
  * by getMigrationStatements().
  */
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 15;
+    public const int VERSION = 44;
 
     /**
-     * Get the complete schema DDL for version 1.
+     * Get the complete schema DDL for the current version.
      *
      * @return list<string> Individual CREATE TABLE statements.
      */
@@ -39,13 +40,14 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_restore_jobs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name TEXT NOT NULL,
-                version_id VARCHAR(255),
+                key_name VARBINARY(1024) NOT NULL,
+                version_id VARBINARY(255),
                 source_tier VARCHAR(64) NOT NULL,
                 source_storage_path TEXT NOT NULL,
                 restored_storage_path TEXT,
                 restore_days INT NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 attempts INT NOT NULL DEFAULT 0,
                 max_attempts INT NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE NOT NULL,
@@ -61,19 +63,28 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_buckets (
                 name VARCHAR(255) NOT NULL PRIMARY KEY,
-                owner_id VARCHAR(255) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
                 region VARCHAR(64) NOT NULL DEFAULT 'us-east-1',
+                generation CHAR(32) NOT NULL DEFAULT '',
                 versioning VARCHAR(16) NOT NULL DEFAULT '',
                 object_lock_enabled TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_s3_buckets_owner (owner_id)
+                KEY idx_s3_buckets_owner (owner_id),
+                KEY idx_s3_buckets_owner_name (owner_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (
+                bucket VARCHAR(255) NOT NULL PRIMARY KEY,
+                object_ownership VARCHAR(32) NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
             // Account quotas
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_account_quotas (
-                owner_id VARCHAR(255) NOT NULL PRIMARY KEY,
+                owner_id VARBINARY(255) NOT NULL PRIMARY KEY,
                 max_buckets_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_objects_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_bytes_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -90,14 +101,14 @@ final class MysqlSchema
             // Transactional owner write locks for quotas and replacement serialization.
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
-                owner_id VARCHAR(255) NOT NULL PRIMARY KEY
+                owner_id VARBINARY(255) NOT NULL PRIMARY KEY
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
             // Account policies
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_account_policies (
-                owner_id VARCHAR(255) NOT NULL PRIMARY KEY,
+                owner_id VARBINARY(255) NOT NULL PRIMARY KEY,
                 policy_json JSON NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -107,7 +118,7 @@ final class MysqlSchema
             // Named policies
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_named_policies (
-                policy_name VARCHAR(255) NOT NULL PRIMARY KEY,
+                policy_name VARBINARY(255) NOT NULL PRIMARY KEY,
                 policy_json JSON NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -117,8 +128,8 @@ final class MysqlSchema
             // Distributed locks
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_locks (
-                lock_name VARCHAR(255) NOT NULL PRIMARY KEY,
-                owner_id VARCHAR(255) NOT NULL,
+                lock_name VARBINARY(255) NOT NULL PRIMARY KEY,
+                owner_id VARBINARY(255) NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -130,10 +141,10 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_lifecycle_checkpoints (
                 bucket VARCHAR(255) NOT NULL,
-                rule_id VARCHAR(255) NOT NULL,
+                rule_id VARBINARY(1020) NOT NULL,
                 action VARCHAR(64) NOT NULL,
                 cursor_key TEXT,
-                cursor_version_id VARCHAR(255),
+                cursor_version_id VARBINARY(255),
                 cursor_upload_id VARCHAR(255),
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 PRIMARY KEY (bucket, rule_id, action)
@@ -145,14 +156,18 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_tier_transition_jobs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name TEXT NOT NULL,
-                version_id VARCHAR(255),
+                key_name VARBINARY(1024) NOT NULL,
+                version_id VARBINARY(255),
                 source_tier VARCHAR(64) NOT NULL,
                 target_tier VARCHAR(64) NOT NULL,
                 target_storage_class VARCHAR(64) NOT NULL,
                 source_storage_path TEXT NOT NULL,
+                origin VARCHAR(16) NOT NULL DEFAULT 'legacy',
+                lifecycle_rule_id VARBINARY(255) NULL,
+                expected_is_latest TINYINT NULL,
                 target_storage_path TEXT,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 attempts INT NOT NULL DEFAULT 0,
                 max_attempts INT NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE NOT NULL,
@@ -169,11 +184,12 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_objects (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name TEXT NOT NULL,
-                version_id VARCHAR(255) NOT NULL DEFAULT 'null',
+                key_name VARBINARY(1024) NOT NULL,
+                key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED,
+                version_id VARBINARY(255) NOT NULL DEFAULT 'null',
                 is_latest TINYINT(1) NOT NULL DEFAULT 1,
                 is_delete_marker TINYINT(1) NOT NULL DEFAULT 0,
-                owner_id VARCHAR(255) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
                 etag VARCHAR(255) NOT NULL,
                 size BIGINT UNSIGNED NOT NULL,
                 content_type VARCHAR(255) NOT NULL DEFAULT 'application/octet-stream',
@@ -187,7 +203,8 @@ final class MysqlSchema
                 transition_error TEXT,
                 restore_status VARCHAR(32),
                 restored_storage_path TEXT,
-                restore_expires_at TIMESTAMP NULL,
+                restored_storage_tier VARBINARY(64) NULL,
+                restore_expires_at DATETIME NULL,
                 storage_path TEXT NOT NULL,
                 user_metadata JSON NOT NULL,
                 checksum_crc32 VARCHAR(64),
@@ -195,10 +212,15 @@ final class MysqlSchema
                 checksum_sha1 VARCHAR(64),
                 checksum_sha256 VARCHAR(128),
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                noncurrent_at TIMESTAMP NULL,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uk_s3_objects_bkv (bucket, key_name(255), version_id),
+                UNIQUE KEY uk_s3_objects_exact (bucket, key_identity, version_id),
                 KEY idx_s3_objects_bucket_key (bucket, key_name(255)),
-                KEY idx_s3_objects_bucket_latest (bucket, is_latest, is_delete_marker)
+                KEY idx_s3_objects_bucket_latest (bucket, is_latest, is_delete_marker),
+                KEY idx_s3_objects_owner (owner_id, is_delete_marker),
+                KEY idx_s3_objects_tier_state (storage_tier, transition_status, restore_status),
+                KEY idx_s3_objects_transition_target_tier (transition_target_tier),
+                KEY idx_s3_objects_noncurrent_at (bucket, is_latest, is_delete_marker, noncurrent_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -207,12 +229,15 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_multipart_uploads (
                 upload_id VARCHAR(255) NOT NULL PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name TEXT NOT NULL,
-                owner_id VARCHAR(255) NOT NULL,
+                bucket_generation CHAR(32) NOT NULL DEFAULT '',
+                key_name VARBINARY(1024) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
+                storage_tier VARBINARY(64) NULL,
                 content_type VARCHAR(255) DEFAULT 'application/octet-stream',
                 user_metadata JSON NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_s3_multipart_uploads_bucket (bucket)
+                KEY idx_s3_multipart_uploads_bucket (bucket),
+                KEY idx_s3_multipart_uploads_owner (owner_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -225,6 +250,8 @@ final class MysqlSchema
                 etag VARCHAR(255) NOT NULL,
                 size BIGINT UNSIGNED NOT NULL,
                 storage_path TEXT NOT NULL,
+                checksum_algorithm VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                checksum_value VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uk_s3_parts_upload_part (upload_id, part_number),
                 FOREIGN KEY (upload_id) REFERENCES s3_multipart_uploads(upload_id) ON DELETE CASCADE
@@ -236,9 +263,9 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_acls (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 resource_type VARCHAR(64) NOT NULL,
-                resource_name VARCHAR(512) NOT NULL,
+                resource_name VARBINARY(2048) NOT NULL,
                 grantee_type VARCHAR(64) NOT NULL,
-                grantee_id VARCHAR(255) NOT NULL,
+                grantee_id VARBINARY(255) NOT NULL,
                 permission VARCHAR(64) NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 KEY idx_s3_acls_resource (resource_type, resource_name(255))
@@ -251,8 +278,8 @@ final class MysqlSchema
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 resource_type VARCHAR(64) NOT NULL,
                 bucket VARCHAR(255) NOT NULL,
-                key_name VARCHAR(1024),
-                version_id VARCHAR(255) NOT NULL DEFAULT 'null',
+                key_name VARBINARY(1024),
+                version_id VARBINARY(255) NOT NULL DEFAULT 'null',
                 tag_key VARCHAR(128) NOT NULL,
                 tag_value VARCHAR(256) NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -287,11 +314,12 @@ final class MysqlSchema
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
                 rule_order INT NOT NULL DEFAULT 0,
+                rule_id VARBINARY(255) NULL,
                 allowed_origins JSON NOT NULL,
                 allowed_methods JSON NOT NULL,
                 allowed_headers JSON NOT NULL,
                 expose_headers JSON NOT NULL,
-                max_age_seconds INT NOT NULL DEFAULT 0,
+                max_age_seconds INT NOT NULL DEFAULT -1,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 KEY idx_s3_cors_rules_bucket (bucket)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -306,7 +334,12 @@ final class MysqlSchema
                 kms_master_key_id VARCHAR(255),
                 bucket_key_enabled TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                    sse_algorithm COLLATE utf8mb4_bin = 'AES256'
+                    AND kms_master_key_id IS NULL
+                    AND bucket_key_enabled = 0
+                )
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -315,7 +348,7 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_lifecycle_rules (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                rule_id VARCHAR(255) NOT NULL,
+                rule_id VARBINARY(1020) NOT NULL,
                 status VARCHAR(16) NOT NULL DEFAULT 'Enabled',
                 prefix TEXT,
                 filter_json JSON,
@@ -349,13 +382,14 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_object_retention (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name VARCHAR(1024) NOT NULL,
-                version_id VARCHAR(255) NOT NULL DEFAULT 'null',
+                key_name VARBINARY(1024) NOT NULL,
+                key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED,
+                version_id VARBINARY(255) NOT NULL DEFAULT 'null',
                 mode VARCHAR(16) NOT NULL,
                 retain_until_date VARCHAR(64) NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uk_s3_object_retention (bucket, key_name(255), version_id)
+                UNIQUE KEY uk_s3_object_retention_exact (bucket, key_identity, version_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -364,12 +398,13 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_object_legal_holds (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name VARCHAR(1024) NOT NULL,
-                version_id VARCHAR(255) NOT NULL DEFAULT 'null',
+                key_name VARBINARY(1024) NOT NULL,
+                key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED,
+                version_id VARBINARY(255) NOT NULL DEFAULT 'null',
                 status VARCHAR(8) NOT NULL DEFAULT 'OFF',
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uk_s3_object_legal_holds (bucket, key_name(255), version_id)
+                UNIQUE KEY uk_s3_object_legal_holds_exact (bucket, key_identity, version_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -378,7 +413,7 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_notification_configs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                config_id VARCHAR(255) NOT NULL,
+                config_id VARBINARY(1020) NOT NULL,
                 event_type TEXT NOT NULL,
                 destination_type VARCHAR(64) NOT NULL,
                 destination_arn VARCHAR(512) NOT NULL,
@@ -394,9 +429,9 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_website_configs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL UNIQUE,
-                index_document VARCHAR(255) NOT NULL DEFAULT 'index.html',
-                error_document VARCHAR(255),
-                redirect_all_host VARCHAR(255),
+                index_document MEDIUMTEXT NOT NULL,
+                error_document MEDIUMTEXT,
+                redirect_all_host MEDIUMTEXT,
                 redirect_all_protocol VARCHAR(16),
                 routing_rules_json JSON,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -421,7 +456,7 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_bucket_logging (
                 bucket VARCHAR(255) NOT NULL UNIQUE,
                 target_bucket VARCHAR(255) NOT NULL,
-                target_prefix VARCHAR(1024) NOT NULL DEFAULT '',
+                target_prefix MEDIUMTEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
@@ -443,11 +478,12 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_notification_queue (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
-                key_name TEXT NOT NULL,
+                key_name VARBINARY(1024) NOT NULL,
                 event_name VARCHAR(255) NOT NULL,
                 destination_url TEXT NOT NULL,
                 payload_json LONGTEXT NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 attempts INT NOT NULL DEFAULT 0,
                 max_attempts INT NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE NOT NULL,
@@ -465,15 +501,79 @@ final class MysqlSchema
                 bucket VARCHAR(255) NOT NULL,
                 storage_tier VARCHAR(64) NOT NULL,
                 storage_path VARCHAR(1024) NOT NULL,
+                operation VARCHAR(32) NOT NULL DEFAULT 'delete_path',
+                key_name VARBINARY(1024) NULL,
+                upload_id VARCHAR(255) NULL,
+                owner_id VARBINARY(255) NULL,
+                lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000',
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
                 attempts INT NOT NULL DEFAULT 0,
                 next_attempt_at DOUBLE NOT NULL,
                 last_error TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_s3_storage_gc_status (status, next_attempt_at)
+                recursive_cleanup_unsafe TINYINT(1) GENERATED ALWAYS AS (
+                    CASE WHEN operation IS NULL OR NOT (
+                        BINARY operation = BINARY 'delete_path'
+                        OR BINARY operation = BINARY 'part_write_intent'
+                    ) THEN 1 ELSE 0 END
+                ) VIRTUAL,
+                KEY idx_s3_storage_gc_status (status, next_attempt_at),
+                KEY idx_s3_storage_gc_operation_owner (operation, owner_id),
+                KEY idx_s3_storage_gc_recursive_unsafe (recursive_cleanup_unsafe, storage_tier)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_write_intents (
+                attempt_id CHAR(32) NOT NULL PRIMARY KEY,
+                upload_id VARCHAR(255) NOT NULL,
+                active_upload_id VARCHAR(255) NULL UNIQUE,
+                bucket VARCHAR(255) NOT NULL,
+                bucket_generation CHAR(32) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
+                storage_tier VARCHAR(64) NOT NULL,
+                assembly_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                part_digest CHAR(64) NOT NULL,
+                sse_mode VARCHAR(16) NULL,
+                state VARCHAR(16) NOT NULL DEFAULT 'active',
+                lease_until DOUBLE NOT NULL,
+                next_attempt_at DOUBLE NOT NULL,
+                claim_generation BIGINT NOT NULL DEFAULT 0,
+                dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_s3_multipart_intents_due (state, next_attempt_at),
+                KEY idx_s3_multipart_intents_upload (upload_id),
+                KEY idx_s3_multipart_intents_tier (storage_tier),
+                KEY idx_s3_multipart_intents_owner (owner_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_write_intents (
+                attempt_id CHAR(32) NOT NULL PRIMARY KEY,
+                bucket VARCHAR(255) NOT NULL,
+                bucket_generation CHAR(32) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
+                storage_tier VARBINARY(64) NOT NULL,
+                storage_path TEXT NOT NULL,
+                path_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                purpose VARCHAR(32) NOT NULL,
+                state VARCHAR(16) NOT NULL DEFAULT 'active',
+                lease_until DOUBLE NOT NULL,
+                claim_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_s3_object_write_intents_path (storage_tier, path_digest),
+                KEY idx_s3_object_write_intents_owner (owner_id),
+                KEY idx_s3_object_write_intents_due (state, lease_until),
+                KEY idx_s3_object_write_intents_tier (storage_tier)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
+            ...self::completionCapacityStatements(),
+            ...self::writeIntentCapacityStatements(),
         ];
     }
 
@@ -526,7 +626,7 @@ final class MysqlSchema
         if ($fromVersion < 5) {
             $statements[] = <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_account_quotas (
-                owner_id VARCHAR(255) NOT NULL PRIMARY KEY,
+                owner_id VARBINARY(255) NOT NULL PRIMARY KEY,
                 max_buckets_per_owner BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_objects_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 max_bytes_per_bucket BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -540,8 +640,8 @@ final class MysqlSchema
         if ($fromVersion < 6) {
             $statements[] = <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_locks (
-                lock_name VARCHAR(255) NOT NULL PRIMARY KEY,
-                owner_id VARCHAR(255) NOT NULL,
+                lock_name VARBINARY(255) NOT NULL PRIMARY KEY,
+                owner_id VARBINARY(255) NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -628,7 +728,7 @@ final class MysqlSchema
         if ($fromVersion < 12) {
             $statements[] = <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_owner_write_locks (
-                owner_id VARCHAR(255) NOT NULL PRIMARY KEY
+                owner_id VARBINARY(255) NOT NULL PRIMARY KEY
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL;
         }
@@ -676,6 +776,369 @@ final class MysqlSchema
             SQL;
         }
 
+        if ($fromVersion < 16) {
+            // MySQL's default collation folds case, accents, and trailing spaces.
+            // Prefix-unique indexes also identify different long S3 keys as one.
+            // Install the full-key hash index before removing the old constraint;
+            // every statement can be retried after a partial DDL migration.
+            $statements[] = 'ALTER TABLE s3_objects MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED';
+            $statements[] = 'ALTER TABLE s3_objects ADD UNIQUE KEY uk_s3_objects_exact (bucket, key_identity, version_id)';
+            $statements[] = 'ALTER TABLE s3_objects DROP INDEX uk_s3_objects_bkv';
+
+            $statements[] = 'ALTER TABLE s3_object_retention MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_object_retention ADD COLUMN key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED';
+            $statements[] = 'ALTER TABLE s3_object_retention ADD UNIQUE KEY uk_s3_object_retention_exact (bucket, key_identity, version_id)';
+            $statements[] = 'ALTER TABLE s3_object_retention DROP INDEX uk_s3_object_retention';
+
+            $statements[] = 'ALTER TABLE s3_object_legal_holds MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_object_legal_holds ADD COLUMN key_identity BINARY(32) GENERATED ALWAYS AS (UNHEX(SHA2(key_name, 256))) STORED';
+            $statements[] = 'ALTER TABLE s3_object_legal_holds ADD UNIQUE KEY uk_s3_object_legal_holds_exact (bucket, key_identity, version_id)';
+            $statements[] = 'ALTER TABLE s3_object_legal_holds DROP INDEX uk_s3_object_legal_holds';
+
+            $statements[] = 'ALTER TABLE s3_multipart_uploads MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_tagging MODIFY key_name VARBINARY(1024) NULL';
+            $statements[] = 'ALTER TABLE s3_acls MODIFY resource_name VARBINARY(2048) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_restore_jobs MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_notification_queue MODIFY key_name VARBINARY(1024) NOT NULL';
+            $statements[] = "ALTER TABLE s3_objects MODIFY version_id VARBINARY(255) NOT NULL DEFAULT 'null'";
+            $statements[] = "ALTER TABLE s3_tagging MODIFY version_id VARBINARY(255) NOT NULL DEFAULT 'null'";
+            $statements[] = "ALTER TABLE s3_object_retention MODIFY version_id VARBINARY(255) NOT NULL DEFAULT 'null'";
+            $statements[] = "ALTER TABLE s3_object_legal_holds MODIFY version_id VARBINARY(255) NOT NULL DEFAULT 'null'";
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs MODIFY version_id VARBINARY(255) NULL';
+            $statements[] = 'ALTER TABLE s3_restore_jobs MODIFY version_id VARBINARY(255) NULL';
+            $statements[] = 'ALTER TABLE s3_lifecycle_checkpoints MODIFY cursor_version_id VARBINARY(255) NULL';
+        }
+
+        if ($fromVersion < 17) {
+            $statements[] = 'CREATE INDEX idx_s3_objects_owner ON s3_objects(owner_id, is_delete_marker)';
+            $statements[] = 'CREATE INDEX idx_s3_multipart_uploads_owner ON s3_multipart_uploads(owner_id)';
+        }
+
+        if ($fromVersion < 18) {
+            $statements[] = 'CREATE INDEX idx_s3_buckets_owner_name ON s3_buckets(owner_id, name)';
+        }
+
+        if ($fromVersion < 19) {
+            $statements[] = 'CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (bucket VARCHAR(255) NOT NULL PRIMARY KEY, object_ownership VARCHAR(32) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
+        }
+
+        if ($fromVersion < 20) {
+            $statements[] = 'CREATE INDEX idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status)';
+            $statements[] = 'CREATE INDEX idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier)';
+        }
+
+        if ($fromVersion < 21) {
+            $statements[] = "ALTER TABLE s3_buckets ADD COLUMN generation CHAR(32) NOT NULL DEFAULT ''";
+            $statements[] = "UPDATE s3_buckets SET generation = REPLACE(UUID(), '-', '') WHERE generation = ''";
+        }
+
+        if ($fromVersion < 22) {
+            $statements[] = "ALTER TABLE s3_storage_garbage ADD COLUMN operation VARCHAR(32) NOT NULL DEFAULT 'delete_path'";
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN key_name VARBINARY(1024) NULL';
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN upload_id VARCHAR(255) NULL';
+        }
+
+        if ($fromVersion < 23) {
+            // Account and credential policy identifiers are byte strings. A
+            // case/accent-folding collation can expose another owner's bucket
+            // listing, aggregate their bytes, or attach their quota/policy.
+            $statements[] = 'ALTER TABLE s3_buckets MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_objects MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_multipart_uploads MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_account_quotas MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_account_policies MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_owner_write_locks MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_locks MODIFY lock_name VARBINARY(255) NOT NULL, MODIFY owner_id VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_named_policies MODIFY policy_name VARBINARY(255) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_acls MODIFY grantee_id VARBINARY(255) NOT NULL';
+        }
+
+        if ($fromVersion < 24) {
+            // MySQL DDL auto-commits. Separate additions let a retry finish
+            // after a crash between columns without masking missing columns.
+            $statements[] = "ALTER TABLE s3_tier_transition_jobs ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'legacy'";
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs ADD COLUMN lifecycle_rule_id VARBINARY(255) NULL';
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs ADD COLUMN expected_is_latest TINYINT NULL';
+        }
+
+        if ($fromVersion < 25) {
+            $statements[] = "ALTER TABLE s3_multipart_uploads ADD COLUMN bucket_generation CHAR(32) NOT NULL DEFAULT ''";
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_write_intents (
+                attempt_id CHAR(32) NOT NULL PRIMARY KEY,
+                upload_id VARCHAR(255) NOT NULL,
+                active_upload_id VARCHAR(255) NULL UNIQUE,
+                bucket VARCHAR(255) NOT NULL,
+                bucket_generation CHAR(32) NOT NULL,
+                owner_id VARBINARY(255) NOT NULL,
+                storage_tier VARCHAR(64) NOT NULL,
+                assembly_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                part_digest CHAR(64) NOT NULL,
+                sse_mode VARCHAR(16) NULL,
+                state VARCHAR(16) NOT NULL DEFAULT 'active',
+                lease_until DOUBLE NOT NULL,
+                next_attempt_at DOUBLE NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_s3_multipart_intents_due (state, next_attempt_at),
+                KEY idx_s3_multipart_intents_upload (upload_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL;
+        }
+
+        if ($fromVersion < 26) {
+            $statements[] = 'ALTER TABLE s3_multipart_write_intents ADD INDEX idx_s3_multipart_intents_tier (storage_tier)';
+        }
+
+        if ($fromVersion < 27) {
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN owner_id VARBINARY(255) NULL';
+            $statements[] = <<<'SQL'
+                UPDATE s3_storage_garbage AS garbage
+                JOIN s3_multipart_uploads AS upload
+                  ON garbage.upload_id = upload.upload_id AND garbage.bucket = upload.bucket
+                SET garbage.owner_id = upload.owner_id
+                WHERE garbage.operation = 'part_write_intent'
+                  AND garbage.owner_id IS NULL
+                  AND SUBSTRING(garbage.storage_path, -65, 32) = upload.bucket_generation
+                SQL;
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD INDEX idx_s3_storage_gc_operation_owner (operation, owner_id)';
+        }
+
+        if ($fromVersion < 28) {
+            foreach (['s3_storage_garbage', 's3_tier_transition_jobs', 's3_restore_jobs', 's3_notification_queue'] as $table) {
+                $statements[] = "ALTER TABLE {$table} ADD COLUMN lease_generation BIGINT UNSIGNED NOT NULL DEFAULT 0";
+            }
+        }
+
+        if ($fromVersion < 29) {
+            $statements[] = 'ALTER TABLE s3_multipart_write_intents ADD INDEX idx_s3_multipart_intents_owner (owner_id)';
+        }
+
+        if ($fromVersion < 30) {
+            $statements[] = <<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_object_write_intents (
+                    attempt_id CHAR(32) NOT NULL PRIMARY KEY,
+                    bucket VARCHAR(255) NOT NULL,
+                    bucket_generation CHAR(32) NOT NULL,
+                    owner_id VARBINARY(255) NOT NULL,
+                    storage_tier VARBINARY(64) NOT NULL,
+                    storage_path TEXT NOT NULL,
+                    path_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    purpose VARCHAR(32) NOT NULL,
+                    state VARCHAR(16) NOT NULL DEFAULT 'active',
+                    lease_until DOUBLE NOT NULL,
+                    claim_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_s3_object_write_intents_path (storage_tier, path_digest),
+                    KEY idx_s3_object_write_intents_owner (owner_id),
+                    KEY idx_s3_object_write_intents_due (state, lease_until),
+                    KEY idx_s3_object_write_intents_tier (storage_tier)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                SQL;
+        }
+
+        if ($fromVersion < 31) {
+            // A case/accent-insensitive collation silently merges distinct
+            // lifecycle and notification identifiers. Keep the prior maximum
+            // storage width (255 utf8mb4 characters = 1020 bytes) so an
+            // existing multibyte ID survives the conversion unchanged.
+            $statements[] = 'ALTER TABLE s3_lifecycle_rules MODIFY rule_id VARBINARY(1020) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_lifecycle_checkpoints MODIFY rule_id VARBINARY(1020) NOT NULL';
+            $statements[] = 'ALTER TABLE s3_notification_configs MODIFY config_id VARBINARY(1020) NOT NULL';
+        }
+
+        if ($fromVersion < 32) {
+            $statements[] = "ALTER TABLE s3_object_write_intents ADD COLUMN dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000'";
+        }
+        if ($fromVersion < 33) {
+            $statements[] = 'ALTER TABLE s3_multipart_uploads ADD COLUMN storage_tier VARBINARY(64) NULL';
+        }
+        if ($fromVersion < 34) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN restored_storage_tier VARBINARY(64) NULL';
+        }
+        if ($fromVersion < 35) {
+            $statements[] = 'ALTER TABLE s3_multipart_write_intents ADD COLUMN claim_generation BIGINT NOT NULL DEFAULT 0';
+        }
+        if ($fromVersion < 36) {
+            $statements[] = "ALTER TABLE s3_storage_garbage ADD COLUMN dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000'";
+            $statements[] = "ALTER TABLE s3_multipart_write_intents ADD COLUMN dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000'";
+        }
+        if ($fromVersion < 37) {
+            array_push($statements, ...self::completionCapacityStatements());
+        }
+        if ($fromVersion < 38) {
+            array_push($statements, ...self::writeIntentCapacityStatements());
+        }
+        if ($fromVersion < 39) {
+            $statements[] = <<<'SQL'
+                ALTER TABLE s3_encryption_configs
+                ADD CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                    sse_algorithm COLLATE utf8mb4_bin = 'AES256'
+                    AND kms_master_key_id IS NULL
+                    AND bucket_key_enabled = 0
+                )
+                SQL;
+        }
+        if ($fromVersion < 40) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN noncurrent_at TIMESTAMP NULL';
+            $statements[] = 'UPDATE s3_objects SET noncurrent_at = CURRENT_TIMESTAMP WHERE is_latest = 0 AND noncurrent_at IS NULL';
+            $statements[] = 'ALTER TABLE s3_objects ADD INDEX idx_s3_objects_noncurrent_at (bucket, is_latest, is_delete_marker, noncurrent_at)';
+        }
+        if ($fromVersion < 41) {
+            $statements[] = 'ALTER TABLE s3_objects MODIFY COLUMN restore_expires_at DATETIME NULL';
+        }
+        if ($fromVersion < 42) {
+            $statements[] = <<<'SQL'
+                ALTER TABLE s3_storage_garbage ADD COLUMN recursive_cleanup_unsafe TINYINT(1)
+                GENERATED ALWAYS AS (
+                    CASE WHEN operation IS NULL OR NOT (
+                        BINARY operation = BINARY 'delete_path'
+                        OR BINARY operation = BINARY 'part_write_intent'
+                    ) THEN 1 ELSE 0 END
+                ) VIRTUAL
+                SQL;
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD INDEX idx_s3_storage_gc_recursive_unsafe (recursive_cleanup_unsafe, storage_tier)';
+        }
+        if ($fromVersion < 43) {
+            $statements[] = 'ALTER TABLE s3_parts ADD COLUMN checksum_algorithm VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL';
+            $statements[] = 'ALTER TABLE s3_parts ADD COLUMN checksum_value VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL';
+        }
+        if ($fromVersion < 44) {
+            $statements[] = 'ALTER TABLE s3_cors_rules ADD COLUMN rule_id VARBINARY(255) NULL AFTER rule_order';
+            $statements[] = 'UPDATE s3_cors_rules SET max_age_seconds = -1 WHERE max_age_seconds = 0';
+            $statements[] = 'ALTER TABLE s3_cors_rules MODIFY COLUMN max_age_seconds INT NOT NULL DEFAULT -1';
+            $statements[] = 'ALTER TABLE s3_website_configs MODIFY COLUMN index_document MEDIUMTEXT NOT NULL, MODIFY COLUMN error_document MEDIUMTEXT NULL, MODIFY COLUMN redirect_all_host MEDIUMTEXT NULL';
+            $statements[] = 'ALTER TABLE s3_bucket_logging MODIFY COLUMN target_prefix MEDIUMTEXT NOT NULL';
+        }
+
         return $statements;
+    }
+
+    /** @return list<string> */
+    private static function completionCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_completion_capacity (
+                id TINYINT NOT NULL PRIMARY KEY,
+                retained_count BIGINT NOT NULL,
+                CONSTRAINT chk_s3_multipart_completion_capacity CHECK (id = 1 AND retained_count BETWEEN 0 AND 1000000)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+            'INSERT INTO s3_multipart_completion_capacity (id, retained_count) SELECT 1, (SELECT COUNT(*) FROM s3_multipart_write_intents) WHERE NOT EXISTS (SELECT 1 FROM s3_multipart_completion_capacity WHERE id = 1)',
+            'DROP TRIGGER IF EXISTS s3_multipart_completion_capacity_insert',
+            <<<'SQL'
+            CREATE TRIGGER s3_multipart_completion_capacity_insert BEFORE INSERT ON s3_multipart_write_intents
+            FOR EACH ROW BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count + 1
+                WHERE id = 1 AND retained_count < 1000000;
+                IF ROW_COUNT() <> 1 THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart completion recovery capacity is exhausted.';
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_multipart_completion_capacity_delete',
+            <<<'SQL'
+            CREATE TRIGGER s3_multipart_completion_capacity_delete BEFORE DELETE ON s3_multipart_write_intents
+            FOR EACH ROW BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count - 1
+                WHERE id = 1 AND retained_count > 0;
+                IF ROW_COUNT() <> 1 THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart completion recovery capacity is inconsistent.';
+                END IF;
+            END
+            SQL,
+        ];
+    }
+
+    /** @return list<string> */
+    private static function writeIntentCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_write_intent_capacity (
+                kind VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+                retained_count BIGINT NOT NULL,
+                CONSTRAINT chk_s3_write_intent_capacity CHECK (kind IN ('object', 'part') AND retained_count BETWEEN 0 AND 1000000)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'object', (SELECT COUNT(*) FROM s3_object_write_intents)
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object')",
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent')
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')",
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_insert',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents
+            FOR EACH ROW BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'object' AND retained_count < 1000000;
+                IF ROW_COUNT() <> 1 THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is exhausted or unavailable.';
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_delete',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents
+            FOR EACH ROW BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object' AND retained_count > 0;
+                IF ROW_COUNT() <> 1 THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is inconsistent.';
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_insert',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF NEW.operation = 'part_write_intent' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                    WHERE kind = 'part' AND retained_count < 1000000;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is exhausted or unavailable.';
+                    END IF;
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_delete',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF OLD.operation = 'part_write_intent' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'part' AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is inconsistent.';
+                    END IF;
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_update',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_update BEFORE UPDATE ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF OLD.operation <> NEW.operation THEN
+                    IF NEW.operation = 'part_write_intent' THEN
+                        UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                        WHERE kind = 'part' AND retained_count < 1000000;
+                        IF ROW_COUNT() <> 1 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is exhausted or unavailable.';
+                        END IF;
+                    ELSEIF OLD.operation = 'part_write_intent' THEN
+                        UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                        WHERE kind = 'part' AND retained_count > 0;
+                        IF ROW_COUNT() <> 1 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is inconsistent.';
+                        END IF;
+                    END IF;
+                END IF;
+            END
+            SQL,
+        ];
     }
 }

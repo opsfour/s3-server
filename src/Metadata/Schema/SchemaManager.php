@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Metadata\Schema;
 
+use OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration;
+
 /**
  * Tracks and applies schema migrations for the S3 metadata store.
  *
@@ -37,8 +39,12 @@ final class SchemaManager
             return $row !== false && $row['version'] !== null
                 ? (int) $row['version']
                 : 0;
-        } catch (\PDOException) {
-            // Table doesn't exist yet — version is 0.
+        } catch (\PDOException $error) {
+            if (! str_contains($error->getMessage(), 'no such table: s3_schema_version')) {
+                throw $error;
+            }
+
+            // Only a missing version table denotes a fresh database.
             return 0;
         }
     }
@@ -51,6 +57,14 @@ final class SchemaManager
     public function migrate(int $targetVersion = SqliteSchema::VERSION): void
     {
         $currentVersion = $this->getCurrentVersion();
+
+        if ($currentVersion > SqliteSchema::VERSION) {
+            throw new \RuntimeException("SQLite metadata schema version {$currentVersion} is newer than the supported version " . SqliteSchema::VERSION . '.');
+        }
+
+        if ($currentVersion > 0) {
+            $this->assertSupportedBucketEncryptionInventory();
+        }
 
         if ($currentVersion >= $targetVersion) {
             return;
@@ -72,6 +86,18 @@ final class SchemaManager
                     throw $e;
                 }
             }
+        }
+        $this->assertSupportedBucketEncryptionInventory();
+    }
+
+    public function assertSupportedBucketEncryptionInventory(): void
+    {
+        $statement = $this->pdo->query(StoredBucketEncryptionConfiguration::invalidRowQuery('sqlite'));
+        if ($statement === false) {
+            throw new \RuntimeException('Stored bucket encryption inventory cannot be verified.');
+        }
+        if ($statement->fetch(\PDO::FETCH_NUM) !== false) {
+            throw new \RuntimeException('Stored bucket encryption configuration is unsupported; repair metadata before serving.');
         }
     }
 
@@ -471,6 +497,465 @@ final class SchemaManager
         $stmt->execute([14, 'Add durable physical storage garbage queue']);
     }
 
+    private function applyVersion15(): void
+    {
+        $this->pdo->exec(
+            'CREATE INDEX IF NOT EXISTS idx_s3_objects_owner ON s3_objects(owner_id, is_delete_marker)',
+        );
+        $this->pdo->exec(
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_uploads_owner ON s3_multipart_uploads(owner_id)',
+        );
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([15, 'Index object owner for account storage quotas']);
+    }
+
+    private function applyVersion16(): void
+    {
+        $this->pdo->exec(
+            'CREATE INDEX IF NOT EXISTS idx_s3_buckets_owner_name ON s3_buckets(owner_id, name)',
+        );
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([16, 'Index owner bucket names for bounded ListBuckets pagination']);
+    }
+
+    private function applyVersion17(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_bucket_ownership_controls (
+                bucket TEXT PRIMARY KEY,
+                object_ownership TEXT NOT NULL
+            )
+        SQL);
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
+        );
+        $stmt->execute([17, 'Persist bucket Object Ownership controls']);
+    }
+
+    private function applyVersion18(): void
+    {
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier)');
+
+        $stmt = $this->pdo->prepare('INSERT INTO s3_schema_version (version, description) VALUES (?, ?)');
+        $stmt->execute([18, 'Index pending object transition target tiers for startup validation']);
+    }
+
+    private function applyVersion19(): void
+    {
+        if (! $this->columnExists('s3_buckets', 'generation')) {
+            $this->pdo->exec("ALTER TABLE s3_buckets ADD COLUMN generation TEXT NOT NULL DEFAULT ''");
+        }
+        $this->pdo->exec("UPDATE s3_buckets SET generation = lower(hex(randomblob(16))) WHERE generation = ''");
+
+        $stmt = $this->pdo->prepare('INSERT INTO s3_schema_version (version, description) VALUES (?, ?)');
+        $stmt->execute([19, 'Assign immutable bucket generations for access-log isolation']);
+    }
+
+    private function applyVersion20(): void
+    {
+        if (! $this->columnExists('s3_storage_garbage', 'operation')) {
+            $this->pdo->exec("ALTER TABLE s3_storage_garbage ADD COLUMN operation TEXT NOT NULL DEFAULT 'delete_path'");
+        }
+        if (! $this->columnExists('s3_storage_garbage', 'key_name')) {
+            $this->pdo->exec('ALTER TABLE s3_storage_garbage ADD COLUMN key_name TEXT');
+        }
+        if (! $this->columnExists('s3_storage_garbage', 'upload_id')) {
+            $this->pdo->exec('ALTER TABLE s3_storage_garbage ADD COLUMN upload_id TEXT');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (20, 'Queue multipart aborts during bucket deletion')");
+    }
+
+    private function applyVersion21(): void
+    {
+        if (! $this->columnExists('s3_tier_transition_jobs', 'origin')) {
+            $this->pdo->exec("ALTER TABLE s3_tier_transition_jobs ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'");
+        }
+        if (! $this->columnExists('s3_tier_transition_jobs', 'lifecycle_rule_id')) {
+            $this->pdo->exec('ALTER TABLE s3_tier_transition_jobs ADD COLUMN lifecycle_rule_id TEXT');
+        }
+        if (! $this->columnExists('s3_tier_transition_jobs', 'expected_is_latest')) {
+            $this->pdo->exec('ALTER TABLE s3_tier_transition_jobs ADD COLUMN expected_is_latest INTEGER');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (21, 'Fence lifecycle tier jobs against stale rules and version roles')");
+    }
+
+    private function applyVersion22(): void
+    {
+        if (! $this->columnExists('s3_multipart_uploads', 'bucket_generation')) {
+            $this->pdo->exec("ALTER TABLE s3_multipart_uploads ADD COLUMN bucket_generation TEXT NOT NULL DEFAULT ''");
+        }
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_write_intents (
+                attempt_id TEXT PRIMARY KEY,
+                upload_id TEXT NOT NULL,
+                active_upload_id TEXT UNIQUE,
+                bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                assembly_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                part_digest TEXT NOT NULL,
+                sse_mode TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                lease_until REAL NOT NULL,
+                next_attempt_at REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_due
+                ON s3_multipart_write_intents(state, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_upload
+                ON s3_multipart_write_intents(upload_id);
+        SQL);
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (22, 'Track multipart completion paths before storage writes')");
+    }
+
+    private function applyVersion23(): void
+    {
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_tier ON s3_multipart_write_intents(storage_tier)');
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (23, 'Index multipart intent storage tiers for startup inventory')");
+    }
+
+    private function applyVersion24(): void
+    {
+        $this->pdo->exec('ALTER TABLE s3_storage_garbage ADD COLUMN owner_id TEXT');
+        $this->pdo->exec(<<<'SQL'
+            UPDATE s3_storage_garbage AS garbage
+            SET owner_id = (
+                SELECT upload.owner_id FROM s3_multipart_uploads AS upload
+                WHERE upload.upload_id = garbage.upload_id
+                  AND upload.bucket = garbage.bucket
+                  AND substr(garbage.storage_path, -65, 32) = upload.bucket_generation
+            )
+            WHERE garbage.operation = 'part_write_intent' AND garbage.owner_id IS NULL
+            SQL);
+        $this->pdo->exec('CREATE INDEX idx_s3_storage_gc_operation_owner ON s3_storage_garbage(operation, owner_id)');
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (24, 'Isolate multipart part recovery admission by owner')");
+    }
+
+    private function applyVersion25(): void
+    {
+        foreach (['s3_storage_garbage', 's3_tier_transition_jobs', 's3_restore_jobs', 's3_notification_queue'] as $table) {
+            $this->pdo->exec("ALTER TABLE {$table} ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0");
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (25, 'Fence leased queue claims by generation')");
+    }
+
+    private function applyVersion26(): void
+    {
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_owner ON s3_multipart_write_intents(owner_id)');
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (26, 'Bound multipart completion recovery intents by owner')");
+    }
+
+    private function applyVersion27(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_write_intents (
+                attempt_id TEXT PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                bucket_generation TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                storage_tier TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                path_digest TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                lease_until REAL NOT NULL,
+                claim_generation INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(storage_tier, path_digest)
+            );
+            CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner ON s3_object_write_intents(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_due ON s3_object_write_intents(state, lease_until);
+            CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_tier ON s3_object_write_intents(storage_tier);
+        SQL);
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (27, 'Add durable pathwise object write intents')");
+    }
+
+    private function applyVersion28(): void
+    {
+        // A constant default preserves every existing row as possibly
+        // dispatched. New reservations explicitly INSERT NULL.
+        $this->pdo->exec("ALTER TABLE s3_object_write_intents ADD COLUMN dispatch_id TEXT DEFAULT '00000000000000000000000000000000'");
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (28, 'Fence local object write dispatches once per attempt')");
+    }
+
+    private function applyVersion29(): void
+    {
+        // Existing uploads cannot be assigned a physical tier safely. A NULL
+        // upload must be resolved explicitly before an API node can serve it.
+        if (! $this->columnExists('s3_multipart_uploads', 'storage_tier')) {
+            $this->pdo->exec('ALTER TABLE s3_multipart_uploads ADD COLUMN storage_tier TEXT');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (29, 'Pin multipart uploads to physical storage tiers')");
+    }
+
+    private function applyVersion30(): void
+    {
+        // Existing restored paths have no provable physical tier. Keep them
+        // NULL so API startup can reject the ambiguity until resolved.
+        if ($this->tableExists('s3_objects') && ! $this->columnExists('s3_objects', 'restored_storage_tier')) {
+            $this->pdo->exec('ALTER TABLE s3_objects ADD COLUMN restored_storage_tier TEXT');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (30, 'Pin restored object copies to physical storage tiers')");
+    }
+
+    private function applyVersion31(): void
+    {
+        if ($this->tableExists('s3_multipart_write_intents') && ! $this->columnExists('s3_multipart_write_intents', 'claim_generation')) {
+            $this->pdo->exec('ALTER TABLE s3_multipart_write_intents ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (31, 'Fence multipart completion collector claims by generation')");
+    }
+
+    private function applyVersion32(): void
+    {
+        // A pre-upgrade path may already have an in-flight physical write.
+        // Only new local reservations explicitly store NULL before dispatch.
+        if ($this->tableExists('s3_storage_garbage') && ! $this->columnExists('s3_storage_garbage', 'dispatch_id')) {
+            $this->pdo->exec("ALTER TABLE s3_storage_garbage ADD COLUMN dispatch_id TEXT DEFAULT '00000000000000000000000000000000'");
+        }
+        if ($this->tableExists('s3_multipart_write_intents') && ! $this->columnExists('s3_multipart_write_intents', 'dispatch_id')) {
+            $this->pdo->exec("ALTER TABLE s3_multipart_write_intents ADD COLUMN dispatch_id TEXT DEFAULT '00000000000000000000000000000000'");
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (32, 'Fence local multipart part and completion dispatches once')");
+    }
+
+    private function applyVersion33(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_multipart_completion_capacity (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                retained_count INTEGER NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
+            )
+            SQL);
+        $this->pdo->exec('INSERT INTO s3_multipart_completion_capacity (id, retained_count) SELECT 1, (SELECT COUNT(*) FROM s3_multipart_write_intents) WHERE NOT EXISTS (SELECT 1 FROM s3_multipart_completion_capacity WHERE id = 1)');
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_multipart_completion_capacity_insert BEFORE INSERT ON s3_multipart_write_intents
+            BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count + 1
+                WHERE id = 1 AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart completion recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_multipart_completion_capacity_delete BEFORE DELETE ON s3_multipart_write_intents
+            BEGIN
+                UPDATE s3_multipart_completion_capacity SET retained_count = retained_count - 1
+                WHERE id = 1 AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart completion recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->assertMultipartCompletionCapacityConsistent();
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (33, 'Bound retained multipart completion intents globally')");
+    }
+
+    public function assertMultipartCompletionCapacityConsistent(): void
+    {
+        try {
+            $capacity = $this->pdo->query('SELECT retained_count, typeof(retained_count) AS count_type, (SELECT COUNT(*) FROM s3_multipart_write_intents) AS actual_count FROM s3_multipart_completion_capacity WHERE id = 1');
+            if ($capacity === false) {
+                throw new \RuntimeException('Multipart completion recovery capacity counter cannot be read.');
+            }
+            $row = $capacity->fetch(\PDO::FETCH_ASSOC);
+        } catch (\PDOException $error) {
+            throw new \RuntimeException('Multipart completion recovery capacity counter cannot be verified.', 0, $error);
+        }
+        if ($row === false || $row['count_type'] !== 'integer' || (int) $row['retained_count'] !== (int) $row['actual_count']) {
+            throw new \RuntimeException('Multipart completion recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
+        }
+    }
+
+    private function applyVersion34(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_write_intent_capacity (
+                kind TEXT PRIMARY KEY CHECK (kind IN ('object', 'part')),
+                retained_count INTEGER NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
+            )
+            SQL);
+        $this->pdo->exec("INSERT INTO s3_write_intent_capacity (kind, retained_count)
+            SELECT 'object', (SELECT COUNT(*) FROM s3_object_write_intents)
+            WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object')");
+        $this->pdo->exec("INSERT INTO s3_write_intent_capacity (kind, retained_count)
+            SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent')
+            WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')");
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'object' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Object write recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Object write recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage
+            WHEN NEW.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'part' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage
+            WHEN OLD.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'part' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_part_enter BEFORE UPDATE OF operation ON s3_storage_garbage
+            WHEN OLD.operation != 'part_write_intent' AND NEW.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'part' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_write_intent_capacity_part_leave BEFORE UPDATE OF operation ON s3_storage_garbage
+            WHEN OLD.operation = 'part_write_intent' AND NEW.operation != 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'part' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->assertWriteIntentCapacityConsistent();
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (34, 'Bound object and multipart part write intents globally')");
+    }
+
+    private function applyVersion35(): void
+    {
+        // SQLite cannot add a table CHECK in place. This entire replacement
+        // and its version row commit in the surrounding migration transaction.
+        $this->assertSupportedBucketEncryptionInventory();
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE s3_encryption_configs_v35 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket TEXT NOT NULL UNIQUE,
+                sse_algorithm TEXT NOT NULL DEFAULT 'AES256',
+                kms_master_key_id TEXT,
+                bucket_key_enabled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CONSTRAINT chk_s3_encryption_configs_supported CHECK (
+                    sse_algorithm COLLATE BINARY = 'AES256'
+                    AND kms_master_key_id IS NULL
+                    AND bucket_key_enabled = 0
+                )
+            )
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            INSERT INTO s3_encryption_configs_v35
+                (id, bucket, sse_algorithm, kms_master_key_id, bucket_key_enabled, created_at, updated_at)
+            SELECT id, bucket, sse_algorithm, kms_master_key_id, bucket_key_enabled, created_at, updated_at
+            FROM s3_encryption_configs
+            SQL);
+        $this->pdo->exec('DROP TABLE s3_encryption_configs');
+        $this->pdo->exec('ALTER TABLE s3_encryption_configs_v35 RENAME TO s3_encryption_configs');
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (35, 'Enforce supported bucket encryption configuration')");
+    }
+
+    private function applyVersion36(): void
+    {
+        if ($this->tableExists('s3_objects')) {
+            if (! $this->columnExists('s3_objects', 'noncurrent_at')) {
+                $this->pdo->exec('ALTER TABLE s3_objects ADD COLUMN noncurrent_at TEXT');
+            }
+            // A legacy row has no trustworthy demotion timestamp. Starting its
+            // NoncurrentDays clock at migration time prevents an immediate,
+            // potentially destructive expiration based on the older created_at.
+            $this->pdo->exec("UPDATE s3_objects SET noncurrent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE is_latest = 0 AND noncurrent_at IS NULL");
+            $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at)');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (36, 'Track object noncurrent transition time')");
+    }
+
+    private function applyVersion37(): void
+    {
+        // Keep the normal admission path proportional to unsafe work rather
+        // than to every retained exact-path cleanup row. The predicate is
+        // deliberately identical to the fail-closed admission query and
+        // retains NULL operations if a legacy/drifted schema allowed them.
+        $this->pdo->exec(<<<'SQL'
+            CREATE INDEX IF NOT EXISTS idx_s3_storage_gc_recursive_unsafe
+                ON s3_storage_garbage(storage_tier, operation)
+                WHERE CASE WHEN operation IN ('delete_path', 'part_write_intent') THEN 0 ELSE 1 END = 1
+            SQL);
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (37, 'Index unsafe recursive storage cleanup admission')");
+    }
+
+    private function applyVersion38(): void
+    {
+        if (! $this->columnExists('s3_parts', 'checksum_algorithm')) {
+            $this->pdo->exec('ALTER TABLE s3_parts ADD COLUMN checksum_algorithm TEXT');
+        }
+        if (! $this->columnExists('s3_parts', 'checksum_value')) {
+            $this->pdo->exec('ALTER TABLE s3_parts ADD COLUMN checksum_value TEXT');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (38, 'Persist verified multipart part checksums')");
+    }
+
+    private function applyVersion39(): void
+    {
+        if ($this->tableExists('s3_cors_rules')) {
+            if (! $this->columnExists('s3_cors_rules', 'rule_id')) {
+                $this->pdo->exec('ALTER TABLE s3_cors_rules ADD COLUMN rule_id TEXT');
+            }
+            // Before this version both an omitted MaxAgeSeconds and an explicit
+            // zero were stored as 0 and read as absent. Preserve that established
+            // meaning for legacy rows; new writes use -1 for absence.
+            $this->pdo->exec('UPDATE s3_cors_rules SET max_age_seconds = -1 WHERE max_age_seconds = 0');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (39, 'Preserve CORS rule IDs and explicit zero maximum age')");
+    }
+
+    public function assertWriteIntentCapacityConsistent(): void
+    {
+        foreach ([
+            'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
+            'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
+        ] as $kind => $countSql) {
+            try {
+                $statement = $this->pdo->prepare("SELECT retained_count, typeof(retained_count) AS count_type, ({$countSql}) AS actual_count FROM s3_write_intent_capacity WHERE kind = ?");
+                $statement->execute([$kind]);
+                $row = $statement->fetch(\PDO::FETCH_ASSOC);
+            } catch (\PDOException $error) {
+                throw new \RuntimeException('Write intent recovery capacity counter cannot be verified.', 0, $error);
+            }
+            if ($row === false || $row['count_type'] !== 'integer' || (int) $row['retained_count'] !== (int) $row['actual_count']) {
+                throw new \RuntimeException('Write intent recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
+            }
+        }
+    }
+
+    private function tableExists(string $table): bool
+    {
+        $stmt = $this->pdo->prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1");
+        $stmt->execute([$table]);
+
+        return $stmt->fetchColumn() !== false;
+    }
+
     private function columnExists(string $table, string $column): bool
     {
         $stmt = $this->pdo->query("PRAGMA table_info({$table})");
@@ -503,6 +988,7 @@ final class SchemaManager
     public function dropAll(): void
     {
         $tables = [
+            's3_object_write_intents',
             's3_lifecycle_checkpoints',
             's3_tier_transition_jobs',
             's3_restore_jobs',

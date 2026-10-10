@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
  * Applies explicit Object Lock headers or a bucket default to a new version.
@@ -125,8 +126,16 @@ final readonly class ObjectLockRequestApplier
             $default = $config['rule']['defaultRetention'];
             $retainUntilDate = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
             if (isset($default['days'])) {
+                if (! is_int($default['days']) || $default['days'] < 1
+                    || $default['days'] > XmlRequestParser::MAX_DEFAULT_RETENTION_DAYS) {
+                    throw new InvalidArgumentException('Stored Object Lock default Days are outside the supported range.');
+                }
                 $retainUntilDate = $retainUntilDate->modify('+' . $default['days'] . ' days');
             } elseif (isset($default['years'])) {
+                if (! is_int($default['years']) || $default['years'] < 1
+                    || $default['years'] > XmlRequestParser::MAX_DEFAULT_RETENTION_YEARS) {
+                    throw new InvalidArgumentException('Stored Object Lock default Years are outside the supported range.');
+                }
                 $retainUntilDate = $retainUntilDate->modify('+' . $default['years'] . ' years');
             } else {
                 throw new InvalidArgumentException('Object Lock default retention requires Days or Years.');

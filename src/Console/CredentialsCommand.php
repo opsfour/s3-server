@@ -53,14 +53,20 @@ final class CredentialsCommand extends Command
             return Command::FAILURE;
         }
 
-        return match ($action) {
-            'create' => $this->handleCreate($input, $io, $manager),
-            'list' => $this->handleList($io, $manager),
-            'show' => $this->handleShow($input, $io, $manager),
-            'activate' => $this->handleToggle($input, $io, $manager, true),
-            'deactivate' => $this->handleToggle($input, $io, $manager, false),
-            'delete' => $this->handleDelete($input, $io, $manager),
-        };
+        try {
+            return match ($action) {
+                'create' => $this->handleCreate($input, $io, $manager),
+                'list' => $this->handleList($io, $manager),
+                'show' => $this->handleShow($input, $io, $manager),
+                'activate' => $this->handleToggle($input, $io, $manager, true),
+                'deactivate' => $this->handleToggle($input, $io, $manager, false),
+                'delete' => $this->handleDelete($input, $io, $manager),
+            };
+        } catch (\Throwable $e) {
+            $io->error(sprintf('S3 credential operation failed (%s).', $e::class));
+
+            return Command::FAILURE;
+        }
     }
 
     private function buildManager(InputInterface $input, SymfonyStyle $io): ?CredentialManager
@@ -76,25 +82,38 @@ final class CredentialsCommand extends Command
             return null;
         }
 
+        if ($driver === 'database' && $input->getOption('credentials-dsn') === null) {
+            $io->error('--credentials-dsn is required for the database driver.');
+
+            return null;
+        }
+        if ($driver === 'file' && $input->getOption('credentials-file') === null) {
+            $io->error('--credentials-file is required for the file driver.');
+
+            return null;
+        }
+        if (! in_array($driver, ['database', 'file'], true)) {
+            $io->error("Unsupported credentials driver for management. Use 'database' or 'file'.");
+
+            return null;
+        }
+
         $config = match ($driver) {
             'database' => [
-                'dsn' => $input->getOption('credentials-dsn')
-                    ?? throw new \RuntimeException('--credentials-dsn is required for the database driver.'),
+                'dsn' => $input->getOption('credentials-dsn'),
                 'username' => $input->getOption('credentials-username'),
                 'password' => $input->getOption('credentials-password'),
                 'cache_ttl' => 0,
             ],
             'file' => [
-                'path' => $input->getOption('credentials-file')
-                    ?? throw new \RuntimeException('--credentials-file is required for the file driver.'),
+                'path' => $input->getOption('credentials-file'),
             ],
-            default => throw new \RuntimeException("Unsupported credentials driver for management: '{$driver}'. Use 'database' or 'file'."),
         };
 
         try {
             $provider = CredentialProviderFactory::create($driver, $config);
         } catch (\Throwable $e) {
-            $io->error($e->getMessage());
+            $io->error(sprintf('S3 credential provider initialization failed (%s).', $e::class));
 
             return null;
         }
@@ -192,7 +211,12 @@ final class CredentialsCommand extends Command
         try {
             $manager->setActive($accessKeyId, $active);
         } catch (\RuntimeException $e) {
-            $io->error($e->getMessage());
+            $io->error(match ($e->getMessage()) {
+                "Credential not found: {$accessKeyId}" => 'Credential not found.',
+                "Credential changed or was revoked: {$accessKeyId}" => 'Credential changed or was revoked.',
+                'Credential provider does not support atomic status updates.' => 'Credential provider does not support atomic status updates.',
+                default => sprintf('S3 credential operation failed (%s).', $e::class),
+            });
 
             return Command::FAILURE;
         }

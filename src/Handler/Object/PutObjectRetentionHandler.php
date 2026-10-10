@@ -8,10 +8,13 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -30,7 +33,7 @@ final class PutObjectRetentionHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -42,7 +45,7 @@ final class PutObjectRetentionHandler implements RequestHandler
         // Object Lock must be enabled on the bucket.
         $lockConfig = $this->metadata->getObjectLockConfig($bucket);
         if ($lockConfig === null) {
-            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+            throw new InvalidRequestException(
                 'Bucket is missing Object Lock Configuration',
             );
         }
@@ -63,8 +66,10 @@ final class PutObjectRetentionHandler implements RequestHandler
             );
         }
 
-        $this->metadata->transaction(function () use ($bucketInfo, $request, $bucket, $key, $retention, $newDate): void {
-            $this->metadata->lockOwnerForUpdate($bucketInfo->ownerId);
+        $this->metadata->transaction(function () use ($bucketInfo, $ownerId, $request, $bucket, $key, $retention, $newDate): void {
+            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
             $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
             $versionId = $objectInfo->versionId;
 
@@ -80,14 +85,16 @@ final class PutObjectRetentionHandler implements RequestHandler
             }
             if ($existing !== null && $existing['mode'] === 'GOVERNANCE') {
                 $existingDate = new \DateTimeImmutable($existing['retainUntilDate']);
-                $weakensRetention = $retention['mode'] !== 'GOVERNANCE' || $newDate < $existingDate;
+                // Moving GOVERNANCE to COMPLIANCE at the same or a later
+                // date strengthens the lock and needs no bypass permission.
+                $weakensRetention = $newDate < $existingDate;
                 $bypassRequested = strtolower(
                     $request->getHeader('x-amz-bypass-governance-retention') ?? '',
                 ) === 'true';
                 $canBypass = $request->getAttribute('s3.canBypassGovernanceRetention') === true;
                 if ($weakensRetention && (! $bypassRequested || ! $canBypass)) {
                     throw new AccessDeniedException(
-                        'Shortening or changing GOVERNANCE retention requires s3:BypassGovernanceRetention.',
+                        'Shortening GOVERNANCE retention requires s3:BypassGovernanceRetention.',
                     );
                 }
             }
