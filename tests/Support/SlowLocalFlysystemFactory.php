@@ -15,6 +15,8 @@ final readonly class SlowLocalFlysystemFactory implements FlysystemFilesystemFac
     public function __construct(
         private string $rootPath,
         private int $writeDelayMicroseconds = 0,
+        private int $readDelayMicroseconds = 0,
+        private ?string $readDelayPath = null,
     ) {}
 
     public function createFilesystem(): FilesystemOperator
@@ -22,18 +24,20 @@ final readonly class SlowLocalFlysystemFactory implements FlysystemFilesystemFac
         return new Filesystem(new SlowLocalFlysystemAdapter(
             $this->rootPath,
             $this->writeDelayMicroseconds,
+            $this->readDelayMicroseconds,
+            $this->readDelayPath,
         ));
     }
 
     public function cacheKey(): string
     {
-        return self::class . ':' . hash('sha256', $this->rootPath . "\0" . $this->writeDelayMicroseconds);
+        return self::class . ':' . hash('sha256', $this->rootPath . "\0" . $this->writeDelayMicroseconds . "\0" . $this->readDelayMicroseconds . "\0" . ($this->readDelayPath ?? ''));
     }
 }
 
 final class SlowLocalFlysystemAdapter extends LocalFilesystemAdapter
 {
-    public function __construct(string $rootPath, private readonly int $writeDelayMicroseconds)
+    public function __construct(string $rootPath, private readonly int $writeDelayMicroseconds, private readonly int $readDelayMicroseconds, private readonly ?string $readDelayPath)
     {
         parent::__construct($rootPath);
     }
@@ -48,5 +52,15 @@ final class SlowLocalFlysystemAdapter extends LocalFilesystemAdapter
         }
 
         parent::writeStream($path, $contents, $config);
+    }
+
+    /** @return resource */
+    public function readStream(string $path)
+    {
+        if ($this->readDelayMicroseconds > 0 && $path === $this->readDelayPath) {
+            usleep($this->readDelayMicroseconds);
+        }
+
+        return parent::readStream($path);
     }
 }

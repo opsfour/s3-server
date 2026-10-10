@@ -5,13 +5,21 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Lifecycle;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\File\Driver\BlockingFilesystemDriver;
+use Amp\File\Filesystem;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\StorageGarbageCollector;
+use OpsFour\S3Server\Storage\StorageTier;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 use Revolt\EventLoop;
@@ -43,6 +51,103 @@ final class LifecycleExecutorTest extends TestCase
         }
 
         parent::tearDown();
+    }
+
+    public function test_lifecycle_sweeps_stale_files_in_all_observed_filesystem_tiers(): void
+    {
+        $filesystem = new Filesystem(new BlockingFilesystemDriver());
+        $metrics = new MetricsCollector();
+        $backends = [];
+        $stalePaths = [];
+        foreach (['hot', 'cold'] as $name) {
+            $root = $this->path . '/' . $name;
+            $tmp = $root . '/.tmp';
+            self::assertTrue(mkdir($tmp, 0700, true));
+            $stale = $tmp . '/' . bin2hex(random_bytes(16));
+            self::assertSame(5, file_put_contents($stale, 'stale'));
+            self::assertTrue(touch($stale, time() - 7200));
+            $stalePaths[] = $stale;
+            $backends[$name] = new ObservedStorageBackend(
+                new FilesystemBackend($root, $filesystem, $filesystem),
+                $metrics,
+                'filesystem:' . $name,
+            );
+        }
+
+        $tiers = new StorageTierRegistry([
+            new StorageTier('STANDARD', $backends['hot'], defaultWriteTier: true),
+            new StorageTier('COLD', $backends['cold']),
+        ]);
+        (new LifecycleExecutor($this->metadata, $backends['hot'], storageTiers: $tiers))->execute();
+
+        foreach ($stalePaths as $stale) {
+            self::assertFileDoesNotExist($stale);
+        }
+    }
+
+    #[DataProvider('stopKinds')]
+    public function test_cancelled_sweep_does_not_start_stale_temp_cleanup(string $stopKind): void
+    {
+        $tmp = $this->path . '/objects/.tmp';
+        self::assertTrue(mkdir($tmp, 0700, true));
+        $stale = $tmp . '/stale';
+        self::assertSame(5, file_put_contents($stale, 'stale'));
+        self::assertTrue(touch($stale, time() - 7200));
+
+        $executor = new LifecycleExecutor($this->metadata, $this->storage);
+        if ($stopKind === 'direct') {
+            $executor->requestStop();
+        } else {
+            $executor->requestRunnerStop();
+        }
+
+        $executor->execute();
+
+        self::assertFileExists($stale);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function stopKinds(): iterable
+    {
+        yield 'direct' => ['direct'];
+        yield 'runner' => ['runner'];
+    }
+
+    public function test_runner_stop_rejects_a_new_physical_delete(): void
+    {
+        $this->createBucket('bucket');
+        $written = $this->putObject('bucket', 'object.txt', 'payload');
+        $object = $this->metadata->getObjectMetadata('bucket', 'object.txt');
+        self::assertNotNull($object);
+        $executor = new LifecycleExecutor($this->metadata, $this->storage);
+        $executor->requestRunnerStop();
+
+        try {
+            (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteStoredData')
+                ->invoke($executor, $object, 'expire_current');
+            self::fail('Lifecycle launched a physical delete after stop.');
+        } catch (OperationAbortedException) {
+            self::assertFileExists($written->path);
+        }
+    }
+
+    public function test_runner_stop_rejects_a_new_multipart_abort_cleanup(): void
+    {
+        $this->createBucket('bucket');
+        $uploadId = $this->createMultipartUploadWithPart('bucket', 'object.bin');
+        $parts = $this->metadata->getParts($uploadId);
+        self::assertCount(1, $parts);
+        $executor = new LifecycleExecutor($this->metadata, $this->storage);
+        $executor->requestRunnerStop();
+
+        try {
+            (new \ReflectionClass(LifecycleExecutor::class))->getMethod('abortMultipartUploadDurably')
+                ->invoke($executor, 'bucket', 'object.bin', $uploadId);
+            self::fail('Lifecycle launched multipart cleanup after stop.');
+        } catch (OperationAbortedException) {
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertFileExists($parts[0]['storage_path']);
+        }
     }
 
     public function test_expiration_deletes_current_objects_and_storage_by_prefix(): void
@@ -77,6 +182,272 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertFileExists($keptByAge->path);
     }
 
+    public function test_stored_overflowing_lifecycle_days_fail_closed_without_deleting_objects(): void
+    {
+        $this->createBucket('bucket');
+        $write = $this->putObject('bucket', 'old.txt', 'payload');
+        $this->ageObject('bucket', 'old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'unsafe-days',
+            'status' => 'Enabled',
+            'prefix' => '',
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => PHP_INT_MAX],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        (new LifecycleExecutor($this->metadata, $this->storage))->execute();
+
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
+        self::assertFileExists($write->path);
+    }
+
+    public function test_expiration_keeps_metadata_and_bytes_when_cleanup_queue_insert_fails(): void
+    {
+        $this->createBucket('bucket');
+        $expired = $this->putObject('bucket', 'logs/old.txt', 'expired');
+        $this->ageObject('bucket', 'logs/old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-logs',
+            'status' => 'Enabled',
+            'prefix' => 'logs/',
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $connection = (new \ReflectionClass($this->metadata))->getMethod('connection')->invoke($this->metadata);
+        self::assertInstanceOf(\PDO::class, $connection);
+        $secret = 'backend-password-private-test-token';
+        $connection->exec("CREATE TRIGGER reject_lifecycle_garbage BEFORE INSERT ON s3_storage_garbage BEGIN SELECT RAISE(ABORT, '$secret'); END");
+        $logger = new LifecycleArrayLogger();
+        (new LifecycleExecutor($this->metadata, $this->storage, $logger))->processBucket('bucket');
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'logs/old.txt'));
+        self::assertFileExists($expired->path);
+        self::assertStringNotContainsString($secret, json_encode($logger->records, JSON_THROW_ON_ERROR));
+        self::assertNotNull($logger->findContext('rule_failed', ['exception' => \PDOException::class]));
+
+        $connection->exec('DROP TRIGGER reject_lifecycle_garbage');
+        // The first sweep clears the cursor recorded before the failed action.
+        $this->executor()->processBucket('bucket');
+        $this->executor()->processBucket('bucket');
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'logs/old.txt'));
+        self::assertFileDoesNotExist($expired->path);
+    }
+
+    public function test_expiration_keeps_exact_path_queued_when_physical_delete_fails(): void
+    {
+        $this->createBucket('bucket');
+        $expired = $this->putObject('bucket', 'logs/old.txt', 'expired');
+        $this->ageObject('bucket', 'logs/old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-logs',
+            'status' => 'Enabled',
+            'prefix' => 'logs/',
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+        $failingStorage = new CallbackStorageBackend(
+            $this->storage,
+            beforeDelete: static function (): never {
+                throw new \RuntimeException('physical delete unavailable');
+            },
+        );
+
+        (new LifecycleExecutor($this->metadata, $failingStorage))->processBucket('bucket');
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'logs/old.txt'));
+        self::assertFileExists($expired->path);
+        self::assertSame(1, (new StorageGarbageCollector($this->metadata, StorageTierRegistry::single($this->storage)))->collect(1));
+        self::assertFileDoesNotExist($expired->path);
+    }
+
+    public function test_storage_cancellation_stops_bucket_sweep_and_keeps_cleanup_queued(): void
+    {
+        $this->createBucket('bucket');
+        $expired = $this->putObject('bucket', 'expired.txt', 'expired');
+        $this->ageObject('bucket', 'expired.txt', 5);
+        $this->configureOneDayExpiration();
+        $cancelledStorage = new CallbackStorageBackend(
+            $this->storage,
+            beforeDelete: static function (): never {
+                throw new \Amp\CancelledException();
+            },
+        );
+
+        try {
+            (new LifecycleExecutor($this->metadata, $cancelledStorage))->processBucket('bucket');
+            self::fail('Expected backend cancellation to stop lifecycle processing.');
+        } catch (\Amp\CancelledException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'expired.txt'));
+            self::assertFileExists($expired->path);
+            self::assertSame(1, (new StorageGarbageCollector($this->metadata, StorageTierRegistry::single($this->storage)))->collect(1));
+            self::assertFileDoesNotExist($expired->path);
+        }
+    }
+
+    public function test_suspended_expiration_preserves_the_current_numbered_version_payload(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $numbered = $this->putVersionedObject('bucket', 'retained.txt', 'numbered payload');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->ageVersion('bucket', 'retained.txt', $numbered['versionId'], 5);
+        $this->configureOneDayExpiration();
+
+        $this->executor()->processBucket('bucket');
+
+        $retained = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $numbered['versionId']);
+        self::assertNotNull($retained);
+        self::assertFileExists($numbered['path']);
+        self::assertSame('numbered payload', \Amp\ByteStream\buffer($this->storage->getObjectByPath($numbered['path'])));
+        self::assertTrue($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', 'null')?->isDeleteMarker);
+    }
+
+    public function test_suspended_expiration_replaces_only_an_older_null_version_payload(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $olderNumbered = $this->putVersionedObject('bucket', 'retained.txt', 'older numbered');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $oldNull = $this->putObject('bucket', 'retained.txt', 'old null payload');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $latestNumbered = $this->putVersionedObject('bucket', 'retained.txt', 'latest numbered');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->ageVersion('bucket', 'retained.txt', $latestNumbered['versionId'], 5);
+        $this->configureOneDayExpiration();
+
+        $this->executor()->processBucket('bucket');
+
+        self::assertTrue($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', 'null')?->isDeleteMarker);
+        self::assertFileDoesNotExist($oldNull->path);
+        foreach ([$olderNumbered, $latestNumbered] as $numbered) {
+            self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $numbered['versionId']));
+            self::assertFileExists($numbered['path']);
+        }
+    }
+
+    public function test_suspended_expiration_does_not_replace_a_protected_null_version(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $this->putVersionedObject('bucket', 'retained.txt', 'older numbered');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $oldNull = $this->putObject('bucket', 'retained.txt', 'locked null payload');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $latestNumbered = $this->putVersionedObject('bucket', 'retained.txt', 'latest numbered');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->ageVersion('bucket', 'retained.txt', $latestNumbered['versionId'], 5);
+        $this->metadata->putObjectRetention(
+            'bucket',
+            'retained.txt',
+            'COMPLIANCE',
+            (new \DateTimeImmutable('+1 day', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM),
+            'null',
+        );
+        $this->configureOneDayExpiration();
+
+        $this->executor()->processBucket('bucket');
+
+        self::assertFalse($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', 'null')?->isDeleteMarker);
+        self::assertFileExists($oldNull->path);
+        self::assertFileExists($latestNumbered['path']);
+        self::assertSame($latestNumbered['versionId'], $this->metadata->getObjectMetadata('bucket', 'retained.txt')?->versionId);
+    }
+
+    #[DataProvider('recreatedBucketOwners')]
+    public function test_old_lifecycle_rules_cannot_delete_objects_after_bucket_name_is_reused(string $newOwner): void
+    {
+        $this->createBucket('bucket');
+        $old = $this->putObject('bucket', 'a/old.txt', 'old');
+        $this->ageObject('bucket', 'a/old.txt', 5);
+        $rules = [];
+        foreach (['a/', 'b/'] as $prefix) {
+            $rules[] = [
+                'id' => 'expire-' . $prefix,
+                'status' => 'Enabled',
+                'prefix' => $prefix,
+                'filter' => null,
+                'transitions' => null,
+                'expiration' => ['days' => 1],
+                'noncurrentTransitions' => null,
+                'noncurrentExpiration' => null,
+                'abortIncompleteDays' => null,
+            ];
+        }
+        $this->metadata->putBucketLifecycle('bucket', $rules);
+
+        $newWrite = null;
+        $storage = new CallbackStorageBackend($this->storage, afterDelete: function () use (&$newWrite, $newOwner): void {
+            if ($newWrite !== null) {
+                return;
+            }
+            $this->metadata->deleteBucket('owner', 'bucket');
+            $this->metadata->createBucket($newOwner, 'bucket', 'us-east-1');
+            $newWrite = $this->storage->putObject('bucket', 'b/new.txt', new ReadableBuffer('new'));
+            $this->metadata->putObjectMetadata(
+                'bucket',
+                'b/new.txt',
+                $newOwner,
+                $newWrite->size,
+                '"' . $newWrite->md5Hex . '"',
+                'text/plain',
+                $newWrite->path,
+            );
+            $this->ageObject('bucket', 'b/new.txt', 5);
+        });
+
+        $this->expectException(OperationAbortedException::class);
+        try {
+            (new LifecycleExecutor($this->metadata, $storage))->processBucket('bucket');
+        } finally {
+            self::assertNotNull($newWrite);
+            self::assertSame($newOwner, $this->metadata->getBucketOwner('bucket'));
+            self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'b/new.txt'));
+            self::assertFileExists($newWrite->path);
+            self::assertFileDoesNotExist($old->path);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function recreatedBucketOwners(): iterable
+    {
+        yield 'different owner' => ['new-owner'];
+        yield 'same owner' => ['owner'];
+    }
+
+    public function test_stale_multipart_cleanup_rejects_reused_bucket_generation(): void
+    {
+        $this->createBucket('bucket');
+        $observedBucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($observedBucket);
+        $this->metadata->deleteBucket('owner', 'bucket');
+        $this->metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $uploadId = $this->createMultipartUploadWithPart('bucket', 'new-generation.bin');
+        $this->ageMultipartUpload($uploadId, 10);
+        $parts = $this->metadata->getParts($uploadId);
+        self::assertCount(1, $parts);
+
+        $executor = new LifecycleExecutor($this->metadata, $this->storage);
+        $cleanup = (new \ReflectionClass($executor))->getMethod('cleanupStaleMultipartUploads');
+        $this->expectException(OperationAbortedException::class);
+        try {
+            $cleanup->invoke($executor, $observedBucket);
+        } finally {
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertSame($parts, $this->metadata->getParts($uploadId));
+        }
+    }
+
     public function test_noncurrent_version_expiration_deletes_only_old_noncurrent_versions(): void
     {
         $this->createBucket('bucket');
@@ -104,6 +475,242 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertFileDoesNotExist($oldVersion['path']);
         $this->assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'versioned.txt', $latestVersion['versionId']));
         $this->assertFileExists($latestVersion['path']);
+    }
+
+    public function test_noncurrent_expiration_handles_suspended_null_versions_and_respects_legal_hold(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $protected = $this->putObject('bucket', 'a-protected.txt', 'held-null');
+        $expired = $this->putObject('bucket', 'z-expired.txt', 'old-null');
+        $this->metadata->putObjectLegalHold('bucket', 'a-protected.txt', 'ON', 'null');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $currentProtected = $this->putVersionedObject('bucket', 'a-protected.txt', 'current');
+        $currentExpired = $this->putVersionedObject('bucket', 'z-expired.txt', 'current');
+        $this->ageVersion('bucket', 'a-protected.txt', 'null', 5);
+        $this->ageVersion('bucket', 'z-expired.txt', 'null', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-noncurrent',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => ['noncurrentDays' => 1],
+            'abortIncompleteDays' => null,
+        ]]);
+
+        (new LifecycleExecutor($this->metadata, $this->storage, batchSize: 1, maxActionsPerRun: 5))->processBucket('bucket');
+
+        self::assertNull($this->metadata->getObjectMetadataByVersion('bucket', 'z-expired.txt', 'null'));
+        self::assertFileDoesNotExist($expired->path);
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'a-protected.txt', 'null'));
+        self::assertFileExists($protected->path);
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'z-expired.txt', $currentExpired['versionId']));
+        self::assertFileExists($currentExpired['path']);
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'a-protected.txt', $currentProtected['versionId']));
+        self::assertFileExists($currentProtected['path']);
+    }
+
+    public function test_noncurrent_expiration_does_not_delete_a_version_promoted_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'retained.txt', 'retained payload');
+        $markerId = $this->metadata->deleteObjectVersioned('bucket', 'retained.txt', 'owner');
+        $this->ageVersion('bucket', 'retained.txt', $version['versionId'], 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-noncurrent',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => ['noncurrentDays' => 1],
+            'abortIncompleteDays' => null,
+        ]]);
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        $listedAsNoncurrent = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']);
+        self::assertNotNull($listedAsNoncurrent);
+        self::assertSame('0', $listedAsNoncurrent->systemMetadata['isLatest']);
+
+        // A concurrent client removes the latest delete marker before the
+        // lifecycle worker commits its previously selected noncurrent version.
+        $this->metadata->deleteObjectVersion('bucket', 'retained.txt', $markerId);
+        self::assertSame($version['versionId'], $this->metadata->getObjectMetadata('bucket', 'retained.txt')?->versionId);
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $method = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteNoncurrentVersion');
+        $deleted = $method->invoke($this->executor(), $bucketInfo, $listedAsNoncurrent, $rule);
+
+        self::assertFalse($deleted);
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']));
+        self::assertFileExists($version['path']);
+    }
+
+    public function test_noncurrent_expiration_rechecks_a_fresh_redemotion_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'retained.txt', 'retained payload');
+        $markerId = $this->metadata->deleteObjectVersioned('bucket', 'retained.txt', 'owner');
+        $this->sql(
+            'UPDATE s3_objects SET noncurrent_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?',
+            [$this->past(5), 'bucket', 'retained.txt', $version['versionId']],
+        );
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-noncurrent',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => ['noncurrentDays' => 1],
+            'abortIncompleteDays' => null,
+        ]]);
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        $listedAsExpired = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']);
+        self::assertNotNull($listedAsExpired);
+
+        $this->metadata->deleteObjectVersion('bucket', 'retained.txt', $markerId);
+        $this->putVersionedObject('bucket', 'retained.txt', 'new current payload');
+        $redemoted = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']);
+        self::assertNotNull($redemoted);
+        self::assertGreaterThan(new \DateTimeImmutable('-1 minute'), new \DateTimeImmutable($redemoted->systemMetadata['noncurrentAt']));
+
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $method = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteNoncurrentVersion');
+        self::assertFalse($method->invoke($this->executor(), $bucketInfo, $listedAsExpired, $rule));
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']));
+        self::assertFileExists($version['path']);
+    }
+
+    public function test_current_expiration_does_not_use_a_rule_disabled_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $write = $this->putObject('bucket', 'retained.txt', 'retained payload');
+        $this->ageObject('bucket', 'retained.txt', 5);
+        $this->configureOneDayExpiration();
+        $observedBucket = $this->metadata->getBucket('bucket');
+        $listedObject = $this->metadata->getObjectMetadata('bucket', 'retained.txt');
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        self::assertNotNull($observedBucket);
+        self::assertNotNull($listedObject);
+
+        $disabledRule = $rule;
+        $disabledRule['status'] = 'Disabled';
+        $this->metadata->putBucketLifecycle('bucket', [$disabledRule]);
+
+        $delete = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteObject');
+        self::assertFalse($delete->invoke($this->executor(), $observedBucket, $listedObject, $rule));
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'retained.txt'));
+        self::assertFileExists($write->path);
+    }
+
+    public function test_noncurrent_expiration_does_not_use_a_rule_changed_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $oldVersion = $this->putVersionedObject('bucket', 'retained.txt', 'retained payload');
+        $this->putVersionedObject('bucket', 'retained.txt', 'current payload');
+        $this->ageVersion('bucket', 'retained.txt', $oldVersion['versionId'], 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-noncurrent',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => ['noncurrentDays' => 1],
+            'abortIncompleteDays' => null,
+        ]]);
+        $observedBucket = $this->metadata->getBucket('bucket');
+        $listedVersion = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $oldVersion['versionId']);
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        self::assertNotNull($observedBucket);
+        self::assertNotNull($listedVersion);
+
+        $changedRule = $rule;
+        $changedRule['noncurrentExpiration'] = ['noncurrentDays' => 365];
+        $this->metadata->putBucketLifecycle('bucket', [$changedRule]);
+
+        $delete = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteNoncurrentVersion');
+        self::assertFalse($delete->invoke($this->executor(), $observedBucket, $listedVersion, $rule));
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $oldVersion['versionId']));
+        self::assertFileExists($oldVersion['path']);
+    }
+
+    public function test_orphan_marker_expiration_does_not_use_a_rule_removed_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $markerId = $this->metadata->deleteObjectVersioned('bucket', 'retained.txt', 'owner');
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'delete-orphan-markers',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['expiredObjectDeleteMarker' => true],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+        $observedBucket = $this->metadata->getBucket('bucket');
+        $listedMarker = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $markerId);
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        self::assertNotNull($observedBucket);
+        self::assertNotNull($listedMarker);
+
+        $this->metadata->putBucketLifecycle('bucket', []);
+
+        $delete = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteOrphanedMarker');
+        self::assertFalse($delete->invoke($this->executor(), $observedBucket, $listedMarker, $rule));
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $markerId));
+    }
+
+    public function test_noncurrent_expiration_preserves_compliance_legal_hold_and_unknown_retention_modes(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $retainUntil = (new \DateTimeImmutable('+1 day', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM);
+
+        foreach (['compliance', 'legal-hold', 'unknown-mode', 'unprotected'] as $key) {
+            $old = $this->putVersionedObject('bucket', $key, 'old');
+            $this->putVersionedObject('bucket', $key, 'current');
+            $this->ageVersion('bucket', $key, $old['versionId'], 5);
+            $versions[$key] = $old;
+        }
+
+        $this->metadata->putObjectRetention('bucket', 'compliance', 'COMPLIANCE', $retainUntil, $versions['compliance']['versionId']);
+        $this->metadata->putObjectLegalHold('bucket', 'legal-hold', 'ON', $versions['legal-hold']['versionId']);
+        // Simulate legacy or corrupted metadata: the public API validates this field.
+        $this->metadata->putObjectRetention('bucket', 'unknown-mode', 'UNKNOWN', $retainUntil, $versions['unknown-mode']['versionId']);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-noncurrent',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => ['noncurrentDays' => 1],
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $this->executor()->processBucket('bucket');
+
+        foreach (['compliance', 'legal-hold', 'unknown-mode'] as $key) {
+            self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', $key, $versions[$key]['versionId']));
+            self::assertFileExists($versions[$key]['path']);
+        }
+        self::assertNull($this->metadata->getObjectMetadataByVersion('bucket', 'unprotected', $versions['unprotected']['versionId']));
+        self::assertFileDoesNotExist($versions['unprotected']['path']);
     }
 
     public function test_abort_incomplete_multipart_upload_removes_metadata_and_part_files(): void
@@ -158,6 +765,52 @@ final class LifecycleExecutorTest extends TestCase
 
         $this->assertNull($this->metadata->getMultipartUpload($expiredUploadId));
         $this->assertNotNull($this->metadata->getMultipartUpload($keptUploadId));
+    }
+
+    #[DataProvider('staleAbortRuleMutations')]
+    public function test_lifecycle_multipart_abort_rejects_a_rule_changed_after_listing(string $mutation): void
+    {
+        $this->createBucket('bucket');
+        $uploadId = $this->createMultipartUploadWithPart('bucket', 'retained.bin');
+        $this->ageMultipartUpload($uploadId, 5);
+        $parts = $this->metadata->getParts($uploadId);
+        self::assertCount(1, $parts);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'abort-old-mpu',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => 1,
+        ]]);
+        $observedBucket = $this->metadata->getBucket('bucket');
+        $observedRule = $this->metadata->getBucketLifecycle('bucket')[0];
+        self::assertNotNull($observedBucket);
+
+        $currentRule = $observedRule;
+        if ($mutation === 'disabled') {
+            $currentRule['status'] = 'Disabled';
+        } elseif ($mutation === 'later') {
+            $currentRule['abortIncompleteDays'] = 365;
+        }
+        $this->metadata->putBucketLifecycle('bucket', $mutation === 'removed' ? [] : [$currentRule]);
+
+        $abort = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('abortMultipartUploadDurably');
+        self::assertFalse($abort->invoke($this->executor(), 'bucket', 'retained.bin', $uploadId, $observedBucket, $observedRule));
+        self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+        self::assertSame($parts, $this->metadata->getParts($uploadId));
+        self::assertFileExists($parts[0]['storage_path']);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function staleAbortRuleMutations(): iterable
+    {
+        yield 'disabled' => ['disabled'];
+        yield 'removed' => ['removed'];
+        yield 'raised age' => ['later'];
     }
 
     public function test_global_multipart_max_age_uses_exact_seconds_without_lifecycle_rules(): void
@@ -266,6 +919,37 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertFileExists($keptByPrefix->path);
     }
 
+    public function test_persisted_duplicate_filter_tag_keys_fail_closed(): void
+    {
+        $this->createBucket('bucket');
+        $kept = $this->putObject('bucket', 'old.txt', 'kept');
+        $this->ageObject('bucket', 'old.txt', 5);
+        $this->metadata->putObjectTagging('bucket', 'old.txt', [['key' => 'env', 'value' => 'dev']]);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'invalid-legacy-filter',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => [
+                'and' => [
+                    'tags' => [
+                        ['key' => 'env', 'value' => 'prod'],
+                        ['key' => 'env', 'value' => 'dev'],
+                    ],
+                ],
+            ],
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $this->executor()->processBucket('bucket');
+
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
+        self::assertFileExists($kept->path);
+    }
+
     public function test_lifecycle_run_stops_at_configured_action_budget(): void
     {
         $this->createBucket('bucket');
@@ -298,6 +982,41 @@ final class LifecycleExecutorTest extends TestCase
         }
 
         $this->assertSame(2, $remaining);
+    }
+
+    public function test_execute_applies_action_budget_across_all_buckets(): void
+    {
+        foreach (['bucket-a', 'bucket-b'] as $bucket) {
+            $this->createBucket($bucket);
+            $this->putObject($bucket, 'old.txt', 'expired');
+            $this->ageObject($bucket, 'old.txt', 5);
+            $this->metadata->putBucketLifecycle($bucket, [[
+                'id' => 'expire-all',
+                'status' => 'Enabled',
+                'prefix' => '',
+                'filter' => null,
+                'transitions' => null,
+                'expiration' => ['days' => 1],
+                'noncurrentTransitions' => null,
+                'noncurrentExpiration' => null,
+                'abortIncompleteDays' => null,
+            ]]);
+        }
+
+        $executor = new LifecycleExecutor($this->metadata, $this->storage, maxActionsPerRun: 1);
+        $executor->execute();
+
+        $remaining = 0;
+        foreach (['bucket-a', 'bucket-b'] as $bucket) {
+            if ($this->metadata->getObjectMetadata($bucket, 'old.txt') !== null) {
+                $remaining++;
+            }
+        }
+        self::assertSame(1, $remaining);
+
+        (new LifecycleExecutor($this->metadata, $this->storage, maxActionsPerRun: 1))->execute();
+        self::assertNull($this->metadata->getObjectMetadata('bucket-a', 'old.txt'));
+        self::assertNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
     }
 
     public function test_lifecycle_checkpoint_resumes_large_backlog_across_sweeps(): void
@@ -466,6 +1185,21 @@ final class LifecycleExecutorTest extends TestCase
         ]));
     }
 
+    public function test_throwing_logger_cannot_interrupt_a_sweep_or_leave_its_lock_held(): void
+    {
+        $logger = new class extends \Psr\Log\AbstractLogger {
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                throw new \RuntimeException('logger unavailable');
+            }
+        };
+
+        (new LifecycleExecutor($this->metadata, $this->storage, $logger))->execute();
+
+        self::assertTrue($this->metadata->acquireLock('lifecycle:global', 'node-b', 60));
+    }
+
     public function test_lifecycle_action_dispatches_internal_event_without_webhook_enqueue(): void
     {
         $this->createBucket('bucket');
@@ -616,9 +1350,98 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertSame('available', $latest->transitionStatus);
     }
 
+    public function test_noncurrent_transition_targets_null_version_under_suspended_versioning(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $old = $this->putObject('bucket', 'versioned.txt', 'null version');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $latest = $this->putVersionedObject('bucket', 'versioned.txt', 'numbered version');
+        $this->ageVersion('bucket', 'versioned.txt', 'null', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'transition-null',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => [['noncurrentDays' => 1, 'storageClass' => 'GLACIER']],
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $this->executor()->processBucket('bucket');
+
+        $jobs = $this->tierTransitionJobs();
+        self::assertCount(1, $jobs);
+        self::assertSame('null', $jobs[0]['version_id']);
+        self::assertSame('pending', $this->metadata->getObjectMetadataByVersion('bucket', 'versioned.txt', 'null')?->transitionStatus);
+        self::assertSame('available', $this->metadata->getObjectMetadataByVersion('bucket', 'versioned.txt', $latest['versionId'])?->transitionStatus);
+        self::assertFileExists($old->path);
+        self::assertFileExists($latest['path']);
+    }
+
+    public function test_noncurrent_transition_skips_version_promoted_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'retained.txt', 'payload');
+        $markerId = $this->metadata->deleteObjectVersioned('bucket', 'retained.txt', 'owner');
+        $listedAsNoncurrent = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']);
+        self::assertNotNull($listedAsNoncurrent);
+        self::assertSame('0', $listedAsNoncurrent->systemMetadata['isLatest']);
+
+        $this->metadata->deleteObjectVersion('bucket', 'retained.txt', $markerId);
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $method = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('enqueueTransitionIfNeeded');
+        $queued = $method->invoke($this->executor(), $bucketInfo, $listedAsNoncurrent, 'GLACIER', false, 'transition-noncurrent');
+
+        self::assertFalse($queued);
+        self::assertSame([], $this->tierTransitionJobs());
+        self::assertSame('available', $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId'])?->transitionStatus);
+        self::assertFileExists($version['path']);
+    }
+
+    public function test_current_transition_skips_version_demoted_after_listing(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'retained.txt', 'original');
+        $listedAsCurrent = $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId']);
+        self::assertNotNull($listedAsCurrent);
+        self::assertSame('1', $listedAsCurrent->systemMetadata['isLatest']);
+
+        $this->putVersionedObject('bucket', 'retained.txt', 'replacement');
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $method = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('enqueueTransitionIfNeeded');
+        $queued = $method->invoke($this->executor(), $bucketInfo, $listedAsCurrent, 'GLACIER', true, 'transition-current');
+
+        self::assertFalse($queued);
+        self::assertSame([], $this->tierTransitionJobs());
+        self::assertSame('available', $this->metadata->getObjectMetadataByVersion('bucket', 'retained.txt', $version['versionId'])?->transitionStatus);
+        self::assertFileExists($version['path']);
+    }
+
     private function executor(): LifecycleExecutor
     {
         return new LifecycleExecutor($this->metadata, $this->storage);
+    }
+
+    private function configureOneDayExpiration(): void
+    {
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'expire-current',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
     }
 
     private function createBucket(string $bucket): void
@@ -683,8 +1506,8 @@ final class LifecycleExecutorTest extends TestCase
     private function ageVersion(string $bucket, string $key, string $versionId, int $days): void
     {
         $this->sql(
-            'UPDATE s3_objects SET created_at = ?, updated_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?',
-            [$this->past($days), $this->past($days), $bucket, $key, $versionId],
+            'UPDATE s3_objects SET created_at = ?, noncurrent_at = CASE WHEN is_latest = 0 THEN ? ELSE noncurrent_at END, updated_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?',
+            [$this->past($days), $this->past($days), $this->past($days), $bucket, $key, $versionId],
         );
     }
 
@@ -717,7 +1540,7 @@ final class LifecycleExecutorTest extends TestCase
     }
 
     /**
-     * @param list<mixed> $params
+     * @param  list<mixed>  $params
      */
     private function sql(string $sql, array $params): void
     {
@@ -729,7 +1552,6 @@ final class LifecycleExecutorTest extends TestCase
     {
         $reflection = new \ReflectionClass($this->metadata);
         $method = $reflection->getMethod('connection');
-        $method->setAccessible(true);
         $connection = $method->invoke($this->metadata);
         if (! $connection instanceof \PDO) {
             throw new \RuntimeException('SQLite metadata test connection is unavailable.');
@@ -781,7 +1603,7 @@ final class LifecycleArrayLogger extends AbstractLogger
     public array $records = [];
 
     /**
-     * @param array<string, mixed> $context
+     * @param  array<string, mixed>  $context
      */
     public function log($level, string|\Stringable $message, array $context = []): void
     {
@@ -793,8 +1615,7 @@ final class LifecycleArrayLogger extends AbstractLogger
     }
 
     /**
-     * @param array<string, mixed> $expected
-     *
+     * @param  array<string, mixed>  $expected
      * @return array<string, mixed>|null
      */
     public function findContext(string $event, array $expected): ?array

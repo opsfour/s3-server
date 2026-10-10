@@ -17,6 +17,7 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Revolt\EventLoop;
 
@@ -106,15 +107,21 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertSame(1, $storage->shutdownCalls);
     }
 
-    public function test_runtime_shutdown_failure_does_not_break_idempotent_cleanup(): void
+    public function test_runtime_shutdown_failure_can_be_retried_without_reporting_success(): void
     {
         $encryption = new RuntimeFactoryRecordingEncryptionService(throwOnShutdown: true);
         $runtime = $this->createRuntime(encryption: $encryption);
 
-        $runtime->stop();
-        $runtime->stop();
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            try {
+                $runtime->stop();
+                self::fail('An incomplete encryption worker shutdown was reported as successful.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('S3 runtime shutdown incomplete; dependencies remain owned.', $error->getMessage());
+            }
+        }
 
-        self::assertSame(1, $encryption->shutdownCalls);
+        self::assertSame(2, $encryption->shutdownCalls);
     }
 
     public function test_factory_failure_releases_transferred_runtime_resources(): void
@@ -137,6 +144,63 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertSame(1, $encryption->shutdownCalls);
     }
 
+    public function test_factory_preserves_bootstrap_error_when_runtime_cleanup_and_logger_fail(): void
+    {
+        $storage = new CallbackStorageBackend(new InMemoryBackend());
+        $encryption = new RuntimeFactoryRecordingEncryptionService(throwOnShutdown: true);
+        $logger = new class extends NullLogger {
+            public function warning(string|\Stringable $message, array $context = []): void
+            {
+                throw new \RuntimeException('Injected logger failure.');
+            }
+        };
+
+        try {
+            $this->createRuntime(
+                notificationListeners: [['pattern' => '', 'listener' => static function (): void {}]],
+                encryption: $encryption,
+                storage: $storage,
+                logger: $logger,
+            );
+            self::fail('Expected invalid notification listener configuration.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertSame('Notification listener pattern must be a non-empty string.', $error->getMessage());
+        }
+
+        self::assertSame(1, $storage->shutdownCalls);
+        self::assertSame(2, $encryption->shutdownCalls);
+    }
+
+    public function test_factory_retries_transient_storage_cleanup_before_losing_runtime_owner(): void
+    {
+        $storageCalls = 0;
+        /** @var \OpsFour\S3Server\Storage\StorageBackend&\OpsFour\S3Server\Storage\ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([
+            \OpsFour\S3Server\Storage\StorageBackend::class,
+            \OpsFour\S3Server\Storage\ShutdownAwareStorageBackend::class,
+        ]);
+        $storage->method('shutdown')->willReturnCallback(static function () use (&$storageCalls): void {
+            if (++$storageCalls === 1) {
+                throw new \RuntimeException('transient cleanup failure');
+            }
+        });
+        $encryption = new RuntimeFactoryRecordingEncryptionService();
+
+        try {
+            $this->createRuntime(
+                notificationListeners: [['pattern' => '', 'listener' => static function (): void {}]],
+                encryption: $encryption,
+                storage: $storage,
+            );
+            self::fail('Expected invalid notification listener configuration.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertSame('Notification listener pattern must be a non-empty string.', $error->getMessage());
+        }
+
+        self::assertSame(2, $storageCalls);
+        self::assertSame(1, $encryption->shutdownCalls);
+    }
+
     /**
      * @param list<array{pattern: string, listener: callable}> $notificationListeners
      */
@@ -144,6 +208,7 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         array $notificationListeners = [],
         ?EncryptionServiceInterface $encryption = null,
         ?\OpsFour\S3Server\Storage\StorageBackend $storage = null,
+        ?LoggerInterface $logger = null,
     ): \OpsFour\S3Server\Runtime\S3ServerRuntime {
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
@@ -155,7 +220,7 @@ final class S3ServerRuntimeFactoryTest extends TestCase
             credentialProvider: new InMemoryCredentialProvider(
                 new Credential('test-key', 'test-secret', 'test-owner'),
             ),
-            logger: new NullLogger(),
+            logger: $logger ?? new NullLogger(),
             metrics: new MetricsCollector(),
             encryption: $encryption,
             notificationListeners: $notificationListeners,

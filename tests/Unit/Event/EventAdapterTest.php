@@ -117,8 +117,8 @@ final class EventAdapterTest extends TestCase
 
     public function test_destination_adapter_listener_logs_delivery_result_context(): void
     {
-        $adapter = new RecordingDestinationAdapter(NotificationDeliveryResult::retryableFailure('broker unavailable', [
-            'partition' => 3,
+        $adapter = new RecordingDestinationAdapter(NotificationDeliveryResult::retryableFailure('sasl.password=secret-token', [
+            'partition' => 'secret-token',
         ]));
         $logger = new EventAdapterArrayLogger();
         $event = $this->event();
@@ -134,8 +134,9 @@ final class EventAdapterTest extends TestCase
         $this->assertSame('bucket', $context['bucket']);
         $this->assertSame('key.txt', $context['key']);
         $this->assertSame(NotificationDeliveryStatus::RetryableFailure->value, $context['status']);
-        $this->assertSame('broker unavailable', $context['reason']);
-        $this->assertSame(3, $context['partition']);
+        $this->assertArrayNotHasKey('reason', $context);
+        $this->assertArrayNotHasKey('partition', $context);
+        $this->assertStringNotContainsString('secret-token', json_encode($logger->records, JSON_THROW_ON_ERROR));
     }
 
     public function test_destination_adapter_listener_rethrows_adapter_exceptions_for_dispatcher_observability(): void
@@ -165,6 +166,7 @@ final class EventAdapterTest extends TestCase
             $listenerFailure = $logger->findContext('listener_failed');
             $this->assertNotNull($listenerFailure);
             $this->assertSame('s3:ObjectCreated:Put', $listenerFailure['event_name']);
+            $this->assertStringNotContainsString('secret-token', json_encode($logger->records, JSON_THROW_ON_ERROR));
         } finally {
             $this->recursiveDelete($path);
         }
@@ -245,7 +247,7 @@ final class ThrowingDestinationAdapter implements NotificationDestinationAdapter
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        throw new \RuntimeException('adapter exploded');
+        throw new \RuntimeException('sasl.password=secret-token');
     }
 }
 

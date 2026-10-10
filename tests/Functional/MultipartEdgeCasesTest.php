@@ -41,6 +41,33 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
     // UploadPartCopy
     // -----------------------------------------------------------------
 
+    public function test_completion_location_is_an_absolute_encoded_object_uri(): void
+    {
+        $key = 'dir/a b?#.txt';
+        $uploadId = (string) self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+        $part = self::$s3->uploadPart([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'location payload',
+        ]);
+        $complete = self::$s3->completeMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+        ]);
+
+        self::assertSame(
+            sprintf('http://%s:%d/%s/dir/a%%20b%%3F%%23.txt', self::$host, self::$port, self::$bucket),
+            $complete['Location'],
+        );
+    }
+
     public function test_upload_part_copy(): void
     {
         $key = 'partcopy-test.txt';
@@ -60,7 +87,7 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
             'CopySource' => self::$bucket . '/copy-source.txt',
         ]);
 
-        $etag = $partCopy['CopyPartResult']['ETag'] ?? $partCopy['ETag'] ?? '';
+        $etag = $partCopy['CopyPartResult']['ETag'] ?? '';
         $this->assertNotEmpty($etag);
 
         // Complete.
@@ -90,6 +117,12 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
     public function test_upload_part_copy_with_range(): void
     {
         $key = 'partcopy-range.txt';
+        $sourceKey = 'copy-source-large.txt';
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $sourceKey,
+            'Body' => str_repeat('S', 5 * 1024 * 1024 + 1),
+        ]);
 
         $create = self::$s3->createMultipartUpload([
             'Bucket' => self::$bucket,
@@ -103,11 +136,11 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
             'Key' => $key,
             'UploadId' => $uploadId,
             'PartNumber' => 1,
-            'CopySource' => self::$bucket . '/copy-source.txt',
+            'CopySource' => self::$bucket . '/' . $sourceKey,
             'CopySourceRange' => 'bytes=0-1023',
         ]);
 
-        $etag = $partCopy['CopyPartResult']['ETag'] ?? $partCopy['ETag'] ?? '';
+        $etag = $partCopy['CopyPartResult']['ETag'] ?? '';
         $this->assertNotEmpty($etag);
 
         $complete = self::$s3->completeMultipartUpload([
@@ -128,6 +161,97 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
         $this->assertSame(1024, $get['ContentLength']);
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $sourceKey]);
+    }
+
+    public function test_upload_part_copy_rejects_invalid_ranges_without_writing_a_part(): void
+    {
+        $key = 'partcopy-invalid-range.txt';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+
+        try {
+            foreach (['bytes=1junk-2', 'bytes=1', 'items=0-1', 'bytes=-1-2', 'bytes=0-999999999999999999999999999999', 'bytes=0-1023'] as $range) {
+                try {
+                    self::$s3->uploadPartCopy([
+                        'Bucket' => self::$bucket,
+                        'Key' => $key,
+                        'UploadId' => $uploadId,
+                        'PartNumber' => 1,
+                        'CopySource' => self::$bucket . '/copy-source.txt',
+                        'CopySourceRange' => $range,
+                    ]);
+                    $this->fail('UploadPartCopy accepted malformed range: ' . $range);
+                } catch (S3Exception $e) {
+                    $this->assertSame(400, $e->getStatusCode(), $range);
+                    $this->assertSame('InvalidArgument', $e->getAwsErrorCode(), $range);
+                }
+
+                $parts = self::$s3->listParts([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                ]);
+                $this->assertEmpty($parts['Parts'] ?? [], $range);
+            }
+        } finally {
+            self::$s3->abortMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ]);
+        }
+    }
+
+    public function test_upload_part_copy_honors_source_preconditions_before_writing_a_part(): void
+    {
+        $key = 'partcopy-conditions.txt';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+        $base = [
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'CopySource' => self::$bucket . '/copy-source.txt',
+        ];
+        $listArgs = ['Bucket' => self::$bucket, 'Key' => $key, 'UploadId' => $uploadId];
+        $sourceEtag = '"' . md5(str_repeat('S', 10 * 1024)) . '"';
+
+        try {
+            foreach ([
+                'CopySourceIfMatch' => '"wrong-etag"',
+                'CopySourceIfNoneMatch' => $sourceEtag,
+                'CopySourceIfModifiedSince' => new \DateTimeImmutable('2100-01-01', new \DateTimeZone('UTC')),
+                'CopySourceIfUnmodifiedSince' => new \DateTimeImmutable('2020-01-01', new \DateTimeZone('UTC')),
+            ] as $condition => $value) {
+                try {
+                    self::$s3->uploadPartCopy($base + [$condition => $value]);
+                    $this->fail('UploadPartCopy ignored ' . $condition);
+                } catch (S3Exception $exception) {
+                    $this->assertSame(412, $exception->getStatusCode(), $condition);
+                    $this->assertSame('PreconditionFailed', $exception->getAwsErrorCode(), $condition);
+                }
+                $this->assertEmpty(self::$s3->listParts($listArgs)['Parts'] ?? [], $condition);
+            }
+
+            $copied = self::$s3->uploadPartCopy($base + [
+                'CopySourceIfMatch' => $sourceEtag,
+                'CopySourceIfUnmodifiedSince' => new \DateTimeImmutable('2020-01-01', new \DateTimeZone('UTC')),
+            ]);
+            $this->assertSame(200, $copied['@metadata']['statusCode']);
+            $this->assertCount(1, self::$s3->listParts($listArgs)['Parts'] ?? []);
+        } finally {
+            self::$s3->abortMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ]);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -207,6 +331,20 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
         self::$s3->abortMultipartUpload(['Bucket' => self::$bucket, 'Key' => $key1, 'UploadId' => $create1['UploadId']]);
         self::$s3->abortMultipartUpload(['Bucket' => self::$bucket, 'Key' => $key2, 'UploadId' => $create2['UploadId']]);
         self::$s3->abortMultipartUpload(['Bucket' => self::$bucket, 'Key' => $key3, 'UploadId' => $create3['UploadId']]);
+    }
+
+    public function test_list_multipart_uploads_rejects_unsupported_encoding_type(): void
+    {
+        try {
+            self::$s3->listMultipartUploads([
+                'Bucket' => self::$bucket,
+                'EncodingType' => 'gzip',
+            ]);
+            $this->fail('An unsupported encoding type must not return a successful listing.');
+        } catch (S3Exception $e) {
+            $this->assertSame(400, $e->getStatusCode());
+            $this->assertSame('InvalidArgument', $e->getAwsErrorCode());
+        }
     }
 
     // -----------------------------------------------------------------

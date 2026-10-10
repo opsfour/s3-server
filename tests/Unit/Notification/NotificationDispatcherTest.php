@@ -55,7 +55,7 @@ final class NotificationDispatcherTest extends TestCase
             $received[] = $event;
         });
 
-        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'logs/new.txt', 12, '"etag"', 'owner');
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'logs/new.txt', 12, '"etag"', 'owner', $this->bucketGeneration());
         $this->runEventLoopTick();
 
         $this->assertCount(1, $received);
@@ -70,6 +70,232 @@ final class NotificationDispatcherTest extends TestCase
         $this->assertCount(1, $queued);
         $this->assertSame('s3:ObjectCreated:Put', $queued[0]['event_name']);
         $this->assertSame('https://notifications.example.test/s3', $queued[0]['destination_url']);
+    }
+
+    public function test_delayed_event_cannot_use_a_recreated_buckets_webhook_configuration(): void
+    {
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $oldEvent = $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'alice-private-key', ownerId: 'owner', bucketGeneration: $this->bucketGeneration());
+        self::assertNotSame('', $oldEvent->bucketGeneration);
+        self::assertSame($oldEvent->bucketGeneration, $oldEvent->withVersionId('v1')->bucketGeneration);
+
+        $this->metadata->deleteBucket('owner', 'bucket');
+        $this->metadata->createBucket('bob', 'bucket', 'us-east-1');
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'bob-webhook',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://bob.example.test/notify',
+            'filterRules' => null,
+        ]]);
+
+        $dispatcher->enqueueWebhooks($oldEvent);
+        $database = new \PDO('sqlite:' . $this->path . '/metadata.sqlite');
+        $count = $database->query('SELECT COUNT(*) FROM s3_notification_queue');
+        self::assertInstanceOf(\PDOStatement::class, $count);
+        self::assertSame(0, (int) $count->fetchColumn());
+
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'bob-key', ownerId: 'bob', bucketGeneration: $this->bucketGeneration());
+        $queued = $this->metadata->dequeueNotifications(10);
+        self::assertCount(1, $queued);
+        self::assertSame('bob-key', $queued[0]['key_name']);
+        self::assertSame('https://bob.example.test/notify', $queued[0]['destination_url']);
+    }
+
+    public function test_unscoped_external_event_cannot_enqueue_webhooks(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'webhook-created',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => null,
+        ]]);
+
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $dispatcher->enqueueWebhooks(new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'unscoped-key',
+            ownerId: 'owner',
+        ));
+        $dispatcher->enqueueWebhooks($dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'unscoped-created-key'));
+        self::assertSame([], $this->metadata->dequeueNotifications(10));
+    }
+
+    public function test_delayed_dispatch_short_form_cannot_send_old_owner_event_after_bucket_reuse(): void
+    {
+        $oldGeneration = $this->bucketGeneration();
+        $this->metadata->deleteBucket('owner', 'bucket');
+        $this->metadata->createBucket('bob', 'bucket', 'us-east-1');
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'bob-webhook',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://bob.example.test/notify',
+            'filterRules' => null,
+        ]]);
+
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'alice-private-key', ownerId: 'owner');
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'alice-private-key', ownerId: 'owner', bucketGeneration: $oldGeneration);
+        $database = new \PDO('sqlite:' . $this->path . '/metadata.sqlite');
+        $count = $database->query('SELECT COUNT(*) FROM s3_notification_queue');
+        self::assertInstanceOf(\PDOStatement::class, $count);
+        self::assertSame(0, (int) $count->fetchColumn());
+
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'bob-key', ownerId: 'bob', bucketGeneration: $this->bucketGeneration());
+        $queued = $this->metadata->dequeueNotifications(10);
+        self::assertCount(1, $queued);
+        self::assertSame('bob-key', $queued[0]['key_name']);
+        self::assertSame('https://bob.example.test/notify', $queued[0]['destination_url']);
+    }
+
+    public function test_webhook_payload_uses_s3_event_fields_without_invented_request_provenance(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'webhook-created',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => null,
+        ]]);
+
+        (new NotificationDispatcher($this->metadata))->dispatch(
+            's3:ObjectCreated:Put',
+            'bucket',
+            'space + sign.txt',
+            12,
+            '"etag"',
+            'requester',
+            $this->bucketGeneration(),
+        );
+
+        $queued = $this->metadata->dequeueNotifications(1);
+        self::assertCount(1, $queued);
+        $payload = json_decode($queued[0]['payload_json'], true, 512, JSON_THROW_ON_ERROR);
+        $record = $payload['Records'][0];
+        self::assertSame('ObjectCreated:Put', $record['eventName']);
+        self::assertSame('requester', $record['userIdentity']['principalId']);
+        self::assertSame('webhook-created', $record['s3']['configurationId']);
+        self::assertSame('owner', $record['s3']['bucket']['ownerIdentity']['principalId']);
+        self::assertSame('space+%2B+sign.txt', $record['s3']['object']['key']);
+        self::assertArrayNotHasKey('requestParameters', $record);
+        self::assertArrayNotHasKey('responseElements', $record);
+        self::assertMatchesRegularExpression('/^[0-9A-F]{16,}$/', $record['s3']['object']['sequencer']);
+    }
+
+    public function test_webhook_sequencer_is_shared_by_destinations_and_increases_after_restart(): void
+    {
+        $configs = [
+            [
+                'id' => 'first',
+                'events' => ['s3:ObjectCreated:*', 's3:ObjectRemoved:*'],
+                'destinationType' => 'Topic',
+                'destinationArn' => 'https://first.example.test/s3',
+                'filterRules' => null,
+            ],
+            [
+                'id' => 'second',
+                'events' => ['s3:ObjectCreated:*', 's3:ObjectRemoved:*'],
+                'destinationType' => 'Topic',
+                'destinationArn' => 'https://second.example.test/s3',
+                'filterRules' => null,
+            ],
+        ];
+        $this->metadata->putBucketNotification('bucket', $configs);
+
+        $generation = $this->bucketGeneration();
+        (new NotificationDispatcher($this->metadata))->dispatch('s3:ObjectCreated:Put', 'bucket', 'same-key', bucketGeneration: $generation);
+
+        // A new store instance represents a second API process using the same DB.
+        $secondStore = new SqliteMetadataStore($this->path . '/metadata.sqlite');
+        $secondStore->initialize();
+        (new NotificationDispatcher($secondStore))->dispatch('s3:ObjectRemoved:Delete', 'bucket', 'same-key', bucketGeneration: $generation);
+
+        $queued = $this->metadata->dequeueNotifications(10);
+        self::assertCount(4, $queued);
+        $sequences = array_map(static function (array $row): string {
+            $record = json_decode($row['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+
+            return $record['s3']['object']['sequencer'];
+        }, $queued);
+        self::assertSame($sequences[0], $sequences[1]);
+        self::assertSame($sequences[2], $sequences[3]);
+        self::assertLessThan(hexdec($sequences[2]), hexdec($sequences[0]));
+        $firstRecord = json_decode($queued[0]['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+        $secondRecord = json_decode($queued[1]['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+        self::assertSame($firstRecord['eventTime'], $secondRecord['eventTime']);
+    }
+
+    public function test_restore_webhook_omits_put_delete_only_sequencer(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'restore',
+            'events' => ['s3:ObjectRestore:Completed'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://example.test/restore',
+            'filterRules' => null,
+        ]]);
+
+        (new NotificationDispatcher($this->metadata))->dispatch('s3:ObjectRestore:Completed', 'bucket', 'archived', bucketGeneration: $this->bucketGeneration());
+
+        $queued = $this->metadata->dequeueNotifications(1);
+        self::assertCount(1, $queued);
+        $record = json_decode($queued[0]['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+        self::assertArrayNotHasKey('sequencer', $record['s3']['object']);
+
+        $restored = (new NotificationDispatcher($this->metadata))->createEvent(
+            's3:ObjectRestore:Completed',
+            'bucket',
+            'empty-archive',
+            size: 0,
+            etag: '"empty-etag"',
+            attributes: [
+                'sizeKnown' => true,
+                'sourceTier' => 'GLACIER',
+                'restoreExpiresAt' => '2026-10-04T12:00:00+00:00',
+            ],
+            bucketGeneration: $this->bucketGeneration(),
+        );
+        (new NotificationDispatcher($this->metadata))->enqueueWebhooks($restored);
+        $restoredRows = $this->metadata->dequeueNotifications(1);
+        self::assertCount(1, $restoredRows);
+        $restoredRecord = json_decode($restoredRows[0]['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+        self::assertSame(0, $restoredRecord['s3']['object']['size']);
+        self::assertSame('empty-etag', $restoredRecord['s3']['object']['eTag']);
+        self::assertArrayNotHasKey('sequencer', $restoredRecord['s3']['object']);
+        self::assertSame([
+            'lifecycleRestorationExpiryTime' => '2026-10-04T12:00:00+00:00',
+            'lifecycleRestoreStorageClass' => 'GLACIER',
+        ], $restoredRecord['glacierEventData']['restoreEventData']);
+    }
+
+    public function test_url_encoded_key_filters_match_decoded_object_keys(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'encoded-key-filter',
+            'events' => ['s3:ObjectCreated:Put'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => [
+                ['name' => 'prefix', 'value' => 'red+flower%2B'],
+                ['name' => 'suffix', 'value' => '%2B%E2%82%AC.txt'],
+            ],
+        ]]);
+        $dispatcher = new NotificationDispatcher($this->metadata);
+
+        $generation = $this->bucketGeneration();
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'red flower+photo+€.txt', bucketGeneration: $generation);
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'red+flower+photo+€.txt', bucketGeneration: $generation);
+        $dispatcher->dispatch('s3:ObjectCreated:Put', 'bucket', 'red flower+photo+$.txt', bucketGeneration: $generation);
+
+        $queued = $this->metadata->dequeueNotifications(10);
+        self::assertSame(['red flower+photo+€.txt'], array_column($queued, 'key_name'));
+        self::assertSame([
+            ['name' => 'prefix', 'value' => 'red+flower%2B'],
+            ['name' => 'suffix', 'value' => '%2B%E2%82%AC.txt'],
+        ], $this->metadata->getBucketNotification('bucket')[0]['filterRules']);
     }
 
     public function test_failed_internal_listener_is_isolated_and_logged(): void
@@ -154,6 +380,35 @@ final class NotificationDispatcherTest extends TestCase
         self::assertTrue($completed);
     }
 
+    public function test_shutdown_drains_listeners_spawned_by_in_flight_listeners(): void
+    {
+        $dispatcher = new NotificationDispatcher($this->metadata);
+        $nestedCompleted = false;
+        $dispatcher->listen('s3:ObjectCreated:Put', static function () use ($dispatcher): void {
+            \Amp\delay(0.01);
+            $dispatcher->dispatchEvent(new S3Event(
+                name: 's3:ObjectCreated:Copy',
+                bucket: 'bucket',
+                key: 'nested.txt',
+                ownerId: 'owner',
+            ), enqueueWebhooks: false);
+        });
+        $dispatcher->listen('s3:ObjectCreated:Copy', static function () use (&$nestedCompleted): void {
+            \Amp\delay(0.03);
+            $nestedCompleted = true;
+        });
+        $dispatcher->dispatchEvent(new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'first.txt',
+            ownerId: 'owner',
+        ), enqueueWebhooks: false);
+
+        $dispatcher->shutdown(1);
+
+        self::assertTrue($nestedCompleted);
+    }
+
     public function test_shutdown_keeps_waiting_after_timeout_warning(): void
     {
         $logger = new NotificationArrayLogger();
@@ -178,6 +433,32 @@ final class NotificationDispatcherTest extends TestCase
         ]));
     }
 
+    public function test_throwing_timeout_logger_cannot_interrupt_listener_drain(): void
+    {
+        $logger = new class extends AbstractLogger {
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                throw new \RuntimeException('private-logger-failure');
+            }
+        };
+        $dispatcher = new NotificationDispatcher($this->metadata, $logger);
+        $completed = false;
+        $dispatcher->listen('s3:ObjectCreated:*', static function () use (&$completed): void {
+            \Amp\delay(0.03);
+            $completed = true;
+        });
+        $dispatcher->dispatchEvent(new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'throwing-logger-drain.txt',
+            ownerId: 'owner',
+        ), enqueueWebhooks: false);
+
+        $dispatcher->shutdown(0.005);
+
+        self::assertTrue($completed);
+    }
+
     public function test_webhook_enqueue_rolls_back_with_caller_transaction(): void
     {
         $this->metadata->putBucketNotification('bucket', [[
@@ -188,7 +469,7 @@ final class NotificationDispatcherTest extends TestCase
             'filterRules' => null,
         ]]);
         $dispatcher = new NotificationDispatcher($this->metadata);
-        $event = $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'rolled-back.txt');
+        $event = $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'rolled-back.txt', bucketGeneration: $this->bucketGeneration());
 
         try {
             $this->metadata->transaction(function () use ($dispatcher, $event): void {
@@ -202,6 +483,39 @@ final class NotificationDispatcherTest extends TestCase
         self::assertSame([], $this->metadata->dequeueNotifications(10));
     }
 
+    public function test_arn_destination_is_retained_but_not_enqueued_as_a_webhook(): void
+    {
+        $arn = 'arn:aws:sqs:us-east-1:123456789012:object-events';
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'queue-created',
+            'events' => ['s3:ObjectCreated:*'],
+            'destinationType' => 'Queue',
+            'destinationArn' => $arn,
+            'filterRules' => null,
+        ]]);
+
+        $logger = new NotificationArrayLogger();
+        $metrics = new MetricsCollector();
+        $dispatcher = new NotificationDispatcher($this->metadata, $logger, metrics: $metrics);
+        $dispatcher->enqueueWebhooks(
+            $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'arn-only.txt', bucketGeneration: $this->bucketGeneration()),
+        );
+
+        self::assertSame($arn, $this->metadata->getBucketNotification('bucket')[0]['destinationArn']);
+        self::assertSame([], $this->metadata->dequeueNotifications(10));
+        self::assertNotNull($logger->findContext('destination_skipped', [
+            'component' => 'notification',
+            'bucket' => 'bucket',
+            'key' => 'arn-only.txt',
+            'event_name' => 's3:ObjectCreated:Put',
+            'destination_type' => 'Queue',
+        ]));
+        self::assertStringContainsString(
+            's3_server_notification_events_total{stage="webhook_destination",status="skipped"} 1',
+            $metrics->renderPrometheus(),
+        );
+    }
+
     public function test_committed_webhook_outbox_survives_bucket_deletion(): void
     {
         $this->metadata->putBucketNotification('bucket', [[
@@ -213,7 +527,7 @@ final class NotificationDispatcherTest extends TestCase
         ]]);
         $dispatcher = new NotificationDispatcher($this->metadata);
         $dispatcher->enqueueWebhooks(
-            $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'committed.txt'),
+            $dispatcher->createEvent('s3:ObjectCreated:Put', 'bucket', 'committed.txt', bucketGeneration: $this->bucketGeneration()),
         );
 
         $this->metadata->deleteBucket('owner', 'bucket');
@@ -231,6 +545,14 @@ final class NotificationDispatcherTest extends TestCase
             $suspension->resume();
         });
         $suspension->suspend();
+    }
+
+    private function bucketGeneration(): string
+    {
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+
+        return $bucket->generation;
     }
 
     private function recursiveDelete(string $path): void
@@ -260,7 +582,7 @@ final class NotificationArrayLogger extends AbstractLogger
     public array $records = [];
 
     /**
-     * @param array<string, mixed> $context
+     * @param  array<string, mixed>  $context
      */
     public function log($level, string|\Stringable $message, array $context = []): void
     {
@@ -272,8 +594,7 @@ final class NotificationArrayLogger extends AbstractLogger
     }
 
     /**
-     * @param array<string, mixed> $expected
-     *
+     * @param  array<string, mixed>  $expected
      * @return array<string, mixed>|null
      */
     public function findContext(string $event, array $expected): ?array

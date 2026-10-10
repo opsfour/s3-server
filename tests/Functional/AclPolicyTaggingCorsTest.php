@@ -190,7 +190,7 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
             ],
         ]);
 
-        $this->assertSame(204, $putResult['@metadata']['statusCode']);
+        $this->assertSame(200, $putResult['@metadata']['statusCode']);
 
         // Get tags.
         $getResult = self::$s3->getBucketTagging([
@@ -263,6 +263,53 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
         $this->assertEmpty($getAfter['TagSet'] ?? []);
     }
 
+    public function test_multibyte_tag_boundaries_roundtrip_through_header_and_xml(): void
+    {
+        $key = 'unicode-tag-' . bin2hex(random_bytes(4));
+        $tagKey = str_repeat("\u{00E9}", 128);
+        $tagValue = str_repeat("\u{00E9}", 256);
+
+        self::$s3->putBucketTagging([
+            'Bucket' => self::$bucket,
+            'Tagging' => ['TagSet' => [['Key' => $tagKey, 'Value' => $tagValue]]],
+        ]);
+        $bucketTags = self::$s3->getBucketTagging(['Bucket' => self::$bucket]);
+        $this->assertSame([['Key' => $tagKey, 'Value' => $tagValue]], $bucketTags['TagSet']);
+        self::$s3->deleteBucketTagging(['Bucket' => self::$bucket]);
+
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'tagged',
+            'Tagging' => rawurlencode($tagKey) . '=' . rawurlencode($tagValue),
+        ]);
+        $stored = self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => $key]);
+        $this->assertSame([['Key' => $tagKey, 'Value' => $tagValue]], $stored['TagSet']);
+
+        self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Tagging' => ['TagSet' => [['Key' => $tagKey, 'Value' => $tagValue]]],
+        ]);
+        $stored = self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => $key]);
+        $this->assertSame([['Key' => $tagKey, 'Value' => $tagValue]], $stored['TagSet']);
+
+        try {
+            self::$s3->putObjectTagging([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Tagging' => ['TagSet' => [['Key' => $tagKey . "\u{00E9}", 'Value' => 'invalid']]],
+            ]);
+            $this->fail('A tag key beyond 128 Unicode positions was accepted.');
+        } catch (S3Exception $error) {
+            $this->assertSame(400, $error->getStatusCode());
+        }
+        $unchanged = self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => $key]);
+        $this->assertSame([['Key' => $tagKey, 'Value' => $tagValue]], $unchanged['TagSet']);
+
+        self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+    }
+
     // -----------------------------------------------------------------
     // Bucket CORS
     // -----------------------------------------------------------------
@@ -275,11 +322,12 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
             'CORSConfiguration' => [
                 'CORSRules' => [
                     [
+                        'ID' => 'sdk-rule',
                         'AllowedOrigins' => ['https://example.com'],
                         'AllowedMethods' => ['GET', 'PUT'],
                         'AllowedHeaders' => ['*'],
                         'ExposeHeaders' => ['ETag'],
-                        'MaxAgeSeconds' => 3600,
+                        'MaxAgeSeconds' => 0,
                     ],
                 ],
             ],
@@ -295,8 +343,10 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
         $this->assertSame(200, $getResult['@metadata']['statusCode']);
         $rules = $getResult['CORSRules'] ?? [];
         $this->assertCount(1, $rules);
+        $this->assertSame('sdk-rule', $rules[0]['ID']);
         $this->assertContains('https://example.com', $rules[0]['AllowedOrigins']);
         $this->assertContains('GET', $rules[0]['AllowedMethods']);
+        $this->assertSame(0, $rules[0]['MaxAgeSeconds']);
 
         // Delete CORS.
         $deleteResult = self::$s3->deleteBucketCors([

@@ -96,6 +96,50 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
         $this->assertSame('AES256', $rules[0]['ApplyServerSideEncryptionByDefault']['SSEAlgorithm']);
     }
 
+    public function test_aes256_kms_fields_are_rejected_without_changing_existing_encryption(): void
+    {
+        $bucket = self::createIsolatedBucket('phase7-invalid-encryption');
+        $configuration = ['Rules' => [[
+            'ApplyServerSideEncryptionByDefault' => ['SSEAlgorithm' => 'AES256'],
+        ]]];
+        try {
+            self::$s3->putBucketEncryption([
+                'Bucket' => $bucket,
+                'ServerSideEncryptionConfiguration' => $configuration,
+            ]);
+            $before = self::$s3->getBucketEncryption(['Bucket' => $bucket])['ServerSideEncryptionConfiguration'];
+
+            foreach ([
+                'KMS key ID' => [['KMSMasterKeyID' => 'alias/unused'], null],
+                'enabled bucket key' => [[], true],
+                'both KMS fields' => [['KMSMasterKeyID' => 'alias/unused'], true],
+            ] as $case => [$defaults, $bucketKeyEnabled]) {
+                $rule = ['ApplyServerSideEncryptionByDefault' => ['SSEAlgorithm' => 'AES256'] + $defaults];
+                if ($bucketKeyEnabled !== null) {
+                    $rule['BucketKeyEnabled'] = $bucketKeyEnabled;
+                }
+                try {
+                    self::$s3->putBucketEncryption([
+                        'Bucket' => $bucket,
+                        'ServerSideEncryptionConfiguration' => ['Rules' => [$rule]],
+                    ]);
+                    self::fail("AES256 accepted {$case}.");
+                } catch (S3Exception $error) {
+                    self::assertSame(400, $error->getStatusCode(), $case);
+                    self::assertSame('MalformedXML', $error->getAwsErrorCode(), $case);
+                }
+                self::assertSame(
+                    $before,
+                    self::$s3->getBucketEncryption(['Bucket' => $bucket])['ServerSideEncryptionConfiguration'],
+                    $case,
+                );
+            }
+        } finally {
+            self::$s3->deleteBucketEncryption(['Bucket' => $bucket]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
     public function test_delete_bucket_encryption(): void
     {
         // Ensure encryption exists first.
@@ -174,17 +218,12 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
                         ],
                     ],
                     [
-                        'ID' => 'archive-data',
+                        'ID' => 'abort-stale-uploads',
                         'Status' => 'Enabled',
                         'Filter' => [
                             'Prefix' => 'data/',
                         ],
-                        'Transitions' => [
-                            [
-                                'Days' => 90,
-                                'StorageClass' => 'GLACIER',
-                            ],
-                        ],
+                        'AbortIncompleteMultipartUpload' => ['DaysAfterInitiation' => 90],
                     ],
                 ],
             ],
@@ -211,8 +250,8 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
         $this->assertSame('Enabled', $ruleMap['expire-old-logs']['Status']);
         $this->assertSame(30, $ruleMap['expire-old-logs']['Expiration']['Days']);
 
-        $this->assertArrayHasKey('archive-data', $ruleMap);
-        $this->assertSame('Enabled', $ruleMap['archive-data']['Status']);
+        $this->assertArrayHasKey('abort-stale-uploads', $ruleMap);
+        $this->assertSame('Enabled', $ruleMap['abort-stale-uploads']['Status']);
     }
 
     public function test_delete_bucket_lifecycle(): void
@@ -276,7 +315,7 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
                 'TopicConfigurations' => [
                     [
                         'Id' => 'notify-puts',
-                        'TopicArn' => 'arn:aws:sns:us-east-1:123456789012:my-topic',
+                        'TopicArn' => 'https://notifications.invalid/my-topic',
                         'Events' => ['s3:ObjectCreated:*'],
                         'Filter' => [
                             'Key' => [
@@ -306,7 +345,7 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
         $topicConfigs = $getResult['TopicConfigurations'] ?? [];
         $this->assertCount(1, $topicConfigs);
         $this->assertSame('notify-puts', $topicConfigs[0]['Id']);
-        $this->assertSame('arn:aws:sns:us-east-1:123456789012:my-topic', $topicConfigs[0]['TopicArn']);
+        $this->assertSame('https://notifications.invalid/my-topic', $topicConfigs[0]['TopicArn']);
         $this->assertContains('s3:ObjectCreated:*', $topicConfigs[0]['Events']);
     }
 
@@ -319,7 +358,7 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
                 'TopicConfigurations' => [
                     [
                         'Id' => 'temp-notify',
-                        'TopicArn' => 'arn:aws:sns:us-east-1:123456789012:temp-topic',
+                        'TopicArn' => 'https://notifications.invalid/temp-topic',
                         'Events' => ['s3:ObjectCreated:*'],
                     ],
                 ],
@@ -360,7 +399,7 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
                 'TopicConfigurations' => [
                     [
                         'Id' => 'multi-event-config',
-                        'TopicArn' => 'arn:aws:sns:us-east-1:123456789012:multi-topic',
+                        'TopicArn' => 'https://notifications.invalid/multi-topic',
                         'Events' => ['s3:ObjectCreated:*', 's3:ObjectRemoved:*'],
                     ],
                 ],

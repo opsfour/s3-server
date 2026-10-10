@@ -47,6 +47,12 @@ final class ObjectCrudTest extends S3FunctionalTestCase
         ]);
 
         $this->assertSame(200, $result['@metadata']['statusCode']);
+        $headers = $result['@metadata']['headers'];
+        $this->assertSame('us-east-1', $headers['x-amz-bucket-region']);
+        $this->assertSame('false', $headers['x-amz-access-point-alias']);
+        $this->assertArrayNotHasKey('x-rgw-quota-max-buckets', $headers);
+        $this->assertArrayNotHasKey('x-rgw-object-count', $headers);
+        $this->assertArrayNotHasKey('x-rgw-bytes-used', $headers);
     }
 
     #[Depends('test_create_bucket')]

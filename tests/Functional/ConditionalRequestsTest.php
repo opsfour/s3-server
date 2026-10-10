@@ -263,6 +263,25 @@ final class ConditionalRequestsTest extends S3FunctionalTestCase
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => 'copy-if-none-match.txt']);
     }
 
+    public function test_copy_source_weak_etag_uses_strong_if_match_and_weak_if_none_match(): void
+    {
+        foreach (['CopySourceIfMatch', 'CopySourceIfNoneMatch'] as $condition) {
+            $key = 'copy-weak-' . strtolower($condition) . '.txt';
+            try {
+                self::$s3->copyObject([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'CopySource' => self::$bucket . '/' . self::$testKey,
+                    $condition => 'W/' . self::$testEtag,
+                ]);
+                $this->fail("Expected PreconditionFailed for {$condition} with a weak ETag.");
+            } catch (S3Exception $e) {
+                $this->assertSame(412, $e->getStatusCode());
+            }
+            $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+        }
+    }
+
     public function test_copy_object_if_modified_since_success(): void
     {
         $result = self::$s3->copyObject([
@@ -323,5 +342,56 @@ final class ConditionalRequestsTest extends S3FunctionalTestCase
         ]);
 
         $this->assertSame(200, $result['@metadata']['statusCode']);
+    }
+
+    public function test_matching_etag_takes_precedence_over_failed_unmodified_date_for_get_and_head(): void
+    {
+        $conditions = [
+            'Bucket' => self::$bucket,
+            'Key' => self::$testKey,
+            'IfMatch' => self::$testEtag,
+            'IfUnmodifiedSince' => new \DateTimeImmutable('2020-01-01', new \DateTimeZone('UTC')),
+        ];
+
+        $get = self::$s3->getObject($conditions);
+        $this->assertSame(200, $get['@metadata']['statusCode']);
+        $this->assertSame('conditional request test content', (string) $get['Body']);
+        $head = self::$s3->headObject($conditions);
+        $this->assertSame(200, $head['@metadata']['statusCode']);
+    }
+
+    public function test_different_etag_takes_precedence_over_unmodified_date_for_get_and_head(): void
+    {
+        $conditions = [
+            'Bucket' => self::$bucket,
+            'Key' => self::$testKey,
+            'IfNoneMatch' => '"0000000000000000000000000000dead"',
+            'IfModifiedSince' => new \DateTimeImmutable('+1 year', new \DateTimeZone('UTC')),
+        ];
+
+        $this->assertSame(200, self::$s3->getObject($conditions)['@metadata']['statusCode']);
+        $this->assertSame(200, self::$s3->headObject($conditions)['@metadata']['statusCode']);
+    }
+
+    public function test_weak_etag_fails_if_match_but_matches_if_none_match(): void
+    {
+        $weakEtag = 'W/' . self::$testEtag;
+        try {
+            self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => self::$testKey,
+                'IfMatch' => $weakEtag,
+            ]);
+            $this->fail('A weak ETag must not satisfy If-Match.');
+        } catch (S3Exception $e) {
+            $this->assertSame(412, $e->getStatusCode());
+        }
+
+        $result = self::$s3->getObject([
+            'Bucket' => self::$bucket,
+            'Key' => self::$testKey,
+            'IfNoneMatch' => $weakEtag,
+        ]);
+        $this->assertSame(304, $result['@metadata']['statusCode']);
     }
 }

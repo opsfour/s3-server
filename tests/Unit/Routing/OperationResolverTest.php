@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Routing;
 
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Routing\OperationResolver;
 use OpsFour\S3Server\Routing\S3Operation;
 use PHPUnit\Framework\TestCase;
@@ -50,6 +51,12 @@ final class OperationResolverTest extends TestCase
     {
         $op = OperationResolver::resolve('GET', 'bucket', ['list-type' => '2'], []);
         $this->assertSame(S3Operation::ListObjectsV2, $op);
+    }
+
+    public function test_bucket_scope_rejects_unknown_list_type_instead_of_falling_back_to_v1(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        OperationResolver::resolve('GET', 'bucket', ['list-type' => '3'], []);
     }
 
     public function test_bucket_scope_list_objects_v1_default(): void
@@ -164,5 +171,101 @@ final class OperationResolverTest extends TestCase
     {
         $op = OperationResolver::resolve('GET', 'bucket', ['versions' => ''], []);
         $this->assertSame(S3Operation::ListObjectVersions, $op);
+    }
+
+    public function test_every_operation_has_a_direct_route_fixture(): void
+    {
+        $fixtures = self::routeFixtures();
+        self::assertSame(
+            array_map(static fn(S3Operation $operation): string => $operation->name, S3Operation::cases()),
+            array_keys($fixtures),
+            'Every S3Operation must have one direct resolver fixture in enum order.',
+        );
+
+        foreach ($fixtures as $expected => [$method, $scope, $query, $headers]) {
+            self::assertSame(
+                $expected,
+                OperationResolver::resolve($method, $scope, $query, $headers)->name,
+                $expected,
+            );
+        }
+    }
+
+    /**
+     * @return array<string, array{string, string, array<string, string>, array<string, string>}>
+     */
+    private static function routeFixtures(): array
+    {
+        return [
+            'ListBuckets' => ['GET', 'service', [], []],
+            'CreateBucket' => ['PUT', 'bucket', [], []],
+            'DeleteBucket' => ['DELETE', 'bucket', [], []],
+            'HeadBucket' => ['HEAD', 'bucket', [], []],
+            'ListObjects' => ['GET', 'bucket', [], []],
+            'ListObjectsV2' => ['GET', 'bucket', ['list-type' => '2'], []],
+            'ListObjectVersions' => ['GET', 'bucket', ['versions' => ''], []],
+            'GetBucketLocation' => ['GET', 'bucket', ['location' => ''], []],
+            'GetBucketVersioning' => ['GET', 'bucket', ['versioning' => ''], []],
+            'PutBucketVersioning' => ['PUT', 'bucket', ['versioning' => ''], []],
+            'GetBucketAcl' => ['GET', 'bucket', ['acl' => ''], []],
+            'PutBucketAcl' => ['PUT', 'bucket', ['acl' => ''], []],
+            'GetBucketPolicy' => ['GET', 'bucket', ['policy' => ''], []],
+            'PutBucketPolicy' => ['PUT', 'bucket', ['policy' => ''], []],
+            'DeleteBucketPolicy' => ['DELETE', 'bucket', ['policy' => ''], []],
+            'GetBucketCors' => ['GET', 'bucket', ['cors' => ''], []],
+            'PutBucketCors' => ['PUT', 'bucket', ['cors' => ''], []],
+            'DeleteBucketCors' => ['DELETE', 'bucket', ['cors' => ''], []],
+            'GetBucketTagging' => ['GET', 'bucket', ['tagging' => ''], []],
+            'PutBucketTagging' => ['PUT', 'bucket', ['tagging' => ''], []],
+            'DeleteBucketTagging' => ['DELETE', 'bucket', ['tagging' => ''], []],
+            'GetBucketLifecycle' => ['GET', 'bucket', ['lifecycle' => ''], []],
+            'PutBucketLifecycle' => ['PUT', 'bucket', ['lifecycle' => ''], []],
+            'DeleteBucketLifecycle' => ['DELETE', 'bucket', ['lifecycle' => ''], []],
+            'GetBucketNotification' => ['GET', 'bucket', ['notification' => ''], []],
+            'PutBucketNotification' => ['PUT', 'bucket', ['notification' => ''], []],
+            'GetBucketEncryption' => ['GET', 'bucket', ['encryption' => ''], []],
+            'PutBucketEncryption' => ['PUT', 'bucket', ['encryption' => ''], []],
+            'DeleteBucketEncryption' => ['DELETE', 'bucket', ['encryption' => ''], []],
+            'GetObjectLockConfig' => ['GET', 'bucket', ['object-lock' => ''], []],
+            'PutObjectLockConfig' => ['PUT', 'bucket', ['object-lock' => ''], []],
+            'ListMultipartUploads' => ['GET', 'bucket', ['uploads' => ''], []],
+            'DeleteObjects' => ['POST', 'bucket', ['delete' => ''], []],
+            'PostObject' => ['POST', 'bucket', [], []],
+            'GetBucketWebsite' => ['GET', 'bucket', ['website' => ''], []],
+            'PutBucketWebsite' => ['PUT', 'bucket', ['website' => ''], []],
+            'DeleteBucketWebsite' => ['DELETE', 'bucket', ['website' => ''], []],
+            'GetPublicAccessBlock' => ['GET', 'bucket', ['publicAccessBlock' => ''], []],
+            'PutPublicAccessBlock' => ['PUT', 'bucket', ['publicAccessBlock' => ''], []],
+            'DeletePublicAccessBlock' => ['DELETE', 'bucket', ['publicAccessBlock' => ''], []],
+            'GetBucketPolicyStatus' => ['GET', 'bucket', ['policyStatus' => ''], []],
+            'GetBucketLogging' => ['GET', 'bucket', ['logging' => ''], []],
+            'PutBucketLogging' => ['PUT', 'bucket', ['logging' => ''], []],
+            'GetBucketOwnershipControls' => ['GET', 'bucket', ['ownershipControls' => ''], []],
+            'PutBucketOwnershipControls' => ['PUT', 'bucket', ['ownershipControls' => ''], []],
+            'DeleteBucketOwnershipControls' => ['DELETE', 'bucket', ['ownershipControls' => ''], []],
+            'PutObject' => ['PUT', 'object', [], []],
+            'GetObject' => ['GET', 'object', [], []],
+            'HeadObject' => ['HEAD', 'object', [], []],
+            'DeleteObject' => ['DELETE', 'object', [], []],
+            'CopyObject' => ['PUT', 'object', [], ['x-amz-copy-source' => '/source/key']],
+            'GetObjectAcl' => ['GET', 'object', ['acl' => ''], []],
+            'PutObjectAcl' => ['PUT', 'object', ['acl' => ''], []],
+            'GetObjectTagging' => ['GET', 'object', ['tagging' => ''], []],
+            'PutObjectTagging' => ['PUT', 'object', ['tagging' => ''], []],
+            'DeleteObjectTagging' => ['DELETE', 'object', ['tagging' => ''], []],
+            'GetObjectRetention' => ['GET', 'object', ['retention' => ''], []],
+            'PutObjectRetention' => ['PUT', 'object', ['retention' => ''], []],
+            'GetObjectLegalHold' => ['GET', 'object', ['legal-hold' => ''], []],
+            'PutObjectLegalHold' => ['PUT', 'object', ['legal-hold' => ''], []],
+            'SelectObjectContent' => ['POST', 'object', ['select' => '', 'select-type' => '2'], []],
+            'GetObjectAttributes' => ['GET', 'object', ['attributes' => ''], []],
+            'RestoreObject' => ['POST', 'object', ['restore' => ''], []],
+            'CreateMultipartUpload' => ['POST', 'object', ['uploads' => ''], []],
+            'UploadPart' => ['PUT', 'object', ['partNumber' => '1', 'uploadId' => 'upload'], []],
+            'UploadPartCopy' => ['PUT', 'object', ['partNumber' => '1', 'uploadId' => 'upload'], ['x-amz-copy-source' => '/source/key']],
+            'CompleteMultipartUpload' => ['POST', 'object', ['uploadId' => 'upload'], []],
+            'AbortMultipartUpload' => ['DELETE', 'object', ['uploadId' => 'upload'], []],
+            'ListParts' => ['GET', 'object', ['uploadId' => 'upload'], []],
+        ];
     }
 }

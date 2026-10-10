@@ -56,6 +56,66 @@ final class SqliteMetadataStoreLockTest extends TestCase
         $this->assertFalse($this->store->acquireLock('lifecycle:global', 'node-a', 60));
     }
 
+    public function test_manual_rollback_inside_transaction_does_not_mask_original_error(): void
+    {
+        $caught = null;
+        try {
+            $this->store->transaction(function (): void {
+                $this->store->rollback();
+                throw new \RuntimeException('original transaction failure');
+            });
+        } catch (\RuntimeException $error) {
+            $caught = $error;
+        }
+
+        self::assertInstanceOf(\RuntimeException::class, $caught);
+        self::assertSame('original transaction failure', $caught->getMessage());
+        $this->store->createBucket('owner', 'after-rollback', 'us-east-1');
+        self::assertSame('owner', $this->store->getBucketOwner('after-rollback'));
+    }
+
+    public function test_failed_rollback_preserves_original_error_and_discards_connection(): void
+    {
+        $pdo = new FailingRollbackPdo();
+        (new \ReflectionProperty($this->store, 'pdo'))->setValue($this->store, $pdo);
+
+        $caught = null;
+        try {
+            $this->store->transaction(static function (): void {
+                throw new \RuntimeException('original callback failure');
+            });
+        } catch (\RuntimeException $error) {
+            $caught = $error;
+        }
+
+        self::assertInstanceOf(\RuntimeException::class, $caught);
+        self::assertSame('original callback failure', $caught->getMessage());
+        self::assertSame(1, $pdo->rollbackAttempts);
+        self::assertNull((new \ReflectionProperty($this->store, 'pdo'))->getValue($this->store));
+
+        $this->store->createBucket('owner', 'after-failed-rollback', 'us-east-1');
+        self::assertSame('owner', $this->store->getBucketOwner('after-failed-rollback'));
+    }
+
+    public function test_public_rollback_failure_discards_connection(): void
+    {
+        $pdo = new FailingRollbackPdo(inTransaction: true);
+        (new \ReflectionProperty($this->store, 'pdo'))->setValue($this->store, $pdo);
+
+        $caught = null;
+        try {
+            $this->store->rollback();
+        } catch (\RuntimeException $error) {
+            $caught = $error;
+        }
+
+        self::assertInstanceOf(\RuntimeException::class, $caught);
+        self::assertSame('injected rollback failure', $caught->getMessage());
+        self::assertNull((new \ReflectionProperty($this->store, 'pdo'))->getValue($this->store));
+        $this->store->createBucket('owner', 'after-public-rollback-failure', 'us-east-1');
+        self::assertSame('owner', $this->store->getBucketOwner('after-public-rollback-failure'));
+    }
+
     public function test_lifecycle_checkpoint_round_trip(): void
     {
         $this->assertNull($this->store->getLifecycleCheckpoint('bucket', 'rule', 'expire_current'));
@@ -101,10 +161,34 @@ final class SqliteMetadataStoreLockTest extends TestCase
     {
         $reflection = new \ReflectionClass($this->store);
         $method = $reflection->getMethod('connection');
-        $method->setAccessible(true);
         /** @var \PDO $pdo */
         $pdo = $method->invoke($this->store);
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
+    }
+}
+
+final class FailingRollbackPdo extends \PDO
+{
+    public int $rollbackAttempts = 0;
+
+    public function __construct(private bool $inTransaction = false) {}
+
+    public function beginTransaction(): bool
+    {
+        $this->inTransaction = true;
+
+        return true;
+    }
+
+    public function inTransaction(): bool
+    {
+        return $this->inTransaction;
+    }
+
+    public function rollBack(): bool
+    {
+        ++$this->rollbackAttempts;
+        throw new \RuntimeException('injected rollback failure');
     }
 }

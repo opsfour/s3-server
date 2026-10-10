@@ -69,8 +69,61 @@ final class DestinationAdapterTest extends TestCase
         ))->deliver($this->event());
 
         $this->assertSame(NotificationDeliveryStatus::RetryableFailure, $result->status);
-        $this->assertSame('broker unavailable', $result->reason);
+        $this->assertSame('Broker delivery failed.', $result->reason);
         $this->assertSame(\RuntimeException::class, $result->context['exception']);
+    }
+
+    public function test_builtin_broker_failures_do_not_return_client_exception_secrets(): void
+    {
+        $failingClient = static fn(): never => throw new \RuntimeException('sasl.password=secret-token');
+        $adapters = [
+            new RedisStreamNotificationAdapter($failingClient, 's3-events'),
+            new KafkaNotificationAdapter($failingClient, 's3-events'),
+            new AmqpNotificationAdapter($failingClient, 's3-exchange'),
+            new NatsNotificationAdapter($failingClient, 's3.events'),
+        ];
+
+        foreach ($adapters as $adapter) {
+            $result = $adapter->deliver($this->event());
+            $this->assertSame(NotificationDeliveryStatus::RetryableFailure, $result->status);
+            $this->assertSame('Broker delivery failed.', $result->reason);
+            $this->assertStringNotContainsString('secret-token', json_encode($result, JSON_THROW_ON_ERROR));
+            $this->assertSame(\RuntimeException::class, $result->context['exception']);
+        }
+    }
+
+    public function test_explicit_broker_failure_result_is_retryable_for_each_adapter(): void
+    {
+        $failedPublish = static fn(): false => false;
+        $adapters = [
+            new RedisStreamNotificationAdapter($failedPublish, 's3-events'),
+            new KafkaNotificationAdapter($failedPublish, 's3-events'),
+            new AmqpNotificationAdapter($failedPublish, 's3-exchange'),
+            new NatsNotificationAdapter($failedPublish, 's3.events'),
+        ];
+
+        foreach ($adapters as $adapter) {
+            $result = $adapter->deliver($this->event());
+            $this->assertSame(NotificationDeliveryStatus::RetryableFailure, $result->status, $adapter->name());
+            $this->assertSame('Broker delivery failed.', $result->reason);
+        }
+    }
+
+    public function test_missing_broker_publish_acknowledgement_is_retryable_for_each_adapter(): void
+    {
+        $unconfirmedPublish = static fn(): null => null;
+        $adapters = [
+            new RedisStreamNotificationAdapter($unconfirmedPublish, 's3-events'),
+            new KafkaNotificationAdapter($unconfirmedPublish, 's3-events'),
+            new AmqpNotificationAdapter($unconfirmedPublish, 's3-exchange'),
+            new NatsNotificationAdapter($unconfirmedPublish, 's3.events'),
+        ];
+
+        foreach ($adapters as $adapter) {
+            $result = $adapter->deliver($this->event());
+            $this->assertSame(NotificationDeliveryStatus::RetryableFailure, $result->status, $adapter->name());
+            $this->assertSame('Broker delivery failed.', $result->reason);
+        }
     }
 
     private function event(): S3Event

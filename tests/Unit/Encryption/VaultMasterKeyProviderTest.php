@@ -57,6 +57,26 @@ final class VaultMasterKeyProviderTest extends TestCase
         self::assertSame($key, $provider->getMasterKey());
     }
 
+    public function test_numeric_master_key_id_remains_resolvable(): void
+    {
+        $key = str_repeat('n', 32);
+        $client = self::client(200, json_encode([
+            'data' => ['data' => [
+                'keys' => ['123' => base64_encode($key)],
+                'activeKeyId' => '123',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+
+        $provider = new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            httpClient: $client,
+        );
+
+        self::assertSame('123', $provider->getKeyId());
+        self::assertSame($key, $provider->getMasterKeyById('123'));
+    }
+
     public function test_multi_key_configuration_fails_closed_without_active_key(): void
     {
         $client = self::client(200, json_encode([
@@ -103,6 +123,91 @@ final class VaultMasterKeyProviderTest extends TestCase
             vaultAddr: 'https://vault.internal',
             vaultToken: 'secret-token',
             httpClient: $client,
+        );
+    }
+
+    public function test_transport_exception_does_not_expose_vault_token(): void
+    {
+        $delegate = new class implements DelegateHttpClient {
+            public function request(Request $request, Cancellation $cancellation): Response
+            {
+                throw new \RuntimeException('client diagnostic: X-Vault-Token=secret-token-sentinel');
+            }
+        };
+
+        try {
+            new VaultMasterKeyProvider(
+                vaultAddr: 'https://vault.internal',
+                vaultToken: 'secret-token-sentinel',
+                httpClient: new HttpClient($delegate, []),
+            );
+            self::fail('Expected Vault request to fail.');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Unable to read master keys from Vault.', $e->getMessage());
+            self::assertNull($e->getPrevious());
+            self::assertStringNotContainsString('secret-token-sentinel', (string) $e);
+        }
+    }
+
+    public function test_invalid_vault_url_does_not_expose_secret_path(): void
+    {
+        try {
+            new VaultMasterKeyProvider(
+                vaultAddr: 'https://vault.internal:99999',
+                vaultToken: 'secret-token',
+                vaultPath: 'secret/data/sensitive-path-token-sentinel',
+                httpClient: self::client(200, '{}'),
+            );
+            self::fail('Expected invalid Vault URL to fail.');
+        } catch (\RuntimeException $e) {
+            self::assertStringNotContainsString('sensitive-path-token-sentinel', $e->getMessage());
+            self::assertNull($e->getPrevious());
+        }
+    }
+
+    public function test_vault_address_with_userinfo_is_rejected_before_sending_token(): void
+    {
+        $delegate = new class implements DelegateHttpClient {
+            public function request(Request $request, Cancellation $cancellation): Response
+            {
+                TestCase::fail('Vault token must not be sent to an address containing userinfo.');
+            }
+        };
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Vault address must be an HTTPS URL without credentials, query, or fragment.');
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://expected.vault.internal@other.example',
+            vaultToken: 'secret-token',
+            httpClient: new HttpClient($delegate, []),
+        );
+    }
+
+    public function test_vault_error_does_not_repeat_secret_path(): void
+    {
+        try {
+            new VaultMasterKeyProvider(
+                vaultAddr: 'https://vault.internal',
+                vaultToken: 'secret-token',
+                vaultPath: 'secret/data/sensitive-path-token-sentinel',
+                httpClient: self::client(403, 'denied'),
+            );
+            self::fail('Expected Vault error response to fail.');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Vault returned HTTP 403.', $e->getMessage());
+            self::assertStringNotContainsString('sensitive-path-token-sentinel', $e->getMessage());
+        }
+    }
+
+    public function test_vault_secret_path_rejects_query_tokens(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Vault secret path must be a non-empty URL path without query or fragment.');
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            vaultPath: 'secret/data/master-key?token=path-token-sentinel',
+            httpClient: self::client(200, '{}'),
         );
     }
 

@@ -5,10 +5,28 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class QueueLeaseHeartbeatTest extends TestCase
 {
+    #[DataProvider('invalidIntervals')]
+    public function test_non_finite_and_non_positive_intervals_are_rejected(float $interval): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new QueueLeaseHeartbeat(static fn(float $expiresAt): bool => true, $interval);
+    }
+
+    /** @return iterable<string, array{float}> */
+    public static function invalidIntervals(): iterable
+    {
+        yield 'zero' => [0.0];
+        yield 'negative' => [-1.0];
+        yield 'positive infinity' => [INF];
+        yield 'negative infinity' => [-INF];
+        yield 'not a number' => [NAN];
+    }
+
     public function test_heartbeat_renews_until_stopped(): void
     {
         $renewals = 0;

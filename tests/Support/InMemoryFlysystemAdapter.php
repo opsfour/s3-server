@@ -33,6 +33,8 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
 
     public ?string $failNextWriteStreamReason = null;
 
+    public ?string $failNextWriteStreamAfterWriteReason = null;
+
     public function fileExists(string $path): bool
     {
         return array_key_exists($path, $this->files);
@@ -83,6 +85,11 @@ final class InMemoryFlysystemAdapter implements FilesystemAdapter
 
         $this->files[$path] = $data;
         $this->rememberParentDirectories($path);
+        if ($this->failNextWriteStreamAfterWriteReason !== null) {
+            $reason = $this->failNextWriteStreamAfterWriteReason;
+            $this->failNextWriteStreamAfterWriteReason = null;
+            throw UnableToWriteFile::atLocation($path, $reason);
+        }
     }
 
     public function read(string $path): string

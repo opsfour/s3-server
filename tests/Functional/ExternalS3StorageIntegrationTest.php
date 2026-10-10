@@ -23,6 +23,11 @@ final class ExternalS3StorageIntegrationTest extends TestCase
     /** @var list<string> */
     private array $createdStoragePaths = [];
 
+    /** @var list<string> */
+    private array $createdUploadIds = [];
+
+    private bool $markerProvisionAttempted = false;
+
     public static function setUpBeforeClass(): void
     {
         self::loadIntegrationEnv();
@@ -39,7 +44,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         $accessKey = self::requiredEnv('S3_INTEGRATION_ACCESS_KEY');
         $secretKey = self::requiredEnv('S3_INTEGRATION_SECRET_KEY');
         $this->bucket = self::integrationBucket();
-        $this->logicalBucket = self::prefix() . '-' . bin2hex(random_bytes(4));
+        $this->logicalBucket = self::prefix() . '-' . bin2hex(random_bytes(16));
 
         $this->client = new S3Client([
             'version' => 'latest',
@@ -77,27 +82,63 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             return;
         }
 
-        foreach ($this->createdStoragePaths as $path) {
-            $key = self::prefix() . '/' . $path;
-            try {
-                $this->client->deleteObject([
-                    'Bucket' => $this->bucket,
-                    'Key' => $key,
-                ]);
-            } catch (\Throwable) {
+        $cleanupFailed = false;
+        try {
+            foreach ($this->createdStoragePaths as $path) {
+                try {
+                    $this->client->deleteObject([
+                        'Bucket' => $this->bucket,
+                        'Key' => self::remoteKeyForPath($path),
+                    ]);
+                } catch (\Throwable) {
+                    $cleanupFailed = true;
+                }
+            }
+
+            if ($this->markerProvisionAttempted) {
+                // The AWS Flysystem adapter creates exactly this directory marker.
+                // Never recursively delete the logical bucket prefix: another
+                // generation could already be writing below the same name.
+                try {
+                    $this->client->deleteObject([
+                        'Bucket' => $this->bucket,
+                        'Key' => self::remoteKeyForPath($this->logicalBucket . '/'),
+                    ]);
+                } catch (\Throwable) {
+                    $cleanupFailed = true;
+                }
+            }
+
+            $prefixes = $this->markerProvisionAttempted ? [$this->logicalBucket . '/'] : [];
+            foreach ($this->createdUploadIds as $uploadId) {
+                $prefixes[] = '.parts/' . $uploadId . '/';
+            }
+            foreach ($prefixes as $prefix) {
+                try {
+                    $listed = $this->client->listObjectsV2([
+                        'Bucket' => $this->bucket,
+                        'Prefix' => self::remoteKeyForPath($prefix),
+                        'MaxKeys' => 1,
+                    ]);
+                    if (($listed['Contents'] ?? []) !== [] || ($listed['IsTruncated'] ?? false)) {
+                        $cleanupFailed = true;
+                    }
+                } catch (\Throwable) {
+                    $cleanupFailed = true;
+                }
+            }
+        } finally {
+            if (isset($this->backend)) {
+                $this->backend->shutdown();
             }
         }
 
-        try {
-            $this->backend->deleteBucket($this->logicalBucket);
-        } catch (\Throwable) {
-        }
-        $this->backend->shutdown();
+        self::assertFalse($cleanupFailed, 'Exact external S3 test cleanup failed or left objects in a test prefix.');
     }
 
     public function test_external_s3_backend_round_trips_large_object_copy_and_delete(): void
     {
-        $this->backend->createBucket($this->logicalBucket);
+        $this->createLogicalBucket();
 
         $payload = self::deterministicPayload(self::envInt('S3_INTEGRATION_OBJECT_BYTES', 2 * 1024 * 1024));
         $write = $this->backend->putObject($this->logicalBucket, 'objects/large.bin', new ReadableBuffer($payload));
@@ -110,7 +151,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
         $slice = $this->backend->getObjectByPath($write->path, 1024, 4096);
         self::assertSame(substr($payload, 1024, 4096), self::readAll($slice));
 
-        $copy = $this->backend->copyObject($write->path, $this->logicalBucket, 'objects/copy.bin');
+        $copy = $this->backend->copyObjectBounded($write->path, $this->logicalBucket, 'objects/copy.bin', strlen($payload) + 1);
         $this->createdStoragePaths[] = $copy->path;
         self::assertSame($payload, self::readAll($this->backend->getObjectByPath($copy->path)));
 
@@ -126,8 +167,9 @@ final class ExternalS3StorageIntegrationTest extends TestCase
 
     public function test_external_s3_backend_multipart_parts_survive_assembly_until_commit_cleanup(): void
     {
-        $this->backend->createBucket($this->logicalBucket);
-        $uploadId = 'integration-' . bin2hex(random_bytes(8));
+        $this->createLogicalBucket();
+        $uploadId = 'integration-' . bin2hex(random_bytes(16));
+        $this->createdUploadIds[] = $uploadId;
         $partBytes = self::envInt('S3_INTEGRATION_MULTIPART_PART_BYTES', 1024 * 1024);
         $expected = '';
         $parts = [];
@@ -142,6 +184,7 @@ final class ExternalS3StorageIntegrationTest extends TestCase
                 $partNumber,
                 new ReadableBuffer($payload),
             );
+            $this->createdStoragePaths[] = $part->path;
             $parts[] = [
                 'partNumber' => $partNumber,
                 'etag' => $part->md5Hex,
@@ -178,6 +221,19 @@ final class ExternalS3StorageIntegrationTest extends TestCase
             'Prefix' => self::prefix() . '/.parts/' . $uploadId . '/',
         ]);
         self::assertSame(0, count($afterAbort['Contents'] ?? []));
+    }
+
+    private function createLogicalBucket(): void
+    {
+        $this->markerProvisionAttempted = true;
+        $this->backend->createBucket($this->logicalBucket);
+    }
+
+    private static function remoteKeyForPath(string $path): string
+    {
+        $prefix = self::prefix();
+
+        return ($prefix === '' ? '' : $prefix . '/') . $path;
     }
 
     private static function loadIntegrationEnv(): void

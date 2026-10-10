@@ -11,10 +11,61 @@ use OpsFour\S3Server\Auth\External\ExternalIdentityAuthenticationException;
 use OpsFour\S3Server\Auth\External\JwtExternalIdentityProvider;
 use OpsFour\S3Server\Auth\External\OidcClaimMapper;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class ExternalCredentialIssuerTest extends TestCase
 {
+    /** @return iterable<string, array{list<string>, list<string>}> */
+    public static function missingJwtValidationScope(): iterable
+    {
+        yield 'issuer missing' => [[], ['s3-admin']];
+        yield 'audience missing' => [['https://issuer.example.test'], []];
+    }
+
+    /** @return iterable<string, array{list<string>, list<string>}> */
+    public static function blankJwtValidationScope(): iterable
+    {
+        yield 'issuer blank' => [[''], ['s3-admin']];
+        yield 'audience blank' => [['https://issuer.example.test'], ['']];
+    }
+
+    /**
+     * @param list<string> $issuers
+     * @param list<string> $audiences
+     */
+    #[DataProvider('missingJwtValidationScope')]
+    public function test_direct_jwt_provider_requires_issuer_and_audience_scope(array $issuers, array $audiences): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('JWT verification requires expected issuer and audience values.');
+
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => 'public-key'],
+            allowedIssuers: $issuers,
+            allowedAudiences: $audiences,
+        );
+    }
+
+    /**
+     * @param list<string> $issuers
+     * @param list<string> $audiences
+     */
+    #[DataProvider('blankJwtValidationScope')]
+    public function test_direct_jwt_provider_rejects_blank_scope_values(array $issuers, array $audiences): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('JWT verification requires non-empty issuer and audience values.');
+
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => 'public-key'],
+            allowedIssuers: $issuers,
+            allowedAudiences: $audiences,
+        );
+    }
+
     public function test_oidc_claim_mapper_maps_keycloak_claims(): void
     {
         $mapper = new OidcClaimMapper(
@@ -55,6 +106,68 @@ final class ExternalCredentialIssuerTest extends TestCase
         ]);
     }
 
+    /** @return iterable<string, array{array<string, mixed>}> */
+    public static function missingPrefixScopes(): iterable
+    {
+        yield 'missing' => [[]];
+        yield 'null' => [['s3_prefixes' => null]];
+        yield 'empty list' => [['s3_prefixes' => []]];
+        yield 'empty string' => [['s3_prefixes' => '']];
+    }
+
+    /** @param array<string, mixed> $prefixClaim */
+    #[DataProvider('missingPrefixScopes')]
+    public function test_configured_oidc_prefix_claim_requires_nonempty_scope(array $prefixClaim): void
+    {
+        $mapper = new OidcClaimMapper(allowedPrefixesClaim: 's3_prefixes');
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage("OIDC claim 's3_prefixes' must contain at least one prefix.");
+
+        $mapper->map([
+            'sub' => 'bucket-owner',
+            'iss' => 'https://issuer.example.test',
+            ...$prefixClaim,
+        ]);
+    }
+
+    public function test_signed_oidc_token_without_configured_prefix_scope_cannot_issue_owner_credential(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $identityProvider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(allowedPrefixesClaim: 's3_prefixes'),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+        );
+        $credentials = new InMemoryCredentialProvider();
+        $credentialIssuer = new ExternalCredentialIssuer(new CredentialManager($credentials));
+        $claims = [
+            'sub' => 'bucket-owner',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
+            'exp' => time() + 300,
+        ];
+        $header = ['alg' => 'RS256', 'kid' => 'key-1'];
+
+        try {
+            $identity = $identityProvider->authenticate($this->signJwt($privateKey, $header, $claims));
+            $credentialIssuer->issue($identity);
+            self::fail('A missing configured prefix claim must not issue an unrestricted credential.');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame("OIDC claim 's3_prefixes' must contain at least one prefix.", $e->getMessage());
+        }
+
+        self::assertSame([], $credentials->listCredentials());
+
+        $identity = $identityProvider->authenticate($this->signJwt($privateKey, $header, [
+            ...$claims,
+            's3_prefixes' => ['incoming/'],
+        ]));
+        $issued = $credentialIssuer->issue($identity);
+        self::assertSame(['incoming/'], $issued->credential->allowedPrefixes);
+    }
+
     public function test_issue_creates_persisted_sigv4_credential_for_external_identity(): void
     {
         $provider = new InMemoryCredentialProvider();
@@ -69,7 +182,7 @@ final class ExternalCredentialIssuerTest extends TestCase
             allowedPrefixes: ['incoming/'],
         );
 
-        $issued = $issuer->issue($identity, ttlSeconds: 900);
+        $issued = $issuer->issue($identity, ttlSeconds: 3600);
 
         $stored = $provider->getCredential($issued->credential->accessKeyId);
         $this->assertNotNull($stored);
@@ -88,14 +201,40 @@ final class ExternalCredentialIssuerTest extends TestCase
         $this->assertGreaterThan(new \DateTimeImmutable('now', new \DateTimeZone('UTC')), $issued->expiresAt);
     }
 
-    public function test_issue_rejects_invalid_ttl(): void
+    /** @return iterable<string, array{int}> */
+    public static function invalidCredentialTtls(): iterable
+    {
+        yield 'zero' => [0];
+        yield 'below one hour' => [3599];
+        yield 'above twelve hours' => [43201];
+        yield 'integer maximum' => [PHP_INT_MAX];
+    }
+
+    #[DataProvider('invalidCredentialTtls')]
+    public function test_issue_rejects_invalid_ttl(int $ttlSeconds): void
     {
         $issuer = new ExternalCredentialIssuer(new CredentialManager(new InMemoryCredentialProvider()));
 
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('Credential TTL must be at least one second.');
+        $this->expectExceptionMessage('Credential TTL must be between 3600 and 43200 seconds.');
 
-        $issuer->issue(new ExternalIdentity('user-123', '', 'tenant:acme'), ttlSeconds: 0);
+        $issuer->issue(new ExternalIdentity('user-123', '', 'tenant:acme'), ttlSeconds: $ttlSeconds);
+    }
+
+    public function test_issue_defaults_to_one_hour_and_accepts_twelve_hours(): void
+    {
+        $issuer = new ExternalCredentialIssuer(new CredentialManager(new InMemoryCredentialProvider()));
+        $identity = new ExternalIdentity('user-123', '', 'tenant:acme');
+
+        foreach ([[null, 3600], [43200, 43200]] as [$requested, $expected]) {
+            $before = time();
+            $issued = $issuer->issue($identity, $requested);
+            $after = time();
+            self::assertNotNull($issued->expiresAt);
+            self::assertGreaterThanOrEqual($before + $expected, $issued->expiresAt->getTimestamp());
+            self::assertLessThanOrEqual($after + $expected, $issued->expiresAt->getTimestamp());
+            self::assertNotNull($issued->credential->sessionToken);
+        }
     }
 
     public function test_revoke_deletes_issued_credential_without_restart(): void
@@ -161,6 +300,7 @@ final class ExternalCredentialIssuerTest extends TestCase
 
         $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
             'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
             'aud' => 'other-client',
             'exp' => time() + 300,
         ]);
@@ -168,6 +308,7 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider = new JwtExternalIdentityProvider(
             mapper: new OidcClaimMapper(),
             keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
             allowedAudiences: ['s3-admin'],
         );
 
@@ -177,18 +318,135 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider->authenticate($token);
     }
 
+    public function test_multiple_issuers_have_separate_owner_ids_and_verification_keys_even_with_same_kid(): void
+    {
+        [$firstPrivateKey, $firstJwk] = $this->createRsaKeyPair();
+        [$secondPrivateKey, $secondJwk] = $this->createRsaKeyPair();
+        $firstIssuer = 'https://issuer-a.example.test';
+        $secondIssuer = 'https://issuer-b.example.test';
+        $claims = [
+            'sub' => 'same-subject',
+            'aud' => 's3-admin',
+            'exp' => time() + 300,
+            'tenant_id' => 'same-tenant',
+        ];
+        $provider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(ownerClaim: 'tenant_id', ownerPrefix: 'tenant:'),
+            keys: [],
+            allowedIssuers: [$firstIssuer, $secondIssuer],
+            allowedAudiences: ['s3-admin'],
+            keysByIssuer: [
+                $firstIssuer => ['key-1' => $firstJwk],
+                $secondIssuer => ['key-1' => $secondJwk],
+            ],
+        );
+
+        $first = $provider->authenticate($this->signJwt($firstPrivateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            ...$claims, 'iss' => $firstIssuer,
+        ]));
+        $second = $provider->authenticate($this->signJwt($secondPrivateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            ...$claims, 'iss' => $secondIssuer,
+        ]));
+
+        self::assertNotSame($first->ownerId, $second->ownerId);
+        self::assertSame(OidcClaimMapper::issuerScopedOwnerId($firstIssuer, 'same-tenant', 'tenant:'), $first->ownerId);
+        self::assertSame(OidcClaimMapper::issuerScopedOwnerId($secondIssuer, 'same-tenant', 'tenant:'), $second->ownerId);
+        self::assertSame($first->ownerId, $provider->authenticate($this->signJwt($firstPrivateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            ...$claims, 'iss' => $firstIssuer,
+        ]))->ownerId);
+
+        $forged = $this->signJwt($firstPrivateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            ...$claims, 'iss' => $secondIssuer,
+        ]);
+        $this->expectException(ExternalIdentityAuthenticationException::class);
+        $this->expectExceptionMessage('JWT signature is invalid.');
+        $provider->authenticate($forged);
+    }
+
+    public function test_multiple_issuers_reject_a_global_verification_key_pool(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('global key pool');
+
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => 'public-key'],
+            allowedIssuers: ['https://issuer-a.example.test', 'https://issuer-b.example.test'],
+            allowedAudiences: ['s3-admin'],
+        );
+    }
+
+    public function test_multiple_issuers_reject_one_key_present_as_jwk_and_pem(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $private = openssl_pkey_get_private($privateKey);
+        self::assertNotFalse($private);
+        $details = openssl_pkey_get_details($private);
+        self::assertIsArray($details);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('shared by multiple issuers');
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: [],
+            allowedIssuers: ['https://issuer-a.example.test', 'https://issuer-b.example.test'],
+            allowedAudiences: ['s3-admin'],
+            keysByIssuer: [
+                'https://issuer-a.example.test' => ['key-1' => $jwk],
+                'https://issuer-b.example.test' => ['other-kid' => $details['key']],
+            ],
+        );
+    }
+
+    public function test_issuer_scoped_owner_id_rejects_prefix_that_exceeds_storage_limit(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('255-byte');
+
+        OidcClaimMapper::issuerScopedOwnerId('https://issuer.example.test', 'tenant', str_repeat('p', 187));
+    }
+
+    public function test_multi_issuer_provider_rejects_oversized_owner_prefix_at_startup(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('255-byte');
+
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(ownerPrefix: str_repeat('p', 187)),
+            keys: [],
+            allowedIssuers: ['https://issuer-a.example.test', 'https://issuer-b.example.test'],
+            allowedAudiences: ['s3-admin'],
+            keysByIssuer: [
+                'https://issuer-a.example.test' => ['key-1' => 'public-key-a'],
+                'https://issuer-b.example.test' => ['key-1' => 'public-key-b'],
+            ],
+        );
+    }
+
+    public function test_issuer_scoped_owner_id_encodes_separator_characters_without_collision(): void
+    {
+        self::assertNotSame(
+            OidcClaimMapper::issuerScopedOwnerId("a\0b", 'c'),
+            OidcClaimMapper::issuerScopedOwnerId('a', "b\0c"),
+        );
+    }
+
     public function test_jwt_external_identity_provider_rejects_expired_token(): void
     {
         [$privateKey, $jwk] = $this->createRsaKeyPair();
 
         $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
             'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
             'exp' => time() - 120,
         ]);
 
         $provider = new JwtExternalIdentityProvider(
             mapper: new OidcClaimMapper(),
             keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
         );
 
         $this->expectException(ExternalIdentityAuthenticationException::class);
@@ -197,17 +455,36 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider->authenticate($token);
     }
 
+    public function test_jwt_external_identity_provider_rejects_excessive_clock_skew(): void
+    {
+        [, $jwk] = $this->createRsaKeyPair();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('between 0 and 3600 seconds');
+        new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+            clockSkewSeconds: 3_601,
+        );
+    }
+
     public function test_jwt_external_identity_provider_rejects_token_without_expiration(): void
     {
         [$privateKey, $jwk] = $this->createRsaKeyPair();
 
         $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
             'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
         ]);
 
         $provider = new JwtExternalIdentityProvider(
             mapper: new OidcClaimMapper(),
             keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
         );
 
         $this->expectException(ExternalIdentityAuthenticationException::class);
@@ -222,6 +499,8 @@ final class ExternalCredentialIssuerTest extends TestCase
 
         $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
             'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
             'exp' => time() + 300,
         ]);
         [$header, $payload] = explode('.', $token);
@@ -230,6 +509,8 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider = new JwtExternalIdentityProvider(
             mapper: new OidcClaimMapper(),
             keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
         );
 
         $this->expectException(ExternalIdentityAuthenticationException::class);

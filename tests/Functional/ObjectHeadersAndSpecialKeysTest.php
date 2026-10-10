@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
+use GuzzleHttp\Client;
 
 /**
  * Functional tests for HTTP header roundtripping, special object key handling,
@@ -32,6 +33,32 @@ final class ObjectHeadersAndSpecialKeysTest extends S3FunctionalTestCase
     // -----------------------------------------------------------------
     // Header roundtripping
     // -----------------------------------------------------------------
+
+    public function test_malformed_range_is_ignored_consistently_for_get_and_head(): void
+    {
+        $key = 'malformed-range-' . bin2hex(random_bytes(4)) . '.txt';
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'range-body']);
+
+        try {
+            $get = self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Range' => 'bytes=oops-5',
+            ]);
+            $head = self::$s3->headObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Range' => 'bytes=oops-5',
+            ]);
+
+            $this->assertSame(200, $get['@metadata']['statusCode']);
+            $this->assertSame('range-body', (string) $get['Body']);
+            $this->assertSame(200, $head['@metadata']['statusCode']);
+            $this->assertSame(10, $head['ContentLength']);
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
 
     public function test_put_object_with_cache_control(): void
     {
@@ -351,6 +378,103 @@ final class ObjectHeadersAndSpecialKeysTest extends S3FunctionalTestCase
         $this->assertSame('application/octet-stream', $result['ContentType']);
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+    }
+
+    public function test_unsigned_fake_signature_cannot_enable_response_header_overrides(): void
+    {
+        $key = 'public-override-' . bin2hex(random_bytes(4));
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'public payload',
+            'ContentType' => 'text/plain',
+            'ACL' => 'public-read',
+        ]);
+        try {
+            $client = new Client(['http_errors' => false, 'timeout' => 5]);
+            $base = sprintf('http://%s:%d/%s/%s', self::$host, self::$port, self::$bucket, $key);
+            $anonymous = $client->get($base . '?X-Amz-Signature=fake&response-content-type=text%2Fhtml');
+            self::assertSame(200, $anonymous->getStatusCode());
+            self::assertSame('text/plain', $anonymous->getHeaderLine('Content-Type'));
+
+            $command = self::$s3->getCommand('GetObject', [
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'ResponseContentType' => 'text/html',
+            ]);
+            $presignedUrl = (string) self::$s3->createPresignedRequest($command, '+5 minutes')->getUri();
+            $authenticated = $client->get($presignedUrl);
+            self::assertSame(200, $authenticated->getStatusCode());
+            self::assertSame('text/html', $authenticated->getHeaderLine('Content-Type'));
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
+    public function test_head_response_overrides_require_a_signed_untampered_request(): void
+    {
+        $key = 'public-head-override-' . bin2hex(random_bytes(4));
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'public payload',
+            'ContentType' => 'text/plain',
+            'ACL' => 'public-read',
+        ]);
+
+        try {
+            $client = new Client(['http_errors' => false, 'timeout' => 5]);
+            $base = sprintf('http://%s:%d/%s/%s', self::$host, self::$port, self::$bucket, $key);
+            $anonymous = $client->head($base . '?X-Amz-Signature=fake&response-content-type=text%2Fhtml');
+            self::assertSame(200, $anonymous->getStatusCode());
+            self::assertSame('text/plain', $anonymous->getHeaderLine('Content-Type'));
+
+            $command = self::$s3->getCommand('HeadObject', [
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'ResponseContentType' => 'text/html',
+                'ResponseCacheControl' => 'no-store',
+            ]);
+            $url = (string) self::$s3->createPresignedRequest($command, '+5 minutes')->getUri();
+            $signed = $client->head($url);
+            self::assertSame(200, $signed->getStatusCode());
+            self::assertSame('text/html', $signed->getHeaderLine('Content-Type'));
+            self::assertSame('no-store', $signed->getHeaderLine('Cache-Control'));
+
+            $tampered = $client->head($url . '&response-content-language=de');
+            self::assertSame(403, $tampered->getStatusCode());
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
+    public function test_signed_get_and_head_reject_control_characters_in_response_overrides(): void
+    {
+        $key = 'invalid-response-override-' . bin2hex(random_bytes(4));
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'payload']);
+
+        try {
+            $client = new Client(['http_errors' => false, 'timeout' => 5]);
+            foreach (['GetObject' => 'GET', 'HeadObject' => 'HEAD'] as $operation => $method) {
+                $command = self::$s3->getCommand($operation, [
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'ResponseContentDisposition' => "attachment\r\nX-Injected: yes",
+                ]);
+                $url = (string) self::$s3->createPresignedRequest($command, '+5 minutes')->getUri();
+                $response = $client->request($method, $url);
+
+                self::assertSame(400, $response->getStatusCode(), $operation);
+                self::assertSame('', $response->getHeaderLine('X-Injected'), $operation);
+                if ($method === 'GET') {
+                    self::assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+                } else {
+                    self::assertSame('', (string) $response->getBody());
+                }
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
     }
 
     // -----------------------------------------------------------------

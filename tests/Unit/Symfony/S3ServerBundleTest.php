@@ -60,11 +60,61 @@ final class S3ServerBundleTest extends TestCase
         self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle())->getContainerExtension());
     }
 
+    public function test_external_metadata_service_uses_read_only_admission(): void
+    {
+        foreach (['postgres', 'mysql'] as $driver) {
+            $container = new ContainerBuilder();
+            (new S3ServerExtension())->load([[
+                'storage' => ['driver' => 'memory'],
+                'metadata' => ['driver' => $driver, 'dsn' => 'host=127.0.0.1 port=1 dbname=s3audit_unreachable'],
+                'credentials' => ['driver' => 'memory', 'access_key' => 'key', 'secret_key' => 'secret'],
+            ]], $container);
+            $definition = $container->getDefinition('opsfour_s3_server.metadata.inner');
+            self::assertFalse($definition->getArguments()[4]);
+            $container->compile();
+            try {
+                $container->get(MetadataStore::class);
+                self::fail('The Symfony metadata service bypassed read-only admission.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('Metadata schema cannot be verified', $error->getMessage());
+            }
+        }
+    }
+
+    public function test_symfony_serve_checks_postgres_driver_before_resolving_metadata(): void
+    {
+        if (extension_loaded('pq')) {
+            self::markTestSkipped('The negative startup case requires PHP without pecl-pq.');
+        }
+
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => ['driver' => 'memory'],
+            'metadata' => [
+                'driver' => 'postgres',
+                'dsn' => 'host=127.0.0.1 port=1 dbname=unreachable password=private-dsn-secret',
+            ],
+            'credentials' => [
+                'driver' => 'memory',
+                'access_key' => 'test-key',
+                'secret_key' => 'test-secret',
+            ],
+        ]], $container);
+        $container->compile();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('PostgreSQL API servers require the pecl-pq PHP extension.');
+        $container->get(S3ServerServeCommand::class);
+    }
+
     public function test_container_compiles_and_resolves_core_services(): void
     {
         $container = new ContainerBuilder();
         $extension = new S3ServerExtension();
         $extension->load([[
+            'server' => [
+                'trusted_proxy_cidrs' => ['127.0.0.1/32'],
+            ],
             'storage' => [
                 'driver' => 'memory',
                 'path' => sys_get_temp_dir() . '/opsfour-s3-symfony-test',
@@ -98,6 +148,7 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame('0.0.0.0', $config->host);
         self::assertSame(9000, $config->port);
         self::assertSame('us-east-1', $config->region);
+        self::assertSame(['127.0.0.1/32'], $config->trustedProxyCidrs);
         self::assertTrue($config->enforceMinPartSize);
     }
 
@@ -131,7 +182,12 @@ final class S3ServerBundleTest extends TestCase
                 'region' => 'eu-central-1',
                 'max_connections' => 123,
                 'body_size_limit' => 456789,
+                'post_spool_budget' => 987654,
                 'enforce_min_part_size' => false,
+                'allow_unfenced_storage_for_tests' => true,
+            ],
+            'notifications' => [
+                'worker_enabled' => false,
             ],
             'storage' => [
                 'driver' => 'memory',
@@ -153,7 +209,10 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame('eu-central-1', $config->region);
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456789, $config->requestBodySizeLimit);
+        self::assertSame(987654, $config->postSpoolBudgetBytes);
         self::assertFalse($config->enforceMinPartSize);
+        self::assertTrue($config->allowUnfencedStorageForTests);
+        self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
     }
@@ -215,6 +274,48 @@ final class S3ServerBundleTest extends TestCase
 
         self::assertSame(Command::FAILURE, $exit);
         self::assertStringContainsString('Port must be between 1 and 65535', $tester->getDisplay());
+    }
+
+    public function test_serve_command_rejects_non_decimal_port_without_truncating_it(): void
+    {
+        $tester = new CommandTester($this->service($this->container(), S3ServerServeCommand::class));
+
+        $exit = $tester->execute(['--port' => '9000junk']);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('S3 server bootstrap failed', $tester->getDisplay());
+    }
+
+    public function test_serve_command_does_not_echo_external_iam_configuration_details(): void
+    {
+        $container = $this->container([
+            'external_iam' => [
+                'enabled' => true,
+                'admin_token' => 'admin-token',
+                'allowed_issuers' => ['issuer-secret-sentinel', 'another-issuer'],
+                'allowed_audiences' => ['audience'],
+                'keys_by_issuer' => ['another-issuer' => ['kid' => 'public-key']],
+            ],
+        ]);
+        $tester = new CommandTester($this->service($container, S3ServerServeCommand::class));
+
+        self::assertSame(Command::FAILURE, $tester->execute([]));
+        self::assertStringNotContainsString('issuer-secret-sentinel', $tester->getDisplay());
+        self::assertStringContainsString('bootstrap failed', $tester->getDisplay());
+    }
+
+    public function test_quota_admin_token_uses_external_iam_only_when_unset(): void
+    {
+        $externalToken = $this->container([
+            'external_iam' => ['admin_token' => 'external-secret'],
+        ]);
+        self::assertSame('external-secret', $externalToken->getDefinition(S3ServerServeCommand::class)->getArgument(8));
+
+        $dedicatedToken = $this->container([
+            'admin' => ['token' => '0'],
+            'external_iam' => ['admin_token' => 'external-secret'],
+        ]);
+        self::assertSame('0', $dedicatedToken->getDefinition(S3ServerServeCommand::class)->getArgument(8));
     }
 
     public function test_credentials_command_manages_configured_file_provider(): void

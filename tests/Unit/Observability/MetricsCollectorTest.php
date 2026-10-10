@@ -9,6 +9,37 @@ use PHPUnit\Framework\TestCase;
 
 final class MetricsCollectorTest extends TestCase
 {
+    public function test_completion_capacity_gauges_require_a_persisted_sample(): void
+    {
+        $metrics = new MetricsCollector();
+        self::assertStringNotContainsString('s3_server_multipart_completion_intents 0', $metrics->renderPrometheus());
+        $metrics->setMultipartCompletionIntentCount(1_000_000);
+        self::assertStringContainsString('s3_server_multipart_completion_intents 1000000', $metrics->renderPrometheus());
+        self::assertStringContainsString('s3_server_multipart_completion_capacity_remaining 0', $metrics->renderPrometheus());
+        $metrics->setMultipartCompletionIntentCount(null);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_intents /m', $metrics->renderPrometheus());
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_capacity_remaining /m', $metrics->renderPrometheus());
+        $this->expectException(\UnexpectedValueException::class);
+        $metrics->setMultipartCompletionIntentCount(1_000_001);
+    }
+
+    public function test_object_and_part_capacity_gauges_require_a_persisted_sample(): void
+    {
+        $metrics = new MetricsCollector();
+        self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $metrics->renderPrometheus());
+        $metrics->setWriteIntentCapacityCounts(['object' => 1_000_000, 'part' => 17]);
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString('s3_server_object_write_intents 1000000', $rendered);
+        self::assertStringContainsString('s3_server_object_write_capacity_remaining 0', $rendered);
+        self::assertStringContainsString('s3_server_multipart_part_write_intents 17', $rendered);
+        self::assertStringContainsString('s3_server_multipart_part_write_capacity_remaining 999983', $rendered);
+        $metrics->setWriteIntentCapacityCounts(null);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $metrics->renderPrometheus());
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_part_write_intents /m', $metrics->renderPrometheus());
+        $this->expectException(\UnexpectedValueException::class);
+        $metrics->setWriteIntentCapacityCounts(['object' => 0, 'part' => 1_000_001]);
+    }
+
     public function test_request_histogram_and_backend_metrics_render(): void
     {
         $metrics = new MetricsCollector();
@@ -132,5 +163,40 @@ final class MetricsCollectorTest extends TestCase
         self::assertStringContainsString('s3_server_worker_pool_tasks_total{operation="SelectObjectContent",pool="select",status="failure"} 1', $rendered);
         self::assertStringContainsString('s3_server_worker_pool_task_failures_total{exception="RuntimeException",operation="SelectObjectContent",pool="select"} 1', $rendered);
         self::assertStringContainsString('s3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="select"} 1', $rendered);
+    }
+
+    public function test_flysystem_read_first_byte_histogram_has_fixed_result_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        $metrics->recordFlysystemReadFirstByte('ready', 20_000_000);
+        $metrics->recordFlysystemReadFirstByte('first_byte_timeout', 1_200_000_000);
+        $metrics->recordFlysystemReadFirstByte('admission_timeout', 1_000_000_000);
+
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString('# TYPE s3_server_flysystem_read_first_byte_seconds histogram', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_first_byte_seconds_bucket{le="0.025",result="ready"} 1', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_first_byte_seconds_bucket{le="0.5",result="ready"} 1', $rendered);
+        self::assertStringNotContainsString('s3_server_flysystem_read_first_byte_seconds_bucket{le="1",result="first_byte_timeout"}', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_first_byte_seconds_bucket{le="+Inf",result="first_byte_timeout"} 1', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_first_byte_seconds_sum{result="ready"} 0.02', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_first_byte_seconds_count{result="admission_timeout"} 1', $rendered);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $metrics->recordFlysystemReadFirstByte('object-key', 1);
+    }
+
+    public function test_flysystem_read_stage_histogram_has_only_fixed_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        $metrics->recordFlysystemReadStage('admission', 'ready', 12_000_000);
+        $metrics->recordFlysystemReadStage('worker', 'timeout', 1_200_000_000);
+
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString('s3_server_flysystem_read_stage_seconds_count{result="ready",stage="admission"} 1', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_stage_seconds_count{result="timeout",stage="worker"} 1', $rendered);
+        self::assertStringContainsString('s3_server_flysystem_read_stage_seconds_bucket{le="0.025",result="ready",stage="admission"} 1', $rendered);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $metrics->recordFlysystemReadStage('object-key', 'ready', 1);
     }
 }

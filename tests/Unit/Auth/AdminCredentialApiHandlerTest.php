@@ -30,7 +30,27 @@ final class AdminCredentialApiHandlerTest extends TestCase
         ]));
 
         $this->assertSame(401, $response->getStatus());
+        $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame(['error' => 'unauthorized'], $this->json($response));
+    }
+
+    public function test_handler_rejects_empty_admin_token(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('non-empty admin token');
+
+        $this->createHandler(adminToken: '');
+    }
+
+    public function test_duplicate_authorization_headers_are_rejected(): void
+    {
+        $request = $this->request('POST', '/.admin/credentials', ['token' => 'idp-token']);
+        $request->setHeader('authorization', ['Bearer admin-secret', 'Bearer admin-secret']);
+
+        $response = $this->createHandler()->handleRequest($request);
+
+        self::assertSame(401, $response->getStatus());
+        self::assertSame('no-store', $response->getHeader('cache-control'));
     }
 
     public function test_issue_creates_credential_from_external_token(): void
@@ -44,12 +64,13 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $response = $handler->handleRequest($this->request(
             'POST',
             '/.admin/credentials',
-            ['token' => 'idp-token', 'ttlSeconds' => 900],
+            ['token' => 'idp-token', 'ttlSeconds' => 3600],
             ['authorization' => 'Bearer admin-secret'],
         ));
         $payload = $this->json($response);
 
         $this->assertSame(201, $response->getStatus());
+        $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame('tenant:acme', $payload['ownerId']);
         $this->assertSame('alice', $payload['displayName']);
         $this->assertSame(['uploads'], $payload['policyNames']);
@@ -67,17 +88,47 @@ final class AdminCredentialApiHandlerTest extends TestCase
 
         $response = $handler->handleRequest($this->request('POST', '/.admin/credentials', [
             'token' => 'bad-token',
-        ]));
+        ], ['authorization' => 'Bearer admin-secret']));
 
         $this->assertSame(400, $response->getStatus());
+        $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame('invalid_request', $this->json($response)['error']);
+    }
+
+    public function test_issue_without_ttl_returns_temporary_credential(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            ['token' => 'idp-token'],
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(201, $response->getStatus());
+        $payload = $this->json($response);
+        self::assertIsString($payload['sessionToken']);
+        self::assertNotSame('', $payload['sessionToken']);
+        self::assertIsString($payload['expiresAt']);
+    }
+
+    public function test_issue_rejects_ttl_beyond_twelve_hours(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            ['token' => 'idp-token', 'ttlSeconds' => 43201],
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(400, $response->getStatus());
+        self::assertSame('Credential TTL must be between 3600 and 43200 seconds.', $this->json($response)['message']);
     }
 
     public function test_issue_rejects_invalid_json_body(): void
     {
         $handler = $this->createHandler();
 
-        $response = $handler->handleRequest($this->request('POST', '/.admin/credentials', '{'));
+        $response = $handler->handleRequest($this->request('POST', '/.admin/credentials', '{', ['authorization' => 'Bearer admin-secret']));
 
         $this->assertSame(400, $response->getStatus());
         $this->assertSame('Request body must be a JSON object.', $this->json($response)['message']);
@@ -89,6 +140,7 @@ final class AdminCredentialApiHandlerTest extends TestCase
             'POST',
             '/.admin/credentials',
             str_repeat('x', 16_385),
+            ['authorization' => 'Bearer admin-secret'],
         ));
 
         $this->assertSame(400, $response->getStatus());
@@ -113,6 +165,7 @@ final class AdminCredentialApiHandlerTest extends TestCase
         ));
 
         $this->assertSame(204, $response->getStatus());
+        $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertNull($credentialProvider->getCredential($credential->accessKeyId));
     }
 
@@ -120,16 +173,31 @@ final class AdminCredentialApiHandlerTest extends TestCase
     {
         $handler = $this->createHandler();
 
-        $response = $handler->handleRequest($this->request('DELETE', '/.admin/credentials/UNKNOWN'));
+        $response = $handler->handleRequest($this->request('DELETE', '/.admin/credentials/UNKNOWN', '', ['authorization' => 'Bearer admin-secret']));
 
         $this->assertSame(404, $response->getStatus());
+        $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame(['error' => 'not_found'], $this->json($response));
+    }
+
+    public function test_unsupported_method_returns_no_store_and_allow_header(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'GET',
+            '/.admin/credentials',
+            '',
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(405, $response->getStatus());
+        self::assertSame('POST, DELETE', $response->getHeader('Allow'));
+        self::assertSame('no-store', $response->getHeader('cache-control'));
     }
 
     private function createHandler(
         ?InMemoryCredentialProvider $credentialProvider = null,
         ?ExternalIdentityProvider $identityProvider = null,
-        ?string $adminToken = null,
+        string $adminToken = 'admin-secret',
     ): AdminCredentialApiHandler {
         $credentialProvider ??= new InMemoryCredentialProvider();
         $identityProvider ??= new FixedExternalIdentityProvider();

@@ -107,4 +107,34 @@ final class StorageTierRegistryTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $registry->tier('MISSING');
     }
+
+    public function test_tier_name_must_fit_persisted_metadata_columns(): void
+    {
+        $registry = StorageTierRegistry::single(new InMemoryBackend(), str_repeat('a', 64));
+        self::assertSame(64, strlen($registry->defaultTier()->name));
+
+        $this->expectException(\InvalidArgumentException::class);
+        StorageTierRegistry::single(new InMemoryBackend(), str_repeat('a', 65));
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('numericTierNames')]
+    public function test_numeric_string_tier_names_remain_exact_strings(string $name): void
+    {
+        $backend = new InMemoryBackend();
+        $registry = new StorageTierRegistry([new StorageTier($name, $backend)]);
+
+        self::assertSame($name, $registry->defaultTier()->name);
+        self::assertTrue($registry->has($name));
+        self::assertSame($backend, $registry->tier($name)->backend);
+        self::assertSame([$name], array_map(static fn(StorageTier $tier): string => $tier->name, $registry->all()));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function numericTierNames(): iterable
+    {
+        yield 'positive integer' => ['123'];
+        yield 'zero' => ['0'];
+        yield 'negative integer' => ['-1'];
+        yield 'leading zero' => ['01'];
+    }
 }

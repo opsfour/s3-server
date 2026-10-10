@@ -197,6 +197,53 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_suspended_versioning_does_not_subtract_the_retained_numbered_version_from_quota(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '10',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '1',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '10',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '10',
+        ]);
+
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Enabled'],
+        ]);
+        $original = self::$s3->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'same-key.txt',
+            'Body' => '0123456789',
+        ]);
+        $versionId = (string) $original['VersionId'];
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Suspended'],
+        ]);
+
+        try {
+            self::$s3->putObject([
+                'Bucket' => $bucket,
+                'Key' => 'same-key.txt',
+                'Body' => 'abcdefghij',
+            ]);
+            self::fail('A suspended PUT must count a new null version while retaining the numbered version.');
+        } catch (S3Exception $error) {
+            self::assertSame('QuotaExceeded', $error->getAwsErrorCode());
+        }
+
+        self::assertSame('0123456789', (string) self::$s3->getObject([
+            'Bucket' => $bucket,
+            'Key' => 'same-key.txt',
+            'VersionId' => $versionId,
+        ])['Body']);
+        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata->initialize();
+        self::assertSame(['objectCount' => 1, 'bytesUsed' => 10], $metadata->getBucketStorageStats($bucket));
+    }
+
     public function test_delete_marker_does_not_count_against_versioned_object_quota(): void
     {
         self::restartWithFreshStorageAndQuota([
@@ -500,6 +547,169 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_owner_byte_quota_counts_objects_uploaded_into_another_accounts_bucket(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+        ], [
+            'shared-account' => new QuotaConfig(maxBytesPerOwner: 5),
+            'other-account' => new QuotaConfig(maxBytesPerOwner: 5),
+        ]);
+
+        $otherAccount = self::makeClientFor('otherOwnerAccessKey', 'otherOwnerSecretKey');
+        $sharedBucket = 'quota-' . bin2hex(random_bytes(4));
+        $ownBucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $sharedBucket]);
+        self::$s3->putBucketAcl(['Bucket' => $sharedBucket, 'GrantWrite' => 'id="other-account"']);
+        $otherAccount->createBucket(['Bucket' => $ownBucket]);
+        $otherAccount->putObject(['Bucket' => $sharedBucket, 'Key' => 'foreign.txt', 'Body' => '1234']);
+        self::$s3->putObject(['Bucket' => $sharedBucket, 'Key' => 'owner.txt', 'Body' => '12345']);
+
+        try {
+            $otherAccount->putObject(['Bucket' => $ownBucket, 'Key' => 'own.txt', 'Body' => '12']);
+            self::fail('Expected owner byte quota to count the cross-account upload.');
+        } catch (S3Exception $exception) {
+            self::assertSame('QuotaExceeded', $exception->getAwsErrorCode());
+        }
+    }
+
+    public function test_bucket_byte_quota_uses_bucket_owner_limits_for_foreign_uploads(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+        ], [
+            'shared-account' => new QuotaConfig(maxBytesPerBucket: 5),
+            'other-account' => new QuotaConfig(maxBytesPerBucket: 100),
+        ]);
+
+        $otherAccount = self::makeClientFor('otherOwnerAccessKey', 'otherOwnerSecretKey');
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketAcl(['Bucket' => $bucket, 'GrantWrite' => 'id="other-account"']);
+
+        try {
+            $otherAccount->putObject(['Bucket' => $bucket, 'Key' => 'too-large.txt', 'Body' => '123456']);
+            self::fail('Expected the bucket owner quota to reject a foreign upload.');
+        } catch (S3Exception $exception) {
+            self::assertSame('QuotaExceeded', $exception->getAwsErrorCode());
+        }
+    }
+
+    public function test_cross_account_overwrite_charges_new_owner_without_subtracting_foreign_bytes(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+        ], [
+            'shared-account' => new QuotaConfig(maxBytesPerOwner: 5),
+        ]);
+
+        $otherAccount = self::makeClientFor('otherOwnerAccessKey', 'otherOwnerSecretKey');
+        $ownBucket = 'quota-' . bin2hex(random_bytes(4));
+        $foreignBucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $ownBucket]);
+        self::$s3->putObject(['Bucket' => $ownBucket, 'Key' => 'already-owned.txt', 'Body' => '123']);
+        $otherAccount->createBucket(['Bucket' => $foreignBucket]);
+        $otherAccount->putObject(['Bucket' => $foreignBucket, 'Key' => 'foreign.txt', 'Body' => '1234']);
+        $otherAccount->putBucketPolicy([
+            'Bucket' => $foreignBucket,
+            'Policy' => json_encode([
+                'Version' => '2012-10-17',
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Principal' => ['AWS' => 'shared-account'],
+                    'Action' => 's3:PutObject',
+                    'Resource' => "arn:aws:s3:::{$foreignBucket}/foreign.txt",
+                ]],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+
+        try {
+            self::$s3->putObject(['Bucket' => $foreignBucket, 'Key' => 'foreign.txt', 'Body' => 'xyz']);
+            self::fail('Expected the new object owner quota to reject the overwrite.');
+        } catch (S3Exception $exception) {
+            self::assertSame('QuotaExceeded', $exception->getAwsErrorCode());
+        }
+        self::assertSame('1234', (string) $otherAccount->getObject([
+            'Bucket' => $foreignBucket,
+            'Key' => 'foreign.txt',
+        ])['Body']);
+    }
+
+    public function test_bucket_multipart_count_quota_includes_uploads_from_other_accounts(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+        ], [
+            'shared-account' => new QuotaConfig(maxMultipartUploadsPerBucket: 1),
+            'other-account' => new QuotaConfig(maxMultipartUploadsPerBucket: 10),
+        ]);
+
+        $otherAccount = self::makeClientFor('otherOwnerAccessKey', 'otherOwnerSecretKey');
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketAcl(['Bucket' => $bucket, 'GrantWrite' => 'id="other-account"']);
+        $otherAccount->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'foreign.bin']);
+
+        try {
+            self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'owner.bin']);
+            self::fail('Expected bucket multipart count quota to include the foreign upload.');
+        } catch (S3Exception $exception) {
+            self::assertSame('QuotaExceeded', $exception->getAwsErrorCode());
+        }
+    }
+
+    public function test_bucket_multipart_staging_quota_includes_parts_from_other_accounts(): void
+    {
+        self::restartWithFreshStorageAndQuota([
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => '0',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => '0',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => '0',
+        ], [
+            'shared-account' => new QuotaConfig(maxMultipartBytesPerBucket: 5),
+            'other-account' => new QuotaConfig(maxMultipartBytesPerBucket: 100),
+        ]);
+
+        $otherAccount = self::makeClientFor('otherOwnerAccessKey', 'otherOwnerSecretKey');
+        $bucket = 'quota-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketAcl(['Bucket' => $bucket, 'GrantWrite' => 'id="other-account"']);
+        $foreignUpload = $otherAccount->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'foreign.bin']);
+        $ownerUpload = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'owner.bin']);
+        $otherAccount->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => 'foreign.bin',
+            'UploadId' => $foreignUpload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => '1234',
+        ]);
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => 'owner.bin',
+                'UploadId' => $ownerUpload['UploadId'],
+                'PartNumber' => 1,
+                'Body' => '12',
+            ]);
+            self::fail('Expected bucket staging quota to include the foreign part.');
+        } catch (S3Exception $exception) {
+            self::assertSame('QuotaExceeded', $exception->getAwsErrorCode());
+        }
+    }
+
     public function test_multipart_upload_count_quota_is_enforced_per_bucket(): void
     {
         self::restartWithFreshStorageAndQuota([
@@ -703,6 +913,19 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
         mkdir(self::$storagePath, 0o755, true);
         self::$bucket = '';
 
+        // Cross-account quota profiles need consent from each account as well
+        // as the bucket ACL or policy established in the individual test.
+        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata->initialize();
+        $identityPolicy = json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow', 'Action' => 's3:*', 'Resource' => '*',
+            ]],
+        ], JSON_THROW_ON_ERROR);
+        foreach (['shared-account', 'other-account'] as $ownerId) {
+            $metadata->putAccountPolicy($ownerId, $identityPolicy);
+        }
+
         if ($accountQuotas !== []) {
             self::putAccountQuotas($accountQuotas);
         }
@@ -751,7 +974,6 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
     {
         $reflection = new \ReflectionClass($metadata);
         $method = $reflection->getMethod('connection');
-        $method->setAccessible(true);
         /** @var \PDO $pdo */
         $pdo = $method->invoke($metadata);
         $stmt = $pdo->prepare(

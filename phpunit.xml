@@ -17,6 +17,9 @@
             <directory>tests/Functional</directory>
         </testsuite>
     </testsuites>
+    <php>
+        <ini name="memory_limit" value="256M"/>
+    </php>
     <source ignoreIndirectDeprecations="true">
         <include>
             <directory>src</directory>

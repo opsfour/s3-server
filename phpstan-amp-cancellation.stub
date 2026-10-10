@@ -1,0 +1,9 @@
+<?php
+
+namespace Amp;
+
+class DeferredCancellation
+{
+    /** @phpstan-impure */
+    public function isCancelled(): bool {}
+}

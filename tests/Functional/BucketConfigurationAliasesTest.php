@@ -64,7 +64,7 @@ final class BucketConfigurationAliasesTest extends S3FunctionalTestCase
             'NotificationConfiguration' => [
                 'QueueConfiguration' => [
                     'Id' => 'alias-queue',
-                    'Queue' => 'arn:aws:sqs:us-east-1:123456789012:queue',
+                    'Queue' => 'https://notifications.invalid/queue',
                     'Event' => 's3:ObjectCreated:*',
                 ],
             ],
@@ -78,7 +78,7 @@ final class BucketConfigurationAliasesTest extends S3FunctionalTestCase
 
         $this->assertSame(200, $get['@metadata']['statusCode']);
         $this->assertSame('alias-queue', $get['QueueConfiguration']['Id'] ?? null);
-        $this->assertSame('arn:aws:sqs:us-east-1:123456789012:queue', $get['QueueConfiguration']['Queue'] ?? null);
+        $this->assertSame('https://notifications.invalid/queue', $get['QueueConfiguration']['Queue'] ?? null);
     }
 
     public function test_bucket_logging_configuration_round_trip(): void

@@ -1,0 +1,291 @@
+<?php
+
+declare(strict_types=1);
+
+namespace OpsFour\S3Server\Tests\Unit\Storage;
+
+use Amp\ByteStream\ReadableBuffer;
+use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\MultipartWriteIntentCollector;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageBackend;
+use PHPUnit\Framework\TestCase;
+
+final class MultipartWriteIntentCollectorTest extends TestCase
+{
+    public function test_local_collector_retires_never_dispatched_attempt_but_preserves_armed_and_legacy_fences(): void
+    {
+        $root = sys_get_temp_dir() . '/s3-multipart-undispatched-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($root, 0700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $bucket = $metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $storage = new FilesystemBackend($root);
+        $now = $metadata->multipartWriteIntentNow();
+        $attempts = [
+            'undispatched' => str_repeat('a', 32),
+            'armed' => str_repeat('b', 32),
+            'legacy' => str_repeat('c', 32),
+        ];
+        $paths = [];
+
+        try {
+            foreach ($attempts as $name => $attemptId) {
+                $uploadId = 'upload-' . $name;
+                $metadata->createMultipartUploadWithTier($uploadId, 'bucket', $name, 'owner', 'STANDARD');
+                $paths[$name] = $storage->planMultipartCompletionPaths(
+                    'bucket',
+                    $name,
+                    $bucket->generation,
+                    $attemptId,
+                );
+                $lease = $name === 'undispatched' || $name === 'legacy' ? $now - 1 : $now + 30;
+                $metadata->createMultipartWriteIntent(new MultipartWriteIntent(
+                    attemptId: $attemptId,
+                    uploadId: $uploadId,
+                    bucket: 'bucket',
+                    bucketGeneration: $bucket->generation,
+                    ownerId: 'owner',
+                    storageTier: 'STANDARD',
+                    assemblyPath: $paths[$name]['assembly'],
+                    finalPath: $paths[$name]['final'],
+                    partDigest: str_repeat('d', 64),
+                    sseMode: null,
+                    leaseUntil: $lease,
+                    nextAttemptAt: $lease,
+                ));
+            }
+
+            self::assertTrue($metadata->armMultipartWriteIntent(
+                $attempts['armed'],
+                str_repeat('e', 32),
+                $now + 30,
+                $now + 60,
+            ));
+            $connection = (new \ReflectionClass($metadata))->getMethod('connection')->invoke($metadata);
+            self::assertInstanceOf(\PDO::class, $connection);
+            $expire = $connection->prepare('UPDATE s3_multipart_write_intents
+                SET lease_until = ?, next_attempt_at = ? WHERE attempt_id = ?');
+            self::assertInstanceOf(\PDOStatement::class, $expire);
+            $expire->execute([$now - 1, $now - 1, $attempts['armed']]);
+            $legacy = $connection->prepare('UPDATE s3_multipart_write_intents
+                SET dispatch_id = ? WHERE attempt_id = ?');
+            self::assertInstanceOf(\PDOStatement::class, $legacy);
+            $legacy->execute([ObjectWriteIntent::LEGACY_UNKNOWN_DISPATCH, $attempts['legacy']]);
+
+            $collector = new MultipartWriteIntentCollector($metadata, StorageTierRegistry::single($storage));
+            self::assertSame(2, $collector->collect(3));
+            self::assertNull($metadata->getMultipartWriteIntent($attempts['undispatched']));
+            self::assertFileDoesNotExist($paths['undispatched']['assembly']);
+            self::assertFileDoesNotExist($paths['undispatched']['final']);
+
+            self::assertSame('abandoned', $metadata->getMultipartWriteIntent($attempts['armed'])?->state);
+            foreach ($paths['armed'] as $path) {
+                $seal = file_get_contents($path);
+                self::assertIsString($seal);
+                self::assertStringStartsWith(
+                    "OPSFOUR-LOCAL-MULTIPART-SEAL-V1\n" . $attempts['armed'] . "\n",
+                    $seal,
+                );
+            }
+
+            // A legacy sentinel does not prove whether an old writer was ever
+            // dispatched. Keep its row for operator reconciliation without
+            // treating it like the provably undispatched NULL state.
+            self::assertSame('abandoned', $metadata->getMultipartWriteIntent($attempts['legacy'])?->state);
+            foreach ($paths['legacy'] as $path) {
+                self::assertFileDoesNotExist($path);
+            }
+        } finally {
+            $storage->shutdown();
+            $this->removeDirectory($root);
+        }
+    }
+
+    public function test_second_collector_cannot_reclaim_during_yielding_cleanup_and_stale_generation_cannot_retry(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-multipart-claim-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = new SqliteMetadataStore($path);
+            $first->initialize();
+            $second = new SqliteMetadataStore($path);
+            $second->initialize();
+            $first->createBucket('owner', 'bucket', 'us-east-1');
+            $first->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'hot');
+            $bucket = $first->getBucket('bucket');
+            self::assertNotNull($bucket);
+            $attemptId = str_repeat('f', 32);
+            $first->createMultipartWriteIntent(new MultipartWriteIntent(
+                attemptId: $attemptId,
+                uploadId: 'upload',
+                bucket: 'bucket',
+                bucketGeneration: $bucket->generation,
+                ownerId: 'owner',
+                storageTier: 'hot',
+                assemblyPath: 'memory://.assemblies/bucket/path/assembly',
+                finalPath: 'memory://.assemblies/bucket/path/assembly',
+                partDigest: str_repeat('c', 64),
+                sseMode: null,
+                leaseUntil: $first->multipartWriteIntentNow() - 1,
+                nextAttemptAt: $first->multipartWriteIntentNow() - 1,
+            ));
+            $initialLease = null;
+            $backend = $this->createMock(StorageBackend::class);
+            $backend->method('deleteObjectByPath')->willReturnCallback(static function () use ($first, $attemptId, &$initialLease): void {
+                $initialLease = $first->getMultipartWriteIntent($attemptId)?->nextAttemptAt;
+                \Amp\delay(0.7);
+            });
+            $backend->method('getObjectByPath')->willThrowException(new NoSuchKeyException());
+            $tiers = StorageTierRegistry::single($backend, 'hot');
+            $future = \Amp\async(static fn(): int => (new MultipartWriteIntentCollector($first, $tiers, claimLeaseSeconds: 0.3, renewIntervalSeconds: 0.05))->collect(1));
+            \Amp\delay(0.45);
+            self::assertNotNull($initialLease);
+            $current = $second->getMultipartWriteIntent($attemptId);
+            self::assertNotNull($current);
+            self::assertGreaterThan($initialLease, $current->nextAttemptAt);
+            self::assertSame(1, $current->claimGeneration);
+            self::assertSame(0, (new MultipartWriteIntentCollector($second, $tiers, claimLeaseSeconds: 0.3, renewIntervalSeconds: 0.05))->collect(1));
+            self::assertSame(1, $future->await());
+
+            $retained = $second->getMultipartWriteIntent($attemptId);
+            self::assertNotNull($retained);
+            self::assertTrue($second->retryMultipartWriteIntent($attemptId, $retained->nextAttemptAt, $second->multipartWriteIntentNow() - 1));
+            $now = $second->multipartWriteIntentNow();
+            $reclaimed = $second->claimDueMultipartWriteIntents(1, $now, $now + 60);
+            self::assertCount(1, $reclaimed);
+            self::assertSame(2, $reclaimed[0]->claimGeneration);
+            self::assertFalse($first->renewMultipartCollectorClaim($attemptId, $now + 120, $reclaimed[0]->nextAttemptAt, 1));
+            self::assertFalse($first->retryMultipartCollectorClaim($attemptId, $now + 120, $reclaimed[0]->nextAttemptAt, 1));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_pre_cancelled_collection_does_not_claim_due_intent(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $metadata->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'hot');
+        $bucketInfo = $metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $generation = $bucketInfo->generation;
+        $attemptId = str_repeat('a', 32);
+        $intent = new MultipartWriteIntent(
+            attemptId: $attemptId,
+            uploadId: 'upload',
+            bucket: 'bucket',
+            bucketGeneration: $generation,
+            ownerId: 'owner',
+            storageTier: 'hot',
+            assemblyPath: 'memory://.assemblies/bucket/path/assembly',
+            finalPath: 'memory://.assemblies/bucket/path/final',
+            partDigest: str_repeat('c', 64),
+            sseMode: null,
+            leaseUntil: microtime(true) - 1,
+            nextAttemptAt: microtime(true) - 1,
+        );
+        $metadata->createMultipartWriteIntent($intent);
+        $cancellation = new \Amp\DeferredCancellation();
+        $cancellation->cancel();
+
+        try {
+            (new MultipartWriteIntentCollector($metadata, StorageTierRegistry::single(new InMemoryBackend(), 'hot')))
+                ->collect(1, $cancellation->getCancellation());
+            self::fail('Cancellation should stop collection.');
+        } catch (\Amp\CancelledException) {
+            $remaining = $metadata->getMultipartWriteIntent($attemptId);
+            self::assertNotNull($remaining);
+            self::assertSame('active', $remaining->state);
+            self::assertEqualsWithDelta($intent->nextAttemptAt, $remaining->nextAttemptAt, 0.001);
+        }
+    }
+
+    public function test_crashed_sse_attempt_is_recovered_and_late_write_is_deleted_on_next_sweep(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $metadata->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'hot');
+        $bucketInfo = $metadata->getBucket('bucket');
+        self::assertNotNull($bucketInfo);
+        $generation = $bucketInfo->generation;
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+        $oldPaths = $storage->planMultipartCompletionPaths('bucket', 'key', $generation, str_repeat('b', 32));
+        $newPaths = $storage->planMultipartCompletionPaths('bucket', 'key', str_repeat('c', 32), str_repeat('d', 32));
+        $intent = new MultipartWriteIntent(
+            attemptId: str_repeat('b', 32),
+            uploadId: 'upload',
+            bucket: 'bucket',
+            bucketGeneration: $generation,
+            ownerId: 'owner',
+            storageTier: 'hot',
+            assemblyPath: $oldPaths['assembly'],
+            finalPath: $oldPaths['final'],
+            partDigest: str_repeat('e', 64),
+            sseMode: 'AES256',
+            leaseUntil: microtime(true) - 1,
+            nextAttemptAt: microtime(true) - 1,
+        );
+        $metadata->createMultipartWriteIntent($intent);
+        $storage->putObjectAtPath('bucket', 'key', new ReadableBuffer('plaintext'), $oldPaths['assembly']);
+        $storage->putObjectAtPath('bucket', 'key', new ReadableBuffer('ciphertext'), $oldPaths['final']);
+        $storage->putObjectAtPath('bucket', 'key', new ReadableBuffer('new generation'), $newPaths['final']);
+
+        $collector = new MultipartWriteIntentCollector($metadata, StorageTierRegistry::single($storage, 'hot'));
+        self::assertSame(1, $collector->collect());
+        self::assertSame('abandoned', $metadata->getMultipartWriteIntent($intent->attemptId)?->state);
+        $this->assertMissing($storage, $oldPaths['assembly']);
+        $this->assertMissing($storage, $oldPaths['final']);
+        self::assertSame('new generation', \Amp\ByteStream\buffer($storage->getObjectByPath($newPaths['final'])));
+
+        // A remote worker may complete after the first absence check. The
+        // tombstone remains and another sweep removes the same exact path.
+        $storage->putObjectAtPath('bucket', 'key', new ReadableBuffer('late bytes'), $oldPaths['final']);
+        $claimed = $metadata->getMultipartWriteIntent($intent->attemptId);
+        self::assertSame($oldPaths['final'], $claimed->finalPath);
+        self::assertTrue($metadata->retryMultipartWriteIntent($intent->attemptId, $claimed->nextAttemptAt, microtime(true) - 1));
+        self::assertSame(1, $collector->collect());
+        $this->assertMissing($storage, $oldPaths['final']);
+        self::assertSame('new generation', \Amp\ByteStream\buffer($storage->getObjectByPath($newPaths['final'])));
+    }
+
+    private function assertMissing(InMemoryBackend $storage, string $path): void
+    {
+        try {
+            $storage->getObjectByPath($path);
+            self::fail('Uncommitted path remains readable.');
+        } catch (NoSuchKeyException $error) {
+            self::assertSame('NoSuchKey', $error->getErrorCode());
+        }
+    }
+
+    private function removeDirectory(string $path): void
+    {
+        if (! is_dir($path)) {
+            return;
+        }
+        foreach (scandir($path) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $child = $path . '/' . $entry;
+            if (is_dir($child) && ! is_link($child)) {
+                $this->removeDirectory($child);
+            } else {
+                unlink($child);
+            }
+        }
+        rmdir($path);
+    }
+}

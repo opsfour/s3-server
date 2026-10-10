@@ -9,7 +9,13 @@ use OpsFour\S3Server\Quota\QuotaManager;
 
 require dirname(__DIR__, 2) . '/vendor/autoload.php';
 
-[$script, $driver, $ownerId, $bucket, $key] = $argv;
+$arguments = $_SERVER['argv'] ?? [];
+if (count($arguments) !== 5) {
+    fwrite(STDERR, "Usage: metadata-quota-worker.php DRIVER OWNER_ID BUCKET KEY\n");
+    exit(2);
+}
+
+[$script, $driver, $ownerId, $bucket, $key] = $arguments;
 $dsn = getenv('S3_TEST_WORKER_DSN');
 if ($dsn === false || $dsn === '') {
     fwrite(STDERR, "S3_TEST_WORKER_DSN is required.\n");

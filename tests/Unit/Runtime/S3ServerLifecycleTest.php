@@ -1,0 +1,650 @@
+<?php
+
+declare(strict_types=1);
+
+namespace OpsFour\S3Server\Tests\Unit\Runtime;
+
+use Amp\DeferredFuture;
+use Amp\Http\Client\HttpClientBuilder;
+use Amp\Http\Client\Request as ClientRequest;
+use Amp\Http\Server\Middleware;
+use Amp\Http\Server\Request;
+use Amp\Http\Server\RequestHandler;
+use Amp\Http\Server\Response;
+use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
+use OpsFour\S3Server\Lifecycle\LifecycleRunner;
+use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Notification\NotificationDispatcher;
+use OpsFour\S3Server\Runtime\S3ServerRuntime;
+use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
+use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
+use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
+use Revolt\EventLoop;
+
+final class S3ServerLifecycleTest extends TestCase
+{
+    public function test_local_intent_collector_gets_its_own_background_future(): void
+    {
+        $root = sys_get_temp_dir() . '/s3-local-collector-lifecycle-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($root, 0700));
+        $database = $root . '/metadata.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $storage = new FilesystemBackend($root);
+        $tiers = StorageTierRegistry::single($storage);
+        $collector = new LocalObjectWriteIntentCollector($metadata, $tiers, 'STANDARD');
+        $reservation = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($reservation);
+        $address = stream_socket_get_name($reservation, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+        fclose($reservation);
+        $server = new S3Server(new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: $root), $metadata, $storage);
+        $server->setLocalObjectWriteIntentCollector($collector);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::assertCount(3, (new \ReflectionProperty($server, 'backgroundFutures'))->getValue($server));
+        } finally {
+            $server->stop();
+            @unlink($database);
+            @unlink($database . '-wal');
+            @unlink($database . '-shm');
+            @rmdir($root);
+        }
+    }
+
+    public function test_invalid_tls_file_fails_before_server_and_spool_pool_are_created(): void
+    {
+        $server = new S3Server(new S3ServerConfig(
+            storagePath: sys_get_temp_dir(),
+            tlsCertPath: sys_get_temp_dir() . '/missing-s3-cert-' . bin2hex(random_bytes(8)),
+            tlsKeyPath: sys_get_temp_dir() . '/missing-s3-key-' . bin2hex(random_bytes(8)),
+        ));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('Expected a missing TLS certificate to be rejected.');
+        } catch (\InvalidArgumentException) {
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+            self::assertSame([], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function test_failed_http_bind_releases_only_startup_resources(): void
+    {
+        $occupied = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($occupied);
+        $address = stream_socket_get_name($occupied, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+        ));
+        $callerPool = $this->createMock(WorkerPool::class);
+        $callerPool->expects(self::once())->method('shutdown');
+        $server->addWorkerPool($callerPool, 'caller');
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            try {
+                $server->start();
+                self::fail('Expected the occupied HTTP port to reject startup.');
+            } catch (\Amp\Socket\SocketException) {
+                self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+                self::assertSame([['pool' => $callerPool, 'name' => 'caller']], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
+            }
+        } finally {
+            fclose($occupied);
+            $server->stop();
+        }
+    }
+
+    public function test_storage_shutdown_error_does_not_log_backend_secret(): void
+    {
+        $secret = 'storage-password-private-test-token';
+        /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
+        $storage->method('shutdown')->willThrowException(new \RuntimeException($secret));
+        $logger = new class extends AbstractLogger {
+            /** @var list<array{message: string, context: array<string, mixed>}> */
+            public array $records = [];
+
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                $this->records[] = ['message' => (string) $message, 'context' => $context];
+            }
+        };
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage, logger: $logger);
+
+        try {
+            $server->stop();
+            self::fail('A failed storage shutdown was reported as complete.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+
+        self::assertStringNotContainsString($secret, json_encode($logger->records, JSON_THROW_ON_ERROR));
+        self::assertContains(\RuntimeException::class, array_column(array_column($logger->records, 'context'), 'exception'));
+    }
+
+    public function test_runtime_shutdown_error_does_not_log_encryption_secret(): void
+    {
+        $secret = 'encryption-password-private-test-token';
+        $encryption = new class ($secret) implements EncryptionServiceInterface {
+            public function __construct(private readonly string $secret) {}
+
+            public function shutdown(): void
+            {
+                throw new \RuntimeException($this->secret);
+            }
+
+            public function encryptSseS3(string $plaintext): array
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function encryptSseC(string $plaintext, string $customerKey): array
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function decryptSseC(string $ciphertext, string $customerKey, string $ivB64, string $tagB64): string
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+        };
+        $logger = new class extends AbstractLogger {
+            /** @var list<array{message: string, context: array<string, mixed>}> */
+            public array $records = [];
+
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                $this->records[] = ['message' => (string) $message, 'context' => $context];
+            }
+        };
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), logger: $logger);
+        $runtime = new S3ServerRuntime($server, new NotificationDispatcher($metadata), $encryption, logger: $logger);
+
+        try {
+            $runtime->stop();
+            self::fail('A failed encryption shutdown was reported as complete.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 runtime shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+
+        self::assertStringNotContainsString($secret, json_encode($logger->records, JSON_THROW_ON_ERROR));
+        self::assertContains(\RuntimeException::class, array_column(array_column($logger->records, 'context'), 'exception'));
+    }
+
+    public function test_runtime_shutdown_logger_failure_cannot_expose_its_error_or_mark_shutdown_complete(): void
+    {
+        $storageCalls = 0;
+        /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
+        $storage->method('shutdown')->willReturnCallback(static function () use (&$storageCalls): void {
+            if (++$storageCalls === 1) {
+                throw new \RuntimeException('private-storage-error');
+            }
+        });
+        $logger = new class extends AbstractLogger {
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                if ((string) $message === 'Server shutdown failed.') {
+                    throw new \RuntimeException('private-logger-error');
+                }
+            }
+        };
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $runtime = new S3ServerRuntime(
+            new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage),
+            new NotificationDispatcher($metadata),
+            logger: $logger,
+        );
+
+        try {
+            $runtime->stop();
+            self::fail('Expected the first storage close to fail.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 runtime shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+        $runtime->stop();
+        self::assertSame(2, $storageCalls);
+    }
+
+    public function test_active_lifecycle_sweep_keeps_dependencies_owned_until_it_finishes(): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $finished = new DeferredFuture();
+        $stopLogged = new DeferredFuture();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('acquireLock')->willReturn(true);
+        $metadata->method('listAllBuckets')->willReturnCallback(
+            static function () use ($entered, $release): array {
+                $entered->complete();
+                $release->getFuture()->await();
+
+                return [];
+            },
+        );
+        $runnerLogger = new class ($finished, $stopLogged) extends AbstractLogger {
+            /**
+             * @param DeferredFuture<void> $finished
+             * @param DeferredFuture<void> $stopLogged
+             */
+            public function __construct(
+                private readonly DeferredFuture $finished,
+                private readonly DeferredFuture $stopLogged,
+            ) {}
+
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                if (($context['event'] ?? null) === 'runner_stopped' && ! $this->stopLogged->isComplete()) {
+                    $this->stopLogged->complete();
+                }
+                if (($context['event'] ?? null) === 'sweep_finished') {
+                    $this->finished->complete();
+                }
+            }
+        };
+        $runner = new LifecycleRunner(new LifecycleExecutor($metadata, new InMemoryBackend(), $runnerLogger), 0.01, $runnerLogger);
+        $storageCalls = 0;
+        /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
+        $storage->expects(self::once())->method('shutdown')->willReturnCallback(static function () use (&$storageCalls): void {
+            $storageCalls++;
+        });
+        $poolCalls = 0;
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::once())->method('shutdown')->willReturnCallback(static function () use (&$poolCalls): void {
+            $poolCalls++;
+        });
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage);
+        $server->addWorkerPool($pool);
+        (new \ReflectionProperty($server, 'lifecycleRunner'))->setValue($server, $runner);
+        $encryption = new class implements EncryptionServiceInterface {
+            public int $shutdownCalls = 0;
+
+            public function shutdown(): void
+            {
+                $this->shutdownCalls++;
+            }
+
+            public function encryptSseS3(string $plaintext): array
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function encryptSseC(string $plaintext, string $customerKey): array
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+
+            public function decryptSseC(string $ciphertext, string $customerKey, string $ivB64, string $tagB64): string
+            {
+                throw new \LogicException('Not used in this test.');
+            }
+        };
+        $runtime = new S3ServerRuntime($server, new NotificationDispatcher(new SqliteMetadataStore(':memory:')), $encryption);
+        // The lifecycle timer is unreferenced in production. This referenced
+        // test timer permits deterministic waiting for the first sweep.
+        $keepAlive = EventLoop::repeat(0.1, static function (): void {});
+        $serverStop = null;
+        try {
+            $runner->start();
+            $entered->getFuture()->await(new \Amp\TimeoutCancellation(2));
+
+            $serverStop = \Amp\async(static fn() => $server->stop());
+            $stopLogged->getFuture()->await(new \Amp\TimeoutCancellation(2));
+
+            self::assertFalse($serverStop->isComplete());
+            self::assertSame($runner, (new \ReflectionProperty($server, 'lifecycleRunner'))->getValue($server));
+            self::assertSame(0, $storageCalls);
+            self::assertSame(0, $poolCalls);
+            self::assertSame(0, $encryption->shutdownCalls);
+
+            $release->complete();
+            $finished->getFuture()->await(new \Amp\TimeoutCancellation(2));
+            $serverStop->await(new \Amp\TimeoutCancellation(2));
+
+            self::assertSame(1, $storageCalls);
+            self::assertSame(1, $poolCalls);
+            $runtime->stop();
+            self::assertSame(1, $encryption->shutdownCalls);
+        } finally {
+            if (! $release->isComplete()) {
+                $release->complete();
+            }
+            if ($entered->isComplete()) {
+                $finished->getFuture()->await(new \Amp\TimeoutCancellation(2));
+            }
+            if ($serverStop !== null && ! $serverStop->isComplete()) {
+                $serverStop->await(new \Amp\TimeoutCancellation(2));
+            }
+            EventLoop::cancel($keepAlive);
+        }
+    }
+
+    public function test_failed_worker_pool_shutdown_stops_later_teardown_and_retries_only_open_resources(): void
+    {
+        /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
+        $storage->expects(self::once())->method('shutdown');
+        $failedPoolCalls = 0;
+        $firstPool = $this->createMock(WorkerPool::class);
+        $firstPool->expects(self::exactly(2))->method('shutdown')->willReturnCallback(
+            static function () use (&$failedPoolCalls): void {
+                if (++$failedPoolCalls === 1) {
+                    throw new \RuntimeException('private-pool-error');
+                }
+            },
+        );
+        $secondPool = $this->createMock(WorkerPool::class);
+        $secondPool->expects(self::once())->method('shutdown');
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage);
+        $server->addWorkerPool($firstPool, 'first');
+        $server->addWorkerPool($secondPool, 'second');
+
+        try {
+            $server->stop();
+            self::fail('A failed worker close was reported as complete.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+        self::assertSame(1, $failedPoolCalls);
+
+        $server->stop();
+        $server->stop();
+        self::assertSame(2, $failedPoolCalls);
+    }
+
+    public function test_startup_configuration_setters_reject_late_changes(): void
+    {
+        $reservation = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($reservation);
+        $address = stream_socket_get_name($reservation, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+        fclose($reservation);
+
+        $server = new S3Server(new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: sys_get_temp_dir()));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->start();
+        try {
+            $metadata = new SqliteMetadataStore(':memory:');
+            $metadata->initialize();
+            $handler = new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(200);
+                }
+            };
+            $middleware = new class implements Middleware {
+                public function handleRequest(Request $request, RequestHandler $requestHandler): Response
+                {
+                    return $requestHandler->handleRequest($request);
+                }
+            };
+            $unownedPool = $this->createMock(WorkerPool::class);
+            $unownedPool->expects(self::never())->method('shutdown');
+            foreach ([
+                static fn() => $server->setStorageTierRegistry(StorageTierRegistry::single(new InMemoryBackend())),
+                static fn() => $server->setNotificationDispatcher(new NotificationDispatcher($metadata)),
+                static fn() => $server->setAdminCredentialApiHandler($handler),
+                static fn() => $server->setAdminQuotaApiHandler($handler),
+                static fn() => $server->addMiddleware($middleware),
+                static fn() => $server->addWorkerPool($unownedPool, 'late'),
+            ] as $mutate) {
+                try {
+                    $mutate();
+                    self::fail('Expected a late server configuration change to be rejected.');
+                } catch (\LogicException $e) {
+                    self::assertStringContainsString('before the S3 server starts', $e->getMessage());
+                }
+            }
+        } finally {
+            $server->stop();
+        }
+        foreach ([
+            static fn() => $server->setNotificationDispatcher(new NotificationDispatcher($metadata)),
+            static fn() => $server->addWorkerPool($unownedPool, 'after_stop'),
+        ] as $mutate) {
+            try {
+                $mutate();
+                self::fail('Expected a stopped server to reject new owned resources.');
+            } catch (\LogicException $error) {
+                self::assertStringContainsString('before the S3 server starts', $error->getMessage());
+            }
+        }
+        $server->stop();
+    }
+
+    public function test_logger_failures_during_startup_and_shutdown_are_isolated(): void
+    {
+        $port = $this->unusedPort();
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $logger = new class extends AbstractLogger {
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                if ((string) $message === 'Lifecycle runner started.' && $context === []) {
+                    throw new \RuntimeException('startup-sentinel');
+                }
+                if (str_starts_with((string) $message, 'Stopping S3 server')) {
+                    throw new \RuntimeException('stop-logger-sentinel');
+                }
+                if ((string) $message === 'S3 server stopped.') {
+                    throw new \RuntimeException('cleanup-sentinel');
+                }
+            }
+        };
+        $server = new S3Server(
+            new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: sys_get_temp_dir(), notificationWorkerEnabled: false),
+            metadata: $metadata,
+            storage: new InMemoryBackend(),
+            logger: $logger,
+        );
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::assertTrue($this->canConnect($port));
+        } finally {
+            $server->stop();
+        }
+        self::assertFalse($this->canConnect($port));
+        self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+    }
+
+    public function test_background_preparation_logger_failure_does_not_interrupt_startup(): void
+    {
+        $port = $this->unusedPort();
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $logger = new class extends AbstractLogger {
+            public bool $failPreparation = true;
+
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                if ($this->failPreparation && (string) $message === 'Background resources prepared.') {
+                    $this->failPreparation = false;
+                    throw new \RuntimeException('background-preparation-sentinel');
+                }
+            }
+        };
+        $server = new S3Server(
+            new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: sys_get_temp_dir(), notificationWorkerEnabled: true),
+            metadata: $metadata,
+            storage: new InMemoryBackend(),
+            logger: $logger,
+        );
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::assertFalse($logger->failPreparation);
+            self::assertTrue($this->canConnect($port));
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function test_stop_closes_listener_before_waiting_for_background_worker_and_drains_active_request(): void
+    {
+        $port = $this->unusedPort();
+        $workerStarted = new DeferredFuture();
+        $releaseWorker = new DeferredFuture();
+        $requestStarted = new DeferredFuture();
+        $releaseRequest = new DeferredFuture();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('dequeueNotifications')->willReturnCallback(
+            static function () use ($workerStarted, $releaseWorker): array {
+                if (! $workerStarted->isComplete()) {
+                    $workerStarted->complete();
+                }
+                $releaseWorker->getFuture()->await();
+
+                return [];
+            },
+        );
+        $handler = new class ($requestStarted, $releaseRequest) implements RequestHandler {
+            /**
+             * @param  DeferredFuture<void>  $started
+             * @param  DeferredFuture<void>  $release
+             */
+            public function __construct(private readonly DeferredFuture $started, private readonly DeferredFuture $release) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                $this->started->complete();
+                $this->release->getFuture()->await();
+
+                return new Response(200, body: 'drained');
+            }
+        };
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+            shutdownDrainTimeout: 1,
+        ), metadata: $metadata);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->setAdminCredentialApiHandler($handler);
+        $server->start();
+
+        try {
+            $workerStarted->getFuture()->await(new \Amp\TimeoutCancellation(2));
+            $client = HttpClientBuilder::buildDefault();
+            $requestFuture = \Amp\async(static fn() => $client->request(new ClientRequest("http://127.0.0.1:{$port}/.admin/credentials", 'POST')));
+            $requestStarted->getFuture()->await(new \Amp\TimeoutCancellation(2));
+            $stopFuture = \Amp\async(static fn() => $server->stop());
+            \Amp\delay(0.02);
+
+            self::assertFalse($this->canConnect($port));
+            self::assertFalse($requestFuture->isComplete());
+            self::assertFalse($stopFuture->isComplete());
+
+            $releaseRequest->complete();
+            $response = $requestFuture->await(new \Amp\TimeoutCancellation(2));
+            self::assertSame(200, $response->getStatus());
+            self::assertSame('drained', \Amp\ByteStream\buffer($response->getBody()));
+            self::assertFalse($stopFuture->isComplete());
+            self::assertFalse($this->canConnect($port));
+        } finally {
+            if (! $releaseRequest->isComplete()) {
+                $releaseRequest->complete();
+            }
+            if (! $releaseWorker->isComplete()) {
+                $releaseWorker->complete();
+            }
+            if (isset($stopFuture)) {
+                $stopFuture->await(new \Amp\TimeoutCancellation(2));
+            } else {
+                $server->stop();
+            }
+        }
+    }
+
+    private function unusedPort(): int
+    {
+        $reservation = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($reservation);
+        $address = stream_socket_get_name($reservation, false);
+        self::assertIsString($address);
+        fclose($reservation);
+
+        return (int) substr($address, strrpos($address, ':') + 1);
+    }
+
+    private function canConnect(int $port): bool
+    {
+        $socket = @stream_socket_client("tcp://127.0.0.1:{$port}", $errorCode, $error, 0.1);
+        if ($socket === false) {
+            return false;
+        }
+        fclose($socket);
+
+        return true;
+    }
+}

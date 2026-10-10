@@ -38,7 +38,22 @@ final class AwsSdkSupportMatrixTest extends TestCase
         }
     }
 
-    public function test_supported_operations_have_functional_sdk_coverage(): void
+    public function test_every_operation_has_exactly_one_classification(): void
+    {
+        $matrix = self::matrix();
+        $classified = array_merge(
+            $matrix['supported'],
+            $matrix['unsupported'],
+            $matrix['optional_external'],
+        );
+        $counts = array_count_values($classified);
+        $duplicates = array_keys(array_filter($counts, static fn(int $count): bool => $count !== 1));
+        sort($duplicates);
+
+        $this->assertSame([], $duplicates, 'S3 operations must occur in exactly one support category.');
+    }
+
+    public function test_supported_operations_are_referenced_by_functional_sdk_tests(): void
     {
         $matrix = self::matrix();
         $testedOperations = self::testedFunctionalOperations();
@@ -54,7 +69,19 @@ final class AwsSdkSupportMatrixTest extends TestCase
 
         sort($missing);
 
-        $this->assertSame([], $missing, 'Supported S3 operations without functional AWS SDK coverage.');
+        $this->assertSame([], $missing, 'Supported S3 operations without a functional AWS SDK reference.');
+    }
+
+    public function test_functional_coverage_scan_ignores_comments_and_string_literals(): void
+    {
+        $source = <<<'PHP'
+            <?php
+            // self::$s3->deleteBucket(['Bucket' => 'comment']);
+            $text = 'self::$s3->putObject()';
+            self::$s3->getObject(['Bucket' => 'real']);
+            PHP;
+
+        self::assertSame(['getObject' => true], self::sdkOperationsFromSource($source));
     }
 
     /**
@@ -121,10 +148,35 @@ final class AwsSdkSupportMatrixTest extends TestCase
                 continue;
             }
 
-            preg_match_all('/self::\$s3->([A-Za-z0-9_]+)/', $contents, $matches);
-            foreach ($matches[1] as $operation) {
-                $operations[$operation] = true;
+            $operations += self::sdkOperationsFromSource($contents);
+        }
+
+        return $operations;
+    }
+
+    /** @return array<string, true> */
+    private static function sdkOperationsFromSource(string $source): array
+    {
+        $tokens = array_values(array_filter(
+            token_get_all($source),
+            static fn(array|string $token): bool => ! is_array($token)
+                || ! in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true),
+        ));
+        $operations = [];
+        for ($index = 0; $index + 4 < count($tokens); $index++) {
+            $self = $tokens[$index];
+            $separator = $tokens[$index + 1];
+            $client = $tokens[$index + 2];
+            $operator = $tokens[$index + 3];
+            $method = $tokens[$index + 4];
+            if (! is_array($self) || strtolower($self[1]) !== 'self'
+                || ! is_array($separator) || $separator[0] !== T_DOUBLE_COLON
+                || ! is_array($client) || $client[0] !== T_VARIABLE || $client[1] !== '$s3'
+                || ! is_array($operator) || $operator[0] !== T_OBJECT_OPERATOR
+                || ! is_array($method) || $method[0] !== T_STRING) {
+                continue;
             }
+            $operations[$method[1]] = true;
         }
 
         return $operations;

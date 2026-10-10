@@ -5,6 +5,10 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Psr7\MultipartStream;
+use GuzzleHttp\Psr7\AppendStream;
+use GuzzleHttp\Psr7\Utils;
+use Aws\S3\Exception\S3Exception;
 use OpsFour\S3Server\Auth\SigningKey;
 
 final class PostObjectTest extends S3FunctionalTestCase
@@ -34,6 +38,7 @@ final class PostObjectTest extends S3FunctionalTestCase
                 'success_action_status' => '201',
                 'Content-Type' => 'text/plain',
                 'x-amz-meta-origin' => 'browser',
+                'x-amz-storage-class' => 'STANDARD_IA',
                 'tagging' => 'project=post-object',
             ],
         );
@@ -48,6 +53,7 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame($body, (string) $object['Body']);
         $this->assertSame('text/plain', $object['ContentType']);
         $this->assertSame('browser', $object['Metadata']['origin']);
+        $this->assertSame('STANDARD_IA', $object['StorageClass']);
 
         $tags = self::$s3->getObjectTagging([
             'Bucket' => self::$bucket,
@@ -56,12 +62,340 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame([['Key' => 'project', 'Value' => 'post-object']], $tags['TagSet']);
     }
 
+    public function test_signed_browser_form_rejects_unsigned_object_headers(): void
+    {
+        foreach ([
+            'acl' => ['x-amz-acl' => 'public-read'],
+            'metadata' => ['x-amz-meta-injected' => 'unsigned'],
+            'cache-control' => ['Cache-Control' => 'public, max-age=86400'],
+        ] as $case => $headers) {
+            $key = 'unsigned-http-' . $case . '-' . bin2hex(random_bytes(4));
+            $client = new Client([
+                'http_errors' => false,
+                'timeout' => 10,
+                'headers' => $headers,
+            ]);
+
+            $response = $this->postV4($key, 'upload.txt', 'signed payload', client: $client);
+
+            self::assertSame(403, $response->getStatusCode(), $case . ': ' . (string) $response->getBody());
+            self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody(), $case);
+            self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? [], $case);
+        }
+    }
+
+    public function test_virtual_host_browser_post_requires_valid_bucket_host_signature_and_policy(): void
+    {
+        $previousBaseDomain = getenv('S3_BASE_DOMAIN');
+        putenv('S3_BASE_DOMAIN=s3.localhost');
+
+        try {
+            self::restartServer();
+            $suffix = bin2hex(random_bytes(4));
+            $acceptedKey = 'virtual-accepted-' . $suffix;
+            $accepted = $this->postV4($acceptedKey, 'upload.txt', 'virtual payload', virtualHost: true);
+            self::assertSame(204, $accepted->getStatusCode(), (string) $accepted->getBody());
+            self::assertSame('virtual payload', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket, 'Key' => $acceptedKey,
+            ])['Body']);
+
+            $badSignatureKey = 'virtual-bad-signature-' . $suffix;
+            $badSignature = $this->postV4($badSignatureKey, 'upload.txt', 'denied', invalidSignature: true, virtualHost: true);
+            self::assertSame(403, $badSignature->getStatusCode(), (string) $badSignature->getBody());
+            self::assertStringContainsString('<Code>SignatureDoesNotMatch</Code>', (string) $badSignature->getBody());
+
+            $invalidHost = (new Client(['http_errors' => false]))->request(
+                'POST',
+                sprintf('http://%s:%d/', self::$host, self::$port),
+                [
+                    'headers' => ['Host' => 'not-a-bucket.example.test'],
+                    'multipart' => [
+                        ['name' => 'key', 'contents' => 'virtual-invalid-host-' . $suffix],
+                        ['name' => 'file', 'contents' => 'denied', 'filename' => 'upload.txt'],
+                    ],
+                ],
+            );
+            self::assertSame(405, $invalidHost->getStatusCode(), (string) $invalidHost->getBody());
+
+            $deniedKey = 'virtual-policy-denied-' . $suffix;
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode([
+                    'Version' => '2012-10-17',
+                    'Statement' => [[
+                        'Effect' => 'Deny', 'Principal' => '*', 'Action' => 's3:PutObject',
+                        'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $deniedKey,
+                    ]],
+                ], JSON_THROW_ON_ERROR),
+            ]);
+            try {
+                $denied = $this->postV4($deniedKey, 'upload.txt', 'denied', virtualHost: true);
+                self::assertSame(403, $denied->getStatusCode(), (string) $denied->getBody());
+                self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $denied->getBody());
+                foreach ([$badSignatureKey, $deniedKey, 'virtual-invalid-host-' . $suffix] as $key) {
+                    self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+                }
+            } finally {
+                self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+            }
+        } finally {
+            putenv($previousBaseDomain === false ? 'S3_BASE_DOMAIN' : 'S3_BASE_DOMAIN=' . $previousBaseDomain);
+            self::restartServer();
+        }
+    }
+
+    public function test_signed_post_preserves_false_boundary_prefix_inside_file(): void
+    {
+        $boundary = 'post-false-boundary';
+        $body = "before\r\n--{$boundary}XXXX" . str_repeat('a', 20_000) . 'after';
+        $key = 'false-boundary-' . bin2hex(random_bytes(4));
+
+        $response = $this->postV4($key, 'upload.txt', $body, boundary: $boundary);
+
+        self::assertSame(204, $response->getStatusCode(), (string) $response->getBody());
+        $object = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        self::assertSame($body, (string) $object['Body']);
+        self::assertSame(strlen($body), (int) $object['ContentLength']);
+        self::assertSame('"' . md5($body) . '"', (string) $object['ETag']);
+    }
+
+    public function test_signed_post_rejects_total_multipart_body_above_server_limit(): void
+    {
+        $previousLimit = getenv('S3_BODY_SIZE_LIMIT');
+        putenv('S3_BODY_SIZE_LIMIT=1024');
+        try {
+            self::restartServer();
+            $response = $this->postV4('over-body-limit', 'upload.txt', str_repeat('x', 2_048));
+            self::assertSame(400, $response->getStatusCode(), (string) $response->getBody() . "\n" . self::serverLogs());
+            self::assertStringContainsString('<Code>EntityTooLarge</Code>', (string) $response->getBody());
+        } finally {
+            putenv($previousLimit === false ? 'S3_BODY_SIZE_LIMIT' : 'S3_BODY_SIZE_LIMIT=' . $previousLimit);
+            self::restartServer();
+        }
+    }
+
+    public function test_signed_post_epilog_allows_next_request_on_same_http_connection(): void
+    {
+        $client = new Client(['http_errors' => false, 'timeout' => 10]);
+        $key = 'epilog-' . bin2hex(random_bytes(4));
+        $firstStats = [];
+        $response = $this->postV4(
+            $key,
+            'upload.txt',
+            'payload',
+            ['success_action_status' => '201'],
+            boundary: 'post-epilog-boundary',
+            epilog: "ignored epilog\r\n",
+            client: $client,
+            onStats: static function (\GuzzleHttp\TransferStats $stats) use (&$firstStats): void {
+                $firstStats = $stats->getHandlerStats();
+            },
+        );
+        self::assertSame(201, $response->getStatusCode(), (string) $response->getBody());
+
+        $secondStats = [];
+        $health = $client->request('GET', sprintf('http://%s:%d/.live', self::$host, self::$port), [
+            'on_stats' => static function (\GuzzleHttp\TransferStats $stats) use (&$secondStats): void {
+                $secondStats = $stats->getHandlerStats();
+            },
+        ]);
+        self::assertSame(200, $health->getStatusCode());
+        self::assertIsInt($firstStats['local_port'] ?? null);
+        self::assertSame($firstStats['local_port'] ?? null, $secondStats['local_port'] ?? null);
+
+        $object = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        self::assertSame('payload', (string) $object['Body']);
+    }
+
+    public function test_browser_post_sse_s3_roundtrips_through_encrypted_spool(): void
+    {
+        $previousMasterKey = getenv('S3_ENCRYPTION_MASTER_KEY');
+        putenv('S3_ENCRYPTION_MASTER_KEY=' . base64_encode(str_repeat('B', 32)));
+
+        try {
+            self::restartServer();
+            $key = 'encrypted-form-' . bin2hex(random_bytes(4));
+            $response = $this->postV4($key, 'upload.txt', 'browser SSE payload', [
+                'x-amz-server-side-encryption' => 'AES256',
+            ]);
+            self::assertSame(204, $response->getStatusCode(), (string) $response->getBody());
+            $object = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            self::assertSame('browser SSE payload', (string) $object['Body']);
+            self::assertSame('AES256', $object['ServerSideEncryption']);
+        } finally {
+            putenv($previousMasterKey === false
+                ? 'S3_ENCRYPTION_MASTER_KEY'
+                : 'S3_ENCRYPTION_MASTER_KEY=' . $previousMasterKey);
+            self::restartServer();
+        }
+    }
+
+    public function test_signed_browser_post_returns_literal_null_version_header_when_suspended(): void
+    {
+        $bucket = 'post-null-version-' . bin2hex(random_bytes(5));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            $unversioned = $this->postV4('plain.txt', 'plain.txt', 'plain', bucketOverride: $bucket);
+            self::assertSame(204, $unversioned->getStatusCode());
+            self::assertSame('', $unversioned->getHeaderLine('x-amz-version-id'));
+
+            self::$s3->putBucketVersioning(['Bucket' => $bucket, 'VersioningConfiguration' => ['Status' => 'Enabled']]);
+            self::$s3->putBucketVersioning(['Bucket' => $bucket, 'VersioningConfiguration' => ['Status' => 'Suspended']]);
+            $suspended = $this->postV4('suspended.txt', 'suspended.txt', 'suspended', [
+                'success_action_status' => '201',
+            ], bucketOverride: $bucket);
+            self::assertSame(201, $suspended->getStatusCode(), (string) $suspended->getBody());
+            self::assertSame('null', $suspended->getHeaderLine('x-amz-version-id'));
+            self::assertSame('suspended', (string) self::$s3->getObject([
+                'Bucket' => $bucket, 'Key' => 'suspended.txt', 'VersionId' => 'null',
+            ])['Body']);
+
+            $redirect = $this->postV4('redirect.txt', 'redirect.txt', 'redirected', [
+                'success_action_redirect' => 'https://example.test/complete',
+            ], bucketOverride: $bucket);
+            self::assertSame(303, $redirect->getStatusCode());
+            self::assertSame('null', $redirect->getHeaderLine('x-amz-version-id'));
+        } finally {
+            $versions = self::$s3->listObjectVersions(['Bucket' => $bucket]);
+            foreach (array_merge($versions['Versions'] ?? [], $versions['DeleteMarkers'] ?? []) as $version) {
+                self::$s3->deleteObject([
+                    'Bucket' => $bucket, 'Key' => $version['Key'], 'VersionId' => $version['VersionId'],
+                ]);
+            }
+            self::deleteBucketWithDiagnostics($bucket);
+        }
+    }
+
+    public function test_browser_form_acl_obeys_bucket_owner_enforced_mode(): void
+    {
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => self::$bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerEnforced']]],
+        ]);
+        try {
+            $rejectedKey = 'enforced-rejected-' . bin2hex(random_bytes(4)) . '.txt';
+            $rejected = $this->postV4($rejectedKey, 'upload.txt', 'denied', ['acl' => 'public-read']);
+            $this->assertSame(400, $rejected->getStatusCode());
+            $this->assertStringContainsString('<Code>AccessControlListNotSupported</Code>', (string) $rejected->getBody());
+            $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $rejectedKey])['Contents'] ?? []);
+
+            $acceptedKey = 'enforced-accepted-' . bin2hex(random_bytes(4)) . '.txt';
+            $accepted = $this->postV4($acceptedKey, 'upload.txt', 'allowed', ['acl' => 'bucket-owner-full-control']);
+            $this->assertSame(204, $accepted->getStatusCode(), (string) $accepted->getBody());
+            $this->assertSame('allowed', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $acceptedKey])['Body']);
+        } finally {
+            self::$s3->deleteBucketOwnershipControls(['Bucket' => self::$bucket]);
+        }
+    }
+
     public function test_anonymous_form_is_denied_for_private_bucket(): void
     {
-        $response = $this->postAnonymous('anonymous/denied.txt', 'denied');
+        $response = $this->postAnonymous('anonymous/denied.txt', str_repeat('x', 1_048_576));
 
         $this->assertSame(403, $response->getStatusCode());
         $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+    }
+
+    public function test_unauthenticated_oversized_part_header_returns_http_400_without_a_spool(): void
+    {
+        $previousMemoryLimit = getenv('S3_TEST_SERVER_MEMORY_LIMIT');
+        $previousTmpDir = getenv('TMPDIR');
+        $tempDir = self::$storagePath . '/post-header-temp-' . bin2hex(random_bytes(4));
+        self::assertTrue(mkdir($tempDir, 0o700));
+        putenv('S3_TEST_SERVER_MEMORY_LIMIT=128M');
+        putenv('TMPDIR=' . $tempDir);
+
+        try {
+            self::restartServer();
+            self::assertDirectoryExists($tempDir . '/.opsfour-s3-post-budget');
+
+            $boundary = 'post-header-limit';
+            $response = (new Client(['http_errors' => false, 'timeout' => 10]))->request(
+                'POST',
+                sprintf('http://%s:%d/%s', self::$host, self::$port, self::$bucket),
+                [
+                    'headers' => ['Content-Type' => 'multipart/form-data; boundary=' . $boundary],
+                    'body' => "--{$boundary}\r\nX-Long: " . str_repeat('a', 20_000),
+                ],
+            );
+
+            self::assertSame(400, $response->getStatusCode(), (string) $response->getBody());
+            self::assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+            self::assertStringContainsString('Multipart part header exceeds 16 KiB.', (string) $response->getBody());
+            self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
+            self::assertNotNull(self::serverPid());
+        } finally {
+            putenv($previousMemoryLimit === false
+                ? 'S3_TEST_SERVER_MEMORY_LIMIT'
+                : 'S3_TEST_SERVER_MEMORY_LIMIT=' . $previousMemoryLimit);
+            putenv($previousTmpDir === false ? 'TMPDIR' : 'TMPDIR=' . $previousTmpDir);
+            self::restartServer();
+        }
+    }
+
+    public function test_browser_post_spool_budget_returns_retryable_error_and_recovers(): void
+    {
+        $previousBudget = getenv('S3_POST_SPOOL_BUDGET');
+        // One authenticated frame uses 32 bytes beyond the file payload.
+        putenv('S3_POST_SPOOL_BUDGET=35');
+        try {
+            self::restartServer();
+            $rejectedKey = 'spool-budget-rejected-' . bin2hex(random_bytes(4));
+            $rejected = $this->postV4($rejectedKey, 'upload.txt', 'abcd');
+            self::assertSame(503, $rejected->getStatusCode());
+            self::assertStringContainsString('<Code>SlowDown</Code>', (string) $rejected->getBody());
+            self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $rejectedKey])['Contents'] ?? []);
+
+            $acceptedKey = 'spool-budget-accepted-' . bin2hex(random_bytes(4));
+            $accepted = $this->postV4($acceptedKey, 'upload.txt', 'ok');
+            self::assertSame(204, $accepted->getStatusCode(), (string) $accepted->getBody());
+            self::assertSame('ok', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $acceptedKey])['Body']);
+        } finally {
+            if ($previousBudget === false) {
+                putenv('S3_POST_SPOOL_BUDGET');
+            } else {
+                putenv('S3_POST_SPOOL_BUDGET=' . $previousBudget);
+            }
+            self::restartServer();
+        }
+    }
+
+    public function test_invalid_storage_class_is_rejected_for_put_copy_multipart_and_form_uploads(): void
+    {
+        $prefix = 'invalid-storage-' . bin2hex(random_bytes(4));
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => "{$prefix}/source", 'Body' => 'source']);
+
+        $requests = [
+            static fn() => self::$s3->putObject([
+                'Bucket' => self::$bucket, 'Key' => "{$prefix}/put", 'Body' => 'body', 'StorageClass' => 'NOT_A_CLASS',
+            ]),
+            static fn() => self::$s3->copyObject([
+                'Bucket' => self::$bucket, 'Key' => "{$prefix}/copy",
+                'CopySource' => self::$bucket . "/{$prefix}/source", 'StorageClass' => 'NOT_A_CLASS',
+            ]),
+            static fn() => self::$s3->createMultipartUpload([
+                'Bucket' => self::$bucket, 'Key' => "{$prefix}/multipart", 'StorageClass' => 'NOT_A_CLASS',
+            ]),
+        ];
+        foreach ($requests as $send) {
+            try {
+                $send();
+                self::fail('An unsupported storage class must fail before creating an object or upload.');
+            } catch (S3Exception $e) {
+                self::assertSame(400, $e->getStatusCode());
+                self::assertSame('InvalidArgument', $e->getAwsErrorCode());
+            }
+        }
+
+        $form = $this->postV4("{$prefix}/form", 'file.txt', 'body', ['x-amz-storage-class' => 'NOT_A_CLASS']);
+        self::assertSame(400, $form->getStatusCode());
+        self::assertStringContainsString('<Code>InvalidArgument</Code>', (string) $form->getBody());
+        $lockForm = $this->postV4("{$prefix}/lock", 'file.txt', 'body', ['x-amz-object-lock-mode' => 'GOVERNANCE']);
+        self::assertSame(400, $lockForm->getStatusCode());
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => "{$prefix}/put"])['Contents'] ?? []);
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => "{$prefix}/copy"])['Contents'] ?? []);
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => "{$prefix}/form"])['Contents'] ?? []);
     }
 
     public function test_sigv4_form_rejects_impossible_calendar_date(): void
@@ -75,6 +409,36 @@ final class PostObjectTest extends S3FunctionalTestCase
 
         $this->assertSame(403, $response->getStatusCode());
         $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+    }
+
+    public function test_sigv4_form_rejects_trailing_newline_in_date(): void
+    {
+        $key = 'invalid-newline-date-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'invalid-date.txt',
+            body: 'must not be written',
+            dateTime: gmdate('Ymd\THis\Z') . "\n",
+        );
+
+        self::assertSame(403, $response->getStatusCode());
+        self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
+    public function test_bad_form_signature_rejects_large_file_without_creating_object(): void
+    {
+        $key = 'invalid-signature-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            invalidSignature: true,
+        );
+
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>SignatureDoesNotMatch</Code>', (string) $response->getBody());
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
     }
 
     public function test_sigv4_form_rejects_impossible_policy_expiration(): void
@@ -101,6 +465,175 @@ final class PostObjectTest extends S3FunctionalTestCase
 
         $this->assertSame(400, $response->getStatusCode());
         $this->assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+    }
+
+    public function test_sigv4_form_rejects_invalid_size_range(): void
+    {
+        $key = 'invalid-policy-range-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            additionalConditions: [['content-length-range', 10, 1]],
+        );
+
+        $this->assertSame(400, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
+    public function test_sigv4_form_rejects_unsatisfied_field_condition(): void
+    {
+        $key = 'invalid-policy-field-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            additionalConditions: [['eq', '$key', 'different-key.txt']],
+        );
+
+        $this->assertSame(403, $response->getStatusCode());
+        $xml = new \SimpleXMLElement((string) $response->getBody());
+        $this->assertSame('AccessDenied', (string) $xml->Code);
+        $this->assertSame('/' . self::$bucket, (string) $xml->Resource);
+        $this->assertSame($response->getHeaderLine('x-amz-request-id'), (string) $xml->RequestId);
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
+    public function test_sigv4_form_rejects_field_not_covered_by_policy(): void
+    {
+        $key = 'uncovered-policy-field-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            uncoveredFields: ['x-amz-meta-uncovered' => 'value'],
+        );
+
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
+    public function test_expired_signed_policy_and_size_limit_reject_large_form_files(): void
+    {
+        $expiredKey = 'expired-policy-' . bin2hex(random_bytes(4)) . '.txt';
+        $expired = $this->postV4(
+            key: $expiredKey,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            policyExpiration: gmdate('Y-m-d\TH:i:s\Z', time() - 60),
+        );
+        $this->assertSame(403, $expired->getStatusCode());
+        $this->assertStringContainsString('<Code>AccessDenied</Code>', (string) $expired->getBody());
+
+        $oversizeKey = 'oversize-policy-' . bin2hex(random_bytes(4)) . '.txt';
+        $oversize = $this->postV4(
+            key: $oversizeKey,
+            filename: 'upload.txt',
+            body: str_repeat('x', 1_048_576),
+            additionalConditions: [['content-length-range', 0, 10]],
+        );
+        $this->assertSame(400, $oversize->getStatusCode());
+        $this->assertStringContainsString('<Code>EntityTooLarge</Code>', (string) $oversize->getBody());
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $expiredKey])['Contents'] ?? []);
+        $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $oversizeKey])['Contents'] ?? []);
+
+        $acceptedKey = 'within-policy-' . bin2hex(random_bytes(4)) . '.txt';
+        $accepted = $this->postV4(
+            key: $acceptedKey,
+            filename: 'upload.txt',
+            body: '0123456789',
+            additionalConditions: [['content-length-range', 0, 10]],
+        );
+        $this->assertSame(204, $accepted->getStatusCode(), (string) $accepted->getBody());
+        $this->assertSame('0123456789', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $acceptedKey])['Body']);
+    }
+
+    public function test_invalid_success_redirect_uses_success_status_without_redirecting(): void
+    {
+        foreach (['javascript:alert(1)', 'http:/relative', "https://example.test/\tbad"] as $redirect) {
+            $key = 'invalid-redirect-' . bin2hex(random_bytes(4)) . '.txt';
+            $response = $this->postV4(
+                key: $key,
+                filename: 'upload.txt',
+                body: 'uploaded without redirect',
+                extraFields: ['success_action_redirect' => $redirect],
+            );
+
+            $this->assertSame(204, $response->getStatusCode(), $redirect);
+            $this->assertSame('', $response->getHeaderLine('Location'));
+            $this->assertSame('uploaded without redirect', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key])['Body']);
+        }
+    }
+
+    public function test_valid_success_redirect_is_returned_after_object_write(): void
+    {
+        $key = 'valid-redirect-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: 'uploaded',
+            extraFields: ['success_action_redirect' => 'https://example.test/upload?source=form#section'],
+        );
+
+        $this->assertSame(303, $response->getStatusCode());
+        $this->assertStringStartsWith(
+            'https://example.test/upload?source=form&bucket=' . self::$bucket . '&key=' . $key,
+            $response->getHeaderLine('Location'),
+        );
+        $this->assertStringEndsWith('#section', $response->getHeaderLine('Location'));
+        $this->assertSame('uploaded', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key])['Body']);
+    }
+
+    public function test_uninterpretable_redirect_falls_back_to_requested_success_status(): void
+    {
+        $key = 'fallback-redirect-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: 'uploaded',
+            extraFields: [
+                'success_action_redirect' => 'javascript:alert(1)',
+                'success_action_status' => '201',
+            ],
+        );
+
+        $this->assertSame(201, $response->getStatusCode());
+        $this->assertSame('', $response->getHeaderLine('Location'));
+        $this->assertStringContainsString('<PostResponse>', (string) $response->getBody());
+        $this->assertSame('uploaded', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key])['Body']);
+    }
+
+    public function test_tagged_form_respects_put_object_tagging_deny(): void
+    {
+        $key = 'tagged-denied-' . bin2hex(random_bytes(4)) . '.txt';
+        self::$s3->putBucketPolicy([
+            'Bucket' => self::$bucket,
+            'Policy' => json_encode([
+                'Version' => '2012-10-17',
+                'Statement' => [[
+                    'Effect' => 'Deny',
+                    'Principal' => '*',
+                    'Action' => 's3:PutObjectTagging',
+                    'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $key,
+                ]],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+
+        try {
+            $response = $this->postV4(
+                key: $key,
+                filename: 'upload.txt',
+                body: str_repeat('x', 1_048_576),
+                extraFields: ['tagging' => 'project=private'],
+            );
+            $this->assertSame(403, $response->getStatusCode());
+            $objects = self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key]);
+            $this->assertSame([], $objects['Contents'] ?? []);
+        } finally {
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+        }
     }
 
     public function test_anonymous_form_is_allowed_by_public_write_acl(): void
@@ -171,6 +704,8 @@ final class PostObjectTest extends S3FunctionalTestCase
     /**
      * @param resource|string $body
      * @param array<string, string> $extraFields
+     * @param list<list<int|string>> $additionalConditions
+     * @param array<string, string> $uncoveredFields
      */
     private function postV4(
         string $key,
@@ -179,7 +714,17 @@ final class PostObjectTest extends S3FunctionalTestCase
         array $extraFields = [],
         ?string $dateTime = null,
         ?string $policyExpiration = null,
+        bool $invalidSignature = false,
+        array $additionalConditions = [],
+        array $uncoveredFields = [],
+        ?string $bucketOverride = null,
+        ?string $boundary = null,
+        ?string $epilog = null,
+        ?Client $client = null,
+        ?\Closure $onStats = null,
+        bool $virtualHost = false,
     ): \Psr\Http\Message\ResponseInterface {
+        $bucket = $bucketOverride ?? self::$bucket;
         $dateTime ??= gmdate('Ymd\THis\Z');
         $date = substr($dateTime, 0, 8);
         $credential = self::$accessKey . "/{$date}/us-east-1/s3/aws4_request";
@@ -193,7 +738,7 @@ final class PostObjectTest extends S3FunctionalTestCase
         ];
 
         $conditions = [
-            ['bucket' => self::$bucket],
+            ['bucket' => $bucket],
             ['starts-with', '$key', strstr($key, '${filename}', true) ?: $key],
         ];
         foreach ($fields as $name => $value) {
@@ -202,6 +747,7 @@ final class PostObjectTest extends S3FunctionalTestCase
             }
             $conditions[] = [$name => $value];
         }
+        array_push($conditions, ...$additionalConditions);
 
         $policy = base64_encode(json_encode([
             'expiration' => $policyExpiration ?? gmdate('Y-m-d\TH:i:s\Z', time() + 300),
@@ -214,9 +760,10 @@ final class PostObjectTest extends S3FunctionalTestCase
         );
 
         $fields['policy'] = $policy;
-        $fields['x-amz-signature'] = $signature;
+        $fields['x-amz-signature'] = $invalidSignature ? str_repeat('0', 64) : $signature;
+        $fields = [...$fields, ...$uncoveredFields];
 
-        return $this->sendMultipart($fields, $filename, $body);
+        return $this->sendMultipart($fields, $filename, $body, $bucket, $boundary, $epilog, $client, $onStats, $virtualHost);
     }
 
     private function postAnonymous(string $key, string $body): \Psr\Http\Message\ResponseInterface
@@ -228,8 +775,17 @@ final class PostObjectTest extends S3FunctionalTestCase
      * @param array<string, string> $fields
      * @param resource|string $body
      */
-    private function sendMultipart(array $fields, string $filename, mixed $body): \Psr\Http\Message\ResponseInterface
-    {
+    private function sendMultipart(
+        array $fields,
+        string $filename,
+        mixed $body,
+        ?string $bucket = null,
+        ?string $boundary = null,
+        ?string $epilog = null,
+        ?Client $client = null,
+        ?\Closure $onStats = null,
+        bool $virtualHost = false,
+    ): \Psr\Http\Message\ResponseInterface {
         $multipart = [];
         foreach ($fields as $name => $value) {
             $multipart[] = ['name' => $name, 'contents' => $value];
@@ -240,13 +796,34 @@ final class PostObjectTest extends S3FunctionalTestCase
             'filename' => $filename,
         ];
 
-        return (new Client([
+        $customBody = $boundary === null ? null : new MultipartStream($multipart, $boundary);
+        if ($customBody !== null && $epilog !== null) {
+            $customBody = new AppendStream([$customBody, Utils::streamFor($epilog)]);
+        }
+        $options = $boundary === null
+            ? ['multipart' => $multipart, 'allow_redirects' => false]
+            : [
+                'body' => $customBody,
+                'headers' => [
+                    'Content-Type' => 'multipart/form-data; boundary=' . $boundary,
+                    'Connection' => 'keep-alive',
+                ],
+                'allow_redirects' => false,
+            ];
+        if ($onStats !== null) {
+            $options['on_stats'] = $onStats;
+        }
+        if ($virtualHost) {
+            $options['headers']['Host'] = ($bucket ?? self::$bucket) . '.s3.localhost';
+        }
+
+        return ($client ?? new Client([
             'http_errors' => false,
             'timeout' => 60,
         ]))->request(
             'POST',
-            sprintf('http://%s:%d/%s', self::$host, self::$port, self::$bucket),
-            ['multipart' => $multipart],
+            sprintf('http://%s:%d/%s', self::$host, self::$port, $virtualHost ? '' : ($bucket ?? self::$bucket)),
+            $options,
         );
     }
 }

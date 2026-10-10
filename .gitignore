@@ -1,4 +1,5 @@
 *.log
+*.py[cod]
 .DS_Store
 .env
 .env.integration
@@ -21,6 +22,7 @@
 /storage/*.key
 /storage/pail
 /vendor
+__pycache__/
 Homestead.json
 Homestead.yaml
 Thumbs.db

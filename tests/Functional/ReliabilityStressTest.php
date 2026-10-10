@@ -98,7 +98,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
 
         try {
             for ($partNumber = 1; $partNumber <= $partCount; $partNumber++) {
-                $file = self::createDeterministicFile("part-{$partNumber}-", $partBytes, chr(64 + $partNumber));
+                $file = self::createDeterministicFile("part-{$partNumber}-", $partBytes, chr(65 + (($partNumber - 1) % 26)));
                 $partFiles[] = $file;
                 hash_update_file($expectedHashContext, $file);
 
@@ -187,6 +187,12 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $this->runCommandPool($headCommands, $concurrency, function (ResultInterface $result) use ($objectBytes): void {
             $this->assertSame($objectBytes, $result['ContentLength']);
         });
+
+        $afterHead = self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'concurrent/',
+        ]);
+        $this->assertSame($objectCount, count($afterHead['Contents'] ?? []));
 
         $deleteObjects = [];
         for ($i = 0; $i < $objectCount; $i++) {
@@ -298,8 +304,8 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $pauseMilliseconds = self::envNonNegativeInt('S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS', 0);
         $progressSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS', 60);
 
-        $rssBaseline = null;
-        $tmpBefore = self::countFiles(self::$storagePath . '/.tmp');
+        $memoryBaseline = null;
+        $tmpBefore = self::storageTempArtifacts(self::$storagePath . '/.tmp');
         $deadline = microtime(true) + $durationSeconds;
         $lastBatchCompletedAt = microtime(true);
         $iteration = 0;
@@ -332,18 +338,24 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 $deleteObjects[] = ['Key' => $key];
             }
 
-            $this->runCommandPool($putCommands, $concurrency);
-            $this->runCommandPool($headCommands, $concurrency, function (ResultInterface $result) use ($objectBytes): void {
-                $this->assertSame($objectBytes, $result['ContentLength']);
-            });
-            $this->runCommandPool(
+            $this->measureProductionSoakPhase($iteration, 'put', fn() => $this->runCommandPool($putCommands, $concurrency, safeFailure: true));
+            $this->measureProductionSoakPhase($iteration, 'head', fn() => $this->runCommandPool(
+                $headCommands,
+                $concurrency,
+                function (ResultInterface $result) use ($objectBytes): void {
+                    $this->assertSame($objectBytes, $result['ContentLength']);
+                },
+                safeFailure: true,
+            ));
+            $this->measureProductionSoakPhase($iteration, 'get', fn() => $this->runCommandPool(
                 $getCommands,
                 $concurrency,
                 function (ResultInterface $result, int|string $index) use ($objectBytes): void {
                     $expected = str_repeat(chr(65 + (((int) $index) % 26)), $objectBytes);
                     $this->assertSame($expected, (string) $result['Body'], 'GET returned stale or corrupt data.');
                 },
-            );
+                safeFailure: true,
+            ));
 
             self::$s3->deleteObjects([
                 'Bucket' => self::$bucket,
@@ -356,22 +368,22 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 $this->assertStringContainsString('ok', strtolower($response));
             }
 
-            $currentRss = self::serverRssBytes();
-            if ($currentRss !== null) {
+            $memoryPeak = self::productionSoakMemoryBytes();
+            if ($memoryPeak !== null) {
                 $this->assertLessThanOrEqual(
                     $maximumTotalRss,
-                    $currentRss,
-                    'Server process-tree RSS exceeded the production soak hard limit.',
+                    $memoryPeak,
+                    'Container memory peak or server process-tree RSS exceeded the production soak hard limit.',
                 );
 
                 // Flysystem workers are started lazily by the first storage batch.
-                if ($rssBaseline === null) {
-                    $rssBaseline = $currentRss;
+                if ($memoryBaseline === null) {
+                    $memoryBaseline = $memoryPeak;
                 } else {
                     $this->assertLessThanOrEqual(
                         $allowedGrowth,
-                        max(0, $currentRss - $rssBaseline),
-                        'Server process-tree RSS grew too much after worker warm-up.',
+                        max(0, $memoryPeak - $memoryBaseline),
+                        'Container memory peak or server process-tree RSS grew too much after worker warm-up.',
                     );
                 }
             }
@@ -415,23 +427,32 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             ),
         );
         $this->assertGreaterThan(0, $iteration, 'Production soak did not complete a workload batch.');
-        $tmpAfter = self::countFiles(self::$storagePath . '/.tmp');
-        $this->assertLessThanOrEqual($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
+        $tmpAfter = self::storageTempArtifacts(self::$storagePath . '/.tmp');
+        $this->assertSame($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
 
-        $rssAfter = self::serverRssBytes();
-        if ($rssBaseline !== null && $rssAfter !== null) {
+        $memoryPeak = self::productionSoakMemoryBytes();
+        if ($memoryBaseline !== null && $memoryPeak !== null) {
             $this->assertLessThanOrEqual(
                 $allowedGrowth,
-                max(0, $rssAfter - $rssBaseline),
-                'Server process-tree RSS grew too much after worker warm-up.',
+                max(0, $memoryPeak - $memoryBaseline),
+                'Container memory peak or server process-tree RSS grew too much after worker warm-up.',
             );
+        }
+
+        $cgroupPeak = self::productionSoakCgroupPeakBytes();
+        if ($cgroupPeak !== null) {
+            fwrite(STDOUT, sprintf(
+                "\nSoak cgroup-v2 memory.peak: %d bytes (%.1f MiB).\n",
+                $cgroupPeak,
+                $cgroupPeak / (1024 * 1024),
+            ));
         }
     }
 
     /**
      * @param array<int|string, \Aws\CommandInterface> $commands
      */
-    private function runCommandPool(array $commands, int $concurrency, ?callable $fulfilled = null): void
+    private function runCommandPool(array $commands, int $concurrency, ?callable $fulfilled = null, bool $safeFailure = false): void
     {
         $errors = [];
         $pool = new CommandPool(self::$s3, $commands, [
@@ -441,14 +462,80 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                     $fulfilled($result, $index);
                 }
             },
-            'rejected' => static function ($reason) use (&$errors): void {
-                $errors[] = $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason;
+            'rejected' => static function ($reason) use (&$errors, $safeFailure): void {
+                $errors[] = $safeFailure
+                    ? ($reason instanceof \Throwable ? $reason::class : 'non-throwable rejection')
+                    : ($reason instanceof \Throwable ? $reason->getMessage() : (string) $reason);
             },
         ]);
 
         $pool->promise()->wait();
 
-        $this->assertSame([], $errors, self::serverLogs());
+        $this->assertSame([], $errors, $safeFailure ? 'Production soak command pool rejected a request.' : self::serverLogs());
+    }
+
+    private function measureProductionSoakPhase(int $iteration, string $phase, callable $work): void
+    {
+        $startedAt = hrtime(true);
+        $status = 'failed';
+        try {
+            $work();
+            $status = 'ok';
+        } finally {
+            $duration = (hrtime(true) - $startedAt) / 1_000_000_000;
+            $line = sprintf("%s\t%d\t%s\t%.6f\t%s\n", gmdate('Y-m-d\TH:i:s\Z'), $iteration, $phase, $duration, $status);
+            fwrite(STDOUT, 'Soak phase: ' . trim($line) . "\n");
+            $diagnosticsDir = getenv('S3_TEST_PRODUCTION_SOAK_DIAGNOSTICS_DIR');
+            if ($diagnosticsDir !== false && $diagnosticsDir !== '') {
+                if (file_put_contents($diagnosticsDir . '/phases.tsv', $line, FILE_APPEND | LOCK_EX) === false) {
+                    self::fail('Could not persist production soak phase timing.');
+                }
+                if ($phase === 'get') {
+                    $this->saveProductionSoakReadMetrics($diagnosticsDir, $status === 'ok');
+                }
+            }
+        }
+    }
+
+    private function saveProductionSoakReadMetrics(string $diagnosticsDir, bool $phaseSucceeded): void
+    {
+        $context = stream_context_create(['http' => ['timeout' => 2]]);
+        $metrics = @file_get_contents(sprintf('http://%s:%d/.metrics', self::$host, self::$port), false, $context);
+        if ($metrics === false) {
+            file_put_contents($diagnosticsDir . '/read-metrics-error', "Metrics endpoint unavailable after GET phase.\n", LOCK_EX);
+            if ($phaseSucceeded) {
+                self::fail('Could not capture production soak read metrics.');
+            }
+
+            return;
+        }
+
+        $safeLines = array_filter(
+            explode("\n", $metrics),
+            static fn(string $line): bool => str_starts_with($line, 's3_server_flysystem_read_first_byte_seconds_')
+                || str_starts_with($line, 's3_server_flysystem_read_stage_seconds_'),
+        );
+        if ($safeLines === [] && getenv('S3_TEST_SERVER_STORAGE_DRIVER') === 'flysystem') {
+            file_put_contents($diagnosticsDir . '/read-metrics-error', "No Flysystem first-byte samples after GET phase.\n", LOCK_EX);
+            if ($phaseSucceeded) {
+                self::fail('Production soak read metrics contain no Flysystem first-byte samples.');
+            }
+
+            return;
+        }
+        $snapshot = implode("\n", $safeLines) . "\n";
+        $temporary = $diagnosticsDir . '/read-first-byte.prom.tmp';
+        $handle = @fopen($temporary, 'x');
+        if ($handle === false) {
+            self::fail('Could not create a production soak metrics snapshot.');
+        }
+        $written = fwrite($handle, $snapshot);
+        fclose($handle);
+        if ($written !== strlen($snapshot) || ! rename($temporary, $diagnosticsDir . '/read-first-byte.prom')) {
+            @unlink($temporary);
+            self::fail('Could not persist production soak first-byte metrics.');
+        }
+        @unlink($diagnosticsDir . '/read-metrics-error');
     }
 
     private static function createDeterministicFile(string $prefix, int $bytes, string $seed = 'A'): string
@@ -505,23 +592,58 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         return in_array(strtolower((string) $value), ['1', 'true', 'yes', 'on'], true);
     }
 
-    private static function countFiles(string $path): int
+    private static function productionSoakMemoryBytes(): ?int
     {
-        if (! is_dir($path)) {
-            return 0;
+        // The constrained cgroup peak includes the test client and every
+        // server worker, and captures spikes between workload batches.
+        return self::productionSoakCgroupPeakBytes() ?? self::serverRssBytes();
+    }
+
+    private static function productionSoakCgroupPeakBytes(): ?int
+    {
+        $memoryMax = @file_get_contents('/sys/fs/cgroup/memory.max');
+        if ($memoryMax === false || ! ctype_digit(trim($memoryMax))
+            || (int) trim($memoryMax) > 4 * 1024 * 1024 * 1024) {
+            return null;
         }
 
-        $count = 0;
+        $memoryPeak = @file_get_contents('/sys/fs/cgroup/memory.peak');
+        if ($memoryPeak === false || ! ctype_digit(trim($memoryPeak))) {
+            throw new \RuntimeException('The constrained cgroup-v2 memory.peak metric is unavailable.');
+        }
+
+        return (int) trim($memoryPeak);
+    }
+
+    /** @return list<string> */
+    private static function storageTempArtifacts(string $path): array
+    {
+        if (! is_dir($path)) {
+            return [];
+        }
+
+        $artifacts = [];
         $iterator = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
         );
 
         foreach ($iterator as $file) {
-            if ($file->isFile()) {
-                $count++;
+            if (! $file->isFile()) {
+                continue;
             }
+            $relative = substr($file->getPathname(), strlen($path) + 1);
+            if (in_array($relative, [
+                '.opsfour-s3-storage-budget/budget',
+                '.opsfour-s3-storage-budget/lock',
+                '.opsfour-s3-storage-budget/total',
+            ], true)) {
+                continue;
+            }
+            $artifacts[] = $relative;
         }
 
-        return $count;
+        sort($artifacts);
+
+        return $artifacts;
     }
 }

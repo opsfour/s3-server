@@ -7,11 +7,16 @@ namespace OpsFour\S3Server\Tests\Support;
 use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\BoundedCopyStorageBackend;
+use OpsFour\S3Server\Storage\LimitedReadableStream;
+use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
-final class CallbackStorageBackend implements ShutdownAwareStorageBackend, StorageBackend
+final class CallbackStorageBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, BoundedCopyStorageBackend
 {
     public ?StorageWriteResult $lastWrite = null;
+
+    public ?StorageWriteResult $lastPartWrite = null;
 
     public int $putCalls = 0;
 
@@ -24,6 +29,9 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Stora
         private readonly ?\Closure $afterPut = null,
         private readonly ?\Closure $afterDelete = null,
         private readonly ?\Closure $beforeBucketExists = null,
+        private readonly ?\Closure $beforeDelete = null,
+        private readonly ?\Closure $afterAssemble = null,
+        private readonly ?\Closure $beforeRead = null,
     ) {}
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
@@ -39,11 +47,18 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Stora
 
     public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
     {
+        if ($this->beforeRead !== null) {
+            ($this->beforeRead)($storagePath);
+        }
+
         return $this->delegate->getObjectByPath($storagePath, $offset, $length);
     }
 
     public function deleteObjectByPath(string $storagePath, string $bucket): void
     {
+        if ($this->beforeDelete !== null) {
+            ($this->beforeDelete)($storagePath, $bucket);
+        }
         $this->delegate->deleteObjectByPath($storagePath, $bucket);
         if ($this->afterDelete !== null) {
             ($this->afterDelete)($storagePath, $bucket);
@@ -76,7 +91,7 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Stora
         int $partNumber,
         ReadableStream $data,
     ): StorageWriteResult {
-        return $this->delegate->putPart($bucket, $key, $uploadId, $partNumber, $data);
+        return $this->lastPartWrite = $this->delegate->putPart($bucket, $key, $uploadId, $partNumber, $data);
     }
 
     public function assembleMultipartUpload(
@@ -85,7 +100,42 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Stora
         string $uploadId,
         array $parts,
     ): StorageWriteResult {
-        return $this->delegate->assembleMultipartUpload($bucket, $key, $uploadId, $parts);
+        return $this->lastWrite = $this->delegate->assembleMultipartUpload($bucket, $key, $uploadId, $parts);
+    }
+
+    public function planMultipartCompletionPaths(string $bucket, string $key, string $bucketGeneration, string $attemptId): array
+    {
+        return $this->recoverableDelegate()->planMultipartCompletionPaths($bucket, $key, $bucketGeneration, $attemptId);
+    }
+
+    public function assembleMultipartUploadAtPath(string $bucket, string $key, string $uploadId, array $parts, string $path): StorageWriteResult
+    {
+        $this->lastWrite = $this->recoverableDelegate()->assembleMultipartUploadAtPath($bucket, $key, $uploadId, $parts, $path);
+        if ($this->afterAssemble !== null) {
+            ($this->afterAssemble)($this->lastWrite);
+        }
+
+        return $this->lastWrite;
+    }
+
+    public function putObjectAtPath(string $bucket, string $key, ReadableStream $body, string $path): StorageWriteResult
+    {
+        $this->putCalls++;
+        $this->lastWrite = $this->recoverableDelegate()->putObjectAtPath($bucket, $key, $body, $path);
+        if ($this->afterPut !== null) {
+            ($this->afterPut)($this->lastWrite);
+        }
+
+        return $this->lastWrite;
+    }
+
+    private function recoverableDelegate(): RecoverableMultipartAssemblyBackend
+    {
+        if (! $this->delegate instanceof RecoverableMultipartAssemblyBackend) {
+            throw new \LogicException('Storage backend does not support durable multipart completion paths.');
+        }
+
+        return $this->delegate;
     }
 
     public function abortMultipartUpload(string $bucket, string $key, string $uploadId): void
@@ -97,7 +147,22 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Stora
     {
         $this->copyCalls++;
 
-        return $this->delegate->copyObject($srcPath, $dstBucket, $dstKey);
+        return $this->lastWrite = $this->delegate->copyObject($srcPath, $dstBucket, $dstKey);
+    }
+
+    public function copyObjectBounded(string $srcPath, string $dstBucket, string $dstKey, int $maxBytes): StorageWriteResult
+    {
+        $this->copyCalls++;
+        if ($this->delegate instanceof BoundedCopyStorageBackend) {
+            return $this->lastWrite = $this->delegate->copyObjectBounded($srcPath, $dstBucket, $dstKey, $maxBytes);
+        }
+
+        $source = new LimitedReadableStream($this->delegate->getObjectByPath($srcPath), $maxBytes);
+        try {
+            return $this->lastWrite = $this->delegate->putObject($dstBucket, $dstKey, $source);
+        } finally {
+            $source->close();
+        }
     }
 
     public function shutdown(): void

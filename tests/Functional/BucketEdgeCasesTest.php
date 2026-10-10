@@ -5,6 +5,10 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
+use Aws\Credentials\Credentials;
+use Aws\Signature\S3SignatureV4;
+use GuzzleHttp\Client;
+use GuzzleHttp\Psr7\Request;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 /**
@@ -116,6 +120,73 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
         self::$s3->deleteBucket(['Bucket' => $bucket]);
     }
 
+    public function test_list_buckets_paginates_and_filters_without_losing_or_repeating_buckets(): void
+    {
+        $prefix = 'bucket-page-' . bin2hex(random_bytes(4));
+        $buckets = array_map(static fn(int $number): string => sprintf('%s-%02d', $prefix, $number), range(0, 3));
+        $created = [];
+        try {
+            foreach ($buckets as $index => $bucket) {
+                $request = ['Bucket' => $bucket];
+                if ($index === 3) {
+                    $request['CreateBucketConfiguration'] = ['LocationConstraint' => 'us-west-2'];
+                }
+                self::$s3->createBucket($request);
+                $created[] = $bucket;
+            }
+
+            $first = self::$s3->listBuckets(['MaxBuckets' => 2, 'Prefix' => $prefix]);
+            self::assertSame(array_slice($buckets, 0, 2), array_column($first['Buckets'] ?? [], 'Name'));
+            self::assertSame($prefix, $first['Prefix'] ?? null);
+            self::assertSame('us-east-1', $first['Buckets'][0]['BucketRegion'] ?? null);
+            $token = $first['ContinuationToken'] ?? null;
+            self::assertIsString($token);
+
+            $second = self::$s3->listBuckets(['MaxBuckets' => 2, 'Prefix' => $prefix, 'ContinuationToken' => $token]);
+            self::assertSame(array_slice($buckets, 2), array_column($second['Buckets'] ?? [], 'Name'));
+            self::assertNull($second['ContinuationToken'] ?? null);
+            self::assertSame('us-west-2', $second['Buckets'][1]['BucketRegion'] ?? null);
+
+            $west = self::$s3->listBuckets(['BucketRegion' => 'us-west-2', 'Prefix' => $prefix]);
+            self::assertSame([$buckets[3]], array_column($west['Buckets'] ?? [], 'Name'));
+            self::assertSame([], self::$s3->listBuckets(['Prefix' => $prefix . '%'])['Buckets'] ?? []);
+
+            try {
+                self::$s3->listBuckets(['MaxBuckets' => 2, 'Prefix' => $prefix . '-0', 'ContinuationToken' => $token]);
+                self::fail('A continuation token must be bound to its prefix.');
+            } catch (S3Exception $exception) {
+                self::assertSame('InvalidArgument', $exception->getAwsErrorCode());
+            }
+        } finally {
+            foreach ($created as $bucket) {
+                self::$s3->deleteBucket(['Bucket' => $bucket]);
+            }
+        }
+    }
+
+    #[DataProvider('invalidListBucketsParametersProvider')]
+    public function test_list_buckets_rejects_invalid_pagination_parameters(string $query): void
+    {
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $credentials = new Credentials(self::$accessKey, self::$secretKey);
+        $request = new Request('GET', sprintf('http://%s:%d/?%s', self::$host, self::$port, $query));
+        $response = (new Client(['http_errors' => false]))->send($signer->signRequest($request, $credentials));
+
+        self::assertSame(400, $response->getStatusCode());
+        self::assertStringContainsString('<Code>InvalidArgument</Code>', (string) $response->getBody());
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function invalidListBucketsParametersProvider(): array
+    {
+        return [
+            'zero maximum' => ['max-buckets=0'],
+            'excessive maximum' => ['max-buckets=10001'],
+            'malformed maximum' => ['max-buckets=1junk'],
+            'malformed token' => ['continuation-token=opaque-token'],
+        ];
+    }
+
     // -----------------------------------------------------------------
     // Delete non-empty bucket
     // -----------------------------------------------------------------
@@ -221,9 +292,77 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
 
         $result = self::$s3->getBucketLocation(['Bucket' => $bucket]);
         $this->assertSame(200, $result['@metadata']['statusCode']);
+        // The AWS PHP SDK normalizes S3's empty us-east-1 XML value.
+        $this->assertSame('us-east-1', $result['LocationConstraint']);
 
         // Clean up.
         self::$s3->deleteBucket(['Bucket' => $bucket]);
+    }
+
+    public function test_get_bucket_location_returns_non_default_region_and_missing_bucket_error(): void
+    {
+        $bucket = 'location-west-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket([
+            'Bucket' => $bucket,
+            'CreateBucketConfiguration' => ['LocationConstraint' => 'us-west-2'],
+        ]);
+
+        try {
+            $result = self::$s3->getBucketLocation(['Bucket' => $bucket]);
+            self::assertSame('us-west-2', $result['LocationConstraint']);
+
+            try {
+                self::$s3->getBucketLocation(['Bucket' => 'missing-' . bin2hex(random_bytes(4))]);
+                self::fail('Expected NoSuchBucket.');
+            } catch (S3Exception $error) {
+                self::assertSame(404, $error->getStatusCode());
+                self::assertSame('NoSuchBucket', $error->getAwsErrorCode());
+            }
+        } finally {
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
+    public function test_new_bucket_configuration_reads_have_distinct_empty_and_missing_contracts(): void
+    {
+        $bucket = 'empty-config-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            $versioning = self::$s3->getBucketVersioning(['Bucket' => $bucket]);
+            $this->assertSame(200, $versioning['@metadata']['statusCode']);
+            $this->assertNull($versioning['Status']);
+
+            $notification = self::$s3->getBucketNotificationConfiguration(['Bucket' => $bucket]);
+            $this->assertSame(200, $notification['@metadata']['statusCode']);
+            $this->assertEmpty($notification['TopicConfigurations'] ?? []);
+            $this->assertEmpty($notification['QueueConfigurations'] ?? []);
+            $this->assertEmpty($notification['LambdaFunctionConfigurations'] ?? []);
+
+            $logging = self::$s3->getBucketLogging(['Bucket' => $bucket]);
+            $this->assertSame(200, $logging['@metadata']['statusCode']);
+            $this->assertNull($logging['LoggingEnabled']);
+
+            foreach ([
+                'GetBucketPolicy' => 'NoSuchBucketPolicy',
+                'GetBucketTagging' => 'NoSuchTagSet',
+                'GetBucketLifecycleConfiguration' => 'NoSuchLifecycleConfiguration',
+                'GetBucketCors' => 'NoSuchCORSConfiguration',
+                'GetBucketWebsite' => 'NoSuchWebsiteConfiguration',
+                'GetObjectLockConfiguration' => 'ObjectLockConfigurationNotFoundError',
+                'GetPublicAccessBlock' => 'NoSuchPublicAccessBlockConfiguration',
+            ] as $operation => $errorCode) {
+                try {
+                    self::$s3->execute(self::$s3->getCommand($operation, ['Bucket' => $bucket]));
+                    $this->fail($operation . ' accepted a missing configuration.');
+                } catch (S3Exception $exception) {
+                    $this->assertSame(404, $exception->getStatusCode(), $operation);
+                    $this->assertSame($errorCode, $exception->getAwsErrorCode(), $operation);
+                }
+            }
+        } finally {
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
     }
 
     // -----------------------------------------------------------------

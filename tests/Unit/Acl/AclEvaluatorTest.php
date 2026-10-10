@@ -75,6 +75,7 @@ final class AclEvaluatorTest extends TestCase
         yield 'ListObjectsV2' => [S3Operation::ListObjectsV2];
         yield 'ListObjects' => [S3Operation::ListObjects];
         yield 'ListObjectVersions' => [S3Operation::ListObjectVersions];
+        yield 'ListMultipartUploads' => [S3Operation::ListMultipartUploads];
     }
 
     #[DataProvider('writeOperationsProvider')]
@@ -88,14 +89,11 @@ final class AclEvaluatorTest extends TestCase
     {
         yield 'PutObject' => [S3Operation::PutObject];
         yield 'PostObject' => [S3Operation::PostObject];
-        yield 'DeleteObject' => [S3Operation::DeleteObject];
-        yield 'DeleteObjects' => [S3Operation::DeleteObjects];
         yield 'CopyObject' => [S3Operation::CopyObject];
         yield 'CreateMultipartUpload' => [S3Operation::CreateMultipartUpload];
         yield 'UploadPart' => [S3Operation::UploadPart];
         yield 'UploadPartCopy' => [S3Operation::UploadPartCopy];
         yield 'CompleteMultipartUpload' => [S3Operation::CompleteMultipartUpload];
-        yield 'AbortMultipartUpload' => [S3Operation::AbortMultipartUpload];
     }
 
     #[DataProvider('readAcpOperationsProvider')]
@@ -133,6 +131,9 @@ final class AclEvaluatorTest extends TestCase
     /** @return iterable<string, array{S3Operation}> */
     public static function configOperationsProvider(): iterable
     {
+        yield 'DeleteObject uses per-key authorization' => [S3Operation::DeleteObject];
+        yield 'DeleteObjects uses per-key authorization' => [S3Operation::DeleteObjects];
+        yield 'AbortMultipartUpload uses upload ownership or bucket policy' => [S3Operation::AbortMultipartUpload];
         yield 'CreateBucket' => [S3Operation::CreateBucket];
         yield 'GetBucketVersioning' => [S3Operation::GetBucketVersioning];
         yield 'PutBucketPolicy' => [S3Operation::PutBucketPolicy];
@@ -160,7 +161,7 @@ final class AclEvaluatorTest extends TestCase
             $classified[] = $operation->value;
         }
 
-        $this->assertCount(66, $classified);
+        $this->assertCount(69, $classified);
         $this->assertSame(
             array_map(static fn(S3Operation $operation): string => $operation->value, S3Operation::cases()),
             $classified,

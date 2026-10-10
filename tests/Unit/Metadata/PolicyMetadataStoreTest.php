@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
 use OpsFour\S3Server\Metadata\Schema\SqliteSchema;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Exception\MalformedPolicyException;
 use PHPUnit\Framework\TestCase;
 
 final class PolicyMetadataStoreTest extends TestCase
@@ -66,6 +67,36 @@ final class PolicyMetadataStoreTest extends TestCase
         $this->assertNull($this->store->getNamedPolicy('readonly'));
     }
 
+    public function test_invalid_direct_policy_replacement_preserves_existing_rows(): void
+    {
+        $valid = self::policyJson('s3:GetObject');
+        $invalid = '{"Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"*","Condition":{"StringEquals":{"aws:UserAgent":[]}}}]}';
+        $this->store->putAccountPolicy('tenant-a', $valid);
+        $this->store->putNamedPolicy('readonly', $valid);
+
+        foreach ([
+            fn() => $this->store->putAccountPolicy('tenant-a', $invalid),
+            fn() => $this->store->putNamedPolicy('readonly', $invalid),
+            fn() => $this->store->putAccountPolicy('tenant-new', $invalid),
+            fn() => $this->store->putNamedPolicy('new', $invalid),
+        ] as $write) {
+            try {
+                $write();
+                self::fail('Expected malformed direct policy to be rejected.');
+            } catch (MalformedPolicyException) {
+            }
+        }
+
+        self::assertSame($valid, $this->store->getAccountPolicy('tenant-a'));
+        self::assertSame($valid, $this->store->getNamedPolicy('readonly'));
+        self::assertNull($this->store->getAccountPolicy('tenant-new'));
+        self::assertNull($this->store->getNamedPolicy('new'));
+        $this->store->putAccountPolicy('tenant-a', '{"Statement":[]}');
+        $this->store->putNamedPolicy('readonly', '{"Statement":[]}');
+        self::assertSame('{"Statement":[]}', $this->store->getAccountPolicy('tenant-a'));
+        self::assertSame('{"Statement":[]}', $this->store->getNamedPolicy('readonly'));
+    }
+
     public function test_schema_migrates_to_current_policy_version(): void
     {
         $this->assertSame(SqliteSchema::VERSION, $this->schemaVersion());
@@ -99,7 +130,6 @@ final class PolicyMetadataStoreTest extends TestCase
     {
         $reflection = new \ReflectionClass($this->store);
         $method = $reflection->getMethod('connection');
-        $method->setAccessible(true);
 
         /** @var \PDO $pdo */
         $pdo = $method->invoke($this->store);

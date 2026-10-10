@@ -44,6 +44,30 @@ final class RedisMasterKeyProviderTest extends TestCase
         self::assertSame($key, $provider->getMasterKey());
     }
 
+    public function test_numeric_master_key_id_remains_resolvable(): void
+    {
+        $key = str_repeat('n', 32);
+        $provider = new RedisMasterKeyProvider(redisClient: self::client([
+            'HGETALL:s3:master-keys' => ['123', base64_encode($key)],
+            'GET:s3:active-key-id' => '123',
+        ]));
+
+        self::assertSame('123', $provider->getKeyId());
+        self::assertSame($key, $provider->getMasterKeyById('123'));
+    }
+
+    public function test_numeric_master_key_id_in_associative_redis_response_remains_resolvable(): void
+    {
+        $key = str_repeat('n', 32);
+        $provider = new RedisMasterKeyProvider(redisClient: self::client([
+            'HGETALL:s3:master-keys' => ['123' => base64_encode($key)],
+            'GET:s3:active-key-id' => '123',
+        ]));
+
+        self::assertSame('123', $provider->getKeyId());
+        self::assertSame($key, $provider->getMasterKey());
+    }
+
     public function test_multi_key_configuration_fails_closed_without_active_key(): void
     {
         $this->expectException(\RuntimeException::class);
@@ -70,25 +94,55 @@ final class RedisMasterKeyProviderTest extends TestCase
         new RedisMasterKeyProvider(redisClient: new RedisClient($link));
     }
 
+    public function test_transport_failures_do_not_expose_client_secrets(): void
+    {
+        $sentinel = 'redis://user:password-sentinel@redis.internal';
+        foreach ([
+            'HGETALL:s3:master-keys' => [
+                'HGETALL:s3:master-keys' => new \RuntimeException($sentinel),
+            ],
+            'GET:s3:active-key-id' => [
+                'HGETALL:s3:master-keys' => ['active', base64_encode(str_repeat('a', 32))],
+                'GET:s3:active-key-id' => new \RuntimeException($sentinel),
+            ],
+            'GET:legacy' => [
+                'HGETALL:s3:master-keys' => [],
+                'GET:legacy' => new \RuntimeException($sentinel),
+            ],
+        ] as $stage => $responses) {
+            try {
+                new RedisMasterKeyProvider(keyName: 'legacy', redisClient: self::client($responses));
+                self::fail("Expected {$stage} to fail.");
+            } catch (\RuntimeException $e) {
+                self::assertSame('Unable to read master keys from Redis.', $e->getMessage(), $stage);
+                self::assertNull($e->getPrevious(), $stage);
+                self::assertStringNotContainsString('password-sentinel', (string) $e, $stage);
+            }
+        }
+    }
+
     /**
-     * @param array<string, int|string|list<mixed>|null> $responses
+     * @param array<string, int|string|array<int|string, mixed>|\Throwable|null> $responses
      */
     private static function client(array $responses): RedisClient
     {
         $link = new class ($responses) implements RedisLink {
-            /** @param array<string, int|string|list<mixed>|null> $responses */
+            /** @param array<string, int|string|array<int|string, mixed>|\Throwable|null> $responses */
             public function __construct(private readonly array $responses) {}
 
             public function execute(string $command, array $parameters): RedisResponse
             {
                 $key = strtoupper($command) . ':' . implode(':', $parameters);
                 $value = $this->responses[$key] ?? null;
+                if ($value instanceof \Throwable) {
+                    throw $value;
+                }
 
                 return new class ($value) implements RedisResponse {
-                    /** @param int|string|list<mixed>|null $value */
+                    /** @param int|string|array<int|string, mixed>|null $value */
                     public function __construct(private readonly int|string|array|null $value) {}
 
-                    /** @return int|string|list<mixed>|null */
+                    /** @return int|string|array<int|string, mixed>|null */
                     public function unwrap(): int|string|array|null
                     {
                         return $this->value;

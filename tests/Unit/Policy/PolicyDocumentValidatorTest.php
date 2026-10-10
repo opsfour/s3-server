@@ -30,6 +30,61 @@ final class PolicyDocumentValidatorTest extends TestCase
         $this->addToAssertionCount(1);
     }
 
+    public function test_accepts_boolean_condition_values(): void
+    {
+        PolicyDocumentValidator::validateBucketPolicy(json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => '*',
+                'Condition' => [
+                    'Bool' => ['aws:SecureTransport' => true],
+                    'Null' => ['aws:PrincipalArn' => 'false'],
+                ],
+            ]],
+        ], JSON_THROW_ON_ERROR));
+
+        $this->addToAssertionCount(1);
+    }
+
+    public function test_identity_policy_accepts_empty_statements_and_supported_selectors(): void
+    {
+        foreach ([
+            ['Statement' => []],
+            ['Statement' => [
+                'Effect' => 'Allow', 'Action' => 's3:GetObject', 'Resource' => '*',
+            ]],
+            ['Statement' => [[
+                'Effect' => 'Deny', 'NotPrincipal' => 'tenant:excepted',
+                'NotAction' => 's3:ListBucket', 'NotResource' => 'arn:aws:s3:::safe',
+                'Condition' => ['StringEquals' => ['aws:UserAgent' => ['client-a', 'client-b']]],
+            ]]],
+        ] as $policy) {
+            PolicyDocumentValidator::validateIdentityPolicy(json_encode($policy, JSON_THROW_ON_ERROR));
+            $this->addToAssertionCount(1);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidIdentityPolicies(): iterable
+    {
+        yield 'invalid JSON' => ['{'];
+        yield 'missing Statement' => ['{}'];
+        yield 'unknown statement field' => ['{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*","Condtion":{}}]}'];
+        yield 'missing Action' => ['{"Statement":[{"Effect":"Deny","Resource":"*"}]}'];
+        yield 'both principals' => ['{"Statement":[{"Effect":"Allow","Principal":"*","NotPrincipal":"x","Action":"s3:*","Resource":"*"}]}'];
+        yield 'malformed condition' => ['{"Statement":[{"Effect":"Deny","Action":"s3:*","Resource":"*","Condition":{"StringEquals":{"aws:UserAgent":[]}}}]}'];
+        yield 'unsupported condition' => ['{"Statement":[{"Effect":"Deny","Action":"s3:*","Resource":"*","Condition":{"ArnEquals":{"aws:PrincipalArn":"x"}}}]}'];
+    }
+
+    #[DataProvider('invalidIdentityPolicies')]
+    public function test_identity_policy_rejects_invalid_document(string $policy): void
+    {
+        $this->expectException(MalformedPolicyException::class);
+        PolicyDocumentValidator::validateIdentityPolicy($policy);
+    }
+
     /**
      * @return iterable<string, array{array<string, mixed>}>
      */
@@ -64,6 +119,26 @@ final class PolicyDocumentValidatorTest extends TestCase
             'Resource' => '*',
             'Condition' => [],
         ]]]];
+        foreach ([
+            'invalid null value' => ['Null' => ['aws:PrincipalArn' => 'maybe']],
+            'numeric null value' => ['Null' => ['aws:PrincipalArn' => 1]],
+            'array null value' => ['Null' => ['aws:PrincipalArn' => ['true']]],
+            'invalid bool value' => ['Bool' => ['aws:SecureTransport' => 'maybe']],
+            'invalid source IP' => ['IpAddress' => ['aws:SourceIp' => 'not-an-ip']],
+            'invalid negated CIDR' => ['NotIpAddress' => ['aws:SourceIp' => '192.0.2.0/99']],
+            'invalid numeric threshold' => ['NumericLessThan' => ['s3:max-keys' => 'many']],
+            'infinite numeric threshold' => ['NumericGreaterThan' => ['s3:max-keys' => '1e309']],
+            'invalid date threshold' => ['DateLessThan' => ['aws:CurrentTime' => 'never-ever']],
+            'relative date threshold' => ['DateLessThan' => ['aws:CurrentTime' => 'tomorrow']],
+        ] as $name => $condition) {
+            yield $name => [['Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => '*',
+                'Condition' => $condition,
+            ]]]];
+        }
     }
 
     /**

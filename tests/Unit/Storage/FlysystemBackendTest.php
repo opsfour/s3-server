@@ -5,12 +5,18 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableStream;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Flysystem\Filesystem;
+use League\Flysystem\Config;
+use League\Flysystem\FilesystemOperator;
+use League\Flysystem\UnableToDeleteDirectory;
+use League\Flysystem\UnableToDeleteFile;
+use League\Flysystem\UnableToReadFile;
 use League\Uri\Http;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
@@ -29,6 +35,334 @@ use function Amp\Future\await as awaitFutures;
 
 final class FlysystemBackendTest extends TestCase
 {
+    public function test_bucket_operations_reject_path_segments_that_normalize_into_other_namespaces(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        foreach (['safe/../other', '../other', '.parts', ''] as $bucket) {
+            foreach ([
+                static fn() => $backend->createBucket($bucket),
+                static fn() => $backend->bucketExists($bucket),
+            ] as $operation) {
+                try {
+                    $operation();
+                    self::fail('Invalid bucket path segment must be rejected.');
+                } catch (\InvalidArgumentException) {
+                }
+            }
+        }
+
+        self::assertFalse($backend->bucketExists('__health_check__'));
+        self::assertFalse($filesystem->directoryExists('other'));
+    }
+
+    public function test_exact_delete_accepts_safe_internal_bucket_path_segment(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $filesystem->write('__health_check__/path', 'keep');
+
+        (new FlysystemBackend($filesystem, $this->tempDir))
+            ->deleteObjectByPath('__health_check__/path', '__health_check__');
+
+        self::assertFalse($filesystem->fileExists('__health_check__/path'));
+    }
+
+    public function test_object_write_copy_and_assembly_destinations_reject_bucket_traversal(): void
+    {
+        $adapter = new InMemoryFlysystemAdapter();
+        $backend = new FlysystemBackend(new Filesystem($adapter), $this->tempDir);
+        $source = $backend->putObject('source', 'key', new ReadableBuffer('source'));
+
+        foreach ([
+            static fn() => $backend->putObject('safe/../other', 'key', new ReadableBuffer('bad')),
+            static fn() => $backend->copyObject($source->path, 'safe/../other', 'key'),
+            static fn() => $backend->assembleMultipartUpload('safe/../other', 'key', 'upload', []),
+        ] as $operation) {
+            try {
+                $operation();
+                self::fail('Invalid destination bucket must be rejected.');
+            } catch (\InvalidArgumentException) {
+                self::assertSame([$source->path], $adapter->paths());
+            }
+        }
+    }
+
+    public function test_planned_multipart_assembly_rejects_foreign_bucket_or_key_scope(): void
+    {
+        $adapter = new InMemoryFlysystemAdapter();
+        $backend = new FlysystemBackend(new Filesystem($adapter), $this->tempDir);
+        $paths = $backend->planMultipartCompletionPaths('bucket', 'key', bin2hex(random_bytes(16)), bin2hex(random_bytes(16)));
+
+        foreach ([['other', 'key'], ['bucket', 'other-key']] as [$bucket, $key]) {
+            try {
+                $backend->assembleMultipartUploadAtPath($bucket, $key, 'upload', [], $paths['final']);
+                self::fail('Foreign planned assembly path must be rejected.');
+            } catch (\InvalidArgumentException) {
+                self::assertSame([], $adapter->paths());
+            }
+        }
+    }
+
+    public function test_read_rejects_normalized_traversal_before_adapter_access(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $filesystem->write('other/path', 'keep');
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        foreach (['bucket/../other/path', 'bucket\\..\\other\\path', '/other/path'] as $path) {
+            try {
+                $backend->getObjectByPath($path);
+                self::fail('Malformed stored path must not be read.');
+            } catch (\InvalidArgumentException) {
+                self::assertSame('keep', $filesystem->read('other/path'));
+            }
+        }
+    }
+
+    public function test_delete_rejects_foreign_bucket_and_normalized_traversal(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $filesystem->write('other/path', 'keep');
+        $filesystem->write('.assemblies/other/path', 'keep assembly');
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        foreach (['other/path', 'bucket/../other/path', 'bucket\\..\\other\\path', '.assemblies/other/path'] as $path) {
+            try {
+                $backend->deleteObjectByPath($path, 'bucket');
+                self::fail('Foreign or malformed stored path must not be deleted.');
+            } catch (\InvalidArgumentException) {
+                self::assertSame('keep', $filesystem->read('other/path'));
+                self::assertSame('keep assembly', $filesystem->read('.assemblies/other/path'));
+            }
+        }
+    }
+
+    public function test_copy_source_rejects_path_that_normalizes_into_another_bucket(): void
+    {
+        $adapter = new InMemoryFlysystemAdapter();
+        $filesystem = new Filesystem($adapter);
+        $filesystem->write('other/path', 'keep');
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        $this->expectException(\InvalidArgumentException::class);
+        try {
+            $backend->copyObject('bucket/../other/path', 'bucket', 'copy');
+        } finally {
+            self::assertSame(['other/path'], $adapter->paths());
+        }
+    }
+
+    public function test_multipart_assembly_rejects_part_path_that_normalizes_into_another_bucket(): void
+    {
+        $adapter = new InMemoryFlysystemAdapter();
+        $filesystem = new Filesystem($adapter);
+        $filesystem->write('other/part', 'part');
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        $this->expectException(\InvalidArgumentException::class);
+        try {
+            $backend->assembleMultipartUpload('bucket', 'key', 'upload', [
+                ['partNumber' => 1, 'etag' => md5('part'), 'storagePath' => 'bucket/../other/part'],
+            ]);
+        } finally {
+            self::assertSame(['other/part'], $adapter->paths());
+        }
+    }
+
+    public function test_delete_failure_is_reported_when_remote_file_still_exists(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('delete')
+            ->willThrowException(UnableToDeleteFile::atLocation('bucket/path'));
+        $filesystem->expects(self::once())->method('fileExists')
+            ->with('bucket/path')->willReturn(true);
+
+        $this->expectException(InternalErrorException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->deleteObjectByPath('bucket/path', 'bucket');
+    }
+
+    public function test_delete_failure_is_idempotent_when_remote_file_is_gone(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('delete')
+            ->willThrowException(UnableToDeleteFile::atLocation('bucket/path'));
+        $filesystem->expects(self::once())->method('fileExists')
+            ->with('bucket/path')->willReturn(false);
+
+        (new FlysystemBackend($filesystem, $this->tempDir))->deleteObjectByPath('bucket/path', 'bucket');
+    }
+
+    public function test_multipart_directory_failure_keeps_cleanup_retryable(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('deleteDirectory')
+            ->willThrowException(UnableToDeleteDirectory::atLocation('.parts/upload'));
+        $filesystem->expects(self::once())->method('directoryExists')
+            ->with('.parts/upload')->willReturn(true);
+
+        $this->expectException(InternalErrorException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->abortMultipartUpload('bucket', 'key', 'upload');
+    }
+
+    public function test_malformed_upload_id_cannot_turn_part_abort_into_root_deletion(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $filesystem->write('unrelated-bucket/object', 'keep');
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+        foreach (['..', '../unrelated-bucket', 'safe/../..', 'safe\\..', ''] as $uploadId) {
+            try {
+                $backend->abortMultipartUpload('bucket', 'key', $uploadId);
+                self::fail('Malformed upload ID must fail before directory deletion.');
+            } catch (\InvalidArgumentException) {
+            }
+            self::assertSame('keep', $filesystem->read('unrelated-bucket/object'));
+
+            try {
+                $backend->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer('bad'));
+                self::fail('Malformed upload ID must fail before part placement.');
+            } catch (\InvalidArgumentException) {
+            }
+            self::assertSame('keep', $filesystem->read('unrelated-bucket/object'));
+        }
+    }
+
+    public function test_name_only_bucket_deletion_never_touches_an_existing_namespace(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::never())->method('deleteDirectory');
+        $filesystem->expects(self::never())->method('directoryExists');
+
+        $this->expectException(\LogicException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->deleteBucket('bucket');
+    }
+
+    public function test_name_only_bucket_deletion_does_not_probe_an_absent_namespace(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::never())->method('deleteDirectory');
+        $filesystem->expects(self::never())->method('directoryExists');
+
+        $this->expectException(\LogicException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->deleteBucket('bucket');
+    }
+
+    public function test_remote_read_failure_is_not_reported_as_missing_object(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('readStream')
+            ->willThrowException(UnableToReadFile::fromLocation('bucket/path'));
+        $filesystem->expects(self::once())->method('fileExists')
+            ->with('bucket/path')->willReturn(true);
+
+        $this->expectException(InternalErrorException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path');
+    }
+
+    public function test_cancelled_remote_read_does_not_probe_existence_or_become_missing_object(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('readStream')
+            ->willThrowException(new \Amp\CancelledException());
+        $filesystem->expects(self::never())->method('fileExists');
+
+        $this->expectException(\Amp\CancelledException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path');
+    }
+
+    public function test_cancelled_existence_probe_after_read_failure_propagates_cancellation(): void
+    {
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('readStream')
+            ->willThrowException(UnableToReadFile::fromLocation('bucket/path'));
+        $filesystem->expects(self::once())->method('fileExists')
+            ->willThrowException(new \Amp\CancelledException());
+
+        $this->expectException(\Amp\CancelledException::class);
+        (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path');
+    }
+
+    public function test_nonseekable_range_waits_for_transient_empty_read_before_skipping_offset(): void
+    {
+        $scheme = 's3transientrange';
+        self::assertTrue(stream_wrapper_register($scheme, FlysystemTransientEmptyStream::class));
+        try {
+            $resource = fopen($scheme . '://data', 'r');
+            self::assertIsResource($resource);
+            $filesystem = $this->createMock(FilesystemOperator::class);
+            $filesystem->method('readStream')->willReturn($resource);
+
+            $range = (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path', 3, 3);
+            self::assertSame('def', self::readAll($range));
+        } finally {
+            stream_wrapper_unregister($scheme);
+        }
+    }
+
+    public function test_nonseekable_range_rejects_eof_before_requested_offset(): void
+    {
+        $scheme = 's3shortrange';
+        self::assertTrue(stream_wrapper_register($scheme, FlysystemTransientEmptyStream::class));
+        try {
+            $resource = fopen($scheme . '://data', 'r');
+            self::assertIsResource($resource);
+            $filesystem = $this->createMock(FilesystemOperator::class);
+            $filesystem->method('readStream')->willReturn($resource);
+
+            $this->expectException(InternalErrorException::class);
+            (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path', 8, 1);
+        } finally {
+            stream_wrapper_unregister($scheme);
+        }
+    }
+
+    public function test_seekable_file_range_rejects_offset_beyond_physical_eof(): void
+    {
+        $path = $this->tempDir . '/short-object';
+        file_put_contents($path, 'abcdef');
+        $resource = fopen($path, 'rb');
+        self::assertIsResource($resource);
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->method('readStream')->willReturn($resource);
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path', 8, 1);
+            self::fail('A physical object shorter than the range offset must be rejected.');
+        } catch (InternalErrorException) {
+            self::assertFalse(is_resource($resource), 'The rejected stream must be closed.');
+        }
+    }
+
+    public function test_seekable_file_range_rejects_positive_length_starting_at_physical_eof(): void
+    {
+        $path = $this->tempDir . '/short-object';
+        file_put_contents($path, 'abcdef');
+        $resource = fopen($path, 'rb');
+        self::assertIsResource($resource);
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->method('readStream')->willReturn($resource);
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path', 6, 1);
+            self::fail('A nonempty range starting at physical EOF must be rejected.');
+        } catch (InternalErrorException) {
+            self::assertFalse(is_resource($resource), 'The rejected stream must be closed.');
+        }
+    }
+
+    public function test_seekable_file_allows_zero_length_slice_at_physical_eof(): void
+    {
+        $path = $this->tempDir . '/short-object';
+        file_put_contents($path, 'abcdef');
+        $resource = fopen($path, 'rb');
+        self::assertIsResource($resource);
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->method('readStream')->willReturn($resource);
+
+        $slice = (new FlysystemBackend($filesystem, $this->tempDir))->getObjectByPath('bucket/path', 6, 0);
+        self::assertSame('', self::readAll($slice));
+    }
     private InMemoryFlysystemAdapter $adapter;
 
     private FlysystemBackend $backend;
@@ -78,6 +412,140 @@ final class FlysystemBackendTest extends TestCase
         $this->backend->getObjectByPath($result->path);
     }
 
+    public function test_planned_part_uses_exact_adapter_path_and_can_be_reconciled_after_late_write(): void
+    {
+        $uploadId = bin2hex(random_bytes(16));
+        $generation = bin2hex(random_bytes(16));
+        $path = $this->backend->planMultipartPartPath('bucket', $generation, $uploadId, 1, bin2hex(random_bytes(16)));
+        $result = $this->backend->putPartAtPath('bucket', 'key', $uploadId, 1, new ReadableBuffer('ciphertext'), $path);
+        self::assertSame($path, $result->path);
+        self::assertSame('ciphertext', $this->adapter->contents($path));
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+
+        $this->backend->deleteObjectByPath($path, 'bucket');
+        self::assertFalse($this->adapter->fileExists($path));
+        $this->backend->putPartAtPath('bucket', 'key', $uploadId, 1, new ReadableBuffer('late ciphertext'), $path);
+        self::assertSame('late ciphertext', $this->adapter->contents($path));
+        $this->backend->deleteObjectByPath($path, 'bucket');
+        self::assertFalse($this->adapter->fileExists($path));
+    }
+
+    public function test_planned_object_write_uses_exact_adapter_path_and_rejects_other_scope(): void
+    {
+        $generation = bin2hex(random_bytes(16));
+        $attempt = bin2hex(random_bytes(16));
+        $path = $this->backend->planObjectWritePath('bucket', 'key', $generation, $attempt);
+
+        foreach ([['other-bucket', 'key', $path], ['bucket', 'other-key', $path], ['bucket', 'key', 'bucket/../escape']] as [$bucket, $key, $invalid]) {
+            try {
+                $this->backend->putObjectAtPath($bucket, $key, new ReadableBuffer('wrong'), $invalid);
+                self::fail('Invalid planned object path must be rejected before adapter I/O.');
+            } catch (\InvalidArgumentException) {
+            }
+        }
+        self::assertSame([], $this->adapter->paths());
+
+        $write = $this->backend->putObjectAtPath('bucket', 'key', new ReadableBuffer('planned'), $path);
+        self::assertSame($path, $write->path);
+        self::assertSame('planned', $this->adapter->contents($path));
+        self::assertSame(1, $this->adapter->writeStreamCalls);
+    }
+
+    public function test_completion_object_write_rejects_foreign_bucket_and_key_hash(): void
+    {
+        $generation = bin2hex(random_bytes(16));
+        $attempt = bin2hex(random_bytes(16));
+        $foreignBucket = $this->backend->planMultipartCompletionPaths('foreign', 'key', $generation, $attempt);
+        $foreignKey = $this->backend->planMultipartCompletionPaths('bucket', 'other-key', $generation, $attempt);
+
+        foreach ([$foreignBucket['assembly'], $foreignBucket['final'], $foreignKey['assembly'], $foreignKey['final']] as $path) {
+            try {
+                $this->backend->putObjectAtPath('bucket', 'key', new ReadableBuffer('wrong'), $path);
+                self::fail('Foreign multipart completion path must be rejected before adapter I/O.');
+            } catch (\InvalidArgumentException) {
+            }
+        }
+        self::assertSame([], $this->adapter->paths());
+
+        $valid = $this->backend->planMultipartCompletionPaths('bucket', 'key', $generation, $attempt);
+        self::assertSame($valid['final'], $this->backend->putObjectAtPath('bucket', 'key', new ReadableBuffer('final'), $valid['final'])->path);
+    }
+
+    public function test_forged_planned_part_upload_id_cannot_escape_part_directory(): void
+    {
+        $path = '.parts/../1-' . bin2hex(random_bytes(16)) . '-' . bin2hex(random_bytes(16));
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->backend->putPartAtPath('bucket', 'key', '..', 1, new ReadableBuffer('forged'), $path);
+    }
+
+    public function test_missing_configured_temp_directory_rejects_object_before_read_or_remote_write(): void
+    {
+        $missingDirectory = $this->tempDir . '/missing';
+        $body = $this->createMock(ReadableStream::class);
+        $body->expects(self::never())->method('read');
+        $systemTempBefore = glob(sys_get_temp_dir() . '/s3put_*') ?: [];
+
+        try {
+            (new FlysystemBackend(new Filesystem($this->adapter), $missingDirectory))
+                ->putObject('bucket', 'object', $body);
+            self::fail('A missing configured staging directory must reject the upload.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to create Flysystem temporary file.', $error->getMessage());
+        }
+
+        self::assertSame($systemTempBefore, glob(sys_get_temp_dir() . '/s3put_*') ?: []);
+        self::assertSame(0, $this->adapter->writeStreamCalls);
+        self::assertSame([], $this->adapter->paths());
+    }
+
+    public function test_non_directory_temp_path_rejects_part_before_read_or_remote_write(): void
+    {
+        $notDirectory = $this->tempDir . '/not-a-directory';
+        file_put_contents($notDirectory, 'sentinel');
+        $body = $this->createMock(ReadableStream::class);
+        $body->expects(self::never())->method('read');
+        $systemTempBefore = glob(sys_get_temp_dir() . '/s3part_*') ?: [];
+
+        try {
+            (new FlysystemBackend(new Filesystem($this->adapter), $notDirectory))
+                ->putPart('bucket', 'object', 'upload', 1, $body);
+            self::fail('An invalid configured staging directory must reject the part.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to create Flysystem temporary file.', $error->getMessage());
+        }
+
+        self::assertSame('sentinel', file_get_contents($notDirectory));
+        self::assertSame($systemTempBefore, glob(sys_get_temp_dir() . '/s3part_*') ?: []);
+        self::assertSame(0, $this->adapter->writeStreamCalls);
+        self::assertSame([], $this->adapter->paths());
+    }
+
+    public function test_valid_configured_temp_directory_stages_privately_and_writes_object(): void
+    {
+        $readCount = 0;
+        $body = $this->createMock(ReadableStream::class);
+        $body->expects(self::exactly(2))->method('read')->willReturnCallback(
+            function () use (&$readCount): ?string {
+                if ($readCount++ > 0) {
+                    return null;
+                }
+
+                $paths = glob($this->tempDir . '/s3put_*') ?: [];
+                self::assertCount(1, $paths);
+                self::assertSame(0600, fileperms($paths[0]) & 0777);
+
+                return 'private payload';
+            },
+        );
+
+        $result = $this->backend->putObject('bucket', 'object', $body);
+
+        self::assertSame('private payload', $this->adapter->contents($result->path));
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+        self::assertSame(1, $this->adapter->writeStreamCalls);
+    }
+
     public function test_multipart_assembly_uses_configured_temp_dir_and_cleans_up_parts(): void
     {
         $this->backend->createBucket('bucket');
@@ -106,6 +574,30 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame([], array_values(array_filter(
             $this->adapter->paths(),
             static fn(string $path): bool => str_starts_with($path, ".parts/{$uploadId}/"),
+        )));
+    }
+
+    public function test_multipart_assembly_rejects_part_bytes_changed_after_upload(): void
+    {
+        $uploadId = bin2hex(random_bytes(8));
+        $part = $this->backend->putPart('bucket', 'object.bin', $uploadId, 1, new ReadableBuffer('original'));
+        $this->adapter->write($part->path, 'tampered', new Config());
+
+        try {
+            $this->backend->assembleMultipartUpload('bucket', 'object.bin', $uploadId, [[
+                'partNumber' => 1,
+                'etag' => $part->md5Hex,
+                'storagePath' => $part->path,
+            ]]);
+            self::fail('Changed part bytes were accepted.');
+        } catch (InternalErrorException $error) {
+            self::assertStringContainsString('checksum verification', $error->getMessage());
+        }
+
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+        self::assertSame([], array_values(array_filter(
+            $this->adapter->paths(),
+            static fn(string $path): bool => str_starts_with($path, 'bucket/'),
         )));
     }
 
@@ -154,18 +646,92 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame(hash('md5', 'copy me'), $copy->md5Hex);
     }
 
+    public function test_bounded_copy_streams_only_the_limit_plus_detection_byte(): void
+    {
+        $this->backend->createBucket('bucket');
+        $source = $this->backend->putObject('bucket', 'source.txt', new ReadableBuffer(str_repeat('x', 1_000_000)));
+
+        $copy = $this->backend->copyObjectBounded($source->path, 'bucket', 'copy.txt', 4);
+
+        self::assertSame(4, $copy->size);
+        self::assertSame('xxxx', self::readAll($this->backend->getObjectByPath($copy->path)));
+        self::assertSame(0, $this->adapter->copyCalls);
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+    }
+
     public function test_remote_write_failure_is_reported_and_does_not_leave_partial_file(): void
     {
-        $this->adapter->failNextWriteStreamReason = 'simulated remote outage';
-
-        $this->expectException(InternalErrorException::class);
-        $this->expectExceptionMessage('simulated remote outage');
+        $sentinel = 'storage-token=secret-sentinel';
+        $this->adapter->failNextWriteStreamReason = $sentinel;
 
         try {
             $this->backend->putObject('bucket', 'broken.bin', new ReadableBuffer('payload'));
+            self::fail('The adapter write failure must be reported.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to write object to Flysystem backend.', $error->getMessage());
+            self::assertStringNotContainsString($sentinel, $error->getMessage());
+            self::assertNotNull($error->getPrevious());
+            self::assertStringContainsString($sentinel, $error->getPrevious()->getMessage());
         } finally {
             self::assertSame([], $this->adapter->paths());
         }
+    }
+
+    public function test_failed_object_write_removes_bytes_left_by_the_adapter(): void
+    {
+        $this->adapter->failNextWriteStreamAfterWriteReason = 'failure after object bytes';
+
+        try {
+            $this->backend->putObject('bucket', 'broken.bin', new ReadableBuffer('partial object'));
+            self::fail('The adapter failure must be reported.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to write object to Flysystem backend.', $error->getMessage());
+            self::assertNotNull($error->getPrevious());
+            self::assertStringContainsString('failure after object bytes', $error->getPrevious()->getMessage());
+        }
+
+        self::assertSame([], $this->adapter->paths());
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+    }
+
+    public function test_failed_part_write_removes_bytes_left_by_the_adapter(): void
+    {
+        $this->adapter->failNextWriteStreamAfterWriteReason = 'failure after part bytes';
+
+        try {
+            $this->backend->putPart('bucket', 'broken.bin', 'abcdef123456', 1, new ReadableBuffer('partial part'));
+            self::fail('The adapter failure must be reported.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to write multipart part to Flysystem backend.', $error->getMessage());
+            self::assertNotNull($error->getPrevious());
+            self::assertStringContainsString('failure after part bytes', $error->getPrevious()->getMessage());
+        }
+
+        self::assertSame([], $this->adapter->paths());
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+    }
+
+    public function test_failed_multipart_assembly_write_removes_only_its_partial_object(): void
+    {
+        $part = $this->backend->putPart('bucket', 'broken.bin', 'abcdef123456', 1, new ReadableBuffer('committed part'));
+        $this->adapter->failNextWriteStreamAfterWriteReason = 'failure after assembled bytes';
+
+        try {
+            $this->backend->assembleMultipartUpload('bucket', 'broken.bin', 'abcdef123456', [[
+                'partNumber' => 1,
+                'etag' => $part->md5Hex,
+                'storagePath' => $part->path,
+            ]]);
+            self::fail('The adapter failure must be reported.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Failed to write assembled multipart object to Flysystem backend.', $error->getMessage());
+            self::assertNotNull($error->getPrevious());
+            self::assertStringContainsString('failure after assembled bytes', $error->getPrevious()->getMessage());
+        }
+
+        self::assertSame([$part->path], $this->adapter->paths());
+        self::assertSame('committed part', $this->adapter->contents($part->path));
+        self::assertSame([], self::temporaryFiles($this->tempDir));
     }
 
     /** @return list<string> */
@@ -301,4 +867,49 @@ final class FlysystemBackendTestClient implements Client
     }
 
     public function onClose(\Closure $onClose): void {}
+}
+
+/** Nonseekable adapter stream with one would-block read before its bytes arrive. */
+final class FlysystemTransientEmptyStream
+{
+    public mixed $context;
+
+    private int $position = 0;
+
+    private bool $firstRead = true;
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$openedPath): bool
+    {
+        return true;
+    }
+
+    public function stream_read(int $count): string
+    {
+        if ($this->firstRead) {
+            $this->firstRead = false;
+
+            return '';
+        }
+
+        $chunk = substr('abcdef', $this->position, $count);
+        $this->position += strlen($chunk);
+
+        return $chunk;
+    }
+
+    public function stream_eof(): bool
+    {
+        return $this->position >= 6;
+    }
+
+    public function stream_set_option(int $option, int $arg1, ?int $arg2): bool
+    {
+        return true;
+    }
+
+    /** @return array<string, int> */
+    public function stream_stat(): array
+    {
+        return [];
+    }
 }

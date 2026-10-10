@@ -59,11 +59,12 @@ final class TierTransitionJobMetadataStoreTest extends TestCase
         $dequeued = $this->store->dequeueTierTransitionJobs(10);
         self::assertCount(1, $dequeued);
         self::assertSame($id, $dequeued[0]['id']);
-        self::assertSame('pending', $dequeued[0]['status']);
+        self::assertSame('processing', $dequeued[0]['status']);
 
         $processing = $this->store->getTierTransitionJob($id);
         self::assertNotNull($processing);
         self::assertSame('processing', $processing['status']);
+        self::assertEqualsWithDelta($processing['nextAttemptAt'], $dequeued[0]['nextAttemptAt'], 0.001);
 
         $this->store->updateTierTransitionJobStatus(
             id: $id,
@@ -172,7 +173,6 @@ final class TierTransitionJobMetadataStoreTest extends TestCase
     {
         $reflection = new \ReflectionClass($this->store);
         $method = $reflection->getMethod('connection');
-        $method->setAccessible(true);
 
         /** @var \PDO $pdo */
         $pdo = $method->invoke($this->store);

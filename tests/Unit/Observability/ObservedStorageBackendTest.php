@@ -31,6 +31,23 @@ final class ObservedStorageBackendTest extends TestCase
         $this->assertStringContainsString('s3_server_backend_slow_operations_total{backend="storage",driver="memory",operation="putObject"} 1', $rendered);
     }
 
+    public function test_planned_object_write_is_forwarded_and_observed(): void
+    {
+        $metrics = new MetricsCollector();
+        $storage = new ObservedStorageBackend(new InMemoryBackend(), $metrics, 'memory');
+        $storage->createBucket('bucket');
+        $path = $storage->planObjectWritePath('bucket', 'key', bin2hex(random_bytes(16)), bin2hex(random_bytes(16)));
+
+        $write = $storage->putObjectAtPath('bucket', 'key', new ReadableBuffer('planned'), $path);
+
+        self::assertSame($path, $write->path);
+        self::assertSame('planned', \Amp\ByteStream\buffer($storage->getObjectByPath($path)));
+        self::assertStringContainsString(
+            's3_server_backend_operations_total{backend="storage",driver="memory",operation="putObjectAtPath"} 1',
+            $metrics->renderPrometheus(),
+        );
+    }
+
     public function test_records_failed_storage_operations_and_rethrows(): void
     {
         $metrics = new MetricsCollector();

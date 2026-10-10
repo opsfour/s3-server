@@ -7,8 +7,9 @@ return [
 
     /*
      * Operations this package intends to support as local S3-compatible
-     * functionality. Each entry must either have an AWS SDK functional test or
-     * an explicit equivalent/alias in AwsSdkSupportMatrixTest.
+     * functionality. Each entry must be referenced by an AWS SDK functional
+     * test or an explicit equivalent/alias in AwsSdkSupportMatrixTest. The
+     * operation-specific tests remain responsible for positive-path coverage.
      */
     'supported' => [
         'abortMultipartUpload',
@@ -20,6 +21,7 @@ return [
         'deleteBucketCors',
         'deleteBucketEncryption',
         'deleteBucketLifecycle',
+        'deleteBucketOwnershipControls',
         'deleteBucketPolicy',
         'deleteBucketTagging',
         'deleteBucketWebsite',
@@ -36,6 +38,7 @@ return [
         'getBucketLogging',
         'getBucketNotification',
         'getBucketNotificationConfiguration',
+        'getBucketOwnershipControls',
         'getBucketPolicy',
         'getBucketPolicyStatus',
         'getBucketTagging',
@@ -65,6 +68,7 @@ return [
         'putBucketLogging',
         'putBucketNotification',
         'putBucketNotificationConfiguration',
+        'putBucketOwnershipControls',
         'putBucketPolicy',
         'putBucketTagging',
         'putBucketVersioning',
@@ -97,7 +101,6 @@ return [
         'deleteBucketMetadataConfiguration',
         'deleteBucketMetadataTableConfiguration',
         'deleteBucketMetricsConfiguration',
-        'deleteBucketOwnershipControls',
         'deleteBucketReplication',
         'deleteObjectAnnotation',
         'getBucketAbac',
@@ -108,7 +111,6 @@ return [
         'getBucketMetadataConfiguration',
         'getBucketMetadataTableConfiguration',
         'getBucketMetricsConfiguration',
-        'getBucketOwnershipControls',
         'getBucketReplication',
         'getBucketRequestPayment',
         'getObjectAnnotation',
@@ -125,7 +127,6 @@ return [
         'putBucketIntelligentTieringConfiguration',
         'putBucketInventoryConfiguration',
         'putBucketMetricsConfiguration',
-        'putBucketOwnershipControls',
         'putBucketReplication',
         'putBucketRequestPayment',
         'putObjectAnnotation',

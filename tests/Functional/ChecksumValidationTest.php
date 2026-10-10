@@ -70,6 +70,30 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_put_object_rejects_xml_in_tagging_header_before_publication(): void
+    {
+        $key = 'xml-tagging-header.txt';
+        try {
+            self::$s3->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'Body' => 'must not persist',
+                'Tagging' => '<Tagging><TagSet/></Tagging>',
+            ]);
+            self::fail('XML in x-amz-tagging was accepted.');
+        } catch (S3Exception $error) {
+            self::assertSame(400, $error->getStatusCode());
+            self::assertSame('InvalidArgument', $error->getAwsErrorCode());
+        }
+
+        try {
+            self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            self::fail('Rejected object was published.');
+        } catch (S3Exception $error) {
+            self::assertSame(404, $error->getStatusCode());
+        }
+    }
+
     public function test_put_object_over_16_mib_with_content_md5_is_validated_and_round_trips(): void
     {
         $body = str_repeat('large-md5-block-', 1_400_000);
@@ -88,7 +112,16 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
 
         $result = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
         $this->assertSame(strlen($body), $result['ContentLength']);
-        $this->assertSame(md5($body), md5((string) $result['Body']));
+        $downloaded = $result['Body'];
+        $hash = hash_init('md5');
+        $downloadedBytes = 0;
+        while (! $downloaded->eof()) {
+            $chunk = $downloaded->read(64 * 1024);
+            $downloadedBytes += strlen($chunk);
+            hash_update($hash, $chunk);
+        }
+        $this->assertSame(strlen($body), $downloadedBytes);
+        $this->assertSame(md5($body), hash_final($hash));
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
     }
@@ -240,6 +273,62 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => 'crc32-test.txt']);
     }
 
+    public function test_get_and_head_checksums_require_enabled_mode_and_are_absent_for_ranges(): void
+    {
+        $key = 'checksum-mode-' . bin2hex(random_bytes(4));
+        $body = 'checksum mode payload';
+        $checksum = base64_encode(hash('crc32b', $body, true));
+        $put = self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => $body,
+            'ChecksumAlgorithm' => 'CRC32',
+        ]);
+        self::assertSame($checksum, $put['ChecksumCRC32'] ?? null);
+        self::assertSame('FULL_OBJECT', $put['ChecksumType'] ?? null);
+
+        try {
+            foreach (['getObject', 'headObject'] as $operation) {
+                $plain = self::$s3->{$operation}(['Bucket' => self::$bucket, 'Key' => $key]);
+                self::assertArrayNotHasKey('ChecksumCRC32', $plain, $operation);
+                self::assertArrayNotHasKey('ChecksumType', $plain, $operation);
+
+                $enabled = self::$s3->{$operation}([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'ChecksumMode' => 'ENABLED',
+                ]);
+                self::assertSame($checksum, $enabled['ChecksumCRC32'] ?? null, $operation);
+                self::assertSame('FULL_OBJECT', $enabled['ChecksumType'] ?? null, $operation);
+
+                $range = self::$s3->{$operation}([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'ChecksumMode' => 'ENABLED',
+                    'Range' => 'bytes=0-3',
+                ]);
+                self::assertArrayNotHasKey('ChecksumCRC32', $range, $operation . ' range');
+                self::assertArrayNotHasKey('ChecksumType', $range, $operation . ' range');
+
+                try {
+                    self::$s3->{$operation}([
+                        'Bucket' => self::$bucket,
+                        'Key' => $key,
+                        'ChecksumMode' => 'DISABLED',
+                    ]);
+                    self::fail($operation . ' accepted unsupported checksum mode.');
+                } catch (\Aws\S3\Exception\S3Exception $error) {
+                    self::assertSame(400, $error->getStatusCode());
+                    if ($operation === 'getObject') {
+                        self::assertSame('InvalidArgument', $error->getAwsErrorCode());
+                    }
+                }
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
     public function test_put_object_with_sha1_checksum(): void
     {
         $body = 'SHA1 checksum test content';
@@ -279,11 +368,13 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
     public function test_copy_object_preserves_etag_content(): void
     {
         $body = 'copy checksum test';
+        $checksum = base64_encode(hash('sha256', $body, true));
 
         self::$s3->putObject([
             'Bucket' => self::$bucket,
             'Key' => 'checksum-src.txt',
             'Body' => $body,
+            'ChecksumAlgorithm' => 'SHA256',
         ]);
 
         $srcHead = self::$s3->headObject([
@@ -291,19 +382,26 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
             'Key' => 'checksum-src.txt',
         ]);
 
-        self::$s3->copyObject([
+        $copy = self::$s3->copyObject([
             'Bucket' => self::$bucket,
             'Key' => 'checksum-dst.txt',
             'CopySource' => self::$bucket . '/checksum-src.txt',
+            'MetadataDirective' => 'REPLACE',
+            'ContentType' => 'text/plain',
         ]);
+        self::assertSame($checksum, $copy['CopyObjectResult']['ChecksumSHA256'] ?? null);
+        self::assertSame('FULL_OBJECT', $copy['CopyObjectResult']['ChecksumType'] ?? null);
 
         $dstHead = self::$s3->headObject([
             'Bucket' => self::$bucket,
             'Key' => 'checksum-dst.txt',
+            'ChecksumMode' => 'ENABLED',
         ]);
 
         // The content is the same, so the ETags should match.
         $this->assertSame($srcHead['ETag'], $dstHead['ETag']);
+        self::assertSame($checksum, $dstHead['ChecksumSHA256'] ?? null);
+        self::assertSame('FULL_OBJECT', $dstHead['ChecksumType'] ?? null);
 
         // Verify the content is identical.
         $get = self::$s3->getObject([
@@ -314,6 +412,56 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => 'checksum-src.txt']);
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => 'checksum-dst.txt']);
+    }
+
+    public function test_legacy_object_without_checksum_never_claims_checksum_type(): void
+    {
+        $client = self::makeClient(requestChecksumCalculation: 'when_required');
+        $sourceKey = 'legacy-checksum-src-' . bin2hex(random_bytes(4));
+        $copyKey = 'legacy-checksum-copy-' . bin2hex(random_bytes(4));
+
+        try {
+            $put = $client->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'Body' => 'legacy payload',
+            ]);
+            self::assertArrayNotHasKey('ChecksumType', $put);
+
+            foreach (['getObject', 'headObject'] as $operation) {
+                $result = $client->{$operation}([
+                    'Bucket' => self::$bucket,
+                    'Key' => $sourceKey,
+                    'ChecksumMode' => 'ENABLED',
+                ]);
+                self::assertArrayNotHasKey('ChecksumType', $result, $operation);
+                self::assertArrayNotHasKey('ChecksumCRC32', $result, $operation);
+                self::assertArrayNotHasKey('ChecksumCRC32C', $result, $operation);
+                self::assertArrayNotHasKey('ChecksumSHA1', $result, $operation);
+                self::assertArrayNotHasKey('ChecksumSHA256', $result, $operation);
+            }
+
+            $attributes = $client->getObjectAttributes([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'ObjectAttributes' => ['Checksum'],
+            ]);
+            self::assertArrayNotHasKey('Checksum', $attributes);
+
+            $copy = $client->copyObject([
+                'Bucket' => self::$bucket,
+                'Key' => $copyKey,
+                'CopySource' => self::$bucket . '/' . $sourceKey,
+            ]);
+            self::assertArrayNotHasKey('ChecksumType', $copy['CopyObjectResult']);
+            self::assertArrayNotHasKey('ChecksumCRC32', $copy['CopyObjectResult']);
+            self::assertArrayNotHasKey('ChecksumCRC32C', $copy['CopyObjectResult']);
+            self::assertArrayNotHasKey('ChecksumSHA1', $copy['CopyObjectResult']);
+            self::assertArrayNotHasKey('ChecksumSHA256', $copy['CopyObjectResult']);
+        } finally {
+            $client->deleteObject(['Bucket' => self::$bucket, 'Key' => $sourceKey]);
+            $client->deleteObject(['Bucket' => self::$bucket, 'Key' => $copyKey]);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -362,6 +510,7 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
 
         $partData = 'part content for etag test';
         $expectedPartEtag = '"' . md5($partData) . '"';
+        $expectedPartChecksum = base64_encode(hash('crc32b', $partData, true));
 
         $part = self::$s3->uploadPart([
             'Bucket' => self::$bucket,
@@ -373,6 +522,14 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
 
         // Each part should have an ETag that matches its MD5.
         $this->assertSame($expectedPartEtag, $part['ETag']);
+        $this->assertSame($expectedPartChecksum, $part['ChecksumCRC32'] ?? null);
+
+        $listed = self::$s3->listParts([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
+        $this->assertSame($expectedPartChecksum, $listed['Parts'][0]['ChecksumCRC32'] ?? null);
 
         // Complete and clean up.
         self::$s3->completeMultipartUpload([
@@ -387,6 +544,87 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
         ]);
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+    }
+
+    public function test_multipart_part_with_wrong_sdk_checksum_is_rejected_without_part_metadata(): void
+    {
+        $key = 'multipart-bad-sdk-checksum.txt';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 1,
+                'Body' => 'payload',
+                'ChecksumCRC32' => base64_encode("\0\0\0\0"),
+            ]);
+            self::fail('UploadPart accepted a checksum that did not match the request body.');
+        } catch (\Aws\S3\Exception\S3Exception $error) {
+            self::assertSame('BadDigest', $error->getAwsErrorCode());
+        }
+
+        $listed = self::$s3->listParts([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
+        self::assertSame([], $listed['Parts'] ?? []);
+
+        self::$s3->abortMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
+    }
+
+    public function test_multipart_part_checksum_algorithms_cannot_change_between_parts(): void
+    {
+        $key = 'multipart-checksum-algorithm-consistency.txt';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+
+        self::$s3->uploadPart([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'first',
+        ]);
+
+        try {
+            self::$s3->uploadPart([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 2,
+                'Body' => 'second',
+                'ChecksumAlgorithm' => 'SHA256',
+            ]);
+            self::fail('UploadPart accepted a different checksum algorithm in the same upload.');
+        } catch (\Aws\S3\Exception\S3Exception $error) {
+            self::assertSame('InvalidRequest', $error->getAwsErrorCode());
+        }
+
+        $listed = self::$s3->listParts([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
+        self::assertCount(1, $listed['Parts']);
+        self::assertArrayHasKey('ChecksumCRC32', $listed['Parts'][0]);
+
+        self::$s3->abortMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
     }
 
     // -----------------------------------------------------------------
@@ -419,6 +657,22 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
 
         $this->assertSame(400, $response->getStatusCode());
         $this->assertStringContainsString('BadDigest', (string) $response->getBody());
+    }
+
+    public function test_signed_put_with_explicitly_empty_checksum_is_rejected(): void
+    {
+        $key = 'empty-checksum.txt';
+        $response = $this->signedPutWithChecksum(self::$bucket, $key, 'payload', 'x-amz-checksum-sha256', '');
+
+        $this->assertSame(400, $response->getStatusCode());
+        $this->assertStringContainsString('BadDigest', (string) $response->getBody());
+
+        try {
+            self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            $this->fail('The invalid checksum must not publish an object.');
+        } catch (\Aws\S3\Exception\S3Exception $e) {
+            $this->assertSame('404', (string) $e->getStatusCode());
+        }
     }
 
     /**

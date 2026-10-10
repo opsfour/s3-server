@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Laravel;
 
 use Illuminate\Config\Repository;
 use Illuminate\Foundation\Application;
+use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Laravel\S3QuotaCommand;
 use OpsFour\S3Server\Laravel\S3ServerCommand;
@@ -15,9 +16,13 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
+use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Tester\CommandTester;
 
@@ -40,6 +45,140 @@ final class S3ServerServiceProviderTest extends TestCase
         parent::tearDown();
     }
 
+    public function test_artisan_serve_checks_postgres_driver_before_resolving_metadata(): void
+    {
+        if (extension_loaded('pq')) {
+            self::markTestSkipped('The negative startup case requires PHP without pecl-pq.');
+        }
+
+        $app = $this->application([
+            'metadata' => [
+                'driver' => 'postgres',
+                'dsn' => 'host=127.0.0.1 port=1 dbname=unreachable password=private-dsn-secret',
+            ],
+        ]);
+        $app->singleton(MetadataStore::class, static function (): never {
+            throw new \LogicException('Metadata was resolved before the driver check.');
+        });
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        self::assertSame(Command::FAILURE, $tester->execute([]));
+        self::assertStringContainsString('PostgreSQL API servers require the pecl-pq PHP extension.', $tester->getDisplay());
+        self::assertStringNotContainsString('private-dsn-secret', $tester->getDisplay());
+    }
+
+    public function test_artisan_serve_does_not_echo_dependency_exception_details(): void
+    {
+        $app = $this->application();
+        $app->singleton(MetadataStore::class, static function (): never {
+            throw new \RuntimeException('database-password-secret-sentinel');
+        });
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        self::assertSame(Command::FAILURE, $tester->execute([]));
+        self::assertStringNotContainsString('database-password-secret-sentinel', $tester->getDisplay());
+        self::assertStringContainsString('bootstrap failed', $tester->getDisplay());
+    }
+
+    public function test_artisan_serve_reports_shutdown_failure_with_failure_exit_code(): void
+    {
+        $occupied = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($occupied);
+        $address = stream_socket_get_name($occupied, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+
+        /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
+        $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
+        $storage->method('shutdown')->willThrowException(new \RuntimeException('private-laravel-storage-secret'));
+        $app = $this->application(['allow_unfenced_storage_for_tests' => true]);
+        $app->instance(StorageTierRegistry::class, StorageTierRegistry::single($storage));
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+
+        try {
+            $tester = new CommandTester($command);
+            self::assertSame(Command::FAILURE, $tester->execute(['--host' => '127.0.0.1', '--port' => (string) $port]));
+            self::assertStringContainsString('runtime failed', $tester->getDisplay());
+            self::assertStringContainsString('shutdown failed', $tester->getDisplay());
+            self::assertStringNotContainsString('private-laravel-storage-secret', $tester->getDisplay());
+        } finally {
+            fclose($occupied);
+        }
+    }
+
+    #[DataProvider('invalidNumericEnvironmentValues')]
+    public function test_package_config_rejects_invalid_numeric_environment_values(string $name, string $value): void
+    {
+        $previous = getenv($name);
+        putenv("{$name}={$value}");
+        new Application($this->basePath);
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            require __DIR__ . '/../../../config/s3-server.php';
+        } finally {
+            putenv($previous === false ? $name : "{$name}={$previous}");
+        }
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function invalidNumericEnvironmentValues(): iterable
+    {
+        yield 'rate limit silently disabled' => ['S3_RATE_LIMIT', 'invalid'];
+        yield 'quota silently disabled' => ['S3_QUOTA_MAX_BYTES_PER_OWNER', 'invalid'];
+        yield 'body limit silently changed' => ['S3_BODY_SIZE_LIMIT', 'invalid'];
+        yield 'integer overflow' => ['S3_MAX_CONNECTIONS', '999999999999999999999999999'];
+        yield 'lifecycle interval silently changed' => ['S3_LIFECYCLE_INTERVAL_SECONDS', 'invalid'];
+    }
+
+    public function test_package_config_preserves_explicit_zero_numeric_values(): void
+    {
+        $names = [
+            'S3_RATE_LIMIT',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER',
+            'S3_BODY_SIZE_LIMIT',
+            'S3_CREDENTIALS_CACHE_TTL',
+        ];
+        $previous = [];
+        foreach ($names as $name) {
+            $previous[$name] = getenv($name);
+            putenv("{$name}=0");
+        }
+        new Application($this->basePath);
+
+        try {
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            self::assertSame(0, $config['rate_limit']);
+            self::assertSame(0, $config['quotas']['max_bytes_per_owner']);
+            self::assertSame(0, $config['body_size_limit']);
+            self::assertSame(0.0, $config['credentials']['cache_ttl']);
+        } finally {
+            foreach ($previous as $name => $value) {
+                putenv($value === false ? $name : "{$name}={$value}");
+            }
+        }
+    }
+
+    public function test_package_config_preserves_invalid_external_iam_enabled_for_runtime_validation(): void
+    {
+        $name = 'S3_EXTERNAL_IAM_ENABLED';
+        $previous = getenv($name);
+        putenv("{$name}=treu");
+        new Application($this->basePath);
+
+        try {
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            self::assertSame('treu', $config['external_iam']['enabled']);
+        } finally {
+            putenv($previous === false ? $name : "{$name}={$previous}");
+        }
+    }
+
     public function test_provider_resolves_config_and_core_singletons(): void
     {
         $app = $this->application([
@@ -49,7 +188,11 @@ final class S3ServerServiceProviderTest extends TestCase
             'region' => 'eu-central-1',
             'max_connections' => 123,
             'body_size_limit' => 456_789,
+            'trusted_proxy_cidrs' => '127.0.0.1/32, ::1/128',
+            'post_spool_budget' => 987_654,
             'enforce_min_part_size' => false,
+            'allow_unfenced_storage_for_tests' => true,
+            'notifications' => ['worker_enabled' => false],
             'parallel' => [
                 'select_workers' => 4,
                 'request_body_spool_workers' => 3,
@@ -63,7 +206,11 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame('eu-central-1', $config->region);
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456_789, $config->requestBodySizeLimit);
+        self::assertSame(['127.0.0.1/32', '::1/128'], $config->trustedProxyCidrs);
+        self::assertSame(987_654, $config->postSpoolBudgetBytes);
         self::assertFalse($config->enforceMinPartSize);
+        self::assertTrue($config->allowUnfencedStorageForTests);
+        self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
 
@@ -75,6 +222,35 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame($storage, $app->make(StorageBackend::class));
         self::assertInstanceOf(CachedMetadataStoreDecorator::class, $app->make(MetadataStore::class));
         self::assertInstanceOf(CredentialProvider::class, $app->make(CredentialProvider::class));
+    }
+
+    #[DataProvider('invalidMetadataCacheTtlValues')]
+    public function test_provider_rejects_non_finite_metadata_cache_ttl(float $ttl): void
+    {
+        $app = $this->application([
+            'metadata' => ['cache_ttl' => $ttl],
+        ]);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Metadata cache TTL');
+        $app->make(MetadataStore::class);
+    }
+
+    /** @return iterable<string, array{float}> */
+    public static function invalidMetadataCacheTtlValues(): iterable
+    {
+        yield 'not a number' => [NAN];
+        yield 'positive infinity' => [INF];
+        yield 'negative infinity' => [-INF];
+    }
+
+    public function test_provider_keeps_zero_metadata_cache_ttl_disabled(): void
+    {
+        $app = $this->application([
+            'metadata' => ['cache_ttl' => 0.0],
+        ]);
+
+        self::assertNotInstanceOf(CachedMetadataStoreDecorator::class, $app->make(MetadataStore::class));
     }
 
     public function test_artisan_quota_command_manages_provider_metadata(): void
@@ -116,6 +292,23 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertNull($metadata->getAccountQuota('account-a'));
     }
 
+    public function test_provider_resolves_direct_flysystem_service_like_symfony_integration(): void
+    {
+        $app = $this->application([
+            'storage' => [
+                'driver' => 'flysystem',
+                'filesystem_service' => 'test.flysystem',
+                'worker_pool_size' => 0,
+            ],
+        ]);
+        $app->instance('test.flysystem', new Filesystem(new InMemoryFlysystemAdapter()));
+
+        $backend = $app->make(StorageBackend::class);
+
+        self::assertInstanceOf(ObservedStorageBackend::class, $backend);
+        self::assertInstanceOf(FlysystemBackend::class, $backend->innerBackend());
+    }
+
     public function test_serve_command_reports_invalid_overrides_as_failure(): void
     {
         $app = $this->application();
@@ -128,6 +321,56 @@ final class S3ServerServiceProviderTest extends TestCase
 
         self::assertSame(Command::FAILURE, $exit);
         self::assertStringContainsString('Port must be between 1 and 65535', $tester->getDisplay());
+    }
+
+    public function test_serve_command_rejects_non_decimal_port_without_truncating_it(): void
+    {
+        $app = $this->application();
+        $command = $app->make(S3ServerCommand::class);
+        self::assertInstanceOf(S3ServerCommand::class, $command);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        $exit = $tester->execute(['--port' => '9000junk']);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('S3 server bootstrap failed', $tester->getDisplay());
+    }
+
+    public function test_explicit_quota_admin_token_is_not_replaced_by_external_iam_token(): void
+    {
+        $app = $this->application([
+            'admin' => ['token' => '0'],
+            'external_iam' => ['admin_token' => 'external-secret'],
+        ]);
+        $command = $app->make(S3ServerCommand::class);
+        $resolve = new \ReflectionMethod($command, 'adminTokenFromConfig');
+
+        self::assertSame('0', $resolve->invoke($command));
+
+        $app['config']->set('s3-server.admin.token', null);
+        self::assertSame('external-secret', $resolve->invoke($command));
+
+        $app['config']->set('s3-server.admin.token', '');
+        self::assertSame('', $resolve->invoke($command));
+    }
+
+    public function test_serve_command_rejects_memory_key_override_with_database_credentials(): void
+    {
+        $app = $this->application([
+            'credentials' => [
+                'driver' => 'database',
+                'dsn' => 'sqlite::memory:',
+            ],
+        ]);
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        $exit = $tester->execute(['--access-key' => 'override']);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('require the memory credentials driver', $tester->getDisplay());
     }
 
     /**

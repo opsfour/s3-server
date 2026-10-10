@@ -35,13 +35,18 @@ final class VersioningTest extends S3FunctionalTestCase
 
     public function test_get_bucket_versioning_default_disabled(): void
     {
-        $result = self::$s3->getBucketVersioning([
-            'Bucket' => self::$bucket,
-        ]);
+        $bucket = 'test-versioning-default-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
 
-        $this->assertSame(200, $result['@metadata']['statusCode']);
-        // Status is empty/null when versioning has never been enabled.
-        $this->assertEmpty($result['Status'] ?? '');
+        try {
+            $result = self::$s3->getBucketVersioning(['Bucket' => $bucket]);
+
+            $this->assertSame(200, $result['@metadata']['statusCode']);
+            // Status is empty/null when versioning has never been enabled.
+            $this->assertEmpty($result['Status'] ?? '');
+        } finally {
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
     }
 
     public function test_enable_versioning(): void
@@ -352,8 +357,8 @@ final class VersioningTest extends S3FunctionalTestCase
             'Body' => 'suspended content',
         ]);
 
-        // No version ID should be returned for suspended buckets.
-        $this->assertEmpty($put['VersionId'] ?? '');
+        // Suspended buckets return the literal null version ID.
+        $this->assertSame('null', $put['VersionId'] ?? null);
 
         // Clean up — must delete all versions and delete markers before bucket deletion.
         $versions = self::$s3->listObjectVersions(['Bucket' => $suspendBucket]);
@@ -371,7 +376,58 @@ final class VersioningTest extends S3FunctionalTestCase
                 'VersionId' => $dm['VersionId'],
             ]);
         }
-        self::$s3->deleteBucket(['Bucket' => $suspendBucket]);
+        self::deleteBucketWithDiagnostics($suspendBucket);
+    }
+
+    public function test_suspended_put_preserves_the_numbered_version_of_the_same_key(): void
+    {
+        $bucket = 'test-suspend-preserve-bucket';
+        $key = 'same-key.txt';
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            self::$s3->putBucketVersioning([
+                'Bucket' => $bucket,
+                'VersioningConfiguration' => ['Status' => 'Enabled'],
+            ]);
+            $original = self::$s3->putObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'Body' => 'numbered original',
+            ]);
+            $versionId = (string) $original['VersionId'];
+            self::assertNotSame('', $versionId);
+
+            self::$s3->putBucketVersioning([
+                'Bucket' => $bucket,
+                'VersioningConfiguration' => ['Status' => 'Suspended'],
+            ]);
+            self::$s3->putObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'Body' => 'new null version',
+            ]);
+
+            self::assertSame('new null version', (string) self::$s3->getObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+            ])['Body']);
+            self::assertSame('numbered original', (string) self::$s3->getObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'VersionId' => $versionId,
+            ])['Body']);
+        } finally {
+            $versions = self::$s3->listObjectVersions(['Bucket' => $bucket]);
+            foreach (array_merge($versions->get('Versions') ?? [], $versions->get('DeleteMarkers') ?? []) as $version) {
+                self::$s3->deleteObject([
+                    'Bucket' => $bucket,
+                    'Key' => $version['Key'],
+                    'VersionId' => $version['VersionId'],
+                ]);
+            }
+            self::deleteBucketWithDiagnostics($bucket);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -492,7 +548,7 @@ final class VersioningTest extends S3FunctionalTestCase
         ]);
 
         // Clean up.
-        self::$s3->deleteBucket(['Bucket' => $lockBucket]);
+        self::deleteBucketWithDiagnostics($lockBucket);
     }
 
     /** @param iterable<array<string, mixed>> $grants */
@@ -574,11 +630,7 @@ final class VersioningTest extends S3FunctionalTestCase
             'Bucket' => self::$bucket,
             'Key' => $key,
             'VersionId' => $versionId,
-            '@http' => [
-                'headers' => [
-                    'x-amz-bypass-governance-retention' => 'true',
-                ],
-            ],
+            'BypassGovernanceRetention' => true,
         ]);
 
         $this->assertSame(204, $deleteResult['@metadata']['statusCode']);

@@ -83,6 +83,37 @@ final class PresignedUrlEdgeCasesTest extends S3FunctionalTestCase
         $this->assertSame($body, (string) $result['Body']);
     }
 
+    public function test_presigned_put_rejects_unsigned_public_acl_before_creating_object(): void
+    {
+        $key = 'presigned-unsigned-acl-' . bin2hex(random_bytes(5)) . '.txt';
+        $command = self::$s3->getCommand('PutObject', [
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ]);
+        $url = (string) self::$s3->createPresignedRequest($command, '+5 minutes')->getUri();
+
+        $client = new Client(['http_errors' => false]);
+        $denied = $client->put($url, [
+            'headers' => ['x-amz-acl' => 'public-read'],
+            'body' => 'must not be public',
+        ]);
+        self::assertSame(403, $denied->getStatusCode());
+        self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $denied->getBody());
+
+        try {
+            self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            self::fail('Unsigned ACL request created an object.');
+        } catch (S3Exception $exception) {
+            self::assertSame(404, $exception->getStatusCode());
+        }
+
+        self::assertSame(200, $client->put($url, ['body' => 'private content'])->getStatusCode());
+        $acl = self::$s3->getObjectAcl(['Bucket' => self::$bucket, 'Key' => $key]);
+        foreach ($acl['Grants'] as $grant) {
+            self::assertNotSame('http://acs.amazonaws.com/groups/global/AllUsers', $grant['Grantee']['URI'] ?? null);
+        }
+    }
+
     public function test_presigned_head_object(): void
     {
         $key = 'presigned-head.txt';

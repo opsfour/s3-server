@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use Aws\Credentials\Credentials;
 use Aws\S3\Exception\S3Exception;
+use Aws\Signature\S3SignatureV4;
+use GuzzleHttp\Client;
+use GuzzleHttp\Psr7\Request;
 
 /**
  * Functional tests for Phase 3: ListObjectsV2, ListObjects v1,
@@ -23,6 +27,15 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         'meta-copy.txt',
         'meta-source.txt',
         'quiet-delete.txt',
+        'ambiguous-delete.txt',
+        'missing-delete-md5.txt',
+        'grouped/a/001',
+        'grouped/a/002',
+        'grouped/b/001',
+        'tag-source.txt',
+        'tag-copy.txt',
+        'tag-replace.txt',
+        'self-copy.txt',
     ];
 
     private static string $bucket = 'test-listing-bucket';
@@ -194,6 +207,66 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $this->assertCount(9, $allKeys);
     }
 
+    public function test_list_objects_v2_rejects_malformed_continuation_tokens_even_for_empty_pages(): void
+    {
+        foreach (['@@@', '', 'YQ', base64_encode(str_repeat('a', 1025))] as $token) {
+            try {
+                self::$s3->listObjectsV2([
+                    'Bucket' => self::$bucket,
+                    'MaxKeys' => 0,
+                    'ContinuationToken' => $token,
+                ]);
+                self::fail('Malformed continuation token was accepted.');
+            } catch (S3Exception $exception) {
+                self::assertSame('InvalidArgument', $exception->getAwsErrorCode());
+                self::assertSame(400, $exception->getStatusCode());
+            }
+        }
+    }
+
+    public function test_delimited_pages_do_not_repeat_a_common_prefix(): void
+    {
+        foreach (['grouped/a/001', 'grouped/a/002', 'grouped/b/001'] as $key) {
+            self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'x']);
+        }
+
+        $first = self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'grouped/',
+            'Delimiter' => '/',
+            'MaxKeys' => 1,
+        ]);
+        $this->assertSame(['grouped/a/'], array_column($first['CommonPrefixes'], 'Prefix'));
+        $this->assertTrue($first['IsTruncated']);
+
+        $second = self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'grouped/',
+            'Delimiter' => '/',
+            'MaxKeys' => 1,
+            'ContinuationToken' => $first['NextContinuationToken'],
+        ]);
+        $this->assertSame(['grouped/b/'], array_column($second['CommonPrefixes'], 'Prefix'));
+        $this->assertFalse($second['IsTruncated']);
+
+        $legacyFirst = self::$s3->listObjects([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'grouped/',
+            'Delimiter' => '/',
+            'MaxKeys' => 1,
+        ]);
+        $this->assertSame('grouped/a/', $legacyFirst['NextMarker']);
+        $legacySecond = self::$s3->listObjects([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'grouped/',
+            'Delimiter' => '/',
+            'MaxKeys' => 1,
+            'Marker' => $legacyFirst['NextMarker'],
+        ]);
+        $this->assertSame(['grouped/b/'], array_column($legacySecond['CommonPrefixes'], 'Prefix'));
+        $this->assertFalse($legacySecond['IsTruncated']);
+    }
+
     // -----------------------------------------------------------------
     // ListObjects v1
     // -----------------------------------------------------------------
@@ -325,6 +398,73 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         $this->assertEmpty($result['Errors'] ?? []);
     }
 
+    public function test_signed_delete_objects_without_content_md5_preserves_object(): void
+    {
+        $key = 'missing-delete-md5.txt';
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'preserved']);
+
+        $xml = '<Delete><Object><Key>' . $key . '</Key></Object></Delete>';
+        $url = sprintf('http://%s:%d/%s?delete', self::$host, self::$port, self::$bucket);
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $credentials = new Credentials(self::$accessKey, self::$secretKey);
+        $client = new Client(['http_errors' => false]);
+
+        foreach ([
+            [['Content-Type' => 'application/xml'], 'InvalidRequest'],
+            [['Content-Type' => 'application/xml', 'x-amz-sdk-checksum-algorithm' => 'CRC32'], 'InvalidRequest'],
+            [['Content-Type' => 'application/xml', 'x-amz-checksum-crc32' => base64_encode("\0\0\0\0")], 'BadDigest'],
+        ] as [$headers, $errorCode]) {
+            $request = new Request('POST', $url, $headers, $xml);
+            $response = $client->send($signer->signRequest($request, $credentials));
+
+            self::assertSame(400, $response->getStatusCode());
+            self::assertStringContainsString("<Code>{$errorCode}</Code>", (string) $response->getBody());
+            self::assertSame('preserved', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+            ])['Body']);
+        }
+
+        $validChecksum = base64_encode(pack('H*', hash('crc32b', $xml)));
+        $valid = new Request('POST', $url, [
+            'Content-Type' => 'application/xml',
+            'x-amz-checksum-crc32' => $validChecksum,
+        ], $xml);
+        $response = $client->send($signer->signRequest($valid, $credentials));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertStringContainsString('<Deleted>', (string) $response->getBody());
+    }
+
+    public function test_signed_ambiguous_delete_xml_rejects_before_mutation(): void
+    {
+        $key = 'ambiguous-delete.txt';
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'preserved']);
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $credentials = new Credentials(self::$accessKey, self::$secretKey);
+        $client = new Client(['http_errors' => false]);
+        $url = sprintf('http://%s:%d/%s?delete', self::$host, self::$port, self::$bucket);
+
+        foreach ([
+            '<Delete><Object><Key>ambiguous-delete.txt</Key><Key>other.txt</Key></Object></Delete>',
+            '<Delete><Object><Key>ambiguous-delete.txt<Other>other.txt</Other></Key></Object></Delete>',
+            '<Delete xmlns:x="urn:unexpected"><Object><Key>ambiguous-delete.txt</Key><x:VersionId>fake</x:VersionId></Object></Delete>',
+            '<Delete xmlns="urn:unexpected"><Object><Key>ambiguous-delete.txt</Key></Object></Delete>',
+        ] as $xml) {
+            $request = new Request('POST', $url, [
+                'Content-Type' => 'application/xml',
+                'Content-MD5' => base64_encode(md5($xml, true)),
+            ], $xml);
+            $response = $client->send($signer->signRequest($request, $credentials));
+
+            self::assertSame(400, $response->getStatusCode());
+            self::assertStringContainsString('<Code>MalformedXML</Code>', (string) $response->getBody());
+            self::assertSame('preserved', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+            ])['Body']);
+        }
+    }
+
     // -----------------------------------------------------------------
     // CopyObject
     // -----------------------------------------------------------------
@@ -424,5 +564,88 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         ]);
         $this->assertSame('text/csv', $headResult['ContentType']);
         $this->assertSame('test', $headResult['Metadata']['origin'] ?? null);
+    }
+
+    public function test_copy_object_copies_or_replaces_tags_independently_of_metadata(): void
+    {
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => 'tag-source.txt', 'Body' => 'tagged']);
+        self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => 'tag-source.txt',
+            'Tagging' => ['TagSet' => [['Key' => 'source', 'Value' => 'yes']]],
+        ]);
+
+        self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'tag-copy.txt',
+            'CopySource' => self::$bucket . '/tag-source.txt',
+        ]);
+        $copied = self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => 'tag-copy.txt']);
+        $this->assertSame([['Key' => 'source', 'Value' => 'yes']], $copied['TagSet']);
+
+        self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'tag-replace.txt',
+            'CopySource' => self::$bucket . '/tag-source.txt',
+            'TaggingDirective' => 'REPLACE',
+            'Tagging' => 'replacement=ok',
+        ]);
+        $replaced = self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => 'tag-replace.txt']);
+        $this->assertSame([['Key' => 'replacement', 'Value' => 'ok']], $replaced['TagSet']);
+    }
+
+    public function test_copy_object_rejects_unknown_directives_before_writing(): void
+    {
+        foreach (['MetadataDirective', 'TaggingDirective'] as $field) {
+            try {
+                self::$s3->copyObject([
+                    'Bucket' => self::$bucket,
+                    'Key' => 'invalid-directive.txt',
+                    'CopySource' => self::$bucket . '/file1.txt',
+                    $field => 'INVALID',
+                ]);
+                $this->fail("Expected {$field} to be rejected.");
+            } catch (S3Exception $e) {
+                $this->assertSame(400, $e->getStatusCode());
+            }
+        }
+    }
+
+    public function test_self_copy_allows_storage_class_change_and_rejects_no_op_with_invalid_request(): void
+    {
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'self-copy.txt',
+            'Body' => 'self-copy',
+        ]);
+
+        $changed = self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'self-copy.txt',
+            'CopySource' => self::$bucket . '/self-copy.txt',
+            'MetadataDirective' => 'COPY',
+            'StorageClass' => 'STANDARD_IA',
+        ]);
+        self::assertSame(200, $changed['@metadata']['statusCode']);
+        self::assertSame('STANDARD_IA', self::$s3->headObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'self-copy.txt',
+        ])['StorageClass']);
+
+        foreach ([[], ['StorageClass' => 'STANDARD_IA']] as $unchangedOptions) {
+            try {
+                self::$s3->copyObject([
+                    'Bucket' => self::$bucket,
+                    'Key' => 'self-copy.txt',
+                    'CopySource' => self::$bucket . '/self-copy.txt',
+                    'MetadataDirective' => 'COPY',
+                    ...$unchangedOptions,
+                ]);
+                self::fail('An unchanged current-version self-copy must be rejected.');
+            } catch (S3Exception $exception) {
+                self::assertSame(400, $exception->getStatusCode());
+                self::assertSame('InvalidRequest', $exception->getAwsErrorCode());
+            }
+        }
     }
 }

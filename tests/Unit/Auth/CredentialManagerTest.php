@@ -6,7 +6,12 @@ namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\CredentialManager;
+use OpsFour\S3Server\Auth\ChainCredentialProvider;
+use OpsFour\S3Server\Auth\ConfigFileCredentialProvider;
+use OpsFour\S3Server\Auth\DatabaseCredentialProvider;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\CredentialProvider;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -93,6 +98,261 @@ final class CredentialManagerTest extends TestCase
         $this->assertSame($expiresAt, $credential->expiresAt);
     }
 
+    public function test_create_with_existing_access_key_does_not_replace_the_credential(): void
+    {
+        $original = $this->manager->createCredential('first-owner', accessKeyId: 'AKIAEXPLICITKEY0001', secretAccessKey: 'first-secret');
+
+        try {
+            $this->manager->createCredential('second-owner', accessKeyId: $original->accessKeyId, secretAccessKey: 'second-secret');
+            self::fail('An existing credential was replaced by create.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('already exists', $error->getMessage());
+        }
+
+        self::assertSame($original, $this->provider->getCredential($original->accessKeyId));
+    }
+
+    public function test_database_create_with_existing_access_key_preserves_another_nodes_credential(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-create-collision-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 60, bootstrap: true);
+            $second = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 0);
+            $original = (new CredentialManager($first))->createCredential(
+                'first-owner',
+                accessKeyId: 'AKIADBEXPLICIT000001',
+                secretAccessKey: 'first-secret',
+            );
+
+            try {
+                (new CredentialManager($second))->createCredential(
+                    'second-owner',
+                    accessKeyId: $original->accessKeyId,
+                    secretAccessKey: 'second-secret',
+                );
+                self::fail('A cross-node create replaced an existing credential.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('already exists', $error->getMessage());
+            }
+
+            $stored = $second->getCredential($original->accessKeyId);
+            self::assertNotNull($stored);
+            self::assertSame($original->secretAccessKey, $stored->secretAccessKey);
+            self::assertSame($original->ownerId, $stored->ownerId);
+            self::assertTrue($stored->isActive);
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_generated_access_key_collision_is_retried_with_a_new_id(): void
+    {
+        $provider = new class implements AtomicCredentialCreator, CredentialProvider {
+            /** @var list<string> */
+            public array $attemptedIds = [];
+
+            public function createCredentialIfAbsent(Credential $credential): bool
+            {
+                $this->attemptedIds[] = $credential->accessKeyId;
+
+                return count($this->attemptedIds) > 1;
+            }
+
+            public function getCredential(string $accessKeyId): ?Credential
+            {
+                return null;
+            }
+            public function listCredentials(): array
+            {
+                return [];
+            }
+            public function putCredential(Credential $credential): void {}
+            public function deleteCredential(string $accessKeyId): void {}
+        };
+
+        $created = (new CredentialManager($provider))->createCredential('owner');
+
+        self::assertCount(2, $provider->attemptedIds);
+        self::assertNotSame($provider->attemptedIds[0], $provider->attemptedIds[1]);
+        self::assertSame($provider->attemptedIds[1], $created->accessKeyId);
+    }
+
+    public function test_create_rejects_provider_without_atomic_insert_capability(): void
+    {
+        $provider = new class implements CredentialProvider {
+            public function getCredential(string $accessKeyId): ?Credential
+            {
+                return null;
+            }
+            public function listCredentials(): array
+            {
+                return [];
+            }
+            public function putCredential(Credential $credential): void
+            {
+                throw new \RuntimeException('Unsafe upsert fallback was used.');
+            }
+            public function deleteCredential(string $accessKeyId): void {}
+        };
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('does not support atomic creation');
+
+        (new CredentialManager($provider))->createCredential('owner');
+    }
+
+    public function test_activation_cannot_resurrect_a_credential_revoked_by_another_database_node(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-revocation-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 60, bootstrap: true);
+            $second = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 0);
+            $manager = new CredentialManager($first);
+            $credential = $manager->createCredential('owner', accessKeyId: 'AKIAREVOKERACE00001');
+            self::assertNotNull($manager->getCredential($credential->accessKeyId));
+
+            $second->deleteCredential($credential->accessKeyId);
+            try {
+                $manager->setActive($credential->accessKeyId, true);
+                self::fail('Activation resurrected a revoked credential.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('revoked', $error->getMessage());
+            }
+            self::assertNull($second->getCredential($credential->accessKeyId));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_activation_cannot_change_a_replaced_secret_from_stale_cache(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-replacement-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 60, bootstrap: true);
+            $second = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 0);
+            $manager = new CredentialManager($first);
+            $credential = $manager->createCredential('owner', accessKeyId: 'AKIAREPLACERACE00001');
+            $second->putCredential(new Credential(
+                accessKeyId: $credential->accessKeyId,
+                secretAccessKey: 'new-secret',
+                ownerId: 'owner',
+                isActive: false,
+            ));
+
+            try {
+                $manager->setActive($credential->accessKeyId, true);
+                self::fail('Activation changed a replacement credential.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('changed', $error->getMessage());
+            }
+            $current = $second->getCredential($credential->accessKeyId);
+            self::assertNotNull($current);
+            self::assertSame('new-secret', $current->secretAccessKey);
+            self::assertFalse($current->isActive);
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_activation_cannot_undo_concurrent_deactivation_from_stale_cache(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-status-race-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 60, bootstrap: true);
+            $second = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 0);
+            $manager = new CredentialManager($first);
+            $credential = $manager->createCredential('owner', accessKeyId: 'AKIASTATUSRACE00001');
+            self::assertTrue($manager->getCredential($credential->accessKeyId)?->isActive);
+
+            self::assertFalse((new CredentialManager($second))->setActive($credential->accessKeyId, false)->isActive);
+            try {
+                $manager->setActive($credential->accessKeyId, true);
+                self::fail('Activation undid a concurrent credential deactivation.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('changed', $error->getMessage());
+            }
+            self::assertFalse($second->getCredential($credential->accessKeyId)?->isActive);
+            self::assertFalse($first->setActiveIfCurrent($credential, false));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_stale_delete_cannot_remove_a_reissued_database_credential(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-delete-race-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $first = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 60, bootstrap: true);
+            $second = DatabaseCredentialProvider::fromDsn('sqlite:' . $path, cacheTtlSeconds: 0);
+            $manager = new CredentialManager($first);
+            $original = $manager->createCredential('first-owner', accessKeyId: 'AKIADELETERACE00001', secretAccessKey: 'first-secret');
+            $replacement = new Credential($original->accessKeyId, 'second-secret', 'second-owner');
+            $second->deleteCredential($original->accessKeyId);
+            $second->putCredential($replacement);
+
+            self::assertFalse($manager->deleteCredential($original->accessKeyId));
+            $stored = $second->getCredential($original->accessKeyId);
+            self::assertNotNull($stored);
+            self::assertSame('second-owner', $stored->ownerId);
+            self::assertSame('second-secret', $stored->secretAccessKey);
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_status_update_on_file_provider_rejects_stale_activation(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-file-status-' . bin2hex(random_bytes(6)) . '.json';
+        try {
+            $provider = new ConfigFileCredentialProvider($path);
+            $original = (new CredentialManager($provider))->createCredential('owner', accessKeyId: 'AKIAFILESTATUS000001');
+            self::assertTrue($provider->setActiveIfCurrent($original, false));
+            self::assertFalse($provider->setActiveIfCurrent($original, true));
+            self::assertFalse($provider->getCredential($original->accessKeyId)?->isActive);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function test_multi_provider_chain_refuses_a_partial_delete(): void
+    {
+        $primary = new InMemoryCredentialProvider();
+        $secondary = new InMemoryCredentialProvider();
+        $credential = new Credential('AKIACHAINDELETE0001', 'first-secret', 'first-owner');
+        $primary->putCredential($credential);
+        $secondary->putCredential(new Credential($credential->accessKeyId, 'second-secret', 'second-owner'));
+        $chain = new ChainCredentialProvider($primary, $secondary);
+        $manager = new CredentialManager($chain);
+
+        try {
+            $manager->deleteCredential($credential->accessKeyId);
+            self::fail('Multi-provider deletion partially removed the primary credential.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('across multiple credential providers', $error->getMessage());
+        }
+        self::assertNotNull($primary->getCredential($credential->accessKeyId));
+        self::assertNotNull($secondary->getCredential($credential->accessKeyId));
+
+        try {
+            $chain->deleteCredential($credential->accessKeyId);
+            self::fail('Direct chain deletion partially removed a credential.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('across multiple credential providers', $error->getMessage());
+        }
+        self::assertNotNull($primary->getCredential($credential->accessKeyId));
+        self::assertNotNull($secondary->getCredential($credential->accessKeyId));
+    }
+
     /**
      * @return iterable<string, array<string, mixed>>
      */
@@ -123,8 +383,8 @@ final class CredentialManagerTest extends TestCase
     }
 
     /**
-     * @param list<string> $policyNames
-     * @param list<string> $allowedPrefixes
+     * @param  list<string>  $policyNames
+     * @param  list<string>  $allowedPrefixes
      */
     #[DataProvider('invalidCredentialFields')]
     public function test_create_credential_rejects_invalid_or_unpersistable_fields(
