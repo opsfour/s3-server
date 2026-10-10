@@ -88,7 +88,7 @@ src/
 ├── Event/                # Event objects
 ├── Exception/            # S3Exception hierarchy (maps to HTTP status codes)
 ├── Factory/              # MetadataStore, Storage, Credential factories
-├── Handler/              # 66 S3 operation handlers
+├── Handler/              # 69 routed S3 operations
 ├── Http/                 # HTTP utilities
 ├── Laravel/              # Service provider and Artisan commands
 ├── Lifecycle/            # Lifecycle rule evaluation and execution
@@ -196,6 +196,11 @@ and Laravel 13 with Symfony 8.1 or newer.
 
 ## Current Test Baseline
 
+The complete local package gate for the current `develop` source records:
+
 ```
-745 tests, 3288 assertions, 9 skipped, 0 failures
+3350 tests, 29192 assertions, 217 expected opt-in/environment skips, 0 failures
 ```
+
+External database, remote-storage, multi-host, load-balancer, and long-soak
+profiles remain separate gates; see the [release checklist](release-checklist.md).

@@ -5,6 +5,60 @@ not complete merely because the default PHPUnit run passes: the opt-in
 integration and load profiles below are release gates for the backends being
 advertised.
 
+## Unreleased Candidate
+
+The `develop` branch contains a substantial runtime and metadata update after
+`v1.3.1`. Do not treat the branch as a tagged production release until every
+gate required by the advertised deployment profile has passed.
+
+### Required Gates Before Tagging
+
+- Run `composer quality`, strict Composer validation, and the locked dependency
+  audit on PHP 8.4 and PHP 8.5.
+- Run PostgreSQL and MySQL functional suites with skipped external-driver tests
+  treated as failures. PostgreSQL API profiles must load `pq` and `raphf`.
+- Measure every schema migration on a representative, isolated database copy;
+  stop old API and worker processes before the production migration.
+- Qualify the exact local filesystem, mount options, shutdown path, backup, and
+  sudden-power-loss behavior used by a single-host deployment.
+- Qualify each advertised multi-host storage backend on separate hosts. Shared
+  PostgreSQL or MySQL metadata alone does not qualify object storage.
+- Keep generic Flysystem and unverified shared mounts out of production until
+  their provider-specific delayed-write and cleanup fence has passed.
+- Exercise signed path-style and virtual-hosted requests through the intended
+  load balancer with exact `Host` preservation and trusted-proxy CIDRs.
+- Run the long soak only after the selected storage backend and proxy profile
+  satisfy their correctness gates; a soak cannot establish a missing write
+  fence.
+- For a strict at-rest claim, verify encrypted request spools, encrypted
+  multipart staging, private temporary directories, swap, core dumps, proxy
+  logs, worker memory, and cleanup of legacy plaintext multipart parts.
+
+### Upgrade Checks
+
+- Review cross-account grants for the new two-sided identity/resource Allow
+  requirement.
+- Run one `metadata:migrate` and, when database credentials are used, one
+  `credentials:migrate` with DDL-capable bootstrap roles before serving.
+- Abort or migrate legacy encrypted multipart uploads and drain old writers
+  before the coordinated node replacement.
+- Verify that every persisted storage tier is configured on every API node and
+  that dedicated workers intentionally defer tiers they do not serve.
+- Revoke older permanent OIDC-issued credentials where indefinite access is no
+  longer acceptable, and prepare the issuer-scoped owner migration before
+  enabling multiple issuers.
+- Confirm webhook consumers tolerate duplicate delivery and that optional
+  broker adapters are accepted as Best Effort.
+
+### Current Local Evidence
+
+The current package source passed 3,350 PHPUnit tests with 29,192 assertions
+and 217 expected opt-in or environment skips. PHPStan, the coding-style check,
+strict Composer validation, the locked dependency audit, and `git diff --check`
+also passed. External PostgreSQL/MySQL execution of the newest skipped cases,
+the exact PHP 8.4 deployment profile, multi-host storage qualification, and the
+current-source long soak remain separate gates.
+
 ## Released Version
 
 `v1.3.1` is a documentation-only follow-up to the runtime-identical `v1.3.0`,

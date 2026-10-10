@@ -3,17 +3,22 @@
 This document records the remediation work from the full server audit completed
 on 2026-07-24. Historical feature scope remains in
 `production-feature-roadmap.md`; exact release commands and measured results are
-in `release-checklist.md`.
+in `release-checklist.md`. Unless a paragraph explicitly identifies the current
+unreleased source, these counts and schema versions describe the July 2026
+release. Current behavior and pending gates are documented in the feature
+guides and [release checklist](release-checklist.md).
 
 ## Release Decision
 
-Status: **P0, P1, and P2 complete; all configured release gates pass**
+Status for the July 2026 release: **P0, P1, and P2 complete; its configured
+release gates passed.** The current unreleased source has additional pending
+gates tracked in the [release checklist](release-checklist.md).
 
 Runtime hardening was released as `v1.3.0` on 2026-07-26. The
 runtime-identical `v1.3.1` patch includes the completed release documentation.
 
 The default suite, PostgreSQL 16, MySQL 8.0, large-file, high-concurrency, and
-five-minute soak profiles pass on the current source. The external Linode
+five-minute soak profiles passed on the released source. The external Linode
 Path-Style profile also passes against the configured remote bucket. AWS STS
 Query API compatibility remains optional and unsupported. The first detached
 12-hour attempt was invalidated by a 9-hour-21-minute host suspension after
@@ -26,8 +31,9 @@ The uninterrupted repeat passed against Linode Flysystem and PostgreSQL in
 
 - [x] P0: fail-closed encryption/KMS behavior, source-side authorization for
   copy operations, version-scoped ACL/tag/Object Lock state, bounded control
-  bodies/metadata/tags, atomic conditionals, and transactional notification
-  outbox.
+  bodies/metadata/tags, atomic conditionals, and transactional webhook
+  notification outbox. Optional broker listeners remain Best Effort; see the
+  [current notification contract](notifications.md#internal-listeners-and-broker-adapters).
 - [x] P1: durable physical deletion retries, multipart quotas and stale cleanup,
   lifecycle lease renewal, transfer-time race revalidation, bounded signed and
   unsigned AWS chunk trailers, and storage/backend failure-path cleanup.
@@ -67,10 +73,15 @@ Status: **Complete**
 
 ## 3. Runtime and Shutdown
 
-Status: **Complete**
+Status: **Partial** — independent HTTP/1 idle timeout remains open.
 
 - [x] TLS certificate and key configuration reaches the listening server.
-- [x] Connection, read, write, and idle timeouts are configurable and applied.
+- [ ] Connection, read, write, and idle timeouts are configurable. HTTP/2 uses
+  the configured idle timeout; Amp HTTP Server 3.4.6 uses one HTTP/1 timeout
+  for both idle connections and active stream reads/writes. The package uses
+  the larger read/write value (300 seconds by default) for HTTP/1 so active
+  transfers are not cut off after the 60-second idle setting. See the
+  [deployment timeout note](deployment.md#connection-limits).
 - [x] Lifecycle, cleanup, tiering, restore, notification, request-spool, and
   storage worker activity is cancelled during shutdown.
 - [x] Background tasks and worker pools stop in deterministic order.
@@ -157,7 +168,8 @@ Status: **Complete**
 - [x] Migration, round-trip, observability, and concurrent quota tests pass
   against PostgreSQL 16 and MySQL 8.0 instances.
 
-SQLite uses schema version `14`. PostgreSQL and MySQL use schema version `15`.
+The current unreleased source uses SQLite schema version `39`, PostgreSQL
+schema version `41`, and MySQL schema version `44`.
 The external schemas include owner write locks, version-aware tags, multipart
 staging quotas, and durable physical-storage garbage collection. MySQL uses a
 generated SHA-256 tag identity so full long keys remain unique without exceeding

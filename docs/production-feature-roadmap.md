@@ -131,7 +131,8 @@ Need:
   marker lifecycle execution.
 - [x] Keep tag-filtered abort-multipart rules conservative until incomplete MPU
   tags are persisted.
-- [x] Add bounded scan batching and per-run action backpressure.
+- [x] Add bounded scan batching and a global per-sweep action budget shared by
+  all buckets, with a persistent fair-resume bucket cursor.
 - [x] Add configurable lifecycle interval, batch size, and max actions per run.
 - [x] Add metadata-backed lifecycle lease so only one node runs a lifecycle
   sweep at a time.
@@ -310,9 +311,17 @@ Acceptance:
 
 ### 8. Additional Notification Destinations
 
-Status: Implemented. Webhook delivery exists, internal event adapters exist,
-queue/dead-letter observability is implemented, and durable destination
-adapters can be added against a stable contract.
+Status: Implemented for webhook delivery and in-process event adapters.
+Queue/dead-letter observability applies to webhooks. Optional broker adapters
+are Best Effort for this release; a transactional broker outbox is deferred.
+
+The S3 notification XML endpoint now rejects new SNS/SQS/Lambda ARNs with
+`NotImplemented`. Legacy stored ARNs remain readable but are not delivered.
+The built-in dispatcher enqueues HTTP(S) webhooks only; direct ARN delivery
+remains outside the implemented contract.
+The XML endpoint now rejects event names that the webhook dispatcher cannot
+produce. Direct and batch versioned deletes emit `ObjectRemoved:DeleteMarkerCreated`
+when they create a marker, including for a previously absent key.
 
 Need:
 
@@ -322,9 +331,10 @@ Need:
   - [x] Kafka adapter implementation
   - [x] AMQP adapter implementation
   - [x] NATS adapter implementation
-- [x] Queue depth, retry, sent, blocked, and dead-letter metrics.
-- [x] Structured delivery logs for retry/dead-letter/circuit-breaker state.
-- [x] Destination adapter contracts for durable external destinations.
+- [x] Webhook queue depth, retry, sent, blocked, and dead-letter metrics.
+- [x] Structured webhook delivery logs for retry/dead-letter/circuit-breaker state.
+- [x] Destination adapter contracts for optional external producers. Their
+  in-process listener bridge does not persist, retry, or dead-letter events.
 - [x] Optional Redis/Kafka/AMQP/NATS adapter implementations without hard
   Composer dependencies.
 
