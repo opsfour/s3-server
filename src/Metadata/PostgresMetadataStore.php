@@ -3424,6 +3424,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
         return (int) $row['retained_count'];
     }
 
+    /** @return array{object: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
         $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'part')");
@@ -3818,11 +3819,6 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
                     || ($dispatchId !== null && ! is_scalar($dispatchId))) {
                     throw new \RuntimeException('Storage garbage queue returned an invalid row.');
                 }
-                $this->conn()->execute(
-                    "UPDATE s3_storage_garbage SET status = 'processing', next_attempt_at = $1,
-                     lease_generation = lease_generation + 1 WHERE id = $2",
-                    [$leaseExpiresAt, $id],
-                );
                 $rows[] = [
                     'id' => (int) $id,
                     'bucket' => (string) $bucket,
@@ -3836,6 +3832,15 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
                     'lease_generation' => (int) $leaseGeneration + 1,
                     'dispatch_id' => $dispatchId === null ? null : (string) $dispatchId,
                 ];
+            }
+            if ($rows !== []) {
+                $ids = array_column($rows, 'id');
+                $placeholders = implode(',', array_map(fn(int $index): string => '$' . ($index + 2), array_keys($ids)));
+                $this->conn()->execute(
+                    "UPDATE s3_storage_garbage SET status = 'processing', next_attempt_at = $1,
+                     lease_generation = lease_generation + 1 WHERE id IN ({$placeholders})",
+                    [$leaseExpiresAt, ...$ids],
+                );
             }
 
             return $rows;
@@ -4119,7 +4124,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
             'status' => self::str($row['status']),
             'attempts' => self::int($row['attempts']),
             'maxAttempts' => self::int($row['max_attempts']),
-            'nextAttemptAt' => (float) self::str($row['next_attempt_at']),
+            'nextAttemptAt' => self::float($row['next_attempt_at']),
             'leaseGeneration' => self::int($row['lease_generation']),
             'lastError' => $row['last_error'] !== null ? self::str($row['last_error']) : null,
             'createdAt' => $this->formatTimestamp($row['created_at']),
@@ -4145,7 +4150,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
             'status' => self::str($row['status']),
             'attempts' => self::int($row['attempts']),
             'maxAttempts' => self::int($row['max_attempts']),
-            'nextAttemptAt' => (float) self::str($row['next_attempt_at']),
+            'nextAttemptAt' => self::float($row['next_attempt_at']),
             'leaseGeneration' => self::int($row['lease_generation']),
             'lastError' => $row['last_error'] !== null ? self::str($row['last_error']) : null,
             'createdAt' => $this->formatTimestamp($row['created_at']),
@@ -4210,6 +4215,16 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
         }
 
         return (int) $value;
+    }
+
+    /** @param list<mixed>|bool|int|float|string|null $value */
+    private static function float(mixed $value): float
+    {
+        if (is_array($value)) {
+            return 0.0;
+        }
+
+        return (float) $value;
     }
 
     /**

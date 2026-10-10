@@ -50,7 +50,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        StorageBackend $storage,
         private readonly ?EncryptionServiceInterface $encryption = null,
         private readonly ?NotificationDispatcher $notifications = null,
         private readonly bool $enforceMinPartSize = false,

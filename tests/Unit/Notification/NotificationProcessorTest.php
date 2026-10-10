@@ -266,6 +266,7 @@ final class NotificationProcessorTest extends TestCase
         );
         $delegate = new DelayedCancellationNotificationHttpClient();
         $logger = new class extends AbstractLogger {
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 throw new \RuntimeException('private-logger-failure');

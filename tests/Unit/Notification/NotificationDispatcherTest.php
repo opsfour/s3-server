@@ -436,6 +436,7 @@ final class NotificationDispatcherTest extends TestCase
     public function test_throwing_timeout_logger_cannot_interrupt_listener_drain(): void
     {
         $logger = new class extends AbstractLogger {
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 throw new \RuntimeException('private-logger-failure');

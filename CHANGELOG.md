@@ -51,6 +51,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Restore PHP 8.4/Linux SQLite cutover inventory compatibility and prevent
+  PostgreSQL storage-garbage claim workers from issuing updates before their
+  locked result set is fully consumed.
 - Reject ambiguous duplicate authorization, query, checksum, and XML mutation
   inputs before selecting or changing resources.
 - Preserve checksum, version, storage-tier, object-owner, and bucket-generation

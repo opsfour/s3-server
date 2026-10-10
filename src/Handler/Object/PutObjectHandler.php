@@ -500,6 +500,8 @@ final class PutObjectHandler implements RequestHandler
                 // transaction rolled back. Preserve any path now referenced by
                 // metadata; if that lookup fails, defer cleanup instead of
                 // deleting a possibly published object.
+                // The transaction can throw while committing after its callback
+                // has set this by-reference safety flag.
                 if (! $publicationCallbackCompleted
                     && ! $this->mayBePublishedAfterCommitFailure($bucket, $key, $result->path, $versionId, $versioning, $metadataWriteAttempted)) {
                     $this->deleteUncommittedPath($bucket, $result->path);

@@ -149,6 +149,7 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         $storage = new CallbackStorageBackend(new InMemoryBackend());
         $encryption = new RuntimeFactoryRecordingEncryptionService(throwOnShutdown: true);
         $logger = new class extends NullLogger {
+            /** @param array<string, mixed> $context */
             public function warning(string|\Stringable $message, array $context = []): void
             {
                 throw new \RuntimeException('Injected logger failure.');

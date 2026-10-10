@@ -276,14 +276,14 @@ final class SqliteCutoverPathReferenceEnumerator implements CutoverPathReference
     private static function jsonProbe(string $column, string $jsonPath): string
     {
         $extracted = self::probe("json_extract({$column}, '{$jsonPath}')");
-        return "CASE WHEN {$column} IS NOT NULL AND octet_length({$column}) <= "
+        return "CASE WHEN {$column} IS NOT NULL AND length(CAST({$column} AS BLOB)) <= "
             . self::MAX_METADATA_JSON_BYTES . " THEN {$extracted} ELSE NULL END";
     }
 
     private static function metadataOversize(string $column, bool $allowNull): string
     {
         $nullCheck = $allowNull ? '' : "{$column} IS NULL OR ";
-        return "CASE WHEN {$nullCheck}octet_length({$column}) > " . self::MAX_METADATA_JSON_BYTES
+        return "CASE WHEN {$nullCheck}length(CAST({$column} AS BLOB)) > " . self::MAX_METADATA_JSON_BYTES
             . ' THEN 1 ELSE 0 END';
     }
 }

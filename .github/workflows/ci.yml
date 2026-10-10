@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -25,7 +25,7 @@ jobs:
       - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: "8.4"
-          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml
+          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml, sockets
           coverage: none
         env:
           fail-fast: "true"
@@ -63,7 +63,7 @@ jobs:
 
   dependency-compatibility:
     name: Dependencies (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -86,7 +86,7 @@ jobs:
       - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: "8.4"
-          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml
+          extensions: curl, mbstring, openssl, pdo_sqlite, simplexml, sockets
           coverage: none
         env:
           fail-fast: "true"
@@ -111,8 +111,8 @@ jobs:
       - run: composer test
 
   metadata-backends:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     services:
       mysql:
@@ -156,7 +156,7 @@ jobs:
       - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: "8.4"
-          extensions: curl, mbstring, openssl, simplexml
+          extensions: curl, mbstring, openssl, pdo_mysql, pdo_pgsql, simplexml, sockets, raphf, pq
           coverage: none
         env:
           fail-fast: "true"
@@ -164,6 +164,12 @@ jobs:
       - uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
         with:
           dependency-versions: locked
+
+      - name: Allow CI metadata user to create MySQL triggers
+        run: >-
+          docker exec --env MYSQL_PWD=s3audit "${{ job.services.mysql.id }}"
+          mysql --user=root
+          --execute='SET GLOBAL log_bin_trust_function_creators = 1'
 
       - name: Metadata backend parity and concurrency
         run: vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php

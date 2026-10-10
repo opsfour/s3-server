@@ -463,6 +463,7 @@ final class TierTransitionExecutorTest extends TestCase
             /** @var list<array{message: string, context: array<string, mixed>}> */
             public array $records = [];
 
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 $this->records[] = ['message' => (string) $message, 'context' => $context];

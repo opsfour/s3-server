@@ -25,7 +25,7 @@ final class AbortMultipartUploadHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        StorageBackend $storage,
         private readonly ?NotificationDispatcher $notifications = null,
         ?StorageTierRegistry $storageTiers = null,
     ) {

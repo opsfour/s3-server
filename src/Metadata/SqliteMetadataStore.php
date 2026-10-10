@@ -1063,6 +1063,8 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 // WAL read snapshots cannot be promoted after a concurrent commit.
                 // Retry only the metadata admission after its transaction rolled back;
                 // a COMMIT error may have succeeded and must never be retried.
+                // The transaction can throw while committing after the callback
+                // has returned and changed this by-reference safety flag.
                 if ($callbackCompleted || ! self::isSqliteBusy($e) || $retries >= 5) {
                     throw $e;
                 }
@@ -3917,6 +3919,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         return (int) $row['retained_count'];
     }
 
+    /** @return array{object: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
         $statement = $this->prepare('SELECT kind, retained_count, typeof(retained_count) AS count_type FROM s3_write_intent_capacity WHERE kind IN (\'object\', \'part\')');

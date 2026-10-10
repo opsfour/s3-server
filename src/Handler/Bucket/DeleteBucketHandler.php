@@ -38,7 +38,7 @@ final class DeleteBucketHandler implements RequestHandler
 
     public function __construct(
         private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
+        StorageBackend $storage,
         ?StorageTierRegistry $storageTiers = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);

@@ -63,6 +63,7 @@ final class SimpleEventDispatcherTest extends TestCase
     {
         $nestedCalls = 0;
         $logger = new class extends AbstractLogger {
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 throw new \RuntimeException('private-logger-failure');

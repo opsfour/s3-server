@@ -857,11 +857,20 @@ final class MetadataBackendIntegrationTest extends TestCase
         $writer = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
         if ($driver === 'mysql') {
             // Hosts can provide their own pool with stronger isolation than
-            // Amp's READ COMMITTED default.
-            $reader = new MysqlMetadataStore(new MysqlConnectionPool(
-                MysqlConfig::fromString(trim($dsn)),
-                transactionIsolation: SqlTransactionIsolationLevel::Repeatable,
-            ));
+            // Amp's READ COMMITTED default. Amp MySQL 3.0 predates the pool
+            // isolation argument and keeps the server's REPEATABLE READ default.
+            $config = MysqlConfig::fromString(trim($dsn));
+            $constructor = new \ReflectionMethod(MysqlConnectionPool::class, '__construct');
+            $supportsIsolation = array_filter(
+                $constructor->getParameters(),
+                static fn(\ReflectionParameter $parameter): bool => $parameter->getName() === 'transactionIsolation',
+            ) !== [];
+            $arguments = $supportsIsolation
+                ? [$config, MysqlConnectionPool::DEFAULT_MAX_CONNECTIONS, MysqlConnectionPool::DEFAULT_IDLE_TIMEOUT, null, SqlTransactionIsolationLevel::Repeatable]
+                : [$config];
+            $pool = (new \ReflectionClass(MysqlConnectionPool::class))->newInstanceArgs($arguments);
+            self::assertInstanceOf(MysqlConnectionPool::class, $pool);
+            $reader = new MysqlMetadataStore($pool);
             $reader->initialize();
         }
         $name = 'named-snapshot-' . bin2hex(random_bytes(8));

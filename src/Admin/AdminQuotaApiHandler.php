@@ -108,7 +108,7 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             }
 
             $last = end($quotas);
-            $nextCursor = $hasMore && is_array($last) ? self::encodeCursor($last['ownerId']) : null;
+            $nextCursor = $hasMore && is_array($last) ? self::encodeCursor((string) $last['ownerId']) : null;
 
             return $this->json(['quotas' => $quotas, 'nextCursor' => $nextCursor]);
         }

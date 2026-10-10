@@ -74,6 +74,7 @@ final class S3ServerStartupOwnershipTest extends TestCase
 
             public bool $installed = false;
 
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 if ($this->installed || ! str_starts_with((string) $message, 'Listening on http://')) {

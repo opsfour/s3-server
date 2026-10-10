@@ -45,6 +45,7 @@ final class LifecycleRunnerTest extends TestCase
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
         $logger = new class extends NullLogger {
+            /** @param array<string, mixed> $context */
             public function log($level, string|\Stringable $message, array $context = []): void
             {
                 if (($context['event'] ?? null) === 'runner_stopped') {

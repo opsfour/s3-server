@@ -838,6 +838,8 @@ final class CopyObjectHandler implements RequestHandler
             // An empty immediate lookup cannot rule out a COMMIT still in
             // flight. Once the callback returned, retain the path regardless
             // of whether an immediate read can already see publication.
+            // The transaction can throw while committing after its callback
+            // has set this by-reference safety flag.
             if (! $metadataCallbackCompleted && $localDispatchToken === null) {
                 $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $versionId);
             }

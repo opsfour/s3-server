@@ -3398,6 +3398,7 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
         return (int) $row['retained_count'];
     }
 
+    /** @return array{object: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
         $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'part')");
