@@ -6,27 +6,40 @@ PHP Fibers.
 
 ## Features
 
-- **Broad S3 API coverage** — 66 routed S3 operations including multipart uploads, versioning, object lock, lifecycle rules, S3 Select, restore, and website hosting
+- **Broad S3 API coverage** — 69 routed S3 operations including multipart uploads, versioning, Object Ownership controls, object lock, lifecycle rules, S3 Select, restore, and website hosting
 - **AWS SDK compatible** — Tested with the AWS SDK for PHP; standard S3 clients can use the documented operation subset
-- **Multiple metadata backends** — SQLite (single-node), PostgreSQL or MySQL (multi-node HA)
-- **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory
-- **Server-side encryption** — SSE-S3 with key rotation support, SSE-C (customer-provided keys), AES-256-GCM
+- **Multiple metadata backends** — SQLite for one node; PostgreSQL and MySQL
+  for shared cluster metadata. Review the documented storage requirements
+  before deploying API nodes on separate hosts.
+- **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory for development with volatile SQLite metadata; remote Flysystem production qualification requires a provider-verified write fence
+- **Optional server-side encryption** — SSE-S3 with key rotation support and SSE-C (customer-provided keys), using AES-256-GCM when configured
 - **Authentication** — AWS Signature V4, presigned URLs, signed and unsigned `aws-chunked` checksum trailers
-- **Multi-tenant** — Owner ID scopes all operations; multiple credential providers (memory, database, file, chain)
+- **Multi-tenant** — Owner IDs isolate buckets by default; explicit grants can allow cross-account object access. Credential providers include memory, database, file, and chain.
 - **Framework integrations** — Standalone CLI, Laravel service provider, and Symfony Bundle
 - **Quotas and tiering** — Per-owner/per-bucket object and multipart-staging quotas, physical storage tiers, cold-tier restore workflow
-- **Event notifications** — Persistent queue with retry, exponential backoff, dead-letter, and SSRF protection
+- **Event notifications** — Persistent webhook queue with retry, exponential backoff, dead-letter, and SSRF protection; optional in-process broker adapters are Best Effort
 - **S3 Select** — SQL queries over unencrypted CSV and JSON objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Production hardened** — 745-test default suite plus large-object, high-concurrency, remote-storage, and uninterrupted 12-hour soak profiles
+- **Release checks** — Default suite plus opt-in large-object, high-concurrency,
+  remote-storage, and long-soak profiles. A current-source 12-hour soak is
+  required before advertising a qualified remote backend and is deferred until
+  that backend has a provider-verified write fence; see the
+  [release checklist](docs/release-checklist.md)
+
+Signed access across local accounts requires an explicit Allow in the requester's
+account or attached credential policy and a bucket-policy or ACL grant from the
+resource side. Existing cross-account grants need both permissions when upgrading;
+see [Policy Compatibility](docs/policy-compatibility.md).
 
 ## Requirements
 
 - PHP 8.4+
 - Composer 2.x
-- ext-openssl (encryption)
-- ext-pdo_sqlite (default metadata) or ext-pdo_pgsql / ext-pdo_mysql
+- ext-openssl (required for all request-body temporary spools)
+- ext-pdo_sqlite for the default SQLite metadata backend
+- pecl-pq and its pecl-raphf dependency for PostgreSQL API nodes; the server
+  refuses to start with only ext-pgsql
 - Symfony 7.4 LTS or 8.1+ when using the Symfony Bundle
 - Laravel 12 or 13 when using the Laravel service provider
 
@@ -37,11 +50,10 @@ PHP Fibers.
 ```bash
 composer require opsfour/s3-server
 
-# Start with defaults (SQLite metadata, filesystem storage)
+# Set S3_ACCESS_KEY and S3_SECRET_KEY in the environment first.
+# Start with SQLite metadata and filesystem storage.
 php vendor/bin/s3-server \
-  --storage-path=/var/data/s3 \
-  --access-key=myAccessKey \
-  --secret-key=mySecretKey
+  --storage-path=/var/data/s3
 ```
 
 ### Laravel
@@ -72,12 +84,15 @@ php bin/console opsfour:s3:serve
 ### Connect with AWS CLI
 
 ```bash
-aws configure set aws_access_key_id myAccessKey
-aws configure set aws_secret_access_key mySecretKey
+(
+export AWS_ACCESS_KEY_ID=myAccessKey
+export AWS_SECRET_ACCESS_KEY=mySecretKey
+export AWS_DEFAULT_REGION=us-east-1
 
 aws --endpoint-url http://localhost:9000 s3 mb s3://my-bucket
 aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://my-bucket/
 aws --endpoint-url http://localhost:9000 s3 ls s3://my-bucket/
+)
 ```
 
 ## Documentation
@@ -95,7 +110,7 @@ Full documentation is in the [docs/](docs/) directory:
 | [Storage Backends](docs/storage-backends.md) | Filesystem, Flysystem, in-memory |
 | [Metadata Backends](docs/metadata-backends.md) | SQLite, PostgreSQL, MySQL |
 | [Encryption](docs/encryption.md) | SSE-S3 key rotation, SSE-C, configuration |
-| [API Operations](docs/api-operations.md) | All 66 supported S3 operations |
+| [API Operations](docs/api-operations.md) | All 69 supported S3 operations |
 | [Versioning & Object Lock](docs/versioning.md) | Bucket versioning, retention, legal holds |
 | [Notifications](docs/notifications.md) | Event notifications and webhook delivery |
 | [Lifecycle Rules](docs/lifecycle.md) | Object expiration and cleanup |
@@ -110,20 +125,15 @@ Full documentation is in the [docs/](docs/) directory:
 
 ## Project & Support
 
-opsfour S3 Server is a [twopeaks.digital](https://twopeaks.digital) project.
+opsfour S3 Server is a project of [twopeaks digital GmbH](https://twopeaks.digital).
 Related ops4 information is available at [ops4.com](https://ops4.com).
 
-This package and repository are provided **as is**, without warranty of any kind.
-No guarantee is made for fitness for a particular purpose, uninterrupted
-operation, data integrity, security, compatibility, or continued maintenance.
-To the maximum extent permitted by law, no liability is accepted for damages,
-data loss, business interruption, or other consequences arising from use of this
-software. By using this repository or package, you acknowledge and agree to this
-disclaimer and limitation of liability.
+The open-source package is licensed under the [MIT License](LICENSE.md), which
+includes its warranty disclaimer and limitation of liability.
 
 Paid support, integration work, production hardening, and custom development are
-available on request.
+available on request under separately agreed terms.
 
 ## License
 
-MIT
+[MIT License](LICENSE.md)

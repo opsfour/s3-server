@@ -1,13 +1,12 @@
 # opsfour S3 Server Documentation
 
-opsfour S3 Server is a [twopeaks.digital](https://twopeaks.digital) project.
+opsfour S3 Server is a project of [twopeaks digital GmbH](https://twopeaks.digital).
 Related ops4 information is available at [ops4.com](https://ops4.com).
 
-The package and repository are provided **as is**, without warranty or liability.
-By using this repository or package, you acknowledge and agree to this
-disclaimer and limitation of liability.
+The [MIT License](../LICENSE.md) includes the warranty disclaimer and limitation
+of liability for the open-source package.
 Paid support, integration work, production hardening, and custom development are
-available on request.
+available on request under separately agreed terms.
 
 ## Getting Started
 
@@ -30,7 +29,7 @@ available on request.
 
 ## S3 API
 
-- [API Operations](api-operations.md) — All 66 supported S3 operations
+- [API Operations](api-operations.md) — All 69 supported S3 operations
 - [Versioning & Object Lock](versioning.md) — Bucket versioning, retention, legal holds
 - [Notifications](notifications.md) — Event notifications and webhook delivery
 - [Lifecycle Rules](lifecycle.md) — Object expiration and automated cleanup
