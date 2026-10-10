@@ -12,18 +12,22 @@ composer require opsfour/s3-server
 
 ### Standalone (no framework)
 
+Set `S3_ACCESS_KEY` and `S3_SECRET_KEY` in the server environment before
+starting. The sample values below are for local development; use a secret
+manager for deployed credentials.
+
 ```bash
+export S3_ACCESS_KEY=myAccessKey
+export S3_SECRET_KEY=mySecretKey
 php vendor/bin/s3-server \
   --storage-path=./storage/s3 \
-  --access-key=myAccessKey \
-  --secret-key=mySecretKey \
   --port=9000
 ```
 
 ### Laravel
 
 ```bash
-php artisan s3:serve --storage-path=./storage/s3 --access-key=myAccessKey --secret-key=mySecretKey
+php artisan s3:serve --storage-path=./storage/s3
 ```
 
 ### Symfony
@@ -38,8 +42,8 @@ opsfour_s3_server:
     path: '%kernel.project_dir%/var/s3'
   credentials:
     driver: memory
-    access_key: myAccessKey
-    secret_key: mySecretKey
+    access_key: '%env(S3_ACCESS_KEY)%'
+    secret_key: '%env(S3_SECRET_KEY)%'
     owner_id: default-owner
     display_name: Default User
 ```

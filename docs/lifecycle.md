@@ -2,6 +2,11 @@
 
 Lifecycle rules automate object management — expiring old objects, cleaning up noncurrent versions, and aborting incomplete multipart uploads.
 
+A configuration contains at most 1,000 rules, and every rule must contain at
+least one action. Current-version transitions may use `Days: 0`; expiration,
+noncurrent and incomplete-upload day values must be positive. All day values
+are capped at 365,000 so date arithmetic remains portable and fail closed.
+
 ## Configure Lifecycle Rules
 
 ```php
@@ -74,7 +79,9 @@ Clean up abandoned multipart uploads:
 
 ### Transitions
 
-Move objects to different storage classes (metadata-only in this implementation):
+Move objects to configured physical storage tiers. Each `StorageClass` must
+match a tier name in the server configuration; the default standalone profile
+has only `STANDARD`. Configure the target tiers before saving this rule:
 
 ```php
 'Transitions' => [
@@ -82,6 +89,21 @@ Move objects to different storage classes (metadata-only in this implementation)
     ['Days' => 90, 'StorageClass' => 'GLACIER'],
 ]
 ```
+
+Configure every source and target tier on each transition worker. If a worker
+receives a job for a tier it lacks, it returns the job to the pending queue for
+another attempt after 60 seconds without consuming its failure budget or moving
+the object. Restore the missing tier configuration to recover these jobs. A
+worker that can access both tiers can then complete the copy. API servers
+refuse to start when stored objects, lifecycle rules, queued tier work, or
+storage-garbage entries reference a tier missing from that node's registry.
+Retain a tier's backend until its references have been migrated or removed.
+Standalone tier workers can intentionally have fewer tiers and continue to
+defer work they cannot perform.
+
+Restore workers also defer jobs for 60 seconds without consuming an attempt
+when the source tier is missing locally. Configure that tier on a worker to
+complete the restore; until then, the object remains in pending restore state.
 
 ## Filters
 
@@ -116,9 +138,16 @@ Apply the rule only to objects with a specific tag:
 ]
 ```
 
+An `And` filter requires at least two predicates. Every tag key in it must be
+unique; tag keys remain case-sensitive. Malformed, nested, foreign-namespace,
+or duplicate predicates are rejected before an existing configuration is
+replaced. A malformed rule found directly in legacy/imported metadata is
+skipped without applying any lifecycle action. See the
+[AWS lifecycle filter rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-filters.html).
+
 ## Lifecycle Runner
 
-The lifecycle executor runs automatically in the background when the server starts (if metadata and storage backends are available). It periodically evaluates all bucket lifecycle rules and applies them.
+The lifecycle executor runs automatically in the background when the server starts (if metadata and storage backends are available). It periodically evaluates all bucket lifecycle rules and applies them. The configured maximum action count is shared by all buckets and stale multipart cleanup in one sweep. When that budget is exhausted, a metadata-backed cursor lets the next process or cluster node resume at the following bucket.
 
 There is no manual trigger needed — the runner handles scheduling internally.
 

@@ -3,11 +3,14 @@
 ## Requirements
 
 - **PHP 8.4+** with the following extensions:
-  - `ext-openssl` (required for encryption)
+  - `ext-openssl` (always required for encrypted request-body temporary spools)
   - `ext-pdo_sqlite` (default metadata backend)
   - `ext-pdo_pgsql` (optional, for PostgreSQL metadata)
   - `ext-pdo_mysql` (optional, for MySQL metadata)
   - `ext-pcntl` (recommended, for signal handling)
+  - `ext-posix` (required on Unix when writing credentials with the file provider)
+- **PostgreSQL API nodes:** `pecl-pq` and its `pecl-raphf` dependency are
+  required; `ext-pdo_pgsql` alone does not satisfy the server startup check.
 - **Composer 2.x**
 - **Symfony 7.4 LTS or 8.1+** when using the Symfony Bundle
 - **Laravel 12 or 13** when using the Laravel service provider
@@ -26,10 +29,12 @@ The package includes a CLI binary at `vendor/bin/s3-server`. No framework requir
 php vendor/bin/s3-server \
   --host=0.0.0.0 \
   --port=9000 \
-  --storage-path=/var/data/s3 \
-  --access-key=AKIAIOSFODNN7EXAMPLE \
-  --secret-key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  --storage-path=/var/data/s3
 ```
+
+Load credentials from a protected environment file or the process
+supervisor's secret store. Passing a secret key on the command line can expose
+it through shell history or process listings.
 
 ### CLI Options
 
@@ -42,7 +47,8 @@ php vendor/bin/s3-server \
 | `--storage-temp-dir` | system temp | Local Flysystem staging directory |
 | `--flysystem-workers` | `0` | Bounded remote-storage workers; standalone Flysystem requires at least 1 |
 | `--backing-bucket` | - | Backing S3 bucket for standalone Flysystem |
-| `--backing-endpoint` | AWS default | Backing S3-compatible endpoint |
+| `--backing-endpoint` | AWS default | HTTPS backing S3-compatible endpoint |
+| `--backing-allow-insecure-http-for-tests` | `false` | Unsafe test-only opt-in for an HTTP backing endpoint; never use in production |
 | `--backing-path-style` | `false` | Use path-style backing requests |
 | `--region` | `us-east-1` | AWS region identifier |
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
@@ -50,7 +56,7 @@ php vendor/bin/s3-server \
 | `--metadata-path` | (auto) | Standalone SQLite database path |
 | `--credentials-driver` | `memory` | `memory`, `database`, `file` |
 | `--access-key` | - | Access key (memory driver) |
-| `--secret-key` | - | Secret key (memory driver) |
+| `--secret-key` | - | Secret key override for isolated local use; prefer a protected environment or secret store |
 | `--owner-id` | `default-owner` | Owner ID (memory driver) |
 | `--display-name` | `Default User` | Display name (memory driver) |
 | `--max-connections` | `10000` | Max concurrent connections |

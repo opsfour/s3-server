@@ -80,6 +80,7 @@ opsfour_s3_server:
     port: '%env(int:S3_PORT)%'
     region: '%env(S3_REGION)%'
     body_size_limit: '%env(int:S3_BODY_SIZE_LIMIT)%'
+    trusted_proxy_cidrs: ['10.0.1.10/32']
 
   storage:
     driver: '%env(S3_STORAGE_DRIVER)%'
@@ -121,7 +122,7 @@ Options:
 |--------|-------------|
 | `--host` | Listen address override |
 | `--port` | Listen port override |
-| `--admin-token` | Admin API token override |
+| `--admin-token` | Admin API token override for isolated local use; prefer configuration from a protected secret store because command arguments can be visible in shell history and process listings |
 
 The command handles `SIGINT` and `SIGTERM` and shuts the server down through the
 shared runtime drain path.
@@ -279,6 +280,7 @@ opsfour_s3_server:
     filesystem_factory_service: 'app.s3_backing_filesystem_factory'
     worker_pool_size: 8
     temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
+    temp_budget_bytes: 10737418240
 ```
 
 The same pattern works for physical tiers:
@@ -305,8 +307,11 @@ opsfour_s3_server:
 ```
 
 The server uses local temporary files for bounded-memory staging. Object data
-is persisted in the configured remote backend. Size and monitor each
-`temp_dir` for the maximum number of concurrent worker transfers.
+is persisted in the configured remote backend. `temp_budget_bytes` defaults
+to 10 GiB and counts both API and worker temporary files for transfers sharing
+one `temp_dir`; tiers can override it. A multipart assembly larger than the
+budget returns 503 until the budget is raised. Size and monitor each temporary
+volume, and apply a volume quota when browser POST or unrelated writers share it.
 
 ## Symfony Event Listeners
 
@@ -352,6 +357,10 @@ Supported event patterns match the core dispatcher:
 - exact names, for example `s3:ObjectCreated:Put`
 - wildcard suffixes, for example `s3:ObjectCreated:*`
 - global wildcard `s3:*`
+
+To keep an API node enqueueing webhooks while a separate node drains the
+shared queue, set `notifications.worker_enabled: false` on that API node.
+At least one node using the same metadata database must keep it enabled.
 
 You can also bridge every matching S3 event into Symfony's EventDispatcher:
 

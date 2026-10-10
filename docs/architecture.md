@@ -43,7 +43,8 @@ OpsFour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concu
    - `RequestIdMiddleware` — assigns a UUID
    - `ErrorHandlingMiddleware` — catches S3Exceptions, returns XML errors
    - `LoggingMiddleware` — logs request/response with timing
-   - `ExpectContinueMiddleware` — sends 100 Continue for large uploads
+   - `ExpectContinueMiddleware` — removes a handled `Expect: 100-continue`
+     header after Amp's HTTP driver has emitted the interim response
    - `RateLimitMiddleware` — per-IP token bucket check (database-backed)
    - `S3AttributeMiddleware` — parses bucket/key from path, resolves S3 operation name
    - `WebsiteHostingMiddleware` — authorizes and serves anonymous static
@@ -96,21 +97,20 @@ A single server process can handle thousands of concurrent requests because Fibe
 ## Storage Architecture
 
 ```
-Storage Path Structure:
+Storage Path Structure (filesystem backend):
 /var/data/s3/
-├── metadata.sqlite          # SQLite database (if using sqlite driver)
-├── objects/                  # Object data files
-│   ├── ab/cd/ef/1234...     # Content-addressable storage
-│   └── ...
-├── parts/                   # Multipart upload parts (temporary)
-│   ├── upload-id-1/
-│   │   ├── part-1
-│   │   └── part-2
-│   └── ...
-└── temp/                    # Temporary files for atomic writes
+├── bucket-name/              # Object data by bucket and key hash
+│   └── ab/cd/<unique-path>
+├── .parts/<upload-id>/       # Multipart upload parts
+├── .assemblies/              # Planned multipart completion paths
+└── .tmp/                     # Temporary files for atomic rename
 ```
 
-Object writes follow a write-ahead pattern: write to temp file → store metadata → atomic rename. This prevents partial reads and ensures consistency.
+The backend writes a temporary file and renames it to a unique final path
+before the handler commits the metadata reference. Readers follow committed
+metadata, so they do not see a partial file. Failed commits require cleanup of
+the unreferenced path. Atomic rename alone does not establish sudden-power-loss
+durability; see [Storage Backends](storage-backends.md#requirements).
 
 ## Encryption Architecture
 
@@ -145,7 +145,10 @@ Request Fiber                    Background Fiber
                                  updateStatus()
 ```
 
-The dispatcher is synchronous and sub-millisecond (single INSERT). The processor runs as a background Fiber with its own polling loop.
+This diagram describes configured HTTP(S) webhooks. Their queue insertion is
+synchronous; the processor runs as a background Fiber with its own polling
+loop. Internal listeners and optional Redis/Kafka/AMQP/NATS broker adapters
+run in-process without this persistent queue or its retry schedule.
 
 ## Multi-Tenancy
 

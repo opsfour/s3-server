@@ -52,12 +52,14 @@ php artisan s3:serve
 ```bash
 php artisan s3:serve \
   --host=0.0.0.0 \
-  --port=9000 \
-  --access-key=myKey \
-  --secret-key=mySecret
+  --port=9000
 ```
 
-CLI options override `.env` values.
+CLI options override `.env` values. Configure access and secret keys through a
+protected environment file or the process supervisor's secret store. The
+`--access-key` and `--secret-key` overrides are intended only for isolated local
+development because command arguments can appear in shell history and process
+listings.
 
 ## Manage Per-Account Quotas
 
@@ -155,4 +157,9 @@ S3_CREDENTIALS_PASSWORD=secret
 S3_CREDENTIALS_CACHE_TTL=1
 ```
 
-Tables are auto-created on first start via the built-in schema manager.
+Before starting Artisan `s3:serve` with PostgreSQL/MySQL metadata and database
+credentials, run `php bin/s3-server metadata:migrate` and
+`php bin/s3-server credentials:migrate` once with DDL-capable bootstrap roles.
+The latter uses the PDO credential DSN and preserves stored credentials. Start
+the API with DML-only roles after both schemas are ready; it checks them
+without applying DDL. SQLite metadata still initializes locally on first use.
