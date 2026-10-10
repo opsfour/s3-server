@@ -27,7 +27,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'opsfour:s3:serve', description: 'Start the OpsFour S3-compatible server')]
+#[AsCommand(name: 'opsfour:s3:serve', description: 'Start the opsfour S3-compatible server')]
 final class S3ServerServeCommand extends Command
 {
     /**
@@ -90,7 +90,7 @@ final class S3ServerServeCommand extends Command
 
         $failed = false;
         try {
-            $output->writeln("OpsFour S3 Server starting on {$config->host}:{$config->port}");
+            $output->writeln("opsfour S3 Server starting on {$config->host}:{$config->port}");
             $output->writeln("Storage: {$config->storagePath}");
             if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
                 $output->writeln("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");

@@ -74,7 +74,7 @@
     "minimum-stability": "stable",
     "prefer-stable": true,
     "suggest": {
-        "symfony/http-kernel": "Required when using OpsFour S3 Server as a Symfony Bundle.",
+        "symfony/http-kernel": "Required when using opsfour S3 Server as a Symfony Bundle.",
         "amphp/redis": "Required when using the Redis master-key provider.",
         "aws/aws-sdk-php": "Required for the S3-compatible Flysystem worker factory.",
         "league/flysystem-aws-s3-v3": "Required for the S3-compatible Flysystem worker factory."

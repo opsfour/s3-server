@@ -173,7 +173,7 @@ S3_SHUTDOWN_DRAIN_TIMEOUT=30   # seconds
 ```ini
 # /etc/systemd/system/s3-server.service
 [Unit]
-Description=OpsFour S3 Server
+Description=opsfour S3 Server
 After=network.target postgresql.service
 
 [Service]

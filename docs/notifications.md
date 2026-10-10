@@ -1,6 +1,6 @@
 # Event Notifications
 
-OpsFour S3 Server queues event notifications for HTTP(S) webhook destinations when objects are created, deleted, or copied. Delivered server access-log files also produce `ObjectCreated:Put` events in the logging target bucket. The database queue retains pending deliveries across restarts and retries failures with exponential backoff before dead-letter handling.
+opsfour S3 Server queues event notifications for HTTP(S) webhook destinations when objects are created, deleted, or copied. Delivered server access-log files also produce `ObjectCreated:Put` events in the logging target bucket. The database queue retains pending deliveries across restarts and retries failures with exponential backoff before dead-letter handling.
 
 Webhook enqueueing requires the bucket generation captured by the operation
 that produced the event. A delayed event from a deleted bucket is discarded if

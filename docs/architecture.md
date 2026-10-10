@@ -2,7 +2,7 @@
 
 ## Overview
 
-OpsFour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concurrency framework for PHP. It uses PHP 8.4 Fibers for cooperative multitasking — a single process handles thousands of concurrent connections without threads or child processes.
+opsfour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concurrency framework for PHP. It uses PHP 8.4 Fibers for cooperative multitasking — a single process handles thousands of concurrent connections without threads or child processes.
 
 ```
 ┌─────────────────────────────────────────────────────────┐

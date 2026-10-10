@@ -1,6 +1,6 @@
 # Symfony Integration
 
-OpsFour S3 Server can run as a Symfony Bundle. The bundle wires the same core
+opsfour S3 Server can run as a Symfony Bundle. The bundle wires the same core
 runtime used by the standalone and Laravel entry points, so S3 behavior remains
 consistent across integrations.
 
@@ -488,7 +488,7 @@ stopsignal=TERM
 
 ```ini
 [Unit]
-Description=OpsFour S3 Server
+Description=opsfour S3 Server
 After=network.target
 
 [Service]

@@ -1,6 +1,6 @@
 # Laravel Integration
 
-OpsFour S3 Server integrates with Laravel 12 and 13 via a service provider and
+opsfour S3 Server integrates with Laravel 12 and 13 via a service provider and
 Artisan commands.
 
 Laravel 11 reached the end of security support on March 12, 2026 and is not a

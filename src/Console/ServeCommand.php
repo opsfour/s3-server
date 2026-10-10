@@ -35,7 +35,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'serve', description: 'Start the OpsFour S3-compatible server')]
+#[AsCommand(name: 'serve', description: 'Start the opsfour S3-compatible server')]
 final class ServeCommand extends Command
 {
     /** Internal only: there is no CLI or environment switch for EFS serving. */
@@ -315,7 +315,7 @@ final class ServeCommand extends Command
 
         $failed = false;
         try {
-            $logger->info('OpsFour S3 Server starting', [
+            $logger->info('opsfour S3 Server starting', [
                 'storage' => "{$storageDriver}" . ($storagePath ? ":{$storagePath}" : ''),
                 'region' => $region,
                 'metadata' => $metadataDriver,

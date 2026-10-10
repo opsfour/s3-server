@@ -1,6 +1,6 @@
 # Policy Compatibility Matrix
 
-OpsFour S3 Server supports an IAM-style bucket policy subset for the S3 data
+opsfour S3 Server supports an IAM-style bucket policy subset for the S3 data
 plane. The evaluator is intentionally bounded: supported conditions are applied
 explicitly, and unsupported condition operators or keys fail closed with
 `AccessDenied`.

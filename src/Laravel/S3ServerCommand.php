@@ -26,7 +26,7 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
- * Artisan command to start the OpsFour S3-compatible server.
+ * Artisan command to start the opsfour S3-compatible server.
  *
  * Resolves backends from the container (registered by S3ServerServiceProvider)
  * with optional CLI overrides.
@@ -44,7 +44,7 @@ class S3ServerCommand extends Command
         {--access-key= : Access key ID (overrides config, memory driver only)}
         {--secret-key= : Secret access key (overrides config, memory driver only)}';
 
-    protected $description = 'Start the OpsFour S3-compatible server';
+    protected $description = 'Start the opsfour S3-compatible server';
 
     public function handle(): int
     {
@@ -142,7 +142,7 @@ class S3ServerCommand extends Command
 
         $failed = false;
         try {
-            $this->info("OpsFour S3 Server starting on {$config->host}:{$config->port}");
+            $this->info("opsfour S3 Server starting on {$config->host}:{$config->port}");
             $this->info("Storage: {$config->storagePath}");
             if ($config->sqliteWorkerPoolSize > 0 && $config->metadataDriver === 'sqlite') {
                 $this->info("SQLite worker pool: {$config->sqliteWorkerPoolSize} workers");

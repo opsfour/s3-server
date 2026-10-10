@@ -31,6 +31,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Normalize the user-facing product name to the lowercase `opsfour` spelling.
 - Cross-account signed access now requires an explicit identity-policy Allow
   plus resource-side consent from a bucket policy or applicable ACL.
 - PostgreSQL API nodes require `pecl-pq` and `pecl-raphf`; migration commands

@@ -1,6 +1,6 @@
 # Symfony Integration Plan
 
-This document tracks the Symfony Bundle work for OpsFour S3 Server. The
+This document tracks the Symfony Bundle work for opsfour S3 Server. The
 production integration is implemented; the remaining items are optional
 ecosystem conveniences.
 

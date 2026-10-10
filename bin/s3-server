@@ -32,7 +32,7 @@ use OpsFour\S3Server\Console\QuotaCommand;
 use OpsFour\S3Server\Console\ServeCommand;
 use Symfony\Component\Console\Application;
 
-$app = new Application('OpsFour S3 Server', '1.0.0');
+$app = new Application('opsfour S3 Server', '1.0.0');
 $app->addCommand(new ServeCommand());
 $app->addCommand(new MetadataMigrateCommand());
 $app->addCommand(new CredentialsCommand());

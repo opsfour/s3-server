@@ -19,7 +19,7 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
- * Laravel service provider for the OpsFour S3 Server.
+ * Laravel service provider for the opsfour S3 Server.
  *
  * Registers backend singletons (storage, metadata, credentials) via
  * factory classes and provides the s3:serve artisan command.

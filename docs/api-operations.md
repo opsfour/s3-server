@@ -1,6 +1,6 @@
 # API Operations
 
-OpsFour S3 Server implements 69 S3 API operations using standard AWS S3
+opsfour S3 Server implements 69 S3 API operations using standard AWS S3
 request/response formats. Compatibility is limited to the documented operation
 and policy subset; AWS-specific control-plane services such as KMS and STS are
 not implied.

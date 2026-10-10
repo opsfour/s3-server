@@ -1,6 +1,6 @@
 # Authentication
 
-OpsFour S3 Server implements the documented AWS Signature Version 4 request forms, including presigned URLs and chunked streaming signatures.
+opsfour S3 Server implements the documented AWS Signature Version 4 request forms, including presigned URLs and chunked streaming signatures.
 
 ## How Authentication Works
 

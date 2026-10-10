@@ -188,7 +188,7 @@ $container = new ContainerBuilder;
 ]], $container);
 $container->compile();
 
-$app = new Application('OpsFour S3 Symfony Smoke');
+$app = new Application('opsfour S3 Symfony Smoke');
 $registerCommand = method_exists($app, 'addCommand') ? 'addCommand' : 'add';
 $app->{$registerCommand}($container->get(S3ServerServeCommand::class));
 $app->setDefaultCommand('opsfour:s3:serve', true);

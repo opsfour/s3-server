@@ -1,6 +1,6 @@
 # Encryption
 
-OpsFour S3 Server supports server-side encryption with two modes:
+opsfour S3 Server supports server-side encryption with two modes:
 
 - **SSE-S3** — Server-managed keys with key rotation support
 - **SSE-C** — Customer-provided keys (per-request)
