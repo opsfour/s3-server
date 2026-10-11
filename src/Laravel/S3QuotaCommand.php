@@ -8,6 +8,7 @@ use Illuminate\Console\Command;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Quota\QuotaValueParser;
 
 /**
  * Artisan command for managing per-account S3 quotas.
@@ -164,12 +165,7 @@ final class S3QuotaCommand extends Command
 
     private function optionInt(string $name): int
     {
-        $value = $this->option($name);
-        if (!is_string($value) || preg_match('/^\d+$/', $value) !== 1) {
-            throw new \InvalidArgumentException("--{$name} must be an integer >= 0.");
-        }
-
-        return (int) $value;
+        return QuotaValueParser::nonNegativeInteger($this->option($name), "--{$name}");
     }
 
     private function renderQuota(string $ownerId, QuotaConfig $quota): void

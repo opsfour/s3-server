@@ -97,6 +97,21 @@ final class QuotaCommandTest extends TestCase
         $this->assertStringContainsString('--max-buckets must be an integer >= 0', $tester->getDisplay());
     }
 
+    public function test_set_rejects_values_above_the_platform_integer_range(): void
+    {
+        $tester = $this->tester();
+
+        $exit = $tester->execute([
+            'action' => 'set',
+            'owner-id' => 'account-a',
+            '--storage-path' => $this->storagePath,
+            '--max-bytes' => (string) PHP_INT_MAX . '0',
+        ]);
+
+        $this->assertSame(Command::FAILURE, $exit, $tester->getDisplay());
+        $this->assertStringContainsString('--max-bytes must be an integer >= 0 within the supported range', $tester->getDisplay());
+    }
+
     private function tester(): CommandTester
     {
         return new CommandTester(new QuotaCommand());

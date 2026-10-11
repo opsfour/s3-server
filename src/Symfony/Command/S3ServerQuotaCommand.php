@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Symfony\Command;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Quota\QuotaValueParser;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
@@ -178,12 +179,7 @@ final class S3ServerQuotaCommand extends Command
 
     private function optionInt(InputInterface $input, string $name): int
     {
-        $value = (string) $input->getOption($name);
-        if (! preg_match('/^\d+$/', $value)) {
-            throw new \InvalidArgumentException("--{$name} must be an integer >= 0.");
-        }
-
-        return (int) $value;
+        return QuotaValueParser::nonNegativeInteger($input->getOption($name), "--{$name}");
     }
 
     private function renderQuota(SymfonyStyle $io, string $ownerId, QuotaConfig $quota): void

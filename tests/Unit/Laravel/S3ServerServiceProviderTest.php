@@ -347,6 +347,23 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertNull($metadata->getAccountQuota('account-a'));
     }
 
+    public function test_artisan_quota_command_rejects_values_above_the_platform_integer_range(): void
+    {
+        $app = $this->application();
+        $command = $app->make(S3QuotaCommand::class);
+        self::assertInstanceOf(S3QuotaCommand::class, $command);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        self::assertSame(Command::FAILURE, $tester->execute([
+            'action' => 'set',
+            'owner-id' => 'account-a',
+            '--max-bytes' => (string) PHP_INT_MAX . '0',
+        ]));
+        self::assertStringContainsString('--max-bytes must be an integer >= 0 within the supported range', $tester->getDisplay());
+        self::assertNull($app->make(MetadataStore::class)->getAccountQuota('account-a'));
+    }
+
     public function test_provider_resolves_direct_flysystem_service_like_symfony_integration(): void
     {
         $app = $this->application([

@@ -393,6 +393,19 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
     }
 
+    public function test_quota_command_rejects_values_above_the_platform_integer_range(): void
+    {
+        $container = $this->container();
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
+
+        self::assertSame(Command::FAILURE, $tester->execute([
+            'action' => 'set',
+            'owner-id' => 'account-overflow',
+            '--max-bytes' => (string) PHP_INT_MAX . '0',
+        ]));
+        self::assertStringContainsString('--max-bytes must be an integer >= 0 within the supported range', $tester->getDisplay());
+    }
+
     public function test_flysystem_storage_can_reference_symfony_service(): void
     {
         $container = new ContainerBuilder();

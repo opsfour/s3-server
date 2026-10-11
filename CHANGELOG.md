@@ -75,6 +75,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   backend diagnostics are not exposed in responses or logs.
 - Reject invalid Laravel boolean environment values instead of treating every
   nonempty string as enabled, including the unsafe storage-fence test bypass.
+- Reject quota CLI values above the platform integer range instead of silently
+  storing a smaller saturated value.
 
 ### Upgrade Notes
 
