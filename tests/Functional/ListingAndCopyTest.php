@@ -209,7 +209,7 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
 
     public function test_list_objects_v2_rejects_malformed_continuation_tokens_even_for_empty_pages(): void
     {
-        foreach (['@@@', '', 'YQ', base64_encode(str_repeat('a', 1025))] as $token) {
+        foreach (['@@@', '', 'YQ', base64_encode("\xFF"), base64_encode(str_repeat('a', 1025))] as $token) {
             try {
                 self::$s3->listObjectsV2([
                     'Bucket' => self::$bucket,
