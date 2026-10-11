@@ -77,6 +77,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   nonempty string as enabled, including the unsafe storage-fence test bypass.
 - Reject quota CLI values above the platform integer range instead of silently
   storing a smaller saturated value.
+- Complete the Laravel quick-start credentials with the required owner ID and
+  display name.
 
 ### Upgrade Notes
 

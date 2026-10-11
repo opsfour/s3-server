@@ -67,6 +67,8 @@ php artisan vendor:publish --provider="OpsFour\S3Server\Laravel\S3ServerServiceP
 S3_STORAGE_PATH=/var/data/s3
 S3_ACCESS_KEY=myAccessKey
 S3_SECRET_KEY=mySecretKey
+S3_OWNER_ID=local-account
+S3_DISPLAY_NAME="Local account"
 
 php artisan s3:serve
 ```

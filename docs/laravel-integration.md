@@ -31,6 +31,8 @@ Add to your `.env`:
 S3_STORAGE_PATH=/var/data/s3
 S3_ACCESS_KEY=your-access-key
 S3_SECRET_KEY=your-secret-key
+S3_OWNER_ID=local-account
+S3_DISPLAY_NAME="Local account"
 
 # Optional
 S3_PORT=9000
