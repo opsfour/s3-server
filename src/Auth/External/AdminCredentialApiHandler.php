@@ -18,7 +18,7 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
         private ExternalCredentialIssuer $credentialIssuer,
         private string $adminToken,
     ) {
-        if ($adminToken === '') {
+        if (trim($adminToken) === '') {
             throw new \InvalidArgumentException('External IAM admin API requires a non-empty admin token.');
         }
     }
@@ -26,7 +26,7 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         if (!$this->isAuthorized($request)) {
-            return $this->json(['error' => 'unauthorized'], 401);
+            return $this->json(['error' => 'unauthorized'], 401, ['WWW-Authenticate' => 'Bearer']);
         }
 
         return match ($request->getMethod()) {

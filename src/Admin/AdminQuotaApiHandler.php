@@ -36,7 +36,7 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
         private MetadataStore $metadata,
         private string $adminToken,
     ) {
-        if ($adminToken === '') {
+        if (trim($adminToken) === '') {
             throw new \InvalidArgumentException('Quota admin API requires a non-empty admin token.');
         }
     }
@@ -44,7 +44,7 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         if (!$this->isAuthorized($request)) {
-            return $this->json(['error' => 'unauthorized'], 401);
+            return $this->json(['error' => 'unauthorized'], 401, ['WWW-Authenticate' => 'Bearer']);
         }
 
         return match ($request->getMethod()) {
@@ -185,7 +185,9 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             throw new \InvalidArgumentException('Owner ID is invalid.');
         }
         $ownerId = rawurldecode($encoded);
-        if (strlen($ownerId) > 255 || preg_match('//u', $ownerId) !== 1) {
+        if (strlen($ownerId) > 255
+            || preg_match('//u', $ownerId) !== 1
+            || preg_match('/[\x00-\x1F\x7F]/', $ownerId) === 1) {
             throw new \InvalidArgumentException('Owner ID is invalid.');
         }
 

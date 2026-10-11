@@ -297,6 +297,24 @@ final class ServeCommandTest extends TestCase
         }
     }
 
+    public function test_explicit_empty_quota_admin_token_does_not_fall_back_to_external_iam_token(): void
+    {
+        $names = ['S3_ADMIN_API_TOKEN', 'S3_EXTERNAL_IAM_ADMIN_TOKEN'];
+        $originals = [];
+        foreach ($names as $name) {
+            $originals[$name] = getenv($name);
+        }
+        putenv('S3_ADMIN_API_TOKEN=');
+        putenv('S3_EXTERNAL_IAM_ADMIN_TOKEN=external-secret');
+        try {
+            self::assertSame('', $this->invoke(new ServeCommand(), 'adminApiTokenFromEnv', []));
+        } finally {
+            foreach ($originals as $name => $original) {
+                putenv($original === false ? $name : $name . '=' . $original);
+            }
+        }
+    }
+
     public function test_explicit_empty_metrics_token_does_not_publish_metrics(): void
     {
         $command = new ServeCommand();

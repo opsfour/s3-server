@@ -19,7 +19,11 @@ final class MetricsHandler implements RequestHandler
         private readonly MetricsCollector $metrics,
         private readonly ?MetadataStore $metadata = null,
         private readonly ?string $bearerToken = null,
-    ) {}
+    ) {
+        if ($bearerToken !== null && trim($bearerToken) === '') {
+            throw new \InvalidArgumentException('Metrics bearer token must not be empty when configured.');
+        }
+    }
 
     public function handleRequest(Request $request): Response
     {

@@ -162,6 +162,14 @@ final class MetricsHandlerTest extends TestCase
         self::assertSame('no-store', $authorized->getHeader('cache-control'));
     }
 
+    public function test_whitespace_bearer_token_is_rejected_instead_of_publishing_metrics(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not be empty');
+
+        new MetricsHandler(new MetricsCollector(), bearerToken: " \t ");
+    }
+
     public function test_duplicate_authorization_headers_are_rejected(): void
     {
         $request = $this->request();

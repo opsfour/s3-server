@@ -626,7 +626,7 @@ final class ServeCommand extends Command
     private function adminApiTokenFromEnv(): ?string
     {
         $token = getenv('S3_ADMIN_API_TOKEN');
-        if ($token !== false && trim($token) !== '') {
+        if ($token !== false) {
             return trim($token);
         }
 

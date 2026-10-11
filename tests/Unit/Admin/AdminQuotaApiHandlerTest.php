@@ -46,7 +46,16 @@ final class AdminQuotaApiHandlerTest extends TestCase
 
         $this->assertSame(401, $response->getStatus());
         $this->assertSame('no-store', $response->getHeader('cache-control'));
+        $this->assertSame('Bearer', $response->getHeader('www-authenticate'));
         $this->assertSame(['error' => 'unauthorized'], $this->json($response));
+    }
+
+    public function test_handler_rejects_whitespace_admin_token(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('non-empty admin token');
+
+        new AdminQuotaApiHandler($this->metadata, " \t ");
     }
 
     public function test_duplicate_authorization_headers_are_rejected(): void
@@ -72,6 +81,26 @@ final class AdminQuotaApiHandlerTest extends TestCase
         self::assertSame(400, $response->getStatus());
         self::assertSame('no-store', $response->getHeader('cache-control'));
         self::assertSame([], $this->metadata->listAccountQuotas());
+    }
+
+    public function test_control_character_owner_is_rejected_before_quota_lookup_or_mutation(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getAccountQuota');
+        $metadata->expects(self::never())->method('putAccountQuota');
+        $handler = new AdminQuotaApiHandler($metadata, 'admin-secret');
+
+        foreach (['GET', 'PUT'] as $method) {
+            $response = $handler->handleRequest($this->request(
+                $method,
+                '/.admin/quotas/tenant%00hidden',
+                $method === 'PUT' ? $this->fullQuota() : '',
+                $this->authHeaders(),
+            ));
+
+            self::assertSame(400, $response->getStatus());
+            self::assertSame('invalid_request', $this->json($response)['error']);
+        }
     }
 
     public function test_put_get_list_and_delete_account_quota(): void
