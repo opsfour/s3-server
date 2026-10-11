@@ -19,6 +19,10 @@ use OpsFour\S3Server\Http\Iso8601Timestamp;
  */
 final class PostObjectFormParser
 {
+    private const int MAX_SIGV4_SIGNING_AGE_SECONDS = 604_800;
+
+    private const int MAX_CLOCK_SKEW_SECONDS = 900;
+
     private const int FIELD_SIZE_LIMIT = 65_536;
 
     private readonly PostObjectTempFileSweeper $tempFileSweeper;
@@ -340,7 +344,7 @@ final class PostObjectFormParser
                 }
                 $expected = (string) $condition[2];
                 if (($operator === 'eq' && $actual !== $expected)
-                    || ($operator === 'starts-with' && !str_starts_with($actual, $expected))) {
+                    || ($operator === 'starts-with' && ! PostPolicyConditionMatcher::startsWith($field, $actual, $expected))) {
                     throw new AccessDeniedException('Invalid according to Policy: form field condition failed.');
                 }
                 continue;
@@ -442,6 +446,7 @@ final class PostObjectFormParser
             || !str_starts_with($dateTime, $scope[1])) {
             throw new AccessDeniedException('Invalid POST credential scope.');
         }
+        self::validateV4SigningTime($dateTime);
 
         $credential = $this->credential($scope[0], self::value($fields, 'x-amz-security-token'));
         $signingKey = SigningKey::derive($credential->secretAccessKey, $scope[1], $scope[2], 's3');
@@ -470,6 +475,29 @@ final class PostObjectFormParser
             && $hour <= 23
             && $minute <= 59
             && $second <= 59;
+    }
+
+    private static function validateV4SigningTime(string $dateTime): void
+    {
+        $signedAt = gmmktime(
+            (int) substr($dateTime, 9, 2),
+            (int) substr($dateTime, 11, 2),
+            (int) substr($dateTime, 13, 2),
+            (int) substr($dateTime, 4, 2),
+            (int) substr($dateTime, 6, 2),
+            (int) substr($dateTime, 0, 4),
+        );
+        if ($signedAt === false) {
+            throw new AccessDeniedException('Invalid POST credential scope.');
+        }
+
+        $now = time();
+        if ($signedAt < $now - self::MAX_SIGV4_SIGNING_AGE_SECONDS) {
+            throw new AccessDeniedException('POST signing key is older than seven days.');
+        }
+        if ($signedAt > $now + self::MAX_CLOCK_SKEW_SECONDS) {
+            throw new AccessDeniedException('The difference between the request time and the current time is too large.');
+        }
     }
 
     private function credential(string $accessKeyId, ?string $sessionToken): Credential

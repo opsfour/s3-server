@@ -310,16 +310,23 @@ final class CopyObjectHandler implements RequestHandler
         $srcObjectInfo = ($srcVersionId !== null)
             ? $this->metadata->getObjectMetadataByVersion($srcBucket, $srcKey, $srcVersionId)
             : $this->metadata->getObjectMetadata($srcBucket, $srcKey);
-        if ($srcObjectInfo === null || $srcObjectInfo->isDeleteMarker) {
+        if ($srcObjectInfo === null) {
             $request->setAttribute('s3.copySourceLogEligible', true);
             // A missing current source must not disclose its absence to a
-            // caller who cannot list the source bucket. A current delete
-            // marker retains its established missing-key response.
+            // caller who cannot list the source bucket.
             if ($srcVersionId === null
-                && $srcObjectInfo === null
                 && $this->metadata->getCurrentObjectVersion($srcBucket, $srcKey) === null
                 && ! MissingObjectListVisibility::canList($this->metadata, $request, $srcBucket, copySource: true)) {
                 throw new AccessDeniedException();
+            }
+            throw new NoSuchKeyException();
+        }
+        if ($srcObjectInfo->isDeleteMarker) {
+            $request->setAttribute('s3.copySourceLogEligible', true);
+            if ($srcVersionId !== null) {
+                throw new InvalidRequestException(
+                    'The source of a copy request may not specifically refer to a delete marker by version ID.',
+                );
             }
             throw new NoSuchKeyException();
         }
@@ -391,6 +398,17 @@ final class CopyObjectHandler implements RequestHandler
                 's3:PutObjectTagging',
                 $policyRequestTags,
             );
+        }
+
+        // Validate replacement metadata before the storage copy. Besides
+        // failing fast, this prevents an invalid metadata request from
+        // leaving an unreferenced physical destination object behind.
+        $replacementUserMetadata = $metadataDirective === 'REPLACE'
+            ? UserMetadataExtractor::extract($request)
+            : null;
+        $replacementExpires = $request->getHeader('expires');
+        if ($replacementUserMetadata !== null && $replacementExpires !== null && $replacementExpires !== '') {
+            $replacementUserMetadata['__expires'] = $replacementExpires;
         }
 
         // Reject self-copy unless this request changes a property that this
@@ -594,7 +612,8 @@ final class CopyObjectHandler implements RequestHandler
             $contentEncoding = $request->getHeader('content-encoding');
             $contentDisposition = $request->getHeader('content-disposition');
             $cacheControl = $request->getHeader('cache-control');
-            $userMetadata = UserMetadataExtractor::extract($request);
+            \assert($replacementUserMetadata !== null);
+            $userMetadata = $replacementUserMetadata;
         } else {
             // COPY: preserve source metadata (but strip source encryption metadata).
             $contentType = $srcObjectInfo->contentType;
@@ -603,7 +622,7 @@ final class CopyObjectHandler implements RequestHandler
             $cacheControl = $srcObjectInfo->systemMetadata['cache-control'] ?? null;
             $userMetadata = [];
             foreach ($srcObjectInfo->userMetadata as $k => $v) {
-                if (! str_starts_with($k, '__')) {
+                if (! str_starts_with($k, '__') || $k === '__expires') {
                     $userMetadata[$k] = $v;
                 }
             }

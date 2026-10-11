@@ -426,6 +426,22 @@ final class PostObjectTest extends S3FunctionalTestCase
         self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
     }
 
+    public function test_sigv4_form_rejects_a_signing_key_older_than_seven_days(): void
+    {
+        $key = 'stale-signing-key-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'stale.txt',
+            body: 'must not be written',
+            dateTime: gmdate('Ymd\THis\Z', time() - 8 * 86400),
+            policyExpiration: gmdate('Y-m-d\TH:i:s\Z', time() + 300),
+        );
+
+        self::assertSame(403, $response->getStatusCode());
+        self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
     public function test_bad_form_signature_rejects_large_file_without_creating_object(): void
     {
         $key = 'invalid-signature-' . bin2hex(random_bytes(4)) . '.txt';
@@ -498,6 +514,22 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame('/' . self::$bucket, (string) $xml->Resource);
         $this->assertSame($response->getHeaderLine('x-amz-request-id'), (string) $xml->RequestId);
         $this->assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
+    public function test_content_type_list_must_satisfy_starts_with_for_every_value(): void
+    {
+        $key = 'mixed-content-types-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: 'must not be written',
+            extraFields: ['Content-Type' => 'image/jpeg,text/plain'],
+            additionalConditions: [['starts-with', '$Content-Type', 'image/']],
+        );
+
+        self::assertSame(403, $response->getStatusCode());
+        self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $response->getBody());
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
     }
 
     public function test_sigv4_form_rejects_field_not_covered_by_policy(): void

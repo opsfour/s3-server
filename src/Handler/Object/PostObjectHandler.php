@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\PostObjectForm;
+use OpsFour\S3Server\Auth\PostPolicyConditionMatcher;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\EntityTooSmallException;
@@ -204,7 +205,7 @@ final class PostObjectHandler implements RequestHandler
             if ($operator === 'eq' && $actual !== $expected) {
                 return $this->policyConditionFailure($operator, $field, $expected);
             }
-            if ($operator === 'starts-with' && !str_starts_with($actual, $expected)) {
+            if ($operator === 'starts-with' && ! PostPolicyConditionMatcher::startsWith($field, $actual, $expected)) {
                 return $this->policyConditionFailure($operator, $field, $expected);
             }
         }
