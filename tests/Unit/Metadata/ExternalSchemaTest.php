@@ -106,7 +106,10 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(41, PostgresSchema::VERSION);
+        self::assertSame(42, PostgresSchema::VERSION);
+        $quotaCollationIndex = 'CREATE INDEX IF NOT EXISTS idx_s3_account_quotas_owner_c ON s3_account_quotas(owner_id COLLATE "C")';
+        self::assertContains($quotaCollationIndex, PostgresSchema::getMigrationStatements(41));
+        self::assertContains($quotaCollationIndex, PostgresSchema::getCreateStatements());
         $corsMigration = implode("\n", PostgresSchema::getMigrationStatements(40));
         self::assertStringContainsString('s3_cors_rules ADD COLUMN IF NOT EXISTS rule_id TEXT', $corsMigration);
         self::assertStringContainsString('SET max_age_seconds = -1 WHERE max_age_seconds = 0', $corsMigration);

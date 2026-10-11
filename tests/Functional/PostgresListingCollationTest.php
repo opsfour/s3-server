@@ -8,6 +8,7 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
+use OpsFour\S3Server\Quota\QuotaConfig;
 use PHPUnit\Framework\TestCase;
 
 final class PostgresListingCollationTest extends TestCase
@@ -46,6 +47,8 @@ final class PostgresListingCollationTest extends TestCase
         $versionKeys = array_merge($allKeys, ['a', 'é']);
         usort($versionKeys, 'strcmp');
         $uploads = [];
+        $quotaPrefix = 's3audit-list-quota-' . bin2hex(random_bytes(5)) . '-';
+        $quotaOwners = array_map(static fn(string $suffix): string => $quotaPrefix . $suffix, $flat);
         $store->createBucket($owner, $bucket, 'us-east-1');
         try {
             foreach ($allKeys as $key) {
@@ -65,10 +68,29 @@ final class PostgresListingCollationTest extends TestCase
             $this->assertDelimitedPages($store, $bucket, ['group/Z/', 'group/a/', 'group/z/', 'group/é/']);
             self::assertSame(['é'], array_map(static fn($object): string => $object->key, $store->listObjects($bucket, prefix: 'é')->objects));
             self::assertSame(['é'], array_column($store->listMultipartUploads($bucket, prefix: 'é')['uploads'], 'key_name'));
-            $pool->execute("UPDATE s3_objects SET created_at = '2020-01-01T00:00:00Z' WHERE bucket = $1", [$bucket]);
+            $pool->execute(
+                "UPDATE s3_objects SET created_at = '2020-01-01T00:00:00Z', noncurrent_at = CASE WHEN is_latest THEN NULL ELSE '2020-01-01T00:00:00Z'::timestamptz END WHERE bucket = $1",
+                [$bucket],
+            );
             $store->deleteObjectVersioned($bucket, 'orphan/Z', $owner);
             $store->deleteObjectVersioned($bucket, 'orphan/é', $owner);
             $this->assertLifecyclePages($store, $bucket, $allKeys);
+            foreach ($quotaOwners as $quotaOwner) {
+                $store->putAccountQuota($quotaOwner, new QuotaConfig(maxBucketsPerOwner: 1));
+            }
+            self::assertSame($quotaOwners, array_keys(array_filter(
+                $store->listAccountQuotas(),
+                static fn(QuotaConfig $quota, string $ownerId): bool => str_starts_with($ownerId, $quotaPrefix),
+                ARRAY_FILTER_USE_BOTH,
+            )));
+            $quotaPage = $store->listAccountQuotasPage($quotaPrefix, 2);
+            self::assertSame(array_slice($quotaOwners, 0, 2), array_column($quotaPage, 'ownerId'));
+            $quotaPage = $store->listAccountQuotasPage($quotaPage[1]['ownerId'], 2);
+            self::assertSame(array_slice($quotaOwners, 2), array_column($quotaPage, 'ownerId'));
+            self::assertStringContainsString(
+                'idx_s3_account_quotas_owner_c',
+                self::explainIndex($pool, 'SELECT owner_id FROM s3_account_quotas WHERE owner_id COLLATE "C" > $1 ORDER BY owner_id COLLATE "C" LIMIT 1', [$quotaPrefix]),
+            );
 
             self::assertStringContainsString(
                 '_listing_c',
@@ -83,27 +105,29 @@ final class PostgresListingCollationTest extends TestCase
                 self::explainIndex($pool, 'SELECT key_name FROM s3_multipart_uploads WHERE bucket = $1 AND key_name COLLATE "C" > $2 ORDER BY key_name COLLATE "C", upload_id COLLATE "C" LIMIT 1', [$bucket, 'a']),
             );
 
-            foreach ([
+            $bytewiseIndexes = [
                 'idx_s3_objects_latest_listing_c',
                 'idx_s3_objects_versions_listing_c',
                 'idx_s3_objects_lifecycle_listing_c',
                 'idx_s3_multipart_uploads_listing_c',
-            ] as $index) {
+                'idx_s3_account_quotas_owner_c',
+            ];
+            foreach ($bytewiseIndexes as $index) {
                 $pool->execute('DROP INDEX ' . $index);
             }
-            $pool->execute('DELETE FROM s3_schema_version WHERE version = 29');
+            $pool->execute('DELETE FROM s3_schema_version');
             $pool->execute("INSERT INTO s3_schema_version (version, description) VALUES (28, 'Isolated v28 listing fixture')");
             $store->initialize();
             $version = $pool->execute('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
             self::assertSame(PostgresSchema::VERSION, (int) ($version['version'] ?? 0));
-            foreach (PostgresSchema::getMigrationStatements(28) as $statement) {
-                if (!str_contains($statement, '_listing_c')) {
-                    continue;
-                }
-                self::assertNotNull($pool->execute('SELECT indexname FROM pg_indexes WHERE indexname = $1', [self::indexName($statement)])->fetchRow());
+            foreach ($bytewiseIndexes as $index) {
+                self::assertNotNull($pool->execute('SELECT indexname FROM pg_indexes WHERE indexname = $1', [$index])->fetchRow());
             }
             $this->assertObjectPages($store, $bucket, $allKeys);
         } finally {
+            foreach ($quotaOwners as $quotaOwner) {
+                $store->deleteAccountQuota($quotaOwner);
+            }
             foreach ($uploads as $id) {
                 $store->deleteMultipartUpload($id);
             }
@@ -285,11 +309,5 @@ final class PostgresListingCollationTest extends TestCase
         } finally {
             $tx->rollback();
         }
-    }
-
-    private static function indexName(string $statement): string
-    {
-        preg_match('/\bidx_s3_[a-z_]+_listing_c\b/', $statement, $match);
-        return $match[0] ?? '';
     }
 }

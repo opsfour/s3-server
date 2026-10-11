@@ -173,8 +173,9 @@ DSN and DDL-capable role. See the [deployment order](deployment.md#rollout-and-r
 | 37 (SQLite) / 39 (PostgreSQL) / 42 (MySQL) | Index cleanup operations that are unsafe for local multi-host admission. SQLite and PostgreSQL use partial indexes; MySQL uses a byte-exact virtual classifier plus a secondary index. |
 | 38 (SQLite) / 40 (PostgreSQL) / 43 (MySQL) | Persist the verified algorithm and value of each optional UploadPart checksum so retries replace both fields atomically and ListParts can return them. |
 | 39 (SQLite) / 41 (PostgreSQL) / 44 (MySQL) | Preserve optional CORS rule IDs and distinguish an omitted `MaxAgeSeconds` from explicit zero. Legacy zero rows retain their previous omitted meaning. MySQL also widens website document/redirect fields and logging prefixes to `MEDIUMTEXT` for parity with the one-MiB control-plane request limit. |
+| 42 (PostgreSQL) | Add a C-collated account-quota owner index so cursor pagination keeps UTF-8 byte order under non-C database collations. |
 
-SQLite currently uses schema version `39`; PostgreSQL uses `41`, and MySQL
+SQLite currently uses schema version `39`; PostgreSQL uses `42`, and MySQL
 uses `44`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried

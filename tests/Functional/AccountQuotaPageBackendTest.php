@@ -36,20 +36,20 @@ final class AccountQuotaPageBackendTest extends TestCase
 
         $store = MetadataStoreFactory::create($driver, $config);
         $prefix = 'quota-page-' . bin2hex(random_bytes(8));
-        $owners = [$prefix . '-1', $prefix . '-2', $prefix . '-3'];
+        $owners = [$prefix . '-Z', $prefix . '-a', $prefix . '-z', $prefix . '-é'];
         try {
             foreach ($owners as $number => $ownerId) {
                 $store->putAccountQuota($ownerId, new QuotaConfig(maxBytesPerOwner: $number + 1));
             }
 
-            $first = $store->listAccountQuotasPage($prefix . '-0', 2);
+            $first = $store->listAccountQuotasPage($prefix . '-', 2);
             self::assertSame($owners[0], $first[0]['ownerId']);
             self::assertSame($owners[1], $first[1]['ownerId']);
             self::assertSame(2, count($first));
             self::assertSame(1, $first[0]['quota']->maxBytesPerOwner);
 
             $second = $store->listAccountQuotasPage($first[1]['ownerId'], 2);
-            self::assertSame([$owners[2]], array_column($second, 'ownerId'));
+            self::assertSame([$owners[2], $owners[3]], array_column($second, 'ownerId'));
             self::assertSame(3, $second[0]['quota']->maxBytesPerOwner);
         } finally {
             foreach ($owners as $ownerId) {

@@ -44,7 +44,7 @@ The project follows [Semantic Versioning](https://semver.org/).
   retry contract applies to HTTP(S) webhooks.
 - New objects remain unencrypted unless SSE is requested or bucket default
   encryption is configured.
-- SQLite metadata schema is version 39, PostgreSQL is 41, and MySQL is 44.
+- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 44.
 - Lifecycle action limits now apply across the complete sweep and resume fairly
   from a persisted bucket cursor.
 - API documentation now describes 69 routed S3 operations.

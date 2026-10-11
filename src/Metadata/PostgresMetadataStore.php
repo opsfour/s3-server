@@ -706,7 +706,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
     public function listAccountQuotas(): array
     {
         $result = $this->conn()->execute(
-            'SELECT * FROM s3_account_quotas ORDER BY owner_id ASC',
+            'SELECT * FROM s3_account_quotas ORDER BY owner_id COLLATE "C" ASC',
         );
 
         $quotas = [];
@@ -733,8 +733,8 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
         }
 
         $result = $after === null
-            ? $this->conn()->execute('SELECT * FROM s3_account_quotas ORDER BY owner_id ASC LIMIT $1', [$limit])
-            : $this->conn()->execute('SELECT * FROM s3_account_quotas WHERE owner_id > $1 ORDER BY owner_id ASC LIMIT $2', [$after, $limit]);
+            ? $this->conn()->execute('SELECT * FROM s3_account_quotas ORDER BY owner_id COLLATE "C" ASC LIMIT $1', [$limit])
+            : $this->conn()->execute('SELECT * FROM s3_account_quotas WHERE owner_id COLLATE "C" > $1 ORDER BY owner_id COLLATE "C" ASC LIMIT $2', [$after, $limit]);
         $page = [];
         while (($row = $result->fetchRow()) !== null) {
             $ownerId = self::str($row['owner_id']);

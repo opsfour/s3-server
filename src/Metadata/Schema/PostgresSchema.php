@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 41;
+    public const int VERSION = 42;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -70,6 +70,7 @@ final class PostgresSchema
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
+            'CREATE INDEX IF NOT EXISTS idx_s3_account_quotas_owner_c ON s3_account_quotas(owner_id COLLATE "C")',
 
             // Transactional owner write locks for quotas and replacement serialization.
             <<<'SQL'
@@ -934,6 +935,9 @@ final class PostgresSchema
             $statements[] = 'ALTER TABLE s3_cors_rules ADD COLUMN IF NOT EXISTS rule_id TEXT';
             $statements[] = 'UPDATE s3_cors_rules SET max_age_seconds = -1 WHERE max_age_seconds = 0';
             $statements[] = 'ALTER TABLE s3_cors_rules ALTER COLUMN max_age_seconds SET DEFAULT -1';
+        }
+        if ($fromVersion < 42) {
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_account_quotas_owner_c ON s3_account_quotas(owner_id COLLATE "C")';
         }
 
         return $statements;
