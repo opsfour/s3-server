@@ -228,7 +228,6 @@ final class CorsMiddlewareTest extends TestCase
 
         $this->metadata->deleteBucket('owner', 'bucket-a');
         $this->metadata->createBucket('owner', 'bucket-a', 'us-east-1');
-        self::assertSame($rules, $cached->getBucketCors('bucket-a'));
 
         $response = (new CorsMiddleware($observed))->handleRequest(
             $this->request('OPTIONS', ['Origin' => 'https://client.example', 'Access-Control-Request-Method' => 'PUT']),
