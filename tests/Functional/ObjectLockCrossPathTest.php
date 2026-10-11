@@ -91,6 +91,12 @@ final class ObjectLockCrossPathTest extends S3FunctionalTestCase
         $key = 'protected.txt';
         $put = self::$s3->putObject(['Bucket' => $bucket, 'Key' => $key, 'Body' => 'protected bytes']);
         $versionId = (string) $put['VersionId'];
+        $deletableKey = 'deletable.txt';
+        $deletableVersionId = (string) self::$s3->putObject([
+            'Bucket' => $bucket,
+            'Key' => $deletableKey,
+            'Body' => 'deletable bytes',
+        ])['VersionId'];
         $retainUntil = new \DateTimeImmutable('+1 day', new \DateTimeZone('UTC'));
         self::$s3->putObjectRetention([
             'Bucket' => $bucket,
@@ -107,12 +113,18 @@ final class ObjectLockCrossPathTest extends S3FunctionalTestCase
 
         $batch = self::$s3->deleteObjects([
             'Bucket' => $bucket,
-            'Delete' => ['Objects' => [['Key' => $key, 'VersionId' => $versionId]]],
+            'Delete' => ['Objects' => [
+                ['Key' => $key, 'VersionId' => $versionId],
+                ['Key' => $deletableKey, 'VersionId' => $deletableVersionId],
+            ]],
             'BypassGovernanceRetention' => true,
         ]);
         self::assertCount(1, $batch['Errors']);
         self::assertSame('AccessDenied', $batch['Errors'][0]['Code']);
-        self::assertEmpty($batch['Deleted'] ?? []);
+        self::assertSame($deletableKey, $batch['Deleted'][0]['Key'] ?? null);
+        self::assertSame($deletableVersionId, $batch['Deleted'][0]['VersionId'] ?? null);
+        $versions = self::$s3->listObjectVersions(['Bucket' => $bucket]);
+        self::assertNotContains($deletableVersionId, array_column($versions['Versions'] ?? [], 'VersionId'));
 
         $marker = self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
         self::assertTrue((bool) $marker['DeleteMarker']);

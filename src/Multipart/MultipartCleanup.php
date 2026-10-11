@@ -87,6 +87,8 @@ final class MultipartCleanup
                     $storageTier,
                     $part['storage_path'],
                 );
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
             } catch (\Throwable) {
                 // The staged delete_path job remains for the collector.
                 continue;

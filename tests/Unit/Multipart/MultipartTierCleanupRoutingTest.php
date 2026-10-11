@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableBuffer;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketHandler;
@@ -16,6 +17,7 @@ use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
+use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
@@ -160,6 +162,73 @@ final class MultipartTierCleanupRoutingTest extends TestCase
         self::assertCount(1, $jobs);
         self::assertSame('delete_path', $jobs[0]['operation']);
         self::assertSame('HOT', $jobs[0]['storage_tier']);
+        self::assertSame('hot-part-path', $jobs[0]['storage_path']);
+    }
+
+    public function test_cleanup_propagates_cancellation_and_keeps_exact_path_queued(): void
+    {
+        $metadata = $this->metadata();
+        $uploadId = bin2hex(random_bytes(16));
+        $metadata->createMultipartUploadWithTier($uploadId, 'bucket', 'key', 'owner', 'HOT');
+        $metadata->putPart($uploadId, 1, 'etag', 1, 'hot-part-path');
+        $parts = $metadata->transaction(function () use ($metadata, $uploadId): array {
+            $metadata->lockOwnerForUpdate('owner');
+
+            return MultipartCleanup::stage($metadata, 'bucket', 'key', $uploadId, 'owner', 'HOT');
+        });
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('deleteObjectByPath')
+            ->with('hot-part-path', 'bucket')
+            ->willThrowException(new \Amp\CancelledException());
+
+        $cancelled = false;
+        try {
+            MultipartCleanup::clean($metadata, $storage, 'bucket', 'key', $uploadId, 'HOT', $parts);
+        } catch (\Amp\CancelledException) {
+            $cancelled = true;
+        }
+        self::assertTrue($cancelled, 'Multipart cleanup must propagate backend cancellation.');
+        $jobs = $metadata->dequeueStorageGarbage(1);
+        self::assertCount(1, $jobs);
+        self::assertSame('hot-part-path', $jobs[0]['storage_path']);
+    }
+
+    public function test_abort_propagates_cleanup_cancellation_without_dispatching_internal_notification(): void
+    {
+        $metadata = $this->metadata();
+        $uploadId = bin2hex(random_bytes(16));
+        $metadata->createMultipartUploadWithTier($uploadId, 'bucket', 'key', 'owner', 'HOT');
+        $metadata->putPart($uploadId, 1, 'etag', 1, 'hot-part-path');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('deleteObjectByPath')
+            ->with('hot-part-path', 'bucket')
+            ->willThrowException(new \Amp\CancelledException());
+        $notifications = new NotificationDispatcher($metadata);
+        $received = [];
+        $notifications->listen('s3:MultipartUpload:Aborted', static function (S3Event $event) use (&$received): void {
+            $received[] = $event;
+        });
+
+        $status = null;
+        $cancelled = false;
+        try {
+            $status = (new AbortMultipartUploadHandler(
+                $metadata,
+                $storage,
+                $notifications,
+                StorageTierRegistry::single($storage, 'HOT'),
+            ))->handleRequest($this->request('DELETE', '/bucket/key?uploadId=' . $uploadId, 'key'))->getStatus();
+        } catch (\Amp\CancelledException) {
+            $cancelled = true;
+        } finally {
+            $notifications->shutdown();
+        }
+        self::assertTrue($cancelled, 'AbortMultipartUpload must propagate cleanup cancellation.');
+        self::assertNull($status, 'AbortMultipartUpload must not return 204 after cleanup cancellation.');
+        self::assertSame([], $received);
+        self::assertNull($metadata->getMultipartUpload($uploadId));
+        $jobs = $metadata->dequeueStorageGarbage(1);
+        self::assertCount(1, $jobs);
         self::assertSame('hot-part-path', $jobs[0]['storage_path']);
     }
 
