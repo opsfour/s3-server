@@ -36,7 +36,8 @@ final class ErrorHandlingMiddleware implements Middleware
         try {
             return $requestHandler->handleRequest($request);
         } catch (S3Exception $e) {
-            $requestId = $request->getAttribute('requestId') ?? '';
+            $requestId = $request->hasAttribute('requestId') ? (string) $request->getAttribute('requestId') : '';
+            $hostId = $request->hasAttribute('amzId2') ? (string) $request->getAttribute('amzId2') : '';
             $resource = $request->getUri()->getPath();
             $status = $e->getHttpStatus();
             $internalFailure = $status === 500;
@@ -77,6 +78,7 @@ final class ErrorHandlingMiddleware implements Middleware
                 $internalFailure ? 'We encountered an internal error. Please try again.' : $e->getMessage(),
                 $resource,
                 $requestId,
+                $hostId,
             );
 
             /** @var array<non-empty-string, string> $headers */
@@ -96,7 +98,8 @@ final class ErrorHandlingMiddleware implements Middleware
                 'exception' => $e::class,
             ]);
 
-            $requestId = $request->getAttribute('requestId') ?? '';
+            $requestId = $request->hasAttribute('requestId') ? (string) $request->getAttribute('requestId') : '';
+            $hostId = $request->hasAttribute('amzId2') ? (string) $request->getAttribute('amzId2') : '';
             $resource = $request->getUri()->getPath();
 
             $xml = ErrorResponseBuilder::build(
@@ -104,6 +107,7 @@ final class ErrorHandlingMiddleware implements Middleware
                 'We encountered an internal error. Please try again.',
                 $resource,
                 $requestId,
+                $hostId,
             );
 
             return new Response(

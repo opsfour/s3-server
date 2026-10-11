@@ -36,6 +36,7 @@ final class RateLimitFailureTest extends TestCase
         self::assertSame('1', $response->getHeader('Retry-After'));
         self::assertSame('rate-failure-test', $response->getHeader('x-amz-request-id'));
         self::assertStringContainsString('<Code>SlowDown</Code>', $body);
+        self::assertStringContainsString('<HostId>rate-failure-host-id</HostId>', $body);
         self::assertStringNotContainsString('secret', $body);
         self::assertFalse($terminal->handled);
     }
@@ -68,6 +69,7 @@ final class RateLimitFailureTest extends TestCase
         $client->method('getRemoteAddress')->willReturn(new InternetAddress('192.0.2.55', 12345));
         $request = new Request($client, 'GET', Http::new('http://localhost/bucket/key'));
         $request->setAttribute('requestId', 'rate-failure-test');
+        $request->setAttribute('amzId2', 'rate-failure-host-id');
 
         return $request;
     }

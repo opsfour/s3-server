@@ -221,13 +221,17 @@ final class ErrorHandlingTest extends S3FunctionalTestCase
         );
 
         $headerRequestId = $response->getHeaderLine('x-amz-request-id');
+        $headerHostId = $response->getHeaderLine('x-amz-id-2');
         $this->assertNotEmpty($headerRequestId, 'x-amz-request-id header should be present on errors');
+        $this->assertNotEmpty($headerHostId, 'x-amz-id-2 header should be present on errors');
 
         $body = $response->getBody()->getContents();
         $xml = simplexml_load_string($body);
         $xmlRequestId = (string) ($xml->RequestId ?? '');
+        $xmlHostId = (string) ($xml->HostId ?? '');
 
         $this->assertSame($headerRequestId, $xmlRequestId, 'RequestId in XML should match header');
+        $this->assertSame($headerHostId, $xmlHostId, 'HostId in XML should match x-amz-id-2');
     }
 
     // -----------------------------------------------------------------

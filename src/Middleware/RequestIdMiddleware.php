@@ -52,9 +52,17 @@ final class RequestIdMiddleware implements Middleware
             $response->setBody('');
             $response->removeHeader('Content-Length');
             $response->removeHeader('Transfer-Encoding');
-            if (str_starts_with($request->getProtocolVersion(), '1.')) {
-                $response->setHeader('Connection', 'close');
-            }
+        }
+
+        // Amp suppresses HEAD bodies at the wire writer, but can still select
+        // chunked framing when a response has no Content-Length. It then omits
+        // the terminating chunk together with the body, so a persistent client
+        // can parse the next response as chunk data. Close only those HEAD
+        // responses; object HEAD responses already carry their stored length.
+        if (str_starts_with($request->getProtocolVersion(), '1.')
+            && (($request->getMethod() === 'HEAD' && $response->getHeader('Content-Length') === null)
+                || in_array($response->getStatus(), [204, 304], true))) {
+            $response->setHeader('Connection', 'close');
         }
 
         return $response;

@@ -166,22 +166,16 @@ final class HeadConnectionReuseHttpTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_missing_head_does_not_leave_error_body_before_follow_up_get(): void
+    public function test_missing_head_closes_without_sending_error_body(): void
     {
         $bucket = 'head-missing-' . bin2hex(random_bytes(4));
         self::$s3->createBucket(['Bucket' => $bucket]);
-        self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'present', 'Body' => 'abcde']);
 
         try {
             $head = self::$s3->createPresignedRequest(
                 self::$s3->getCommand('HeadObject', ['Bucket' => $bucket, 'Key' => 'missing']),
                 '+5 minutes',
             );
-            $get = self::$s3->createPresignedRequest(
-                self::$s3->getCommand('GetObject', ['Bucket' => $bucket, 'Key' => 'present']),
-                '+5 minutes',
-            );
-
             $socket = stream_socket_client(sprintf('tcp://%s:%d', self::$host, self::$port), $errorCode, $error, 5);
             self::assertIsResource($socket, $error ?? 'Could not connect to the test server.');
             try {
@@ -196,30 +190,13 @@ final class HeadConnectionReuseHttpTest extends S3FunctionalTestCase
                 self::assertSame(strlen($request), fwrite($socket, $request));
                 $headers = self::readHeaders($socket);
                 self::assertMatchesRegularExpression('/^HTTP\/1\.1 404 /', $headers);
-
-                if (preg_match('/^connection: close\r?$/im', $headers) === 1) {
-                    self::assertSame('', stream_get_contents($socket));
-                    self::assertTrue(feof($socket));
-
-                    return;
-                }
-
-                $request = sprintf(
-                    "GET %s?%s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
-                    $get->getUri()->getPath(),
-                    $get->getUri()->getQuery(),
-                    self::$host,
-                    self::$port,
-                );
-                self::assertSame(strlen($request), fwrite($socket, $request));
-                $headers = self::readHeaders($socket);
-                self::assertMatchesRegularExpression('/^HTTP\/1\.1 200 /', $headers);
-                self::assertSame('abcde', stream_get_contents($socket));
+                self::assertMatchesRegularExpression('/^connection: close\r?$/im', $headers);
+                self::assertSame('', stream_get_contents($socket));
+                self::assertTrue(feof($socket));
             } finally {
                 fclose($socket);
             }
         } finally {
-            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'present']);
             self::$s3->deleteBucket(['Bucket' => $bucket]);
         }
     }

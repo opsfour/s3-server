@@ -55,6 +55,40 @@ final class RequestIdMiddlewareTest extends TestCase
         self::assertNull($response->getHeader('Connection'));
     }
 
+    public function test_http_one_head_advertises_the_connection_close_used_by_the_wire_writer(): void
+    {
+        $request = new Request($this->createMock(Client::class), 'HEAD', Http::new('http://127.0.0.1/missing'));
+        $response = (new RequestIdMiddleware())->handleRequest(
+            $request,
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(404, ['Content-Type' => 'application/xml'], '<Error/>');
+                }
+            },
+        );
+
+        self::assertNull($response->getHeader('Content-Length'));
+        self::assertSame('close', $response->getHeader('Connection'));
+    }
+
+    public function test_http_one_head_with_explicit_length_remains_reusable(): void
+    {
+        $request = new Request($this->createMock(Client::class), 'HEAD', Http::new('http://127.0.0.1/bucket/key'));
+        $response = (new RequestIdMiddleware())->handleRequest(
+            $request,
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(200, ['Content-Length' => '42']);
+                }
+            },
+        );
+
+        self::assertSame('42', $response->getHeader('Content-Length'));
+        self::assertNull($response->getHeader('Connection'));
+    }
+
     public function test_http_two_bodyless_response_has_no_connection_header(): void
     {
         $request = new Request($this->createMock(Client::class), 'GET', Http::new('https://127.0.0.1/bucket'));

@@ -43,6 +43,30 @@ final class ErrorHandlingDisclosureTest extends TestCase
         self::assertStringContainsString('max-keys must be an integer.', $body);
     }
 
+    public function test_error_body_contains_the_extended_request_id(): void
+    {
+        $response = $this->dispatch(new InvalidArgumentException('invalid'));
+        $body = ByteStream\buffer($response->getBody());
+
+        self::assertStringContainsString('<RequestId>disclosure-test</RequestId>', $body);
+        self::assertStringContainsString('<HostId>extended-disclosure-test</HostId>', $body);
+    }
+
+    public function test_error_handling_remains_available_without_request_id_middleware(): void
+    {
+        foreach ([
+            400 => new InvalidArgumentException('invalid'),
+            500 => new \RuntimeException('failed'),
+        ] as $expectedStatus => $exception) {
+            $response = $this->dispatch($exception, includeRequestIds: false);
+            $body = ByteStream\buffer($response->getBody());
+
+            self::assertSame($expectedStatus, $response->getStatus());
+            self::assertStringContainsString('<RequestId></RequestId>', $body);
+            self::assertStringContainsString('<HostId></HostId>', $body);
+        }
+    }
+
     public function test_internal_exception_details_are_not_written_to_logs(): void
     {
         $secret = 'database-password-private-test-token';
@@ -89,10 +113,13 @@ final class ErrorHandlingDisclosureTest extends TestCase
         );
     }
 
-    private function dispatch(\Throwable $exception, ?LoggerInterface $logger = null): Response
+    private function dispatch(\Throwable $exception, ?LoggerInterface $logger = null, bool $includeRequestIds = true): Response
     {
         $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://localhost/bucket/key'));
-        $request->setAttribute('requestId', 'disclosure-test');
+        if ($includeRequestIds) {
+            $request->setAttribute('requestId', 'disclosure-test');
+            $request->setAttribute('amzId2', 'extended-disclosure-test');
+        }
 
         return (new ErrorHandlingMiddleware($logger))->handleRequest($request, new class ($exception) implements RequestHandler {
             public function __construct(private readonly \Throwable $exception) {}

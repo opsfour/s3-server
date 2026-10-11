@@ -23,9 +23,9 @@ final class XmlResponseBuilder
      *
      * Delegates to ErrorResponseBuilder.
      */
-    public static function error(string $code, string $message, string $resource, string $requestId): string
+    public static function error(string $code, string $message, string $resource, string $requestId, string $hostId = ''): string
     {
-        return ErrorResponseBuilder::build($code, $message, $resource, $requestId);
+        return ErrorResponseBuilder::build($code, $message, $resource, $requestId, $hostId);
     }
 
     /**

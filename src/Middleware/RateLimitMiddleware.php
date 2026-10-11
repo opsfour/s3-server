@@ -68,6 +68,7 @@ final class RateLimitMiddleware implements Middleware
             'Please reduce your request rate.',
             $request->getUri()->getPath(),
             $requestId,
+            $request->hasAttribute('amzId2') ? (string) $request->getAttribute('amzId2') : '',
         );
 
         return new Response(
