@@ -96,8 +96,7 @@ final readonly class ObjectReadAuthorizer
 
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($object->bucket);
         if (
-            $resourceResult === 'Allow'
-            && $bucketPolicy !== null
+            $bucketPolicy !== null
             && $publicAccessBlock !== null
             && $publicAccessBlock['restrictPublicBuckets']
             && PolicyEvaluator::isPublicPolicy($bucketPolicy)

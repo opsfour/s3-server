@@ -8,7 +8,6 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
-use OpsFour\S3Server\Exception\NoSuchBucketPolicyException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 
@@ -30,11 +29,7 @@ final class GetBucketPolicyStatusHandler implements RequestHandler
 
         $policyJson = $this->metadata->getBucketPolicy($bucket);
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-        if ($policyJson === null) {
-            throw new NoSuchBucketPolicyException();
-        }
-
-        $isPublic = PolicyEvaluator::isPublicPolicy($policyJson);
+        $isPublic = $policyJson !== null && PolicyEvaluator::isPublicPolicy($policyJson);
 
         $writer = new \XMLWriter();
         $writer->openMemory();

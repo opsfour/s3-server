@@ -70,7 +70,9 @@ final class PutObjectAclHandler implements RequestHandler
             }
 
             $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $object->versionId);
-            $this->metadata->putAcl('object', $bucket . '/' . $key, $objectOwnerId, []);
+            if ($object->versionId === null || $object->versionId === 'null') {
+                $this->metadata->putAcl('object', $bucket . '/' . $key, $objectOwnerId, []);
+            }
             $this->metadata->putAcl('object', $resourceName, $objectOwnerId, $grants);
 
             return $object->versionId

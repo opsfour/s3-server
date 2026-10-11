@@ -69,13 +69,6 @@ final class PostObjectHandler implements RequestHandler
             }
         }
 
-        // Anonymous writes are authorized by the bucket WRITE ACL. Objects
-        // created this way belong to the bucket owner.
-        $ownerId = $request->hasAttribute('ownerId') ? $request->getAttribute('ownerId') : '';
-        if ($ownerId === '') {
-            $request->setAttribute('ownerId', $bucketInfo->ownerId);
-        }
-
         $putResponse = $this->putObject->handleRequest($request);
         $etag = $putResponse->getHeader('etag') ?? '""';
 

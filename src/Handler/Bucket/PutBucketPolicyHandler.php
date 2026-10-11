@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
@@ -35,6 +36,9 @@ final class PutBucketPolicyHandler implements RequestHandler
 
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
+        }
+        if ($ownerId !== $bucketInfo->ownerId) {
+            throw new MethodNotAllowedException();
         }
 
         // Read raw JSON body.

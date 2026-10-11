@@ -103,8 +103,7 @@ final class ObjectDeletePolicyGuard
 
         if ($ownerId === '' || $ownerId !== $bucketOwner) {
             $pab = $this->metadata->getPublicAccessBlock($bucket);
-            if ($resourceResult === 'Allow'
-                && $pab !== null
+            if ($pab !== null
                 && $pab['restrictPublicBuckets']
                 && $bucketPolicy !== null
                 && PolicyEvaluator::isPublicPolicy($bucketPolicy)) {

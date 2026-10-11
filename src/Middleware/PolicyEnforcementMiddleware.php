@@ -97,7 +97,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         // Cache for downstream middleware (AclEnforcementMiddleware) to avoid re-querying.
         $request->setAttribute('s3.cachedBucketOwner', $bucketOwner);
         $request->setAttribute('s3.cachedBucketGeneration', $bucketInfo?->generation);
-        if (in_array($operation, [S3Operation::PutBucketPolicy, S3Operation::DeleteBucketPolicy, S3Operation::PutBucketLogging], true)
+        if ($operation === S3Operation::PutBucketLogging
             && ($ownerId === '' || $bucketOwner !== $ownerId)) {
             throw new AccessDeniedException();
         }
@@ -332,9 +332,11 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
         $request->setAttribute('s3.canBypassGovernanceRetention', $canBypassGovernance);
 
-        // RestrictPublicBuckets blocks public-policy access from anonymous and
-        // foreign accounts while preserving access for the bucket owner.
-        if ($resourceResult === 'Allow' && $policyJson !== null) {
+        // A public bucket policy activates RestrictPublicBuckets for the whole
+        // bucket. Foreign and anonymous callers must not bypass it through an
+        // ACL merely because the public-policy statement does not match this
+        // particular request.
+        if ($policyJson !== null) {
             $pab = $this->metadata->getPublicAccessBlock($bucket);
             if ($pab !== null
                 && $pab['restrictPublicBuckets']

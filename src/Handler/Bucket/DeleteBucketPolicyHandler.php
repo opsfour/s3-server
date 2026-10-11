@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -31,6 +32,9 @@ final class DeleteBucketPolicyHandler implements RequestHandler
 
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
+        }
+        if ($ownerId !== $bucketInfo->ownerId) {
+            throw new MethodNotAllowedException();
         }
 
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(

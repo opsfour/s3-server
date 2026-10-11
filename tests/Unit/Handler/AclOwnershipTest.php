@@ -80,6 +80,43 @@ final class AclOwnershipTest extends TestCase
         self::assertSame('bucket-owner', $grants[0]['granteeId']);
     }
 
+    public function test_updating_numbered_version_acl_does_not_clear_legacy_null_version_acl(): void
+    {
+        $legacyGrants = [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'legacy-reader',
+            'permission' => 'READ',
+        ]];
+        $this->metadata->putAcl('object', 'bucket/key', 'object-owner', $legacyGrants);
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $versionId = $this->metadata->putObjectVersioned(
+            'bucket',
+            'key',
+            'version-owner',
+            3,
+            '"new"',
+            'text/plain',
+            'new-path',
+        );
+        $request = new Request(
+            new ObjectAclOwnershipTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/key?acl&versionId=' . rawurlencode($versionId)),
+            ['x-amz-acl' => 'private'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'version-owner');
+        $request->setAttribute('credential', null);
+
+        self::assertSame(200, (new PutObjectAclHandler($this->metadata))->handleRequest($request)->getStatus());
+        self::assertSame($legacyGrants, $this->metadata->getAcl('object', 'bucket/key'));
+        self::assertSame('version-owner', $this->metadata->getAcl(
+            'object',
+            'bucket/key?versionId=' . rawurlencode($versionId),
+        )[0]['granteeId']);
+    }
+
     /**
      * @param non-empty-string $method
      * @param array<non-empty-string, array<string>|string> $headers

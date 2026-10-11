@@ -16,8 +16,10 @@ use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketPolicyHandler;
+use OpsFour\S3Server\Handler\Bucket\PutBucketPolicyHandler;
 use OpsFour\S3Server\Handler\Multipart\AbortMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\ListPartsHandler;
 use OpsFour\S3Server\Handler\Multipart\ListMultipartUploadsHandler;
@@ -31,6 +33,7 @@ use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Policy\ObjectDeletePolicyGuard;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Security\ObjectReadAuthorizer;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\TestCase;
@@ -1369,15 +1372,28 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         ]]));
 
         foreach ([S3Operation::PutBucketPolicy, S3Operation::DeleteBucketPolicy] as $operation) {
-            $request = $this->request($operation === S3Operation::PutBucketPolicy ? 'PUT' : 'DELETE', '/bucket?policy');
+            $request = $this->request(
+                $operation === S3Operation::PutBucketPolicy ? 'PUT' : 'DELETE',
+                '/bucket?policy',
+                [],
+                $this->policy([[
+                    'Effect' => 'Allow',
+                    'Principal' => '*',
+                    'Action' => 's3:GetObject',
+                    'Resource' => 'arn:aws:s3:::bucket/*',
+                ]]),
+            );
             $request->setAttribute('s3.bucket', 'bucket');
             $request->setAttribute('s3.operation', $operation);
             $request->setAttribute('ownerId', 'foreign-account');
+            $handler = $operation === S3Operation::PutBucketPolicy
+                ? new PutBucketPolicyHandler($this->metadata)
+                : new DeleteBucketPolicyHandler($this->metadata);
 
             try {
-                (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
-                $this->fail('Expected owner-only policy mutation to be denied.');
-            } catch (AccessDeniedException) {
+                (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, $handler);
+                $this->fail('Expected an otherwise authorized foreign policy mutation to return MethodNotAllowed.');
+            } catch (MethodNotAllowedException) {
                 $this->addToAssertionCount(1);
             }
         }
@@ -1474,6 +1490,101 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         $this->expectException(AccessDeniedException::class);
 
         (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+    }
+
+    public function test_restrict_public_buckets_cannot_be_bypassed_by_object_acl(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => 's3:PutObject',
+            'Resource' => 'arn:aws:s3:::bucket/uploads/*',
+        ]]));
+        $this->metadata->putPublicAccessBlock('bucket', false, false, false, true);
+        $this->metadata->putAcl('object', 'bucket/public/readme.txt?versionId=null', 'owner', [
+            [
+                'granteeType' => 'CanonicalUser',
+                'granteeId' => 'foreign-account',
+                'permission' => 'READ',
+            ],
+            [
+                'granteeType' => 'Group',
+                'granteeId' => 'http://acs.amazonaws.com/groups/global/AllUsers',
+                'permission' => 'READ',
+            ],
+        ]);
+        $handler = \Amp\Http\Server\Middleware\stackMiddleware(
+            new PolicyTerminalHandler(),
+            new PolicyEnforcementMiddleware($this->metadata),
+            new AclEnforcementMiddleware($this->metadata),
+        );
+
+        $denied = 0;
+        foreach (['foreign-account', ''] as $principal) {
+            $request = $this->request('GET', '/bucket/public/readme.txt');
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('s3.key', 'public/readme.txt');
+            $request->setAttribute('s3.operation', S3Operation::GetObject);
+            $request->setAttribute('ownerId', $principal);
+
+            try {
+                $handler->handleRequest($request);
+                self::fail('RestrictPublicBuckets was bypassed through an object ACL.');
+            } catch (AccessDeniedException) {
+                ++$denied;
+            }
+        }
+        self::assertSame(2, $denied);
+    }
+
+    public function test_restrict_public_buckets_applies_to_internal_object_read_authorization(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => 's3:PutObject',
+            'Resource' => 'arn:aws:s3:::bucket/uploads/*',
+        ]]));
+        $this->metadata->putPublicAccessBlock('bucket', false, false, false, true);
+        $this->metadata->putAcl('object', 'bucket/public/readme.txt?versionId=null', 'owner', [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'foreign-account',
+            'permission' => 'READ',
+        ]]);
+        $request = $this->request('GET', '/bucket/public/readme.txt');
+        $request->setAttribute('ownerId', 'foreign-account');
+        $object = $this->metadata->getObjectMetadata('bucket', 'public/readme.txt');
+        self::assertNotNull($object);
+
+        $this->expectException(AccessDeniedException::class);
+        (new ObjectReadAuthorizer($this->metadata))->assertAllowed($request, $object);
+    }
+
+    public function test_restrict_public_buckets_applies_to_acl_authorized_object_delete(): void
+    {
+        $this->metadata->putObjectMetadata('bucket', 'foreign.txt', 'tenant:writer', 1, '"etag"', 'text/plain', '');
+        $this->metadata->putAcl('bucket', 'bucket', 'owner', [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'tenant:writer',
+            'permission' => 'WRITE',
+        ]]);
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/public/*',
+        ]]));
+        $this->metadata->putPublicAccessBlock('bucket', false, false, false, true);
+
+        $this->expectException(AccessDeniedException::class);
+        (new ObjectDeletePolicyGuard($this->metadata))->check(
+            $this->request('DELETE', '/bucket/foreign.txt'),
+            'bucket',
+            'foreign.txt',
+            null,
+            'tenant:writer',
+            'owner',
+        );
     }
 
     public function test_named_policy_attached_to_credential_can_allow_request(): void
