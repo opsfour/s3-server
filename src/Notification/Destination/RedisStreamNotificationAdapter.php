@@ -9,8 +9,8 @@ use OpsFour\S3Server\Event\S3Event;
 /**
  * Publishes normalized S3 events to a Redis Stream.
  *
- * The client can be a native Redis client, Predis-like client, or a callable.
- * Object clients must expose an xAdd() or xadd() method.
+ * The client can be an amphp/redis v2 client, a native or Predis-like client,
+ * or a callable. Object clients must expose execute() or xAdd()/xadd().
  */
 final readonly class RedisStreamNotificationAdapter implements NotificationDestinationAdapter
 {
@@ -35,7 +35,7 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        $fields = S3EventDestinationPayload::toArray($event);
+        $fields = self::scalarFields(S3EventDestinationPayload::toArray($event));
         $fields['payload'] = S3EventDestinationPayload::toJson($event);
 
         try {
@@ -57,7 +57,7 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
     }
 
     /**
-     * @param array<string, mixed> $fields
+     * @param array<string, string|int|float> $fields
      */
     private function publish(array $fields): mixed
     {
@@ -66,7 +66,7 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
         }
 
         foreach (['xAdd', 'xadd'] as $method) {
-            if (is_object($this->client) && method_exists($this->client, $method)) {
+            if (is_object($this->client) && is_callable([$this->client, $method])) {
                 if ($this->maxLen > 0) {
                     return $this->client->{$method}($this->stream, '*', $fields, $this->maxLen, $this->approximateTrimming);
                 }
@@ -75,6 +75,38 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
             }
         }
 
-        throw new \InvalidArgumentException('Redis stream adapter requires a callable client or an xAdd()/xadd() method.');
+        if (is_object($this->client) && is_callable([$this->client, 'execute'])) {
+            $arguments = [$this->stream];
+            if ($this->maxLen > 0) {
+                array_push($arguments, 'MAXLEN', $this->approximateTrimming ? '~' : '=', $this->maxLen);
+            }
+            $arguments[] = '*';
+            foreach ($fields as $name => $value) {
+                array_push($arguments, $name, $value);
+            }
+
+            return $this->client->execute('XADD', ...$arguments);
+        }
+
+        throw new \InvalidArgumentException('Redis stream adapter requires a callable client or an execute()/xAdd()/xadd() method.');
+    }
+
+    /**
+     * @param array<string, mixed> $fields
+     * @return array<string, string|int|float>
+     */
+    private static function scalarFields(array $fields): array
+    {
+        $result = [];
+        foreach ($fields as $name => $value) {
+            $result[$name] = match (true) {
+                is_string($value), is_int($value), is_float($value) => $value,
+                is_bool($value) => (int) $value,
+                $value === null => '',
+                default => json_encode($value, JSON_THROW_ON_ERROR),
+            };
+        }
+
+        return $result;
     }
 }

@@ -24,8 +24,39 @@ final class DestinationAdapterTest extends TestCase
         $this->assertSame('*', $client->calls[0]['id']);
         $this->assertSame('s3:ObjectCreated:Put', $client->calls[0]['fields']['name']);
         $this->assertSame('bucket', $client->calls[0]['fields']['bucket']);
+        $this->assertSame(['request_id' => 'req-1'], json_decode($client->calls[0]['fields']['attributes'], true, flags: JSON_THROW_ON_ERROR));
+        foreach ($client->calls[0]['fields'] as $field) {
+            $this->assertTrue(is_scalar($field));
+        }
         $this->assertJson($client->calls[0]['fields']['payload']);
         $this->assertSame('redis-id-1', $result->context['message_id']);
+    }
+
+    public function test_redis_stream_adapter_supports_amphp_redis_execute_signature(): void
+    {
+        $client = new RecordingAmpRedisClient();
+        $result = (new RedisStreamNotificationAdapter($client, 's3-events', 1000, false))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('XADD', $client->command);
+        self::assertSame(['s3-events', 'MAXLEN', '=', 1000, '*'], array_slice($client->arguments, 0, 5));
+        self::assertContains('attributes', $client->arguments);
+        self::assertContains('{"request_id":"req-1"}', $client->arguments);
+        foreach ($client->arguments as $argument) {
+            self::assertTrue(is_string($argument) || is_int($argument) || is_float($argument));
+        }
+        self::assertSame('redis-id-amp', $result->context['message_id']);
+    }
+
+    public function test_redis_stream_adapter_supports_dynamic_predis_style_clients(): void
+    {
+        $client = new RecordingDynamicRedisClient();
+        $result = (new RedisStreamNotificationAdapter($client, 's3-events'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('xAdd', $client->method);
+        self::assertSame('s3-events', $client->arguments[0]);
+        self::assertSame('redis-id-dynamic', $result->context['message_id']);
     }
 
     public function test_kafka_adapter_publishes_json_payload_with_object_key(): void
@@ -146,14 +177,45 @@ final class RecordingRedisStreamClient
     /** @var list<array<string, mixed>> */
     public array $calls = [];
 
-    /**
-     * @param array<string, mixed> $fields
-     */
+    /** @param array<string, string|int|float> $fields */
     public function xAdd(string $stream, string $id, array $fields, int $maxLen = 0, bool $approximate = true): string
     {
         $this->calls[] = compact('stream', 'id', 'fields', 'maxLen', 'approximate');
 
         return 'redis-id-1';
+    }
+}
+
+final class RecordingAmpRedisClient
+{
+    public string $command = '';
+
+    /** @var list<string|int|float> */
+    public array $arguments = [];
+
+    public function execute(string $command, string|int|float ...$arguments): string
+    {
+        $this->command = $command;
+        $this->arguments = array_values($arguments);
+
+        return 'redis-id-amp';
+    }
+}
+
+final class RecordingDynamicRedisClient
+{
+    public string $method = '';
+
+    /** @var list<mixed> */
+    public array $arguments = [];
+
+    /** @param list<mixed> $arguments */
+    public function __call(string $method, array $arguments): string
+    {
+        $this->method = $method;
+        $this->arguments = $arguments;
+
+        return 'redis-id-dynamic';
     }
 }
 

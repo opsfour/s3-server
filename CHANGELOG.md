@@ -81,6 +81,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   display name.
 - Return `NoSuchVersion` from GET and HEAD when an explicitly selected object
   version does not exist.
+- Make the Redis Stream notification adapter compatible with `amphp/redis` v2
+  and dynamic clients, and encode every stream field as a scalar value.
 
 ### Upgrade Notes
 

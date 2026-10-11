@@ -174,7 +174,10 @@ The injected client must wait for and validate broker acceptance before
 returning a success value. An exception, `false`, or `null` (including a
 `void` publisher method) is reported as `retryable_failure`; any other returned
 value is treated as the client's positive acknowledgement. For Redis Streams,
-return the successful `XADD` message ID. For Kafka, verify a delivery report;
+the adapter accepts `amphp/redis` v2 through `execute()`, native or dynamic
+clients through `xAdd()`/`xadd()`, and callables. Stream fields are scalar;
+the `attributes` field and complete `payload` are JSON. Return the successful
+`XADD` message ID. For Kafka, verify a delivery report;
 for AMQP, verify publisher confirmation and routability; for durable NATS,
 verify a JetStream publish acknowledgement. A method that only buffers a
 message locally must not return a success value as proof of broker acceptance.
@@ -190,7 +193,7 @@ errors and adapter result context because client exceptions can contain broker
 credentials. Applications that need more diagnostics should log selected,
 redacted fields in their producer integration.
 
-`SimpleEventDispatcher` queues listener callbacks without waiting for an
+`NotificationDispatcher` queues listener callbacks without waiting for an
 execution slot. Its constructor keeps the existing concurrency argument and
 accepts a bounded listener-task queue; when that bound is full, the event is
 dropped and only sanitized metadata is logged. Call `shutdown()` during an
