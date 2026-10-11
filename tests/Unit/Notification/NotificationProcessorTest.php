@@ -68,6 +68,28 @@ final class NotificationProcessorTest extends TestCase
         $this->assertSame('Notification destination must not contain user information.', $context['error']);
     }
 
+    public function test_legacy_destination_with_control_characters_is_dead_lettered_without_transport(): void
+    {
+        $destination = "https://93.184.216.34/webhook\nprivate";
+        $this->metadata->enqueueNotification('bucket', 'key.txt', 's3:ObjectCreated:Put', $destination, '{}');
+        $item = $this->metadata->dequeueNotifications(1)[0];
+        $delegate = new SequenceHttpClient([]);
+        $logger = new ProcessorArrayLogger();
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            $logger,
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        $this->invokeProcess($processor, $item);
+
+        self::assertSame([], $delegate->requests);
+        self::assertSame(['dead_letter' => 1], $this->metadata->getNotificationQueueStats());
+        $blocked = $logger->findContext('delivery_blocked');
+        self::assertNotNull($blocked);
+        self::assertSame('Notification destination must not contain whitespace or control characters.', $blocked['error']);
+    }
+
     public function test_public_ipv6_literal_is_validated_as_an_address_without_dns_lookup(): void
     {
         $url = 'https://[2606:4700:4700::1111]/webhook';

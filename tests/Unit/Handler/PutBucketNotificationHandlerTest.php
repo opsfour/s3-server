@@ -193,4 +193,47 @@ final class PutBucketNotificationHandlerTest extends TestCase
             @unlink($path . '-shm');
         }
     }
+
+    public function test_destination_with_control_characters_does_not_replace_existing_configuration(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-notification-destination-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $handler = new PutBucketNotificationHandler($metadata);
+        $request = function (string $destination) use ($path): Request {
+            $request = new Request(
+                $this->createMock(Client::class),
+                'PUT',
+                Http::new('http://127.0.0.1/bucket?notification'),
+                [],
+                '<NotificationConfiguration><TopicConfiguration><Id>' . basename($path) . '</Id>'
+                    . '<Topic>' . $destination . '</Topic><Event>s3:ObjectCreated:Put</Event>'
+                    . '</TopicConfiguration></NotificationConfiguration>',
+            );
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('ownerId', 'owner');
+
+            return $request;
+        };
+
+        try {
+            self::assertSame(200, $handler->handleRequest($request('https://notifications.invalid/existing'))->getStatus());
+            $existing = $metadata->getBucketNotification('bucket');
+
+            foreach (['https://notifications.invalid/has space', 'https://notifications.invalid/line&#10;break'] as $destination) {
+                try {
+                    $handler->handleRequest($request($destination));
+                    self::fail('A destination containing whitespace or control characters was accepted.');
+                } catch (InvalidArgumentException $exception) {
+                    self::assertSame(400, $exception->getHttpStatus());
+                }
+                self::assertSame($existing, $metadata->getBucketNotification('bucket'));
+            }
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
 }

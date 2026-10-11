@@ -396,6 +396,10 @@ final class NotificationProcessor
 
     private function resolveAndValidateUrl(string $url, ?Cancellation $cancellation = null): string
     {
+        if (preg_match('/[\x00-\x20\x7F]/', $url) === 1) {
+            throw new UnsafeNotificationDestination('Notification destination must not contain whitespace or control characters.');
+        }
+
         $parts = parse_url($url);
         if ($parts === false || ! isset($parts['scheme'], $parts['host'])) {
             throw new UnsafeNotificationDestination('Notification destination must be an absolute HTTP(S) URL.');

@@ -251,7 +251,9 @@ final class NotificationDispatcher
                 return 0;
             }
 
-            $eventTime = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.v\Z');
+            $eventTime = $event->occurredAt
+                ->setTimezone(new \DateTimeZone('UTC'))
+                ->format('Y-m-d\TH:i:s.v\Z');
             $orderedEvent = str_starts_with($event->name, 's3:ObjectCreated:')
                 || str_starts_with($event->name, 's3:ObjectRemoved:');
             $sequencer = null;

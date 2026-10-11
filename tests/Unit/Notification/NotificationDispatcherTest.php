@@ -185,6 +185,33 @@ final class NotificationDispatcherTest extends TestCase
         self::assertMatchesRegularExpression('/^[0-9A-F]{16,}$/', $record['s3']['object']['sequencer']);
     }
 
+    public function test_webhook_payload_preserves_the_event_occurrence_time_when_enqueued_later(): void
+    {
+        $this->metadata->putBucketNotification('bucket', [[
+            'id' => 'webhook-created',
+            'events' => ['s3:ObjectCreated:Put'],
+            'destinationType' => 'Topic',
+            'destinationArn' => 'https://notifications.example.test/s3',
+            'filterRules' => null,
+        ]]);
+        $occurredAt = new \DateTimeImmutable('2026-09-08T07:06:05.432100+02:00');
+        $event = new S3Event(
+            name: 's3:ObjectCreated:Put',
+            bucket: 'bucket',
+            key: 'delayed.txt',
+            ownerId: 'owner',
+            occurredAt: $occurredAt,
+            bucketGeneration: $this->bucketGeneration(),
+        );
+
+        (new NotificationDispatcher($this->metadata))->enqueueWebhooks($event);
+
+        $queued = $this->metadata->dequeueNotifications(1);
+        self::assertCount(1, $queued);
+        $record = json_decode($queued[0]['payload_json'], true, 512, JSON_THROW_ON_ERROR)['Records'][0];
+        self::assertSame('2026-09-08T05:06:05.432Z', $record['eventTime']);
+    }
+
     public function test_webhook_sequencer_is_shared_by_destinations_and_increases_after_restart(): void
     {
         $configs = [

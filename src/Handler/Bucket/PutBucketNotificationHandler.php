@@ -72,6 +72,10 @@ final class PutBucketNotificationHandler implements RequestHandler
                 throw new NotImplementedException('SNS, SQS, and Lambda notification destinations are not supported.');
             }
 
+            if (preg_match('/[\x00-\x20\x7F]/', $destination) === 1) {
+                throw new InvalidArgumentException('Notification destination must not contain whitespace or control characters.');
+            }
+
             $parts = parse_url($destination);
             if ($parts === false || ! isset($parts['scheme'], $parts['host']) || $parts['host'] === ''
                 || isset($parts['user']) || isset($parts['pass'])) {
