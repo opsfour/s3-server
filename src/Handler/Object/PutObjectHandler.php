@@ -24,6 +24,7 @@ use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\ObjectTagValidator;
+use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Handler\Multipart\MultipartPartLogicalValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
@@ -813,25 +814,6 @@ final class PutObjectHandler implements RequestHandler
         }
     }
 
-    /**
-     * Check if an object's ETag matches the given header value.
-     * Handles both quoted and unquoted ETags, and comma-separated lists.
-     */
-    private function etagMatches(string $objectEtag, string $headerValue): bool
-    {
-        $objectEtag = trim($objectEtag, '"');
-        $candidates = array_map('trim', explode(',', $headerValue));
-
-        foreach ($candidates as $candidate) {
-            $candidate = trim($candidate, '"');
-            if ($candidate === '*' || $candidate === $objectEtag) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private function evaluatePutConditionals(
         string $bucket,
         string $key,
@@ -850,7 +832,7 @@ final class PutObjectHandler implements RequestHandler
             if ($existingObject === null) {
                 throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
             }
-            if (! $this->etagMatches($existingObject->etag, $ifMatch)) {
+            if (! ConditionalHeaderEvaluator::etagMatches($ifMatch, $existingObject->etag)) {
                 throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
             }
         }
@@ -861,7 +843,7 @@ final class PutObjectHandler implements RequestHandler
             if (
                 $ifNoneMatch !== '*'
                 && $existingObject !== null
-                && $this->etagMatches($existingObject->etag, $ifNoneMatch)
+                && ConditionalHeaderEvaluator::etagMatches($ifNoneMatch, $existingObject->etag, allowWeak: true)
             ) {
                 throw new \OpsFour\S3Server\Exception\PreconditionFailedException();
             }

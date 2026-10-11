@@ -68,4 +68,35 @@ final class ConditionalHttpDateTest extends TestCase
             self::assertNull(ConditionalHeaderEvaluator::parseHttpDate($date), $date);
         }
     }
+
+    #[DataProvider('malformedEntityTags')]
+    public function test_malformed_entity_tags_never_match(string $header): void
+    {
+        self::assertFalse(ConditionalHeaderEvaluator::etagMatches($header, '"etag"'));
+        self::assertFalse(ConditionalHeaderEvaluator::etagMatches($header, '"etag"', allowWeak: true));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function malformedEntityTags(): iterable
+    {
+        yield 'unquoted' => ['etag'];
+        yield 'missing closing quote' => ['"etag'];
+        yield 'missing opening quote' => ['etag"'];
+        yield 'extra quotes' => ['""etag""'];
+        yield 'empty list member' => ['"other", , "etag"'];
+        yield 'trailing comma' => ['"etag",'];
+        yield 'wildcard in list' => ['"other", *'];
+        yield 'space inside tag' => ['"eta g"'];
+        yield 'lowercase weak marker' => ['w/"etag"'];
+    }
+
+    public function test_valid_entity_tag_lists_preserve_quotes_commas_and_weak_semantics(): void
+    {
+        self::assertTrue(ConditionalHeaderEvaluator::etagMatches(' "other" , "etag" ', '"etag"'));
+        self::assertTrue(ConditionalHeaderEvaluator::etagMatches('"tag,part"', '"tag,part"'));
+        self::assertFalse(ConditionalHeaderEvaluator::etagMatches('W/"etag"', '"etag"'));
+        self::assertTrue(ConditionalHeaderEvaluator::etagMatches('W/"etag"', '"etag"', allowWeak: true));
+        self::assertTrue(ConditionalHeaderEvaluator::etagMatches("\t* ", '"etag"'));
+        self::assertFalse(ConditionalHeaderEvaluator::etagMatches('*, "etag"', '"etag"'));
+    }
 }

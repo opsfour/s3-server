@@ -282,6 +282,25 @@ final class ConditionalRequestsTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_malformed_copy_source_etag_cannot_authorize_a_copy(): void
+    {
+        $key = 'copy-malformed-etag.txt';
+        try {
+            self::$s3->copyObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'CopySource' => self::$bucket . '/' . self::$testKey,
+                'CopySourceIfMatch' => trim(self::$testEtag, '"'),
+            ]);
+            self::fail('An unquoted entity-tag must not satisfy CopySourceIfMatch.');
+        } catch (S3Exception $error) {
+            self::assertSame('PreconditionFailed', $error->getAwsErrorCode());
+            self::assertSame(412, $error->getStatusCode());
+        }
+
+        self::assertSame([], self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key])['Contents'] ?? []);
+    }
+
     public function test_copy_object_if_modified_since_success(): void
     {
         $result = self::$s3->copyObject([

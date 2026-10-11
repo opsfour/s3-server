@@ -88,33 +88,92 @@ final class ConditionalHeaderEvaluator
      */
     public static function etagMatches(string $headerValue, string $objectEtag, bool $allowWeak = false): bool
     {
-        $headerValue = trim($headerValue);
+        $offset = 0;
+        self::skipOptionalWhitespace($headerValue, $offset);
+        if (($headerValue[$offset] ?? null) === '*') {
+            $offset++;
+            self::skipOptionalWhitespace($headerValue, $offset);
 
-        if ($headerValue === '*') {
-            return true;
+            return $offset === strlen($headerValue);
         }
 
-        $normalizedObjectEtag = trim($objectEtag, '"');
-        $candidates = explode(',', $headerValue);
+        if (! self::validOpaqueTag($objectEtag)) {
+            return false;
+        }
+
+        $candidates = self::parseEntityTagList($headerValue);
+        if ($candidates === null) {
+            return false;
+        }
 
         foreach ($candidates as $candidate) {
-            $candidate = trim($candidate);
-
-            if (str_starts_with($candidate, 'W/')) {
-                if (! $allowWeak) {
-                    continue;
-                }
-                $candidate = substr($candidate, 2);
-            }
-
-            $candidate = trim($candidate, '"');
-
-            if ($candidate === $normalizedObjectEtag) {
+            if ((! $candidate['weak'] || $allowWeak) && $candidate['tag'] === $objectEtag) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /** @return list<array{weak: bool, tag: string}>|null */
+    private static function parseEntityTagList(string $value): ?array
+    {
+        $length = strlen($value);
+        $offset = 0;
+        $tags = [];
+
+        while (true) {
+            self::skipOptionalWhitespace($value, $offset);
+            if ($offset >= $length) {
+                return null;
+            }
+
+            $weak = substr($value, $offset, 2) === 'W/';
+            if ($weak) {
+                $offset += 2;
+            }
+            if (($value[$offset] ?? null) !== '"') {
+                return null;
+            }
+
+            $start = $offset++;
+            while ($offset < $length && $value[$offset] !== '"') {
+                $byte = ord($value[$offset]);
+                if ($byte !== 0x21 && ($byte < 0x23 || ($byte > 0x7e && $byte < 0x80))) {
+                    return null;
+                }
+                $offset++;
+            }
+            if ($offset >= $length) {
+                return null;
+            }
+            $offset++;
+            $tags[] = ['weak' => $weak, 'tag' => substr($value, $start, $offset - $start)];
+
+            self::skipOptionalWhitespace($value, $offset);
+            if ($offset === $length) {
+                return $tags;
+            }
+            if ($value[$offset] !== ',') {
+                return null;
+            }
+            $offset++;
+        }
+    }
+
+    private static function validOpaqueTag(string $value): bool
+    {
+        $tags = self::parseEntityTagList($value);
+
+        return $tags !== null && count($tags) === 1 && ! $tags[0]['weak'];
+    }
+
+    private static function skipOptionalWhitespace(string $value, int &$offset): void
+    {
+        $length = strlen($value);
+        while ($offset < $length && ($value[$offset] === ' ' || $value[$offset] === "\t")) {
+            $offset++;
+        }
     }
 
     /**

@@ -83,6 +83,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   version does not exist.
 - Make the Redis Stream notification adapter compatible with `amphp/redis` v2
   and dynamic clients, and encode every stream field as a scalar value.
+- Parse conditional request entity-tags strictly so malformed quotes and lists
+  cannot satisfy read, copy, multipart-copy, or conditional-write guards.
 
 ### Upgrade Notes
 
