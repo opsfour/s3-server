@@ -79,6 +79,29 @@ final class SessionCredentialVerifierTest extends TestCase
         (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
     }
 
+    public function test_header_sigv4_rejects_duplicate_authentication_headers(): void
+    {
+        $credential = $this->temporaryCredential();
+
+        foreach (['authorization', 'x-amz-content-sha256', 'x-amz-date', 'x-amz-security-token'] as $name) {
+            $request = $this->signedHeaderRequest($credential, $credential->sessionToken);
+            $value = $request->getHeader($name);
+            self::assertNotNull($value);
+            $request->setHeader($name, [$value, $value]);
+
+            try {
+                (new SignatureV4Verifier())->verify(
+                    $request,
+                    new InMemoryCredentialProvider($credential),
+                    'us-east-1',
+                );
+                self::fail("Duplicate {$name} was accepted.");
+            } catch (AccessDeniedException $exception) {
+                self::assertSame('Request contains duplicate authentication headers.', $exception->getMessage());
+            }
+        }
+    }
+
     public function test_header_sigv4_rejects_reordered_duplicate_signed_header_values(): void
     {
         $credential = $this->temporaryCredential();

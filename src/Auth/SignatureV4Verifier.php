@@ -52,6 +52,8 @@ final class SignatureV4Verifier
      */
     public function verify(Request $request, CredentialProvider $credentialProvider, string $region): AuthResult
     {
+        self::assertSingletonAuthenticationHeaders($request);
+
         if (QueryStringParser::hasConflictingValues($request->getUri()->getQuery())) {
             throw new AccessDeniedException('Conflicting duplicate query parameter.');
         }
@@ -159,6 +161,15 @@ final class SignatureV4Verifier
             credentialDate: $parsed['date'],
             credentialRegion: $parsed['region'],
         );
+    }
+
+    private static function assertSingletonAuthenticationHeaders(Request $request): void
+    {
+        foreach (['authorization', 'x-amz-content-sha256', 'x-amz-date', 'date', 'x-amz-security-token'] as $name) {
+            if (count($request->getHeaderArray($name)) > 1) {
+                throw new AccessDeniedException('Request contains duplicate authentication headers.');
+            }
+        }
     }
 
     /**
