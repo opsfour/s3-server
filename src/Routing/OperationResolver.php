@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Routing;
 
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 
 /**
  * Resolves an HTTP method + scope + query params + headers to an S3Operation.
@@ -24,6 +25,67 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
  */
 final class OperationResolver
 {
+    /** @var array<string, list<string>> */
+    private const array BUCKET_SUBRESOURCE_METHODS = [
+        'ownershipControls' => ['GET', 'PUT', 'DELETE'],
+        'versioning' => ['GET', 'PUT'],
+        'acl' => ['GET', 'PUT'],
+        'policy' => ['GET', 'PUT', 'DELETE'],
+        'cors' => ['GET', 'PUT', 'DELETE'],
+        'tagging' => ['GET', 'PUT', 'DELETE'],
+        'lifecycle' => ['GET', 'PUT', 'DELETE'],
+        'notification' => ['GET', 'PUT'],
+        'encryption' => ['GET', 'PUT', 'DELETE'],
+        'object-lock' => ['GET', 'PUT'],
+        'website' => ['GET', 'PUT', 'DELETE'],
+        'publicAccessBlock' => ['GET', 'PUT', 'DELETE'],
+        'logging' => ['GET', 'PUT'],
+        'location' => ['GET'],
+        'uploads' => ['GET'],
+        'versions' => ['GET'],
+        'policyStatus' => ['GET'],
+        'delete' => ['POST'],
+    ];
+
+    /** @var list<string> */
+    private const array UNSUPPORTED_BUCKET_SUBRESOURCES = [
+        'abac',
+        'accelerate',
+        'analytics',
+        'intelligent-tiering',
+        'inventory',
+        'metadataAnnotationTable',
+        'metadataConfiguration',
+        'metadataInventoryTable',
+        'metadataJournalTable',
+        'metadataTable',
+        'metrics',
+        'replication',
+        'requestPayment',
+        'session',
+    ];
+
+    /** @var array<string, list<string>> */
+    private const array OBJECT_SUBRESOURCE_METHODS = [
+        'acl' => ['GET', 'PUT'],
+        'tagging' => ['GET', 'PUT', 'DELETE'],
+        'retention' => ['GET', 'PUT'],
+        'legal-hold' => ['GET', 'PUT'],
+        'uploadId' => ['GET', 'PUT', 'DELETE', 'POST'],
+        'attributes' => ['GET'],
+        'restore' => ['POST'],
+        'uploads' => ['POST'],
+        'select' => ['POST'],
+    ];
+
+    /** @var list<string> */
+    private const array UNSUPPORTED_OBJECT_SUBRESOURCES = [
+        'annotation',
+        'encryption',
+        'renameObject',
+        'torrent',
+    ];
+
     /**
      * Resolve the S3 operation from request components.
      *
@@ -69,6 +131,13 @@ final class OperationResolver
      */
     private static function resolveBucket(string $method, array $queryParams): S3Operation
     {
+        self::assertSubresourceRoutingIsValid(
+            $method,
+            $queryParams,
+            self::BUCKET_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_BUCKET_SUBRESOURCES,
+        );
+
         return match ($method) {
             'PUT' => self::resolveBucketPut($queryParams),
             'DELETE' => self::resolveBucketDelete($queryParams),
@@ -253,6 +322,13 @@ final class OperationResolver
      */
     private static function resolveObject(string $method, array $queryParams, array $headers): S3Operation
     {
+        self::assertSubresourceRoutingIsValid(
+            $method,
+            $queryParams,
+            self::OBJECT_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_OBJECT_SUBRESOURCES,
+        );
+
         return match ($method) {
             'GET' => self::resolveObjectGet($queryParams),
             'PUT' => self::resolveObjectPut($queryParams, $headers),
@@ -371,5 +447,50 @@ final class OperationResolver
         throw new MethodNotAllowedException(
             'Unsupported POST on object scope without recognized query parameter.',
         );
+    }
+
+    /**
+     * A recognized subresource remains the request target even when its HTTP
+     * method is unsupported. Never fall through to a base bucket or object
+     * mutation merely because that method has no operation for the subresource.
+     *
+     * @param  array<string, mixed>  $queryParams
+     * @param  array<string, list<string>>  $supportedMethods
+     * @param  list<string>  $unsupportedSubresources
+     */
+    private static function assertSubresourceRoutingIsValid(
+        string $method,
+        array $queryParams,
+        array $supportedMethods,
+        array $unsupportedSubresources,
+    ): void {
+        foreach ($unsupportedSubresources as $subresource) {
+            if (\array_key_exists($subresource, $queryParams)) {
+                throw new NotImplementedException(
+                    "The '{$subresource}' subresource is not implemented.",
+                );
+            }
+        }
+
+        $matchedSubresource = null;
+
+        foreach ($supportedMethods as $subresource => $methods) {
+            if (! \array_key_exists($subresource, $queryParams)) {
+                continue;
+            }
+
+            if ($matchedSubresource !== null) {
+                throw new InvalidArgumentException(
+                    "Conflicting subresources '{$matchedSubresource}' and '{$subresource}'.",
+                );
+            }
+            $matchedSubresource = $subresource;
+
+            if (! \in_array($method, $methods, true)) {
+                throw new MethodNotAllowedException(
+                    "Unsupported method '{$method}' for the '{$subresource}' subresource.",
+                );
+            }
+        }
     }
 }

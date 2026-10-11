@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Routing;
 
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Routing\OperationResolver;
 use OpsFour\S3Server\Routing\S3Operation;
 use PHPUnit\Framework\TestCase;
@@ -171,6 +173,119 @@ final class OperationResolverTest extends TestCase
     {
         $op = OperationResolver::resolve('GET', 'bucket', ['versions' => ''], []);
         $this->assertSame(S3Operation::ListObjectVersions, $op);
+    }
+
+    /**
+     * @param array<string, string> $query
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('unsupportedBucketSubresourceMethods')]
+    public function test_bucket_subresource_does_not_fall_through_to_a_base_operation(
+        string $method,
+        array $query,
+    ): void {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve($method, 'bucket', $query, []);
+    }
+
+    /** @return iterable<string, array{string, array<string, string>}> */
+    public static function unsupportedBucketSubresourceMethods(): iterable
+    {
+        yield 'delete bucket acl must not delete the bucket' => ['DELETE', ['acl' => '']];
+        yield 'delete bucket logging must not delete the bucket' => ['DELETE', ['logging' => '']];
+        yield 'put bucket location must not create the bucket' => ['PUT', ['location' => '']];
+        yield 'post bucket policy must not become a form upload' => ['POST', ['policy' => '']];
+        yield 'head bucket tagging must not become HeadBucket' => ['HEAD', ['tagging' => '']];
+    }
+
+    /**
+     * @param array<string, string> $query
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('unsupportedObjectSubresourceMethods')]
+    public function test_object_subresource_does_not_fall_through_to_a_base_operation(
+        string $method,
+        array $query,
+    ): void {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve($method, 'object', $query, []);
+    }
+
+    /** @return iterable<string, array{string, array<string, string>}> */
+    public static function unsupportedObjectSubresourceMethods(): iterable
+    {
+        yield 'delete object acl must not delete the object' => ['DELETE', ['acl' => '']];
+        yield 'delete object retention must not delete the object' => ['DELETE', ['retention' => '']];
+        yield 'put object attributes must not overwrite the object' => ['PUT', ['attributes' => '']];
+        yield 'head object tagging must not become HeadObject' => ['HEAD', ['tagging' => '']];
+    }
+
+    public function test_object_version_selector_remains_valid_for_head_and_delete(): void
+    {
+        self::assertSame(
+            S3Operation::HeadObject,
+            OperationResolver::resolve('HEAD', 'object', ['versionId' => 'version'], []),
+        );
+        self::assertSame(
+            S3Operation::DeleteObject,
+            OperationResolver::resolve('DELETE', 'object', ['versionId' => 'version'], []),
+        );
+    }
+
+    public function test_conflicting_bucket_subresources_are_rejected_instead_of_using_priority(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        OperationResolver::resolve('GET', 'bucket', ['acl' => '', 'policy' => ''], []);
+    }
+
+    public function test_conflicting_object_subresources_are_rejected_instead_of_using_priority(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        OperationResolver::resolve('POST', 'object', ['restore' => '', 'uploadId' => 'upload'], []);
+    }
+
+    public function test_subresource_selectors_are_not_mistaken_for_conflicting_operations(): void
+    {
+        self::assertSame(
+            S3Operation::GetObjectAcl,
+            OperationResolver::resolve('GET', 'object', ['acl' => '', 'versionId' => 'version'], []),
+        );
+        self::assertSame(
+            S3Operation::UploadPart,
+            OperationResolver::resolve(
+                'PUT',
+                'object',
+                ['partNumber' => '1', 'uploadId' => 'upload'],
+                [],
+            ),
+        );
+        self::assertSame(
+            S3Operation::SelectObjectContent,
+            OperationResolver::resolve('POST', 'object', ['select' => '', 'select-type' => '2'], []),
+        );
+    }
+
+    /**
+     * @param array<string, string> $query
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('unsupportedAwsSubresources')]
+    public function test_unsupported_aws_subresource_does_not_fall_through_to_supported_operation(
+        string $method,
+        string $scope,
+        array $query,
+    ): void {
+        $this->expectException(NotImplementedException::class);
+        OperationResolver::resolve($method, $scope, $query, []);
+    }
+
+    /** @return iterable<string, array{string, string, array<string, string>}> */
+    public static function unsupportedAwsSubresources(): iterable
+    {
+        yield 'delete replication must not delete bucket' => ['DELETE', 'bucket', ['replication' => '']];
+        yield 'put analytics must not create bucket' => ['PUT', 'bucket', ['analytics' => '']];
+        yield 'metadata table must not become form upload' => ['POST', 'bucket', ['metadataTable' => '']];
+        yield 'torrent must not return object body' => ['GET', 'object', ['torrent' => '']];
+        yield 'object encryption must not overwrite object' => ['PUT', 'object', ['encryption' => '']];
+        yield 'annotation must not delete object' => ['DELETE', 'object', ['annotation' => '']];
+        yield 'rename must not overwrite object' => ['PUT', 'object', ['renameObject' => '']];
     }
 
     public function test_every_operation_has_a_direct_route_fixture(): void
