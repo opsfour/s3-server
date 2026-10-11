@@ -20,6 +20,7 @@ use OpsFour\S3Server\Auth\PresignedUrlValidator;
 use OpsFour\S3Server\Auth\SignatureV4Verifier;
 use OpsFour\S3Server\Auth\SigningKey;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\AuthorizationHeaderMalformedException;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use OpsFour\S3Server\Http\QueryStringParser;
 use PHPUnit\Framework\TestCase;
@@ -100,6 +101,38 @@ final class SessionCredentialVerifierTest extends TestCase
                 self::assertSame('Request contains duplicate authentication headers.', $exception->getMessage());
             }
         }
+    }
+
+    public function test_header_sigv4_rejects_unsorted_signed_headers_even_with_a_valid_signature(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->signedHeaderRequest($credential, $credential->sessionToken);
+        $authorization = $request->getHeader('authorization');
+        self::assertNotNull($authorization);
+        $request->setHeader('authorization', str_replace(
+            'SignedHeaders=host;x-amz-content-sha256;',
+            'SignedHeaders=x-amz-content-sha256;host;',
+            $authorization,
+        ));
+
+        $this->expectException(AuthorizationHeaderMalformedException::class);
+        $this->expectExceptionMessage('SignedHeaders must contain unique lowercase header names in sorted order.');
+        (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
+    }
+
+    public function test_header_sigv4_rejects_unsigned_date_header_used_for_authentication(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->signedHeaderRequest(
+            $credential,
+            $credential->sessionToken,
+            useDateHeader: true,
+            signDateHeader: false,
+        );
+
+        $this->expectException(AuthorizationHeaderMalformedException::class);
+        $this->expectExceptionMessage('Date header used for authentication to be signed.');
+        (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
     }
 
     public function test_header_sigv4_rejects_reordered_duplicate_signed_header_values(): void
@@ -338,6 +371,28 @@ final class SessionCredentialVerifierTest extends TestCase
         )->ownerId);
     }
 
+    public function test_presigned_url_rejects_unsorted_or_missing_signed_headers(): void
+    {
+        $credential = $this->temporaryCredential();
+        $provider = new InMemoryCredentialProvider($credential);
+
+        foreach ([['x-amz-meta-test', 'host'], ['host', 'x-amz-missing']] as $signedHeaders) {
+            $request = $this->presignedRequest(
+                $credential,
+                $credential->sessionToken,
+                additionalHeaders: $signedHeaders[0] === 'x-amz-meta-test' ? ['x-amz-meta-test' => 'value'] : [],
+                signedHeadersOverride: $signedHeaders,
+            );
+
+            try {
+                (new PresignedUrlValidator())->validate($request, $provider, 'us-east-1');
+                self::fail('Malformed presigned SignedHeaders were accepted.');
+            } catch (AuthorizationHeaderMalformedException $exception) {
+                self::assertStringContainsString('SignedHeaders', $exception->getMessage());
+            }
+        }
+    }
+
     public function test_presigned_url_rejects_invalid_session_token(): void
     {
         $credential = $this->temporaryCredential();
@@ -446,6 +501,7 @@ final class SessionCredentialVerifierTest extends TestCase
         ?string $dateHeaderValue = null,
         bool $omitPayloadHashHeader = false,
         string $queryString = '',
+        bool $signDateHeader = true,
     ): Request {
         $timestamp ??= gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
@@ -471,6 +527,12 @@ final class SessionCredentialVerifierTest extends TestCase
         }
 
         $signedHeaders = array_keys($headers);
+        if (! $signDateHeader) {
+            $signedHeaders = array_values(array_filter(
+                $signedHeaders,
+                static fn(string $name): bool => $name !== 'date',
+            ));
+        }
         sort($signedHeaders);
 
         $canonicalRequest = CanonicalRequest::build(
@@ -500,7 +562,10 @@ final class SessionCredentialVerifierTest extends TestCase
         return $this->request('GET', '/bucket/key.txt' . ($queryString === '' ? '' : '?' . $queryString), $headers);
     }
 
-    /** @param array<non-empty-string, string> $additionalHeaders */
+    /**
+     * @param array<non-empty-string, string> $additionalHeaders
+     * @param list<string>|null $signedHeadersOverride
+     */
     private function presignedRequest(
         Credential $credential,
         ?string $sessionToken,
@@ -508,6 +573,7 @@ final class SessionCredentialVerifierTest extends TestCase
         array $additionalHeaders = [],
         string $expires = '300',
         string $additionalQueryString = '',
+        ?array $signedHeadersOverride = null,
     ): Request {
         $timestamp ??= gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
@@ -516,8 +582,10 @@ final class SessionCredentialVerifierTest extends TestCase
         foreach ($additionalHeaders as $name => $value) {
             $headers[$name] = [$value];
         }
-        $signedHeaders = array_keys($headers);
-        sort($signedHeaders);
+        $signedHeaders = $signedHeadersOverride ?? array_keys($headers);
+        if ($signedHeadersOverride === null) {
+            sort($signedHeaders);
+        }
         $query = [
             'X-Amz-Algorithm' => 'AWS4-HMAC-SHA256',
             'X-Amz-Credential' => "{$credential->accessKeyId}/{$credentialScope}",

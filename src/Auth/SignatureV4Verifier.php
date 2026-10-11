@@ -107,13 +107,17 @@ final class SignatureV4Verifier
         }
 
         // 6. Build the canonical request.
-        $signedHeaders = explode(';', $parsed['signedHeaders']);
-        sort($signedHeaders);
+        $signedHeaders = self::validateSignedHeaders($request, $parsed['signedHeaders']);
 
         // AWS requires 'host' to always be signed — reject if missing.
         if (!in_array('host', $signedHeaders, true)) {
             throw new AuthorizationHeaderMalformedException(
                 'Authorization header requires "host" to be a signed header.',
+            );
+        }
+        if (! $request->hasHeader('x-amz-date') && ! in_array('date', $signedHeaders, true)) {
+            throw new AuthorizationHeaderMalformedException(
+                'Authorization header requires the Date header used for authentication to be signed.',
             );
         }
         self::assertMutationHeadersSigned($request, $signedHeaders, allowPayloadHashHeader: true);
@@ -170,6 +174,37 @@ final class SignatureV4Verifier
                 throw new AccessDeniedException('Request contains duplicate authentication headers.');
             }
         }
+    }
+
+    /** @return list<string> */
+    public static function validateSignedHeaders(Request $request, string $value): array
+    {
+        $signedHeaders = explode(';', $value);
+        $sorted = $signedHeaders;
+        sort($sorted, SORT_STRING);
+
+        if ($signedHeaders !== $sorted
+            || count(array_unique($signedHeaders)) !== count($signedHeaders)
+            || in_array('', $signedHeaders, true)) {
+            throw new AuthorizationHeaderMalformedException(
+                'SignedHeaders must contain unique lowercase header names in sorted order.',
+            );
+        }
+
+        foreach ($signedHeaders as $name) {
+            if ($name !== strtolower($name) || preg_match('/^[a-z0-9._-]+$/D', $name) !== 1) {
+                throw new AuthorizationHeaderMalformedException(
+                    'SignedHeaders must contain unique lowercase header names in sorted order.',
+                );
+            }
+            if (! $request->hasHeader($name)) {
+                throw new AuthorizationHeaderMalformedException(
+                    sprintf('SignedHeaders contains a header that is missing from the request: %s.', $name),
+                );
+            }
+        }
+
+        return $signedHeaders;
     }
 
     /**

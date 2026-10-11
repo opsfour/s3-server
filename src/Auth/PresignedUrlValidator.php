@@ -139,8 +139,7 @@ final class PresignedUrlValidator
 
         // 8. Build the canonical request.
         // For presigned URLs, the hashed payload is always "UNSIGNED-PAYLOAD".
-        $signedHeaders = explode(';', $params['signedHeaders']);
-        sort($signedHeaders);
+        $signedHeaders = SignatureV4Verifier::validateSignedHeaders($request, $params['signedHeaders']);
 
         // AWS requires 'host' to always be signed — reject if missing.
         if (!in_array('host', $signedHeaders, true)) {
