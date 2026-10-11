@@ -216,8 +216,11 @@ final class XmlRequestParser
             $allowedHeaders = [];
             foreach ($fields['AllowedHeader'] ?? [] as $header) {
                 $name = self::scalarText($header, 'AllowedHeader');
-                if ($name === '' || substr_count($name, '*') > 1) {
-                    throw new MalformedXmlException('AllowedHeader must be non-empty and contain at most one wildcard.');
+                if (preg_match('/\A[!#$%&\'*+\-.^_`|~0-9A-Za-z]+\z/', $name) !== 1
+                    || substr_count($name, '*') > 1) {
+                    throw new MalformedXmlException(
+                        'AllowedHeader must be a valid HTTP header name containing at most one wildcard.',
+                    );
                 }
                 $allowedHeaders[] = $name;
             }
@@ -285,7 +288,11 @@ final class XmlRequestParser
         }
 
         if (isset($children['MfaDelete'])) {
-            $result['mfaDelete'] = self::scalarText($children['MfaDelete'][0], 'MfaDelete');
+            $mfaDelete = self::scalarText($children['MfaDelete'][0], 'MfaDelete');
+            if (! in_array($mfaDelete, ['Enabled', 'Disabled'], true)) {
+                throw new MalformedXmlException('MfaDelete must be Enabled or Disabled.');
+            }
+            $result['mfaDelete'] = $mfaDelete;
         }
 
         return $result;
@@ -533,6 +540,12 @@ final class XmlRequestParser
                     $granteeFields = self::assertAllowedChildren($grantee, ['ID', 'DisplayName', 'EmailAddress', 'URI'], 'ACL Grantee');
                     foreach ($granteeFields as $name => $value) {
                         self::scalarText($value[0], 'ACL Grantee ' . $name);
+                    }
+                    $identifierCount = (int) isset($granteeFields['ID'])
+                        + (int) isset($granteeFields['EmailAddress'])
+                        + (int) isset($granteeFields['URI']);
+                    if ($identifierCount > 1) {
+                        throw new MalformedXmlException('ACL Grantee must not contain conflicting identifiers.');
                     }
 
                     // Check xsi:type attribute for grantee type.

@@ -19,6 +19,7 @@ final class BucketConfigurationMalformedXmlTest extends TestCase
         yield 'ownership nested value' => [BucketOwnershipControlsHandler::class, 'parseMode', '<OwnershipControls><Rule><ObjectOwnership><Mode>ObjectWriter</Mode></ObjectOwnership></Rule></OwnershipControls>'];
         yield 'public access unknown field' => [PutPublicAccessBlockHandler::class, 'parsePublicAccessBlock', '<PublicAccessBlockConfiguration><Unknown>true</Unknown></PublicAccessBlockConfiguration>'];
         yield 'public access invalid boolean' => [PutPublicAccessBlockHandler::class, 'parsePublicAccessBlock', '<PublicAccessBlockConfiguration><BlockPublicAcls>yes</BlockPublicAcls></PublicAccessBlockConfiguration>'];
+        yield 'public access uppercase boolean' => [PutPublicAccessBlockHandler::class, 'parsePublicAccessBlock', '<PublicAccessBlockConfiguration><BlockPublicAcls>TRUE</BlockPublicAcls></PublicAccessBlockConfiguration>'];
     }
 
     #[DataProvider('structurallyInvalidDocuments')]

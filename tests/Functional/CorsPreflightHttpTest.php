@@ -95,7 +95,7 @@ final class CorsPreflightHttpTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_signed_invalid_exposed_header_preserves_previous_cors_configuration(): void
+    public function test_signed_invalid_cors_header_name_preserves_previous_configuration(): void
     {
         self::$s3->putBucketCors([
             'Bucket' => self::$bucket,
@@ -110,17 +110,22 @@ final class CorsPreflightHttpTest extends S3FunctionalTestCase
             self::assertSame('ETag', $this->preflight('/' . self::$bucket, 's3.test', 'https://client.example', 'GET')
                 ->getHeaderLine('Access-Control-Expose-Headers'));
 
-            foreach (["X-Ok\nBad", 'X-Ok: Bad'] as $invalid) {
+            foreach ([
+                ['ExposeHeaders', "X-Ok\nBad"],
+                ['ExposeHeaders', 'X-Ok: Bad'],
+                ['AllowedHeaders', "X-Ok\nBad"],
+                ['AllowedHeaders', 'X-Ok: Bad'],
+            ] as [$field, $invalid]) {
                 try {
                     self::$s3->putBucketCors([
                         'Bucket' => self::$bucket,
                         'CORSConfiguration' => ['CORSRules' => [[
                             'AllowedOrigins' => ['https://client.example'],
                             'AllowedMethods' => ['GET'],
-                            'ExposeHeaders' => [$invalid],
+                            $field => [$invalid],
                         ]]],
                     ]);
-                    self::fail('A CORS exposed header that cannot be written as an HTTP header was accepted.');
+                    self::fail('An invalid CORS header name was accepted.');
                 } catch (S3Exception $error) {
                     self::assertSame(400, $error->getStatusCode());
                 }

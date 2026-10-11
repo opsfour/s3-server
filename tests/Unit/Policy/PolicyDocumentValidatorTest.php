@@ -85,6 +85,13 @@ final class PolicyDocumentValidatorTest extends TestCase
         PolicyDocumentValidator::validateIdentityPolicy($policy);
     }
 
+    public function test_bucket_policy_rejects_empty_document_as_malformed_policy(): void
+    {
+        $this->expectException(MalformedPolicyException::class);
+
+        PolicyDocumentValidator::validateBucketPolicy('');
+    }
+
     /**
      * @return iterable<string, array{array<string, mixed>}>
      */

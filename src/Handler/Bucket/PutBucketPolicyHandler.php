@@ -8,7 +8,6 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
-use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
@@ -41,10 +40,6 @@ final class PutBucketPolicyHandler implements RequestHandler
         // Read raw JSON body.
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 20_480);
 
-        if (trim($body) === '') {
-            throw new MalformedXmlException('Request body is empty.');
-        }
-
         PolicyDocumentValidator::validateBucketPolicy($body);
 
         $this->metadata->transaction(function () use ($request, $bucketInfo, $ownerId, $bucket, $body): void {
@@ -58,6 +53,6 @@ final class PutBucketPolicyHandler implements RequestHandler
             $this->metadata->putBucketPolicy($bucket, $body);
         });
 
-        return new Response(status: 204);
+        return new Response(status: 200);
     }
 }

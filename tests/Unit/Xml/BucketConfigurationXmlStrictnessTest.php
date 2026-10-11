@@ -34,6 +34,13 @@ final class BucketConfigurationXmlStrictnessTest extends TestCase
             '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>'
             . '<AllowedHeader>x-*-*</AllowedHeader></CORSRule></CORSConfiguration>',
         ];
+        foreach (['X-Ok&#10;Bad', 'X-Ok&#13;Bad', 'X-Ok: Bad', 'X Bad', 'X-Ünicode'] as $header) {
+            yield 'CORS invalid allowed header ' . $header => [
+                'parseCorsConfiguration',
+                '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>'
+                . '<AllowedHeader>' . $header . '</AllowedHeader></CORSRule></CORSConfiguration>',
+            ];
+        }
         yield 'CORS maximum age beyond signed 32-bit storage' => [
             'parseCorsConfiguration',
             '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>'
@@ -47,6 +54,10 @@ final class BucketConfigurationXmlStrictnessTest extends TestCase
         yield 'tag without value element' => [
             'parseTagging',
             '<Tagging><TagSet><Tag><Key>present</Key></Tag></TagSet></Tagging>',
+        ];
+        yield 'versioning invalid MFA delete value' => [
+            'parseVersioningConfiguration',
+            '<VersioningConfiguration><Status>Enabled</Status><MfaDelete>enable</MfaDelete></VersioningConfiguration>',
         ];
         foreach (['X-Ok&#10;Bad', 'X-Ok&#13;Bad', 'X-Ok: Bad', 'X Bad', 'X-Ünicode'] as $header) {
             yield 'CORS invalid exposed header ' . $header => [

@@ -76,7 +76,7 @@ final class PutPublicAccessBlockHandler implements RequestHandler
                 throw new MalformedXmlException('Invalid PublicAccessBlockConfiguration field.');
             }
             $seen[$name] = true;
-            $value = strtolower(trim((string) $child));
+            $value = trim((string) $child);
             if (!in_array($value, ['true', 'false', '1', '0'], true)) {
                 throw new MalformedXmlException('Invalid PublicAccessBlockConfiguration boolean value.');
             }
