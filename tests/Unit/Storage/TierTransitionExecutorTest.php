@@ -1136,6 +1136,43 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertSame('STANDARD', $object->storageTier);
     }
 
+    public function test_lifecycle_job_is_cancelled_when_stored_rule_becomes_malformed(): void
+    {
+        $hot = new InMemoryBackend();
+        $archive = new InMemoryBackend();
+        $target = new CallbackStorageBackend($archive);
+        $hot->createBucket('bucket');
+        $archive->createBucket('bucket');
+        $source = $hot->putObject('bucket', 'rule.bin', new ReadableBuffer('payload'));
+        $this->metadata->putObjectMetadata('bucket', 'rule.bin', 'owner', $source->size, '"' . $source->md5Hex . '"', 'application/octet-stream', $source->path);
+        $this->configureLifecycleTransition(true);
+        $jobId = $this->metadata->enqueueTierTransitionJob('bucket', 'rule.bin', null, 'STANDARD', 'GLACIER', 'GLACIER', $source->path, origin: 'lifecycle', lifecycleRuleId: 'transition', expectedIsLatest: true);
+        $this->metadata->updateObjectPlacement('bucket', 'rule.bin', null, 'STANDARD', 'STANDARD', $source->path, 'pending', 'GLACIER');
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'transition',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => [['days' => 0, 'storageClass' => 'GLACIER']],
+            'expiration' => ['date' => 'invalid'],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        (new TierTransitionExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+            new StorageTier('GLACIER', $target, restoreRequired: true),
+        ])))->processNext(1);
+
+        self::assertSame('completed', $this->metadata->getTierTransitionJob($jobId)['status'] ?? null);
+        $object = $this->metadata->getObjectMetadata('bucket', 'rule.bin');
+        self::assertNotNull($object);
+        self::assertSame('available', $object->transitionStatus);
+        self::assertSame('STANDARD', $object->storageTier);
+        self::assertNull($target->lastWrite);
+    }
+
     public function test_legacy_job_is_cancelled_and_direct_job_still_transitions(): void
     {
         $hot = new InMemoryBackend();

@@ -78,6 +78,18 @@ final class StorageBackendFactoryTest extends TestCase
         ]);
     }
 
+    public function test_malformed_flysystem_first_byte_timeout_is_not_truncated(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Flysystem read_first_byte_timeout_seconds must be a positive decimal integer.');
+
+        StorageBackendFactory::create('flysystem', [
+            'temp_dir' => $this->tempDir,
+            'worker_pool_size' => 1,
+            'read_first_byte_timeout_seconds' => '20seconds',
+        ]);
+    }
+
     public function test_negative_sqlite_worker_count_is_not_treated_as_synchronous_mode(): void
     {
         $this->expectException(\InvalidArgumentException::class);

@@ -29,6 +29,9 @@ final class LifecycleRunner
         private readonly float $intervalSeconds = 60.0,
         LoggerInterface $logger = new NullLogger(),
     ) {
+        if (! is_finite($this->intervalSeconds) || $this->intervalSeconds <= 0.0) {
+            throw new \InvalidArgumentException('Lifecycle interval must be a finite number greater than zero.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
     }
 

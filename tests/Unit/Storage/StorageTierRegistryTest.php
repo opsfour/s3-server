@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
+use League\Flysystem\FilesystemOperator;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
@@ -97,6 +98,68 @@ final class StorageTierRegistryTest extends TestCase
         new StorageTierRegistry([
             new StorageTier('STANDARD', new InMemoryBackend(), defaultWriteTier: true),
             new StorageTier('STANDARD_IA', new InMemoryBackend(), defaultWriteTier: true),
+        ]);
+    }
+
+    public function test_same_backend_cannot_be_registered_as_two_physical_tiers(): void
+    {
+        $backend = new InMemoryBackend();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not share the same backend');
+
+        new StorageTierRegistry([
+            new StorageTier('STANDARD', $backend, defaultWriteTier: true),
+            new StorageTier('GLACIER', $backend, restoreRequired: true),
+        ]);
+    }
+
+    public function test_observed_wrappers_do_not_hide_a_shared_backend(): void
+    {
+        $backend = new InMemoryBackend();
+        $metrics = new MetricsCollector();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not share the same backend');
+
+        new StorageTierRegistry([
+            new StorageTier('STANDARD', new ObservedStorageBackend($backend, $metrics, 'hot'), defaultWriteTier: true),
+            new StorageTier('GLACIER', new ObservedStorageBackend($backend, $metrics, 'cold'), restoreRequired: true),
+        ]);
+    }
+
+    public function test_factory_rejects_two_filesystem_tiers_with_the_same_path(): void
+    {
+        $path = sys_get_temp_dir() . '/opsfour-shared-tier-' . bin2hex(random_bytes(4));
+        self::assertTrue(mkdir($path, 0700));
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('must not share the same physical backend');
+
+            StorageBackendFactory::createTierRegistry([
+                'tiers' => [
+                    'STANDARD' => ['driver' => 'filesystem', 'path' => $path, 'default' => true],
+                    'GLACIER' => ['driver' => 'filesystem', 'path' => $path . '/', 'restore_required' => true],
+                ],
+            ]);
+        } finally {
+            rmdir($path);
+        }
+    }
+
+    public function test_factory_rejects_two_flysystem_tiers_with_the_same_operator(): void
+    {
+        $operator = $this->createMock(FilesystemOperator::class);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not share the same physical backend');
+
+        StorageBackendFactory::createTierRegistry([
+            'tiers' => [
+                'STANDARD' => ['driver' => 'flysystem', 'filesystem' => $operator, 'default' => true],
+                'GLACIER' => ['driver' => 'flysystem', 'filesystem' => $operator, 'restore_required' => true],
+            ],
         ]);
     }
 

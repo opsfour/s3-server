@@ -18,6 +18,15 @@ use Revolt\EventLoop;
 
 final class LifecycleRunnerTest extends TestCase
 {
+    public function test_invalid_interval_is_rejected_before_registering_a_timer(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+
+        $this->expectException(\InvalidArgumentException::class);
+        new LifecycleRunner(new LifecycleExecutor($metadata, new InMemoryBackend()), NAN);
+    }
+
     public function test_running_state_tracks_the_periodic_watcher(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');

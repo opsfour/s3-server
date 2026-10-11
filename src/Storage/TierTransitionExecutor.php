@@ -8,6 +8,7 @@ use Amp\Cancellation;
 use Amp\CancelledException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
+use OpsFour\S3Server\Lifecycle\LifecycleRuleValidator;
 use OpsFour\S3Server\Metadata\FencedQueueStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
@@ -16,7 +17,6 @@ use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Metadata\QueueLease;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Xml\XmlRequestParser;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -502,6 +502,11 @@ final class TierTransitionExecutor
             if (($rule['id'] ?? null) !== $job['lifecycleRuleId'] || ($rule['status'] ?? null) !== 'Enabled') {
                 continue;
             }
+            try {
+                LifecycleRuleValidator::assertValid($rule);
+            } catch (\UnexpectedValueException) {
+                return false;
+            }
             $prefix = $rule['prefix'] ?? $rule['filter']['prefix'] ?? $rule['filter']['and']['prefix'] ?? null;
             if (is_string($prefix) && ! str_starts_with($object->key, $prefix)) {
                 return false;
@@ -519,9 +524,6 @@ final class TierTransitionExecutor
                 }
                 if (! $expectedLatest && isset($transition['noncurrentDays'])) {
                     $days = $transition['noncurrentDays'];
-                    if (! is_int($days) || $days < 1 || $days > XmlRequestParser::MAX_LIFECYCLE_DAYS) {
-                        return false;
-                    }
                     if ($created < $now->modify("-{$days} days")) {
                         return true;
                     }
@@ -530,9 +532,6 @@ final class TierTransitionExecutor
                 }
                 if ($expectedLatest && isset($transition['days'])) {
                     $days = $transition['days'];
-                    if (! is_int($days) || $days < 0 || $days > XmlRequestParser::MAX_LIFECYCLE_DAYS) {
-                        return false;
-                    }
                     if ($created < $now->modify("-{$days} days")) {
                         return true;
                     }

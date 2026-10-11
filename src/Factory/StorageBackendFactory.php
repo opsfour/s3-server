@@ -25,7 +25,7 @@ final class StorageBackendFactory
 {
     /**
      * @param  string  $driver  One of: filesystem, flysystem, memory.
-     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
+     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int|string} $config
      */
     public static function create(
         string $driver,
@@ -48,7 +48,7 @@ final class StorageBackendFactory
     }
 
     /**
-     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
+     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int|string} $config
      */
     private static function createFlysystem(array $config, ?MetricsCollector $metrics): StorageBackend
     {
@@ -69,6 +69,14 @@ final class StorageBackendFactory
         if ($workerPoolSize === false) {
             throw new \InvalidArgumentException('Flysystem worker_pool_size must be a decimal integer >= 0.');
         }
+        $firstByteTimeoutSeconds = filter_var(
+            $config['read_first_byte_timeout_seconds'] ?? 20,
+            FILTER_VALIDATE_INT,
+            ['options' => ['min_range' => 1]],
+        );
+        if ($firstByteTimeoutSeconds === false) {
+            throw new \InvalidArgumentException('Flysystem read_first_byte_timeout_seconds must be a positive decimal integer.');
+        }
         if ($workerPoolSize > 0) {
             return new ParallelFlysystemBackend(
                 $config['filesystem_factory'] ?? throw new \InvalidArgumentException(
@@ -79,7 +87,7 @@ final class StorageBackendFactory
                 $metrics,
                 poolName: (string) ($config['pool_name'] ?? 'flysystem'),
                 tempBudgetBytes: $tempBudgetBytes,
-                firstByteTimeoutSeconds: (int) ($config['read_first_byte_timeout_seconds'] ?? 20),
+                firstByteTimeoutSeconds: $firstByteTimeoutSeconds,
             );
         }
 
@@ -104,6 +112,7 @@ final class StorageBackendFactory
         if (is_array($tiers) && $tiers !== []) {
             $configured = [];
             $created = [];
+            $physicalIdentities = [];
             try {
                 foreach ($tiers as $name => $tierConfig) {
                     if (!is_array($tierConfig)) {
@@ -112,6 +121,15 @@ final class StorageBackendFactory
 
                     $tierName = is_string($name) ? $name : (string) ($tierConfig['name'] ?? '');
                     $driver = (string) ($tierConfig['driver'] ?? $storageConfig['driver'] ?? 'filesystem');
+                    $physicalIdentity = self::configuredPhysicalIdentity($driver, $tierConfig);
+                    if ($physicalIdentity !== null && isset($physicalIdentities[$physicalIdentity])) {
+                        throw new \InvalidArgumentException(
+                            "Storage tiers {$physicalIdentities[$physicalIdentity]} and {$tierName} must not share the same physical backend.",
+                        );
+                    }
+                    if ($physicalIdentity !== null) {
+                        $physicalIdentities[$physicalIdentity] = $tierName;
+                    }
                     $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
                     $tierConfig['temp_budget_bytes'] ??= $storageConfig['temp_budget_bytes'] ?? 10_737_418_240;
                     $tierConfig['read_first_byte_timeout_seconds'] ??= $storageConfig['read_first_byte_timeout_seconds'] ?? 20;
@@ -156,5 +174,24 @@ final class StorageBackendFactory
             }
             throw $error;
         }
+    }
+
+    /** @param array<string, mixed> $config */
+    private static function configuredPhysicalIdentity(string $driver, array $config): ?string
+    {
+        if ($driver === 'filesystem' && is_string($config['path'] ?? null)) {
+            $path = $config['path'];
+            $resolved = realpath($path);
+
+            return 'filesystem:' . ($resolved !== false ? $resolved : rtrim($path, DIRECTORY_SEPARATOR));
+        }
+        if ($driver === 'flysystem') {
+            $operator = $config['filesystem'] ?? $config['filesystem_factory'] ?? null;
+            if (is_object($operator)) {
+                return 'flysystem:' . spl_object_id($operator);
+            }
+        }
+
+        return null;
     }
 }

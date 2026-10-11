@@ -753,7 +753,7 @@ final class LifecycleExecutorTest extends TestCase
             'id' => 'abort-old-logs-mpu',
             'status' => 'Enabled',
             'prefix' => null,
-            'filter' => ['and' => ['prefix' => 'logs/']],
+            'filter' => ['prefix' => 'logs/'],
             'transitions' => null,
             'expiration' => null,
             'noncurrentTransitions' => null,
@@ -948,6 +948,52 @@ final class LifecycleExecutorTest extends TestCase
 
         self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
         self::assertFileExists($kept->path);
+    }
+
+    public function test_persisted_incomplete_tag_filter_fails_closed(): void
+    {
+        $this->createBucket('bucket');
+        $kept = $this->putObject('bucket', 'old.txt', 'kept');
+        $this->ageObject('bucket', 'old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'invalid-tag-filter',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => ['tag' => ['key' => 'env']],
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $this->executor()->processBucket('bucket');
+
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
+        self::assertFileExists($kept->path);
+    }
+
+    public function test_malformed_later_action_prevents_transition_job_from_being_enqueued(): void
+    {
+        $this->createBucket('bucket');
+        $this->putObject('bucket', 'old.txt', 'kept');
+        $this->ageObject('bucket', 'old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'invalid-expiration',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => [['days' => 0, 'storageClass' => 'GLACIER']],
+            'expiration' => ['date' => 'not-a-lifecycle-date'],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $this->executor()->processBucket('bucket');
+
+        self::assertSame([], $this->tierTransitionJobs());
+        self::assertSame('available', $this->metadata->getObjectMetadata('bucket', 'old.txt')?->transitionStatus);
     }
 
     public function test_lifecycle_run_stops_at_configured_action_budget(): void

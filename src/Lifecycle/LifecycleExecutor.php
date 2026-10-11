@@ -285,15 +285,16 @@ final class LifecycleExecutor
                 break;
             }
 
-            if ($rule['status'] !== 'Enabled') {
-                continue;
-            }
-
-            $prefix = $this->rulePrefix($rule);
             $ruleStartedAt = hrtime(true);
-            $ruleId = $this->ruleId($rule);
+            $ruleId = is_string($rule['id'] ?? null) ? $rule['id'] : 'invalid';
+            $prefix = null;
 
             try {
+                LifecycleRuleValidator::assertValid($rule);
+                if ($rule['status'] !== 'Enabled') {
+                    continue;
+                }
+                $prefix = $this->rulePrefix($rule);
                 $this->logger->debug('Lifecycle rule processing started.', $this->lifecycleContext([
                     'event' => 'rule_started',
                     'bucket' => $bucket,
@@ -344,7 +345,6 @@ final class LifecycleExecutor
     {
         $this->renewLeaseIfNeeded();
         BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
-        $this->assertSafeDayValues($rule);
         $bucket = $observedBucket->name;
         $actions = 0;
         $tags = $this->ruleTags($rule);
@@ -727,40 +727,6 @@ final class LifecycleExecutor
         }
 
         return null;
-    }
-
-    /** @param array<string, mixed> $rule */
-    private function assertSafeDayValues(array $rule): void
-    {
-        $values = [];
-        if (isset($rule['expiration']['days'])) {
-            $values['Expiration Days'] = $rule['expiration']['days'];
-        }
-        if (isset($rule['noncurrentExpiration']['noncurrentDays'])) {
-            $values['NoncurrentVersionExpiration NoncurrentDays'] = $rule['noncurrentExpiration']['noncurrentDays'];
-        }
-        if (isset($rule['abortIncompleteDays'])) {
-            $values['AbortIncompleteMultipartUpload DaysAfterInitiation'] = $rule['abortIncompleteDays'];
-        }
-        foreach (($rule['transitions'] ?? []) as $index => $transition) {
-            if (is_array($transition) && array_key_exists('days', $transition)) {
-                $days = $transition['days'];
-                if (! is_int($days) || $days < 0 || $days > XmlRequestParser::MAX_LIFECYCLE_DAYS) {
-                    throw new \UnexpectedValueException("Stored lifecycle Transition {$index} Days is outside the supported range.");
-                }
-            }
-        }
-        foreach (($rule['noncurrentTransitions'] ?? []) as $index => $transition) {
-            if (is_array($transition) && array_key_exists('noncurrentDays', $transition)) {
-                $values["NoncurrentVersionTransition {$index} NoncurrentDays"] = $transition['noncurrentDays'];
-            }
-        }
-
-        foreach ($values as $field => $days) {
-            if (! is_int($days) || $days < 1 || $days > XmlRequestParser::MAX_LIFECYCLE_DAYS) {
-                throw new \UnexpectedValueException("Stored {$field} is outside the supported range.");
-            }
-        }
     }
 
     private function enqueueTransitionIfNeeded(BucketInfo $observedBucket, ObjectInfo $object, string $targetStorageClass, bool $expectedLatest, string $ruleId): bool

@@ -15,6 +15,9 @@ final class StorageTierRegistry
     /** @var array<string, StorageTier> Tier name prefixed to prevent PHP from casting numeric string keys. */
     private array $tiers = [];
 
+    /** @var array<int, string> Tier name keyed by the unwrapped backend object ID. */
+    private array $backendOwners = [];
+
     private string $defaultTierName;
 
     /**
@@ -123,7 +126,19 @@ final class StorageTierRegistry
             throw new \InvalidArgumentException("Duplicate storage tier: {$tier->name}");
         }
 
+        $backend = $tier->backend;
+        while ($backend instanceof ObservedStorageBackend) {
+            $backend = $backend->innerBackend();
+        }
+        $backendId = spl_object_id($backend);
+        if (isset($this->backendOwners[$backendId])) {
+            throw new \InvalidArgumentException(
+                "Storage tiers {$this->backendOwners[$backendId]} and {$tier->name} must not share the same backend.",
+            );
+        }
+
         $this->tiers[$key] = $tier;
+        $this->backendOwners[$backendId] = $tier->name;
     }
 
     private static function key(string $name): string
