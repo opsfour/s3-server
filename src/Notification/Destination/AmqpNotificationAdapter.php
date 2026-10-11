@@ -77,10 +77,10 @@ final readonly class AmqpNotificationAdapter implements NotificationDestinationA
             throw new \InvalidArgumentException('AMQP adapter requires a callable or publisher object.');
         }
 
-        if (method_exists($this->publisher, 'publish')) {
+        if (is_callable([$this->publisher, 'publish'])) {
             return $this->publisher->publish($payload, $this->routingKey, $this->exchange);
         }
-        if (method_exists($this->publisher, 'basic_publish')) {
+        if (is_callable([$this->publisher, 'basic_publish'])) {
             $message = $this->messageFactory !== null
                 ? ($this->messageFactory)($payload, $event)
                 : $payload;

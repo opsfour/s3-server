@@ -64,7 +64,7 @@ final readonly class NatsNotificationAdapter implements NotificationDestinationA
             return ($this->publisher)($this->subject, $payload, $event);
         }
 
-        if (is_object($this->publisher) && method_exists($this->publisher, 'publish')) {
+        if (is_object($this->publisher) && is_callable([$this->publisher, 'publish'])) {
             return $this->publisher->publish($this->subject, $payload);
         }
 

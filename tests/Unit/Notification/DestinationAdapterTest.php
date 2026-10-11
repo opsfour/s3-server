@@ -71,6 +71,41 @@ final class DestinationAdapterTest extends TestCase
         $this->assertJson($producer->calls[0]['payload']);
     }
 
+    public function test_kafka_adapter_supports_send_producers(): void
+    {
+        $producer = new RecordingKafkaSendProducer();
+        $result = (new KafkaNotificationAdapter($producer, 's3-events'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('s3-events', $producer->topic);
+        self::assertSame('bucket/key.txt', $producer->key);
+        self::assertJson($producer->payload);
+        self::assertSame('send-ack', $result->context['result']);
+    }
+
+    public function test_kafka_adapter_supports_publish_producers(): void
+    {
+        $producer = new RecordingKafkaPublishProducer();
+        $result = (new KafkaNotificationAdapter($producer, 's3-events'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('s3-events', $producer->topic);
+        self::assertSame('bucket/key.txt', $producer->key);
+        self::assertJson($producer->payload);
+        self::assertSame('publish-ack', $result->context['result']);
+    }
+
+    public function test_kafka_adapter_delivers_through_an_accepted_dynamic_producer(): void
+    {
+        $producer = new RecordingDynamicBrokerClient();
+        $result = (new KafkaNotificationAdapter($producer, 's3-events'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('produce', $producer->method);
+        self::assertSame('s3-events', $producer->arguments[0]);
+        self::assertSame('bucket/key.txt', $producer->arguments[4]);
+    }
+
     public function test_amqp_adapter_publishes_json_payload(): void
     {
         $publisher = new RecordingAmqpPublisher();
@@ -92,6 +127,64 @@ final class DestinationAdapterTest extends TestCase
         self::assertSame('', $publisher->calls[0]['routingKey']);
     }
 
+    public function test_amqp_adapter_supports_basic_publish_with_raw_payload(): void
+    {
+        $publisher = new RecordingAmqpBasicPublisher();
+        $result = (new AmqpNotificationAdapter($publisher, 's3-exchange', 'bucket.created'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('s3-exchange', $publisher->exchange);
+        self::assertSame('bucket.created', $publisher->routingKey);
+        self::assertIsString($publisher->message);
+        self::assertJson($publisher->message);
+        self::assertSame('basic-publish-ack', $result->context['result']);
+    }
+
+    public function test_amqp_adapter_uses_message_factory_for_basic_publish(): void
+    {
+        $publisher = new RecordingAmqpBasicPublisher();
+        $factoryEvent = null;
+        $adapter = new AmqpNotificationAdapter(
+            $publisher,
+            's3-exchange',
+            'bucket.created',
+            static function (string $payload, S3Event $event) use (&$factoryEvent): RecordingAmqpMessage {
+                $factoryEvent = $event;
+
+                return new RecordingAmqpMessage($payload);
+            },
+        );
+
+        $event = $this->event();
+        $result = $adapter->deliver($event);
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame($event, $factoryEvent);
+        self::assertInstanceOf(RecordingAmqpMessage::class, $publisher->message);
+        self::assertJson($publisher->message->body);
+    }
+
+    public function test_amqp_basic_publish_without_confirmation_is_retryable(): void
+    {
+        $publisher = new UnconfirmedAmqpBasicPublisher();
+        $result = (new AmqpNotificationAdapter($publisher, 's3-exchange'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::RetryableFailure, $result->status);
+        self::assertSame('Broker delivery failed.', $result->reason);
+        self::assertSame(1, $publisher->calls);
+    }
+
+    public function test_amqp_adapter_delivers_through_an_accepted_dynamic_publisher(): void
+    {
+        $publisher = new RecordingDynamicBrokerClient();
+        $result = (new AmqpNotificationAdapter($publisher, 's3-exchange', 'bucket.created'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('publish', $publisher->method);
+        self::assertSame('bucket.created', $publisher->arguments[1]);
+        self::assertSame('s3-exchange', $publisher->arguments[2]);
+    }
+
     public function test_nats_adapter_publishes_json_payload(): void
     {
         $publisher = new RecordingNatsPublisher();
@@ -100,6 +193,17 @@ final class DestinationAdapterTest extends TestCase
         $this->assertSame(NotificationDeliveryStatus::Sent, $result->status);
         $this->assertSame('s3.object.created', $publisher->calls[0]['subject']);
         $this->assertJson($publisher->calls[0]['payload']);
+    }
+
+    public function test_nats_adapter_delivers_through_an_accepted_dynamic_publisher(): void
+    {
+        $publisher = new RecordingDynamicBrokerClient();
+        $result = (new NatsNotificationAdapter($publisher, 's3.object.created'))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('publish', $publisher->method);
+        self::assertSame('s3.object.created', $publisher->arguments[0]);
+        self::assertJson($publisher->arguments[1]);
     }
 
     public function test_adapter_publish_failure_is_retryable(): void
@@ -272,6 +376,23 @@ final class RecordingDynamicRedisClient
     }
 }
 
+final class RecordingDynamicBrokerClient
+{
+    public string $method = '';
+
+    /** @var list<mixed> */
+    public array $arguments = [];
+
+    /** @param list<mixed> $arguments */
+    public function __call(string $method, array $arguments): string
+    {
+        $this->method = $method;
+        $this->arguments = $arguments;
+
+        return 'dynamic-ack';
+    }
+}
+
 final class RecordingKafkaProducer
 {
     /** @var list<array<string, mixed>> */
@@ -285,6 +406,42 @@ final class RecordingKafkaProducer
     }
 }
 
+final class RecordingKafkaSendProducer
+{
+    public string $topic = '';
+
+    public string $payload = '';
+
+    public string $key = '';
+
+    public function send(string $topic, string $payload, string $key): string
+    {
+        $this->topic = $topic;
+        $this->payload = $payload;
+        $this->key = $key;
+
+        return 'send-ack';
+    }
+}
+
+final class RecordingKafkaPublishProducer
+{
+    public string $topic = '';
+
+    public string $payload = '';
+
+    public string $key = '';
+
+    public function publish(string $topic, string $payload, string $key): string
+    {
+        $this->topic = $topic;
+        $this->payload = $payload;
+        $this->key = $key;
+
+        return 'publish-ack';
+    }
+}
+
 final class RecordingAmqpPublisher
 {
     /** @var list<array<string, mixed>> */
@@ -295,6 +452,39 @@ final class RecordingAmqpPublisher
         $this->calls[] = compact('payload', 'routingKey', 'exchange');
 
         return 'amqp-ok';
+    }
+}
+
+final class RecordingAmqpBasicPublisher
+{
+    public mixed $message = null;
+
+    public string $exchange = '';
+
+    public string $routingKey = '';
+
+    public function basic_publish(mixed $message, string $exchange, string $routingKey): string
+    {
+        $this->message = $message;
+        $this->exchange = $exchange;
+        $this->routingKey = $routingKey;
+
+        return 'basic-publish-ack';
+    }
+}
+
+final readonly class RecordingAmqpMessage
+{
+    public function __construct(public string $body) {}
+}
+
+final class UnconfirmedAmqpBasicPublisher
+{
+    public int $calls = 0;
+
+    public function basic_publish(mixed $message, string $exchange, string $routingKey): void
+    {
+        ++$this->calls;
     }
 }
 

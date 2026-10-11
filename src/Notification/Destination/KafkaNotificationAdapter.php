@@ -73,13 +73,13 @@ final readonly class KafkaNotificationAdapter implements NotificationDestination
             throw new \InvalidArgumentException('Kafka adapter requires a callable or producer object.');
         }
 
-        if (method_exists($this->producer, 'produce')) {
+        if (is_callable([$this->producer, 'produce'])) {
             return $this->producer->produce($this->topic, $this->partition, 0, $payload, $key);
         }
-        if (method_exists($this->producer, 'send')) {
+        if (is_callable([$this->producer, 'send'])) {
             return $this->producer->send($this->topic, $payload, $key);
         }
-        if (method_exists($this->producer, 'publish')) {
+        if (is_callable([$this->producer, 'publish'])) {
             return $this->producer->publish($this->topic, $payload, $key);
         }
 
