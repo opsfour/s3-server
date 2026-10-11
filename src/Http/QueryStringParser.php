@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Http;
 
+use OpsFour\S3Server\Exception\InvalidArgumentException;
+
 /**
  * Parses raw query strings into key-value pairs with proper URL decoding.
  *
@@ -28,10 +30,12 @@ final class QueryStringParser
             if ($pair === '') {
                 continue;
             }
+            self::assertValidPercentEncoding($pair);
 
             $eqPos = strpos($pair, '=');
             $key = rawurldecode($eqPos === false ? $pair : substr($pair, 0, $eqPos));
             $value = $eqPos === false ? '' : rawurldecode(substr($pair, $eqPos + 1));
+            self::assertValidUtf8($key, $value);
 
             if (array_key_exists($key, $values)) {
                 if ($values[$key] !== $value && ! in_array($key, $orderInsensitiveNames, true)) {
@@ -58,17 +62,20 @@ final class QueryStringParser
             if ($pair === '') {
                 continue;
             }
+            self::assertValidPercentEncoding($pair);
 
             $eqPos = strpos($pair, '=');
 
             if ($eqPos === false) {
                 $key = rawurldecode($pair);
+                self::assertValidUtf8($key, '');
                 if (! array_key_exists($key, $params)) {
                     $params[$key] = '';
                 }
             } else {
                 $key = rawurldecode(substr($pair, 0, $eqPos));
                 $value = rawurldecode(substr($pair, $eqPos + 1));
+                self::assertValidUtf8($key, $value);
                 if (! array_key_exists($key, $params)) {
                     $params[$key] = $value;
                 }
@@ -76,5 +83,19 @@ final class QueryStringParser
         }
 
         return $params;
+    }
+
+    private static function assertValidUtf8(string $key, string $value): void
+    {
+        if (preg_match('//u', $key) !== 1 || preg_match('//u', $value) !== 1) {
+            throw new InvalidArgumentException('Query parameters must be valid UTF-8.');
+        }
+    }
+
+    private static function assertValidPercentEncoding(string $pair): void
+    {
+        if (preg_match('/%(?![0-9A-Fa-f]{2})/', $pair) === 1) {
+            throw new InvalidArgumentException('Query parameters contain invalid percent encoding.');
+        }
     }
 }

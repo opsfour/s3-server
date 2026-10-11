@@ -41,6 +41,42 @@ final class ListingQueryTest extends TestCase
         self::assertSame(['max-keys' => ''], QueryStringParser::parse('max-keys&max-keys=1'));
     }
 
+    public function test_query_parser_rejects_invalid_utf8_names_and_values(): void
+    {
+        foreach (['%FF=value', 'prefix=%FF'] as $query) {
+            try {
+                QueryStringParser::parse($query);
+                self::fail("Invalid UTF-8 query '{$query}' was accepted.");
+            } catch (InvalidArgumentException $exception) {
+                self::assertSame('Query parameters must be valid UTF-8.', $exception->getMessage());
+            }
+
+            try {
+                QueryStringParser::hasConflictingValues($query);
+                self::fail("Invalid UTF-8 query '{$query}' was accepted by conflict detection.");
+            } catch (InvalidArgumentException $exception) {
+                self::assertSame('Query parameters must be valid UTF-8.', $exception->getMessage());
+            }
+        }
+    }
+
+    public function test_query_parser_rejects_invalid_percent_encoding(): void
+    {
+        foreach (['%=value', 'prefix=%2', 'prefix=%GG'] as $query) {
+            foreach ([QueryStringParser::parse(...), QueryStringParser::hasConflictingValues(...)] as $parse) {
+                try {
+                    $parse($query);
+                    self::fail("Invalid percent encoding '{$query}' was accepted.");
+                } catch (InvalidArgumentException $exception) {
+                    self::assertSame(
+                        'Query parameters contain invalid percent encoding.',
+                        $exception->getMessage(),
+                    );
+                }
+            }
+        }
+    }
+
     public function test_encoding_type_accepts_only_url(): void
     {
         self::assertNull(ListingQuery::encodingType([]));
