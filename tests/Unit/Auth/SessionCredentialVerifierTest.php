@@ -120,6 +120,26 @@ final class SessionCredentialVerifierTest extends TestCase
         (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
     }
 
+    public function test_header_sigv4_rejects_duplicate_signed_headers_even_with_a_valid_signature(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->signedHeaderRequest(
+            $credential,
+            $credential->sessionToken,
+            signedHeadersOverride: [
+                'host',
+                'host',
+                'x-amz-content-sha256',
+                'x-amz-date',
+                'x-amz-security-token',
+            ],
+        );
+
+        $this->expectException(AuthorizationHeaderMalformedException::class);
+        $this->expectExceptionMessage('SignedHeaders must contain unique lowercase header names in sorted order.');
+        (new SignatureV4Verifier())->verify($request, new InMemoryCredentialProvider($credential), 'us-east-1');
+    }
+
     public function test_header_sigv4_rejects_unsigned_date_header_used_for_authentication(): void
     {
         $credential = $this->temporaryCredential();
@@ -491,7 +511,10 @@ final class SessionCredentialVerifierTest extends TestCase
         );
     }
 
-    /** @param array<non-empty-string, string|list<string>> $additionalHeaders */
+    /**
+     * @param array<non-empty-string, string|list<string>> $additionalHeaders
+     * @param list<string>|null $signedHeadersOverride
+     */
     private function signedHeaderRequest(
         Credential $credential,
         ?string $sessionToken,
@@ -502,6 +525,7 @@ final class SessionCredentialVerifierTest extends TestCase
         bool $omitPayloadHashHeader = false,
         string $queryString = '',
         bool $signDateHeader = true,
+        ?array $signedHeadersOverride = null,
     ): Request {
         $timestamp ??= gmdate('Ymd\THis\Z');
         $date = substr($timestamp, 0, 8);
@@ -526,14 +550,16 @@ final class SessionCredentialVerifierTest extends TestCase
             $headers[$name] = is_array($value) ? $value : [$value];
         }
 
-        $signedHeaders = array_keys($headers);
-        if (! $signDateHeader) {
+        $signedHeaders = $signedHeadersOverride ?? array_keys($headers);
+        if ($signedHeadersOverride === null && ! $signDateHeader) {
             $signedHeaders = array_values(array_filter(
                 $signedHeaders,
                 static fn(string $name): bool => $name !== 'date',
             ));
         }
-        sort($signedHeaders);
+        if ($signedHeadersOverride === null) {
+            sort($signedHeaders);
+        }
 
         $canonicalRequest = CanonicalRequest::build(
             method: 'GET',
