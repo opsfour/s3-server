@@ -10,6 +10,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Routing\S3Operation;
 
 /** Validates request-body digests before dispatch without buffering in memory. */
@@ -40,10 +41,10 @@ final class ContentMd5Middleware implements Middleware
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
-        $contentMd5 = $request->getHeader('Content-MD5');
         if (! in_array($request->getMethod(), ['PUT', 'POST'], true)) {
             return $requestHandler->handleRequest($request);
         }
+        $contentMd5 = RequestHeaderValues::singleton($request, 'content-md5');
 
         /** @var array<string, array{algorithm: string, expected: string}> $digests */
         $digests = [];
@@ -62,13 +63,13 @@ final class ContentMd5Middleware implements Middleware
                 'x-amz-checksum-sha1' => ['sha1', 20],
                 'x-amz-checksum-sha256' => ['sha256', 32],
             ] as $header => [$algorithm, $length]) {
-                $value = $request->getHeader($header);
+                $value = RequestHeaderValues::singleton($request, $header);
                 if ($value !== null) {
                     $digests[$header] = self::decodeDigest($value, $algorithm, $length, $header);
                     $hasSdkChecksum = true;
                 }
             }
-            $declaredAlgorithm = $request->getHeader('x-amz-sdk-checksum-algorithm');
+            $declaredAlgorithm = RequestHeaderValues::singleton($request, 'x-amz-sdk-checksum-algorithm');
             if ($declaredAlgorithm !== null) {
                 $declaredHeader = match ($declaredAlgorithm) {
                     'CRC32' => 'x-amz-checksum-crc32',

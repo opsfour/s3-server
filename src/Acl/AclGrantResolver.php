@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Acl;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 
 final class AclGrantResolver
 {
@@ -263,7 +264,7 @@ final class AclGrantResolver
         $grants = self::privateAcl($ownerId);
 
         foreach (self::GRANT_HEADERS as $header => $permission) {
-            $value = $request->getHeader($header);
+            $value = RequestHeaderValues::combined($request, $header);
             if ($value === null) {
                 continue;
             }

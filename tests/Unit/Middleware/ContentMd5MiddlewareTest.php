@@ -12,6 +12,7 @@ use Amp\Http\Server\Response;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\BadDigestException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\RequestBodySpool;
@@ -111,6 +112,72 @@ final class ContentMd5MiddlewareTest extends TestCase
             $pool->shutdown();
             @rmdir($tempDir);
         }
+    }
+
+    /**
+     * @param non-empty-string $header
+     * @param list<string> $values
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('repeatedDigestHeaders')]
+    public function test_repeated_digest_singletons_are_rejected_before_dispatch(string $header, array $values): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-sdk-checksum-' . bin2hex(random_bytes(6));
+        self::assertTrue(mkdir($tempDir, 0o700));
+        $pool = new ContextWorkerPool(1);
+        $middleware = new ContentMd5Middleware(new RequestBodySpool($pool, $tempDir));
+        $calls = 0;
+        $handler = new class (static function () use (&$calls): void {
+            ++$calls;
+        }) implements RequestHandler {
+            public function __construct(private readonly \Closure $onCall) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ($this->onCall)();
+
+                return new Response(204);
+            }
+        };
+        $body = '<Delete><Object><Key>keep</Key></Object></Delete>';
+        $request = new Request(
+            $this->createMock(Client::class),
+            'POST',
+            Http::new('http://127.0.0.1/bucket?delete'),
+            [$header => $values],
+            new ReadableBuffer($body),
+        );
+        $request->setAttribute('s3.operation', S3Operation::DeleteObjects);
+
+        try {
+            $this->expectException(InvalidArgumentException::class);
+            try {
+                $middleware->handleRequest($request, $handler);
+            } finally {
+                self::assertSame(0, $calls);
+            }
+        } finally {
+            $pool->shutdown();
+            @rmdir($tempDir);
+        }
+    }
+
+    /** @return iterable<string, array{non-empty-string, list<string>}> */
+    public static function repeatedDigestHeaders(): iterable
+    {
+        $body = '<Delete><Object><Key>keep</Key></Object></Delete>';
+
+        yield 'Content-MD5' => [
+            'Content-MD5',
+            [base64_encode(md5($body, true)), base64_encode(str_repeat("\0", 16))],
+        ];
+        yield 'checksum value' => [
+            'x-amz-checksum-crc32',
+            [base64_encode(hash('crc32b', $body, true)), base64_encode("\0\0\0\0")],
+        ];
+        yield 'declared checksum algorithm' => [
+            'x-amz-sdk-checksum-algorithm',
+            ['CRC32', 'SHA256'],
+        ];
     }
 
     public function test_delete_objects_rejects_checksum_header_that_disagrees_with_declared_sdk_algorithm(): void

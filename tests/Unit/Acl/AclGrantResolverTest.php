@@ -46,6 +46,40 @@ final class AclGrantResolverTest extends TestCase
         );
     }
 
+    public function test_repeated_grant_field_lines_are_combined(): void
+    {
+        $grants = AclGrantResolver::fromHeaders(
+            $this->request([
+                'x-amz-grant-read' => ['id="first-reader"', 'id="second-reader"'],
+            ]),
+            'owner',
+            'object',
+            'bucket-owner',
+        );
+
+        self::assertNotNull($grants);
+        self::assertSame(
+            ['owner', 'first-reader', 'second-reader'],
+            array_column($grants, 'granteeId'),
+        );
+        self::assertSame(['FULL_CONTROL', 'READ', 'READ'], array_column($grants, 'permission'));
+    }
+
+    public function test_invalid_repeated_grant_field_line_is_not_ignored(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid grantee');
+
+        AclGrantResolver::fromHeaders(
+            $this->request([
+                'x-amz-grant-read' => ['id="reader"', 'invalid'],
+            ]),
+            'owner',
+            'object',
+            'bucket-owner',
+        );
+    }
+
     /**
      * @param array<non-empty-string, string> $headers
      */
@@ -109,7 +143,7 @@ final class AclGrantResolverTest extends TestCase
     }
 
     /**
-     * @param array<non-empty-string, string> $headers
+     * @param array<non-empty-string, string|list<string>> $headers
      */
     private function request(array $headers): Request
     {
