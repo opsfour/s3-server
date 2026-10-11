@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class CachedMetadataStoreDecorator implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -711,6 +711,16 @@ final class CachedMetadataStoreDecorator implements MetadataStore, GenerationBou
     public function putObjectRetention(string $bucket, string $key, string $mode, string $retainUntilDate, ?string $versionId = null): void
     {
         $this->inner->putObjectRetention($bucket, $key, $mode, $retainUntilDate, $versionId);
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        if (! $this->inner instanceof ObjectRetentionDeletionStore) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'Object retention removal is unavailable for this metadata backend.',
+            );
+        }
+        $this->inner->deleteObjectRetention($bucket, $key, $versionId);
     }
 
     public function getObjectLegalHold(string $bucket, string $key, ?string $versionId = null): ?string

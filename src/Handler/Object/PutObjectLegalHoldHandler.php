@@ -47,6 +47,9 @@ final class PutObjectLegalHoldHandler implements RequestHandler
                 'Bucket is missing Object Lock Configuration',
             );
         }
+        if (($lockConfig['objectLockEnabled'] ?? null) !== 'Enabled') {
+            throw new InvalidRequestException('Stored Object Lock configuration is not enabled.');
+        }
 
         // Parse the XML body.
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);

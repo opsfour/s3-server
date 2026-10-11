@@ -523,6 +523,7 @@ final class XmlResponseBuilder
      *     encodingType?: string,
      *     versions: list<array{key: string, versionId: string, isLatest: bool, lastModified: string, etag: string, size: int, storageClass?: string, ownerId?: string, displayName?: string}>,
      *     deleteMarkers?: list<array{key: string, versionId: string, isLatest: bool, lastModified: string, ownerId?: string, displayName?: string}>,
+     *     entries?: list<array{type: 'Version'|'DeleteMarker', key: string, versionId: string, isLatest: bool, lastModified: string, etag?: string, size?: int, storageClass?: string, ownerId?: string, displayName?: string}>,
      *     commonPrefixes?: list<string>,
      * } $params
      */
@@ -556,41 +557,21 @@ final class XmlResponseBuilder
             $writer->writeElement('EncodingType', 'url');
         }
 
-        foreach ($params['versions'] as $version) {
-            $writer->startElement('Version');
-            $writer->writeElement('Key', self::safeXmlValue($version['key'], $urlEncode));
-            $writer->writeElement('VersionId', $version['versionId']);
-            $writer->writeElement('IsLatest', $version['isLatest'] ? 'true' : 'false');
-            $writer->writeElement('LastModified', $version['lastModified']);
-            $writer->writeElement('ETag', $version['etag']);
-            $writer->writeElement('Size', (string) $version['size']);
-            $writer->writeElement('StorageClass', $version['storageClass'] ?? 'STANDARD');
-
-            if (isset($version['ownerId'])) {
-                $writer->startElement('Owner');
-                $writer->writeElement('ID', $version['ownerId']);
-                $writer->writeElement('DisplayName', $version['displayName'] ?? '');
-                $writer->endElement();
+        if (isset($params['entries'])) {
+            foreach ($params['entries'] as $entry) {
+                if ($entry['type'] === 'DeleteMarker') {
+                    self::writeDeleteMarkerEntry($writer, $entry, $urlEncode);
+                } else {
+                    self::writeVersionEntry($writer, $entry, $urlEncode);
+                }
             }
-
-            $writer->endElement(); // Version
-        }
-
-        foreach ($params['deleteMarkers'] ?? [] as $marker) {
-            $writer->startElement('DeleteMarker');
-            $writer->writeElement('Key', self::safeXmlValue($marker['key'], $urlEncode));
-            $writer->writeElement('VersionId', $marker['versionId']);
-            $writer->writeElement('IsLatest', $marker['isLatest'] ? 'true' : 'false');
-            $writer->writeElement('LastModified', $marker['lastModified']);
-
-            if (isset($marker['ownerId'])) {
-                $writer->startElement('Owner');
-                $writer->writeElement('ID', $marker['ownerId']);
-                $writer->writeElement('DisplayName', $marker['displayName'] ?? '');
-                $writer->endElement();
+        } else {
+            foreach ($params['versions'] as $version) {
+                self::writeVersionEntry($writer, $version, $urlEncode);
             }
-
-            $writer->endElement(); // DeleteMarker
+            foreach ($params['deleteMarkers'] ?? [] as $marker) {
+                self::writeDeleteMarkerEntry($writer, $marker, $urlEncode);
+            }
         }
 
         foreach ($params['commonPrefixes'] ?? [] as $prefix) {
@@ -603,6 +584,47 @@ final class XmlResponseBuilder
         $writer->endDocument();
 
         return $writer->outputMemory();
+    }
+
+    /** @param array{key: string, versionId: string, isLatest: bool, lastModified: string, etag?: string, size?: int, storageClass?: string, ownerId?: string, displayName?: string} $version */
+    private static function writeVersionEntry(\XMLWriter $writer, array $version, bool $urlEncode): void
+    {
+        $writer->startElement('Version');
+        $writer->writeElement('Key', self::safeXmlValue($version['key'], $urlEncode));
+        $writer->writeElement('VersionId', $version['versionId']);
+        $writer->writeElement('IsLatest', $version['isLatest'] ? 'true' : 'false');
+        $writer->writeElement('LastModified', $version['lastModified']);
+        $writer->writeElement('ETag', $version['etag'] ?? '');
+        $writer->writeElement('Size', (string) ($version['size'] ?? 0));
+        $writer->writeElement('StorageClass', $version['storageClass'] ?? 'STANDARD');
+
+        if (isset($version['ownerId'])) {
+            $writer->startElement('Owner');
+            $writer->writeElement('ID', $version['ownerId']);
+            $writer->writeElement('DisplayName', $version['displayName'] ?? '');
+            $writer->endElement();
+        }
+
+        $writer->endElement();
+    }
+
+    /** @param array{key: string, versionId: string, isLatest: bool, lastModified: string, ownerId?: string, displayName?: string} $marker */
+    private static function writeDeleteMarkerEntry(\XMLWriter $writer, array $marker, bool $urlEncode): void
+    {
+        $writer->startElement('DeleteMarker');
+        $writer->writeElement('Key', self::safeXmlValue($marker['key'], $urlEncode));
+        $writer->writeElement('VersionId', $marker['versionId']);
+        $writer->writeElement('IsLatest', $marker['isLatest'] ? 'true' : 'false');
+        $writer->writeElement('LastModified', $marker['lastModified']);
+
+        if (isset($marker['ownerId'])) {
+            $writer->startElement('Owner');
+            $writer->writeElement('ID', $marker['ownerId']);
+            $writer->writeElement('DisplayName', $marker['displayName'] ?? '');
+            $writer->endElement();
+        }
+
+        $writer->endElement();
     }
 
     /**
@@ -1117,15 +1139,14 @@ final class XmlResponseBuilder
     /**
      * Encode a string for safe inclusion in XML output.
      *
-     * When $urlEncode is true, uses AWS S3-compatible percent-encoding:
-     * rawurlencode() but preserving '/' and '*' unencoded (matching AWS behavior).
+     * When $urlEncode is true, uses RFC 3986 percent-encoding as required by
+     * S3's encoding-type=url response fields.
      * Otherwise, invalid UTF-8 bytes are stripped to prevent XML parse errors.
      */
     private static function safeXmlValue(string $value, bool $urlEncode): string
     {
         if ($urlEncode) {
-            // AWS S3 encoding-type=url preserves '/' (path separator) and '*' (wildcard).
-            return str_replace(['%2F', '%2A'], ['/', '*'], rawurlencode($value));
+            return rawurlencode($value);
         }
 
         // Strip invalid UTF-8 sequences to prevent XML parse errors.

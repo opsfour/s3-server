@@ -23,12 +23,13 @@ use OpsFour\S3Server\Metadata\LocalMultipartPartSealGuard;
 use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectRetentionDeletionStore;
 use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final readonly class ObservedMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     public function __construct(
         private MetadataStore $inner,
@@ -554,6 +555,16 @@ final readonly class ObservedMetadataStore implements MetadataStore, GenerationB
     public function putObjectRetention(string $bucket, string $key, string $mode, string $retainUntilDate, ?string $versionId = null): void
     {
         $this->observe(__FUNCTION__, fn() => $this->inner->putObjectRetention($bucket, $key, $mode, $retainUntilDate, $versionId));
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        if (! $this->inner instanceof ObjectRetentionDeletionStore) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'Object retention removal is unavailable for this metadata backend.',
+            );
+        }
+        $this->observe(__FUNCTION__, fn() => $this->inner->deleteObjectRetention($bucket, $key, $versionId));
     }
 
     public function getObjectLegalHold(string $bucket, string $key, ?string $versionId = null): ?string

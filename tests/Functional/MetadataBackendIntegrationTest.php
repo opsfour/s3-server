@@ -1341,6 +1341,74 @@ final class MetadataBackendIntegrationTest extends TestCase
     }
 
     #[DataProvider('externalMetadataDrivers')]
+    public function test_external_listing_preserves_missing_upload_marker_and_version_wire_order(
+        string $driver,
+        string $dsnVariable,
+    ): void {
+        $dsn = getenv($dsnVariable);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnVariable} for the disposable listing ordering test.");
+        }
+
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'listing-order-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $uploadIds = [
+            'upload-a-' . $suffix,
+            'upload-m-' . $suffix,
+            'upload-z-' . $suffix,
+            'upload-other-' . $suffix,
+        ];
+        $versionId = null;
+        $deleteMarkerId = null;
+
+        try {
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            foreach (array_slice($uploadIds, 0, 3) as $uploadId) {
+                $metadata->createMultipartUpload($uploadId, $bucket, 'same-key', $owner);
+            }
+            $metadata->createMultipartUpload($uploadIds[3], $bucket, 'z-next-key', $owner);
+
+            $uploads = $metadata->listMultipartUploads(
+                $bucket,
+                keyMarker: 'same-key',
+                uploadIdMarker: 'upload-l-' . $suffix,
+            );
+            self::assertSame(
+                [$uploadIds[1], $uploadIds[2], $uploadIds[3]],
+                array_column($uploads['uploads'], 'upload_id'),
+            );
+
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $versionId = $metadata->putObjectVersioned($bucket, 'versioned-key', $owner, 1, '"etag"', 'text/plain', 'path');
+            $deleteMarkerId = $metadata->deleteObjectVersioned($bucket, 'versioned-key', $owner);
+            $versions = $metadata->listObjectVersions($bucket);
+            $entries = $versions['entries'] ?? [];
+
+            self::assertSame(
+                [$deleteMarkerId, $versionId],
+                array_map(static fn($entry): ?string => $entry->versionId, $entries),
+            );
+            self::assertSame(
+                [true, false],
+                array_map(static fn($entry): bool => $entry->isDeleteMarker, $entries),
+            );
+        } finally {
+            foreach ($uploadIds as $uploadId) {
+                $metadata->deleteMultipartUpload($uploadId);
+            }
+            if ($deleteMarkerId !== null) {
+                $metadata->deleteObjectVersion($bucket, 'versioned-key', $deleteMarkerId);
+            }
+            if ($versionId !== null) {
+                $metadata->deleteObjectVersion($bucket, 'versioned-key', $versionId);
+            }
+            $metadata->deleteBucket($owner, $bucket);
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
     public function test_suspended_null_replacement_retains_numbered_versions_on_external_metadata(
         string $driver,
         string $dsnVariable,

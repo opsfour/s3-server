@@ -57,6 +57,31 @@ final class ObjectListingContractTest extends TestCase
         self::assertStringContainsString('<NextMarker>a/</NextMarker>', \Amp\ByteStream\buffer($response->getBody()));
     }
 
+    public function test_encoding_type_url_percent_encodes_slashes_and_asterisks_in_response_fields(): void
+    {
+        $metadata = $this->metadataWithResult(new ListObjectsResult(
+            name: 'bucket',
+            prefix: 'dir/*',
+            delimiter: '/',
+            maxKeys: 1,
+            keyCount: 1,
+            objects: [new ObjectInfo('bucket', 'dir/*/file(1)', 1, '"etag"', ownerId: 'owner')],
+            commonPrefixes: ['dir/*/nested/'],
+            startAfter: 'dir/*/before',
+        ));
+
+        $response = (new ListObjectsV2Handler($metadata))->handleRequest(
+            $this->request('?list-type=2&encoding-type=url&prefix=dir%2F%2A&delimiter=%2F&start-after=dir%2F%2A%2Fbefore'),
+        );
+        $body = \Amp\ByteStream\buffer($response->getBody());
+
+        self::assertStringContainsString('<Prefix>dir%2F%2A</Prefix>', $body);
+        self::assertStringContainsString('<Delimiter>%2F</Delimiter>', $body);
+        self::assertStringContainsString('<StartAfter>dir%2F%2A%2Fbefore</StartAfter>', $body);
+        self::assertStringContainsString('<Key>dir%2F%2A%2Ffile%281%29</Key>', $body);
+        self::assertStringContainsString('<Prefix>dir%2F%2A%2Fnested%2F</Prefix>', $body);
+    }
+
     public function test_list_versions_rejects_version_marker_without_key_marker_before_listing(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
@@ -89,6 +114,48 @@ final class ObjectListingContractTest extends TestCase
         );
 
         self::assertSame(200, $response->getStatus());
+    }
+
+    public function test_list_versions_preserves_interleaved_version_and_delete_marker_order(): void
+    {
+        $deleteMarker = new ObjectInfo(
+            'bucket',
+            'same-key',
+            0,
+            '"marker"',
+            ownerId: 'owner',
+            versionId: 'delete-version',
+            isDeleteMarker: true,
+            lastModified: new \DateTimeImmutable('2026-03-02T00:00:00Z'),
+        );
+        $version = new ObjectInfo(
+            'bucket',
+            'same-key',
+            1,
+            '"etag"',
+            ownerId: 'owner',
+            versionId: 'object-version',
+            lastModified: new \DateTimeImmutable('2026-03-01T00:00:00Z'),
+        );
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('listObjectVersions')->willReturn([
+            'versions' => [$version],
+            'deleteMarkers' => [$deleteMarker],
+            'entries' => [$deleteMarker, $version],
+            'isTruncated' => false,
+            'nextKeyMarker' => null,
+            'nextVersionIdMarker' => null,
+            'commonPrefixes' => [],
+        ]);
+
+        $body = \Amp\ByteStream\buffer(
+            (new ListObjectVersionsHandler($metadata))->handleRequest($this->request('?versions'))->getBody(),
+        );
+
+        self::assertLessThan(strpos($body, '<Version>'), strpos($body, '<DeleteMarker>'));
+        self::assertSame(1, substr_count($body, '<Version>'));
+        self::assertSame(1, substr_count($body, '<DeleteMarker>'));
     }
 
     private function metadataWithResult(ListObjectsResult $result): MetadataStore

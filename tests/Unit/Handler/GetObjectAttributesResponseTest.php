@@ -162,6 +162,54 @@ final class GetObjectAttributesResponseTest extends TestCase
         self::assertStringNotContainsString('<ChecksumType>', $body);
     }
 
+    public function test_standard_storage_class_is_omitted_from_attributes_response(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, '"etag"'));
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key?attributes'),
+            ['x-amz-object-attributes' => 'StorageClass'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        $body = \Amp\ByteStream\buffer((new GetObjectAttributesHandler($metadata))->handleRequest($request)->getBody());
+
+        self::assertStringNotContainsString('<StorageClass>', $body);
+    }
+
+    public function test_only_a_valid_multipart_etag_claims_object_parts(): void
+    {
+        foreach ([
+            '"opaque-value-2"',
+            '"d41d8cd98f00b204e9800998ecf8427-0"',
+            '"d41d8cd98f00b204e9800998ecf8427-01"',
+            '"d41d8cd98f00b204e9800998ecf8427-10001"',
+            '"d41d8cd98f00b204e9800998ecf842-2"',
+            '"d41d8cd98f00b204e9800998ecf8427ee-2"',
+            '"g41d8cd98f00b204e9800998ecf8427-2"',
+        ] as $etag) {
+            $body = $this->objectPartsResponse($etag);
+
+            self::assertStringNotContainsString('<ObjectParts>', $body, $etag);
+            self::assertStringNotContainsString('<PartsCount>', $body, $etag);
+        }
+    }
+
+    public function test_multipart_part_count_accepts_the_full_one_to_ten_thousand_range(): void
+    {
+        foreach ([1, 10_000] as $partsCount) {
+            $body = $this->objectPartsResponse('"D41D8CD98F00B204E9800998ECF8427E-' . $partsCount . '"');
+
+            self::assertStringContainsString('<ObjectParts>', $body);
+            self::assertStringContainsString('<PartsCount>' . $partsCount . '</PartsCount>', $body);
+        }
+    }
+
     public function test_bucket_reuse_during_versioning_lookup_does_not_return_old_object_attributes(): void
     {
         $oldBucket = new BucketInfo('bucket', 'alice', generation: str_repeat('a', 32));
@@ -192,6 +240,24 @@ final class GetObjectAttributesResponseTest extends TestCase
 
         $this->expectException(OperationAbortedException::class);
         (new GetObjectAttributesHandler($metadata))->handleRequest($request);
+    }
+
+    private function objectPartsResponse(string $etag): string
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, $etag));
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key?attributes'),
+            ['x-amz-object-attributes' => 'ObjectParts'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        return \Amp\ByteStream\buffer((new GetObjectAttributesHandler($metadata))->handleRequest($request)->getBody());
     }
 
     public function test_bucket_reuse_during_delete_marker_lookup_aborts_missing_object_response(): void

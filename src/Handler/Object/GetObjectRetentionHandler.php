@@ -44,6 +44,9 @@ final class GetObjectRetentionHandler implements RequestHandler
         if ($lockConfig === null) {
             throw new InvalidRequestException('Bucket does not have Object Lock enabled.');
         }
+        if (($lockConfig['objectLockEnabled'] ?? null) !== 'Enabled') {
+            throw new InvalidRequestException('Stored Object Lock configuration is not enabled.');
+        }
 
         try {
             $object = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);

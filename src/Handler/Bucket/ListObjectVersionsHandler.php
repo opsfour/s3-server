@@ -94,6 +94,35 @@ final class ListObjectVersionsHandler implements RequestHandler
             ];
         }
 
+        $entries = null;
+        foreach ($result['entries'] ?? [] as $info) {
+            $entries ??= [];
+            if ($info->isDeleteMarker) {
+                $entries[] = [
+                    'type' => 'DeleteMarker',
+                    'key' => $info->key,
+                    'versionId' => $info->versionId ?? 'null',
+                    'isLatest' => $info->systemMetadata['isLatest'] ?? false,
+                    'lastModified' => $info->lastModified->format('Y-m-d\TH:i:s.000\Z'),
+                    'ownerId' => $info->ownerId,
+                    'displayName' => $displayNameMap[$info->ownerId] ?? '',
+                ];
+            } else {
+                $entries[] = [
+                    'type' => 'Version',
+                    'key' => $info->key,
+                    'versionId' => $info->versionId ?? 'null',
+                    'isLatest' => $info->systemMetadata['isLatest'] ?? false,
+                    'lastModified' => $info->lastModified->format('Y-m-d\TH:i:s.000\Z'),
+                    'etag' => $info->etag,
+                    'size' => $info->size,
+                    'storageClass' => $info->storageClass,
+                    'ownerId' => $info->ownerId,
+                    'displayName' => $displayNameMap[$info->ownerId] ?? '',
+                ];
+            }
+        }
+
         /** @var array{name: string, prefix?: string, delimiter?: string, keyMarker?: string, versionIdMarker?: string, nextKeyMarker?: string, nextVersionIdMarker?: string, maxKeys?: int, isTruncated?: bool, versions: list<array{key: string, versionId: string, isLatest: bool, lastModified: string, etag: string, size: int, storageClass?: string, ownerId?: string}>, deleteMarkers?: list<array{key: string, versionId: string, isLatest: bool, lastModified: string, ownerId?: string}>, commonPrefixes?: list<string>} $xmlParams */
         $xmlParams = array_filter([
             'name' => $bucket,
@@ -107,6 +136,7 @@ final class ListObjectVersionsHandler implements RequestHandler
             'nextVersionIdMarker' => $result['nextVersionIdMarker'],
             'versions' => $versions,
             'deleteMarkers' => $deleteMarkers,
+            'entries' => $entries,
             'commonPrefixes' => $result['commonPrefixes'],
             'encodingType' => $encodingType,
         ], fn($v) => $v !== null);

@@ -294,6 +294,40 @@ final class DelimitedListingTest extends TestCase
         self::assertSame($secondId, $second['versions'][0]->versionId);
     }
 
+    public function test_version_listing_preserves_delete_markers_and_versions_in_wire_order(): void
+    {
+        $versionId = $this->store->putObjectVersioned('bucket', 'same-key', 'owner', 1, '"etag"', 'text/plain', 'path');
+        $deleteMarkerId = $this->store->deleteObjectVersioned('bucket', 'same-key', 'owner');
+
+        $result = $this->store->listObjectVersions('bucket');
+        $entries = $result['entries'] ?? [];
+
+        self::assertSame(
+            [$deleteMarkerId, $versionId],
+            array_map(static fn($entry): ?string => $entry->versionId, $entries),
+        );
+        self::assertSame([true, false], array_map(static fn($entry): bool => $entry->isDeleteMarker, $entries));
+    }
+
+    public function test_missing_upload_id_marker_keeps_later_same_key_upload_ids(): void
+    {
+        foreach (['upload-a', 'upload-m', 'upload-z'] as $uploadId) {
+            $this->store->createMultipartUpload($uploadId, 'bucket', 'same-key', 'owner');
+        }
+        $this->store->createMultipartUpload('upload-other', 'bucket', 'z-next-key', 'owner');
+
+        $result = $this->store->listMultipartUploads(
+            'bucket',
+            keyMarker: 'same-key',
+            uploadIdMarker: 'upload-l',
+        );
+
+        self::assertSame(
+            ['upload-m', 'upload-z', 'upload-other'],
+            array_column($result['uploads'], 'upload_id'),
+        );
+    }
+
     public function test_prefix_filters_are_case_sensitive_across_listing_types(): void
     {
         $this->put('grouped/item');

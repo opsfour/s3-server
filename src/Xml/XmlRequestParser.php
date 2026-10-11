@@ -422,17 +422,23 @@ final class XmlRequestParser
     /**
      * Parse a Retention XML body.
      *
-     * @return array{mode: string, retainUntilDate: string}
+     * @return array{mode: string, retainUntilDate: string}|null
      *
      * @throws MalformedXmlException
      */
-    public static function parseRetention(string $xml): array
+    public static function parseRetention(string $xml): ?array
     {
         $element = self::parse($xml, 'Retention');
-        $children = self::assertExactChildren($element, ['Mode', 'RetainUntilDate'], 'Retention');
+        $children = self::assertAllowedChildren($element, ['Mode', 'RetainUntilDate'], 'Retention');
+        if ($children === []) {
+            return null;
+        }
+        if (! isset($children['Mode'], $children['RetainUntilDate'])) {
+            throw new MalformedXmlException('Retention is missing a required element.');
+        }
 
-        $mode = self::scalarText($children['Mode'], 'Retention Mode');
-        $retainUntilDate = self::scalarText($children['RetainUntilDate'], 'RetainUntilDate');
+        $mode = self::scalarText($children['Mode'][0], 'Retention Mode');
+        $retainUntilDate = self::scalarText($children['RetainUntilDate'][0], 'RetainUntilDate');
 
         if ($mode === '' || $retainUntilDate === '') {
             throw new MalformedXmlException('Retention element must contain both Mode and RetainUntilDate elements.');

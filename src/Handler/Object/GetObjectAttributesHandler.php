@@ -131,7 +131,7 @@ final class GetObjectAttributesHandler implements RequestHandler
             match ($attr) {
                 'ETag' => $writer->writeElement('ETag', trim($objectInfo->etag, '"')),
                 'ObjectSize' => $writer->writeElement('ObjectSize', (string) $objectInfo->size),
-                'StorageClass' => $writer->writeElement('StorageClass', $objectInfo->storageClass),
+                'StorageClass' => self::writeStorageClass($writer, $objectInfo),
                 'Checksum' => self::writeChecksum($writer, $objectInfo),
                 'ObjectParts' => self::writeObjectParts($writer, $objectInfo),
             };
@@ -197,21 +197,34 @@ final class GetObjectAttributesHandler implements RequestHandler
         $writer->endElement();
     }
 
+    private static function writeStorageClass(\XMLWriter $writer, \OpsFour\S3Server\Dto\ObjectInfo $obj): void
+    {
+        // S3 omits this optional response element for the default STANDARD
+        // storage class, even when the attribute was requested.
+        if ($obj->storageClass !== 'STANDARD') {
+            $writer->writeElement('StorageClass', $obj->storageClass);
+        }
+    }
+
     private static function writeObjectParts(\XMLWriter $writer, \OpsFour\S3Server\Dto\ObjectInfo $obj): void
     {
-        // Check if ETag indicates multipart (contains "-N").
-        $etag = trim($obj->etag, '"');
-        if (!str_contains($etag, '-')) {
+        // Only the established MD5-based multipart ETag format carries a part
+        // count. Other ETags are opaque even when they end in "-N".
+        $etag = $obj->etag;
+        if (strlen($etag) >= 2 && $etag[0] === '"' && $etag[-1] === '"') {
+            $etag = substr($etag, 1, -1);
+        }
+        if (preg_match('/\A[0-9a-f]{32}-([1-9][0-9]{0,4})\z/iD', $etag, $matches) !== 1) {
             return;
         }
 
-        $parts = explode('-', $etag);
-        $totalParts = (int) ($parts[1] ?? 0);
-
-        if ($totalParts > 0) {
-            $writer->startElement('ObjectParts');
-            $writer->writeElement('PartsCount', (string) $totalParts);
-            $writer->endElement();
+        $totalParts = (int) $matches[1];
+        if ($totalParts < 1 || $totalParts > 10_000) {
+            return;
         }
+
+        $writer->startElement('ObjectParts');
+        $writer->writeElement('PartsCount', (string) $totalParts);
+        $writer->endElement();
     }
 }

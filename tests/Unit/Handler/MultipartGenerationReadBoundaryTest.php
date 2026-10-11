@@ -96,6 +96,33 @@ final class MultipartGenerationReadBoundaryTest extends TestCase
         self::assertStringContainsString('<Owner><ID>bob</ID>', $xml);
     }
 
+    public function test_upload_id_marker_without_key_marker_is_ignored(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            GenerationBoundMultipartListingStore::class,
+        ]);
+        if (! $metadata instanceof MetadataStore) {
+            throw new \LogicException('Intersection mock does not implement MetadataStore.');
+        }
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner', generation: str_repeat('b', 32)));
+        $metadata->expects(self::once())->method('listMultipartUploadsForBucket')
+            ->with(self::isInstanceOf(BucketInfo::class), null, null, 1000, null, 'orphaned')
+            ->willReturn([
+                'uploads' => [],
+                'isTruncated' => false,
+                'nextKeyMarker' => null,
+                'nextUploadIdMarker' => null,
+                'commonPrefixes' => [],
+            ]);
+
+        $response = (new ListMultipartUploadsHandler($metadata))->handleRequest(
+            $this->request('GET', 'owner', query: '?uploads&upload-id-marker=orphaned'),
+        );
+
+        self::assertSame(200, $response->getStatus());
+    }
+
     public function test_list_parts_rechecks_generation_after_ownership_lookup(): void
     {
         $oldBucket = new BucketInfo('bucket', 'alice', generation: str_repeat('a', 32));
@@ -288,12 +315,16 @@ final class MultipartGenerationReadBoundaryTest extends TestCase
     }
 
     /** @param non-empty-string $method */
-    private function request(string $method, string $ownerId, ?string $generation = null): Request
-    {
+    private function request(
+        string $method,
+        string $ownerId,
+        ?string $generation = null,
+        string $query = '?uploadId=old-upload',
+    ): Request {
         $request = new Request(
             $this->createMock(Client::class),
             $method,
-            Http::new('http://127.0.0.1/bucket/key?uploadId=old-upload'),
+            Http::new('http://127.0.0.1/bucket/key' . $query),
         );
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');

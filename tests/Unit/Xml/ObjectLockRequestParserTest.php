@@ -11,6 +11,11 @@ use PHPUnit\Framework\TestCase;
 
 final class ObjectLockRequestParserTest extends TestCase
 {
+    public function test_empty_retention_document_requests_governance_retention_removal(): void
+    {
+        self::assertNull(XmlRequestParser::parseRetention('<Retention/>'));
+    }
+
     #[DataProvider('invalidRetentionDocuments')]
     public function test_retention_rejects_ambiguous_or_unsupported_children(string $xml): void
     {

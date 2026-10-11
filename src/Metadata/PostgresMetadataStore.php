@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class PostgresMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -1691,9 +1691,13 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
                     $sql .= " AND (key_name COLLATE \"C\" > \${$keyParam} OR (key_name COLLATE \"C\" = \${$sameKeyParam} AND (created_at > \${$dateParam} OR (created_at = \${$sameDateParam} AND upload_id COLLATE \"C\" > \${$uploadParam}))))";
                     array_push($params, $keyMarker, $keyMarker, $markerCreatedAt, $markerCreatedAt, $uploadIdMarker);
                 } else {
-                    $sql .= " AND key_name COLLATE \"C\" > \${$paramIndex}";
-                    $params[] = $keyMarker;
-                    $paramIndex++;
+                    $keyParam = $paramIndex++;
+                    $sameKeyParam = $paramIndex++;
+                    $uploadParam = $paramIndex++;
+                    // The marker may refer to an upload that was already
+                    // removed. Preserve S3's lexicographic same-key fallback.
+                    $sql .= " AND (key_name COLLATE \"C\" > \${$keyParam} OR (key_name COLLATE \"C\" = \${$sameKeyParam} AND upload_id COLLATE \"C\" > \${$uploadParam}))";
+                    array_push($params, $keyMarker, $keyMarker, $uploadIdMarker);
                 }
             } else {
                 $sql .= " AND key_name COLLATE \"C\" > \${$paramIndex}";
@@ -2205,6 +2209,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
             return [
                 'versions' => [],
                 'deleteMarkers' => [],
+                'entries' => [],
                 'isTruncated' => false,
                 'nextKeyMarker' => null,
                 'nextVersionIdMarker' => null,
@@ -2280,9 +2285,11 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
 
             $versions = [];
             $deleteMarkers = [];
+            $entries = [];
 
             foreach ($rows as $row) {
                 $info = $this->rowToObjectInfo($row);
+                $entries[] = $info;
                 if ($row['is_delete_marker']) {
                     $deleteMarkers[] = $info;
                 } else {
@@ -2301,6 +2308,7 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
             return [
                 'versions' => $versions,
                 'deleteMarkers' => $deleteMarkers,
+                'entries' => $entries,
                 'isTruncated' => $isTruncated,
                 'nextKeyMarker' => $nextKeyMarker,
                 'nextVersionIdMarker' => $nextVersionIdMarker,
@@ -2436,6 +2444,14 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
                 updated_at = NOW()
             SQL,
             [$bucket, $key, $effectiveVersionId, $mode, $retainUntilDate],
+        );
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        $this->conn()->execute(
+            'DELETE FROM s3_object_retention WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
+            [$bucket, $key, $versionId ?? 'null'],
         );
     }
 

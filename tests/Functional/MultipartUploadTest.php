@@ -434,8 +434,6 @@ final class MultipartUploadTest extends S3FunctionalTestCase
             '?list-type=2&max-keys=-1',
             '?versions&max-keys=1junk',
             '?uploads&max-uploads=1junk',
-            '?uploads&upload-id-marker=orphaned',
-            '?uploads&key-marker=&upload-id-marker=orphaned',
             '/key?uploadId=missing&max-parts=1junk',
             '/key?uploadId=missing&part-number-marker=1junk',
             '/key?uploadId=missing&part-number-marker=' . str_repeat('9', 40),
@@ -450,6 +448,11 @@ final class MultipartUploadTest extends S3FunctionalTestCase
 
         $signed = $signer->signRequest(new Request('GET', $baseUrl . '?list-type=2&max-keys=0'), $credentials);
         self::assertSame(200, $client->send($signed)->getStatusCode());
+
+        foreach (['?uploads&upload-id-marker=orphaned', '?uploads&key-marker=&upload-id-marker=orphaned'] as $query) {
+            $signed = $signer->signRequest(new Request('GET', $baseUrl . $query), $credentials);
+            self::assertSame(200, $client->send($signed)->getStatusCode());
+        }
     }
 
     public function test_signed_incomplete_upload_part_query_cannot_overwrite_object(): void

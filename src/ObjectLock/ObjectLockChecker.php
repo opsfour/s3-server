@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\ObjectLock;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Exception\ObjectLockedException;
+use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -44,27 +45,26 @@ final class ObjectLockChecker
     ): void {
         // Check legal hold first.
         $legalHold = $this->metadata->getObjectLegalHold($bucket, $key, $versionId);
-        if ($legalHold === 'ON') {
+        if ($legalHold !== null && $legalHold !== 'OFF') {
             throw new ObjectLockedException();
         }
 
         // Check retention.
         $retention = $this->metadata->getObjectRetention($bucket, $key, $versionId);
         if ($retention !== null) {
-            $retainUntilDate = new \DateTimeImmutable($retention['retainUntilDate']);
+            $mode = $retention['mode'];
+            $retainUntilDate = Iso8601Timestamp::parse($retention['retainUntilDate']);
+            if (! in_array($mode, ['GOVERNANCE', 'COMPLIANCE'], true) || $retainUntilDate === null) {
+                throw new ObjectLockedException();
+            }
             $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
 
             if ($retainUntilDate > $now) {
-                $mode = $retention['mode'];
-
                 if ($mode === 'COMPLIANCE') {
                     throw new ObjectLockedException();
                 }
 
-                // Stored metadata may predate current validation rules or be
-                // corrupted. An unknown mode must never make a retained
-                // version deletable.
-                if ($mode !== 'GOVERNANCE' || ! $canBypassGovernance) {
+                if (! $canBypassGovernance) {
                     throw new ObjectLockedException();
                 }
             }

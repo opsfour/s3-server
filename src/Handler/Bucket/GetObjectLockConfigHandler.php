@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Handler\Bucket;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\ObjectLockConfigurationNotFoundException;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -42,6 +43,9 @@ final class GetObjectLockConfigHandler implements RequestHandler
         // If no config exists, Object Lock was never enabled for this bucket.
         if ($config === null) {
             throw new ObjectLockConfigurationNotFoundException();
+        }
+        if (($config['objectLockEnabled'] ?? null) !== 'Enabled') {
+            throw new InvalidRequestException('Stored Object Lock configuration is not enabled.');
         }
 
         /** @var array{objectLockEnabled: string, rule?: array{defaultRetention: array{mode: string, days?: int, years?: int}}} $config */

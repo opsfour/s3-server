@@ -16,6 +16,7 @@ use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\GenerationBoundBucketMultipartCleanupStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectRetentionDeletionStore;
 use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
 use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
@@ -47,7 +48,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * calling Fiber to a dedicated worker via WeakMap<Fiber, Worker>.
  * A TransactionGuard ensures abandoned fibers trigger a rollback.
  */
-final class ParallelSqliteMetadataStore implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class ParallelSqliteMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private readonly WorkerPool $pool;
 
@@ -652,6 +653,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore, GenerationBoun
     public function putObjectRetention(string $bucket, string $key, string $mode, string $retainUntilDate, ?string $versionId = null): void
     {
         $this->submit('putObjectRetention', [$bucket, $key, $mode, $retainUntilDate, $versionId]);
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        $this->submit('deleteObjectRetention', [$bucket, $key, $versionId]);
     }
 
     public function getObjectLegalHold(string $bucket, string $key, ?string $versionId = null): ?string

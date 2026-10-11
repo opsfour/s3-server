@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/mysql for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class MysqlMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, MysqlTransaction> */
     private \WeakMap $fiberTxMap;
@@ -1697,8 +1697,10 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
                     $sql .= ' AND (key_name > ? OR (key_name = ? AND (created_at > ? OR (created_at = ? AND BINARY upload_id > BINARY ?))))';
                     array_push($params, $keyMarker, $keyMarker, $markerCreatedAt, $markerCreatedAt, $uploadIdMarker);
                 } else {
-                    $sql .= ' AND key_name > ?';
-                    $params[] = $keyMarker;
+                    // The marker may refer to an upload that was already
+                    // removed. Preserve S3's lexicographic same-key fallback.
+                    $sql .= ' AND (key_name > ? OR (key_name = ? AND BINARY upload_id > BINARY ?))';
+                    array_push($params, $keyMarker, $keyMarker, $uploadIdMarker);
                 }
             } else {
                 $sql .= ' AND key_name > ?';
@@ -2207,6 +2209,7 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
             return [
                 'versions' => [],
                 'deleteMarkers' => [],
+                'entries' => [],
                 'isTruncated' => false,
                 'nextKeyMarker' => null,
                 'nextVersionIdMarker' => null,
@@ -2277,9 +2280,11 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
 
             $versions = [];
             $deleteMarkers = [];
+            $entries = [];
 
             foreach ($rows as $row) {
                 $info = $this->rowToObjectInfo($row);
+                $entries[] = $info;
                 if ((int) $row['is_delete_marker']) {
                     $deleteMarkers[] = $info;
                 } else {
@@ -2298,6 +2303,7 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
             return [
                 'versions' => $versions,
                 'deleteMarkers' => $deleteMarkers,
+                'entries' => $entries,
                 'isTruncated' => $isTruncated,
                 'nextKeyMarker' => $nextKeyMarker,
                 'nextVersionIdMarker' => $nextVersionIdMarker,
@@ -2427,6 +2433,14 @@ final class MysqlMetadataStore implements MetadataStore, GenerationBoundMultipar
                 updated_at = NOW()
             SQL,
             [$bucket, $key, $effectiveVersionId, $mode, $retainUntilDate],
+        );
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        $this->conn()->execute(
+            'DELETE FROM s3_object_retention WHERE bucket = ? AND key_name = ? AND version_id = ?',
+            [$bucket, $key, $versionId ?? 'null'],
         );
     }
 

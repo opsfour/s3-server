@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private ?\PDO $pdo = null;
 
@@ -1678,8 +1678,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                     $sql .= ' AND (key_name > ? OR (key_name = ? AND (created_at > ? OR (created_at = ? AND upload_id > ?))))';
                     array_push($params, $keyMarker, $keyMarker, $markerCreatedAt, $markerCreatedAt, $uploadIdMarker);
                 } else {
-                    $sql .= ' AND key_name > ?';
-                    $params[] = $keyMarker;
+                    // An arbitrary marker need not identify a currently live
+                    // upload. S3 still includes same-key uploads whose IDs
+                    // sort after the supplied upload-id-marker.
+                    $sql .= ' AND (key_name > ? OR (key_name = ? AND upload_id > ?))';
+                    array_push($params, $keyMarker, $keyMarker, $uploadIdMarker);
                 }
             } else {
                 $sql .= ' AND key_name > ?';
@@ -2210,6 +2213,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             return [
                 'versions' => [],
                 'deleteMarkers' => [],
+                'entries' => [],
                 'isTruncated' => false,
                 'nextKeyMarker' => null,
                 'nextVersionIdMarker' => null,
@@ -2277,9 +2281,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
             $versions = [];
             $deleteMarkers = [];
+            $entries = [];
 
             foreach ($rows as $row) {
                 $info = $this->rowToObjectInfo($row);
+                $entries[] = $info;
                 if ((bool) $row['is_delete_marker']) {
                     $deleteMarkers[] = $info;
                 } else {
@@ -2298,6 +2304,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             return [
                 'versions' => $versions,
                 'deleteMarkers' => $deleteMarkers,
+                'entries' => $entries,
                 'isTruncated' => $isTruncated,
                 'nextKeyMarker' => $nextKeyMarker,
                 'nextVersionIdMarker' => $nextVersionIdMarker,
@@ -2442,6 +2449,14 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         );
 
         $stmt->execute([$bucket, $key, $effectiveVersionId, $mode, $retainUntilDate]);
+    }
+
+    public function deleteObjectRetention(string $bucket, string $key, ?string $versionId = null): void
+    {
+        $stmt = $this->prepare(
+            'DELETE FROM s3_object_retention WHERE bucket = ? AND key_name = ? AND version_id = ?',
+        );
+        $stmt->execute([$bucket, $key, $versionId ?? 'null']);
     }
 
     public function getObjectLegalHold(string $bucket, string $key, ?string $versionId = null): ?string

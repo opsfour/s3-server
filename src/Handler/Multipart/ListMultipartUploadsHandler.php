@@ -8,7 +8,6 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\BucketOwnership;
-use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -38,10 +37,6 @@ final class ListMultipartUploadsHandler implements RequestHandler
         $keyMarker = $queryParams['key-marker'] ?? null;
         $uploadIdMarker = $queryParams['upload-id-marker'] ?? null;
         $encodingType = ListingQuery::encodingType($queryParams);
-
-        if ($uploadIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {
-            throw new InvalidArgumentException('upload-id-marker requires a non-empty key-marker.');
-        }
 
         if (! $this->metadata instanceof GenerationBoundMultipartListingStore) {
             throw new NotImplementedException('Generation-bound multipart listing is unavailable for this metadata backend.');

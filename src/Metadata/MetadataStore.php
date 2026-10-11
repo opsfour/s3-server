@@ -533,7 +533,7 @@ interface MetadataStore
     /**
      * List all object versions (including delete markers) in a bucket.
      *
-     * @return array{versions: list<ObjectInfo>, deleteMarkers: list<ObjectInfo>, isTruncated: bool, nextKeyMarker: ?string, nextVersionIdMarker: ?string, commonPrefixes: list<string>}
+     * @return array{versions: list<ObjectInfo>, deleteMarkers: list<ObjectInfo>, entries?: list<ObjectInfo>, isTruncated: bool, nextKeyMarker: ?string, nextVersionIdMarker: ?string, commonPrefixes: list<string>}
      */
     public function listObjectVersions(
         string $bucket,

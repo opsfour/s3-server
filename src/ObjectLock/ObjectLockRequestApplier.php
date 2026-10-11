@@ -51,6 +51,9 @@ final readonly class ObjectLockRequestApplier
                 'legalHold' => null,
             ];
         }
+        if (($config['objectLockEnabled'] ?? null) !== 'Enabled') {
+            throw new InvalidArgumentException('Stored Object Lock configuration is not enabled.');
+        }
         if ($this->metadata->getBucketVersioning($bucket) !== 'Enabled') {
             throw new InvalidArgumentException('Object Lock requires bucket versioning to be enabled.');
         }
@@ -124,6 +127,12 @@ final readonly class ObjectLockRequestApplier
             );
         } elseif (isset($config['rule']['defaultRetention'])) {
             $default = $config['rule']['defaultRetention'];
+            if (! in_array($default['mode'], ['GOVERNANCE', 'COMPLIANCE'], true)) {
+                throw new InvalidArgumentException('Stored Object Lock default retention mode is invalid.');
+            }
+            if (isset($default['days']) === isset($default['years'])) {
+                throw new InvalidArgumentException('Stored Object Lock default retention requires exactly one of Days or Years.');
+            }
             $retainUntilDate = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
             if (isset($default['days'])) {
                 if (! is_int($default['days']) || $default['days'] < 1

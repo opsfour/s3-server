@@ -16,7 +16,7 @@ final class DelimitedVersionListing
     /**
      * @param callable(array<string, mixed>|null, int, ?string): list<array<string, mixed>> $fetchRows
      * @param callable(array<string, mixed>): ObjectInfo $toObjectInfo
-     * @return array{versions: list<ObjectInfo>, deleteMarkers: list<ObjectInfo>, isTruncated: bool, nextKeyMarker: ?string, nextVersionIdMarker: ?string, commonPrefixes: list<string>}
+     * @return array{versions: list<ObjectInfo>, deleteMarkers: list<ObjectInfo>, entries: list<ObjectInfo>, isTruncated: bool, nextKeyMarker: ?string, nextVersionIdMarker: ?string, commonPrefixes: list<string>}
      */
     public static function page(
         callable $fetchRows,
@@ -28,6 +28,7 @@ final class DelimitedVersionListing
     ): array {
         $versions = [];
         $deleteMarkers = [];
+        $entries = [];
         $commonPrefixes = [];
         $activePrefix = null;
         $lastIncludedRow = null;
@@ -82,6 +83,7 @@ final class DelimitedVersionListing
                     $lastIncludedRow = null;
                 } else {
                     $info = $toObjectInfo($row);
+                    $entries[] = $info;
                     if ((bool) $row['is_delete_marker']) {
                         $deleteMarkers[] = $info;
                     } else {
@@ -107,6 +109,7 @@ final class DelimitedVersionListing
         return [
             'versions' => $versions,
             'deleteMarkers' => $deleteMarkers,
+            'entries' => $entries,
             'isTruncated' => $isTruncated,
             'nextKeyMarker' => $isTruncated ? ($lastIncludedPrefix ?? ($lastIncludedRow !== null ? (string) $lastIncludedRow['key_name'] : null)) : null,
             'nextVersionIdMarker' => $isTruncated && $lastIncludedPrefix === null && $lastIncludedRow !== null && $lastIncludedRow['version_id'] !== null
