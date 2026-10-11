@@ -54,6 +54,42 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Evaluate repeated list-valued HTTP condition, range, and ACL-grant fields as
+  one value, and reject repeated singleton digest, copy, checksum, and
+  encryption controls. Reject ambiguous `Content-Length` plus
+  `Transfer-Encoding` framing, close the HTTP/1 connection, and reject already
+  buffered follow-up requests before routing or dispatch.
+- Reject DTDs hidden by alternate XML encodings, schema-unknown attributes,
+  unsafe identity text, and out-of-range ACL or multipart XML input before
+  changing state or serializing a response.
+- Keep PostgreSQL account-quota cursor pagination in deterministic UTF-8 byte
+  order under non-C database collations.
+- Reject malformed webhook destinations before replacing notification
+  configuration, dead-letter unsafe legacy destinations without transport, and
+  preserve the original event occurrence time in queued payloads.
+- Validate complete stored lifecycle rules before any action, revalidate queued
+  lifecycle transitions, and reject storage tiers that share one physical
+  backend namespace.
+- Resolve Symfony serve dependencies inside the sanitized bootstrap boundary,
+  and reject malformed Flysystem first-byte timeout values without truncation.
+- Reject invalid multipart backend results before publishing part metadata,
+  clean safe uncommitted paths, and normalize valid uppercase MD5 values in
+  part ETags.
+- Preserve the shared wire order of versions and delete markers, apply full
+  RFC 3986 encoding to listing response fields, accept standalone multipart
+  upload ID markers, and report optional object attributes only when valid.
+- Allow an authorized empty-retention request to remove active `GOVERNANCE`
+  retention and permit expired locks to be cleared or replaced, while
+  continuing to protect active `COMPLIANCE`, legal holds, disabled or malformed
+  stored Object Lock state, and custom metadata-store compatibility.
+- Require and validate payload checksums for Object Lock PutObject, browser
+  PostObject, and relevant UploadPart requests, require streaming checksum
+  trailers to finish verification, and bind UploadPart, UploadPartCopy, and
+  completion to the Object Lock configuration used at initiation.
+- Propagate request cancellation through middleware, temporary-file workers,
+  storage backends, and post-commit cleanup while preserving already staged
+  garbage work and attempting exact-path retry queuing when a physical delete
+  has an uncertain outcome.
 - Restore PHP 8.4/Linux SQLite cutover inventory compatibility and prevent
   PostgreSQL storage-garbage claim workers from issuing updates before their
   locked result set is fully consumed.
@@ -104,6 +140,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   no longer remain valid.
 - Abort or migrate legacy encrypted multipart uploads before enabling the new
   code on every serving node.
+- Abort and restart legacy multipart uploads that carry Object Lock settings or
+  are subject to current default retention; they do not contain the new
+  Object Lock configuration binding.
 - Keep every storage tier referenced by objects, uploads, jobs, intents, or
   cleanup rows configured until those references are migrated or removed.
 - Review [Authentication](docs/authentication.md),

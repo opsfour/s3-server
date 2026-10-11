@@ -50,6 +50,10 @@ digest, selector, and trailer-declaration headers are rejected. Unknown
 `x-amz-checksum-*` algorithms return HTTP 501 before metadata or storage
 access. Successful responses containing a verified checksum also report
 `x-amz-checksum-type: FULL_OBJECT`.
+When explicit Object Lock retention or legal-hold headers are present, or the
+bucket has effective default retention, PutObject requires `Content-MD5` or a
+supported SDK checksum. The request fails before object-storage I/O when that
+integrity check is missing or invalid.
 
 Stored checksum headers on GET and HEAD require
 `x-amz-checksum-mode: ENABLED`; other nonempty values are rejected. The
@@ -71,10 +75,12 @@ file. Object options must be policy-covered form fields; raw HTTP object-option
 headers are rejected before the file is spooled. Multipart boundaries are limited to the 70 characters specified by
 [RFC 2046](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1). The current
 form parser recognizes only complete multipart delimiters, so a delimiter
-prefix with a different suffix remains part of the file. It does not implement the
+prefix with a different suffix remains part of the file. A policy-covered
 [`Content-MD5` form field](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/RESTObjectPOST.html)
-as an object checksum. This remains outside the documented compatibility
-subset.
+is applied to the uploaded file and validated; supported
+`x-amz-checksum-*` form fields receive the same validation. Browser uploads
+with explicit Object Lock settings or effective bucket default retention must
+supply one of these checksums.
 
 ## Listing
 
@@ -90,6 +96,10 @@ case-insensitive values `true` and `false`. ListObjects v1 returns
 `NextMarker` for truncated results only when a `delimiter` was supplied, as
 required by the S3 response contract. ListObjectVersions requires a nonempty
 `key-marker` whenever `version-id-marker` is supplied.
+When `encoding-type=url` is requested, listing response fields use RFC 3986
+percent-encoding; this includes encoding `/` as `%2F` and `*` as `%2A`.
+ListObjectVersions emits object versions and delete markers in their shared
+metadata sort order rather than grouping the two entry types.
 
 ## Multipart Uploads
 
@@ -106,9 +116,8 @@ required by the S3 response contract. ListObjectVersions requires a nonempty
 Custom metadata stores must support generation-bound multipart listings for
 `ListMultipartUploads`; otherwise this endpoint returns HTTP 501. See
 [Metadata Backends](metadata-backends.md#generation-bound-multipart-listings).
-When `upload-id-marker` is supplied, `key-marker` must also be present and
-nonempty; otherwise the request returns `InvalidArgument` before metadata is
-listed.
+`upload-id-marker` may be supplied without `key-marker`, or with an empty
+`key-marker`; those forms are accepted rather than rejected as malformed.
 
 Each uploaded or copied part is limited to 5 GiB. An oversized part returns
 `EntityTooLarge` (HTTP 400); it cannot be committed to the upload.
@@ -123,6 +132,16 @@ trailer. Duplicate digest, selector, and trailer-declaration headers are
 rejected. Missing, malformed, unverified, or mismatched declarations fail
 before part metadata is committed. Unknown `x-amz-checksum-*` headers return
 HTTP 501 before metadata or storage access.
+
+UploadPart requires `Content-MD5` or a supported SDK checksum when the
+multipart upload carries explicit Object Lock settings or was initiated under
+effective bucket default retention. CreateMultipartUpload binds the upload to
+the bucket's Object Lock configuration. A configuration change before a
+part uploaded through UploadPart or UploadPartCopy is committed, or before
+completion, returns `OperationAborted`, and the upload must be started again.
+Legacy uploads without that binding also require a restart when Object Lock is
+effective. UploadPartCopy and CompleteMultipartUpload do not accept a client
+object payload and therefore do not use this payload-checksum gate.
 
 Custom metadata stores must implement `MultipartPartChecksumStore`, report the
 capability as available, and persist the checksum atomically with the part.
@@ -263,7 +282,10 @@ additional fields are outside the documented subset.
 Mutation XML accepts the unprefixed form and the S3 namespace, including a
 consistent namespace prefix on every element. Foreign namespaces, duplicate
 singleton elements, nested scalar elements, and non-whitespace text inside
-container elements return `MalformedXML` before mutation.
+container elements return `MalformedXML` before mutation. DTD declarations are
+rejected even when an alternate XML encoding would hide their byte pattern,
+and schema-unknown attributes are rejected except where an operation explicitly
+defines that attribute.
 This includes structural errors in Object Ownership and Public Access Block
 documents; unsupported but structurally valid values keep their operation
 specific error response.

@@ -39,7 +39,8 @@ The directory must be private or root-owned and sticky (such as `/tmp`);
 secrets are written in a private temporary directory before an atomic move.
 Each JSON entry is validated strictly at startup. Unknown fields and fields with
 the wrong JSON type make startup fail instead of falling back to credential
-defaults.
+defaults. Owner IDs and display names must be valid UTF-8 containing only XML
+1.0 characters because S3 returns them in XML responses.
 
 ```bash
 S3_CREDENTIALS_DRIVER=file
@@ -374,6 +375,17 @@ The server validates:
   the required `x-amz-content-sha256` is bound through the canonical payload
   hash. Header-based requests use an exact basic UTC `x-amz-date`, or a `Date`
   header in that same format when `x-amz-date` is absent.
+
+The server rejects repeated field lines for security-sensitive singleton
+headers instead of silently using only their first value. Core ACL, Object
+Lock, ownership, tagging, content metadata, checksum-selection, and streaming
+controls are checked before authentication or authorization. Specialized
+encryption and copy-source controls are checked by their operation parsers
+before storage access. Requests containing both `Content-Length` and
+`Transfer-Encoding` are rejected before routing or authentication; HTTP/1
+connections are poisoned and closed so already buffered follow-up requests
+cannot dispatch. Documented list-valued headers are combined and evaluated in
+full.
 
 ## Unauthenticated Mode
 

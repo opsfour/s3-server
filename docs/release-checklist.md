@@ -42,6 +42,9 @@ gate required by the advertised deployment profile has passed.
   `credentials:migrate` with DDL-capable bootstrap roles before serving.
 - Abort or migrate legacy encrypted multipart uploads and drain old writers
   before the coordinated node replacement.
+- Abort and restart legacy multipart uploads with explicit retention or legal
+  holds, and uploads subject to current default retention, before serving with
+  the new Object Lock configuration binding.
 - Verify that every persisted storage tier is configured on every API node and
   that dedicated workers intentionally defer tiers they do not serve.
 - Revoke older permanent OIDC-issued credentials where indefinite access is no
@@ -52,12 +55,13 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The current package source passed 3,350 PHPUnit tests with 29,192 assertions
-and 217 expected opt-in or environment skips. PHPStan, the coding-style check,
-strict Composer validation, the locked dependency audit, and `git diff --check`
-also passed. External PostgreSQL/MySQL execution of the newest skipped cases,
-the exact PHP 8.4 deployment profile, multi-host storage qualification, and the
-current-source long soak remain separate gates.
+The current package source passed 3,716 PHPUnit tests with 30,362 assertions
+and 219 expected opt-in or environment skips on PHP 8.5.11 in 4:33.376 with
+154.50 MB peak memory. PHPStan and the coding-style check also passed. Strict
+Composer validation, the locked dependency audit, and `git diff --check` are
+recorded immediately before publishing. External PostgreSQL/MySQL execution of
+the newest skipped cases, the exact PHP 8.4 deployment profile, multi-host
+storage qualification, and the current-source long soak remain separate gates.
 
 ## Released Version
 

@@ -16,6 +16,20 @@ segments. Recoverable planned-part writes require a server-generated
 32-character hexadecimal ID. Custom backends should apply the same checks
 before deriving a physical path from an upload ID.
 
+Custom multipart part writers must return a `StorageWriteResult` with a
+nonempty physical path, a size from zero through 5 GiB, and a 32-character
+hexadecimal MD5 value. UploadPart and UploadPartCopy validate this result before
+publishing part metadata. Valid uppercase MD5 hex is normalized to a lowercase
+ETag; an invalid result fails the request, and a nonempty uncommitted result
+path is sent through durable exact-path cleanup.
+
+Custom storage backends, decorators, and stream wrappers must propagate
+`Amp\CancelledException` unchanged across reads, writes, copies, multipart
+assembly, and cleanup. Cleanup should still be attempted after cancellation,
+but a cleanup failure must not replace the active cancellation. This lets the
+server distinguish a disconnected or stopped request from a backend failure
+and preserves orderly worker shutdown.
+
 The optional `RecoverableObjectWriteBackend` can plan a physical object path from bucket, key, bucket generation, and a unique attempt ID before writing bytes. Built-in in-memory, filesystem, direct/worker Flysystem, and observed wrappers implement it. `putObjectAtPath()` validates the planned object's bucket and key hash; it also preserves the existing multipart completion paths while binding their bucket and key hash. Ordinary `putObject()` still uses its existing path and call behavior. No ordinary PUT handler or metadata intent uses this new capability yet, so it alone does not provide crash recovery or a remote write fence.
 
 Filesystem reads and exact-path deletes resolve existing paths against the configured storage root before I/O, rejecting traversal and symlinks that lead outside it. Keep the storage root private to the API process; path resolution and file opening are separate operations and do not protect against an attacker who can mutate directories concurrently.
@@ -306,7 +320,11 @@ While a restore job is pending, another request returns
 `RestoreAlreadyInProgress`. A terminally failed restore does not expose an
 `x-amz-restore` header claiming that work is still running.
 
-The tier name is a physical backend identity and is limited to 64 bytes.
+The tier name is a physical backend identity and is limited to 64 bytes. Two
+tier names must not point at the same physical namespace: transition cleanup
+deletes the source path after publishing the target. Startup rejects the same
+backend object, filesystem real path, or Flysystem operator/factory object
+when it can identify that duplicate configuration.
 Object writes, multipart uploads, and restored copies persist the exact tier
 that received their bytes. All API nodes and workers serving shared metadata
 must configure every tier referenced by objects, open uploads, restore copies,

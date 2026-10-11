@@ -103,6 +103,22 @@ $s3->putObjectLockConfiguration([
 ]);
 ```
 
+### Upload Checksums
+
+Object uploads protected by explicit retention, an explicit legal hold, or
+bucket default retention require `Content-MD5` or one supported SDK checksum:
+CRC32, CRC32C, SHA1, or SHA256. This applies to PutObject, browser PostObject,
+and UploadPart. Browser POST accepts a policy-covered `Content-MD5` form field
+as well as the supported `x-amz-checksum-*` form fields.
+
+CreateMultipartUpload binds the upload to the current Object Lock
+configuration. If that configuration changes before a payload uploaded with
+UploadPart or a source copied with UploadPartCopy is committed, or before
+completion, the server returns `OperationAborted`; abort the old upload and
+start it again. Legacy multipart uploads without this binding must likewise be
+restarted when explicit retention, an explicit legal hold, or current default
+retention is effective.
+
 ### Retention Modes
 
 | Mode | Delete | Overwrite | Shorten | Extend | Override |
@@ -122,6 +138,23 @@ $s3->putObjectRetention([
     ],
 ]);
 ```
+
+An authorized caller can remove active `GOVERNANCE` retention from one version
+by sending an empty retention configuration with the governance bypass flag:
+
+```php
+$s3->putObjectRetention([
+    'Bucket' => 'immutable-bucket',
+    'Key' => 'audit-log.csv',
+    'VersionId' => 'version-id',
+    'BypassGovernanceRetention' => true,
+    'Retention' => [],
+]);
+```
+
+Active `COMPLIANCE` retention cannot be removed. After the retain-until date
+has passed, either retention mode can be cleared without a governance bypass.
+Removing retention does not change an independent legal hold.
 
 ### Legal Hold
 

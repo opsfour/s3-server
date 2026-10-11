@@ -49,6 +49,9 @@ SQS, and Lambda ARNs with `NotImplemented` because the package cannot deliver
 to those destinations. Previously stored ARN configurations remain readable,
 but the built-in dispatcher skips them. Internal listeners and the broker
 adapters below receive normalized events independently of S3 notification XML.
+Destination URLs containing ASCII whitespace or control characters are
+rejected with `InvalidArgument` before the existing bucket configuration is
+replaced.
 The XML endpoint accepts only the event names listed below. It rejects other
 well-formed names with `NotImplemented` because this package does not emit
 those webhook events. Internal listener patterns, including `s3:*`, have a
@@ -93,7 +96,9 @@ filters are allowed for disjoint event types.
 
 Notifications are delivered as HTTP POST with S3-style JSON. The payload uses
 the configured notification ID and bucket owner, omits the `s3:` prefix from
-`eventName`, and form-encodes object keys (spaces become `+`):
+`eventName`, and form-encodes object keys (spaces become `+`). `eventTime` is
+the original event occurrence time and remains unchanged when queueing,
+delivery delay, or retry happens later:
 
 ```json
 {
@@ -298,7 +303,9 @@ The IPv4 guard additionally blocks `100.64.0.0/10`, `198.18.0.0/15`,
 
 Destinations resolving to private IPs are immediately dead-lettered.
 Plaintext HTTP destinations are rejected at configuration time by default;
-legacy stored HTTP destinations are dead-lettered by the worker. Keep
+legacy stored HTTP destinations are dead-lettered by the worker. Legacy
+destinations containing whitespace or control characters are likewise
+dead-lettered without invoking the transport. Keep
 `S3_NOTIFICATION_REQUIRE_HTTPS=true` in production; setting it to `false`
 changes only the transport requirement and does not disable destination or
 redirect SSRF validation.

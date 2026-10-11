@@ -169,7 +169,7 @@ Status: **Complete**
   against PostgreSQL 16 and MySQL 8.0 instances.
 
 The current unreleased source uses SQLite schema version `39`, PostgreSQL
-schema version `41`, and MySQL schema version `44`.
+schema version `42`, and MySQL schema version `44`.
 The external schemas include owner write locks, version-aware tags, multipart
 staging quotas, and durable physical-storage garbage collection. MySQL uses a
 generated SHA-256 tag identity so full long keys remain unique without exceeding
