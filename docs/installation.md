@@ -26,6 +26,9 @@ composer require opsfour/s3-server
 The package includes a CLI binary at `vendor/bin/s3-server`. No framework required.
 
 ```bash
+export S3_ACCESS_KEY=myAccessKey
+export S3_SECRET_KEY=mySecretKey
+
 php vendor/bin/s3-server \
   --host=0.0.0.0 \
   --port=9000 \

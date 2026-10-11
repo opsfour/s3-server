@@ -56,7 +56,18 @@ opsfour_s3_server:
     path: '%kernel.project_dir%/var/s3/credentials.json'
 ```
 
-Start the server:
+Create the first credential before starting the server. The file provider loads
+its file once during process startup, so changes made by a separate management
+command become visible after restarting the server:
+
+```bash
+php bin/console opsfour:s3:credentials create \
+  --owner-id=local-account \
+  --display-name="Local account"
+```
+
+The command prints the generated access key and secret exactly once. Store them
+in a secret manager, then start the server:
 
 ```bash
 php bin/console opsfour:s3:serve
@@ -145,7 +156,9 @@ php bin/console opsfour:s3:credentials delete ACCESS_KEY_ID
 ```
 
 The command operates on the credential provider configured in
-`opsfour_s3_server.credentials`.
+`opsfour_s3_server.credentials`. The file provider is loaded once during
+server startup; restart running API processes after changing its file. Use the
+database provider when credential changes must become visible without restart.
 
 ### Quotas
 

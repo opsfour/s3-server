@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Laravel;
 
 use Illuminate\Config\Repository;
+use Illuminate\Console\Application as ArtisanApplication;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
 use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Laravel\S3CredentialsCommand;
 use OpsFour\S3Server\Laravel\S3QuotaCommand;
 use OpsFour\S3Server\Laravel\S3ServerCommand;
 use OpsFour\S3Server\Laravel\S3ServerServiceProvider;
@@ -277,6 +280,23 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame($storage, $app->make(StorageBackend::class));
         self::assertInstanceOf(CachedMetadataStoreDecorator::class, $app->make(MetadataStore::class));
         self::assertInstanceOf(CredentialProvider::class, $app->make(CredentialProvider::class));
+    }
+
+    public function test_provider_registers_all_documented_artisan_commands(): void
+    {
+        ArtisanApplication::forgetBootstrappers();
+
+        try {
+            $app = $this->application();
+            $app->boot();
+            $artisan = new ArtisanApplication($app, new Dispatcher($app), 'test');
+
+            self::assertInstanceOf(S3ServerCommand::class, $artisan->find('s3:serve'));
+            self::assertInstanceOf(S3CredentialsCommand::class, $artisan->find('s3:credentials'));
+            self::assertInstanceOf(S3QuotaCommand::class, $artisan->find('s3:quotas'));
+        } finally {
+            ArtisanApplication::forgetBootstrappers();
+        }
     }
 
     #[DataProvider('invalidMetadataCacheTtlValues')]

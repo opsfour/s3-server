@@ -29,6 +29,7 @@ use OpsFour\S3Server\Symfony\Command\S3ServerServeCommand;
 use OpsFour\S3Server\Symfony\DependencyInjection\S3ServerExtension;
 use OpsFour\S3Server\Symfony\Event\SymfonyEventDispatcherListener;
 use OpsFour\S3Server\Symfony\S3ServerBundle;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\DependencyInjection\Definition;
@@ -215,6 +216,27 @@ final class S3ServerBundleTest extends TestCase
         self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
+    }
+
+    #[DataProvider('invalidPositiveServerLimits')]
+    public function test_configuration_rejects_non_positive_server_limits_before_container_compilation(
+        string $name,
+    ): void {
+        $container = new ContainerBuilder();
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage(sprintf('opsfour_s3_server.server.%s', $name));
+
+        (new S3ServerExtension())->load([[
+            'server' => [$name => 0],
+        ]], $container);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidPositiveServerLimits(): iterable
+    {
+        yield 'encrypted object size' => ['max_encrypted_object_size'];
+        yield 'select object size' => ['max_select_object_size'];
     }
 
     public function test_metadata_cache_ttl_wraps_metadata_store_by_default(): void
