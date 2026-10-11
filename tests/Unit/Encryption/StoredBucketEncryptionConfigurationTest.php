@@ -8,6 +8,7 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Console\MetadataMigrateCommand;
 use OpsFour\S3Server\Handler\Bucket\GetBucketEncryptionHandler;
 use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
@@ -117,6 +118,31 @@ final class StoredBucketEncryptionConfigurationTest extends TestCase
             } catch (\RuntimeException $error) {
                 self::assertStringContainsString('Stored bucket encryption configuration is unsupported', $error->getMessage());
                 self::assertNull($this->metadata->getBucketEncryption('bucket'));
+            }
+        }
+    }
+
+    public function test_repeated_encryption_control_headers_are_rejected(): void
+    {
+        foreach ([
+            fn() => EncryptionRequestResolver::resolveDestination(
+                $this->request('PUT', ['x-amz-server-side-encryption' => ['AES256', 'AES256']]),
+                $this->metadata,
+                'bucket',
+                null,
+            ),
+            fn() => EncryptionRequestResolver::resolveCustomerKey(
+                $this->request('GET', [
+                    'x-amz-server-side-encryption-customer-algorithm' => ['AES256', 'AES256'],
+                ]),
+                false,
+            ),
+        ] as $operation) {
+            try {
+                $operation();
+                self::fail('Repeated singleton encryption headers must be rejected.');
+            } catch (InvalidArgumentException $error) {
+                self::assertStringContainsString('must be supplied at most once', $error->getMessage());
             }
         }
     }

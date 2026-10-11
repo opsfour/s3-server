@@ -42,6 +42,25 @@ final class S3XmlDocument
     }
 
     /**
+     * Reject schema-unknown attributes throughout a control document.
+     *
+     * Namespace declarations are not exposed as DOM attributes. Allowed
+     * attributes use Clark notation (`{namespace}local-name`) and are scoped
+     * by the local name of their containing element.
+     *
+     * @param array<string, list<string>> $allowedByElement
+     */
+    public static function assertOnlyAttributes(\SimpleXMLElement $element, array $allowedByElement = []): void
+    {
+        $root = dom_import_simplexml($element);
+        if (! $root instanceof \DOMElement) {
+            throw new MalformedXmlException('Unable to inspect XML document.');
+        }
+
+        self::assertElementAttributes($root, $allowedByElement);
+    }
+
+    /**
      * SimpleXML property access does not expose prefixed children, even when
      * their namespace is the same as the root. Return an internal copy whose
      * element names are namespace-neutral after validating the complete tree.
@@ -99,5 +118,27 @@ final class S3XmlDocument
         }
 
         return $copy;
+    }
+
+    /** @param array<string, list<string>> $allowedByElement */
+    private static function assertElementAttributes(\DOMElement $element, array $allowedByElement): void
+    {
+        $localName = $element->localName;
+        if ($localName === null || $localName === '') {
+            throw new MalformedXmlException('XML element has no local name.');
+        }
+        $allowed = $allowedByElement[$localName] ?? [];
+        foreach ($element->attributes as $attribute) {
+            $name = '{' . ($attribute->namespaceURI ?? '') . '}' . ($attribute->localName ?? $attribute->name);
+            if (! in_array($name, $allowed, true)) {
+                throw new MalformedXmlException('XML element contains an unsupported attribute.');
+            }
+        }
+
+        foreach ($element->childNodes as $child) {
+            if ($child instanceof \DOMElement) {
+                self::assertElementAttributes($child, $allowedByElement);
+            }
+        }
     }
 }

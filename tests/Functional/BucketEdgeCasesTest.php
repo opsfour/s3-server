@@ -184,6 +184,9 @@ final class BucketEdgeCasesTest extends S3FunctionalTestCase
             'excessive maximum' => ['max-buckets=10001'],
             'malformed maximum' => ['max-buckets=1junk'],
             'malformed token' => ['continuation-token=opaque-token'],
+            'invalid UTF-8 in prefix' => ['prefix=%C3%28'],
+            'XML control in prefix' => ['prefix=%01'],
+            'XML noncharacter in prefix' => ['prefix=%EF%BF%BE'],
         ];
     }
 

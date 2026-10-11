@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Encryption;
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -29,13 +30,13 @@ final class EncryptionRequestResolver
     ): ?string {
         $bucketEncryption = $metadata->getBucketEncryption($bucket);
         StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
-        $algorithm = $request->getHeader('x-amz-server-side-encryption');
-        $kmsKeyId = $request->getHeader('x-amz-server-side-encryption-aws-kms-key-id');
-        $kmsContext = $request->getHeader('x-amz-server-side-encryption-context');
+        $algorithm = RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption');
+        $kmsKeyId = RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption-aws-kms-key-id');
+        $kmsContext = RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption-context');
         $sseCHeaders = [
-            $request->getHeader('x-amz-server-side-encryption-customer-algorithm'),
-            $request->getHeader('x-amz-server-side-encryption-customer-key'),
-            $request->getHeader('x-amz-server-side-encryption-customer-key-md5'),
+            RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption-customer-algorithm'),
+            RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption-customer-key'),
+            RequestHeaderValues::singleton($request, 'x-amz-server-side-encryption-customer-key-md5'),
         ];
         $sseCHeaderCount = count(array_filter($sseCHeaders, static fn(?string $value): bool => $value !== null));
 
@@ -103,9 +104,9 @@ final class EncryptionRequestResolver
         bool $copySource = false,
     ): ?string {
         $prefix = $copySource ? 'x-amz-copy-source-' : 'x-amz-';
-        $algorithm = $request->getHeader($prefix . 'server-side-encryption-customer-algorithm');
-        $key = $request->getHeader($prefix . 'server-side-encryption-customer-key');
-        $keyMd5 = $request->getHeader($prefix . 'server-side-encryption-customer-key-md5');
+        $algorithm = RequestHeaderValues::singleton($request, $prefix . 'server-side-encryption-customer-algorithm');
+        $key = RequestHeaderValues::singleton($request, $prefix . 'server-side-encryption-customer-key');
+        $keyMd5 = RequestHeaderValues::singleton($request, $prefix . 'server-side-encryption-customer-key-md5');
         $headers = [$algorithm, $key, $keyMd5];
         $count = count(array_filter($headers, static fn(?string $value): bool => $value !== null));
 

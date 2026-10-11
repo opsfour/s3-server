@@ -19,7 +19,7 @@ final class SafeXmlParserTest extends TestCase
     }
 
     #[DataProvider('unsafeDocuments')]
-    public function test_rejects_dtd_and_entity_declarations(string $xml): void
+    public function test_rejects_unsafe_or_invalid_documents(string $xml): void
     {
         $this->expectException(MalformedXmlException::class);
 
@@ -41,6 +41,22 @@ final class SafeXmlParserTest extends TestCase
             'case-insensitive declaration guard' => [
                 '<!doctype x><x/>',
             ],
+            'invalid UTF-8 sequence' => [
+                "<x>\xC3\x28</x>",
+            ],
+            'XML 1.0 forbidden control character reference' => [
+                '<x>&#1;</x>',
+            ],
         ];
+    }
+
+    public function test_rejects_utf16_encoded_entity_declarations_hidden_from_ascii_scans(): void
+    {
+        $document = '<?xml version="1.0" encoding="UTF-16"?>'
+            . '<!DOCTYPE x [<!ENTITY payload "expanded">]><x>&payload;</x>';
+        $utf16 = "\xFF\xFE" . mb_convert_encoding($document, 'UTF-16LE', 'UTF-8');
+
+        $this->expectException(MalformedXmlException::class);
+        SafeXmlParser::parse($utf16);
     }
 }

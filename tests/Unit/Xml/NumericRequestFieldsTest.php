@@ -27,6 +27,15 @@ final class NumericRequestFieldsTest extends TestCase
         XmlRequestParser::parseRestoreRequest('<RestoreRequest><Days>1junk</Days></RestoreRequest>');
     }
 
+    public function test_complete_part_number_above_s3_limit_is_rejected(): void
+    {
+        $this->expectException(MalformedXmlException::class);
+
+        XmlRequestParser::parseCompleteMultipartUpload(
+            '<CompleteMultipartUpload><Part><PartNumber>10001</PartNumber><ETag>"etag"</ETag></Part></CompleteMultipartUpload>',
+        );
+    }
+
     #[DataProvider('overflowingNumbers')]
     public function test_xml_numeric_fields_reject_values_outside_native_integer_range(string $xml, string $parser): void
     {
@@ -83,6 +92,17 @@ final class NumericRequestFieldsTest extends TestCase
         $rules = XmlRequestParser::parseLifecycleConfiguration(
             '<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/><Transition>'
             . '<Days>0</Days><StorageClass>GLACIER</StorageClass>'
+            . '</Transition></Rule></LifecycleConfiguration>',
+        );
+
+        self::assertSame(0, $rules[0]['transitions'][0]['days'] ?? null);
+    }
+
+    public function test_current_version_transition_accepts_leading_zero_decimal_notation(): void
+    {
+        $rules = XmlRequestParser::parseLifecycleConfiguration(
+            '<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/><Transition>'
+            . '<Days>000</Days><StorageClass>GLACIER</StorageClass>'
             . '</Transition></Rule></LifecycleConfiguration>',
         );
 

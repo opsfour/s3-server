@@ -344,6 +344,34 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         }
     }
 
+    public function test_config_file_provider_rejects_xml_invalid_identity_fields(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-invalid-identity-' . bin2hex(random_bytes(4)) . '.json';
+        $base = [
+            'accessKeyId' => 'AKIASESSION12345678',
+            'secretAccessKey' => 'secret',
+            'ownerId' => 'tenant:acme',
+            'displayName' => 'Alice',
+        ];
+
+        try {
+            foreach ([
+                ['ownerId' => "tenant:\u{FFFE}"],
+                ['displayName' => "Alice\u{FFFF}"],
+            ] as $invalidIdentity) {
+                file_put_contents($path, json_encode([$invalidIdentity + $base], JSON_THROW_ON_ERROR));
+                try {
+                    new ConfigFileCredentialProvider($path);
+                    self::fail('An XML-invalid credential identity must reject the credential file.');
+                } catch (\InvalidArgumentException $error) {
+                    self::assertStringContainsString('XML 1.0', $error->getMessage());
+                }
+            }
+        } finally {
+            @unlink($path);
+        }
+    }
+
     public function test_memory_factory_accepts_string_zero_values_and_rejects_non_strings(): void
     {
         $provider = CredentialProviderFactory::create('memory', [
@@ -410,6 +438,29 @@ final class CredentialProviderSessionMetadataTest extends TestCase
             $stmt = $pdo->prepare("UPDATE s3_credentials SET {$column} = NULL WHERE access_key_id = ?");
             $stmt->execute([$credential->accessKeyId]);
             self::assertNotNull($provider->getCredential($credential->accessKeyId));
+        }
+    }
+
+    public function test_database_provider_rejects_xml_invalid_identity_fields(): void
+    {
+        $pdo = new \PDO('sqlite::memory:');
+        $provider = new DatabaseCredentialProvider($pdo, 0.0);
+        $provider->initialize();
+        $insert = $pdo->prepare(
+            'INSERT INTO s3_credentials (access_key_id, secret_access_key, owner_id, display_name) VALUES (?, ?, ?, ?)',
+        );
+
+        foreach ([
+            ['AKIAINVALIDOWNER001', "owner-\xC3\x28", 'Alice'],
+            ['AKIAINVALIDDISPLAY01', 'owner', "Alice\u{FFFE}"],
+        ] as [$accessKeyId, $ownerId, $displayName]) {
+            $insert->execute([$accessKeyId, 'secret', $ownerId, $displayName]);
+            try {
+                $provider->getCredential($accessKeyId);
+                self::fail('An XML-invalid database credential identity must be rejected.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('XML 1.0', $error->getMessage());
+            }
         }
     }
 

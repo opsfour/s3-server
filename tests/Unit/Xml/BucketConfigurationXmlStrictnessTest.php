@@ -164,6 +164,16 @@ final class BucketConfigurationXmlStrictnessTest extends TestCase
         self::assertSame(0, $rules[0]['maxAgeSeconds']);
     }
 
+    public function test_cors_maximum_age_accepts_leading_zero_decimal_notation(): void
+    {
+        $rules = XmlRequestParser::parseCorsConfiguration(
+            '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>'
+            . '<MaxAgeSeconds>00060</MaxAgeSeconds></CORSRule></CORSConfiguration>',
+        );
+
+        self::assertSame(60, $rules[0]['maxAgeSeconds']);
+    }
+
     public function test_tagging_requires_value_element_but_accepts_empty_value(): void
     {
         self::assertSame([['key' => 'present', 'value' => '']], XmlRequestParser::parseTagging(

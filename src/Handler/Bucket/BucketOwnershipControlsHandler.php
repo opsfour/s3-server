@@ -80,6 +80,7 @@ final class BucketOwnershipControlsHandler implements RequestHandler
     {
         $root = SafeXmlParser::parse($body, 'Invalid OwnershipControls XML.');
         S3XmlDocument::assertRoot($root, 'OwnershipControls');
+        S3XmlDocument::assertOnlyAttributes($root);
         $rootChildren = S3XmlDocument::children($root);
         if (count($rootChildren) !== 1) {
             throw new MalformedXmlException('OwnershipControls requires exactly one Rule.');

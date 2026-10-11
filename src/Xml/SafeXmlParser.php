@@ -18,7 +18,10 @@ final class SafeXmlParser
 
         // S3 control documents never require DTDs. Reject declarations instead
         // of attempting to rewrite attacker-controlled XML.
-        if (preg_match('/<!\s*(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
+        // A NUL byte cannot occur in a valid UTF-8 XML document and is present
+        // in UTF-16/32 encodings that could hide a declaration from the byte
+        // pattern below.
+        if (str_contains($xml, "\0") || preg_match('/<!\s*(?:DOCTYPE|ENTITY)\b/i', $xml) === 1) {
             throw new MalformedXmlException($errorMessage);
         }
 
@@ -36,6 +39,11 @@ final class SafeXmlParser
         }
 
         if ($errors !== []) {
+            throw new MalformedXmlException($errorMessage);
+        }
+
+        $domElement = dom_import_simplexml($element);
+        if ($domElement->ownerDocument?->doctype !== null) {
             throw new MalformedXmlException($errorMessage);
         }
 

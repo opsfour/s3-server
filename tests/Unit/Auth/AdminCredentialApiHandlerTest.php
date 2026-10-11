@@ -104,6 +104,30 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame('invalid_request', $this->json($response)['error']);
     }
 
+    public function test_issue_rejects_external_identity_that_cannot_be_serialized_safely(): void
+    {
+        $identityProvider = new class implements ExternalIdentityProvider {
+            public function authenticate(string $bearerToken): ExternalIdentity
+            {
+                return new ExternalIdentity(
+                    subject: 'user-123',
+                    issuer: 'https://keycloak.example.test/realms/storage',
+                    ownerId: "tenant:\xC3\x28",
+                    displayName: 'alice',
+                );
+            }
+        };
+        $response = $this->createHandler(identityProvider: $identityProvider)->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            ['token' => 'idp-token'],
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(400, $response->getStatus());
+        self::assertSame('invalid_request', $this->json($response)['error']);
+    }
+
     public function test_issue_without_ttl_returns_temporary_credential(): void
     {
         $response = $this->createHandler()->handleRequest($this->request(

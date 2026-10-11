@@ -42,6 +42,7 @@ use OpsFour\S3Server\Select\SelectSqlException;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Xml\S3XmlDocument;
 use OpsFour\S3Server\Xml\SafeXmlParser;
 
 use function Amp\async;
@@ -558,6 +559,7 @@ final class SelectObjectContentHandler implements RequestHandler
             || ! in_array($namespace, [null, self::S3_XML_NAMESPACE], true)) {
             throw new MalformedXmlException('Expected SelectObjectContentRequest root element.');
         }
+        S3XmlDocument::assertOnlyAttributes($element);
         $root = self::selectChildren($element, ['Expression', 'ExpressionType', 'InputSerialization', 'OutputSerialization'], 'SelectObjectContentRequest');
 
         if (! isset($root['Expression'], $root['ExpressionType'], $root['InputSerialization'], $root['OutputSerialization'])) {
@@ -669,7 +671,7 @@ final class SelectObjectContentHandler implements RequestHandler
     {
         $namespace = dom_import_simplexml($element)->namespaceURI;
         $seen = [];
-        foreach ($element->xpath('./*') ?: [] as $child) {
+        foreach (S3XmlDocument::children($element) as $child) {
             $name = $child->getName();
             if (dom_import_simplexml($child)->namespaceURI !== $namespace
                 || ! in_array($name, $allowed, true) || isset($seen[$name])) {

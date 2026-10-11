@@ -12,6 +12,7 @@ use OpsFour\S3Server\Http\BucketContinuationToken;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
+use OpsFour\S3Server\Xml\XmlText;
 
 /**
  * Handles ListBuckets (GET /).
@@ -37,6 +38,10 @@ final class ListBucketsHandler implements RequestHandler
         $prefix = $query['prefix'] ?? null;
         $region = $query['bucket-region'] ?? null;
         $nextToken = null;
+
+        if ($prefix !== null && ! XmlText::isValid($prefix)) {
+            throw new InvalidArgumentException('prefix must contain only characters representable in XML 1.0.');
+        }
 
         if ($paginated) {
             $maxBuckets = self::maxBuckets($query['max-buckets'] ?? null);

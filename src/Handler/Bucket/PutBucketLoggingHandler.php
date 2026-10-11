@@ -35,6 +35,7 @@ final class PutBucketLoggingHandler implements RequestHandler
         $element = SafeXmlParser::parse($body, 'Invalid BucketLoggingStatus XML.');
 
         S3XmlDocument::assertRoot($element, 'BucketLoggingStatus');
+        S3XmlDocument::assertOnlyAttributes($element);
         $loggingEnabled = null;
         foreach (S3XmlDocument::children($element) as $child) {
             if ($child->getName() !== 'LoggingEnabled') {

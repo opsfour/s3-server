@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth;
 
+use OpsFour\S3Server\Xml\XmlText;
+
 /**
  * Represents an S3 credential pair with owner identity.
  *
@@ -34,6 +36,9 @@ final class Credential
         public private(set) array $policyNames = [],
         public private(set) array $allowedPrefixes = [],
     ) {
+        self::validateXmlIdentityString($this->ownerId, 'owner ID');
+        self::validateXmlIdentityString($this->displayName, 'display name');
+
         // AuthMiddleware uses an all-empty credential as its anonymous sentinel.
         if ($this->accessKeyId === '' && $this->secretAccessKey === '' && $this->ownerId === '') {
             return;
@@ -73,6 +78,15 @@ final class Credential
         if (strlen($value) > $maxBytes || preg_match('/[\x00-\x1F\x7F]/', $value)) {
             throw new \InvalidArgumentException(
                 sprintf('Credential %s must contain at most %d bytes without control characters.', $label, $maxBytes),
+            );
+        }
+    }
+
+    private static function validateXmlIdentityString(string $value, string $label): void
+    {
+        if (! XmlText::isValid($value)) {
+            throw new \InvalidArgumentException(
+                "Credential {$label} must be valid UTF-8 containing only XML 1.0 characters.",
             );
         }
     }

@@ -360,6 +360,8 @@ final class CredentialManagerTest extends TestCase
     {
         yield 'empty owner' => ['ownerId' => ''];
         yield 'oversized owner' => ['ownerId' => str_repeat('o', 256)];
+        yield 'owner with invalid UTF-8' => ['ownerId' => "owner-\xC3\x28"];
+        yield 'owner with XML-forbidden character' => ['ownerId' => "owner-\u{FFFE}"];
         yield 'invalid access key characters' => [
             'ownerId' => 'owner-1',
             'accessKeyId' => 'invalid/access/key',
@@ -371,6 +373,14 @@ final class CredentialManagerTest extends TestCase
         yield 'oversized display name' => [
             'ownerId' => 'owner-1',
             'displayName' => str_repeat('d', 256),
+        ];
+        yield 'display name with invalid UTF-8' => [
+            'ownerId' => 'owner-1',
+            'displayName' => "name-\xC3\x28",
+        ];
+        yield 'display name with XML-forbidden character' => [
+            'ownerId' => 'owner-1',
+            'displayName' => "name-\u{FFFF}",
         ];
         yield 'too many policy names' => [
             'ownerId' => 'owner-1',

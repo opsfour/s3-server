@@ -14,6 +14,7 @@ use OpsFour\S3Server\Http\WebsiteRedirectHost;
  */
 final class XmlRequestParser
 {
+    private const int MAX_ACL_GRANTS = 100;
     private const int MAX_LIFECYCLE_RULES = 1_000;
     /** Keep restore expiry representable across every built-in metadata backend. */
     public const int MAX_RESTORE_DAYS = 365_000;
@@ -133,7 +134,7 @@ final class XmlRequestParser
             $partNumber = self::positiveDecimalInt(self::scalarText($fields['PartNumber'], 'PartNumber'));
             $etag = self::scalarText($fields['ETag'], 'ETag');
 
-            if ($partNumber === null || $etag === '') {
+            if ($partNumber === null || $partNumber > 10_000 || $etag === '') {
                 throw new MalformedXmlException('Each Part element must contain valid PartNumber and ETag elements.');
             }
 
@@ -240,11 +241,10 @@ final class XmlRequestParser
             $maxAgeSeconds = null;
             if (isset($fields['MaxAgeSeconds'])) {
                 $rawMaxAge = self::scalarText($fields['MaxAgeSeconds'][0], 'MaxAgeSeconds');
-                if (! ctype_digit($rawMaxAge) || filter_var($rawMaxAge, FILTER_VALIDATE_INT) === false
-                    || (int) $rawMaxAge > 2_147_483_647) {
+                $maxAgeSeconds = self::nonNegativeDecimalInt($rawMaxAge);
+                if ($maxAgeSeconds === null || $maxAgeSeconds > 2_147_483_647) {
                     throw new MalformedXmlException('CORS MaxAgeSeconds must be an integer between 0 and 2147483647.');
                 }
-                $maxAgeSeconds = (int) $rawMaxAge;
             }
 
             $parsedRule = [
@@ -507,7 +507,7 @@ final class XmlRequestParser
      */
     public static function parseAccessControlPolicy(string $xml): array
     {
-        $element = self::parse($xml, 'AccessControlPolicy');
+        $element = self::parse($xml, 'AccessControlPolicy', allowAclGranteeType: true);
         $children = self::assertAllowedChildren($element, ['Owner', 'AccessControlList'], 'AccessControlPolicy');
 
         $ownerId = '';
@@ -524,6 +524,9 @@ final class XmlRequestParser
         $grants = [];
         if (isset($children['AccessControlList'])) {
             $accessControlList = self::assertAllowedChildren($children['AccessControlList'][0], ['Grant'], 'AccessControlList', ['Grant']);
+            if (count($accessControlList['Grant'] ?? []) > self::MAX_ACL_GRANTS) {
+                throw new MalformedXmlException('AccessControlList cannot contain more than 100 grants.');
+            }
             foreach ($accessControlList['Grant'] ?? [] as $grant) {
                 $fields = self::assertAllowedChildren($grant, ['Grantee', 'Permission'], 'ACL Grant');
                 $permission = isset($fields['Permission']) ? self::scalarText($fields['Permission'][0], 'ACL Permission') : '';
@@ -912,21 +915,34 @@ final class XmlRequestParser
 
     private static function nonNegativeLifecycleDays(string $value, string $field): int
     {
-        if ($value === '0') {
-            return 0;
+        $days = self::nonNegativeDecimalInt($value);
+        if ($days === null || $days > self::MAX_LIFECYCLE_DAYS) {
+            throw new MalformedXmlException(
+                "{$field} must be a non-negative decimal integer no greater than " . self::MAX_LIFECYCLE_DAYS . '.',
+            );
         }
 
-        return self::positiveLifecycleDays($value, $field);
+        return $days;
     }
 
     private static function positiveDecimalInt(string $value): ?int
+    {
+        $number = self::nonNegativeDecimalInt($value);
+
+        return $number !== null && $number > 0 ? $number : null;
+    }
+
+    private static function nonNegativeDecimalInt(string $value): ?int
     {
         if ($value === '' || ! ctype_digit($value)) {
             return null;
         }
 
         $normalized = ltrim($value, '0');
-        if ($normalized === '' || strlen($normalized) > strlen((string) PHP_INT_MAX)
+        if ($normalized === '') {
+            return 0;
+        }
+        if (strlen($normalized) > strlen((string) PHP_INT_MAX)
             || (strlen($normalized) === strlen((string) PHP_INT_MAX) && strcmp($normalized, (string) PHP_INT_MAX) > 0)) {
             return null;
         }
@@ -1270,14 +1286,24 @@ final class XmlRequestParser
      *
      * @throws MalformedXmlException
      */
-    private static function parse(string $xml, string $expectedRoot): \SimpleXMLElement
-    {
+    private static function parse(
+        string $xml,
+        string $expectedRoot,
+        bool $allowAclGranteeType = false,
+    ): \SimpleXMLElement {
         $element = SafeXmlParser::parse($xml);
         $namespace = dom_import_simplexml($element)->namespaceURI;
         if ($element->getName() !== $expectedRoot
             || ! in_array($namespace, [null, self::S3_XML_NAMESPACE], true)) {
             throw new MalformedXmlException("Expected {$expectedRoot} XML root element.");
         }
+
+        S3XmlDocument::assertOnlyAttributes(
+            $element,
+            $allowAclGranteeType
+                ? ['Grantee' => ['{http://www.w3.org/2001/XMLSchema-instance}type']]
+                : [],
+        );
 
         return S3XmlDocument::namespaceNeutral($element);
     }

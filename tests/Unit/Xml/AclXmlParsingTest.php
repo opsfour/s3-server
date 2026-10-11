@@ -239,6 +239,16 @@ final class AclXmlParsingTest extends TestCase
         $this->assertSame('WRITE', $result['grants'][2]['permission']);
     }
 
+    public function test_parse_rejects_more_than_one_hundred_grants(): void
+    {
+        $grant = '<Grant><Grantee><ID>owner-1</ID></Grantee><Permission>READ</Permission></Grant>';
+        $xml = '<AccessControlPolicy><Owner><ID>owner-1</ID></Owner><AccessControlList>'
+            . str_repeat($grant, 101) . '</AccessControlList></AccessControlPolicy>';
+
+        $this->expectException(MalformedXmlException::class);
+        XmlRequestParser::parseAccessControlPolicy($xml);
+    }
+
     // -----------------------------------------------------------------
     // Serialization: XmlResponseBuilder::aclResult
     // -----------------------------------------------------------------

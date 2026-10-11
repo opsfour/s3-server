@@ -10,6 +10,7 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketLoggingHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -40,6 +41,29 @@ final class PutBucketLoggingHandlerTest extends TestCase
             }
             self::assertSame($logging, $metadata->getBucketLogging('source'));
         } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_unknown_xml_attributes_are_rejected_before_mutation(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-logging-attribute-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'source', 'us-east-1');
+        $handler = new PutBucketLoggingHandler($metadata);
+        $body = '<BucketLoggingStatus source="client"/>';
+        $request = new Request(new LoggingHandlerTestClient(), 'PUT', Http::new('http://127.0.0.1/source?logging'), [], $body);
+        $request->setAttribute('s3.bucket', 'source');
+        $request->setAttribute('ownerId', 'owner');
+
+        try {
+            $this->expectException(MalformedXmlException::class);
+            $handler->handleRequest($request);
+        } finally {
+            self::assertNull($metadata->getBucketLogging('source'));
             @unlink($path);
             @unlink($path . '-wal');
             @unlink($path . '-shm');

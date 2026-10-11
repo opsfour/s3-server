@@ -56,6 +56,7 @@ final class PutPublicAccessBlockHandler implements RequestHandler
     {
         $element = SafeXmlParser::parse($xml, 'Invalid XML.');
         S3XmlDocument::assertRoot($element, 'PublicAccessBlockConfiguration');
+        S3XmlDocument::assertOnlyAttributes($element);
 
         $fieldNames = [
             'BlockPublicAcls' => 'blockPublicAcls',
