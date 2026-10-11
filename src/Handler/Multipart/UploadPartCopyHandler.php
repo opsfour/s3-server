@@ -491,30 +491,28 @@ final class UploadPartCopyHandler implements RequestHandler
         }
 
         $expectedSize = $length ?? $srcObject->size;
-        $sourceMd5 = [];
-        if (
-            $writeResult->size !== $expectedSize
-            || (
-                $offset === null
-                && preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
-                && ! hash_equals(strtolower($sourceMd5[1]), strtolower($writeResult->md5Hex))
-            )
-        ) {
-            $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
-            throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
-        }
-        if ($offset === null) {
-            try {
-                $this->assertSourceChecksums($srcObject, $writeResult, $uploadStorage);
-            } catch (\Throwable $e) {
-                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
-                throw $e;
+        try {
+            MultipartPartLogicalValidator::assertValidStorageResult($writeResult);
+            $sourceMd5 = [];
+            if ($writeResult->size !== $expectedSize
+                || ($offset === null
+                    && preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
+                    && ! hash_equals(strtolower($sourceMd5[1]), strtolower($writeResult->md5Hex)))) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
             }
+            if ($offset === null) {
+                $this->assertSourceChecksums($srcObject, $writeResult, $uploadStorage);
+            }
+        } catch (\Throwable $e) {
+            if ($writeResult->path !== '') {
+                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+            }
+            throw $e;
         }
         $request->setAttribute('s3.copySourceReadComplete', true);
         $request->setAttribute('s3.copySourceBytesTransferred', $expectedSize);
 
-        $etag = '"' . $writeResult->md5Hex . '"';
+        $etag = '"' . strtolower($writeResult->md5Hex) . '"';
 
         $previousPartPath = null;
         $commitCallbackCompleted = false;

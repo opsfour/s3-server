@@ -846,6 +846,102 @@ final class MultipartCompletionRetryTest extends TestCase
         }
     }
 
+    #[DataProvider('invalidMultipartPartStorageResults')]
+    public function test_upload_part_rejects_invalid_backend_metadata_before_part_commit(
+        string $path,
+        int $size,
+        string $md5,
+        bool $cleanupExpected,
+    ): void {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('putPart')->willReturn(new StorageWriteResult(
+            $path,
+            $size,
+            $md5,
+        ));
+        $delete = $storage->expects($cleanupExpected ? self::once() : self::never())->method('deleteObjectByPath');
+        if ($cleanupExpected) {
+            $delete->with($path, 'bucket');
+        }
+
+        try {
+            (new UploadPartHandler($this->metadata, $storage))
+                ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'abc'));
+            self::fail('Invalid physical part metadata must not be committed.');
+        } catch (InternalErrorException) {
+            self::assertSame([], $this->metadata->getParts($uploadId));
+        }
+    }
+
+    /** @return iterable<string, array{string, int, string, bool}> */
+    public static function invalidMultipartPartStorageResults(): iterable
+    {
+        yield 'negative size' => ['invalid-part-path', -1, md5('abc'), true];
+        yield 'malformed md5' => ['invalid-part-path', 3, 'not-an-md5', true];
+        yield 'empty path' => ['', 3, md5('abc'), false];
+    }
+
+    public function test_upload_part_normalizes_valid_uppercase_backend_md5(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('putPart')->willReturn(new StorageWriteResult(
+            'uppercase-part-path',
+            3,
+            strtoupper(md5('abc')),
+        ));
+        $storage->expects(self::never())->method('deleteObjectByPath');
+
+        $response = (new UploadPartHandler($this->metadata, $storage))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'abc'));
+
+        self::assertSame('"' . md5('abc') . '"', $response->getHeader('etag'));
+        self::assertSame('"' . md5('abc') . '"', $this->metadata->getParts($uploadId)[0]['etag']);
+    }
+
+    public function test_upload_part_copy_rejects_invalid_backend_md5_before_part_commit(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            3,
+            '"' . md5('source-multipart') . '-2"',
+            'application/octet-stream',
+            'source-path',
+        );
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('getObjectByPath')
+            ->with('source-path', null, null)
+            ->willReturn(new \Amp\ByteStream\ReadableBuffer('abc'));
+        $storage->expects(self::once())->method('putPart')->willReturn(new StorageWriteResult(
+            'invalid-copy-part-path',
+            3,
+            'not-an-md5',
+        ));
+        $storage->expects(self::once())->method('deleteObjectByPath')
+            ->with('invalid-copy-part-path', 'bucket');
+
+        try {
+            (new UploadPartCopyHandler($this->metadata, $storage))->handleRequest($this->request(
+                'PUT',
+                '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+                headers: ['x-amz-copy-source' => '/bucket/source.bin'],
+            ));
+            self::fail('Invalid copied-part MD5 metadata must not be committed.');
+        } catch (InternalErrorException) {
+            self::assertSame([], $this->metadata->getParts($uploadId));
+        }
+    }
+
     public function test_plain_part_timeout_retains_planned_path_for_late_write_recovery(): void
     {
         $created = (new CreateMultipartUploadHandler($this->metadata))

@@ -12,6 +12,7 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
 /** Validates logical S3 part bytes before a local one-shot write is armed. */
@@ -222,6 +223,14 @@ final class MultipartPartLogicalValidator
             || $staged->sha1Base64() !== $written->sha1Base64
             || $staged->sha256Base64() !== $written->sha256Base64) {
             throw new InternalErrorException('Multipart worker result does not match the validated staged bytes.');
+        }
+    }
+
+    public static function assertValidStorageResult(StorageWriteResult $written): void
+    {
+        MultipartPartSize::assertStoredSize($written->size);
+        if ($written->path === '' || preg_match('/^[0-9a-f]{32}$/Di', $written->md5Hex) !== 1) {
+            throw new InternalErrorException('Multipart storage backend returned invalid part metadata.');
         }
     }
 

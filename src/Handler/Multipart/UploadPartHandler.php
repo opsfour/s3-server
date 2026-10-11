@@ -295,20 +295,18 @@ final class UploadPartHandler implements RequestHandler
                 $body->close();
             }
         }
-        if ($writeResult->size > MultipartPartSize::MAX_BYTES) {
-            $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
-            MultipartPartSize::assertStoredSize($writeResult->size);
-        }
-
         try {
+            MultipartPartLogicalValidator::assertValidStorageResult($writeResult);
             $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
             MultipartPartLogicalValidator::assertValid($clientChecksums, $writeResult, $declaredLength);
         } catch (\Throwable $e) {
-            $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+            if ($writeResult->path !== '') {
+                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+            }
             throw $e;
         }
 
-        $etag = '"' . $writeResult->md5Hex . '"';
+        $etag = '"' . strtolower($writeResult->md5Hex) . '"';
 
         $responseHeaders = ['ETag' => $etag];
         $checksumAlgorithm = array_key_first($clientChecksums);

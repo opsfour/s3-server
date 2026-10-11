@@ -46,6 +46,9 @@ final class MultipartPartSize
 
     public static function assertStoredSize(int $size): void
     {
+        if ($size < 0) {
+            throw new InternalErrorException('Multipart storage backend returned a negative part size.');
+        }
         if ($size > self::MAX_BYTES) {
             throw new EntityTooLargeException('Multipart part exceeds the 5 GiB maximum.');
         }
