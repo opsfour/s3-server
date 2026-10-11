@@ -105,17 +105,19 @@ final class S3ServerExtension extends Extension
 
         $container->setDefinition(S3ServerServeCommand::class, (new Definition(S3ServerServeCommand::class))
             ->setArguments([
-                new Reference(S3ServerConfig::class),
-                new Reference(MetadataStore::class),
-                new Reference(StorageBackend::class),
-                new Reference(CredentialProvider::class),
+                new ServiceClosureArgument(new Reference(S3ServerConfig::class)),
+                new ServiceClosureArgument(new Reference(MetadataStore::class)),
+                new ServiceClosureArgument(new Reference(StorageBackend::class)),
+                new ServiceClosureArgument(new Reference(CredentialProvider::class)),
                 new Reference(MetricsCollector::class),
-                new Reference(StorageTierRegistry::class),
+                new ServiceClosureArgument(new Reference(StorageTierRegistry::class)),
                 new Reference(S3ServerRuntimeFactory::class),
                 $config['external_iam'],
                 $config['admin']['token'] ?? $config['external_iam']['admin_token'] ?? null,
                 $notificationListeners,
-                $encryptionReference,
+                $encryptionReference === null
+                    ? null
+                    : new ServiceClosureArgument($encryptionReference),
             ])
             ->addTag('console.command', ['command' => 'opsfour:s3:serve'])
             ->setPublic(true));

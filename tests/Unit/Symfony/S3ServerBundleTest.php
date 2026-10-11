@@ -82,7 +82,7 @@ final class S3ServerBundleTest extends TestCase
         }
     }
 
-    public function test_symfony_serve_checks_postgres_driver_before_resolving_metadata(): void
+    public function test_symfony_serve_reports_postgres_driver_failure_without_resolving_metadata_or_leaking_dsn(): void
     {
         if (extension_loaded('pq')) {
             self::markTestSkipped('The negative startup case requires PHP without pecl-pq.');
@@ -103,9 +103,12 @@ final class S3ServerBundleTest extends TestCase
         ]], $container);
         $container->compile();
 
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('PostgreSQL API servers require the pecl-pq PHP extension.');
-        $container->get(S3ServerServeCommand::class);
+        $tester = new CommandTester($this->service($container, S3ServerServeCommand::class));
+        $exit = $tester->execute([]);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('PostgreSQL API servers require the pecl-pq PHP extension.', $tester->getDisplay());
+        self::assertStringNotContainsString('private-dsn-secret', $tester->getDisplay());
     }
 
     public function test_container_compiles_and_resolves_core_services(): void
@@ -761,8 +764,9 @@ final class S3ServerBundleTest extends TestCase
     private function serveCommandEncryption(S3ServerServeCommand $command): ?EncryptionServiceInterface
     {
         $property = new \ReflectionProperty($command, 'encryption');
+        $encryption = $property->getValue($command);
 
-        return $property->getValue($command);
+        return $encryption instanceof \Closure ? $encryption() : $encryption;
     }
 }
 

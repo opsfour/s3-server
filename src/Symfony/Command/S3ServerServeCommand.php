@@ -31,21 +31,27 @@ use Symfony\Component\Console\Output\OutputInterface;
 final class S3ServerServeCommand extends Command
 {
     /**
+     * @param S3ServerConfig|(\Closure(): S3ServerConfig) $config
+     * @param MetadataStore|(\Closure(): MetadataStore) $metadata
+     * @param StorageBackend|(\Closure(): StorageBackend) $storage
+     * @param CredentialProvider|(\Closure(): CredentialProvider) $credentialProvider
+     * @param StorageTierRegistry|(\Closure(): StorageTierRegistry) $storageTiers
+     * @param EncryptionServiceInterface|(\Closure(): EncryptionServiceInterface)|null $encryption
      * @param array<string, mixed> $externalIamConfig
      * @param list<array{pattern: string, listener: callable}> $notificationListeners
      */
     public function __construct(
-        private readonly S3ServerConfig $config,
-        private readonly MetadataStore $metadata,
-        private readonly StorageBackend $storage,
-        private readonly CredentialProvider $credentialProvider,
+        private readonly S3ServerConfig|\Closure $config,
+        private readonly MetadataStore|\Closure $metadata,
+        private readonly StorageBackend|\Closure $storage,
+        private readonly CredentialProvider|\Closure $credentialProvider,
         private readonly MetricsCollector $metrics,
-        private readonly StorageTierRegistry $storageTiers,
+        private readonly StorageTierRegistry|\Closure $storageTiers,
         private readonly S3ServerRuntimeFactory $runtimeFactory,
         private readonly array $externalIamConfig = [],
         private readonly ?string $adminToken = null,
         private readonly array $notificationListeners = [],
-        private readonly ?EncryptionServiceInterface $encryption = null,
+        private readonly EncryptionServiceInterface|\Closure|null $encryption = null,
     ) {
         parent::__construct();
     }
@@ -63,7 +69,19 @@ final class S3ServerServeCommand extends Command
         $logger = $this->logger();
 
         try {
-            $config = $this->configWithOverrides($input);
+            $baseConfig = $this->config instanceof \Closure ? ($this->config)() : $this->config;
+            $config = $this->configWithOverrides($input, $baseConfig);
+            $metadata = $this->metadata instanceof \Closure ? ($this->metadata)() : $this->metadata;
+            $storage = $this->storage instanceof \Closure ? ($this->storage)() : $this->storage;
+            $credentialProvider = $this->credentialProvider instanceof \Closure
+                ? ($this->credentialProvider)()
+                : $this->credentialProvider;
+            $storageTiers = $this->storageTiers instanceof \Closure
+                ? ($this->storageTiers)()
+                : $this->storageTiers;
+            $encryption = $this->encryption instanceof \Closure
+                ? ($this->encryption)()
+                : $this->encryption;
             $adminToken = $input->getOption('admin-token');
             $adminToken = is_string($adminToken) && trim($adminToken) !== ''
                 ? trim($adminToken)
@@ -71,15 +89,15 @@ final class S3ServerServeCommand extends Command
 
             $runtime = $this->runtimeFactory->create(
                 config: $config,
-                metadata: $this->metadata,
-                storage: $this->storage,
-                credentialProvider: $this->credentialProvider,
+                metadata: $metadata,
+                storage: $storage,
+                credentialProvider: $credentialProvider,
                 logger: $logger,
                 metrics: $this->metrics,
-                storageTiers: $this->storageTiers,
+                storageTiers: $storageTiers,
                 externalIamConfig: $this->externalIamConfig,
                 adminToken: $adminToken,
-                encryption: $this->encryption,
+                encryption: $encryption,
                 notificationListeners: $this->notificationListeners,
             );
         } catch (\Throwable $e) {
@@ -129,7 +147,7 @@ final class S3ServerServeCommand extends Command
         return Command::SUCCESS;
     }
 
-    private function configWithOverrides(InputInterface $input): S3ServerConfig
+    private function configWithOverrides(InputInterface $input, S3ServerConfig $config): S3ServerConfig
     {
         $overrides = [];
 
@@ -147,7 +165,7 @@ final class S3ServerServeCommand extends Command
             $overrides['port'] = $parsedPort;
         }
 
-        return $overrides === [] ? $this->config : $this->config->with($overrides);
+        return $overrides === [] ? $config : $config->with($overrides);
     }
 
     private function logger(): LoggerInterface

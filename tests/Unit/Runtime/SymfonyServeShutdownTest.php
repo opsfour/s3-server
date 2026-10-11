@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
@@ -20,6 +21,37 @@ use Symfony\Component\Console\Tester\CommandTester;
 
 final class SymfonyServeShutdownTest extends TestCase
 {
+    public function test_lazy_dependency_failure_is_reported_without_dependency_details(): void
+    {
+        $command = new S3ServerServeCommand(
+            new S3ServerConfig(
+                storagePath: sys_get_temp_dir(),
+                allowUnfencedStorageForTests: true,
+            ),
+            static function (): MetadataStore {
+                throw new \RuntimeException('private-metadata-dsn-secret');
+            },
+            static function (): never {
+                throw new \LogicException('storage must not be resolved');
+            },
+            static function (): never {
+                throw new \LogicException('credentials must not be resolved');
+            },
+            new MetricsCollector(),
+            static function (): never {
+                throw new \LogicException('tiers must not be resolved');
+            },
+            new S3ServerRuntimeFactory(),
+        );
+
+        $tester = new CommandTester($command);
+        $exit = $tester->execute([]);
+
+        self::assertSame(Command::FAILURE, $exit);
+        self::assertStringContainsString('S3 server bootstrap failed (RuntimeException)', $tester->getDisplay());
+        self::assertStringNotContainsString('private-metadata-dsn-secret', $tester->getDisplay());
+    }
+
     public function test_runtime_and_shutdown_failures_return_failure_without_dependency_secret(): void
     {
         $occupied = stream_socket_server('tcp://127.0.0.1:0');
