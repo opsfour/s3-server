@@ -18,6 +18,7 @@ use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -40,7 +41,9 @@ final class HeadObjectHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
-        $includeChecksums = S3ResponseHeaders::checksumModeEnabled($request->getHeader('x-amz-checksum-mode'));
+        $includeChecksums = S3ResponseHeaders::checksumModeEnabled(
+            RequestHeaderValues::singleton($request, 'x-amz-checksum-mode'),
+        );
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         if (array_key_exists('partNumber', $queryParams)) {
             throw new NotImplementedException('HeadObject partNumber is not supported.');
@@ -115,7 +118,7 @@ final class HeadObjectHandler implements RequestHandler
 
         // 4. Handle Range header for Content-Length calculation.
         // S3 ranged HEAD changes only Content-Length when satisfiable.
-        $rangeHeader = $request->getHeader('range');
+        $rangeHeader = RequestHeaderValues::combined($request, 'range');
         $contentLength = $objectInfo->size;
         $isPartialContent = false;
 

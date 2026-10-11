@@ -9,7 +9,9 @@ use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\NotModifiedException;
+use OpsFour\S3Server\Exception\PreconditionFailedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\CopySourceConditionEvaluator;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -98,5 +100,40 @@ final class ConditionalHttpDateTest extends TestCase
         self::assertTrue(ConditionalHeaderEvaluator::etagMatches('W/"etag"', '"etag"', allowWeak: true));
         self::assertTrue(ConditionalHeaderEvaluator::etagMatches("\t* ", '"etag"'));
         self::assertFalse(ConditionalHeaderEvaluator::etagMatches('*, "etag"', '"etag"'));
+    }
+
+    public function test_repeated_if_none_match_lines_are_evaluated_as_one_list(): void
+    {
+        $request = $this->request(['If-None-Match' => ['"other"', '"etag"']]);
+
+        $this->expectException(NotModifiedException::class);
+        ConditionalHeaderEvaluator::evaluate($request, new ObjectInfo('bucket', 'key', 1, '"etag"'));
+    }
+
+    public function test_repeated_if_match_lines_are_evaluated_as_one_list(): void
+    {
+        $request = $this->request(['If-Match' => ['"other"', '"etag"']]);
+
+        ConditionalHeaderEvaluator::evaluate($request, new ObjectInfo('bucket', 'key', 1, '"etag"'));
+        self::addToAssertionCount(1);
+    }
+
+    public function test_repeated_copy_source_if_none_match_lines_are_evaluated_as_one_list(): void
+    {
+        $request = $this->request(['x-amz-copy-source-if-none-match' => ['"other"', '"etag"']]);
+
+        $this->expectException(PreconditionFailedException::class);
+        CopySourceConditionEvaluator::assertSatisfied($request, new ObjectInfo('bucket', 'key', 1, '"etag"'));
+    }
+
+    /** @param array<non-empty-string, string|list<string>> $headers */
+    private function request(array $headers): Request
+    {
+        return new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key'),
+            $headers,
+        );
     }
 }

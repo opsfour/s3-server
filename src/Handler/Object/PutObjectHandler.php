@@ -25,6 +25,7 @@ use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Handler\Multipart\MultipartPartLogicalValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
@@ -125,8 +126,8 @@ final class PutObjectHandler implements RequestHandler
         (new ObjectLockRequestApplier($this->metadata))->validate($request, $bucket);
 
         // 2. Evaluate conditional PUT headers (If-Match, If-None-Match).
-        $ifMatch = $request->getHeader('if-match');
-        $ifNoneMatch = $request->getHeader('if-none-match');
+        $ifMatch = RequestHeaderValues::combined($request, 'if-match');
+        $ifNoneMatch = RequestHeaderValues::combined($request, 'if-none-match');
 
         $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
 

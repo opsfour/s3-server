@@ -12,10 +12,10 @@ final class CopySourceConditionEvaluator
 {
     public static function assertSatisfied(Request $request, ObjectInfo $source): void
     {
-        $ifMatch = $request->getHeader('x-amz-copy-source-if-match');
-        $ifNoneMatch = $request->getHeader('x-amz-copy-source-if-none-match');
-        $ifModifiedSince = $request->getHeader('x-amz-copy-source-if-modified-since');
-        $ifUnmodifiedSince = $request->getHeader('x-amz-copy-source-if-unmodified-since');
+        $ifMatch = RequestHeaderValues::combined($request, 'x-amz-copy-source-if-match');
+        $ifNoneMatch = RequestHeaderValues::combined($request, 'x-amz-copy-source-if-none-match');
+        $ifModifiedSince = RequestHeaderValues::combined($request, 'x-amz-copy-source-if-modified-since');
+        $ifUnmodifiedSince = RequestHeaderValues::combined($request, 'x-amz-copy-source-if-unmodified-since');
 
         if ($ifMatch !== null) {
             if (! ConditionalHeaderEvaluator::etagMatches($ifMatch, $source->etag)) {

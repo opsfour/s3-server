@@ -115,6 +115,20 @@ final class ObjectChecksumModeTest extends TestCase
 
     /** @param 'GET'|'HEAD' $method */
     #[DataProvider('methods')]
+    public function test_repeated_checksum_mode_fails_before_metadata_or_storage_access(string $method): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getBucket');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+
+        $this->expectException(InvalidArgumentException::class);
+        ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
+            ->handleRequest($this->request($method, ['x-amz-checksum-mode' => ['ENABLED', 'ENABLED']]));
+    }
+
+    /** @param 'GET'|'HEAD' $method */
+    #[DataProvider('methods')]
     public function test_part_number_is_rejected_before_metadata_or_storage_access(string $method): void
     {
         $metadata = $this->createMock(MetadataStore::class);
@@ -171,7 +185,7 @@ final class ObjectChecksumModeTest extends TestCase
 
     /**
      * @param 'GET'|'HEAD' $method
-     * @param array<non-empty-string, string> $headers
+     * @param array<non-empty-string, string|list<string>> $headers
      */
     private function request(string $method, array $headers = []): Request
     {

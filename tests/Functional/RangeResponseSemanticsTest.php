@@ -80,6 +80,47 @@ final class RangeResponseSemanticsTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_repeated_range_lines_are_not_reduced_to_the_first_range(): void
+    {
+        $key = 'repeated-range-' . bin2hex(random_bytes(4));
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'abcde']);
+        try {
+            foreach (['GET', 'HEAD'] as $method) {
+                $response = $this->signedRead($method, $key, [
+                    'Range' => ['bytes=0-0', 'bytes=2-2'],
+                ]);
+                self::assertSame(200, $response->getStatusCode(), $method);
+                self::assertSame('5', $response->getHeaderLine('Content-Length'), $method);
+                self::assertSame($method === 'GET' ? 'abcde' : '', (string) $response->getBody(), $method);
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
+    public function test_repeated_entity_tag_condition_lines_are_evaluated_as_one_list(): void
+    {
+        $key = 'repeated-condition-' . bin2hex(random_bytes(4));
+        $put = self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $key, 'Body' => 'abcde']);
+        $etag = (string) $put['ETag'];
+        try {
+            foreach (['GET', 'HEAD'] as $method) {
+                $matched = $this->signedRead($method, $key, [
+                    'If-Match' => ['"different"', $etag],
+                ]);
+                self::assertSame(200, $matched->getStatusCode(), $method . ' If-Match');
+
+                $notModified = $this->signedRead($method, $key, [
+                    'If-None-Match' => ['"different"', $etag],
+                ]);
+                self::assertSame(304, $notModified->getStatusCode(), $method . ' If-None-Match');
+                self::assertSame('', (string) $notModified->getBody(), $method);
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
     public function test_signed_get_and_head_ignore_non_http_conditional_dates(): void
     {
         $key = 'invalid-date-' . bin2hex(random_bytes(4));
@@ -163,7 +204,7 @@ final class RangeResponseSemanticsTest extends S3FunctionalTestCase
         }
     }
 
-    /** @param array<string, string> $headers */
+    /** @param array<string, string|list<string>> $headers */
     private function signedRead(string $method, string $key, array $headers = []): ResponseInterface
     {
         $operation = $method === 'HEAD' ? 'HeadObject' : 'GetObject';

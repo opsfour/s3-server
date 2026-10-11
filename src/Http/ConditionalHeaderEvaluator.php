@@ -27,10 +27,10 @@ final class ConditionalHeaderEvaluator
      */
     public static function evaluate(Request $request, ObjectInfo $objectInfo, bool $emitNullVersion = false): void
     {
-        $ifMatch = $request->getHeader('if-match');
-        $ifNoneMatch = $request->getHeader('if-none-match');
-        $ifModifiedSince = $request->getHeader('if-modified-since');
-        $ifUnmodifiedSince = $request->getHeader('if-unmodified-since');
+        $ifMatch = RequestHeaderValues::combined($request, 'if-match');
+        $ifNoneMatch = RequestHeaderValues::combined($request, 'if-none-match');
+        $ifModifiedSince = RequestHeaderValues::combined($request, 'if-modified-since');
+        $ifUnmodifiedSince = RequestHeaderValues::combined($request, 'if-unmodified-since');
 
         // If-Match: request ETag must match object ETag.
         if ($ifMatch !== null) {

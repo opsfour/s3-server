@@ -13,6 +13,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
@@ -50,7 +51,9 @@ final class GetObjectHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
-        $includeChecksums = S3ResponseHeaders::checksumModeEnabled($request->getHeader('x-amz-checksum-mode'));
+        $includeChecksums = S3ResponseHeaders::checksumModeEnabled(
+            RequestHeaderValues::singleton($request, 'x-amz-checksum-mode'),
+        );
         $queryString = $request->getUri()->getQuery();
         $queryParams = $queryString !== '' ? QueryStringParser::parse($queryString) : [];
         if (array_key_exists('partNumber', $queryParams)) {
@@ -126,7 +129,7 @@ final class GetObjectHandler implements RequestHandler
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
         // 4. Parse Range header if present.
-        $rangeHeader = $request->getHeader('range');
+        $rangeHeader = RequestHeaderValues::combined($request, 'range');
         $offset = null;
         $length = null;
         $isPartialContent = false;

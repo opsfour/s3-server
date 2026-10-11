@@ -19,6 +19,7 @@ use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\CopySourceConditionEvaluator;
 use OpsFour\S3Server\Http\CopySourceParser;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -136,7 +137,7 @@ final class UploadPartCopyHandler implements RequestHandler
         }
 
         // Parse copy source.
-        $copySource = $request->getHeader('x-amz-copy-source') ?? '';
+        $copySource = RequestHeaderValues::singleton($request, 'x-amz-copy-source') ?? '';
         [$srcBucket, $srcKey, $srcVersionId] = CopySourceParser::parse($copySource);
 
         $srcBucketInfo = $this->metadata->getBucket($srcBucket);
@@ -150,7 +151,7 @@ final class UploadPartCopyHandler implements RequestHandler
         $request->setAttribute('s3.copySourceVersionId', $srcVersionId);
         $request->setAttribute('s3.copySourceBucketOwner', $srcBucketInfo->ownerId);
         $request->setAttribute('s3.copySourceBucketGeneration', $srcBucketInfo->generation);
-        $expectedSourceOwner = $request->getHeader('x-amz-source-expected-bucket-owner');
+        $expectedSourceOwner = RequestHeaderValues::singleton($request, 'x-amz-source-expected-bucket-owner');
         if ($expectedSourceOwner !== null && $expectedSourceOwner !== $srcBucketInfo->ownerId) {
             $request->setAttribute('s3.copySourceLogEligible', true);
             throw new \OpsFour\S3Server\Exception\AccessDeniedException('Expected source bucket owner does not match.');
@@ -180,7 +181,7 @@ final class UploadPartCopyHandler implements RequestHandler
         }
 
         // Parse optional range.
-        $rangeHeader = $request->getHeader('x-amz-copy-source-range');
+        $rangeHeader = RequestHeaderValues::singleton($request, 'x-amz-copy-source-range');
         $offset = null;
         $length = null;
 

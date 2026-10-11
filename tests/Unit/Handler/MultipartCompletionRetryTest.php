@@ -759,6 +759,41 @@ final class MultipartCompletionRetryTest extends TestCase
         }
     }
 
+    public function test_upload_part_copy_rejects_repeated_source_and_range_headers(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $source = $this->storage->putObject('bucket', 'source.bin', new \Amp\ByteStream\ReadableBuffer('source'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            $source->size,
+            '"' . $source->md5Hex . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $path = '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId;
+
+        foreach ([
+            ['x-amz-copy-source' => ['/bucket/source.bin', '/bucket/other.bin']],
+            [
+                'x-amz-copy-source' => '/bucket/source.bin',
+                'x-amz-copy-source-range' => ['bytes=0-1', 'bytes=2-3'],
+            ],
+        ] as $headers) {
+            try {
+                (new UploadPartCopyHandler($this->metadata, $this->storage))
+                    ->handleRequest($this->request('PUT', $path, '', $headers));
+                self::fail('Repeated singleton copy headers must be rejected.');
+            } catch (InvalidArgumentException $error) {
+                self::assertStringContainsString('must be supplied at most once', $error->getMessage());
+                self::assertSame([], $this->metadata->getParts($uploadId));
+            }
+        }
+    }
+
     public function test_copy_object_rejects_source_over_five_gib_before_storage_read(): void
     {
         $this->metadata->putObjectMetadata(
@@ -2837,7 +2872,7 @@ final class MultipartCompletionRetryTest extends TestCase
 
     /**
      * @param non-empty-string $method
-     * @param array<non-empty-string, string> $headers
+     * @param array<non-empty-string, string|list<string>> $headers
      */
     private function request(string $method, string $path, string $body = '', array $headers = []): Request
     {

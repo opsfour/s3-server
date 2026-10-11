@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\PreconditionFailedException;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
@@ -85,7 +86,39 @@ final class PutObjectSizeContractTest extends TestCase
         }
     }
 
-    /** @param array<non-empty-string, string> $headers */
+    public function test_repeated_if_match_lines_are_evaluated_as_one_entity_tag_list(): void
+    {
+        $storage = new InMemoryBackend();
+        $handler = new PutObjectHandler($this->metadata, $storage);
+        $handler->handleRequest($this->request('original'));
+        $etag = '"' . md5('original') . '"';
+
+        $response = $handler->handleRequest($this->request('replacement', [
+            'If-Match' => ['"different"', $etag],
+        ]));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('"' . md5('replacement') . '"', $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
+    }
+
+    public function test_repeated_if_none_match_lines_cannot_overwrite_a_matching_object(): void
+    {
+        $storage = new InMemoryBackend();
+        $handler = new PutObjectHandler($this->metadata, $storage);
+        $handler->handleRequest($this->request('original'));
+        $etag = '"' . md5('original') . '"';
+
+        $this->expectException(PreconditionFailedException::class);
+        try {
+            $handler->handleRequest($this->request('replacement', [
+                'If-None-Match' => ['"different"', $etag],
+            ]));
+        } finally {
+            self::assertSame($etag, $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
+        }
+    }
+
+    /** @param array<non-empty-string, string|list<string>> $headers */
     private function request(string $body, array $headers = []): Request
     {
         $request = new Request(

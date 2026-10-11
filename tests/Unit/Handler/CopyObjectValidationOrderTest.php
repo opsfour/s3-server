@@ -61,6 +61,28 @@ final class CopyObjectValidationOrderTest extends TestCase
         }
     }
 
+    public function test_repeated_copy_source_is_rejected_before_storage_is_read_or_written(): void
+    {
+        [$metadata, $storage] = $this->sourceWithStorage([]);
+        $request = new Request(
+            $this->createMock(Client::class),
+            'PUT',
+            Http::new('http://localhost/target/copied'),
+            ['x-amz-copy-source' => ['/source/key', '/source/other']],
+        );
+        $request->setAttribute('s3.bucket', 'target');
+        $request->setAttribute('s3.key', 'copied');
+        $request->setAttribute('ownerId', 'owner');
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('x-amz-copy-source must be supplied at most once.');
+        try {
+            (new CopyObjectHandler($metadata, $storage))->handleRequest($request);
+        } finally {
+            self::assertNull($metadata->getObjectMetadata('target', 'copied'));
+        }
+    }
+
     public function test_copy_directive_preserves_source_expires_metadata(): void
     {
         [$metadata, $storage] = $this->sourceWithStorage([
