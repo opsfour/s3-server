@@ -51,12 +51,22 @@ final class GetObjectAttributesHandler implements RequestHandler
             );
         } catch (NoSuchKeyException|NoSuchVersionException $exception) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $hasExplicitVersion = isset(QueryStringParser::parse($request->getUri()->getQuery())['versionId']);
+            $currentObject = $hasExplicitVersion
+                ? null
+                : $this->metadata->getCurrentObjectVersion($bucket, $key);
             // A current delete marker keeps its established 404 response.
-            $denyMissingObject = ! isset(QueryStringParser::parse($request->getUri()->getQuery())['versionId'])
-                && $this->metadata->getCurrentObjectVersion($bucket, $key) === null
+            $denyMissingObject = ! $hasExplicitVersion
+                && $currentObject === null
                 && ! MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
             // Both lookups can yield after the first generation check.
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if ($currentObject?->isDeleteMarker) {
+                throw (new NoSuchKeyException())->withExtraHeaders([
+                    'x-amz-delete-marker' => 'true',
+                    'x-amz-version-id' => $currentObject->versionId ?? 'null',
+                ]);
+            }
             if ($denyMissingObject) {
                 throw new \OpsFour\S3Server\Exception\AccessDeniedException();
             }

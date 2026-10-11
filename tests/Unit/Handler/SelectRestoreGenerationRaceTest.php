@@ -16,6 +16,8 @@ use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\RestoreObjectHandler;
 use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
@@ -104,6 +106,56 @@ final class SelectRestoreGenerationRaceTest extends TestCase
         $this->expectException(OperationAbortedException::class);
         (new SelectObjectContentHandler($metadata, $storage))
             ->handleRequest($this->selectRequest($oldBucket));
+    }
+
+    public function test_select_does_not_reveal_missing_key_without_list_bucket_access(): void
+    {
+        $bucket = new BucketInfo('bucket', 'alice');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn($bucket);
+        $metadata->method('getObjectMetadata')->willReturn(null);
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+        $request = $this->selectRequest($bucket);
+        $request->setAttribute('ownerId', 'bob');
+
+        $this->expectException(AccessDeniedException::class);
+        (new SelectObjectContentHandler($metadata, $storage))->handleRequest($request);
+    }
+
+    public function test_select_treats_missing_committed_storage_path_as_internal_corruption(): void
+    {
+        $bucket = new BucketInfo('bucket', 'alice');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn($bucket);
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, '"etag"'));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Object storage path missing.');
+        (new SelectObjectContentHandler($metadata, $storage))->handleRequest($this->selectRequest($bucket));
+    }
+
+    public function test_select_treats_unknown_committed_storage_tier_as_internal_corruption(): void
+    {
+        $bucket = new BucketInfo('bucket', 'alice');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn($bucket);
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            3,
+            '"etag"',
+            storageTier: 'MISSING',
+            systemMetadata: ['storagePath' => 'objects/key'],
+        ));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Object storage tier is not configured.');
+        (new SelectObjectContentHandler($metadata, $storage))->handleRequest($this->selectRequest($bucket));
     }
 
     public function test_select_rechecks_reused_bucket_before_returning_completed_worker_result(): void

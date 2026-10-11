@@ -22,7 +22,9 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -104,6 +106,11 @@ final class SelectObjectContentHandler implements RequestHandler
         $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $canList = MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if (! $canList) {
+                throw new AccessDeniedException();
+            }
             throw new NoSuchKeyException();
         }
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
@@ -131,9 +138,12 @@ final class SelectObjectContentHandler implements RequestHandler
         // Fetch object data.
         $storagePath = $objectInfo->systemMetadata['storagePath'] ?? null;
         if ($storagePath === null || $storagePath === '') {
-            throw new NoSuchKeyException();
+            throw new InternalErrorException('Object storage path missing.');
         }
 
+        if (! $this->storageTiers->has($objectInfo->storageTier)) {
+            throw new InternalErrorException('Object storage tier is not configured.');
+        }
         $tier = $this->storageTiers->tier($objectInfo->storageTier);
         $readStorage = $tier->backend;
         if ($tier->restoreRequired) {

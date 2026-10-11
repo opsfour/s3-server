@@ -310,7 +310,7 @@ final class GetObjectHandler implements RequestHandler
             $suffix = (int) $suffixText;
 
             if ($suffix <= 0 || $objectSize === 0) {
-                throw new InvalidRangeException();
+                throw self::invalidRange($objectSize);
             }
 
             // If suffix is larger than the object, return the whole object.
@@ -341,7 +341,7 @@ final class GetObjectHandler implements RequestHandler
 
         // Range beyond object size.
         if ($start >= $objectSize) {
-            throw new InvalidRangeException();
+            throw self::invalidRange($objectSize);
         }
 
         if ($endStr === '') {
@@ -358,10 +358,17 @@ final class GetObjectHandler implements RequestHandler
 
         // Start must not exceed end.
         if ($start > $end) {
-            throw new InvalidRangeException();
+            throw self::invalidRange($objectSize);
         }
 
         return ['start' => $start, 'end' => $end];
+    }
+
+    private static function invalidRange(int $objectSize): InvalidRangeException
+    {
+        return (new InvalidRangeException())->withExtraHeaders([
+            'Content-Range' => 'bytes */' . $objectSize,
+        ]);
     }
 
     private static function bufferCiphertext(\Amp\ByteStream\ReadableStream $source, int $expectedSize): string

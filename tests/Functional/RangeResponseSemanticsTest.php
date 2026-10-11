@@ -33,6 +33,7 @@ final class RangeResponseSemanticsTest extends S3FunctionalTestCase
                 foreach (['bytes=0-0', 'bytes=-1', 'bytes=0-'] as $range) {
                     $response = $this->signedRead($method, $key, ['Range' => $range]);
                     self::assertSame(416, $response->getStatusCode(), $method . ' ' . $range);
+                    self::assertSame('bytes */0', $response->getHeaderLine('Content-Range'), $method . ' ' . $range);
                     if ($method === 'GET') {
                         self::assertStringContainsString('<Code>InvalidRange</Code>', (string) $response->getBody());
                     } else {
@@ -68,6 +69,12 @@ final class RangeResponseSemanticsTest extends S3FunctionalTestCase
             ]);
             self::assertSame(304, $notModified->getStatusCode());
             self::assertSame('', (string) $notModified->getBody());
+
+            foreach (['GET', 'HEAD'] as $method) {
+                $invalid = $this->signedRead($method, $key, ['Range' => 'bytes=5-']);
+                self::assertSame(416, $invalid->getStatusCode());
+                self::assertSame('bytes */5', $invalid->getHeaderLine('Content-Range'));
+            }
         } finally {
             self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
         }

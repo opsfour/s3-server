@@ -105,6 +105,22 @@ final class ObjectAttributesAndSelectTest extends S3FunctionalTestCase
                 self::$s3->getObjectAttributes([
                     'Bucket' => $bucket,
                     'Key' => 'deleted',
+                    'ObjectAttributes' => ['ETag'],
+                ]);
+                self::fail('A current delete marker must not return object attributes.');
+            } catch (S3Exception $error) {
+                self::assertSame('NoSuchKey', $error->getAwsErrorCode());
+                self::assertSame(404, $error->getStatusCode());
+                $response = $error->getResponse();
+                self::assertNotNull($response);
+                self::assertSame('true', $response->getHeaderLine('x-amz-delete-marker'));
+                self::assertSame($deleted['VersionId'], $response->getHeaderLine('x-amz-version-id'));
+            }
+
+            try {
+                self::$s3->getObjectAttributes([
+                    'Bucket' => $bucket,
+                    'Key' => 'deleted',
                     'VersionId' => $deleted['VersionId'],
                     'ObjectAttributes' => ['ETag'],
                 ]);

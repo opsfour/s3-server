@@ -187,7 +187,7 @@ final class HeadObjectHandler implements RequestHandler
             $suffix = (int) $suffixText;
 
             if ($suffix <= 0 || $objectSize === 0) {
-                throw new InvalidRangeException();
+                throw self::invalidRange($objectSize);
             }
 
             if ($suffix >= $objectSize) {
@@ -211,7 +211,7 @@ final class HeadObjectHandler implements RequestHandler
         $start = (int) $parts[0];
 
         if ($start >= $objectSize) {
-            throw new InvalidRangeException();
+            throw self::invalidRange($objectSize);
         }
 
         if ($parts[1] === '') {
@@ -225,10 +225,17 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         if ($start > $end) {
-            throw new \OpsFour\S3Server\Exception\InvalidRangeException();
+            throw self::invalidRange($objectSize);
         }
 
         return ['start' => $start, 'end' => $end];
+    }
+
+    private static function invalidRange(int $objectSize): InvalidRangeException
+    {
+        return (new InvalidRangeException())->withExtraHeaders([
+            'Content-Range' => 'bytes */' . $objectSize,
+        ]);
     }
 
 }
