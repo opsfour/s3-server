@@ -43,7 +43,7 @@ final class CredentialProviderFactory
         $required = ['access_key', 'secret_key', 'owner_id', 'display_name'];
 
         foreach ($required as $key) {
-            if (empty($config[$key])) {
+            if (! isset($config[$key]) || ! is_string($config[$key]) || $config[$key] === '') {
                 throw new \InvalidArgumentException("Memory credentials requires \"{$key}\"");
             }
         }

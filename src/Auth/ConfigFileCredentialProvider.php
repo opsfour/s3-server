@@ -37,6 +37,18 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
 {
     private const int MAX_FILE_BYTES = 16_777_216;
 
+    private const array CREDENTIAL_FIELDS = [
+        'accessKeyId',
+        'secretAccessKey',
+        'ownerId',
+        'displayName',
+        'isActive',
+        'sessionToken',
+        'expiresAt',
+        'policyNames',
+        'allowedPrefixes',
+    ];
+
     /** @var array<string, Credential> Credentials keyed by accessKeyId. */
     private array $credentials = [];
 
@@ -196,6 +208,11 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
             if (! is_array($entry)) {
                 throw new \RuntimeException("Credentials file entry {$index} must be a JSON object.");
             }
+            foreach (array_keys($entry) as $field) {
+                if (! is_string($field) || ! in_array($field, self::CREDENTIAL_FIELDS, true)) {
+                    throw new \RuntimeException("Credentials file entry {$index} contains an unknown field.");
+                }
+            }
             foreach (['accessKeyId', 'secretAccessKey', 'ownerId'] as $required) {
                 if (! isset($entry[$required]) || ! is_string($entry[$required]) || $entry[$required] === '') {
                     throw new \RuntimeException(
@@ -204,6 +221,9 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
                 }
             }
 
+            if (array_key_exists('displayName', $entry) && ! is_string($entry['displayName'])) {
+                throw new \RuntimeException("Credentials file entry {$index} displayName must be a string.");
+            }
             if (array_key_exists('isActive', $entry) && ! is_bool($entry['isActive'])) {
                 throw new \RuntimeException("Credentials file entry {$index} isActive must be a boolean.");
             }
@@ -231,7 +251,7 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
                 accessKeyId: $entry['accessKeyId'],
                 secretAccessKey: $entry['secretAccessKey'],
                 ownerId: $entry['ownerId'],
-                displayName: is_string($entry['displayName'] ?? null) ? $entry['displayName'] : '',
+                displayName: $entry['displayName'] ?? '',
                 isActive: $entry['isActive'] ?? true,
                 sessionToken: $entry['sessionToken'] ?? null,
                 expiresAt: $expiresAt,

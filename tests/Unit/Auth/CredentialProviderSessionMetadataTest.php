@@ -305,6 +305,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         try {
             foreach ([
                 ['isActive' => 'false'],
+                ['displayName' => 123],
                 ['sessionToken' => 123],
                 ['expiresAt' => 123],
                 ['policyNames' => ['readonly', 123]],
@@ -321,6 +322,45 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         } finally {
             @unlink($path);
         }
+    }
+
+    public function test_config_file_provider_rejects_unknown_fields_instead_of_ignoring_a_typo(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-unknown-field-' . bin2hex(random_bytes(4)) . '.json';
+        file_put_contents($path, json_encode([[
+            'accessKeyId' => 'AKIASESSION12345678',
+            'secretAccessKey' => 'secret',
+            'ownerId' => 'tenant:acme',
+            'is_active' => false,
+        ]], JSON_THROW_ON_ERROR));
+
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('contains an unknown field');
+
+            new ConfigFileCredentialProvider($path);
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function test_memory_factory_accepts_string_zero_values_and_rejects_non_strings(): void
+    {
+        $provider = CredentialProviderFactory::create('memory', [
+            'access_key' => '0',
+            'secret_key' => '0',
+            'owner_id' => '0',
+            'display_name' => '0',
+        ]);
+        self::assertSame('0', $provider->getCredential('0')?->ownerId);
+
+        $this->expectException(\InvalidArgumentException::class);
+        CredentialProviderFactory::create('memory', [
+            'access_key' => ['invalid'],
+            'secret_key' => 'secret',
+            'owner_id' => 'owner',
+            'display_name' => 'Owner',
+        ]);
     }
 
     public function test_database_provider_persists_session_token_and_expiration(): void
