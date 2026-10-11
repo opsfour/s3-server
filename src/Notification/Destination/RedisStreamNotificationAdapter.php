@@ -26,6 +26,9 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
         if ($maxLen < 0) {
             throw new \InvalidArgumentException('Redis stream maxLen must be >= 0.');
         }
+        if (! is_callable($client) && ! self::supportsObjectClient($client)) {
+            throw new \InvalidArgumentException('Redis stream adapter requires a callable client or an execute()/xAdd()/xadd() method.');
+        }
     }
 
     public function name(): string
@@ -35,11 +38,15 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        $fields = self::scalarFields(S3EventDestinationPayload::toArray($event));
-        $fields['payload'] = S3EventDestinationPayload::toJson($event);
-
         try {
+            $fields = self::scalarFields(S3EventDestinationPayload::toArray($event));
+            $fields['payload'] = S3EventDestinationPayload::toJson($event);
             $messageId = $this->publish($fields);
+        } catch (\JsonException $e) {
+            return NotificationDeliveryResult::deadLetter('Event payload could not be encoded.', [
+                'stream' => $this->stream,
+                'exception' => $e::class,
+            ]);
         } catch (\Throwable $e) {
             return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'stream' => $this->stream,
@@ -108,5 +115,20 @@ final readonly class RedisStreamNotificationAdapter implements NotificationDesti
         }
 
         return $result;
+    }
+
+    private static function supportsObjectClient(mixed $client): bool
+    {
+        if (! is_object($client)) {
+            return false;
+        }
+
+        foreach (['xAdd', 'xadd', 'execute'] as $method) {
+            if (is_callable([$client, $method])) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

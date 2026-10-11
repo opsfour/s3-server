@@ -161,15 +161,24 @@ Example:
 
 ```php
 use OpsFour\S3Server\Event\Adapter\DestinationAdapterListener;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Notification\Destination\KafkaNotificationAdapter;
 
-$adapter = new KafkaNotificationAdapter($producer, 's3-events');
+$producerBridge = static function (string $topic, string $payload, string $key, S3Event $_event) use ($producer): string {
+    // Adapt the native client here, wait for its delivery report, and return a
+    // stable acknowledgement. Throw when delivery is rejected or times out.
+    return $producer->publishAndConfirm($topic, $payload, $key);
+};
+$adapter = new KafkaNotificationAdapter($producerBridge, 's3-events');
 $notifications->listen('s3:ObjectCreated:*', new DestinationAdapterListener($adapter));
 ```
 
 The adapters return `sent`, `retryable_failure`, or `dead_letter` results to the
-listener bridge. Transport-specific retry, buffering, acknowledgements, and
-broker setup stay inside the injected producer/client.
+listener bridge. Callable bridges are the portable integration contract.
+Object method signatures are package-specific convenience interfaces and must
+not be assumed to match a raw php-rdkafka, php-amqplib, ext-amqp, or NATS client.
+Transport-specific retry, buffering, acknowledgements, and broker setup stay
+inside the injected bridge.
 The injected client must wait for and validate broker acceptance before
 returning a success value. An exception, `false`, or `null` (including a
 `void` publisher method) is reported as `retryable_failure`; any other returned
@@ -181,6 +190,9 @@ the `attributes` field and complete `payload` are JSON. Return the successful
 for AMQP, verify publisher confirmation and routability; for durable NATS,
 verify a JetStream publish acknowledgement. A method that only buffers a
 message locally must not return a success value as proof of broker acceptance.
+The bridge runs on the API process's Amp event loop. Use nonblocking clients and
+bounded timeouts; a blocking publish, flush, or confirmation wait blocks that
+API process.
 The listener bridge itself is in process: it logs failures but does not persist
 or retry broker events, and a full listener queue can drop an event. The
 persistent queue and retry schedule below apply to configured webhooks only.

@@ -22,6 +22,9 @@ final readonly class NatsNotificationAdapter implements NotificationDestinationA
         if ($subject === '') {
             throw new \InvalidArgumentException('NATS subject must not be empty.');
         }
+        if (! is_callable($publisher) && ! (is_object($publisher) && is_callable([$publisher, 'publish']))) {
+            throw new \InvalidArgumentException('NATS adapter requires a callable or a publish() method.');
+        }
     }
 
     public function name(): string
@@ -31,10 +34,14 @@ final readonly class NatsNotificationAdapter implements NotificationDestinationA
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        $payload = S3EventDestinationPayload::toJson($event);
-
         try {
+            $payload = S3EventDestinationPayload::toJson($event);
             $result = $this->publish($payload, $event);
+        } catch (\JsonException $e) {
+            return NotificationDeliveryResult::deadLetter('Event payload could not be encoded.', [
+                'subject' => $this->subject,
+                'exception' => $e::class,
+            ]);
         } catch (\Throwable $e) {
             return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'subject' => $this->subject,

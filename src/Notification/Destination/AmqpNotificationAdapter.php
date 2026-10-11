@@ -22,14 +22,11 @@ final readonly class AmqpNotificationAdapter implements NotificationDestinationA
         private string $routingKey = 's3.event',
         private mixed $messageFactory = null,
     ) {
-        if ($exchange === '') {
-            throw new \InvalidArgumentException('AMQP exchange must not be empty.');
-        }
-        if ($routingKey === '') {
-            throw new \InvalidArgumentException('AMQP routing key must not be empty.');
-        }
         if ($messageFactory !== null && !is_callable($messageFactory)) {
             throw new \InvalidArgumentException('AMQP message factory must be callable.');
+        }
+        if (! is_callable($publisher) && ! self::supportsObjectPublisher($publisher)) {
+            throw new \InvalidArgumentException('AMQP adapter requires a callable or publisher object with publish() or basic_publish().');
         }
     }
 
@@ -40,10 +37,15 @@ final readonly class AmqpNotificationAdapter implements NotificationDestinationA
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        $payload = S3EventDestinationPayload::toJson($event);
-
         try {
+            $payload = S3EventDestinationPayload::toJson($event);
             $result = $this->publish($payload, $event);
+        } catch (\JsonException $e) {
+            return NotificationDeliveryResult::deadLetter('Event payload could not be encoded.', [
+                'exchange' => $this->exchange,
+                'routing_key' => $this->routingKey,
+                'exception' => $e::class,
+            ]);
         } catch (\Throwable $e) {
             return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'exchange' => $this->exchange,
@@ -87,5 +89,13 @@ final readonly class AmqpNotificationAdapter implements NotificationDestinationA
         }
 
         throw new \InvalidArgumentException('AMQP publisher must expose publish() or basic_publish().');
+    }
+
+    private static function supportsObjectPublisher(mixed $publisher): bool
+    {
+        return is_object($publisher) && (
+            is_callable([$publisher, 'publish'])
+            || is_callable([$publisher, 'basic_publish'])
+        );
     }
 }

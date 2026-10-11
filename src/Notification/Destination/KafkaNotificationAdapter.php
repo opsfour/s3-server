@@ -25,6 +25,9 @@ final readonly class KafkaNotificationAdapter implements NotificationDestination
         if ($topic === '') {
             throw new \InvalidArgumentException('Kafka topic must not be empty.');
         }
+        if (! is_callable($producer) && ! self::supportsObjectProducer($producer)) {
+            throw new \InvalidArgumentException('Kafka adapter requires a callable or producer object with produce(), send(), or publish().');
+        }
     }
 
     public function name(): string
@@ -34,11 +37,15 @@ final readonly class KafkaNotificationAdapter implements NotificationDestination
 
     public function deliver(S3Event $event): NotificationDeliveryResult
     {
-        $payload = S3EventDestinationPayload::toJson($event);
-        $key = "{$event->bucket}/{$event->key}";
-
         try {
+            $payload = S3EventDestinationPayload::toJson($event);
+            $key = "{$event->bucket}/{$event->key}";
             $result = $this->publish($payload, $key, $event);
+        } catch (\JsonException $e) {
+            return NotificationDeliveryResult::deadLetter('Event payload could not be encoded.', [
+                'topic' => $this->topic,
+                'exception' => $e::class,
+            ]);
         } catch (\Throwable $e) {
             return NotificationDeliveryResult::retryableFailure('Broker delivery failed.', [
                 'topic' => $this->topic,
@@ -77,5 +84,14 @@ final readonly class KafkaNotificationAdapter implements NotificationDestination
         }
 
         throw new \InvalidArgumentException('Kafka producer must expose produce(), send(), or publish().');
+    }
+
+    private static function supportsObjectProducer(mixed $producer): bool
+    {
+        return is_object($producer) && (
+            is_callable([$producer, 'produce'])
+            || is_callable([$producer, 'send'])
+            || is_callable([$producer, 'publish'])
+        );
     }
 }

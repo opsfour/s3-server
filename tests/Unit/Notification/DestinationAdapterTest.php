@@ -82,6 +82,16 @@ final class DestinationAdapterTest extends TestCase
         $this->assertJson($publisher->calls[0]['payload']);
     }
 
+    public function test_amqp_adapter_allows_default_exchange_and_empty_routing_key(): void
+    {
+        $publisher = new RecordingAmqpPublisher();
+        $result = (new AmqpNotificationAdapter($publisher, '', ''))->deliver($this->event());
+
+        self::assertSame(NotificationDeliveryStatus::Sent, $result->status);
+        self::assertSame('', $publisher->calls[0]['exchange']);
+        self::assertSame('', $publisher->calls[0]['routingKey']);
+    }
+
     public function test_nats_adapter_publishes_json_payload(): void
     {
         $publisher = new RecordingNatsPublisher();
@@ -157,7 +167,50 @@ final class DestinationAdapterTest extends TestCase
         }
     }
 
-    private function event(): S3Event
+    public function test_invalid_event_payload_is_dead_lettered_without_calling_brokers(): void
+    {
+        $calls = 0;
+        $publisher = static function () use (&$calls): string {
+            $calls++;
+
+            return 'unexpected';
+        };
+        $event = $this->event(['invalid_utf8' => "\xB1\x31"]);
+        $adapters = [
+            new RedisStreamNotificationAdapter($publisher, 's3-events'),
+            new KafkaNotificationAdapter($publisher, 's3-events'),
+            new AmqpNotificationAdapter($publisher, 's3-exchange'),
+            new NatsNotificationAdapter($publisher, 's3.events'),
+        ];
+
+        foreach ($adapters as $adapter) {
+            $result = $adapter->deliver($event);
+            self::assertSame(NotificationDeliveryStatus::DeadLetter, $result->status, $adapter->name());
+            self::assertSame('Event payload could not be encoded.', $result->reason);
+            self::assertSame(\JsonException::class, $result->context['exception']);
+        }
+        self::assertSame(0, $calls);
+    }
+
+    public function test_invalid_broker_clients_fail_during_configuration(): void
+    {
+        foreach ([
+            static fn() => new RedisStreamNotificationAdapter(new \stdClass(), 's3-events'),
+            static fn() => new KafkaNotificationAdapter(new \stdClass(), 's3-events'),
+            static fn() => new AmqpNotificationAdapter(new \stdClass(), 's3-exchange'),
+            static fn() => new NatsNotificationAdapter(new \stdClass(), 's3.events'),
+        ] as $createAdapter) {
+            try {
+                $createAdapter();
+                self::fail('Invalid broker clients must fail during adapter configuration.');
+            } catch (\InvalidArgumentException) {
+                self::addToAssertionCount(1);
+            }
+        }
+    }
+
+    /** @param array<string, mixed>|null $attributes */
+    private function event(?array $attributes = null): S3Event
     {
         return new S3Event(
             name: 's3:ObjectCreated:Put',
@@ -167,7 +220,7 @@ final class DestinationAdapterTest extends TestCase
             etag: '"etag"',
             ownerId: 'owner',
             region: 'us-east-1',
-            attributes: ['request_id' => 'req-1'],
+            attributes: $attributes ?? ['request_id' => 'req-1'],
         );
     }
 }

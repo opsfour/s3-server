@@ -88,6 +88,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Reject negative storage and SQLite worker counts instead of silently falling
   back to synchronous I/O, and align framework setup documentation with the
   actual startup gates and dependencies.
+- Fail fast on invalid broker clients, dead-letter unencodable event payloads,
+  permit standard empty AMQP destinations, and document callable bridges as
+  the portable native-client integration contract.
 
 ### Upgrade Notes
 
