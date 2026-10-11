@@ -61,7 +61,9 @@ final class CredentialSchemaAdmissionTest extends TestCase
             if ($driver === 'mysql') {
                 $column = $pdo->query("SHOW COLUMNS FROM s3_credentials LIKE 'access_key_id'");
                 self::assertNotFalse($column);
-                self::assertSame('varbinary(255)', strtolower((string) $column->fetch(\PDO::FETCH_ASSOC)['Type']));
+                $definition = $column->fetch(\PDO::FETCH_ASSOC);
+                self::assertIsArray($definition);
+                self::assertSame('varbinary(255)', strtolower((string) $definition['Type']));
             }
         } finally {
             $pdo->exec('DROP TABLE IF EXISTS s3_credentials');

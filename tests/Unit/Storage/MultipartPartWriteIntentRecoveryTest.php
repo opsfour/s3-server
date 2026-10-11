@@ -195,7 +195,7 @@ final class MultipartPartWriteIntentRecoveryTest extends TestCase
 
         [, $path] = $this->reservePart('clock-skew');
         $process = proc_open(
-            [PHP_BINARY, dirname(__DIR__, 2) . '/Support/storage-garbage-clock-skew-worker.php', $this->databasePath],
+            [PHP_BINARY, '-d', 'display_errors=stderr', dirname(__DIR__, 2) . '/Support/storage-garbage-clock-skew-worker.php', $this->databasePath],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
             $pipes,
         );
@@ -271,6 +271,7 @@ final class MultipartPartWriteIntentRecoveryTest extends TestCase
         $statement->execute([$path]);
     }
 
+    /** @phpstan-impure */
     private function intentCount(string $path): int
     {
         $statement = (new \PDO('sqlite:' . $this->databasePath))

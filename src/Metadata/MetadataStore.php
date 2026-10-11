@@ -435,6 +435,7 @@ interface MetadataStore
      *
      * @param  string  $uploadId  The upload ID.
      * @return list<array{part_number: int, etag: string, size: int, storage_path: string, checksum_algorithm?: ?string, checksum_value?: ?string, created_at: string}>
+     * @phpstan-impure
      */
     public function getParts(string $uploadId): array;
 
@@ -984,6 +985,7 @@ interface MetadataStore
      *
      * @param  array<string, string>  $tags
      * @return list<ObjectInfo>
+     * @phpstan-impure
      */
     public function listExpiredNoncurrentVersions(string $bucket, ?string $prefix, int $noncurrentDays, int $limit = 1000, array $tags = [], ?string $afterKey = null, ?string $afterVersionId = null): array;
 

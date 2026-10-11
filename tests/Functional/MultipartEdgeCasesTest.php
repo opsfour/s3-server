@@ -230,7 +230,8 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
                 'CopySourceIfUnmodifiedSince' => new \DateTimeImmutable('2020-01-01', new \DateTimeZone('UTC')),
             ] as $condition => $value) {
                 try {
-                    self::$s3->uploadPartCopy($base + [$condition => $value]);
+                    $command = self::$s3->getCommand('UploadPartCopy', $base + [$condition => $value]);
+                    self::$s3->execute($command);
                     $this->fail('UploadPartCopy ignored ' . $condition);
                 } catch (S3Exception $exception) {
                     $this->assertSame(412, $exception->getStatusCode(), $condition);
@@ -336,10 +337,11 @@ final class MultipartEdgeCasesTest extends S3FunctionalTestCase
     public function test_list_multipart_uploads_rejects_unsupported_encoding_type(): void
     {
         try {
-            self::$s3->listMultipartUploads([
+            $command = self::$s3->getCommand('ListMultipartUploads', [
                 'Bucket' => self::$bucket,
                 'EncodingType' => 'gzip',
             ]);
+            self::$s3->execute($command);
             $this->fail('An unsupported encoding type must not return a successful listing.');
         } catch (S3Exception $e) {
             $this->assertSame(400, $e->getStatusCode());

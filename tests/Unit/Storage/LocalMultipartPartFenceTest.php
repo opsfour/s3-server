@@ -92,7 +92,7 @@ final class LocalMultipartPartFenceTest extends TestCase
                 $backend->putPartAtPath('bucket', 'key', $uploadId, 1, new ReadableBuffer('late'), $path);
                 self::fail('Late part worker replaced its permanent seal.');
             } catch (InternalErrorException) {
-                self::assertSame($seal, file_get_contents($path));
+                self::assertSame($seal, self::readFile($path));
             }
             $claim = $metadata->dequeueStorageGarbage(1);
             self::assertSame([], $claim);
@@ -217,6 +217,17 @@ final class LocalMultipartPartFenceTest extends TestCase
             $backend->shutdown();
             $this->removeDirectory($root);
         }
+    }
+
+    /** @phpstan-impure */
+    private static function readFile(string $path): string
+    {
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            throw new \RuntimeException("Unable to read test file {$path}.");
+        }
+
+        return $contents;
     }
 
     private function insertReplay(SqliteMetadataStore $metadata, string $path, string $uploadId, string $dispatchId): void

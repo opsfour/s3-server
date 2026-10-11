@@ -247,7 +247,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
                 $context->assertCandidateMetadataBinding($wrongConfig, $metadata);
                 self::fail('An EFS candidate with a mismatched profile was accepted.');
             } catch (\RuntimeException) {
-                self::assertSame(1, $this->storageStats);
+                $this->assertStorageStats(1);
             }
         }
     }
@@ -338,7 +338,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
                     $context->assertCandidateStorageBinding($backend, $tiers);
                     self::fail('An unbound EFS candidate backend or tier was accepted.');
                 } catch (\RuntimeException) {
-                    self::assertSame(1, $this->storageStats);
+                    $this->assertStorageStats(1);
                 }
             }
         } finally {
@@ -3238,7 +3238,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
             $context->workerScope();
             self::fail('Stale evidence was accepted by the context.');
         } catch (\RuntimeException) {
-            self::assertSame(1, $this->storageStats);
+            $this->assertStorageStats(1);
         }
     }
 
@@ -3340,6 +3340,11 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         } finally {
             self::assertTrue(rmdir($originalRoot));
         }
+    }
+
+    private function assertStorageStats(int $expected): void
+    {
+        self::assertSame($expected, $this->storageStats);
     }
 
     /** @param (Closure(): string)|null $mountInfoReader */

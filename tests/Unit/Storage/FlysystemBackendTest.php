@@ -217,14 +217,14 @@ final class FlysystemBackendTest extends TestCase
                 self::fail('Malformed upload ID must fail before directory deletion.');
             } catch (\InvalidArgumentException) {
             }
-            self::assertSame('keep', $filesystem->read('unrelated-bucket/object'));
+            self::assertSame('keep', self::readFile($filesystem, 'unrelated-bucket/object'));
 
             try {
                 $backend->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer('bad'));
                 self::fail('Malformed upload ID must fail before part placement.');
             } catch (\InvalidArgumentException) {
             }
-            self::assertSame('keep', $filesystem->read('unrelated-bucket/object'));
+            self::assertSame('keep', self::readFile($filesystem, 'unrelated-bucket/object'));
         }
     }
 
@@ -824,6 +824,12 @@ final class FlysystemBackendTest extends TestCase
         @unlink($databasePath);
         @unlink($databasePath . '-wal');
         @unlink($databasePath . '-shm');
+    }
+
+    /** @phpstan-impure */
+    private static function readFile(Filesystem $filesystem, string $path): string
+    {
+        return $filesystem->read($path);
     }
 
     private static function readAll(\Amp\ByteStream\ReadableStream $stream): string

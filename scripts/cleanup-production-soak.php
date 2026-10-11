@@ -42,10 +42,14 @@ do {
         'Prefix' => $prefix,
         'MaxKeys' => 1000,
     ]);
-    $objects = array_map(
-        static fn(array $object): array => ['Key' => (string) $object['Key']],
-        $result['Contents'] ?? [],
-    );
+    /** @var list<array{Key: string}> $objects */
+    $objects = [];
+    foreach ($result['Contents'] ?? [] as $object) {
+        $key = (string) ($object['Key'] ?? '');
+        if ($key !== '') {
+            $objects[] = ['Key' => $key];
+        }
+    }
     if ($objects !== []) {
         $client->deleteObjects([
             'Bucket' => $bucket,

@@ -45,7 +45,8 @@ final class CredentialsMigrateCommandTest extends TestCase
             self::assertSame(Command::SUCCESS, $migrator->execute(['--credentials-dsn' => $dsn]));
             $writer = CredentialProviderFactory::create('database', ['dsn' => $dsn]);
             $writer->putCredential(new Credential('AKIAEXISTING1234567', 'existing-secret', 'owner'));
-            self::assertSame(Command::SUCCESS, $migrator->execute(['--credentials-dsn' => $dsn]));
+            $retry = new CommandTester(new CredentialsMigrateCommand());
+            self::assertSame(Command::SUCCESS, $retry->execute(['--credentials-dsn' => $dsn]));
             self::assertSame('existing-secret', CredentialProviderFactory::create('database', ['dsn' => $dsn])
                 ->getCredential('AKIAEXISTING1234567')?->secretAccessKey);
         } finally {

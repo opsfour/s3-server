@@ -575,9 +575,9 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
             'Bucket' => $bucket, 'Key' => 'switch.txt', 'UploadId' => $upload['UploadId'],
             'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
         ]);
-        $this->assertSame('bucket-owner', self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'switch.txt'])['Owner']['ID']);
+        $this->assertSame('bucket-owner', $this->objectOwner($bucket, 'switch.txt'));
         self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
-        $this->assertSame('bucket-owner', self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'switch.txt'])['Owner']['ID']);
+        $this->assertSame('bucket-owner', $this->objectOwner($bucket, 'switch.txt'));
     }
 
     public function test_copy_delete_and_multipart_require_the_right_account(): void
@@ -892,6 +892,12 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         self::$s3->putBucketAcl(['Bucket' => $bucket, 'GrantWrite' => 'id="object-writer"']);
 
         return $bucket;
+    }
+
+    /** @phpstan-impure */
+    private function objectOwner(string $bucket, string $key): string
+    {
+        return (string) (self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => $key])['Owner']['ID'] ?? '');
     }
 
     /**

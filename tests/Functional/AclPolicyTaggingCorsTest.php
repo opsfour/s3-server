@@ -135,7 +135,7 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
                     'Resource' => 'arn:aws:s3:::' . self::$bucket . '/*',
                 ],
             ],
-        ]);
+        ], JSON_THROW_ON_ERROR);
 
         // Put policy.
         $putResult = self::$s3->putBucketPolicy([

@@ -422,6 +422,7 @@ final class HealthCheckHandlerTest extends TestCase
         }
     }
 
+    /** @phpstan-impure */
     private function request(): Request
     {
         return new Request(

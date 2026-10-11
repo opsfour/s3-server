@@ -60,7 +60,7 @@ final class FilesystemPathConfinementTest extends TestCase
                 $stream->close();
                 self::fail('An out-of-root stored path must be rejected before opening the file.');
             } catch (\InvalidArgumentException) {
-                self::assertSame('outside-canary', file_get_contents($this->outside));
+                self::assertSame('outside-canary', self::readFile($this->outside));
             }
         }
     }
@@ -293,6 +293,17 @@ final class FilesystemPathConfinementTest extends TestCase
         } catch (\InvalidArgumentException) {
             self::assertDirectoryDoesNotExist($this->root . '/other-bucket');
         }
+    }
+
+    /** @phpstan-impure */
+    private static function readFile(string $path): string
+    {
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            throw new \RuntimeException("Unable to read test file {$path}.");
+        }
+
+        return $contents;
     }
 
     private function backend(?string $root = null): FilesystemBackend

@@ -311,11 +311,12 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
                 self::assertArrayNotHasKey('ChecksumType', $range, $operation . ' range');
 
                 try {
-                    self::$s3->{$operation}([
+                    $command = self::$s3->getCommand($operation, [
                         'Bucket' => self::$bucket,
                         'Key' => $key,
                         'ChecksumMode' => 'DISABLED',
                     ]);
+                    self::$s3->execute($command);
                     self::fail($operation . ' accepted unsupported checksum mode.');
                 } catch (\Aws\S3\Exception\S3Exception $error) {
                     self::assertSame(400, $error->getStatusCode());

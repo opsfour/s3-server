@@ -1578,9 +1578,20 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             return null;
         }
 
-        $row['user_metadata'] = json_decode($row['user_metadata'], true, 512, JSON_THROW_ON_ERROR);
+        /** @var array<string, string> $userMetadata */
+        $userMetadata = json_decode((string) $row['user_metadata'], true, 512, JSON_THROW_ON_ERROR);
 
-        return $row;
+        return [
+            'upload_id' => (string) $row['upload_id'],
+            'bucket' => (string) $row['bucket'],
+            'bucket_generation' => (string) $row['bucket_generation'],
+            'key_name' => (string) $row['key_name'],
+            'owner_id' => (string) $row['owner_id'],
+            'storage_tier' => $row['storage_tier'] === null ? null : (string) $row['storage_tier'],
+            'content_type' => (string) $row['content_type'],
+            'user_metadata' => $userMetadata,
+            'created_at' => (string) $row['created_at'],
+        ];
     }
 
     public function deleteMultipartUpload(string $uploadId): void

@@ -91,13 +91,17 @@ jobs:
         env:
           fail-fast: "true"
 
-      - name: Constrain framework compatibility target
+      - name: Constrain runtime compatibility target
+        run: >-
+          composer require --no-update
+          symfony/console:${{ matrix.symfony }}
+
+      - name: Constrain development framework compatibility target
         run: >-
           composer require --dev --no-update
           laravel/framework:${{ matrix.laravel }}
           illuminate/console:${{ matrix.laravel }}
           illuminate/support:${{ matrix.laravel }}
-          symfony/console:${{ matrix.symfony }}
           symfony/config:${{ matrix.symfony }}
           symfony/dependency-injection:${{ matrix.symfony }}
           symfony/http-kernel:${{ matrix.symfony }}
@@ -171,8 +175,49 @@ jobs:
           mysql --user=root
           --execute='SET GLOBAL log_bin_trust_function_creators = 1'
 
+      - name: Prepare isolated migration databases
+        run: |
+          docker exec --env MYSQL_PWD=s3audit "${{ job.services.mysql.id }}" \
+            mysql --user=root \
+            --execute="CREATE DATABASE s3audit_package; CREATE DATABASE s3audit_mpu; GRANT ALL PRIVILEGES ON s3audit_package.* TO 's3'@'%'; GRANT ALL PRIVILEGES ON s3audit_mpu.* TO 's3'@'%'; FLUSH PRIVILEGES"
+          docker exec --env PGPASSWORD=s3audit "${{ job.services.postgres.id }}" \
+            createdb --username=s3 s3audit_package
+          docker exec --env PGPASSWORD=s3audit "${{ job.services.postgres.id }}" \
+            createdb --username=s3 s3audit_mpu
+
       - name: Metadata backend parity and concurrency
         run: vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
+
+      - name: Stored identity policy inventory on external backends
+        run: |
+          S3_POLICY_AUDIT_DSN='mysql:host=127.0.0.1;port=3306;dbname=s3server' \
+          S3_POLICY_AUDIT_USER=s3 \
+          S3_POLICY_AUDIT_PASSWORD=s3audit \
+          php scripts/audit-stored-identity-policies.php
+          S3_POLICY_AUDIT_DSN='pgsql:host=127.0.0.1;port=5432;dbname=s3server' \
+          S3_POLICY_AUDIT_USER=s3 \
+          S3_POLICY_AUDIT_PASSWORD=s3audit \
+          php scripts/audit-stored-identity-policies.php
+
+      - name: Collector generation migration compatibility
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MYSQL_METADATA_DSN: "host=127.0.0.1;port=3306;dbname=s3audit_package;user=s3;password=s3audit"
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
+        run: >-
+          vendor/bin/phpunit --fail-on-skipped
+          tests/Functional/MetadataBackendIntegrationTest.php
+          --filter test_external_collector_generation_upgrade_preserves_legacy_intents_and_garbage
+
+      - name: Multipart intent migration and fencing
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MYSQL_METADATA_DSN: "host=127.0.0.1;port=3306;dbname=s3audit_mpu;user=s3;password=s3audit"
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_mpu user=s3 password=s3audit
+        run: >-
+          vendor/bin/phpunit --fail-on-skipped
+          tests/Functional/MetadataBackendIntegrationTest.php
+          --filter test_external_multipart_intent_migration_and_active_claim_fencing
 
       - name: MySQL v11-to-current migration
         env:

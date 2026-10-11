@@ -98,6 +98,7 @@ final class HandlerRegistry
      *
      * @param  S3Operation  $operation  The resolved S3 operation.
      * @return RequestHandler The registered handler.
+     * @phpstan-impure
      *
      * @throws NotImplementedException If no handler is registered for the operation.
      */

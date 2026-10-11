@@ -3836,11 +3836,14 @@ final class PostgresMetadataStore implements MetadataStore, GenerationBoundMulti
             if ($rows !== []) {
                 $ids = array_column($rows, 'id');
                 $placeholders = implode(',', array_map(fn(int $index): string => '$' . ($index + 2), array_keys($ids)));
-                $this->conn()->execute(
+                $updated = $this->conn()->execute(
                     "UPDATE s3_storage_garbage SET status = 'processing', next_attempt_at = $1,
                      lease_generation = lease_generation + 1 WHERE id IN ({$placeholders})",
                     [$leaseExpiresAt, ...$ids],
-                );
+                )->getRowCount();
+                if ($updated !== count($rows)) {
+                    throw new \RuntimeException('Storage garbage queue claim changed while locked.');
+                }
             }
 
             return $rows;

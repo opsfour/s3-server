@@ -367,20 +367,20 @@ final class PostObjectTest extends S3FunctionalTestCase
         self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => "{$prefix}/source", 'Body' => 'source']);
 
         $requests = [
-            static fn() => self::$s3->putObject([
+            ['PutObject', [
                 'Bucket' => self::$bucket, 'Key' => "{$prefix}/put", 'Body' => 'body', 'StorageClass' => 'NOT_A_CLASS',
-            ]),
-            static fn() => self::$s3->copyObject([
+            ]],
+            ['CopyObject', [
                 'Bucket' => self::$bucket, 'Key' => "{$prefix}/copy",
                 'CopySource' => self::$bucket . "/{$prefix}/source", 'StorageClass' => 'NOT_A_CLASS',
-            ]),
-            static fn() => self::$s3->createMultipartUpload([
+            ]],
+            ['CreateMultipartUpload', [
                 'Bucket' => self::$bucket, 'Key' => "{$prefix}/multipart", 'StorageClass' => 'NOT_A_CLASS',
-            ]),
+            ]],
         ];
-        foreach ($requests as $send) {
+        foreach ($requests as [$operation, $arguments]) {
             try {
-                $send();
+                self::$s3->execute(self::$s3->getCommand($operation, $arguments));
                 self::fail('An unsupported storage class must fail before creating an object or upload.');
             } catch (S3Exception $e) {
                 self::assertSame(400, $e->getStatusCode());

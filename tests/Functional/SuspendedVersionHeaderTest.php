@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\Credentials\Credentials;
-use Aws\Result;
+use Aws\ResultInterface;
 use Aws\S3\Exception\S3Exception;
 use Aws\Signature\S3SignatureV4;
 use GuzzleHttp\Client;
@@ -129,12 +129,12 @@ final class SuspendedVersionHeaderTest extends S3FunctionalTestCase
                 ['deleteObjectTagging', []],
             ] as [$operation, $operationArgs]) {
                 foreach ([[], ['VersionId' => 'null']] as $versionArgs) {
-                    $result = self::$s3->{$operation}([
+                    $result = self::$s3->execute(self::$s3->getCommand($operation, [
                         'Bucket' => $bucket,
                         'Key' => 'key',
                         ...$operationArgs,
                         ...$versionArgs,
-                    ]);
+                    ]));
                     self::assertSame('null', self::versionHeader($result), $operation . ' ' . json_encode($versionArgs));
                 }
             }
@@ -197,8 +197,7 @@ final class SuspendedVersionHeaderTest extends S3FunctionalTestCase
         }
     }
 
-    /** @param Result<mixed> $result */
-    private static function versionHeader(Result $result): ?string
+    private static function versionHeader(ResultInterface $result): ?string
     {
         return $result['@metadata']['headers']['x-amz-version-id'] ?? null;
     }

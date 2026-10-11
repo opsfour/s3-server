@@ -267,6 +267,7 @@ final class ExternalGarbageAtomicityTest extends TestCase
         }
     }
 
+    /** @phpstan-impure */
     private function skewedGarbageWorker(string $driver, string $dsn, string $action): string
     {
         $worker = new Process(

@@ -44,6 +44,7 @@ try {
     // SKIP LOCKED may return an empty batch while the other process holds
     // candidate rows. A real worker polls again after that transient result.
     $ids = [];
+    $claims = [];
     $leaseDeadline = microtime(true) + 10;
     while (count($ids) < $expectedCount) {
         $batch = $queue === 'notification'
@@ -54,6 +55,16 @@ try {
                 throw new RuntimeException('Worker claimed another bucket queue item.');
             }
             $ids[] = (int) $row['id'];
+            if ($queue === 'storage_garbage') {
+                if (! isset($row['lease_generation'])) {
+                    throw new RuntimeException('Storage garbage claim is missing its lease generation.');
+                }
+                $claims[] = [
+                    'id' => (int) $row['id'],
+                    'lease_expires_at' => (float) $row['lease_expires_at'],
+                    'lease_generation' => (int) $row['lease_generation'],
+                ];
+            }
         }
         if ($batch !== []) {
             continue;
@@ -63,7 +74,7 @@ try {
         }
         usleep(10_000);
     }
-    fwrite(STDOUT, json_encode($ids, JSON_THROW_ON_ERROR) . "\n");
+    fwrite(STDOUT, json_encode($queue === 'storage_garbage' ? $claims : $ids, JSON_THROW_ON_ERROR) . "\n");
 } catch (Throwable $error) {
     fwrite(STDERR, $error::class . ': ' . $error->getMessage() . "\n");
     exit(2);

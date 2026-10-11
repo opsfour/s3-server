@@ -34,7 +34,8 @@ final class MetadataMigrateCommandTest extends TestCase
                 '--metadata-driver' => 'sqlite',
                 '--metadata-path' => $path,
             ]));
-            self::assertSame(Command::SUCCESS, $tester->execute([
+            $retry = new CommandTester(new MetadataMigrateCommand());
+            self::assertSame(Command::SUCCESS, $retry->execute([
                 '--metadata-driver' => 'sqlite',
                 '--metadata-path' => $path,
             ]));

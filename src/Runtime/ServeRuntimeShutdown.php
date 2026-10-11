@@ -11,26 +11,26 @@ final class ServeRuntimeShutdown
 {
     public static function stop(S3ServerRuntime $runtime, LoggerInterface $logger): ?string
     {
-        for ($attempt = 1; $attempt <= 2; ++$attempt) {
-            try {
-                $runtime->stop();
+        try {
+            $runtime->stop();
 
-                return null;
-            } catch (\Throwable $error) {
-                if ($attempt < 2) {
-                    continue;
-                }
-
-                try {
-                    $logger->error('S3 server shutdown failed.', ['exception' => $error::class]);
-                } catch (\Throwable) {
-                    // A logger failure cannot replace the controlled CLI result.
-                }
-
-                return ServeFailureMessage::format($error, 'shutdown');
-            }
+            return null;
+        } catch (\Throwable) {
+            // Retry once so transient worker shutdown failures can settle.
         }
 
-        return null;
+        try {
+            $runtime->stop();
+
+            return null;
+        } catch (\Throwable $error) {
+            try {
+                $logger->error('S3 server shutdown failed.', ['exception' => $error::class]);
+            } catch (\Throwable) {
+                // A logger failure cannot replace the controlled CLI result.
+            }
+
+            return ServeFailureMessage::format($error, 'shutdown');
+        }
     }
 }

@@ -598,12 +598,13 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
     {
         foreach (['MetadataDirective', 'TaggingDirective'] as $field) {
             try {
-                self::$s3->copyObject([
+                $command = self::$s3->getCommand('CopyObject', [
                     'Bucket' => self::$bucket,
                     'Key' => 'invalid-directive.txt',
                     'CopySource' => self::$bucket . '/file1.txt',
                     $field => 'INVALID',
                 ]);
+                self::$s3->execute($command);
                 $this->fail("Expected {$field} to be rejected.");
             } catch (S3Exception $e) {
                 $this->assertSame(400, $e->getStatusCode());
@@ -634,13 +635,14 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
 
         foreach ([[], ['StorageClass' => 'STANDARD_IA']] as $unchangedOptions) {
             try {
-                self::$s3->copyObject([
+                $command = self::$s3->getCommand('CopyObject', [
                     'Bucket' => self::$bucket,
                     'Key' => 'self-copy.txt',
                     'CopySource' => self::$bucket . '/self-copy.txt',
                     'MetadataDirective' => 'COPY',
                     ...$unchangedOptions,
                 ]);
+                self::$s3->execute($command);
                 self::fail('An unchanged current-version self-copy must be rejected.');
             } catch (S3Exception $exception) {
                 self::assertSame(400, $exception->getStatusCode());

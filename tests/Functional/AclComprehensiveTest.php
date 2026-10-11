@@ -152,10 +152,11 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
 
     public function test_bucket_unknown_canned_defaults_to_private(): void
     {
-        self::$s3->putBucketAcl([
+        $command = self::$s3->getCommand('PutBucketAcl', [
             'Bucket' => self::$bucket,
             'ACL' => 'bucket-owner-full-control',
         ]);
+        self::$s3->execute($command);
 
         $result = self::$s3->getBucketAcl(['Bucket' => self::$bucket]);
         $grants = $result['Grants'];

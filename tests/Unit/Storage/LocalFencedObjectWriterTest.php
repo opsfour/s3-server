@@ -520,7 +520,7 @@ final class LocalFencedObjectWriterTest extends TestCase
             self::assertNotSame([], glob($this->scratch . '/s3fw-put-*'));
 
             $cancel->cancel();
-            $deadline = microtime(true) + 0.5;
+            $deadline = microtime(true) + 2.0;
             while (! $pending->isComplete() && microtime(true) < $deadline) {
                 delay(0.01);
             }

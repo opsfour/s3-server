@@ -1827,10 +1827,11 @@ final class MetadataBackendIntegrationTest extends TestCase
             );
             $worker->setTimeout(20);
             $worker->mustRun();
-            $claimedIds = json_decode(trim($worker->getOutput()), true, 512, JSON_THROW_ON_ERROR);
-            self::assertIsArray($claimedIds);
-            self::assertCount(1, $claimedIds);
-            $garbageId = (int) $claimedIds[0];
+            $claims = json_decode(trim($worker->getOutput()), true, 512, JSON_THROW_ON_ERROR);
+            self::assertIsArray($claims);
+            self::assertCount(1, $claims);
+            self::assertIsArray($claims[0]);
+            $garbageId = (int) $claims[0]['id'];
 
             $collector = new StorageGarbageCollector($metadata, StorageTierRegistry::single($storage));
             self::assertSame(0, $collector->collect(1));
@@ -2839,6 +2840,7 @@ final class MetadataBackendIntegrationTest extends TestCase
 
         $dsn = trim($dsn);
         $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        self::assertInstanceOf(FencedStorageGarbageStore::class, $metadata);
         $ownerId = 'garbage-lease-' . bin2hex(random_bytes(4));
         $bucket = 'garbage-lease-' . bin2hex(random_bytes(8));
         $base = sys_get_temp_dir() . '/s3-garbage-lease-' . bin2hex(random_bytes(8));
@@ -2883,18 +2885,24 @@ final class MetadataBackendIntegrationTest extends TestCase
             }
             file_put_contents($startPath, 'start');
 
-            $allIds = [];
+            $allClaims = [];
             foreach ($processes as $process) {
                 $process->wait();
                 self::assertTrue($process->isSuccessful(), $process->getErrorOutput());
-                $ids = json_decode(trim($process->getOutput()), true, 512, JSON_THROW_ON_ERROR);
-                self::assertIsArray($ids);
-                self::assertCount(10, $ids);
-                $allIds = [...$allIds, ...$ids];
+                $claims = json_decode(trim($process->getOutput()), true, 512, JSON_THROW_ON_ERROR);
+                self::assertIsArray($claims);
+                self::assertCount(10, $claims);
+                $allClaims = [...$allClaims, ...$claims];
             }
+            $allIds = array_column($allClaims, 'id');
             self::assertCount(20, array_unique($allIds));
-            foreach ($allIds as $id) {
-                $metadata->completeStorageGarbage((int) $id);
+            foreach ($allClaims as $claim) {
+                self::assertIsArray($claim);
+                self::assertTrue($metadata->completeStorageGarbageLease(
+                    (int) $claim['id'],
+                    (float) $claim['lease_expires_at'],
+                    (int) $claim['lease_generation'],
+                ));
             }
             self::assertSame([], $metadata->dequeueStorageGarbage(1));
         } finally {

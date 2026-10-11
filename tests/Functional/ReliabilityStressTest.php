@@ -114,7 +114,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                         'UploadId' => $uploadId,
                         'PartNumber' => $partNumber,
                         'Body' => $partStream,
-                        'ContentLength' => filesize($file),
+                        'ContentLength' => $partBytes,
                     ]);
                 } finally {
                     if (is_resource($partStream)) {

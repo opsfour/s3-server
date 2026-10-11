@@ -35,7 +35,7 @@ final class LocalMultipartPathFenceTest extends TestCase
                 $fence->publish($second, $target);
                 self::fail('A second physical dispatch replaced the committed path.');
             } catch (\RuntimeException) {
-                self::assertSame('first payload', file_get_contents($target));
+                self::assertSame('first payload', self::readFile($target));
             }
 
             $fence->seal($target, $attempt);
@@ -154,6 +154,17 @@ final class LocalMultipartPathFenceTest extends TestCase
         } finally {
             $this->removeDirectory($root);
         }
+    }
+
+    /** @phpstan-impure */
+    private static function readFile(string $path): string
+    {
+        $contents = file_get_contents($path);
+        if ($contents === false) {
+            throw new \RuntimeException("Unable to read test file {$path}.");
+        }
+
+        return $contents;
     }
 
     private function removeDirectory(string $directory): void
