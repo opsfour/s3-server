@@ -85,6 +85,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   and dynamic clients, and encode every stream field as a scalar value.
 - Parse conditional request entity-tags strictly so malformed quotes and lists
   cannot satisfy read, copy, multipart-copy, or conditional-write guards.
+- Reject negative storage and SQLite worker counts instead of silently falling
+  back to synchronous I/O, and align framework setup documentation with the
+  actual startup gates and dependencies.
 
 ### Upgrade Notes
 

@@ -15,7 +15,7 @@ LTS or 8.1+ application these are already present. If you embed the bundle into
 a custom application, install:
 
 ```bash
-composer require symfony/http-kernel symfony/dependency-injection symfony/config
+composer require symfony/http-kernel symfony/dependency-injection symfony/config symfony/yaml
 ```
 
 ## Register the Bundle
@@ -244,10 +244,12 @@ runtime.
 
 ## Remote Storage Backends
 
-For remote production storage, register a serializable
+For remote development and integration tests, register a serializable
 `FlysystemFilesystemFactory` as a Symfony service and run the adapter through a
-bounded worker pool. A direct `FilesystemOperator` service remains available
-for development, but its synchronous calls block the Amp event loop.
+bounded worker pool. A direct `FilesystemOperator` service is also available,
+but its synchronous calls block the Amp event loop. Production startup rejects
+generic Flysystem storage until its provider-specific late-write fence has been
+qualified; see [Storage Backends](storage-backends.md#flysystem).
 
 Install the adapter required by your backing storage. For an S3-compatible
 backing bucket:

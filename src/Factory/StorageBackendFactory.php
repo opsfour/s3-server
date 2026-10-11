@@ -25,7 +25,7 @@ final class StorageBackendFactory
 {
     /**
      * @param  string  $driver  One of: filesystem, flysystem, memory.
-     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
+     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
      */
     public static function create(
         string $driver,
@@ -48,7 +48,7 @@ final class StorageBackendFactory
     }
 
     /**
-     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
+     * @param array{filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int} $config
      */
     private static function createFlysystem(array $config, ?MetricsCollector $metrics): StorageBackend
     {
@@ -61,7 +61,14 @@ final class StorageBackendFactory
         if ($tempBudgetBytes === false) {
             throw new \InvalidArgumentException('Flysystem temp_budget_bytes must be a positive decimal integer.');
         }
-        $workerPoolSize = (int) ($config['worker_pool_size'] ?? 0);
+        $workerPoolSize = filter_var(
+            $config['worker_pool_size'] ?? 0,
+            FILTER_VALIDATE_INT,
+            ['options' => ['min_range' => 0]],
+        );
+        if ($workerPoolSize === false) {
+            throw new \InvalidArgumentException('Flysystem worker_pool_size must be a decimal integer >= 0.');
+        }
         if ($workerPoolSize > 0) {
             return new ParallelFlysystemBackend(
                 $config['filesystem_factory'] ?? throw new \InvalidArgumentException(

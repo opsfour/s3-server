@@ -27,6 +27,12 @@ php vendor/bin/s3-server \
 ### Laravel
 
 ```bash
+# Configure the required in-memory credentials in Laravel's .env first:
+S3_ACCESS_KEY=myAccessKey
+S3_SECRET_KEY=mySecretKey
+S3_OWNER_ID=local-account
+S3_DISPLAY_NAME="Local account"
+
 php artisan s3:serve --storage-path=./storage/s3
 ```
 

@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableBuffer;
 use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
+use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
@@ -63,5 +64,28 @@ final class StorageBackendFactoryTest extends TestCase
         self::assertSame([], glob($this->tempDir . '/s3fw-put-*') ?: []);
         self::assertSame([], glob($this->tempDir . '/.opsfour-s3-storage-budget/lease-*') ?: []);
         self::assertSame([], glob($this->tempDir . '/.opsfour-s3-storage-budget/state-*') ?: []);
+    }
+
+    public function test_negative_flysystem_worker_count_is_not_treated_as_synchronous_mode(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Flysystem worker_pool_size must be a decimal integer >= 0.');
+
+        StorageBackendFactory::create('flysystem', [
+            'filesystem' => new Filesystem(new InMemoryFlysystemAdapter()),
+            'temp_dir' => $this->tempDir,
+            'worker_pool_size' => -1,
+        ]);
+    }
+
+    public function test_negative_sqlite_worker_count_is_not_treated_as_synchronous_mode(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Metadata worker_pool_size must be a decimal integer >= 0.');
+
+        MetadataStoreFactory::create('sqlite', [
+            'path' => $this->tempDir . '/metadata.sqlite',
+            'worker_pool_size' => -1,
+        ]);
     }
 }

@@ -25,7 +25,7 @@ final class MetadataStoreFactory
 {
     /**
      * @param  string  $driver  One of: sqlite, postgres, mysql.
-     * @param  array{path?: string, dsn?: string, worker_pool_size?: int}  $config  Driver-specific configuration.
+     * @param  array{path?: string, dsn?: string, worker_pool_size?: int|string}  $config  Driver-specific configuration.
      */
     public static function create(string $driver, array $config = [], ?LoggerInterface $logger = null, ?MetricsCollector $metrics = null, bool $migrate = true): MetadataStore
     {
@@ -36,7 +36,14 @@ final class MetadataStoreFactory
             );
         }
 
-        $workerPoolSize = (int) ($config['worker_pool_size'] ?? 0);
+        $workerPoolSize = filter_var(
+            $config['worker_pool_size'] ?? 0,
+            FILTER_VALIDATE_INT,
+            ['options' => ['min_range' => 0]],
+        );
+        if ($workerPoolSize === false) {
+            throw new \InvalidArgumentException('Metadata worker_pool_size must be a decimal integer >= 0.');
+        }
 
         if (! $migrate) {
             if (! in_array($driver, ['postgres', 'mysql'], true)) {
