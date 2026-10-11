@@ -70,8 +70,10 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
         }
 
         $accessKeyId = rawurldecode(substr($path, strlen($prefix)));
-        if ($accessKeyId === '') {
-            return $this->json(['error' => 'invalid_request', 'message' => 'Access key ID is required.'], 400);
+        if ($accessKeyId === ''
+            || strlen($accessKeyId) > 255
+            || preg_match('/^[A-Za-z0-9_-]+$/D', $accessKeyId) !== 1) {
+            return $this->json(['error' => 'invalid_request', 'message' => 'Access key ID is invalid.'], 400);
         }
 
         if (!$this->credentialIssuer->revoke($accessKeyId)) {
@@ -106,12 +108,19 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
             throw new \InvalidArgumentException('Request body is too large.');
         }
 
-        $decoded = json_decode($raw, true);
-        if (!is_array($decoded)) {
+        $decoded = json_decode($raw);
+        if (!$decoded instanceof \stdClass) {
             throw new \InvalidArgumentException('Request body must be a JSON object.');
         }
 
-        return $decoded;
+        $body = get_object_vars($decoded);
+        foreach (array_keys($body) as $field) {
+            if ($field !== 'token' && $field !== 'ttlSeconds') {
+                throw new \InvalidArgumentException("Unknown field '{$field}'.");
+            }
+        }
+
+        return $body;
     }
 
     /**

@@ -134,6 +134,19 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame('Request body must be a JSON object.', $this->json($response)['message']);
     }
 
+    public function test_issue_rejects_unknown_fields(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            ['token' => 'idp-token', 'ttlSecond' => 3600],
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(400, $response->getStatus());
+        self::assertSame("Unknown field 'ttlSecond'.", $this->json($response)['message']);
+    }
+
     public function test_issue_rejects_oversized_body_without_throwing_buffer_exception(): void
     {
         $response = $this->createHandler()->handleRequest($this->request(
@@ -178,6 +191,23 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame(404, $response->getStatus());
         $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame(['error' => 'not_found'], $this->json($response));
+    }
+
+    public function test_revoke_rejects_invalid_access_key_id_before_provider_lookup(): void
+    {
+        $response = $this->createHandler()->handleRequest($this->request(
+            'DELETE',
+            '/.admin/credentials/' . rawurlencode('INVALID KEY'),
+            '',
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(400, $response->getStatus());
+        self::assertSame('no-store', $response->getHeader('cache-control'));
+        self::assertSame([
+            'error' => 'invalid_request',
+            'message' => 'Access key ID is invalid.',
+        ], $this->json($response));
     }
 
     public function test_unsupported_method_returns_no_store_and_allow_header(): void
