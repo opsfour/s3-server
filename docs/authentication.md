@@ -37,6 +37,9 @@ On Unix, file-provider writes require `ext-posix` so the writer can verify the
 effective user and every ancestor of the canonical credential directory.
 The directory must be private or root-owned and sticky (such as `/tmp`);
 secrets are written in a private temporary directory before an atomic move.
+Each JSON entry is validated strictly at startup. Unknown fields and fields with
+the wrong JSON type make startup fail instead of falling back to credential
+defaults.
 
 ```bash
 S3_CREDENTIALS_DRIVER=file
