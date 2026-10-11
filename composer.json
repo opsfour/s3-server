@@ -25,7 +25,7 @@
         "amphp/dns": "^2.4",
         "monolog/monolog": "^3.0",
         "amphp/pipeline": "^1.0",
-        "revolt/event-loop": "^1.0",
+        "revolt/event-loop": "^1.0.3",
         "psr/log": "^3.0",
         "symfony/console": "^7.4 || ^8.1",
         "league/flysystem": "^3.36.0",
@@ -45,7 +45,10 @@
         "symfony/dependency-injection": "^7.4 || ^8.1",
         "symfony/config": "^7.4 || ^8.1",
         "symfony/http-kernel": "^7.4 || ^8.1",
-        "league/flysystem-aws-s3-v3": "^3.0"
+        "league/flysystem-aws-s3-v3": "^3.35.2"
+    },
+    "conflict": {
+        "league/flysystem-aws-s3-v3": "<3.35.2"
     },
     "autoload": {
         "psr-4": {

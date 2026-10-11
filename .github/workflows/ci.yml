@@ -112,6 +112,20 @@ jobs:
 
       - run: composer show --direct
       - run: composer analyse
+
+      # The dependency-floor job intentionally installs old transitive
+      # packages that still emit PHP 8.4 deprecations during Composer autoload.
+      # Quality and the highest matrix continue to fail on all deprecations.
+      - name: Isolate lowest transitive dependency deprecations
+        if: matrix.dependencies == 'lowest'
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/opsfour-lowest-php-ini"
+          printf '%s\n' 'error_reporting = E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED' \
+            > "${RUNNER_TEMP}/opsfour-lowest-php-ini/99-opsfour-lowest.ini"
+          php -r 'printf("PHP_INI_SCAN_DIR=%s:%s/opsfour-lowest-php-ini\n", PHP_CONFIG_FILE_SCAN_DIR, getenv("RUNNER_TEMP"));' \
+            >> "${GITHUB_ENV}"
+
       - run: composer test
 
   metadata-backends:

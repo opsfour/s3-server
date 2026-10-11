@@ -48,6 +48,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Lifecycle action limits now apply across the complete sweep and resume fairly
   from a persisted bucket cursor.
 - API documentation now describes 69 routed S3 operations.
+- Raise the minimum Revolt event-loop version used by asynchronous shutdown
+  coordination, and require AWS Flysystem adapter 3.35.2 or newer when that
+  optional integration is installed.
 
 ### Fixed
 
