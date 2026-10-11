@@ -19,6 +19,7 @@ use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\InvalidRangeException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
@@ -77,12 +78,14 @@ final class GetObjectHandler implements RequestHandler
 
         if ($objectInfo === null) {
             BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            if ($versionId === null) {
-                $canList = MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
-                BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-                if (! $canList) {
-                    throw new \OpsFour\S3Server\Exception\AccessDeniedException();
-                }
+            if ($versionId !== null) {
+                throw new NoSuchVersionException();
+            }
+
+            $canList = MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+            BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            if (! $canList) {
+                throw new \OpsFour\S3Server\Exception\AccessDeniedException();
             }
             throw new NoSuchKeyException();
         }

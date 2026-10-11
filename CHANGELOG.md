@@ -79,6 +79,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   storing a smaller saturated value.
 - Complete the Laravel quick-start credentials with the required owner ID and
   display name.
+- Return `NoSuchVersion` from GET and HEAD when an explicitly selected object
+  version does not exist.
 
 ### Upgrade Notes
 

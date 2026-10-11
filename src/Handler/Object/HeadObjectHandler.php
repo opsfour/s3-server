@@ -13,6 +13,7 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -66,7 +67,11 @@ final class HeadObjectHandler implements RequestHandler
 
         if ($objectInfo === null) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            $denyMissingObject = $versionId === null && ! MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
+            if ($versionId !== null) {
+                throw new NoSuchVersionException();
+            }
+
+            $denyMissingObject = ! MissingObjectListVisibility::canList($this->metadata, $request, $bucket);
             // The list-visibility check may yield while the bucket is reused.
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             if ($denyMissingObject) {

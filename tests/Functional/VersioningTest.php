@@ -135,6 +135,28 @@ final class VersioningTest extends S3FunctionalTestCase
         $this->assertSame('v2 content', (string) $getV2['Body']);
     }
 
+    #[Depends('test_enable_versioning')]
+    public function test_get_and_head_unknown_explicit_version_return_no_such_version(): void
+    {
+        foreach (['getObject', 'headObject'] as $operation) {
+            try {
+                self::$s3->{$operation}([
+                    'Bucket' => self::$bucket,
+                    'Key' => 'missing-version.txt',
+                    'VersionId' => 'missing-version-id',
+                ]);
+                self::fail("Expected {$operation} to reject an unknown explicit version.");
+            } catch (S3Exception $error) {
+                self::assertSame(404, $error->getStatusCode(), $operation);
+                self::assertSame(
+                    $operation === 'getObject' ? 'NoSuchVersion' : 'NotFound',
+                    $error->getAwsErrorCode(),
+                    $operation,
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Delete markers
     // -----------------------------------------------------------------
@@ -276,7 +298,7 @@ final class VersioningTest extends S3FunctionalTestCase
             $this->fail('Expected 404 for deleted version');
         } catch (S3Exception $e) {
             $this->assertSame(404, $e->getStatusCode());
-            $this->assertSame('NoSuchKey', $e->getAwsErrorCode());
+            $this->assertSame('NoSuchVersion', $e->getAwsErrorCode());
         }
 
         // v2 should still be accessible.

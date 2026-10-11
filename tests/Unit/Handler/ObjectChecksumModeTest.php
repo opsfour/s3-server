@@ -12,6 +12,7 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -125,6 +126,23 @@ final class ObjectChecksumModeTest extends TestCase
         $request->setUri(Http::new('http://127.0.0.1/bucket/key?partNumber=1'));
 
         $this->expectException(NotImplementedException::class);
+        ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
+            ->handleRequest($request);
+    }
+
+    /** @param 'GET'|'HEAD' $method */
+    #[DataProvider('methods')]
+    public function test_unknown_explicit_version_uses_no_such_version(string $method): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadataByVersion')->with('bucket', 'key', 'missing')->willReturn(null);
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+        $request = $this->request($method);
+        $request->setUri(Http::new('http://127.0.0.1/bucket/key?versionId=missing'));
+
+        $this->expectException(NoSuchVersionException::class);
         ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
             ->handleRequest($request);
     }
