@@ -19,11 +19,13 @@ use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectTagValidator;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
+use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -89,6 +91,8 @@ final class CreateMultipartUploadHandler implements RequestHandler
         // Direct handler construction without a storage registry retains the
         // historical STANDARD tier. Registered runtimes pass their actual tier.
         $storageTier = $this->storageTiers?->defaultTier()->name ?? 'STANDARD';
+        $objectLockConfig = $this->metadata->getObjectLockConfig($bucket);
+        ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
         (new ObjectLockRequestApplier($this->metadata))->validate($request, $bucket);
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId)
             ?? AclGrantResolver::privateAcl($ownerId);
@@ -108,11 +112,13 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $userMetadata = UserMetadataExtractor::extract($request);
         $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT;
         $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
+        $userMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY]
+            = ObjectLockConfigurationSnapshot::fingerprint($objectLockConfig);
 
         // Preserve standard HTTP metadata for CompleteMultipartUpload.
-        $contentEncoding = $request->getHeader('content-encoding');
+        $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
         $contentDisposition = $request->getHeader('content-disposition');
-        $cacheControl = $request->getHeader('cache-control');
+        $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
         $storageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($request->getHeader('x-amz-storage-class'));
 
         if ($contentEncoding !== null) {
@@ -168,6 +174,10 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants, $request, $encryptionMode, $tierStore, $storageTier): void {
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            ObjectLockConfigurationSnapshot::assertCurrent(
+                $request,
+                $this->metadata->getObjectLockConfig($bucket),
+            );
             $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
             \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
             if ($encryptionMode === null && $bucketEncryption !== null) {

@@ -117,6 +117,8 @@ final class CorsMiddleware implements Middleware
             if ($metadata->getBucket($bucket)?->generation !== $observedBucket->generation) {
                 return null;
             }
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
         } catch (\Throwable $e) {
             $this->logger?->warning('CORS rule lookup failed.', [
                 'exception' => $e::class,

@@ -22,6 +22,47 @@ use PHPUnit\Framework\TestCase;
 
 final class BoundedMultipartFormParserTest extends TestCase
 {
+    /** @param list<string> $names */
+    #[\PHPUnit\Framework\Attributes\DataProvider('duplicateChecksumFormFieldNames')]
+    public function test_checksum_form_field_names_are_unique_case_insensitively(array $names): void
+    {
+        $body = '';
+        foreach ($names as $index => $name) {
+            $body .= "--guard-boundary\r\n"
+                . 'Content-Disposition: form-data; name="' . $name . "\"\r\n\r\n"
+                . "value-{$index}\r\n";
+        }
+        $body .= "--guard-boundary--\r\n";
+        $parser = new PostObjectFormParser($this->createMock(CredentialProvider::class), 'us-east-1', 1_048_576);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('POST Object form field names must be non-empty and unique.');
+        $parser->parse($this->request(new ReadableBuffer($body), 'guard-boundary'));
+    }
+
+    /** @return iterable<string, array{list<string>}> */
+    public static function duplicateChecksumFormFieldNames(): iterable
+    {
+        yield 'Content-MD5 lower then upper' => [['content-md5', 'Content-MD5']];
+        yield 'Content-MD5 upper then lower' => [['Content-MD5', 'content-md5']];
+        yield 'SDK checksum lower then mixed' => [['x-amz-checksum-sha256', 'X-Amz-Checksum-Sha256']];
+        yield 'SDK checksum mixed then lower' => [['X-Amz-Checksum-Sha256', 'x-amz-checksum-sha256']];
+    }
+
+    public function test_repeated_content_type_is_rejected_before_form_parsing(): void
+    {
+        $request = $this->request(new ReadableBuffer(''), 'guard-boundary');
+        $request->setHeader('Content-Type', [
+            'multipart/form-data; boundary=guard-boundary',
+            'multipart/form-data; boundary=other-boundary',
+        ]);
+        $parser = new PostObjectFormParser($this->createMock(CredentialProvider::class), 'us-east-1', 1_048_576);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('content-type must be supplied at most once.');
+        $parser->parse($request);
+    }
+
     public function test_unterminated_first_part_header_is_rejected_before_spooling(): void
     {
         $body = "--guard-boundary\r\nX-Long: " . str_repeat('a', 20_000);

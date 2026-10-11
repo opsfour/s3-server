@@ -177,7 +177,7 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         }
     }
 
-    public function test_cancellation_after_arm_before_submit_retires_exact_dispatch(): void
+    public function test_cancellation_after_arm_survives_cleanup_budget_failure_and_retires_dispatch(): void
     {
         $directory = sys_get_temp_dir() . '/s3-part-worker-' . bin2hex(random_bytes(8));
         $root = $directory . '/storage';
@@ -193,12 +193,17 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         $uploadId = bin2hex(random_bytes(16));
         $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
         $cancellation = new DeferredCancellation();
+        $cancellationReason = new \RuntimeException('request cancelled');
         $intents = $this->createMock(FencedMultipartPartWriteIntentStore::class);
         $intents->method('reserveLocalMultipartPartWriteIntent')->willReturnCallback($metadata->reserveLocalMultipartPartWriteIntent(...));
         $intents->method('armLocalMultipartPartWriteIntent')->willReturnCallback(
-            static function (string $bucket, string $upload, string $path, string $dispatch) use ($metadata, $cancellation): bool {
+            static function (string $bucket, string $upload, string $path, string $dispatch) use ($metadata, $cancellation, $cancellationReason, $scratch): bool {
                 $armed = $metadata->armLocalMultipartPartWriteIntent($bucket, $upload, $path, $dispatch);
-                $cancellation->cancel();
+                $states = glob($scratch . '/.opsfour-s3-storage-budget/state-*') ?: [];
+                if (count($states) !== 1 || file_put_contents($states[0], '{corrupt') === false) {
+                    throw new \RuntimeException('Could not corrupt the staging budget fixture.');
+                }
+                $cancellation->cancel($cancellationReason);
                 return $armed;
             },
         );
@@ -209,10 +214,66 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
             $outcome = $writer->publish('bucket', $generation, $uploadId, 1, new ReadableBuffer('payload'), $cancellation->getCancellation());
             self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $outcome->state);
             self::assertInstanceOf(\Amp\CancelledException::class, $outcome->error);
+            self::assertSame($cancellationReason, $outcome->error->getPrevious());
             self::assertFileDoesNotExist($outcome->path);
             $query = $this->pdo($metadata)->query("SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'");
             self::assertInstanceOf(\PDOStatement::class, $query);
             self::assertSame(0, (int) $query->fetchColumn());
+        } finally {
+            $writer->shutdown();
+            $this->removeDirectory($directory);
+        }
+    }
+
+    public function test_validation_failure_remains_before_dispatch_when_scratch_budget_cleanup_fails(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-part-worker-' . bin2hex(random_bytes(8));
+        $root = $directory . '/storage';
+        $scratch = $directory . '/scratch';
+        self::assertTrue(mkdir($directory, 0700));
+        self::assertTrue(mkdir($root, 0700));
+        self::assertTrue(mkdir($scratch, 0700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $generation = $metadata->getBucket('bucket')?->generation;
+        self::assertNotNull($generation);
+        $uploadId = bin2hex(random_bytes(16));
+        $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
+        $worker = $this->createMock(Worker::class);
+        $worker->expects(self::never())->method('submit');
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->method('getWorker')->willReturn($worker);
+        $primary = new \OpsFour\S3Server\Exception\BadDigestException('primary checksum failure');
+        $writer = new LocalFencedMultipartPartWriter($root, $scratch, 'STANDARD', $metadata, writePool: $pool);
+        try {
+            $outcome = $writer->publish(
+                'bucket',
+                $generation,
+                $uploadId,
+                1,
+                new ReadableBuffer('payload'),
+                validateBeforeArm: static function () use ($scratch, $primary): never {
+                    $states = glob($scratch . '/.opsfour-s3-storage-budget/state-*') ?: [];
+                    self::assertCount(1, $states);
+                    self::assertNotFalse(file_put_contents($states[0], '{corrupt'));
+                    throw $primary;
+                },
+            );
+            self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $outcome->state);
+            self::assertSame($primary, $outcome->error);
+            self::assertNull($outcome->dispatchId);
+            self::assertNull($outcome->result);
+            self::assertFileDoesNotExist($outcome->path);
+            $query = $this->pdo($metadata)->query("SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'");
+            self::assertInstanceOf(\PDOStatement::class, $query);
+            self::assertSame(0, (int) $query->fetchColumn());
+
+            $later = $writer->publish('bucket', $generation, $uploadId, 1, new ReadableBuffer('later'));
+            self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $later->state);
+            self::assertInstanceOf(\RuntimeException::class, $later->error);
+            self::assertSame('Storage staging reservation is corrupt.', $later->error->getMessage());
+            self::assertFileDoesNotExist($later->path);
         } finally {
             $writer->shutdown();
             $this->removeDirectory($directory);

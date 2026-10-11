@@ -18,6 +18,22 @@ use Psr\Log\LoggerInterface;
 
 final class RateLimitFailureTest extends TestCase
 {
+    public function test_metadata_cancellation_is_not_converted_into_slow_down(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('rateLimitCheck')->willThrowException($cancellation);
+        $terminal = new RateLimitTerminalHandler();
+
+        try {
+            (new RateLimitMiddleware($metadata, 2.0))->handleRequest($this->request(), $terminal);
+            self::fail('Cancellation must leave the rate-limit boundary unchanged.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertFalse($terminal->handled);
+        }
+    }
+
     public function test_metadata_error_fails_closed_without_exposing_backend_details(): void
     {
         $metadata = $this->createMock(MetadataStore::class);

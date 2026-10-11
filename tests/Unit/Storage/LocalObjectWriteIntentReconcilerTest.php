@@ -5,7 +5,13 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\CancelledException;
+use Amp\Parallel\Worker\Execution;
+use Amp\Parallel\Worker\Task;
+use Amp\Parallel\Worker\WorkerPool;
+use Amp\Sync\Channel;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -15,6 +21,9 @@ use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\async;
+use function Amp\delay;
 
 final class LocalObjectWriteIntentReconcilerTest extends TestCase
 {
@@ -164,6 +173,44 @@ final class LocalObjectWriteIntentReconcilerTest extends TestCase
 
         $this->reconciler()->reconcile($newClaim);
         self::assertSame('sealed', $this->metadata->getObjectWriteIntent($reserved->attemptId)->state);
+    }
+
+    public function test_worker_cancellation_is_not_replaced_by_heartbeat_failure(): void
+    {
+        $claimed = $this->asClaim($this->reserve());
+        $metadata = $this->createMock(ObjectWriteIntentStore::class);
+        $metadata->expects(self::once())->method('getObjectWriteIntent')->with($claimed->attemptId)->willReturn($claimed);
+        $metadata->expects(self::once())->method('renewObjectWriteClaim')
+            ->willThrowException(new \RuntimeException('heartbeat failed'));
+        $metadata->expects(self::never())->method('sealObjectWriteIntent');
+
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::once())->method('submit')->willReturnCallback(function () use ($cancellation): Execution {
+            $future = async(static function () use ($cancellation): void {
+                delay(0.02);
+                throw $cancellation;
+            });
+
+            return new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                $future,
+            );
+        });
+        $reconciler = new LocalObjectWriteIntentReconciler(
+            $metadata,
+            $this->tiers,
+            'STANDARD',
+            sealPool: $pool,
+        );
+
+        try {
+            $reconciler->reconcile($claimed, claimLeaseSeconds: 0.003);
+            self::fail('Heartbeat failure must not replace worker cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
     }
 
     private function reserve(): ObjectWriteIntent

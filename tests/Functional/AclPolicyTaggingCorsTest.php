@@ -143,7 +143,7 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
             'Policy' => $policy,
         ]);
 
-        $this->assertSame(204, $putResult['@metadata']['statusCode']);
+        $this->assertSame(200, $putResult['@metadata']['statusCode']);
 
         // Get policy.
         $getResult = self::$s3->getBucketPolicy([

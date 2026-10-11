@@ -137,6 +137,8 @@ final class RequestBodySpool
                 $this->frameIndexes[$created] = 0;
 
                 return $created;
+            } catch (\Amp\CancelledException $e) {
+                throw $e;
             } catch (\Throwable $e) {
                 if ($attempt === 2) {
                     throw new InternalErrorException('Unable to create request-body temporary file.', $e);
@@ -196,6 +198,8 @@ final class RequestBodySpool
                     $deleted = true;
 
                     return;
+                } catch (\Amp\CancelledException $e) {
+                    throw $e;
                 } catch (\Throwable $e) {
                     if ($attempt === self::DELETE_ATTEMPTS) {
                         throw $e;
@@ -232,6 +236,8 @@ final class RequestBodySpool
                 offset: $now - self::STALE_AFTER_SECONDS,
                 length: self::SWEEP_LIMIT,
             ))->await();
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
         } catch (\Throwable) {
             // Request processing can continue; failed cleanup is retried by a
             // later sweep and individual deletes still have their own retries.

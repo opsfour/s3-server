@@ -23,6 +23,7 @@ use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
+use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
@@ -89,6 +90,9 @@ final class UploadPartHandler implements RequestHandler
         if (($upload['bucket_generation'] ?? '') !== $bucketInfo->generation) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
         }
+        $objectLockConfig = $this->assertObjectLockConfiguration($bucket, $upload['user_metadata']);
+        ObjectLockConfigurationSnapshot::assertCurrent($request, $objectLockConfig);
+        ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
         $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
         $uploadStorage = $uploadTier->backend;
         $storageTier = $uploadTier->name;
@@ -151,6 +155,7 @@ final class UploadPartHandler implements RequestHandler
             }
             $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
             $body = MultipartPartSize::boundedBody($request->getBody(), min(MultipartPartSize::MAX_BYTES, $this->maxEncryptedObjectSize));
+            $writeCancellation = null;
             try {
                 [$plaintext, $checksums] = BufferedSsePayload::read($body, $this->maxEncryptedObjectSize);
                 $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
@@ -214,7 +219,10 @@ final class UploadPartHandler implements RequestHandler
                             $plannedPartPath,
                         );
                     } catch (\Throwable $e) {
-                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                            $e,
+                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath),
+                        );
                         throw $e;
                     }
                 }
@@ -233,12 +241,19 @@ final class UploadPartHandler implements RequestHandler
                     $checksums->sha1Base64(),
                     $checksums->sha256Base64(),
                 );
+            } catch (\Amp\CancelledException $error) {
+                $writeCancellation = $error;
+                throw $error;
             } finally {
-                $body->close();
-                $lock->release();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $writeCancellation,
+                    $body->close(...),
+                    $lock->release(...),
+                );
             }
         } else {
             $body = MultipartPartSize::boundedBody($request->getBody());
+            $writeCancellation = null;
             try {
                 if ($this->localPartWriter !== null) {
                     $validated = null;
@@ -281,7 +296,10 @@ final class UploadPartHandler implements RequestHandler
                     try {
                         $writeResult = $plannedPartStorage->putPartAtPath($bucket, $key, $uploadId, $partNumber, $body, $plannedPartPath);
                     } catch (\Throwable $e) {
-                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                            $e,
+                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath),
+                        );
                         throw $e;
                     }
                     if ($writeResult->path !== $plannedPartPath) {
@@ -291,8 +309,14 @@ final class UploadPartHandler implements RequestHandler
                 } else {
                     $writeResult = $uploadStorage->putPart($bucket, $key, $uploadId, $partNumber, $body);
                 }
+            } catch (\Amp\CancelledException $error) {
+                $writeCancellation = $error;
+                throw $error;
             } finally {
-                $body->close();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $writeCancellation,
+                    $body->close(...),
+                );
             }
         }
         try {
@@ -300,9 +324,14 @@ final class UploadPartHandler implements RequestHandler
             $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
             MultipartPartLogicalValidator::assertValid($clientChecksums, $writeResult, $declaredLength);
         } catch (\Throwable $e) {
-            if ($writeResult->path !== '') {
-                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
-            }
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                function () use ($writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId): void {
+                    if ($writeResult->path !== '') {
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+                    }
+                },
+            );
             throw $e;
         }
 
@@ -350,6 +379,11 @@ final class UploadPartHandler implements RequestHandler
                 if (($activeUpload['storage_tier'] ?? null) !== $storageTier) {
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload storage tier changed during part write.');
                 }
+                $objectLockConfig = $this->assertObjectLockConfiguration(
+                    $bucket,
+                    $activeUpload['user_metadata'],
+                );
+                ObjectLockConfigurationSnapshot::assertCurrent($request, $objectLockConfig);
                 foreach ($this->metadata->getParts($uploadId) as $part) {
                     if ($part['part_number'] === $partNumber) {
                         $previousPartPath = $part['storage_path'];
@@ -400,9 +434,14 @@ final class UploadPartHandler implements RequestHandler
         } catch (\Throwable $e) {
             // A returned callback does not prove COMMIT failed: the database
             // may still publish this part after an acknowledgment failure.
-            if (FailedPartCommitCleanup::shouldDelete($commitCallbackCompleted, $this->metadata, $uploadId, $partNumber, $writeResult->path)) {
-                $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
-            }
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                function () use ($commitCallbackCompleted, $uploadId, $partNumber, $writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath): void {
+                    if (FailedPartCommitCleanup::shouldDelete($commitCallbackCompleted, $this->metadata, $uploadId, $partNumber, $writeResult->path)) {
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+                    }
+                },
+            );
             throw $e;
         }
 
@@ -415,6 +454,8 @@ final class UploadPartHandler implements RequestHandler
                     $storageTier,
                     $previousPartPath,
                 );
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
             } catch (\Throwable) {
                 // The committed exact-path job remains for the collector.
             }
@@ -424,6 +465,32 @@ final class UploadPartHandler implements RequestHandler
             status: 200,
             headers: $responseHeaders,
         );
+    }
+
+    /**
+     * @param array<string, string> $uploadMetadata
+     * @return array<string, mixed>|null
+     */
+    private function assertObjectLockConfiguration(string $bucket, array $uploadMetadata): ?array
+    {
+        $config = $this->metadata->getObjectLockConfig($bucket);
+        $configurationFingerprint = $uploadMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY] ?? null;
+        if (is_string($configurationFingerprint)) {
+            ObjectLockConfigurationSnapshot::assertFingerprint($configurationFingerprint, $config);
+
+            return $config;
+        }
+        if (isset($uploadMetadata['__object-lock-mode'])
+            || isset($uploadMetadata['__object-lock-retain-until-date'])
+            || isset($uploadMetadata['__object-lock-legal-hold'])
+            || (($config['objectLockEnabled'] ?? null) === 'Enabled'
+                && isset($config['rule']['defaultRetention']))) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Object Lock multipart upload must be reinitiated with checksum protection.',
+            );
+        }
+
+        return $config;
     }
 
     private function consumeFencedIntent(string $bucket, string $uploadId, string $path, string $dispatchId): bool

@@ -39,6 +39,7 @@ final class EncryptedTempReadableStream implements \IteratorAggregate, ReadableS
         }
     }
 
+    /** @throws \Amp\CancelledException */
     public function read(?Cancellation $cancellation = null): ?string
     {
         if ($this->closed) {
@@ -77,7 +78,10 @@ final class EncryptedTempReadableStream implements \IteratorAggregate, ReadableS
 
             return $plaintext;
         } catch (\Throwable $error) {
-            $this->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $error,
+                $this->close(...),
+            );
             throw $error;
         }
     }
@@ -93,11 +97,13 @@ final class EncryptedTempReadableStream implements \IteratorAggregate, ReadableS
             return;
         }
         $this->closed = true;
-        $this->source->close();
+        /** @var list<callable(): void> $cleanups */
+        $cleanups = [$this->source->close(...)];
         foreach ($this->onCloseCallbacks as $callback) {
-            $callback();
+            $cleanups[] = $callback;
         }
         $this->onCloseCallbacks = [];
+        \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(null, ...$cleanups);
     }
 
     public function isClosed(): bool

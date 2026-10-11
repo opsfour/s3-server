@@ -84,6 +84,8 @@ final class HealthCheckHandler implements RequestHandler
             try {
                 // Lightweight probe: fetch a non-existent bucket.
                 $this->metadata->getBucket('__health_check__');
+            } catch (\Amp\CancelledException $e) {
+                throw $e;
             } catch (\Throwable $e) {
                 return $this->degraded('metadata', $e);
             }
@@ -92,6 +94,8 @@ final class HealthCheckHandler implements RequestHandler
         if ($this->credentialHealthProbe !== null) {
             try {
                 $this->credentialHealthProbe->assertCredentialStoreAvailable();
+            } catch (\Amp\CancelledException $e) {
+                throw $e;
             } catch (\Throwable $e) {
                 return $this->degraded('credentials', $e);
             }
@@ -104,12 +108,13 @@ final class HealthCheckHandler implements RequestHandler
                 // A normal "limit exhausted" result still proves the database call worked.
                 $this->metadata->rateLimitCheck('__rate_limit_health__', 1.0, 1.0);
                 $this->rateLimitHealthy = true;
+            } catch (\Amp\CancelledException $e) {
+                throw $e;
             } catch (\Throwable $e) {
                 $this->rateLimitHealthy = false;
                 $this->logDegraded('rate_limit', $e);
-            } finally {
-                $this->lastRateLimitCheckAt = hrtime(true) / 1e9;
             }
+            $this->lastRateLimitCheckAt = hrtime(true) / 1e9;
         }
         if ($this->rateLimitEnabled && ! $this->rateLimitHealthy) {
             return $this->degradedResponse();
@@ -118,14 +123,17 @@ final class HealthCheckHandler implements RequestHandler
         if ($this->metadata !== null && $this->storageTiers !== null) {
             if (hrtime(true) / 1e9 - $this->lastTierReferenceCheckAt >= max(0, $this->tierReferenceCheckIntervalSeconds)) {
                 try {
-                    $this->missingReferencedTier = null;
+                    $missingReferencedTier = null;
                     foreach ($this->metadata->listReferencedStorageTiers() as $name) {
                         if (!$this->storageTiers->has($name)) {
-                            $this->missingReferencedTier = $name;
+                            $missingReferencedTier = $name;
                             break;
                         }
                     }
+                    $this->missingReferencedTier = $missingReferencedTier;
                     $this->lastTierReferenceCheckAt = hrtime(true) / 1e9;
+                } catch (\Amp\CancelledException $e) {
+                    throw $e;
                 } catch (\Throwable $e) {
                     return $this->degraded('metadata', $e);
                 }
@@ -164,6 +172,8 @@ final class HealthCheckHandler implements RequestHandler
                             throw new \RuntimeException('Local storage root is not writable.');
                         }
                     }
+                } catch (\Amp\CancelledException $e) {
+                    throw $e;
                 } catch (\Throwable $e) {
                     return $this->degraded('storage:' . $tier->name, $e);
                 }
@@ -195,6 +205,8 @@ final class HealthCheckHandler implements RequestHandler
         try {
             $this->efsEvidence->assertFresh();
             return true;
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
         } catch (\Throwable $error) {
             $this->efsEvidenceLost = true;
             $this->logDegraded('efs_evidence', $error);
@@ -214,6 +226,8 @@ final class HealthCheckHandler implements RequestHandler
         try {
             $this->admissionEvidence->assertFresh();
             return true;
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
         } catch (\Throwable $error) {
             $this->admissionEvidenceLost = true;
             $this->logDegraded('efs_admission', $error);

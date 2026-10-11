@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableIterableStream;
+use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Parallel\Worker\ContextWorkerPool;
@@ -169,7 +170,7 @@ final class LocalFencedObjectWriterTest extends TestCase
         }
     }
 
-    public function test_cancellation_after_arm_but_before_submit_retires_exact_object_dispatch(): void
+    public function test_cancellation_after_arm_survives_cleanup_budget_failure_and_retires_dispatch(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
@@ -187,8 +188,14 @@ final class LocalFencedObjectWriterTest extends TestCase
             'put_object',
         );
         $cancel = new DeferredCancellation();
-        $sql = new class ($metadata, $cancel) implements LocalObjectWriteLeaseSql, LocalObjectWriteTerminalRetirementSql {
-            public function __construct(private SqliteMetadataStore $metadata, private DeferredCancellation $cancel) {}
+        $cancellationReason = new \RuntimeException('request cancelled');
+        $sql = new class ($metadata, $cancel, $cancellationReason, $this->scratch) implements LocalObjectWriteLeaseSql, LocalObjectWriteTerminalRetirementSql {
+            public function __construct(
+                private SqliteMetadataStore $metadata,
+                private DeferredCancellation $cancel,
+                private \Throwable $cancellationReason,
+                private string $scratch,
+            ) {}
 
             public function reserve(ObjectWriteIntent $planned, float $leaseSeconds): ObjectWriteIntent
             {
@@ -199,7 +206,11 @@ final class LocalFencedObjectWriterTest extends TestCase
             {
                 $armed = $this->metadata->armObjectWriteIntent($current->attemptId, $current->leaseUntil, $dispatchId, $leaseSeconds);
                 if ($armed !== null) {
-                    $this->cancel->cancel();
+                    $states = glob($this->scratch . '/.opsfour-s3-storage-budget/state-*') ?: [];
+                    if (count($states) !== 1 || file_put_contents($states[0], '{corrupt') === false) {
+                        throw new \RuntimeException('Could not corrupt the staging budget fixture.');
+                    }
+                    $this->cancel->cancel($this->cancellationReason);
                 }
 
                 return $armed;
@@ -226,8 +237,94 @@ final class LocalFencedObjectWriterTest extends TestCase
             $outcome = $writer->publishWithLease($lease->reservedIntent(), 'key', new ReadableBuffer('payload'), $lease, $cancel->getCancellation());
             self::assertSame(LocalObjectWriteOutcome::BEFORE_DISPATCH, $outcome->state);
             self::assertNull($outcome->result);
+            self::assertInstanceOf(CancelledException::class, $outcome->error);
+            self::assertSame($cancellationReason, $outcome->error->getPrevious());
             self::assertNull($metadata->getObjectWriteIntent($attempt));
             self::assertFileDoesNotExist($planned->storagePath);
+        } finally {
+            $lease->close();
+            $writer->shutdown();
+        }
+    }
+
+    public function test_arm_failure_remains_before_dispatch_when_scratch_budget_cleanup_fails(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $generation = $metadata->getBucket('bucket')?->generation;
+        self::assertNotNull($generation);
+        $attempt = bin2hex(random_bytes(16));
+        $planned = new ObjectWriteIntent(
+            $attempt,
+            'bucket',
+            $generation,
+            'owner',
+            'STANDARD',
+            (new LocalObjectWriteFence($this->root))->planPath('bucket', 'key', $generation, $attempt),
+            'put_object',
+        );
+        $sql = new class ($metadata, $this->scratch) implements LocalObjectWriteLeaseSql, LocalObjectWriteTerminalRetirementSql {
+            public int $retireCalls = 0;
+
+            public function __construct(
+                private SqliteMetadataStore $metadata,
+                private string $scratch,
+            ) {}
+
+            public function reserve(ObjectWriteIntent $planned, float $leaseSeconds): ObjectWriteIntent
+            {
+                return $this->metadata->reserveObjectWriteIntent($planned, $leaseSeconds);
+            }
+
+            public function arm(ObjectWriteIntent $current, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+            {
+                $armed = $this->metadata->armObjectWriteIntent($current->attemptId, $current->leaseUntil, $dispatchId, $leaseSeconds);
+                $states = glob($this->scratch . '/.opsfour-s3-storage-budget/state-*') ?: [];
+                if ($armed === null || count($states) !== 1 || file_put_contents($states[0], '{corrupt') === false) {
+                    throw new \RuntimeException('Could not prepare the lost-arm cleanup fixture.');
+                }
+
+                // Simulate a lost SQL acknowledgement after the durable arm.
+                return null;
+            }
+
+            public function retireTerminalPreLink(string $attemptId, string $dispatchId): bool
+            {
+                ++$this->retireCalls;
+
+                return $this->metadata->retireTerminalPreLinkObjectWriteIntent($attemptId, $dispatchId);
+            }
+        };
+        $renewer = new class ($metadata) implements LocalObjectWriteLeaseRenewer {
+            public function __construct(private SqliteMetadataStore $metadata) {}
+
+            public function renew(ObjectWriteIntent $current, float $leaseSeconds): ?ObjectWriteIntent
+            {
+                return $this->metadata->renewObjectWriteIntent($current->attemptId, $current->leaseUntil, $leaseSeconds);
+            }
+        };
+        $method = new \ReflectionMethod(LocalObjectWriteLeaseGuard::class, 'reserveWithOperations');
+        $lease = $method->invoke(null, $planned, $sql, $renewer, new LocalObjectWriteLeaseAdmission(1));
+        self::assertInstanceOf(LocalObjectWriteLeaseGuard::class, $lease);
+        $unexpectedWorkerLink = $this->base . '/unexpected-worker-link';
+        $fault = new LocalObjectWriteFaultIo();
+        $fault->linkEnteredPath = $unexpectedWorkerLink;
+        $fault->releaseLinkPath = $this->base . '/unexpected-worker-release';
+        $writer = new LocalFencedObjectWriter($this->root, $this->scratch, 'STANDARD', workerIo: $fault);
+        try {
+            $outcome = $writer->publishWithLease($lease->reservedIntent(), 'key', new ReadableBuffer('payload'), $lease);
+            self::assertSame(LocalObjectWriteOutcome::BEFORE_DISPATCH, $outcome->state);
+            self::assertNull($outcome->result);
+            self::assertInstanceOf(\RuntimeException::class, $outcome->error);
+            self::assertSame('Local write intent arm did not commit the expected token.', $outcome->error->getMessage());
+            self::assertSame(0, $sql->retireCalls);
+            self::assertFileDoesNotExist($planned->storagePath);
+            self::assertFileDoesNotExist($unexpectedWorkerLink);
+
+            $retained = $metadata->getObjectWriteIntent($attempt);
+            self::assertNotNull($retained);
+            self::assertNotNull($retained->dispatchId);
         } finally {
             $lease->close();
             $writer->shutdown();

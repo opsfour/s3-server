@@ -19,6 +19,18 @@ use Psr\Log\LoggerInterface;
 
 final class ErrorHandlingDisclosureTest extends TestCase
 {
+    public function test_cancellation_is_not_converted_into_an_s3_error_response(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+
+        try {
+            $this->dispatch($cancellation);
+            self::fail('Cancellation must leave the request boundary unchanged.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
     public function test_internal_exception_details_are_not_sent_to_s3_client(): void
     {
         $secret = 'postgres://user:password@internal-db.example/private';

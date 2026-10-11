@@ -38,6 +38,7 @@ final class ChecksumValidationMiddleware implements Middleware
 
         $tempPath = $this->spool->create('s3-sha256-');
         $reader = null;
+        $primaryFailure = null;
 
         try {
             $hash = hash_init('sha256');
@@ -58,11 +59,30 @@ final class ChecksumValidationMiddleware implements Middleware
             $request->setBody($reader);
 
             return $requestHandler->handleRequest($request);
+        } catch (\Throwable $error) {
+            $primaryFailure = $error;
+            throw $error;
         } finally {
-            $reader?->close();
+            $closeFailure = null;
+            try {
+                $reader?->close();
+            } catch (\Throwable $error) {
+                $closeFailure = $error;
+            }
+            $deleteCancellation = null;
             try {
                 $this->spool->delete($tempPath);
+            } catch (\Amp\CancelledException $error) {
+                $deleteCancellation = $error;
             } catch (\Throwable) {
+            }
+            if ($primaryFailure === null) {
+                if ($closeFailure !== null) {
+                    throw $closeFailure;
+                }
+                if ($deleteCancellation !== null) {
+                    throw $deleteCancellation;
+                }
             }
         }
     }

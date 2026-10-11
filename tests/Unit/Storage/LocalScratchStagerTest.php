@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableIterableStream;
+use Amp\ByteStream\ReadableStream;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
@@ -192,6 +193,30 @@ final class LocalScratchStagerTest extends TestCase
                 self::assertSame([], glob($this->scratch . '/.opsfour-s3-storage-budget/lease-*'));
                 self::assertSame('0', file_get_contents($this->scratch . '/.opsfour-s3-storage-budget/total'));
             }
+        } finally {
+            $stager->shutdown();
+        }
+    }
+
+    public function test_cancellation_is_not_replaced_by_temp_budget_release_failure(): void
+    {
+        $stager = new LocalScratchStager($this->scratch, 8);
+        $cancellation = new CancelledException();
+        $body = $this->createMock(ReadableStream::class);
+        $body->method('read')->willReturnCallback(function () use ($cancellation): never {
+            $states = glob($this->scratch . '/.opsfour-s3-storage-budget/state-*') ?: [];
+            self::assertCount(1, $states);
+            self::assertNotFalse(file_put_contents($states[0], '{corrupt'));
+
+            throw $cancellation;
+        });
+
+        try {
+            $stager->stage(str_repeat('f', 32), $body);
+            self::fail('Temp-budget cleanup failure must not replace cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], glob($this->scratch . '/s3fw-put-*'));
         } finally {
             $stager->shutdown();
         }

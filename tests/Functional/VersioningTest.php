@@ -573,6 +573,112 @@ final class VersioningTest extends S3FunctionalTestCase
         self::deleteBucketWithDiagnostics($lockBucket);
     }
 
+    public function test_object_lock_multipart_requires_valid_part_checksum_end_to_end(): void
+    {
+        $bucket = 'test-lock-multipart-' . bin2hex(random_bytes(5));
+        $key = 'locked-multipart.txt';
+        $body = 'object lock multipart payload';
+        $uploadId = null;
+        $versionId = null;
+        self::$s3->createBucket([
+            'Bucket' => $bucket,
+            'ObjectLockEnabledForBucket' => true,
+        ]);
+
+        try {
+            self::$s3->putObjectLockConfiguration([
+                'Bucket' => $bucket,
+                'ObjectLockConfiguration' => [
+                    'ObjectLockEnabled' => 'Enabled',
+                    'Rule' => ['DefaultRetention' => ['Mode' => 'GOVERNANCE', 'Days' => 1]],
+                ],
+            ]);
+            $uploadId = self::$s3->createMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+            ])['UploadId'];
+
+            $withoutAutomaticChecksum = self::makeClient(requestChecksumCalculation: 'when_required');
+            try {
+                $withoutAutomaticChecksum->uploadPart([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'PartNumber' => 1,
+                    'Body' => $body,
+                ]);
+                self::fail('Object Lock UploadPart accepted a missing checksum.');
+            } catch (\Aws\S3\Exception\S3Exception $error) {
+                self::assertSame('InvalidRequest', $error->getAwsErrorCode());
+            }
+
+            try {
+                self::$s3->uploadPart([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'PartNumber' => 1,
+                    'Body' => $body,
+                    'ChecksumSHA256' => base64_encode(hash('sha256', 'wrong payload', true)),
+                ]);
+                self::fail('Object Lock UploadPart accepted a mismatched checksum.');
+            } catch (\Aws\S3\Exception\S3Exception $error) {
+                self::assertSame('BadDigest', $error->getAwsErrorCode());
+            }
+
+            $part = self::$s3->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 1,
+                'Body' => $body,
+                'ChecksumSHA256' => base64_encode(hash('sha256', $body, true)),
+            ]);
+            $completed = self::$s3->completeMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [[
+                    'PartNumber' => 1,
+                    'ETag' => $part['ETag'],
+                ]]],
+            ]);
+            $uploadId = null;
+            $versionId = $completed['VersionId'];
+
+            self::assertSame($body, (string) self::$s3->getObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'VersionId' => $versionId,
+            ])['Body']);
+            self::assertSame('GOVERNANCE', self::$s3->getObjectRetention([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'VersionId' => $versionId,
+            ])['Retention']['Mode']);
+        } finally {
+            if ($uploadId !== null) {
+                try {
+                    self::$s3->abortMultipartUpload([
+                        'Bucket' => $bucket,
+                        'Key' => $key,
+                        'UploadId' => $uploadId,
+                    ]);
+                } catch (\Throwable) {
+                }
+            }
+            if ($versionId !== null) {
+                self::$s3->deleteObject([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                    'VersionId' => $versionId,
+                    'BypassGovernanceRetention' => true,
+                ]);
+            }
+            self::deleteBucketWithDiagnostics($bucket);
+        }
+    }
+
     /** @param iterable<array<string, mixed>> $grants */
     private function hasAllUsersReadGrant(iterable $grants): bool
     {

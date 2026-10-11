@@ -139,10 +139,17 @@ final readonly class ObservedStorageBackend implements ShutdownAwareStorageBacke
             }
 
             $source = new LimitedReadableStream($this->inner->getObjectByPath($srcPath), $maxBytes);
+            $cancellation = null;
             try {
                 return $this->inner->putObject($dstBucket, $dstKey, $source);
+            } catch (\Amp\CancelledException $error) {
+                $cancellation = $error;
+                throw $error;
             } finally {
-                $source->close();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $cancellation,
+                    $source->close(...),
+                );
             }
         });
     }

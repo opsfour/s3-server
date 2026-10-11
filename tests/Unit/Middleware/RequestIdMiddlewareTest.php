@@ -55,6 +55,33 @@ final class RequestIdMiddlewareTest extends TestCase
         self::assertNull($response->getHeader('Connection'));
     }
 
+    public function test_nested_request_id_middleware_reuses_the_global_identity(): void
+    {
+        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/bucket'));
+        $inner = new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(200, [
+                    'x-observed-request-id' => (string) $request->getAttribute('requestId'),
+                    'x-observed-host-id' => (string) $request->getAttribute('amzId2'),
+                ]);
+            }
+        };
+        $nested = new class ($inner) implements RequestHandler {
+            public function __construct(private readonly RequestHandler $inner) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                return (new RequestIdMiddleware())->handleRequest($request, $this->inner);
+            }
+        };
+
+        $response = (new RequestIdMiddleware())->handleRequest($request, $nested);
+
+        self::assertSame($response->getHeader('x-amz-request-id'), $response->getHeader('x-observed-request-id'));
+        self::assertSame($response->getHeader('x-amz-id-2'), $response->getHeader('x-observed-host-id'));
+    }
+
     public function test_http_one_head_advertises_the_connection_close_used_by_the_wire_writer(): void
     {
         $request = new Request($this->createMock(Client::class), 'HEAD', Http::new('http://127.0.0.1/missing'));

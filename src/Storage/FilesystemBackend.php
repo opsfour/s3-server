@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use Amp\ByteStream\ReadableStream;
+use Amp\CancelledException;
 use Amp\File;
 use Amp\File\Driver\ParallelFilesystemDriver;
 use Amp\File\FilesystemException;
@@ -248,8 +249,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
             self::closeAndRelease($tempFile);
             $this->assertTempFileSize($tempPath, $size);
+        } catch (CancelledException $e) {
+            self::safeCloseAndRelease($tempFile);
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
-            self::closeAndRelease($tempFile);
+            self::safeCloseAndRelease($tempFile);
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to write object to filesystem backend.', $e);
         }
@@ -267,6 +272,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             } else {
                 $this->atomicMove($tempPath, $finalPath);
             }
+        } catch (CancelledException $e) {
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize object in filesystem backend.', $e);
@@ -307,6 +315,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                 $file->seek($offset);
             }
             $this->efsEvidence?->assertFresh();
+        } catch (CancelledException $e) {
+            self::safeCloseAndRelease($file);
+            throw $e;
         } catch (\Throwable $e) {
             if ($this->efsEvidence !== null) {
                 // The legacy test profile never serves production EFS. After
@@ -501,8 +512,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
             self::closeAndRelease($tempFile);
             $this->assertTempFileSize($tempPath, $size);
+        } catch (CancelledException $e) {
+            self::safeCloseAndRelease($tempFile);
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
-            self::closeAndRelease($tempFile);
+            self::safeCloseAndRelease($tempFile);
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to write multipart part to filesystem backend.', $e);
         }
@@ -518,6 +533,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             } else {
                 $this->atomicMove($tempPath, $partPath);
             }
+        } catch (CancelledException $e) {
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize multipart part in filesystem backend.', $e);
@@ -739,8 +757,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
             self::closeAndRelease($outFile);
             $this->assertTempFileSize($tempPath, $size);
+        } catch (CancelledException $e) {
+            self::safeCloseAndRelease($outFile);
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
-            self::closeAndRelease($outFile);
+            self::safeCloseAndRelease($outFile);
             $this->safeDelete($tempPath);
 
             if ($e instanceof InternalErrorException) {
@@ -762,6 +784,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $this->ensureDirectory($targetDir);
             $this->publishFencedMultipartPath($tempPath, $finalPath);
             $this->safeDelete($tempPath);
+        } catch (CancelledException $e) {
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize assembled object in filesystem backend.', $e);
@@ -851,9 +876,14 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             self::closeAndRelease($srcFile);
             self::closeAndRelease($dstFile);
             $this->assertTempFileSize($tempPath, $size);
+        } catch (CancelledException $e) {
+            self::safeCloseAndRelease($srcFile);
+            self::safeCloseAndRelease($dstFile);
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
-            self::closeAndRelease($srcFile);
-            self::closeAndRelease($dstFile);
+            self::safeCloseAndRelease($srcFile);
+            self::safeCloseAndRelease($dstFile);
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to copy object in filesystem backend.', $e);
         }
@@ -868,6 +898,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $this->ensureDirectory($targetDir);
             $this->efsEvidence?->assertFresh();
             $this->atomicMove($tempPath, $finalPath);
+        } catch (CancelledException $e) {
+            $this->safeDelete($tempPath);
+            throw $e;
         } catch (\Throwable $e) {
             $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize copied object in filesystem backend.', $e);
@@ -1210,6 +1243,16 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             // ParallelFilesystemDriver releases its reserved worker when the
             // ParallelFile object is destroyed, not merely when close() returns.
             $file = null;
+        }
+    }
+
+    /** @param-out null $file */
+    private static function safeCloseAndRelease(?\Amp\File\File &$file): void
+    {
+        try {
+            self::closeAndRelease($file);
+        } catch (\Throwable) {
+            // Cleanup must never replace the exception that triggered it.
         }
     }
 

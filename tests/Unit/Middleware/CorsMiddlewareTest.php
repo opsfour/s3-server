@@ -39,6 +39,26 @@ final class CorsMiddlewareTest extends TestCase
         @unlink($this->databasePath . '-shm');
     }
 
+    public function test_rule_lookup_cancellation_is_not_converted_into_a_cors_denial(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('getBucket')->willThrowException($cancellation);
+
+        try {
+            (new CorsMiddleware($metadata))->handleRequest(
+                $this->request('OPTIONS', [
+                    'Origin' => 'https://client.example',
+                    'Access-Control-Request-Method' => 'PUT',
+                ]),
+                $this->terminal(),
+            );
+            self::fail('Cancellation must leave the CORS boundary unchanged.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
     public function test_preflight_matches_allowed_header_wildcard_and_echoes_requested_headers(): void
     {
         $this->metadata->putBucketCors('bucket-a', [$this->rule(['x-amz-*', 'content-type'])]);

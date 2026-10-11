@@ -136,9 +136,9 @@ final class PutObjectHandler implements RequestHandler
 
         // 3. Extract metadata from request headers.
         $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
-        $contentEncoding = $request->getHeader('content-encoding');
+        $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
         $contentDisposition = $request->getHeader('content-disposition');
-        $cacheControl = $request->getHeader('cache-control');
+        $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
         $expires = $request->getHeader('expires');
 
         // Storage class (default STANDARD).
@@ -153,6 +153,7 @@ final class PutObjectHandler implements RequestHandler
         }
 
         $localLease = null;
+        $requestCancellation = null;
         try {
             $declaredLength = self::declaredObjectLength($request);
             // 3. SSE payloads are encrypted before the first object-storage write.
@@ -168,6 +169,7 @@ final class PutObjectHandler implements RequestHandler
                 );
             } else {
                 $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+                $encryptionCancellation = null;
                 try {
                     [$plaintext, $plainChecksums] = BufferedSsePayload::read($request->getBody(), $this->maxEncryptedObjectSize);
                     [$encMeta, $ciphertext] = $this->encryptPayload($request, $plaintext, $encryptionMode);
@@ -186,8 +188,14 @@ final class PutObjectHandler implements RequestHandler
                         sha1Base64: $plainChecksums->sha1Base64(),
                         sha256Base64: $plainChecksums->sha256Base64(),
                     );
+                } catch (\Amp\CancelledException $error) {
+                    $encryptionCancellation = $error;
+                    throw $error;
                 } finally {
-                    $bufferedWorkLock->release();
+                    \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                        $encryptionCancellation,
+                        $bufferedWorkLock->release(...),
+                    );
                 }
             }
 
@@ -507,10 +515,15 @@ final class PutObjectHandler implements RequestHandler
                 // deleting a possibly published object.
                 // The transaction can throw while committing after its callback
                 // has set this by-reference safety flag.
-                if (! $publicationCallbackCompleted
-                    && ! $this->mayBePublishedAfterCommitFailure($bucket, $key, $result->path, $versionId, $versioning, $metadataWriteAttempted)) {
-                    $this->deleteUncommittedPath($bucket, $result->path);
-                }
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                    $e,
+                    function () use ($publicationCallbackCompleted, $bucket, $key, $result, $versionId, $versioning, $metadataWriteAttempted): void {
+                        if (! $publicationCallbackCompleted
+                            && ! $this->mayBePublishedAfterCommitFailure($bucket, $key, $result->path, $versionId, $versioning, $metadataWriteAttempted)) {
+                            $this->deleteUncommittedPath($bucket, $result->path);
+                        }
+                    },
+                );
                 throw $e;
             }
 
@@ -560,8 +573,16 @@ final class PutObjectHandler implements RequestHandler
                 status: 200,
                 headers: $headers,
             );
+        } catch (\Amp\CancelledException $error) {
+            $requestCancellation = $error;
+            throw $error;
         } finally {
-            $localLease?->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $requestCancellation,
+                static function () use ($localLease): void {
+                    $localLease?->close();
+                },
+            );
         }
     }
 
@@ -609,6 +630,8 @@ final class PutObjectHandler implements RequestHandler
                     $entry['tier'],
                     $entry['path'],
                 );
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
             } catch (\Throwable) {
                 // The exact cleanup job was committed with the replacement.
             }

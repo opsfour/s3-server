@@ -126,6 +126,7 @@ final class SelectObjectContentHandler implements RequestHandler
         // Parse request XML.
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 262_144);
         $config = self::parseSelectRequest($body);
+        $selectCancellation = null;
         try {
             SqlParser::parse($config['expression']);
         } catch (\RuntimeException $e) {
@@ -208,10 +209,14 @@ final class SelectObjectContentHandler implements RequestHandler
             );
         } catch (SelectMemoryLimitException) {
             throw new SlowDownException('S3 Select exceeded the buffered memory budget.');
-        } catch (CancelledException) {
-            throw new SlowDownException('S3 Select request was cancelled.');
+        } catch (CancelledException $error) {
+            $selectCancellation = $error;
+            throw $error;
         } finally {
-            $bufferedWorkLock->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $selectCancellation,
+                $bufferedWorkLock->release(...),
+            );
         }
     }
 
@@ -220,6 +225,7 @@ final class SelectObjectContentHandler implements RequestHandler
         $limit = min($this->maxSelectObjectSize, SelectMemoryGuard::MAX_INPUT_BYTES);
         $chunks = [];
         $length = 0;
+        $readCancellation = null;
         try {
             while (($chunk = $source->read($cancellation)) !== null) {
                 $chunkLength = strlen($chunk);
@@ -239,8 +245,14 @@ final class SelectObjectContentHandler implements RequestHandler
             $memoryGuard->check();
 
             return $result;
+        } catch (CancelledException $error) {
+            $readCancellation = $error;
+            throw $error;
         } finally {
-            $source->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $readCancellation,
+                $source->close(...),
+            );
         }
     }
 
@@ -268,6 +280,9 @@ final class SelectObjectContentHandler implements RequestHandler
             $worker = self::acquireWorker($workerPool, $cancellation);
         } catch (CancelledException $e) {
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent', false, $e::class);
+            if ($clientCancellation?->isRequested() || ! $timeout->isRequested()) {
+                throw $e;
+            }
             throw new SlowDownException('S3 Select worker acquisition was cancelled.');
         }
 
@@ -278,9 +293,10 @@ final class SelectObjectContentHandler implements RequestHandler
             $execution = $worker->submit($task, $cancellation);
         } catch (CancelledException $e) {
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent', false, $e::class);
-            throw new SlowDownException($clientCancellation?->isRequested()
-                ? 'S3 Select request was cancelled.'
-                : 'S3 Select processing timed out.');
+            if ($clientCancellation?->isRequested() || ! $timeout->isRequested()) {
+                throw $e;
+            }
+            throw new SlowDownException('S3 Select processing timed out.');
         }
 
         try {
@@ -290,9 +306,10 @@ final class SelectObjectContentHandler implements RequestHandler
         } catch (CancelledException $e) {
             $worker->kill();
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent', false, $e::class);
-            throw new SlowDownException($clientCancellation?->isRequested()
-                ? 'S3 Select request was cancelled.'
-                : 'S3 Select processing timed out.');
+            if ($clientCancellation?->isRequested() || ! $timeout->isRequested()) {
+                throw $e;
+            }
+            throw new SlowDownException('S3 Select processing timed out.');
         } catch (TaskFailureThrowable $e) {
             $this->metrics?->recordWorkerPoolTask('select', 'SelectObjectContent', false, $e->getOriginalClassName());
             if ($e->getOriginalClassName() === SelectSqlException::class) {

@@ -163,6 +163,7 @@ final class GetObjectHandler implements RequestHandler
             \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService($this->encryption);
             \assert($this->encryption !== null);
             $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+            $decryptionCancellation = null;
             try {
                 // Size guard: encrypted objects must be fully buffered for decryption.
                 if ($objectInfo->size > $this->maxEncryptedObjectSize) {
@@ -211,8 +212,14 @@ final class GetObjectHandler implements RequestHandler
                     $body = $plaintext;
                     $contentLength = $decryptedSize;
                 }
+            } catch (\Amp\CancelledException $error) {
+                $decryptionCancellation = $error;
+                throw $error;
             } finally {
-                $bufferedWorkLock->release();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $decryptionCancellation,
+                    $bufferedWorkLock->release(...),
+                );
             }
         } else {
             // A corrupt or custom backend must not send more bytes than the
@@ -378,6 +385,7 @@ final class GetObjectHandler implements RequestHandler
     {
         $chunks = [];
         $readBytes = 0;
+        $cancellation = null;
         try {
             while (($chunk = $source->read()) !== null) {
                 $chunkSize = strlen($chunk);
@@ -387,8 +395,14 @@ final class GetObjectHandler implements RequestHandler
                 $chunks[] = $chunk;
                 $readBytes += $chunkSize;
             }
+        } catch (\Amp\CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $source->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $cancellation,
+                $source->close(...),
+            );
         }
 
         if ($readBytes !== $expectedSize) {

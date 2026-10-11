@@ -11,6 +11,7 @@ use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
 
@@ -74,7 +75,7 @@ final class PostObjectFormParser
 
     public function parse(Request $request): PostObjectForm
     {
-        $contentType = $request->getHeader('content-type') ?? '';
+        $contentType = RequestHeaderValues::singleton($request, 'content-type') ?? '';
         // The multipart boundary itself is limited to 70 bytes by RFC 2046.
         // Bound the whole header before the upstream boundary regex sees it.
         if (strlen($contentType) > 1_024) {
@@ -180,6 +181,7 @@ final class PostObjectFormParser
                         $file->close();
                         throw new \RuntimeException('Browser POST temporary file changed before writing.');
                     }
+                    $writeCancellation = null;
                     try {
                         $frameIndex = 0;
                         $fileBytes = 0;
@@ -198,8 +200,14 @@ final class PostObjectFormParser
                                 $fileBytes += $frameBytes;
                             }
                         }
+                    } catch (\Amp\CancelledException $error) {
+                        $writeCancellation = $error;
+                        throw $error;
                     } finally {
-                        $file->close();
+                        \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                            $writeCancellation,
+                            $file->close(...),
+                        );
                     }
                     clearstatcache(true, $filePath);
                     if (@filesize($filePath) !== $fileBytes) {
@@ -247,17 +255,25 @@ final class PostObjectFormParser
 
             return $form;
         } catch (\Throwable $e) {
-            $activeField?->close();
-            try {
-                if ($filePath !== null) {
-                    \Amp\File\deleteFile($filePath);
-                }
-            } catch (\Throwable) {
-            } finally {
-                if ($reservation !== null) {
-                    $this->spoolCoordinator->release($reservation, $filePath === null || !file_exists($filePath));
-                }
-            }
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                static function () use ($activeField): void {
+                    $activeField?->close();
+                },
+                static function () use ($filePath): void {
+                    try {
+                        if ($filePath !== null) {
+                            \Amp\File\deleteFile($filePath);
+                        }
+                    } catch (\Throwable) {
+                    }
+                },
+                function () use ($reservation, $filePath): void {
+                    if ($reservation !== null) {
+                        $this->spoolCoordinator->release($reservation, $filePath === null || !file_exists($filePath));
+                    }
+                },
+            );
 
             throw $e;
         }
@@ -555,6 +571,8 @@ final class PostObjectFormParser
                 $request->setHeader('x-amz-acl', $value);
             } elseif ($lower === 'tagging') {
                 $request->setHeader('x-amz-tagging', $value);
+            } elseif ($lower === 'content-md5') {
+                $request->setHeader('content-md5', $value);
             } elseif (str_starts_with($lower, 'x-amz-meta-')
                 || str_starts_with($lower, 'x-amz-checksum-')
                 || str_starts_with($lower, 'x-amz-server-side-encryption')

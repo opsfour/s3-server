@@ -5,11 +5,17 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Middleware;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\CancelledException;
+use Amp\Future;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Parallel\Worker\ContextWorkerPool;
+use Amp\Parallel\Worker\Execution;
+use Amp\Parallel\Worker\Task;
+use Amp\Parallel\Worker\WorkerPool;
+use Amp\Sync\Channel;
 use Amp\TimeoutCancellation;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
@@ -25,6 +31,148 @@ use function Amp\Future\await;
 
 final class RequestBodySpoolTest extends TestCase
 {
+    public function test_stale_sweep_cancellation_is_not_ignored_before_create(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::once())->method('submit')->willReturn(new Execution(
+            $this->createMock(Task::class),
+            $this->createMock(Channel::class),
+            Future::error($cancellation),
+        ));
+
+        try {
+            try {
+                (new RequestBodySpool($pool, $tempDir))->create('s3-md5-');
+                self::fail('Sweep cancellation must stop request processing.');
+            } catch (CancelledException $error) {
+                self::assertSame($cancellation, $error);
+            }
+        } finally {
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    /** @param class-string<ContentMd5Middleware|ChecksumValidationMiddleware> $middlewareClass */
+    #[\PHPUnit\Framework\Attributes\DataProvider('checksumMiddlewareClasses')]
+    public function test_checksum_consumer_propagates_spool_delete_cancellation(string $middlewareClass): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $path = $tempDir . '/active.tmp';
+        self::assertSame(0, file_put_contents($path, ''));
+        self::assertTrue(chmod($path, 0o600));
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(4))->method('submit')->willReturnOnConsecutiveCalls(
+            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete('0')),
+            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete($path)),
+            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete(null)),
+            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::error($cancellation)),
+        );
+        $middleware = new $middlewareClass(new RequestBodySpool($pool, $tempDir));
+        $handler = new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(204);
+            }
+        };
+
+        try {
+            try {
+                $middleware->handleRequest($this->checksumRequest('abc'), $handler);
+                self::fail('Spool delete cancellation must propagate through its consumer.');
+            } catch (CancelledException $error) {
+                self::assertSame($cancellation, $error);
+            }
+        } finally {
+            @unlink($path);
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    /** @return iterable<string, array{class-string<ContentMd5Middleware|ChecksumValidationMiddleware>}> */
+    public static function checksumMiddlewareClasses(): iterable
+    {
+        yield 'Content-MD5' => [ContentMd5Middleware::class];
+        yield 'SigV4 SHA-256' => [ChecksumValidationMiddleware::class];
+    }
+
+    public function test_create_worker_cancellation_is_not_retried_or_converted(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(2))->method('submit')->willReturnOnConsecutiveCalls(
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                Future::complete('0'),
+            ),
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                Future::error($cancellation),
+            ),
+        );
+
+        try {
+            try {
+                (new RequestBodySpool($pool, $tempDir))->create('s3-md5-');
+                self::fail('Cancellation must not be retried or converted.');
+            } catch (CancelledException $error) {
+                self::assertSame($cancellation, $error);
+            }
+        } finally {
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    public function test_delete_worker_cancellation_is_not_retried_or_converted_and_releases_state(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $path = $tempDir . '/s3-md5-existing.tmp';
+        self::assertSame(0, file_put_contents($path, ''));
+        self::assertTrue(chmod($path, 0o600));
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(3))->method('submit')->willReturnOnConsecutiveCalls(
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                Future::complete('0'),
+            ),
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                Future::complete($path),
+            ),
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                Future::error($cancellation),
+            ),
+        );
+        $spool = new RequestBodySpool($pool, $tempDir);
+        self::assertSame($path, $spool->create('s3-md5-'));
+
+        try {
+            $spool->delete($path);
+            self::fail('Cancellation must not be retried or converted.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            $spool->assertIdle();
+            self::assertFileExists($path);
+        } finally {
+            @unlink($path);
+            self::removeTempDir($tempDir);
+        }
+    }
+
     public function test_md5_sha256_and_browser_post_share_one_budget_across_spool_instances(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));

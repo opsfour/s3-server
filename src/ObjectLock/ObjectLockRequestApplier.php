@@ -39,6 +39,7 @@ final readonly class ObjectLockRequestApplier
             : $request->getHeader('x-amz-object-lock-legal-hold');
         $hasHeaders = $mode !== null || $retainUntil !== null || $legalHold !== null;
         $config = $this->metadata->getObjectLockConfig($bucket);
+        ObjectLockConfigurationSnapshot::assertCurrent($request, $config);
 
         if ($config === null) {
             if ($hasHeaders) {

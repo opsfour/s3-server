@@ -179,6 +179,272 @@ final class MultipartCompletionRetryTest extends TestCase
         }
     }
 
+    public function test_object_lock_default_change_after_initiation_rejects_completion_before_assembly(): void
+    {
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $this->metadata->putObjectLockConfig('bucket', ['objectLockEnabled' => 'Enabled']);
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'));
+        $etag = (string) $part->getHeader('ETag');
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+        $this->metadata->putObjectLockConfig('bucket', [
+            'objectLockEnabled' => 'Enabled',
+            'rule' => ['defaultRetention' => ['mode' => 'GOVERNANCE', 'days' => 1]],
+        ]);
+
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->expects(self::never())->method('assembleMultipartUploadAtPath');
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))
+                ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body));
+            self::fail('A multipart upload completed after its Object Lock checksum contract changed.');
+        } catch (OperationAbortedException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertCount(1, $this->metadata->getParts($uploadId));
+        }
+    }
+
+    public function test_object_lock_default_change_rejects_part_copy_before_commit_and_cleans_written_part(): void
+    {
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $this->metadata->putObjectLockConfig('bucket', ['objectLockEnabled' => 'Enabled']);
+        $source = $this->storage->putObject('bucket', 'source.bin', new \Amp\ByteStream\ReadableBuffer('payload'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            7,
+            '"' . md5('payload') . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $copyRequest = fn(): Request => $this->request(
+            'PUT',
+            '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+            headers: ['x-amz-copy-source' => '/bucket/source.bin'],
+        );
+
+        $writtenPath = null;
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturnCallback($this->storage->getObjectByPath(...));
+        $storage->method('putPart')->willReturnCallback(function (string $bucket, string $key, string $id, int $number, \Amp\ByteStream\ReadableStream $body) use (&$writtenPath): StorageWriteResult {
+            $result = $this->storage->putPart($bucket, $key, $id, $number, $body);
+            $writtenPath = $result->path;
+            $this->metadata->putObjectLockConfig('bucket', [
+                'objectLockEnabled' => 'Enabled',
+                'rule' => ['defaultRetention' => ['mode' => 'GOVERNANCE', 'days' => 1]],
+            ]);
+
+            return $result;
+        });
+        $storage->method('deleteObjectByPath')->willReturnCallback($this->storage->deleteObjectByPath(...));
+
+        try {
+            (new UploadPartCopyHandler($this->metadata, $storage))->handleRequest($copyRequest());
+            self::fail('Copied part committed after the Object Lock configuration changed during its write.');
+        } catch (OperationAbortedException) {
+            self::assertNotNull($writtenPath);
+            self::assertStoragePathMissing($this->storage, $writtenPath);
+            self::assertSame([], $this->metadata->getParts($uploadId));
+        }
+
+        $storageBeforeWrite = $this->createMock(StorageBackend::class);
+        $storageBeforeWrite->expects(self::never())->method('putPart');
+        $this->expectException(OperationAbortedException::class);
+        (new UploadPartCopyHandler($this->metadata, $storageBeforeWrite))->handleRequest($copyRequest());
+    }
+
+    public function test_part_write_cancellation_is_not_replaced_when_durable_cleanup_cannot_be_queued(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->metadataWithCleanupFailures();
+        $storage = $this->createMock(RecoverableMultipartPartBackend::class);
+        $storage->method('planMultipartPartPath')->willReturn('uncommitted-part');
+        $storage->method('putPartAtPath')->willThrowException($cancellation);
+        $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('delete failed'));
+
+        try {
+            (new UploadPartHandler($metadata, $storage))->handleRequest($this->request(
+                'PUT',
+                '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+                'payload',
+            ));
+            self::fail('The part write cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_part_copy_cancellation_is_not_replaced_when_durable_cleanup_cannot_be_queued(): void
+    {
+        $source = $this->storage->putObject('bucket', 'source.bin', new \Amp\ByteStream\ReadableBuffer('payload'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            7,
+            '"' . md5('payload') . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->metadataWithCleanupFailures();
+        $storage = $this->createMock(RecoverableMultipartPartBackend::class);
+        $storage->method('getObjectByPath')->willReturnCallback($this->storage->getObjectByPath(...));
+        $storage->method('planMultipartPartPath')->willReturn('uncommitted-copy-part');
+        $storage->method('putPartAtPath')->willThrowException($cancellation);
+        $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('delete failed'));
+
+        try {
+            (new UploadPartCopyHandler($metadata, $storage))->handleRequest($this->request(
+                'PUT',
+                '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+                headers: ['x-amz-copy-source' => '/bucket/source.bin'],
+            ));
+            self::fail('The part copy cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_completion_cancellation_is_not_replaced_when_attempt_abandonment_fails(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'));
+        $etag = (string) $part->getHeader('ETag');
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->metadataWithCleanupFailures(failAbandon: true);
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->method('planMultipartCompletionPaths')->willReturnCallback($this->storage->planMultipartCompletionPaths(...));
+        $storage->method('assembleMultipartUploadAtPath')->willThrowException($cancellation);
+
+        try {
+            (new CompleteMultipartUploadHandler($metadata, $storage))->handleRequest(
+                $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body),
+            );
+            self::fail('The assembly cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_copy_metadata_cancellation_is_not_replaced_when_durable_cleanup_cannot_be_queued(): void
+    {
+        $source = $this->storage->putObject('bucket', 'source.bin', new \Amp\ByteStream\ReadableBuffer('payload'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            7,
+            '"' . md5('payload') . '"',
+            'application/octet-stream',
+            $source->path,
+        );
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
+            $name = $method->getName();
+            if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true)) {
+                continue;
+            }
+            $metadata->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
+        }
+        $metadata->method('transaction')->willThrowException($cancellation);
+        $metadata->method('enqueueStorageGarbage')->willThrowException(new \RuntimeException('cleanup queue failed'));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturnCallback($this->storage->getObjectByPath(...));
+        $storage->method('putObject')->willReturnCallback($this->storage->putObject(...));
+        $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('delete failed'));
+        $request = $this->request(
+            'PUT',
+            '/bucket/retry.bin',
+            headers: ['x-amz-copy-source' => '/bucket/source.bin'],
+        );
+        $request->setAttribute('s3.operation', \OpsFour\S3Server\Routing\S3Operation::CopyObject);
+
+        try {
+            (new CopyObjectHandler($metadata, $storage))->handleRequest($request);
+            self::fail('The copy metadata cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    /** @param array<string, string> $userMetadata */
+    #[DataProvider('legacyObjectLockMetadata')]
+    public function test_legacy_locked_multipart_completion_is_rejected_before_assembly(array $userMetadata): void
+    {
+        $uploadId = bin2hex(random_bytes(16));
+        $this->metadata->createMultipartUpload(
+            $uploadId,
+            'bucket',
+            'retry.bin',
+            'owner',
+            'application/octet-stream',
+            $userMetadata,
+        );
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('assembleMultipartUpload');
+
+        $this->expectException(OperationAbortedException::class);
+        (new CompleteMultipartUploadHandler($this->metadata, $storage))->handleRequest(
+            $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId),
+        );
+    }
+
+    /** @return iterable<string, array{array<string, string>}> */
+    public static function legacyObjectLockMetadata(): iterable
+    {
+        yield 'retention' => [[
+            '__object-lock-mode' => 'GOVERNANCE',
+            '__object-lock-retain-until-date' => '2099-01-01T00:00:00Z',
+        ]];
+        yield 'legal hold' => [['__object-lock-legal-hold' => 'ON']];
+    }
+
+    public function test_legacy_multipart_completion_is_rejected_when_default_retention_is_now_active(): void
+    {
+        $uploadId = bin2hex(random_bytes(16));
+        $this->metadata->createMultipartUpload(
+            $uploadId,
+            'bucket',
+            'retry.bin',
+            'owner',
+            'application/octet-stream',
+            [],
+        );
+        $this->metadata->putObjectLockConfig('bucket', [
+            'objectLockEnabled' => 'Enabled',
+            'rule' => ['defaultRetention' => ['mode' => 'GOVERNANCE', 'days' => 1]],
+        ]);
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('assembleMultipartUpload');
+
+        $this->expectException(OperationAbortedException::class);
+        (new CompleteMultipartUploadHandler($this->metadata, $storage))->handleRequest(
+            $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId),
+        );
+    }
+
     #[DataProvider('completionVersioningModes')]
     public function test_plain_multipart_completion_rejects_sse_activation_during_assembly_and_cleans_path(bool $versioned): void
     {
@@ -2919,6 +3185,35 @@ final class MultipartCompletionRetryTest extends TestCase
             $this->metadata->transaction($callback);
             throw new \RuntimeException('lost part commit acknowledgement');
         });
+
+        return $proxy;
+    }
+
+    private function metadataWithCleanupFailures(bool $failAbandon = false): MetadataStore&FencedMultipartPartWriteIntentStore&MultipartWriteIntentStore
+    {
+        $proxy = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            FencedMultipartPartWriteIntentStore::class,
+            MultipartWriteIntentStore::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $proxy);
+        self::assertInstanceOf(FencedMultipartPartWriteIntentStore::class, $proxy);
+        self::assertInstanceOf(MultipartWriteIntentStore::class, $proxy);
+        $seen = [];
+        foreach ([MetadataStore::class, FencedMultipartPartWriteIntentStore::class, MultipartWriteIntentStore::class] as $contract) {
+            foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
+                $name = $method->getName();
+                if (isset($seen[$name]) || $name === 'enqueueStorageGarbage' || ($failAbandon && $name === 'abandonMultipartWriteIntent')) {
+                    continue;
+                }
+                $seen[$name] = true;
+                $proxy->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
+            }
+        }
+        $proxy->method('enqueueStorageGarbage')->willThrowException(new \RuntimeException('cleanup queue failed'));
+        if ($failAbandon) {
+            $proxy->method('abandonMultipartWriteIntent')->willThrowException(new \RuntimeException('abandon failed'));
+        }
 
         return $proxy;
     }

@@ -211,6 +211,10 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
                 if ($stage !== null) {
                     $this->stager->cleanup($stage);
                 }
+            } catch (\Throwable) {
+                // This call is still definitely before dispatch. Preserve its
+                // original outcome; corrupt scratch accounting makes later
+                // reservations fail closed independently.
             } finally {
                 unset($writeWorker);
                 $permit?->release();

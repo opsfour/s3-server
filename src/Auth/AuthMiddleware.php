@@ -12,6 +12,7 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\S3Exception;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 
@@ -277,7 +278,7 @@ final class AuthMiddleware implements AuthenticationMiddleware
     private function removeAwsChunkedContentEncoding(Request $request): void
     {
         $encodings = array_values(array_filter(
-            array_map('trim', explode(',', $request->getHeader('content-encoding') ?? '')),
+            array_map('trim', explode(',', RequestHeaderValues::combined($request, 'content-encoding') ?? '')),
             static fn(string $encoding): bool => strtolower($encoding) !== 'aws-chunked' && $encoding !== '',
         ));
         if ($encodings === []) {

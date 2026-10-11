@@ -72,7 +72,10 @@ final class ParallelFlysystemReadableStream implements \IteratorAggregate, Reada
         try {
             $cancellation?->throwIfRequested();
         } catch (CancelledException $error) {
-            $this->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $error,
+                $this->close(...),
+            );
             throw $error;
         }
         if ($this->pending) {
@@ -150,7 +153,10 @@ final class ParallelFlysystemReadableStream implements \IteratorAggregate, Reada
                     $error = $taskError;
                 }
             }
-            $this->finish(false, $error::class);
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $error,
+                fn() => $this->finish(false, $error::class),
+            );
             if ($error instanceof CancelledException) {
                 throw $error;
             }
@@ -166,20 +172,27 @@ final class ParallelFlysystemReadableStream implements \IteratorAggregate, Reada
             return;
         }
         $this->closed = true;
+        /** @var list<callable(): void> $cleanups */
+        $cleanups = [];
         if (! $success) {
-            try {
-                $this->execution->getChannel()->send('cancel');
-            } catch (\Throwable) {
-                // A failed worker may already have closed its channel.
-            }
-            $this->taskCancellation->cancel();
+            $cleanups[] = function (): void {
+                try {
+                    $this->execution->getChannel()->send('cancel');
+                } catch (\Throwable) {
+                    // A failed worker may already have closed its channel.
+                }
+            };
+            $cleanups[] = $this->taskCancellation->cancel(...);
         }
-        $this->execution->getChannel()->close();
-        $this->metrics?->recordWorkerPoolTask($this->poolName, 'streamObject', $success, $errorClass);
+        $cleanups[] = $this->execution->getChannel()->close(...);
+        $cleanups[] = function () use ($success, $errorClass): void {
+            $this->metrics?->recordWorkerPoolTask($this->poolName, 'streamObject', $success, $errorClass);
+        };
         foreach ($this->onCloseCallbacks as $onClose) {
-            $onClose();
+            $cleanups[] = $onClose;
         }
         $this->onCloseCallbacks = [];
+        \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(null, ...$cleanups);
     }
 
     private static function mapError(\Throwable $error): \Throwable

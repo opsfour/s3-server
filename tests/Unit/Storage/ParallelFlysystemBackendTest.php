@@ -12,7 +12,10 @@ use Amp\File\File;
 use Amp\File\Filesystem;
 use Amp\File\FilesystemDriver;
 use Amp\Parallel\Worker\ContextWorkerPool;
+use Amp\Parallel\Worker\Execution;
+use Amp\Parallel\Worker\Task;
 use Amp\Parallel\Worker\WorkerPool;
+use Amp\Sync\Channel;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
@@ -69,6 +72,106 @@ final class ParallelFlysystemBackendTest extends TestCase
                 }
             }
             self::assertDirectoryDoesNotExist($this->remoteRoot . '/other');
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_worker_future_cancellation_propagates_and_releases_write_admission(): void
+    {
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(2))->method('submit')->willReturnOnConsecutiveCalls(
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                \Amp\Future::error($cancellation),
+            ),
+            new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                \Amp\Future::complete(true),
+            ),
+        );
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            pool: $pool,
+            readPool: $pool,
+        );
+
+        try {
+            try {
+                $backend->createBucket('bucket');
+                self::fail('Worker cancellation must propagate unchanged.');
+            } catch (CancelledException $error) {
+                self::assertSame($cancellation, $error);
+            }
+
+            self::assertTrue($backend->bucketExists('bucket'));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_worker_cancellation_is_not_replaced_by_temp_budget_release_failure(): void
+    {
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::once())->method('submit')->willReturnCallback(function () use ($cancellation): Execution {
+            $states = glob($this->tempDir . '/.opsfour-s3-storage-budget/state-*') ?: [];
+            self::assertCount(1, $states);
+            self::assertNotFalse(file_put_contents($states[0], '{corrupt'));
+
+            return new Execution(
+                $this->createMock(Task::class),
+                $this->createMock(Channel::class),
+                \Amp\Future::error($cancellation),
+            );
+        });
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            pool: $pool,
+            readPool: $pool,
+        );
+
+        try {
+            $backend->putObject('bucket', 'cancelled', new ReadableBuffer('body'));
+            self::fail('Temp-budget cleanup failure must not replace worker cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::stagingFiles($this->tempDir));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_read_worker_submit_cancellation_propagates_and_releases_admission(): void
+    {
+        $cancellation = new CancelledException();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(2))->method('submit')
+            ->willThrowException($cancellation);
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            pool: $pool,
+            readPool: $pool,
+        );
+
+        try {
+            foreach (['first', 'second'] as $path) {
+                try {
+                    $backend->getObjectByPath('bucket/' . $path);
+                    self::fail('Read-worker submit cancellation must propagate unchanged.');
+                } catch (CancelledException $error) {
+                    self::assertSame($cancellation, $error);
+                }
+            }
         } finally {
             $backend->shutdown();
         }
@@ -351,6 +454,44 @@ final class ParallelFlysystemBackendTest extends TestCase
             $backend->createBucket('bucket');
             $written = $backend->putObject('bucket', 'next', new ReadableBuffer('next'));
             self::assertSame('next', self::readAll($backend->getObjectByPath($written->path)));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_cancelled_upload_spool_is_not_masked_by_close_failure(): void
+    {
+        $driver = $this->createMock(FilesystemDriver::class);
+        $file = $this->createMock(File::class);
+        $file->method('close')->willThrowException(new \RuntimeException('close failed'));
+        $driver->method('openFile')->willReturn($file);
+        $driver->method('getStatus')->willReturnCallback(static function (string $path): ?array {
+            clearstatcache(true, $path);
+
+            return @stat($path) ?: null;
+        });
+        $driver->method('deleteFile')->willReturnCallback(static function (string $path): void {
+            unlink($path);
+        });
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            localFilesystem: new Filesystem($driver),
+            tempBudgetBytes: 8,
+        );
+        $cancellation = new CancelledException();
+        $source = $this->createMock(ReadableStream::class);
+        $source->method('read')->willThrowException($cancellation);
+
+        try {
+            try {
+                $backend->putObject('bucket', 'cancelled', $source);
+                self::fail('Close failure must not replace request cancellation.');
+            } catch (CancelledException $error) {
+                self::assertSame($cancellation, $error);
+                self::assertSame([], self::stagingFiles($this->tempDir));
+            }
         } finally {
             $backend->shutdown();
         }

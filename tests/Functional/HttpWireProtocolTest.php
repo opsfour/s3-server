@@ -68,7 +68,7 @@ final class HttpWireProtocolTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_reordering_duplicate_signed_acl_headers_rejects_the_same_signature(): void
+    public function test_duplicate_signed_acl_headers_are_rejected_before_dispatch_in_either_order(): void
     {
         $bucket = 'wire-' . bin2hex(random_bytes(8));
         $key = 'duplicate-acl';
@@ -91,18 +91,153 @@ final class HttpWireProtocolTest extends S3FunctionalTestCase
             );
             self::assertSame(['private', 'public-read'], $signed->getHeader('x-amz-acl'));
 
-            $accepted = self::sendRawRequest($signed);
-            self::assertMatchesRegularExpression('/^HTTP\/1\.1 200 /', $accepted);
-            self::assertSame($body, (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => $key])['Body']);
-            self::assertCount(1, self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => $key])['Grants']);
+            $rejected = self::sendRawRequest($signed);
+            self::assertMatchesRegularExpression('/^HTTP\/1\.1 400 /', $rejected);
+            self::assertStringContainsString('<Code>InvalidArgument</Code>', $rejected);
+            self::assertFalse(self::$s3->doesObjectExistV2($bucket, $key));
 
-            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
             $rejected = self::sendRawRequest($signed, reverseAclHeaders: true);
-            self::assertMatchesRegularExpression('/^HTTP\/1\.1 403 /', $rejected);
-            self::assertStringContainsString('<Code>SignatureDoesNotMatch</Code>', $rejected);
+            self::assertMatchesRegularExpression('/^HTTP\/1\.1 400 /', $rejected);
+            self::assertStringContainsString('<Code>InvalidArgument</Code>', $rejected);
             self::assertFalse(self::$s3->doesObjectExistV2($bucket, $key));
         } finally {
             self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
+    public function test_repeated_unsigned_cache_control_lines_are_combined_and_persisted(): void
+    {
+        $bucket = 'wire-' . bin2hex(random_bytes(8));
+        $key = 'repeated-lists';
+        $body = 'list-valued headers';
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            $signed = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+                new Request(
+                    'PUT',
+                    sprintf('http://%s:%d/%s/%s', self::$host, self::$port, $bucket, $key),
+                    [
+                        'content-length' => (string) strlen($body),
+                        'cache-control' => ['no-cache', 'no-store'],
+                        'x-amz-content-sha256' => hash('sha256', $body),
+                    ],
+                    $body,
+                ),
+                new Credentials(self::$accessKey, self::$secretKey),
+            );
+
+            $response = self::sendRawRequest($signed);
+            self::assertMatchesRegularExpression('/^HTTP\/1\.1 200 /', $response);
+
+            $head = self::$s3->headObject(['Bucket' => $bucket, 'Key' => $key]);
+            self::assertSame('no-cache, no-store', $head['CacheControl']);
+        } finally {
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
+    public function test_content_length_and_transfer_encoding_are_rejected_on_the_wire(): void
+    {
+        $bucket = 'wire-' . bin2hex(random_bytes(8));
+        $key = 'ambiguous-framing';
+        $body = 'framed-body';
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            $signed = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+                new Request(
+                    'PUT',
+                    sprintf('http://%s:%d/%s/%s', self::$host, self::$port, $bucket, $key),
+                    [
+                        'content-length' => (string) strlen($body),
+                        'x-amz-content-sha256' => hash('sha256', $body),
+                    ],
+                    $body,
+                ),
+                new Credentials(self::$accessKey, self::$secretKey),
+            );
+
+            $followUp = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+                new Request(
+                    'PUT',
+                    sprintf('http://%s:%d/%s/%s', self::$host, self::$port, $bucket, 'must-not-run'),
+                    [
+                        'content-length' => '6',
+                        'x-amz-content-sha256' => hash('sha256', 'second'),
+                    ],
+                    'second',
+                ),
+                new Credentials(self::$accessKey, self::$secretKey),
+            );
+            $response = self::sendRawRequest(
+                $signed,
+                additionalHeaders: ['Transfer-Encoding' => 'chunked'],
+                bodyOverride: dechex(strlen($body)) . "\r\n{$body}\r\n0\r\n\r\n",
+                connection: 'keep-alive',
+                trailingWire: self::serializeWireRequest($followUp, 'close'),
+            );
+            self::assertMatchesRegularExpression('/^HTTP\/1\.1 400 /', $response);
+            self::assertStringContainsString('<Code>InvalidArgument</Code>', $response);
+            self::assertMatchesRegularExpression('/^connection: close\r?$/im', $response);
+            self::assertSame(1, substr_count($response, 'HTTP/1.1 '));
+            self::assertFalse(self::$s3->doesObjectExistV2($bucket, $key));
+            self::assertObjectStaysAbsent($bucket, 'must-not-run');
+        } finally {
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'must-not-run']);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
+    public function test_ambiguous_framing_is_rejected_before_management_and_router_dispatch(): void
+    {
+        $bucket = 'wire-' . bin2hex(random_bytes(8));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+
+        try {
+            foreach ([
+                'management route' => ['GET', '/.live'],
+                'router method rejection' => ['PATCH', '/.live'],
+            ] as $label => [$method, $path]) {
+                $followKey = strtolower(str_replace(' ', '-', $label));
+                $followUp = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+                    new Request(
+                        'PUT',
+                        sprintf('http://%s:%d/%s/%s', self::$host, self::$port, $bucket, $followKey),
+                        [
+                            'content-length' => '6',
+                            'x-amz-content-sha256' => hash('sha256', 'second'),
+                        ],
+                        'second',
+                    ),
+                    new Credentials(self::$accessKey, self::$secretKey),
+                );
+                $ambiguous = new Request(
+                    $method,
+                    sprintf('http://%s:%d%s', self::$host, self::$port, $path),
+                    ['content-length' => '6'],
+                    'framed',
+                );
+                $response = self::sendRawRequest(
+                    $ambiguous,
+                    additionalHeaders: ['Transfer-Encoding' => 'chunked'],
+                    bodyOverride: "6\r\nframed\r\n0\r\n\r\n",
+                    connection: 'keep-alive',
+                    trailingWire: self::serializeWireRequest($followUp, 'close'),
+                );
+
+                self::assertMatchesRegularExpression('/^HTTP\/1\.1 400 /', $response, $label);
+                self::assertStringContainsString('<Code>InvalidArgument</Code>', $response, $label);
+                self::assertMatchesRegularExpression('/^connection: close\r?$/im', $response, $label);
+                self::assertSame(1, substr_count($response, 'HTTP/1.1 '), $label);
+                self::assertObjectStaysAbsent($bucket, $followKey, $label);
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'management-route']);
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'router-method-rejection']);
             self::$s3->deleteBucket(['Bucket' => $bucket]);
         }
     }
@@ -195,8 +330,15 @@ final class HttpWireProtocolTest extends S3FunctionalTestCase
         self::assertSame('', $body);
     }
 
-    private static function sendRawRequest(\Psr\Http\Message\RequestInterface $request, bool $reverseAclHeaders = false): string
-    {
+    /** @param array<non-empty-string, string> $additionalHeaders */
+    private static function sendRawRequest(
+        \Psr\Http\Message\RequestInterface $request,
+        bool $reverseAclHeaders = false,
+        array $additionalHeaders = [],
+        ?string $bodyOverride = null,
+        string $connection = 'close',
+        string $trailingWire = '',
+    ): string {
         $wire = $request->getMethod() . ' ' . $request->getRequestTarget() . " HTTP/1.1\r\n";
         foreach ($request->getHeaders() as $name => $values) {
             if ($reverseAclHeaders && strtolower($name) === 'x-amz-acl') {
@@ -206,7 +348,11 @@ final class HttpWireProtocolTest extends S3FunctionalTestCase
                 $wire .= $name . ': ' . $value . "\r\n";
             }
         }
-        $wire .= "Connection: close\r\n\r\n" . (string) $request->getBody();
+        foreach ($additionalHeaders as $name => $value) {
+            $wire .= $name . ': ' . $value . "\r\n";
+        }
+        $wire .= 'Connection: ' . $connection . "\r\n\r\n"
+            . ($bodyOverride ?? (string) $request->getBody()) . $trailingWire;
 
         $socket = stream_socket_client(sprintf('tcp://%s:%d', self::$host, self::$port), $errorCode, $error, 5);
         self::assertNotFalse($socket, $error ?? 'Could not connect to the test server.');
@@ -221,5 +367,28 @@ final class HttpWireProtocolTest extends S3FunctionalTestCase
         } finally {
             fclose($socket);
         }
+    }
+
+    private static function serializeWireRequest(
+        \Psr\Http\Message\RequestInterface $request,
+        string $connection,
+    ): string {
+        $wire = $request->getMethod() . ' ' . $request->getRequestTarget() . " HTTP/1.1\r\n";
+        foreach ($request->getHeaders() as $name => $values) {
+            foreach ($values as $value) {
+                $wire .= $name . ': ' . $value . "\r\n";
+            }
+        }
+
+        return $wire . 'Connection: ' . $connection . "\r\n\r\n" . (string) $request->getBody();
+    }
+
+    private static function assertObjectStaysAbsent(string $bucket, string $key, string $message = ''): void
+    {
+        $deadline = microtime(true) + 0.75;
+        do {
+            self::assertFalse(self::$s3->doesObjectExistV2($bucket, $key), $message);
+            usleep(25_000);
+        } while (microtime(true) < $deadline);
     }
 }

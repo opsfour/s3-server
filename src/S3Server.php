@@ -45,6 +45,7 @@ use OpsFour\S3Server\Middleware\MetricsMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\RateLimitMiddleware;
 use OpsFour\S3Server\Middleware\RequestBodySpool;
+use OpsFour\S3Server\Middleware\RequestHeaderContractMiddleware;
 use OpsFour\S3Server\Middleware\RequestIdMiddleware;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
@@ -546,7 +547,16 @@ final class S3Server
                 if ($this->startupCancellation->isCancelled()) {
                     throw new \LogicException('S3 server shutdown during startup.');
                 }
-                $this->server->start($router, $errorHandler);
+                // Framing validation must wrap the router itself: management
+                // routes and router-generated 405 responses share the same
+                // listener and therefore the same desynchronization boundary.
+                $globalHandler = Middleware\stackMiddleware(
+                    $router,
+                    new RequestIdMiddleware(),
+                    new ErrorHandlingMiddleware($this->logger),
+                    new RequestHeaderContractMiddleware(),
+                );
+                $this->server->start($globalHandler, $errorHandler);
                 if ($this->startupCancellation->isCancelled()) {
                     throw new \LogicException('S3 server shutdown during startup.');
                 }
@@ -1580,8 +1590,9 @@ final class S3Server
      *
      * Middleware is applied outermost-first. Request ID, metrics and error
      * handling wrap the optional EFS test admission. Admission precedes proxy,
-     * logging, rate-limit, website, CORS, auth and S3 handler work. Management
-     * routes use a separate stack; admin mutations share the EFS test gate.
+     * logging, header-contract validation, rate-limit, website, CORS, auth and
+     * S3 handler work. Management routes use a separate stack; admin mutations
+     * share the EFS test gate.
      *
      * @param  RequestHandler  $innerHandler  The S3DispatchHandler to wrap.
      * @return RequestHandler The fully stacked handler.
@@ -1597,6 +1608,7 @@ final class S3Server
             ...($this->efsApiAdmissionForTests !== null ? [$this->efsApiAdmissionForTests] : []),
             new TrustedProxyMiddleware($this->config->trustedProxyCidrs),
             new LoggingMiddleware(logger: $this->logger, accessLogs: $this->accessLogs),
+            new RequestHeaderContractMiddleware(),
             new ExpectContinueMiddleware(),
             new RateLimitMiddleware($this->metadata, $this->config->perClientRateLimit, $this->logger),
         ];
@@ -1631,6 +1643,9 @@ final class S3Server
         // Innermost: integrity checks right before the handler. Stateless
         // spool tasks avoid reserving amphp/file workers for request lifetime.
         $spool = $this->requestBodySpoolForStack();
+        if ($this->metadata !== null) {
+            $middlewares[] = new \OpsFour\S3Server\Middleware\ObjectLockChecksumMiddleware($this->metadata);
+        }
         $middlewares[] = new ContentMd5Middleware($spool);
         $middlewares[] = new ChecksumValidationMiddleware($spool);
 

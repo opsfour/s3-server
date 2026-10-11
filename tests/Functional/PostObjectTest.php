@@ -62,6 +62,60 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame([['Key' => 'project', 'Value' => 'post-object']], $tags['TagSet']);
     }
 
+    public function test_object_lock_browser_form_requires_and_validates_a_payload_checksum(): void
+    {
+        $bucket = 'post-lock-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket, 'ObjectLockEnabledForBucket' => true]);
+        self::$s3->putObjectLockConfiguration([
+            'Bucket' => $bucket,
+            'ObjectLockConfiguration' => [
+                'ObjectLockEnabled' => 'Enabled',
+                'Rule' => ['DefaultRetention' => ['Mode' => 'GOVERNANCE', 'Days' => 1]],
+            ],
+        ]);
+        $body = 'locked browser upload';
+
+        $missing = $this->postV4('missing.txt', 'missing.txt', $body, bucketOverride: $bucket);
+        self::assertSame(400, $missing->getStatusCode(), (string) $missing->getBody());
+        self::assertStringContainsString('<Code>InvalidRequest</Code>', (string) $missing->getBody());
+
+        $bad = $this->postV4('bad.txt', 'bad.txt', $body, [
+            'x-amz-checksum-sha256' => base64_encode(str_repeat("\0", 32)),
+        ], bucketOverride: $bucket);
+        self::assertSame(400, $bad->getStatusCode(), (string) $bad->getBody());
+        self::assertStringContainsString('<Code>BadDigest</Code>', (string) $bad->getBody());
+
+        $valid = $this->postV4('valid.txt', 'valid.txt', $body, [
+            'x-amz-checksum-sha256' => base64_encode(hash('sha256', $body, true)),
+        ], bucketOverride: $bucket);
+        self::assertSame(204, $valid->getStatusCode(), (string) $valid->getBody());
+        self::assertSame($body, (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => 'valid.txt'])['Body']);
+        self::assertSame('GOVERNANCE', self::$s3->getObjectRetention([
+            'Bucket' => $bucket,
+            'Key' => 'valid.txt',
+        ])['Retention']['Mode']);
+
+        self::$s3->putObjectLockConfiguration([
+            'Bucket' => $bucket,
+            'ObjectLockConfiguration' => ['ObjectLockEnabled' => 'Enabled'],
+        ]);
+        $explicitMissing = $this->postV4('held-missing.txt', 'held-missing.txt', $body, [
+            'x-amz-object-lock-legal-hold' => 'ON',
+        ], bucketOverride: $bucket);
+        self::assertSame(400, $explicitMissing->getStatusCode(), (string) $explicitMissing->getBody());
+        self::assertStringContainsString('<Code>InvalidRequest</Code>', (string) $explicitMissing->getBody());
+
+        $held = $this->postV4('held.txt', 'held.txt', $body, [
+            'x-amz-object-lock-legal-hold' => 'ON',
+            'Content-MD5' => base64_encode(md5($body, true)),
+        ], bucketOverride: $bucket);
+        self::assertSame(204, $held->getStatusCode(), (string) $held->getBody());
+        self::assertSame('ON', self::$s3->getObjectLegalHold([
+            'Bucket' => $bucket,
+            'Key' => 'held.txt',
+        ])['LegalHold']['Status']);
+    }
+
     public function test_signed_browser_form_rejects_unsigned_object_headers(): void
     {
         foreach ([

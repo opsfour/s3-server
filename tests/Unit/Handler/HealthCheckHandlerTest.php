@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Handler;
 
+use Amp\CancelledException;
 use Amp\File\Filesystem;
 use Amp\File\FilesystemDriver;
 use Amp\Http\Server\Driver\Client;
@@ -71,6 +72,30 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame('{"status":"degraded"}', $response->getBody()->read());
         self::assertSame('storage:STANDARD', $logger->records[0]['context']['component']);
         self::assertSame(\RuntimeException::class, $logger->records[0]['context']['exception']);
+    }
+
+    public function test_storage_probe_propagates_the_original_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $logger = new HealthCheckArrayLogger();
+        $storage = new CallbackStorageBackend(
+            new InMemoryBackend(),
+            beforeBucketExists: static function () use ($cancellation): never {
+                throw $cancellation;
+            },
+        );
+        $handler = new HealthCheckHandler(
+            logger: $logger,
+            storageTiers: StorageTierRegistry::single($storage),
+        );
+
+        try {
+            $handler->handleRequest($this->request());
+            self::fail('Expected readiness cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+        self::assertSame([], $logger->records);
     }
 
     public function test_arbitrary_efs_evidence_cannot_suppress_the_filesystem_probe(): void
@@ -243,6 +268,22 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertStringNotContainsString('private-test-token', json_encode($logger->records, JSON_THROW_ON_ERROR));
     }
 
+    public function test_metadata_probe_propagates_the_original_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willThrowException($cancellation);
+        $logger = new HealthCheckArrayLogger();
+
+        try {
+            (new HealthCheckHandler(metadata: $metadata, logger: $logger))->handleRequest($this->request());
+            self::fail('Expected readiness cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+        self::assertSame([], $logger->records);
+    }
+
     public function test_throwing_logger_cannot_replace_a_degraded_readiness_response(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
@@ -282,6 +323,23 @@ final class HealthCheckHandlerTest extends TestCase
         $probe->failure = null;
         self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
         self::assertSame(3, $probe->checks);
+    }
+
+    public function test_credential_probe_propagates_the_original_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $probe = new HealthCheckCredentialProbe();
+        $probe->failure = $cancellation;
+        $logger = new HealthCheckArrayLogger();
+
+        try {
+            (new HealthCheckHandler(logger: $logger, credentialHealthProbe: $probe))
+                ->handleRequest($this->request());
+            self::fail('Expected readiness cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+        self::assertSame([], $logger->records);
     }
 
     public function test_readiness_degrades_when_configured_rate_limit_query_fails(): void
@@ -344,6 +402,53 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
         self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
         self::assertSame(2, $calls);
+    }
+
+    public function test_rate_limit_cancellation_does_not_poison_or_throttle_the_health_cache(): void
+    {
+        $cancellation = new CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $calls = 0;
+        $metadata->method('rateLimitCheck')->willReturnCallback(static function () use (&$calls, $cancellation): bool {
+            if (++$calls === 1) {
+                throw $cancellation;
+            }
+
+            return true;
+        });
+        $logger = new HealthCheckArrayLogger();
+        $handler = new HealthCheckHandler(metadata: $metadata, logger: $logger, rateLimitEnabled: true);
+
+        try {
+            $handler->handleRequest($this->request());
+            self::fail('Expected readiness cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame(2, $calls);
+        self::assertSame([], $logger->records);
+    }
+
+    public function test_admission_evidence_cancellation_does_not_latch_readiness_degraded(): void
+    {
+        $cancellation = new CancelledException();
+        $evidence = new HealthCheckEfsEvidence();
+        $evidence->failure = $cancellation;
+        $logger = new HealthCheckArrayLogger();
+        $handler = new HealthCheckHandler(logger: $logger, admissionEvidence: $evidence);
+
+        try {
+            $handler->handleRequest($this->request());
+            self::fail('Expected readiness cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        $evidence->failure = null;
+        self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame([], $logger->records);
     }
 
     public function test_readiness_detects_and_recovers_from_post_start_tier_drift(): void
@@ -536,9 +641,14 @@ final class HealthCheckEfsEvidence implements EfsHostEvidence
 
     public ?int $failOnCheck = null;
 
+    public ?\Throwable $failure = null;
+
     public function assertFresh(): void
     {
         $this->checkCount++;
+        if ($this->failure !== null) {
+            throw $this->failure;
+        }
         if ($this->checkCount === $this->failOnCheck) {
             throw new \RuntimeException('evidence failed: private marker');
         }

@@ -45,6 +45,8 @@ final class RateLimitMiddleware implements Middleware
 
         try {
             $allowed = $this->metadata->rateLimitCheck($ip, $this->maxRequestsPerSecond, $this->maxRequestsPerSecond);
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
         } catch (\Throwable $error) {
             $this->logger->error('Rate-limit metadata check failed.', ['exception' => $error::class]);
 

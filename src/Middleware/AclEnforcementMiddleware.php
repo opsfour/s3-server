@@ -115,6 +115,8 @@ final class AclEnforcementMiddleware implements Middleware
                     $grants = $this->metadata->getAcl('object', "{$bucket}/{$key}");
                 }
             }
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
         } catch (\Throwable) {
         }
 
@@ -126,6 +128,8 @@ final class AclEnforcementMiddleware implements Middleware
             if ($requiredPerm === 'WRITE') {
                 try {
                     $grants = $this->metadata->getAcl('bucket', $bucket);
+                } catch (\Amp\CancelledException $error) {
+                    throw $error;
                 } catch (\Throwable) {
                 }
             }
@@ -158,6 +162,8 @@ final class AclEnforcementMiddleware implements Middleware
             if ($pab !== null) {
                 $ignorePublicAcls = $pab['ignorePublicAcls'];
             }
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
         } catch (\Throwable) {
             // Fail-closed: if we can't check PAB, deny access.
             throw new AccessDeniedException('Unable to verify public access block configuration.');

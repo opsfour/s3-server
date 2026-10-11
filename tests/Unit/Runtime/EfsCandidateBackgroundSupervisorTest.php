@@ -88,12 +88,15 @@ final class EfsCandidateBackgroundSupervisorTest extends TestCase
 
     public function test_unexpected_component_exit_is_terminal_visible_and_cancels_siblings(): void
     {
-        $graph = $this->graph(brokenLifecycle: true);
+        $graph = $this->graph();
         $barrier = new EfsCandidateBackgroundBarrier();
         $supervisor = new EfsCandidateBackgroundSupervisor($graph, $barrier);
 
         $supervisor->startParked();
         $supervisor->awaitReady(1);
+        $stoppedWatcher = EventLoop::defer(static fn() => null);
+        EventLoop::disable($stoppedWatcher);
+        $this->set($graph->lifecycleRunner, 'callbackId', $stoppedWatcher);
         $supervisor->release();
 
         try {
@@ -210,7 +213,6 @@ final class EfsCandidateBackgroundSupervisorTest extends TestCase
     }
 
     private function graph(
-        bool $brokenLifecycle = false,
         bool $notificationWorkerEnabled = false,
         bool $revokedEvidence = false,
     ): EfsCandidateRuntimeResources {
@@ -223,10 +225,7 @@ final class EfsCandidateBackgroundSupervisorTest extends TestCase
             $this->set($evidence, 'revoked', true);
         }
         $executor = new LifecycleExecutor($metadata, $storage, efsEvidence: $evidence);
-        $lifecycle = new LifecycleRunner(
-            $executor,
-            $brokenLifecycle ? -1.0 : 60.0,
-        );
+        $lifecycle = new LifecycleRunner($executor, 60.0);
         $pool = new ContextWorkerPool(1);
         $this->pools[] = $pool;
         $config = new S3ServerConfig(

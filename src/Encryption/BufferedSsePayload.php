@@ -62,10 +62,17 @@ final class BufferedSsePayload
     /** @return array{string, ChecksumResult} */
     public static function readExpected(ReadableStream $stream, int $expectedBytes, int $maxBytes): array
     {
+        $cancellation = null;
         try {
             return self::read($stream, $maxBytes, expectedBytes: $expectedBytes);
+        } catch (\Amp\CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $stream->close();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $cancellation,
+                $stream->close(...),
+            );
         }
     }
 

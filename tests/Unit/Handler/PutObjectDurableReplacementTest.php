@@ -9,6 +9,7 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -62,6 +63,66 @@ final class PutObjectDurableReplacementTest extends TestCase
         self::assertCount(1, $queued);
         self::assertSame('STANDARD', $queued[0]['storage_tier']);
         self::assertSame($old->path, $queued[0]['storage_path']);
+    }
+
+    public function test_cancelled_post_commit_delete_keeps_replacement_and_rethrows_cancellation(): void
+    {
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+        $old = $storage->putObject('bucket', 'key', new ReadableBuffer('old'));
+        $this->metadata->putObjectMetadata('bucket', 'key', 'owner', 3, '"' . md5('old') . '"', 'text/plain', $old->path);
+        $cancellation = new \Amp\CancelledException();
+        $failing = new CallbackStorageBackend($storage, beforeDelete: static function (string $path) use ($old, $cancellation): void {
+            if ($path === $old->path) {
+                throw $cancellation;
+            }
+        });
+
+        try {
+            (new PutObjectHandler($this->metadata, $failing))->handleRequest($this->request('new'));
+            self::fail('Cancellation after the metadata commit must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        $current = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($current);
+        self::assertNotSame($old->path, $current->systemMetadata['storagePath']);
+        self::assertSame('new', \Amp\ByteStream\buffer($storage->getObjectByPath($current->systemMetadata['storagePath'])));
+        self::assertSame('old', \Amp\ByteStream\buffer($storage->getObjectByPath($old->path)));
+        $queued = $this->metadata->dequeueStorageGarbage(10);
+        self::assertCount(1, $queued);
+        self::assertSame($old->path, $queued[0]['storage_path']);
+    }
+
+    public function test_metadata_cancellation_is_not_replaced_when_failed_write_cleanup_cannot_be_queued(): void
+    {
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
+            $name = $method->getName();
+            if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true)) {
+                continue;
+            }
+            $metadata->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
+        }
+        $metadata->method('transaction')->willThrowException($cancellation);
+        $metadata->method('enqueueStorageGarbage')->willThrowException(new \RuntimeException('cleanup queue failed'));
+        $failing = new CallbackStorageBackend(
+            $storage,
+            beforeDelete: static function (): void {
+                throw new \RuntimeException('delete failed');
+            },
+        );
+
+        try {
+            (new PutObjectHandler($metadata, $failing))->handleRequest($this->request('new'));
+            self::fail('The metadata cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
     }
 
     public function test_identical_relative_paths_in_different_tiers_cleanup_only_old_tier(): void

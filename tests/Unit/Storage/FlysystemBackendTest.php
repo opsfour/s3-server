@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
+use Amp\CancelledException;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Socket\InternetAddress;
@@ -27,6 +28,7 @@ use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
 
@@ -544,6 +546,185 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame('private payload', $this->adapter->contents($result->path));
         self::assertSame([], self::temporaryFiles($this->tempDir));
         self::assertSame(1, $this->adapter->writeStreamCalls);
+    }
+
+    public function test_cancelled_write_is_not_replaced_by_temp_budget_release_failure(): void
+    {
+        $budget = new StorageTempBudgetCoordinator($this->tempDir, 8);
+        $backend = new FlysystemBackend(new Filesystem($this->adapter), $this->tempDir, $budget);
+        $cancellation = new \Amp\CancelledException();
+        $body = $this->createMock(ReadableStream::class);
+        $body->method('read')->willReturnCallback(function () use ($cancellation): never {
+            $states = glob($this->tempDir . '/.opsfour-s3-storage-budget/state-*') ?: [];
+            self::assertCount(1, $states);
+            self::assertNotFalse(file_put_contents($states[0], '{corrupt'));
+
+            throw $cancellation;
+        });
+
+        try {
+            $backend->putObject('bucket', 'cancelled', $body);
+            self::fail('Temp-budget cleanup failure must not replace cancellation.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::temporaryFiles($this->tempDir));
+        } finally {
+            foreach (glob($this->tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($this->tempDir . '/.opsfour-s3-storage-budget');
+        }
+    }
+
+    public function test_cancelled_adapter_object_write_is_not_wrapped_or_replaced_by_cleanup_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('writeStream')->willThrowException($cancellation);
+        $filesystem->expects(self::once())->method('delete')->willThrowException(new CancelledException());
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->putObject('bucket', 'object', new ReadableBuffer('payload'));
+            self::fail('Adapter cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::temporaryFiles($this->tempDir));
+        }
+    }
+
+    public function test_cancelled_adapter_part_write_is_not_wrapped_or_replaced_by_cleanup_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('writeStream')->willThrowException($cancellation);
+        $filesystem->expects(self::once())->method('delete')->willThrowException(new CancelledException());
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->putPart('bucket', 'object', 'upload', 1, new ReadableBuffer('payload'));
+            self::fail('Adapter cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::temporaryFiles($this->tempDir));
+        }
+    }
+
+    public function test_cancelled_multipart_part_read_is_not_wrapped(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('readStream')->with('.parts/upload/part')
+            ->willThrowException($cancellation);
+        $filesystem->expects(self::never())->method('writeStream');
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))->assembleMultipartUpload(
+                'bucket',
+                'object',
+                'upload',
+                [['partNumber' => 1, 'etag' => md5('payload'), 'storagePath' => '.parts/upload/part']],
+            );
+            self::fail('Multipart part read cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::temporaryFiles($this->tempDir));
+        }
+    }
+
+    public function test_cancelled_multipart_assembly_write_is_not_wrapped_or_replaced_by_cleanup_cancellation(): void
+    {
+        $partStream = fopen('php://temp', 'w+b');
+        self::assertIsResource($partStream);
+        self::assertSame(strlen('payload'), fwrite($partStream, 'payload'));
+        rewind($partStream);
+
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('readStream')->willReturn($partStream);
+        $filesystem->expects(self::once())->method('writeStream')->willThrowException($cancellation);
+        $filesystem->expects(self::once())->method('delete')->willThrowException(new CancelledException());
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))->assembleMultipartUpload(
+                'bucket',
+                'object',
+                'upload',
+                [['partNumber' => 1, 'etag' => md5('payload'), 'storagePath' => '.parts/upload/part']],
+            );
+            self::fail('Multipart assembly cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], self::temporaryFiles($this->tempDir));
+        }
+    }
+
+    public function test_cancelled_copy_source_probe_is_not_wrapped(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('fileExists')->willThrowException($cancellation);
+        $filesystem->expects(self::never())->method('copy');
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->copyObject('bucket/source', 'bucket', 'copy');
+            self::fail('Copy source probe cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_cancelled_adapter_copy_is_not_wrapped_or_replaced_by_cleanup_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('fileExists')->willReturn(true);
+        $filesystem->expects(self::once())->method('copy')->willThrowException($cancellation);
+        $filesystem->expects(self::once())->method('delete')->willThrowException(new CancelledException());
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->copyObject('bucket/source', 'bucket', 'copy');
+            self::fail('Copy cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_cancelled_copied_object_read_is_not_wrapped_or_replaced_by_cleanup_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('fileExists')->willReturn(true);
+        $filesystem->expects(self::once())->method('copy');
+        $filesystem->expects(self::once())->method('readStream')->willThrowException($cancellation);
+        $filesystem->expects(self::once())->method('delete')->willThrowException(new CancelledException());
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->copyObject('bucket/source', 'bucket', 'copy');
+            self::fail('Copied object read cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_copy_cleanup_cancellation_is_not_suppressed_after_adapter_failure(): void
+    {
+        $cancellation = new CancelledException();
+        $filesystem = $this->createMock(FilesystemOperator::class);
+        $filesystem->expects(self::once())->method('fileExists')->willReturn(true);
+        $filesystem->expects(self::once())->method('copy')->willThrowException(new \RuntimeException('copy failed'));
+        $filesystem->expects(self::once())->method('delete')->willThrowException($cancellation);
+
+        try {
+            (new FlysystemBackend($filesystem, $this->tempDir))
+                ->copyObject('bucket/source', 'bucket', 'copy');
+            self::fail('Cleanup cancellation must propagate unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
     }
 
     public function test_multipart_assembly_uses_configured_temp_dir_and_cleans_up_parts(): void

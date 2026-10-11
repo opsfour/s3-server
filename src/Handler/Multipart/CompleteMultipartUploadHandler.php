@@ -34,6 +34,7 @@ use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
+use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
@@ -104,6 +105,19 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 'Multipart upload belongs to an unverified bucket generation.',
             );
         }
+        $objectLockConfig = $this->metadata->getObjectLockConfig($bucket);
+        $configurationFingerprint = $upload['user_metadata'][ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY] ?? null;
+        if (is_string($configurationFingerprint)) {
+            ObjectLockConfigurationSnapshot::assertFingerprint($configurationFingerprint, $objectLockConfig);
+        } elseif (isset($upload['user_metadata']['__object-lock-mode'])
+            || isset($upload['user_metadata']['__object-lock-retain-until-date'])
+            || isset($upload['user_metadata']['__object-lock-legal-hold'])
+            || self::hasDefaultObjectLockRetention($objectLockConfig)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Object Lock multipart upload must be reinitiated with checksum protection.',
+            );
+        }
+        ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
         $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
         $uploadStorage = $uploadTier->backend;
         if ($this->requireLocalFencedCompletion
@@ -282,6 +296,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $request, $uploadId, $bucket, $key, $validatedParts, $intent, $uploadEncryptionMode): void {
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            ObjectLockConfigurationSnapshot::assertCurrent(
+                $request,
+                $this->metadata->getObjectLockConfig($bucket),
+            );
             $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
             $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
             $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
@@ -427,12 +445,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
             $heartbeat->stop();
         } catch (\Throwable $e) {
-            try {
-                $heartbeat->stop();
-            } catch (\Throwable $heartbeatError) {
-                $e = $heartbeatError;
-            }
-            $this->abandonAttempt($intent);
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                $heartbeat->stop(...),
+                fn() => $this->abandonAttempt($intent),
+            );
             if ($e instanceof InternalErrorException && $this->metadata->getMultipartUpload($uploadId) === null) {
                 throw new NoSuchUploadException();
             }
@@ -480,7 +497,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 $aclGrants = AclGrantResolver::validateGrants($decodedAclGrants);
             }
         } catch (\Throwable $e) {
-            $this->abandonAttempt($intent);
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                fn() => $this->abandonAttempt($intent),
+            );
             throw new InternalErrorException('Multipart upload metadata is invalid.', $e);
         }
 
@@ -493,6 +513,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $userMetadata['__mpu-acl-grants'],
             $userMetadata['__mpu-tags'],
             $userMetadata['__mpu-part-format'],
+            $userMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY],
             $userMetadata['__object-lock-mode'],
             $userMetadata['__object-lock-retain-until-date'],
             $userMetadata['__object-lock-legal-hold'],
@@ -745,7 +766,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 });
             }
         } catch (\Throwable $e) {
-            $this->abandonAttempt($intent);
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                fn() => $this->abandonAttempt($intent),
+            );
             throw $e;
         }
 
@@ -793,6 +817,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         );
     }
 
+    /** @param array<string, mixed>|null $config */
+    private static function hasDefaultObjectLockRetention(?array $config): bool
+    {
+        return ($config['objectLockEnabled'] ?? null) === 'Enabled'
+            && isset($config['rule']['defaultRetention']);
+    }
+
     private static function multipartPartEtag(string $etag): ?string
     {
         foreach (['/\A"([0-9a-f]{32})"\z/D', '/\A([0-9a-f]{32})\z/D'] as $pattern) {
@@ -826,18 +857,26 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             throw new InternalErrorException('Encrypted multipart completion is unavailable.');
         }
         $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+        $completionCancellation = null;
         try {
             BufferedSsePayload::assertMemoryHeadroom($expectedSize);
             $plaintext = '';
             foreach ($parts as $part) {
                 $stream = $storage->getObjectByPath($part['storagePath']);
+                $readCancellation = null;
                 try {
                     [$stored] = BufferedSsePayload::read(
                         $stream,
                         $part['size'] + EncryptedMultipartPartCodec::MAX_OVERHEAD,
                     );
+                } catch (\Amp\CancelledException $error) {
+                    $readCancellation = $error;
+                    throw $error;
                 } finally {
-                    $stream->close();
+                    \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                        $readCancellation,
+                        $stream->close(...),
+                    );
                 }
                 $partPlaintext = EncryptedMultipartPartCodec::decode(
                     $this->encryption,
@@ -901,8 +940,14 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
 
             return [new StorageWriteResult($finalPath, $expectedSize, trim($etag, '"')), $encMeta];
+        } catch (\Amp\CancelledException $error) {
+            $completionCancellation = $error;
+            throw $error;
         } finally {
-            $lock->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $completionCancellation,
+                $lock->release(...),
+            );
         }
     }
 
@@ -984,6 +1029,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $entry['tier'],
                     $entry['path'],
                 );
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
             } catch (\Throwable) {
                 // The committed exact-path job remains for the collector.
             }

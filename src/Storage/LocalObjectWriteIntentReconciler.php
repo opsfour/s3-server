@@ -139,15 +139,25 @@ final readonly class LocalObjectWriteIntentReconciler
             }
         })->ignore();
 
+        $workerCancellation = null;
         try {
             // Pool submission can itself wait for capacity. Start renewing
             // before it and never pass caller cancellation into submission:
             // after acceptance, the worker may still rename the target path.
             $worker = $pool->submit(new LocalObjectSealTask($this->root, $claimed, $this->efsWorkerScope))->getFuture();
             $worker->await();
+        } catch (CancelledException $error) {
+            $workerCancellation = $error;
+            throw $error;
         } finally {
             $stop->cancel();
-            $heartbeat->await();
+            try {
+                $heartbeat->await();
+            } catch (\Throwable $heartbeatError) {
+                if ($workerCancellation === null) {
+                    throw $heartbeatError;
+                }
+            }
         }
     }
 }

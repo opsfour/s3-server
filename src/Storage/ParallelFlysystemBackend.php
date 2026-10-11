@@ -106,11 +106,14 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
 
         [$inputPath, $reservation] = $this->spool($body, 's3fw-put-');
 
+        $cancellation = null;
         try {
             return $this->writeResult('putObject', [$bucket, $key, $inputPath]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $this->deleteTempFile($inputPath);
-            $this->tempBudget->release($reservation);
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
         }
     }
 
@@ -155,6 +158,9 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
                     ],
                     tempBudgetBytes: $this->tempBudgetBytes,
                 ), $cancellation->getCancellation());
+            } catch (CancelledException $error) {
+                $this->releaseReadSlot();
+                throw $error;
             } catch (\Throwable $error) {
                 $this->releaseReadSlot();
                 $this->metrics?->recordWorkerPoolTask($this->poolName . '-reads', 'streamObject', false, $error::class);
@@ -254,11 +260,14 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
     ): StorageWriteResult {
         [$inputPath, $reservation] = $this->spool($data, 's3fw-part-', MultipartPartSize::MAX_BYTES);
 
+        $cancellation = null;
         try {
             return $this->writeResult('putPart', [$bucket, $key, $uploadId, $partNumber, $inputPath]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $this->deleteTempFile($inputPath);
-            $this->tempBudget->release($reservation);
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
         }
     }
 
@@ -272,11 +281,14 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         StoragePath::assertPlannedPartPath('', $path, $uploadId, $partNumber);
         [$inputPath, $reservation] = $this->spool($data, 's3fw-part-', MultipartPartSize::MAX_BYTES);
 
+        $cancellation = null;
         try {
             return $this->writeResult('putPartAtPath', [$bucket, $key, $uploadId, $partNumber, $inputPath, $path]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $this->deleteTempFile($inputPath);
-            $this->tempBudget->release($reservation);
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
         }
     }
 
@@ -310,11 +322,14 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         StoragePath::assertObjectWritePath('', $path, $bucket, $key);
         [$inputPath, $reservation] = $this->spool($body, 's3fw-put-');
 
+        $cancellation = null;
         try {
             return $this->writeResult('putObjectAtPath', [$bucket, $key, $inputPath, $path]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
-            $this->deleteTempFile($inputPath);
-            $this->tempBudget->release($reservation);
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
         }
     }
 
@@ -486,6 +501,8 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             $this->metrics?->recordWorkerPoolTask($this->poolName, $operation);
 
             return $result;
+        } catch (CancelledException $error) {
+            throw $error;
         } catch (TaskFailureThrowable $error) {
             $this->metrics?->recordWorkerPoolTask(
                 $this->poolName,
@@ -546,9 +563,21 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
                 throw new InternalErrorException('Flysystem upload staging file is incomplete.');
             }
         } catch (\Throwable $error) {
-            $file?->close();
-            $this->deleteTempFile($path);
-            $this->tempBudget->release($reservation);
+            try {
+                $file?->close();
+            } catch (\Throwable) {
+                // Cleanup failures must not replace the staging failure.
+            }
+            try {
+                $this->deleteTempFile($path);
+            } catch (\Throwable) {
+                // The original failure remains the actionable cause.
+            }
+            try {
+                $this->tempBudget->release($reservation);
+            } catch (\Throwable) {
+                // Reservation cleanup must not mask request cancellation.
+            }
             if ($error instanceof CancelledException || $error instanceof SlowDownException || $error instanceof EntityTooLargeException) {
                 throw $error;
             }
@@ -590,6 +619,21 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             }
         } catch (\Throwable) {
             @unlink($path);
+        }
+    }
+
+    private function releaseSpooledInput(
+        string $path,
+        StorageTempReservation $reservation,
+        ?CancelledException $cancellation,
+    ): void {
+        $this->deleteTempFile($path);
+        try {
+            $this->tempBudget->release($reservation);
+        } catch (\Throwable $releaseError) {
+            if ($cancellation === null) {
+                throw $releaseError;
+            }
         }
     }
 }

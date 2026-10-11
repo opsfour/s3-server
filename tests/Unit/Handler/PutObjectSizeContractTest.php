@@ -68,6 +68,21 @@ final class PutObjectSizeContractTest extends TestCase
         self::assertSame(0, $this->metadata->getObjectMetadata('bucket', 'key')?->size);
     }
 
+    public function test_repeated_list_valued_metadata_headers_are_combined_before_persistence(): void
+    {
+        $storage = new InMemoryBackend();
+        $response = (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request('body', [
+            'content-encoding' => ['gzip', 'br'],
+            'cache-control' => ['no-cache', 'no-store'],
+        ]));
+
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('gzip, br', $object?->systemMetadata['content-encoding'] ?? null);
+        self::assertSame('no-cache, no-store', $object?->systemMetadata['cache-control'] ?? null);
+    }
+
     public function test_backend_result_above_single_put_limit_is_deleted_before_metadata_publish(): void
     {
         $storage = $this->createMock(StorageBackend::class);

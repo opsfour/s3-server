@@ -65,6 +65,24 @@ final class ObservedStorageBackendTest extends TestCase
         }
     }
 
+    public function test_bounded_copy_close_failure_does_not_replace_storage_cancellation(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $source = $this->createMock(ReadableStream::class);
+        $source->method('close')->willThrowException(new \RuntimeException('close failed'));
+        $inner = $this->createMock(StorageBackend::class);
+        $inner->method('getObjectByPath')->willReturn($source);
+        $inner->method('putObject')->willThrowException($cancellation);
+        $storage = new ObservedStorageBackend($inner, new MetricsCollector(), 'failing');
+
+        try {
+            $storage->copyObjectBounded('source', 'bucket', 'key', 8);
+            self::fail('The storage cancellation must propagate.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
     public function test_shutdown_is_forwarded_to_shutdown_aware_backend(): void
     {
         $inner = new ShutdownRecordingStorageBackend();

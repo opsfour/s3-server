@@ -20,6 +20,17 @@ final class RequestHeaderValuesTest extends TestCase
         self::assertSame('"first", "second"', RequestHeaderValues::combined($request, 'if-match'));
     }
 
+    public function test_combined_preserves_repeated_content_encoding_and_cache_control_lists(): void
+    {
+        $request = $this->request([
+            'Content-Encoding' => ['gzip', 'br'],
+            'Cache-Control' => ['no-cache', 'no-store'],
+        ]);
+
+        self::assertSame('gzip, br', RequestHeaderValues::combined($request, 'content-encoding'));
+        self::assertSame('no-cache, no-store', RequestHeaderValues::combined($request, 'cache-control'));
+    }
+
     public function test_singleton_rejects_repeated_field_lines(): void
     {
         $request = $this->request(['x-amz-copy-source' => ['/bucket/first', '/bucket/second']]);

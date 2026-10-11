@@ -125,6 +125,7 @@ final class CopyObjectHandler implements RequestHandler
         $expectedPhysicalPayload = null;
         $body = null;
         $bufferLock = null;
+        $copyCancellation = null;
         try {
             if ($sourceEncryptionMode !== null || $destinationEncryptionMode !== null) {
                 if ($source->size > $this->maxEncryptedObjectSize) {
@@ -210,6 +211,7 @@ final class CopyObjectHandler implements RequestHandler
                 'copy_object',
             );
             $lease = $this->localLeaseFactory->reserve($planned);
+            $leaseCancellation = null;
             try {
                 $outcome = $this->localFencedWriter->publishWithLease($lease->reservedIntent(), $destinationKey, $body, $lease);
                 if ($outcome->result === null) {
@@ -225,12 +227,28 @@ final class CopyObjectHandler implements RequestHandler
                 $token = $lease->stopForCommit();
 
                 return [$write, $etag, $plaintextChecksums !== null ? $plaintextChecksums->size : $write->size, $encryptionMetadata, $plaintextChecksums, $token];
+            } catch (\Amp\CancelledException $error) {
+                $leaseCancellation = $error;
+                throw $error;
             } finally {
-                $lease->close();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $leaseCancellation,
+                    $lease->close(...),
+                );
             }
+        } catch (\Amp\CancelledException $error) {
+            $copyCancellation = $error;
+            throw $error;
         } finally {
-            $body?->close();
-            $bufferLock?->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $copyCancellation,
+                static function () use ($body): void {
+                    $body?->close();
+                },
+                static function () use ($bufferLock): void {
+                    $bufferLock?->release();
+                },
+            );
         }
     }
 
@@ -493,10 +511,19 @@ final class CopyObjectHandler implements RequestHandler
             // One byte past the committed size is enough for the post-write
             // integrity check to reject an oversized physical source.
             $stream = new LimitedReadableStream($sourceStorage->getObjectByPath($srcPath), $readLimit);
+            $streamCancellation = null;
             try {
                 $writeResult = $destinationStorage->putObject($dstBucket, $dstKey, $stream);
+            } catch (\Throwable $error) {
+                if ($error instanceof \Amp\CancelledException) {
+                    $streamCancellation = $error;
+                }
+                throw $error;
             } finally {
-                $stream->close();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $streamCancellation,
+                    $stream->close(...),
+                );
             }
         }
 
@@ -523,6 +550,7 @@ final class CopyObjectHandler implements RequestHandler
         $encMeta = $preEncryptedMeta;
         $objectSize = $preEncryptedObjectSize ?? $writeResult->size;
         $bufferedWorkLock = null;
+        $processingCancellation = null;
         try {
             $bufferedWorkLock = ! $preEncryptedDestination && $sourceEncryptionMode !== null
                 ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
@@ -595,12 +623,25 @@ final class CopyObjectHandler implements RequestHandler
             }
             $this->assertSourceChecksums($srcObjectInfo, $destinationStorage, $writeResult, $sourcePlaintextChecksums, $readLimit);
         } catch (\Throwable $e) {
-            if ($localDispatchToken === null) {
-                $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, protectedPath: $sourceStorage === $destinationStorage ? $srcPath : null);
+            if ($e instanceof \Amp\CancelledException) {
+                $processingCancellation = $e;
             }
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                function () use ($localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $sourceStorage, $srcPath): void {
+                    if ($localDispatchToken === null) {
+                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, protectedPath: $sourceStorage === $destinationStorage ? $srcPath : null);
+                    }
+                },
+            );
             throw $e;
         } finally {
-            $bufferedWorkLock?->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $processingCancellation,
+                static function () use ($bufferedWorkLock): void {
+                    $bufferedWorkLock?->release();
+                },
+            );
         }
         // The source GET succeeded even if destination metadata publication
         // later fails. Keep its result independent of the destination record.
@@ -610,9 +651,9 @@ final class CopyObjectHandler implements RequestHandler
         if ($metadataDirective === 'REPLACE') {
             // Use new metadata from request headers.
             $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
-            $contentEncoding = $request->getHeader('content-encoding');
+            $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
             $contentDisposition = $request->getHeader('content-disposition');
-            $cacheControl = $request->getHeader('cache-control');
+            $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
             \assert($replacementUserMetadata !== null);
             $userMetadata = $replacementUserMetadata;
         } else {
@@ -859,9 +900,14 @@ final class CopyObjectHandler implements RequestHandler
             // of whether an immediate read can already see publication.
             // The transaction can throw while committing after its callback
             // has set this by-reference safety flag.
-            if (! $metadataCallbackCompleted && $localDispatchToken === null) {
-                $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $versionId);
-            }
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                function () use ($metadataCallbackCompleted, $localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $versionId): void {
+                    if (! $metadataCallbackCompleted && $localDispatchToken === null) {
+                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $versionId);
+                    }
+                },
+            );
             throw $e;
         }
 
@@ -936,6 +982,7 @@ final class CopyObjectHandler implements RequestHandler
         }
 
         $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+        $encryptionCancellation = null;
         try {
             [$physicalPayload, $checksums] = BufferedSsePayload::readExpected(
                 $sourceStorage->getObjectByPath($sourcePath),
@@ -1011,8 +1058,14 @@ final class CopyObjectHandler implements RequestHandler
             }
 
             return [$write, '"' . $checksums->md5Hex . '"', $checksums->size, $encryptionMetadata, $checksums];
+        } catch (\Amp\CancelledException $error) {
+            $encryptionCancellation = $error;
+            throw $error;
         } finally {
-            $lock->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $encryptionCancellation,
+                $lock->release(...),
+            );
         }
     }
 
@@ -1055,12 +1108,21 @@ final class CopyObjectHandler implements RequestHandler
             }
             $calculator = new ChecksumCalculator();
             $stream = new LimitedReadableStream($destinationStorage->getObjectByPath($write->path), $readLimit);
+            $streamCancellation = null;
             try {
                 while (($chunk = $stream->read()) !== null) {
                     $calculator->update($chunk);
                 }
+            } catch (\Throwable $error) {
+                if ($error instanceof \Amp\CancelledException) {
+                    $streamCancellation = $error;
+                }
+                throw $error;
             } finally {
-                $stream->close();
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                    $streamCancellation,
+                    $stream->close(...),
+                );
             }
             $checksums = $calculator->finalize();
             if ($checksums->size !== $source->size) {
@@ -1100,6 +1162,8 @@ final class CopyObjectHandler implements RequestHandler
                     $tier,
                     $path,
                 );
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
             } catch (\Throwable) {
                 // The transaction already queued this exact path for the collector.
             }
@@ -1154,7 +1218,10 @@ final class CopyObjectHandler implements RequestHandler
                 );
             }
         } catch (\Throwable $e) {
-            $this->cleanupFailedCopy($storage, $bucket, $key, $replacement->path, protectedPath: $protectedSourcePath);
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                $e,
+                fn() => $this->cleanupFailedCopy($storage, $bucket, $key, $replacement->path, protectedPath: $protectedSourcePath),
+            );
             throw $e;
         }
 

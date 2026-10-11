@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Storage;
 
 use Amp\ByteStream\ReadableStream;
 use Amp\Cancellation;
+use Amp\CancelledException;
 use Amp\File;
 use Amp\File\Driver\ParallelFilesystemDriver;
 use Amp\Parallel\Worker\ContextWorkerPool;
@@ -142,7 +143,13 @@ final class LocalScratchStager
             }
             $this->deleteStage($path);
             if ($reservation !== null) {
-                $this->budget->release($reservation);
+                try {
+                    $this->budget->release($reservation);
+                } catch (\Throwable $releaseError) {
+                    if (! $error instanceof CancelledException) {
+                        throw $releaseError;
+                    }
+                }
             }
             throw $error;
         }

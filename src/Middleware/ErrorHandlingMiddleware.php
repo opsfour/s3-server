@@ -93,6 +93,8 @@ final class ErrorHandlingMiddleware implements Middleware
                 headers: $headers,
                 body: $xml,
             );
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
         } catch (\Throwable $e) {
             $this->logger?->error('Internal server error', [
                 'exception' => $e::class,

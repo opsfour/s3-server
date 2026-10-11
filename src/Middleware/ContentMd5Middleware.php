@@ -52,7 +52,12 @@ final class ContentMd5Middleware implements Middleware
             $digests['Content-MD5'] = self::decodeDigest($contentMd5, 'md5', 16, 'Content-MD5');
         }
         $operation = $request->hasAttribute('s3.operation') ? $request->getAttribute('s3.operation') : null;
-        $requiresChecksum = in_array($operation, self::CHECKSUM_REQUIRED_OPERATIONS, true);
+        $objectLockChecksumRequired = $request->hasAttribute(ObjectLockChecksumMiddleware::REQUIRED_ATTRIBUTE)
+            && $request->getAttribute(ObjectLockChecksumMiddleware::REQUIRED_ATTRIBUTE) === true;
+        $requiresChecksum = in_array($operation, self::CHECKSUM_REQUIRED_OPERATIONS, true)
+            || $objectLockChecksumRequired;
+        $declaredAlgorithm = null;
+        $hasSupportedTrailerDeclaration = false;
         if ($requiresChecksum) {
             // Current AWS PHP SDKs may send a checksum header instead of
             // Content-MD5. Validate a supplied digest before dispatch.
@@ -70,6 +75,9 @@ final class ContentMd5Middleware implements Middleware
                 }
             }
             $declaredAlgorithm = RequestHeaderValues::singleton($request, 'x-amz-sdk-checksum-algorithm');
+            $hasSupportedTrailerDeclaration = $objectLockChecksumRequired
+                && in_array($operation, [S3Operation::PutObject, S3Operation::UploadPart], true)
+                && self::hasSupportedChecksumTrailer($request, $declaredAlgorithm);
             if ($declaredAlgorithm !== null) {
                 $declaredHeader = match ($declaredAlgorithm) {
                     'CRC32' => 'x-amz-checksum-crc32',
@@ -84,20 +92,21 @@ final class ContentMd5Middleware implements Middleware
                 if ($hasSdkChecksum && ! isset($digests[$declaredHeader])) {
                     throw new BadDigestException('The declared SDK checksum algorithm does not match the supplied checksum.');
                 }
-                if (! $hasSdkChecksum) {
+                if (! $hasSdkChecksum && ! $hasSupportedTrailerDeclaration) {
                     throw new InvalidRequestException('A declared SDK checksum requires a matching x-amz-checksum header.');
                 }
             }
-            if ($digests === []) {
+            if ($digests === [] && ! $hasSupportedTrailerDeclaration) {
                 throw new InvalidRequestException('A request checksum is required for this operation.');
             }
         }
-        if ($digests === []) {
+        if ($digests === [] && ! $hasSupportedTrailerDeclaration) {
             return $requestHandler->handleRequest($request);
         }
 
         $tempPath = $this->spool->create('s3-md5-');
         $reader = null;
+        $primaryFailure = null;
 
         try {
             $hashes = [];
@@ -110,6 +119,10 @@ final class ContentMd5Middleware implements Middleware
                     hash_update($hash, $chunk);
                 }
                 $this->spool->append($tempPath, $chunk);
+            }
+
+            if ($hasSupportedTrailerDeclaration) {
+                self::assertSupportedChecksumTrailerVerified($request, $declaredAlgorithm);
             }
 
             foreach ($hashes as $header => $hash) {
@@ -131,11 +144,30 @@ final class ContentMd5Middleware implements Middleware
             $request->setBody($reader);
 
             return $requestHandler->handleRequest($request);
+        } catch (\Throwable $error) {
+            $primaryFailure = $error;
+            throw $error;
         } finally {
-            $reader?->close();
+            $closeFailure = null;
+            try {
+                $reader?->close();
+            } catch (\Throwable $error) {
+                $closeFailure = $error;
+            }
+            $deleteCancellation = null;
             try {
                 $this->spool->delete($tempPath);
+            } catch (\Amp\CancelledException $error) {
+                $deleteCancellation = $error;
             } catch (\Throwable) {
+            }
+            if ($primaryFailure === null) {
+                if ($closeFailure !== null) {
+                    throw $closeFailure;
+                }
+                if ($deleteCancellation !== null) {
+                    throw $deleteCancellation;
+                }
             }
         }
     }
@@ -152,5 +184,46 @@ final class ContentMd5Middleware implements Middleware
         }
 
         return ['algorithm' => $algorithm, 'expected' => $expected];
+    }
+
+    private static function hasSupportedChecksumTrailer(Request $request, ?string $declaredAlgorithm): bool
+    {
+        if ($declaredAlgorithm === null) {
+            return false;
+        }
+        $expectedHeader = match ($declaredAlgorithm) {
+            'CRC32' => 'x-amz-checksum-crc32',
+            'CRC32C' => 'x-amz-checksum-crc32c',
+            'SHA1' => 'x-amz-checksum-sha1',
+            'SHA256' => 'x-amz-checksum-sha256',
+            default => null,
+        };
+        $trailer = RequestHeaderValues::singleton($request, 'x-amz-trailer');
+        if ($expectedHeader === null || $trailer === null
+            || strtolower(trim($trailer)) !== $expectedHeader) {
+            return false;
+        }
+
+        return in_array(RequestHeaderValues::singleton($request, 'x-amz-content-sha256'), [
+            'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+            'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+        ], true);
+    }
+
+    private static function assertSupportedChecksumTrailerVerified(Request $request, ?string $declaredAlgorithm): void
+    {
+        $expectedHeader = match ($declaredAlgorithm) {
+            'CRC32' => 'x-amz-checksum-crc32',
+            'CRC32C' => 'x-amz-checksum-crc32c',
+            'SHA1' => 'x-amz-checksum-sha1',
+            'SHA256' => 'x-amz-checksum-sha256',
+            default => null,
+        };
+        $verified = $request->hasAttribute('s3.verifiedChecksumTrailers')
+            ? $request->getAttribute('s3.verifiedChecksumTrailers') : null;
+        if ($expectedHeader === null || $verified !== [$expectedHeader]
+            || RequestHeaderValues::singleton($request, $expectedHeader) === null) {
+            throw new InvalidRequestException('Checksum trailer verification did not complete.');
+        }
     }
 }

@@ -19,22 +19,24 @@ final class RequestIdMiddleware implements Middleware
 {
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
-        // Single syscall for both UUID (16 bytes) and x-amz-id-2 (36 bytes).
-        $randomBytes = random_bytes(52);
+        $requestId = $request->hasAttribute('requestId') ? $request->getAttribute('requestId') : null;
+        $amzId2 = $request->hasAttribute('amzId2') ? $request->getAttribute('amzId2') : null;
+        if (! is_string($requestId) || $requestId === '' || ! is_string($amzId2) || $amzId2 === '') {
+            // Single syscall for both UUID (16 bytes) and x-amz-id-2 (36 bytes).
+            $randomBytes = random_bytes(52);
+            $uuidBytes = substr($randomBytes, 0, 16);
 
-        $uuidBytes = substr($randomBytes, 0, 16);
+            // Set version to 0100 (UUID v4)
+            $uuidBytes[6] = chr(ord($uuidBytes[6]) & 0x0F | 0x40);
 
-        // Set version to 0100 (UUID v4)
-        $uuidBytes[6] = chr(ord($uuidBytes[6]) & 0x0F | 0x40);
+            // Set variant to 10xx (RFC 4122)
+            $uuidBytes[8] = chr(ord($uuidBytes[8]) & 0x3F | 0x80);
 
-        // Set variant to 10xx (RFC 4122)
-        $uuidBytes[8] = chr(ord($uuidBytes[8]) & 0x3F | 0x80);
-
-        $requestId = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($uuidBytes), 4));
-        $amzId2 = base64_encode(substr($randomBytes, 16, 36));
-
-        $request->setAttribute('requestId', $requestId);
-        $request->setAttribute('amzId2', $amzId2);
+            $requestId = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($uuidBytes), 4));
+            $amzId2 = base64_encode(substr($randomBytes, 16, 36));
+            $request->setAttribute('requestId', $requestId);
+            $request->setAttribute('amzId2', $amzId2);
+        }
 
         $response = $requestHandler->handleRequest($request);
 
@@ -61,7 +63,9 @@ final class RequestIdMiddleware implements Middleware
         // responses; object HEAD responses already carry their stored length.
         if (str_starts_with($request->getProtocolVersion(), '1.')
             && (($request->getMethod() === 'HEAD' && $response->getHeader('Content-Length') === null)
-                || in_array($response->getStatus(), [204, 304], true))) {
+                || in_array($response->getStatus(), [204, 304], true)
+                || ($request->hasAttribute('s3.forceConnectionClose')
+                    && $request->getAttribute('s3.forceConnectionClose') === true))) {
             $response->setHeader('Connection', 'close');
         }
 

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableStream;
+use Amp\CancelledException;
 use Amp\File\Driver\BlockingFilesystemDriver;
 use Amp\File\File;
 use Amp\File\Filesystem;
@@ -78,6 +80,65 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         self::assertSame($path, $write->path);
         self::assertSame('planned', buffer($backend->getObjectByPath($path)));
         self::assertFileDoesNotExist($this->basePath . '/escape');
+    }
+
+    public function test_cancelled_object_write_cleans_staging_file_and_propagates_same_cancellation(): void
+    {
+        $backend = new FilesystemBackend($this->basePath);
+        $backend->createBucket('bucket');
+        $cancellation = new CancelledException();
+        $body = $this->createMock(ReadableStream::class);
+        $body->expects(self::once())->method('read')->willThrowException($cancellation);
+
+        try {
+            $backend->putObject('bucket', 'key', $body);
+            self::fail('Cancellation must leave the filesystem write boundary unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], glob($this->basePath . '/.tmp/*'));
+        }
+    }
+
+    public function test_close_failure_does_not_replace_object_write_cancellation(): void
+    {
+        $driver = $this->createMock(FilesystemDriver::class);
+        $file = $this->createMock(File::class);
+        $file->method('close')->willThrowException(new \RuntimeException('close failed'));
+        $driver->method('openFile')->willReturn($file);
+        $backend = new FilesystemBackend($this->basePath, new Filesystem($driver));
+        $backend->createBucket('bucket');
+        $cancellation = new CancelledException();
+        $body = $this->createMock(ReadableStream::class);
+        $body->method('read')->willThrowException($cancellation);
+
+        try {
+            $backend->putObject('bucket', 'key', $body);
+            self::fail('Close failure must not replace request cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+            self::assertSame([], glob($this->basePath . '/.tmp/*'));
+        }
+    }
+
+    public function test_close_failure_does_not_replace_ranged_read_cancellation(): void
+    {
+        $normal = new FilesystemBackend($this->basePath);
+        $normal->createBucket('bucket');
+        $stored = $normal->putObject('bucket', 'key', new ReadableBuffer('payload'));
+        $cancellation = new CancelledException();
+        $driver = $this->createMock(FilesystemDriver::class);
+        $file = $this->createMock(File::class);
+        $file->method('seek')->willThrowException($cancellation);
+        $file->method('close')->willThrowException(new \RuntimeException('close failed'));
+        $driver->method('openFile')->willReturn($file);
+        $backend = new FilesystemBackend($this->basePath, new Filesystem($driver));
+
+        try {
+            $backend->getObjectByPath($stored->path, 1);
+            self::fail('Close failure must not replace ranged-read cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
     }
 
     public function test_name_only_filesystem_bucket_deletion_does_not_remove_recreated_marker(): void

@@ -70,6 +70,7 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             throw new InternalErrorException('Failed to open temp stream.');
         }
 
+        $cancellation = null;
         try {
             while (($chunk = $body->read()) !== null) {
                 $this->reserveTempBytes($reservation, strlen($chunk));
@@ -83,15 +84,21 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             $checksums = $calculator->finalize();
             try {
                 $this->filesystem->writeStream($storagePath, $tmpStream);
+            } catch (CancelledException $e) {
+                $this->deleteFailedWrite($storagePath, $e);
+                throw $e;
             } catch (\Throwable $e) {
                 $this->deleteFailedWrite($storagePath);
                 throw new InternalErrorException('Failed to write object to Flysystem backend.', $e);
             }
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
             if (is_resource($tmpStream)) {
                 fclose($tmpStream);
             }
-            $this->releaseBudgetedTempFile($tmpFile, $reservation);
+            $this->releaseBudgetedTempFile($tmpFile, $reservation, $cancellation);
         }
 
         return new StorageWriteResult(
@@ -210,6 +217,7 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             throw new InternalErrorException('Failed to open temp stream.');
         }
 
+        $cancellation = null;
         try {
             while (($chunk = $data->read()) !== null) {
                 $this->reserveTempBytes($reservation, strlen($chunk));
@@ -223,15 +231,21 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             $checksums = $calculator->finalize();
             try {
                 $this->filesystem->writeStream($partPath, $tmpStream);
+            } catch (CancelledException $e) {
+                $this->deleteFailedWrite($partPath, $e);
+                throw $e;
             } catch (\Throwable $e) {
                 $this->deleteFailedWrite($partPath);
                 throw new InternalErrorException('Failed to write multipart part to Flysystem backend.', $e);
             }
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
             if (is_resource($tmpStream)) {
                 fclose($tmpStream);
             }
-            $this->releaseBudgetedTempFile($tmpFile, $reservation);
+            $this->releaseBudgetedTempFile($tmpFile, $reservation, $cancellation);
         }
 
         return new StorageWriteResult(
@@ -273,6 +287,7 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         $size = 0;
         $partMd5s = '';
 
+        $cancellation = null;
         try {
             foreach ($parts as $part) {
                 $partNumber = $part['partNumber'];
@@ -281,6 +296,8 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
                 try {
                     $partStream = $this->filesystem->readStream($partPath);
+                } catch (CancelledException $error) {
+                    throw $error;
                 } catch (\Throwable) {
                     fclose($outHandle);
                     throw new InternalErrorException('Multipart part is unavailable in Flysystem backend.');
@@ -326,6 +343,9 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             try {
                 try {
                     $this->filesystem->writeStream($storagePath, $resource);
+                } catch (CancelledException $e) {
+                    $this->deleteFailedWrite($storagePath, $e);
+                    throw $e;
                 } catch (\Throwable $e) {
                     $this->deleteFailedWrite($storagePath);
                     throw new InternalErrorException('Failed to write assembled multipart object to Flysystem backend.', $e);
@@ -335,11 +355,14 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
                     fclose($resource);
                 }
             }
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
         } finally {
             if (is_resource($outHandle)) {
                 fclose($outHandle);
             }
-            $this->releaseBudgetedTempFile($tmpFile, $reservation);
+            $this->releaseBudgetedTempFile($tmpFile, $reservation, $cancellation);
         }
 
         return new StorageWriteResult(
@@ -377,6 +400,8 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             }
         } catch (NoSuchKeyException $error) {
             throw $error;
+        } catch (CancelledException $error) {
+            throw $error;
         } catch (\Throwable $error) {
             throw new InternalErrorException('Failed to check source object in Flysystem backend.', $error);
         }
@@ -385,12 +410,11 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
         try {
             $this->filesystem->copy($srcPath, $storagePath);
+        } catch (CancelledException $error) {
+            $this->deleteFailedWrite($storagePath, $error);
+            throw $error;
         } catch (\Throwable $error) {
-            try {
-                $this->filesystem->delete($storagePath);
-            } catch (\Throwable) {
-            }
-
+            $this->deleteFailedWrite($storagePath);
             throw new InternalErrorException('Failed to copy object in Flysystem backend.', $error);
         }
 
@@ -410,12 +434,11 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             } finally {
                 fclose($copiedStream);
             }
+        } catch (CancelledException $error) {
+            $this->deleteFailedWrite($storagePath, $error);
+            throw $error;
         } catch (\Throwable $error) {
-            try {
-                $this->filesystem->delete($storagePath);
-            } catch (\Throwable) {
-            }
-
+            $this->deleteFailedWrite($storagePath);
             throw new InternalErrorException('Failed to verify copied Flysystem object.', $error);
         }
 
@@ -468,10 +491,14 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
     }
 
     /** A failed adapter write may already have stored bytes at its unique path. */
-    private function deleteFailedWrite(string $path): void
+    private function deleteFailedWrite(string $path, ?CancelledException $cancellation = null): void
     {
         try {
             $this->filesystem->delete($path);
+        } catch (CancelledException $cleanupCancellation) {
+            if ($cancellation === null) {
+                throw $cleanupCancellation;
+            }
         } catch (\Throwable) {
             // Preserve the write failure; a cleanup outage must not replace it.
         }
@@ -574,11 +601,20 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         }
     }
 
-    private function releaseBudgetedTempFile(string $path, ?StorageTempReservation $reservation): void
-    {
+    private function releaseBudgetedTempFile(
+        string $path,
+        ?StorageTempReservation $reservation,
+        ?CancelledException $cancellation = null,
+    ): void {
         @unlink($path);
         if ($reservation !== null) {
-            $this->tempBudget?->release($reservation);
+            try {
+                $this->tempBudget?->release($reservation);
+            } catch (\Throwable $releaseError) {
+                if ($cancellation === null) {
+                    throw $releaseError;
+                }
+            }
         }
     }
 

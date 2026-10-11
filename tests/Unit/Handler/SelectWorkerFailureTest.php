@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Handler;
 
 use Amp\DeferredFuture;
 use Amp\ByteStream\ReadableBuffer;
+use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\Cancellation;
@@ -221,16 +222,35 @@ final class SelectWorkerFailureTest extends TestCase
         $pool->method('getIdleWorkerCount')->willReturn(1);
         $pool->method('getWorker')->willReturn($worker);
         $close = new DeferredCancellation();
-        $watcher = EventLoop::delay(0.01, static function () use ($close): void {
+        $expectedCancellation = null;
+        $watcher = EventLoop::delay(0.01, static function () use ($close, &$expectedCancellation): void {
             $close->cancel();
+            try {
+                $close->getCancellation()->throwIfRequested();
+            } catch (CancelledException $error) {
+                $expectedCancellation = $error;
+            }
         });
         try {
             $this->process($this->handler(), $pool, clientCancellation: $close->getCancellation());
             self::fail('Expected request cancellation.');
-        } catch (SlowDownException $e) {
-            self::assertSame('S3 Select request was cancelled.', $e->getMessage());
+        } catch (CancelledException $error) {
+            self::assertNotNull($expectedCancellation);
+            self::assertSame($expectedCancellation, $error);
         } finally {
             EventLoop::cancel($watcher);
+        }
+    }
+
+    public function test_worker_cancellation_without_select_timeout_propagates_the_original_exception(): void
+    {
+        $cancellation = new CancelledException();
+
+        try {
+            $this->process($this->handler(), $this->poolFor(Future::error($cancellation)));
+            self::fail('Expected worker cancellation.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
         }
     }
 

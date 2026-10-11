@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Encryption;
 
 use Amp\ByteStream\ReadableIterableStream;
 use Amp\ByteStream\ReadableStream;
+use Amp\CancelledException;
 use OpsFour\S3Server\Encryption\BufferedSsePayload;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -68,6 +69,21 @@ final class BufferedSsePayloadTest extends TestCase
         $this->expectExceptionMessage('Encrypted source size does not match metadata.');
 
         BufferedSsePayload::readExpected($stream, 3, 8);
+    }
+
+    public function test_close_failure_does_not_replace_read_cancellation(): void
+    {
+        $cancellation = new CancelledException();
+        $stream = $this->createMock(ReadableStream::class);
+        $stream->method('read')->willThrowException($cancellation);
+        $stream->method('close')->willThrowException(new \RuntimeException('close failed'));
+
+        try {
+            BufferedSsePayload::readExpected($stream, 3, 8);
+            self::fail('The source cancellation must propagate.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
     }
 
     /** @return iterable<string, array{string}> */
