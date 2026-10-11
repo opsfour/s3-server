@@ -17,11 +17,12 @@ final class ObjectVersionResolver
         Request $request,
         string $bucket,
         string $key,
+        bool $allowExplicitDeleteMarker = false,
     ): ObjectInfo {
         $versionId = QueryStringParser::parse($request->getUri()->getQuery())['versionId'] ?? null;
         if ($versionId !== null) {
             $object = $metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
-            if ($object === null || $object->isDeleteMarker) {
+            if ($object === null || ($object->isDeleteMarker && ! $allowExplicitDeleteMarker)) {
                 throw new NoSuchVersionException();
             }
 

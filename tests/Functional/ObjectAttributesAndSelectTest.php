@@ -89,6 +89,42 @@ final class ObjectAttributesAndSelectTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_get_object_attributes_reports_explicit_delete_marker_headers(): void
+    {
+        $bucket = 'attributes-marker-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Enabled'],
+        ]);
+        $object = self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'deleted', 'Body' => 'body']);
+        $deleted = self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'deleted']);
+
+        try {
+            try {
+                self::$s3->getObjectAttributes([
+                    'Bucket' => $bucket,
+                    'Key' => 'deleted',
+                    'VersionId' => $deleted['VersionId'],
+                    'ObjectAttributes' => ['ETag'],
+                ]);
+                self::fail('An explicit delete marker must not return object attributes.');
+            } catch (S3Exception $error) {
+                self::assertSame('MethodNotAllowed', $error->getAwsErrorCode());
+                self::assertSame(405, $error->getStatusCode());
+                $response = $error->getResponse();
+                self::assertNotNull($response);
+                self::assertSame('true', $response->getHeaderLine('x-amz-delete-marker'));
+                self::assertSame($deleted['VersionId'], $response->getHeaderLine('x-amz-version-id'));
+                self::assertNotSame('', $response->getHeaderLine('last-modified'));
+            }
+        } finally {
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'deleted', 'VersionId' => $deleted['VersionId']]);
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'deleted', 'VersionId' => $object['VersionId']]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
     public function test_get_object_attributes_honors_signed_conditional_headers(): void
     {
         $key = 'attributes-condition-' . bin2hex(random_bytes(4));

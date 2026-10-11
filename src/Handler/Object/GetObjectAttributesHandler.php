@@ -16,6 +16,7 @@ use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 
 /**
@@ -41,7 +42,13 @@ final class GetObjectAttributesHandler implements RequestHandler
         }
 
         try {
-            $objectInfo = ObjectVersionResolver::resolve($this->metadata, $request, $bucket, $key);
+            $objectInfo = ObjectVersionResolver::resolve(
+                $this->metadata,
+                $request,
+                $bucket,
+                $key,
+                allowExplicitDeleteMarker: true,
+            );
         } catch (NoSuchKeyException|NoSuchVersionException $exception) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             // A current delete marker keeps its established 404 response.
@@ -56,6 +63,14 @@ final class GetObjectAttributesHandler implements RequestHandler
             throw $exception;
         }
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+
+        if ($objectInfo->isDeleteMarker) {
+            throw (new MethodNotAllowedException())->withExtraHeaders([
+                'x-amz-delete-marker' => 'true',
+                'x-amz-version-id' => $objectInfo->versionId ?? 'null',
+                'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),
+            ]);
+        }
 
         $sseAlgorithm = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
         $customerKey = EncryptionRequestResolver::resolveCustomerKey(

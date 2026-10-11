@@ -91,6 +91,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Fail fast on invalid broker clients, dead-letter unencodable event payloads,
   permit standard empty AMQP destinations, and document callable bridges as
   the portable native-client integration contract.
+- Return the delete-marker response headers and `MethodNotAllowed` from
+  GetObjectAttributes when an explicit delete-marker version is selected.
 
 ### Upgrade Notes
 

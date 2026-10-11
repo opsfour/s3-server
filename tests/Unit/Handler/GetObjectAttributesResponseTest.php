@@ -10,6 +10,7 @@ use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\OperationAbortedException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use PHPUnit\Framework\TestCase;
@@ -70,6 +71,40 @@ final class GetObjectAttributesResponseTest extends TestCase
 
         self::assertSame(1, substr_count($body, '<ETag>'));
         self::assertSame(1, substr_count($body, '<ObjectSize>'));
+    }
+
+    public function test_explicit_delete_marker_returns_method_not_allowed_with_marker_headers(): void
+    {
+        $lastModified = new \DateTimeImmutable('2026-02-03T04:05:06Z');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadataByVersion')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            0,
+            '"marker"',
+            lastModified: $lastModified,
+            versionId: 'marker-version',
+            isDeleteMarker: true,
+        ));
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key?attributes&versionId=marker-version'),
+            ['x-amz-object-attributes' => 'ETag'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        try {
+            (new GetObjectAttributesHandler($metadata))->handleRequest($request);
+            self::fail('An explicit delete marker must not return object attributes.');
+        } catch (MethodNotAllowedException $error) {
+            self::assertSame('true', $error->getExtraHeaders()['x-amz-delete-marker']);
+            self::assertSame('marker-version', $error->getExtraHeaders()['x-amz-version-id']);
+            self::assertSame('Tue, 03 Feb 2026 04:05:06 GMT', $error->getExtraHeaders()['Last-Modified']);
+        }
     }
 
     public function test_response_uses_wire_root_and_canonical_field_order(): void
