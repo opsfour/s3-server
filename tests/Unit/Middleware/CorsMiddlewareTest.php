@@ -13,6 +13,8 @@ use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
+use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 
@@ -83,6 +85,69 @@ final class CorsMiddlewareTest extends TestCase
         self::assertSame('https://client.example', $response->getHeader('Access-Control-Allow-Origin'));
     }
 
+    public function test_response_without_origin_still_prevents_cross_origin_cache_reuse(): void
+    {
+        $response = (new CorsMiddleware($this->metadata))->handleRequest(
+            $this->request('GET', []),
+            $this->terminal(new Response(200, ['Vary' => 'Accept-Encoding'])),
+        );
+
+        self::assertSame('Accept-Encoding, Origin', $response->getHeader('Vary'));
+        self::assertNull($response->getHeader('Access-Control-Allow-Origin'));
+    }
+
+    public function test_regular_response_combines_repeated_vary_fields_and_preserves_wildcard(): void
+    {
+        $this->metadata->putBucketCors('bucket-a', [$this->rule([])]);
+        $middleware = new CorsMiddleware($this->metadata);
+        $request = $this->request('GET', ['Origin' => 'https://client.example']);
+
+        $repeated = new Response(200);
+        $repeated->setHeader('Vary', ['Accept-Encoding', 'User-Agent']);
+        $response = $middleware->handleRequest($request, $this->terminal($repeated));
+        self::assertSame('Accept-Encoding, User-Agent, Origin', $response->getHeader('Vary'));
+
+        $wildcard = new Response(200);
+        $wildcard->setHeader('Vary', ['Accept-Encoding', '*']);
+        $response = $middleware->handleRequest($request, $this->terminal($wildcard));
+        self::assertSame('*', $response->getHeader('Vary'));
+    }
+
+    public function test_unmatched_regular_origin_still_varies_cached_response_by_origin(): void
+    {
+        $this->metadata->putBucketCors('bucket-a', [$this->rule([])]);
+        $response = (new CorsMiddleware($this->metadata))->handleRequest(
+            $this->request('GET', ['Origin' => 'https://other.example']),
+            $this->terminal(new Response(200, ['Vary' => 'Accept-Encoding'])),
+        );
+
+        self::assertNull($response->getHeader('Access-Control-Allow-Origin'));
+        self::assertSame('Accept-Encoding, Origin', $response->getHeader('Vary'));
+    }
+
+    public function test_repeated_origin_and_request_method_fail_closed_while_repeated_header_lists_are_combined(): void
+    {
+        $this->metadata->putBucketCors('bucket-a', [$this->rule(['x-first', 'x-second'])]);
+        $middleware = new CorsMiddleware($this->metadata);
+
+        $duplicateOrigin = $this->request('OPTIONS', ['Access-Control-Request-Method' => 'PUT']);
+        $duplicateOrigin->setHeader('Origin', ['https://client.example', 'https://client.example']);
+        self::assertSame(403, $middleware->handleRequest($duplicateOrigin, $this->terminal())->getStatus());
+
+        $duplicateMethod = $this->request('OPTIONS', ['Origin' => 'https://client.example']);
+        $duplicateMethod->setHeader('Access-Control-Request-Method', ['PUT', 'PUT']);
+        self::assertSame(403, $middleware->handleRequest($duplicateMethod, $this->terminal())->getStatus());
+
+        $splitHeaders = $this->request('OPTIONS', [
+            'Origin' => 'https://client.example',
+            'Access-Control-Request-Method' => 'PUT',
+        ]);
+        $splitHeaders->setHeader('Access-Control-Request-Headers', ['X-First', 'X-Second']);
+        $response = $middleware->handleRequest($splitHeaders, $this->terminal());
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('x-first, x-second', $response->getHeader('Access-Control-Allow-Headers'));
+    }
+
     public function test_origin_question_mark_and_brackets_are_literal_not_extra_glob_syntax(): void
     {
         $rule = $this->rule([]);
@@ -125,6 +190,27 @@ final class CorsMiddlewareTest extends TestCase
         self::assertSame($rules, $cached->getBucketCors('bucket-a'), 'The named CORS cache remains stale across external writes.');
 
         $response = (new CorsMiddleware($cached))->handleRequest(
+            $this->request('OPTIONS', ['Origin' => 'https://client.example', 'Access-Control-Request-Method' => 'PUT']),
+            $this->terminal(),
+        );
+
+        self::assertSame(403, $response->getStatus());
+        self::assertNull($response->getHeader('Access-Control-Allow-Origin'));
+    }
+
+    public function test_observability_wrapper_cannot_hide_stale_cors_cache_from_generation_check(): void
+    {
+        $rules = [$this->rule([])];
+        $this->metadata->putBucketCors('bucket-a', $rules);
+        $cached = new CachedMetadataStoreDecorator($this->metadata, 60.0);
+        self::assertSame($rules, $cached->getBucketCors('bucket-a'));
+        $observed = new ObservedMetadataStore($cached, new MetricsCollector(), 'sqlite');
+
+        $this->metadata->deleteBucket('owner', 'bucket-a');
+        $this->metadata->createBucket('owner', 'bucket-a', 'us-east-1');
+        self::assertSame($rules, $cached->getBucketCors('bucket-a'));
+
+        $response = (new CorsMiddleware($observed))->handleRequest(
             $this->request('OPTIONS', ['Origin' => 'https://client.example', 'Access-Control-Request-Method' => 'PUT']),
             $this->terminal(),
         );

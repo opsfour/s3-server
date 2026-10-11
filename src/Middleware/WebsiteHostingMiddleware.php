@@ -79,7 +79,8 @@ final class WebsiteHostingMiddleware implements Middleware
 
         // Redirect-only buckets do not need an object at the requested key.
         if (isset($websiteConfig['redirectAllHost'])) {
-            $protocol = $websiteConfig['redirectAllProtocol'] ?? ($request->getUri()->getScheme() ?: 'http');
+            $protocol = $websiteConfig['redirectAllProtocol']
+                ?? (RequestNetworkContext::secureTransport($request) ? 'https' : 'http');
             if (!in_array($protocol, ['http', 'https'], true)) {
                 $protocol = 'http';
             }
@@ -167,12 +168,7 @@ final class WebsiteHostingMiddleware implements Middleware
 
             return new Response(
                 status: 200,
-                headers: [
-                    'Content-Type' => $objectInfo->contentType,
-                    'Content-Length' => (string) $objectInfo->size,
-                    'ETag' => $objectInfo->etag,
-                    'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \G\M\T'),
-                ],
+                headers: self::websiteObjectHeaders($objectInfo),
                 body: $body,
             );
         }
@@ -240,10 +236,7 @@ final class WebsiteHostingMiddleware implements Middleware
 
                     return new Response(
                         status: 404,
-                        headers: [
-                            'Content-Type' => $errorObjectInfo->contentType,
-                            'Content-Length' => (string) $errorObjectInfo->size,
-                        ],
+                        headers: self::websiteObjectHeaders($errorObjectInfo),
                         body: $body,
                     );
                 }
@@ -283,7 +276,8 @@ final class WebsiteHostingMiddleware implements Middleware
             $redirectKey = $redirect['replaceKeyWith'];
         }
 
-        $protocol = $redirect['protocol'] ?? ($request->getUri()->getScheme() ?: 'http');
+        $protocol = $redirect['protocol']
+            ?? (RequestNetworkContext::secureTransport($request) ? 'https' : 'http');
         if (! in_array($protocol, ['http', 'https'], true)) {
             $protocol = 'http';
         }
@@ -398,13 +392,17 @@ final class WebsiteHostingMiddleware implements Middleware
             $host = substr($host, 0, $colonPos);
         }
 
+        // DNS host names are case-insensitive, including bucket labels.
+        $host = strtolower($host);
+        $pattern = strtolower($this->websiteHostPattern);
+
         // Match against pattern (e.g., *.s3-website.example.com).
-        if (!fnmatch($this->websiteHostPattern, $host)) {
+        if (!fnmatch($pattern, $host)) {
             return null;
         }
 
         // Extract bucket name from subdomain.
-        $patternBase = ltrim($this->websiteHostPattern, '*.');
+        $patternBase = ltrim($pattern, '*.');
         if (str_ends_with($host, '.' . $patternBase)) {
             return substr($host, 0, -(strlen($patternBase) + 1));
         }
@@ -449,6 +447,33 @@ final class WebsiteHostingMiddleware implements Middleware
             headers: ['Content-Type' => 'text/html; charset=utf-8'],
             body: $html,
         );
+    }
+
+    /** @return array<non-empty-string, string> */
+    private static function websiteObjectHeaders(ObjectInfo $object): array
+    {
+        $headers = [
+            'Content-Type' => $object->contentType,
+            'Content-Length' => (string) $object->size,
+            'ETag' => $object->etag,
+            'Last-Modified' => $object->lastModified->format('D, d M Y H:i:s \G\M\T'),
+        ];
+        foreach ([
+            'content-encoding' => 'Content-Encoding',
+            'content-disposition' => 'Content-Disposition',
+            'cache-control' => 'Cache-Control',
+        ] as $metadataName => $headerName) {
+            $value = $object->systemMetadata[$metadataName] ?? null;
+            if ($value !== null && $value !== '') {
+                $headers[$headerName] = $value;
+            }
+        }
+        $expires = $object->userMetadata['__expires'] ?? null;
+        if ($expires !== null && $expires !== '') {
+            $headers['Expires'] = $expires;
+        }
+
+        return $headers;
     }
 
     private static function validatedRedirectHost(mixed $host): ?string

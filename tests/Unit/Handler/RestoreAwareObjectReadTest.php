@@ -413,6 +413,42 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame(599, $unsafeMethod->getStatus());
     }
 
+    public function test_website_host_matching_is_case_insensitive(): void
+    {
+        $this->metadata->putBucketWebsite('bucket', 'index.html', redirectAllHost: 'example.com');
+        $response = (new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.S3-WEBSITE.TEST'))
+            ->handleRequest(
+                $this->websiteRequest('GET', '/', 'BUCKET.S3-WEBSITE.TEST'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+
+        self::assertSame(301, $response->getStatus());
+        self::assertSame('http://example.com/', $response->getHeader('Location'));
+    }
+
+    public function test_website_redirect_without_protocol_preserves_trusted_proxy_https(): void
+    {
+        $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
+        $this->metadata->putBucketWebsite('bucket', 'index.html', redirectAllHost: 'example.com');
+        $redirectAllRequest = $this->websiteRequest('GET', '/old.html', 'bucket.s3-website.test');
+        $redirectAllRequest->setAttribute(\OpsFour\S3Server\Security\RequestNetworkContext::SECURE_TRANSPORT_ATTRIBUTE, true);
+        $redirectAll = $middleware->handleRequest($redirectAllRequest, new RestoreWebsiteTerminalHandler());
+
+        self::assertSame(301, $redirectAll->getStatus());
+        self::assertSame('https://example.com/old.html', $redirectAll->getHeader('Location'));
+
+        $this->metadata->putBucketWebsite('bucket', 'index.html', routingRules: [[
+            'redirect' => ['replaceKeyWith' => 'secure.html'],
+        ]]);
+        $request = $this->websiteRequest('GET', '/old.html', 'bucket.s3-website.test');
+        $request->setAttribute(\OpsFour\S3Server\Security\RequestNetworkContext::SECURE_TRANSPORT_ATTRIBUTE, true);
+
+        $response = $middleware->handleRequest($request, new RestoreWebsiteTerminalHandler());
+
+        self::assertSame(301, $response->getStatus());
+        self::assertSame('https://bucket.s3-website.test/secure.html', $response->getHeader('Location'));
+    }
+
     public function test_disabled_website_returns_no_configuration_and_head_has_no_body(): void
     {
         $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
@@ -469,6 +505,43 @@ final class RestoreAwareObjectReadTest extends TestCase
 
         self::assertSame(403, $encrypted->getStatus());
         self::assertStringContainsString('AccessDenied', \Amp\ByteStream\buffer($encrypted->getBody()));
+    }
+
+    public function test_website_object_and_error_document_preserve_cache_metadata(): void
+    {
+        foreach (['index.html', 'error.html'] as $key) {
+            $write = $this->hot->putObject('bucket', $key, new ReadableBuffer($key));
+            $this->metadata->putObjectMetadata(
+                bucket: 'bucket',
+                key: $key,
+                ownerId: 'owner',
+                size: $write->size,
+                etag: '"' . $write->md5Hex . '"',
+                contentType: 'text/html',
+                storagePath: $write->path,
+                contentEncoding: 'gzip',
+                contentDisposition: 'inline',
+                cacheControl: 'public, max-age=300',
+                userMetadata: ['__expires' => 'Wed, 21 Oct 2026 07:28:00 GMT'],
+            );
+        }
+        $this->metadata->putBucketWebsite('bucket', 'index.html', 'error.html');
+        $this->allowPublicReadByPolicy();
+        $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
+
+        foreach (['/' => 200, '/missing' => 404] as $path => $status) {
+            $response = $middleware->handleRequest(
+                $this->websiteRequest('HEAD', $path, 'bucket.s3-website.test'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+            self::assertSame($status, $response->getStatus());
+            self::assertSame('gzip', $response->getHeader('Content-Encoding'));
+            self::assertSame('inline', $response->getHeader('Content-Disposition'));
+            self::assertSame('public, max-age=300', $response->getHeader('Cache-Control'));
+            self::assertSame('Wed, 21 Oct 2026 07:28:00 GMT', $response->getHeader('Expires'));
+            self::assertNotNull($response->getHeader('ETag'));
+            self::assertNotNull($response->getHeader('Last-Modified'));
+        }
     }
 
     public function test_website_redirect_sanitizes_scheme_host_and_header_characters(): void

@@ -10,6 +10,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -30,12 +31,20 @@ final class CorsMiddleware implements Middleware
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
-        $origin = $request->getHeader('Origin');
+        $origins = $request->getHeaderArray('Origin');
 
-        // No Origin header — not a CORS request, pass through.
-        if ($origin === null) {
-            return $requestHandler->handleRequest($request);
+        // A cache must not reuse a response selected without Origin for a
+        // later cross-origin request that needs different response headers.
+        if ($origins === []) {
+            $response = $requestHandler->handleRequest($request);
+            self::mergeVary($response, 'Origin');
+
+            return $response;
         }
+
+        // Origin is a singleton field. Different intermediaries can otherwise
+        // make opposite authorization decisions about repeated values.
+        $origin = count($origins) === 1 ? $origins[0] : '';
 
         // Extract bucket name from request.
         $bucket = $request->hasAttribute('s3.bucket') ? $request->getAttribute('s3.bucket') : null;
@@ -64,21 +73,16 @@ final class CorsMiddleware implements Middleware
         // Regular request with Origin — process then add CORS headers.
         $response = $requestHandler->handleRequest($request);
 
-        if ($corsHeaders !== null) {
-            $existingVary = $response->getHeader('Vary');
-            foreach ($corsHeaders as $name => $value) {
-                if ($name === 'Vary' && $existingVary !== null && trim($existingVary) !== '*') {
-                    $varyNames = array_map('trim', explode(',', $existingVary));
-                    foreach (explode(',', $value) as $newName) {
-                        $newName = trim($newName);
-                        if (! in_array(strtolower($newName), array_map('strtolower', $varyNames), true)) {
-                            $varyNames[] = $newName;
-                        }
-                    }
-                    $value = implode(', ', $varyNames);
-                } elseif ($name === 'Vary' && $existingVary !== null) {
-                    $value = '*';
-                }
+        if ($corsHeaders === null) {
+            self::mergeVary($response, 'Origin');
+
+            return $response;
+        }
+
+        foreach ($corsHeaders as $name => $value) {
+            if ($name === 'Vary') {
+                self::mergeVary($response, $value);
+            } else {
                 $response->setHeader($name, $value);
             }
         }
@@ -102,7 +106,7 @@ final class CorsMiddleware implements Middleware
             // Browser permissions must not outlive a bucket deletion on another
             // node. The general CORS cache is keyed by name, not generation.
             $metadata = $this->metadata;
-            while ($metadata instanceof CachedMetadataStoreDecorator) {
+            while ($metadata instanceof ObservedMetadataStore || $metadata instanceof CachedMetadataStoreDecorator) {
                 $metadata = $metadata->innerStore();
             }
             $observedBucket = $metadata->getBucket($bucket);
@@ -127,10 +131,12 @@ final class CorsMiddleware implements Middleware
         }
 
         $method = $request->getMethod();
-        $requestedHeaders = $request->getHeader('access-control-request-headers');
+        $requestedHeaderValues = $request->getHeaderArray('access-control-request-headers');
+        $requestedHeaders = $requestedHeaderValues === [] ? null : implode(',', $requestedHeaderValues);
         $requestedHeaderNames = $requestedHeaders === null ? [] : array_map('trim', explode(',', strtolower($requestedHeaders)));
-        if ($method === 'OPTIONS' && ($request->getHeader('access-control-request-method') === null
-            || ($requestedHeaders !== null && in_array('', $requestedHeaderNames, true)))) {
+        $requestedMethods = $request->getHeaderArray('access-control-request-method');
+        if ($origin === '' || ($method === 'OPTIONS' && (count($requestedMethods) !== 1
+            || ($requestedHeaders !== null && in_array('', $requestedHeaderNames, true))))) {
             return null;
         }
 
@@ -142,7 +148,7 @@ final class CorsMiddleware implements Middleware
 
             // 2. Match HTTP method.
             $effectiveMethod = $method === 'OPTIONS'
-                ? ($request->getHeader('access-control-request-method') ?? $method)
+                ? $requestedMethods[0]
                 : $method;
 
             if (! in_array($effectiveMethod, $rule['allowedMethods'], true) && ! in_array('*', $rule['allowedMethods'], true)) {
@@ -249,6 +255,27 @@ final class CorsMiddleware implements Middleware
         }
 
         return $headers;
+    }
+
+    private static function mergeVary(Response $response, string $newValue): void
+    {
+        $names = [];
+        $lowerNames = [];
+        foreach ([...$response->getHeaderArray('Vary'), $newValue] as $value) {
+            foreach (explode(',', $value) as $name) {
+                $name = trim($name);
+                if ($name === '*') {
+                    $response->setHeader('Vary', '*');
+
+                    return;
+                }
+                if ($name !== '' && ! in_array(strtolower($name), $lowerNames, true)) {
+                    $names[] = $name;
+                    $lowerNames[] = strtolower($name);
+                }
+            }
+        }
+        $response->setHeader('Vary', implode(', ', $names));
     }
 
 }
