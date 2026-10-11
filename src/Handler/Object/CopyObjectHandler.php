@@ -401,8 +401,7 @@ final class CopyObjectHandler implements RequestHandler
             && ($requestedStorageClass === null || $requestedStorageClass === $srcObjectInfo->storageClass)) {
             throw new InvalidRequestException(
                 'This copy request is illegal because it is trying to copy an object to itself '
-                . 'without changing the object\'s metadata, storage class, website redirect location, '
-                . 'or encryption attributes.',
+                . 'without changing the object\'s storage class.',
             );
         }
 

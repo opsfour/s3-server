@@ -647,6 +647,11 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             } catch (S3Exception $exception) {
                 self::assertSame(400, $exception->getStatusCode());
                 self::assertSame('InvalidRequest', $exception->getAwsErrorCode());
+                self::assertSame(
+                    'This copy request is illegal because it is trying to copy an object to itself '
+                    . 'without changing the object\'s storage class.',
+                    $exception->getAwsErrorMessage(),
+                );
             }
         }
     }
