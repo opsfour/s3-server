@@ -70,6 +70,42 @@ final class MultipartVersioningXmlWireTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_signed_multipart_completion_rejects_malformed_etag_without_consuming_upload(): void
+    {
+        $bucket = 'multipart-etag-' . bin2hex(random_bytes(4));
+        $key = 'object';
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        $uploadId = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => $key])['UploadId'];
+        try {
+            $etag = self::$s3->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 1,
+                'Body' => 'part',
+            ])['ETag'];
+            $bareEtag = trim((string) $etag, '"');
+
+            foreach (['""' . $bareEtag . '"', '"' . $bareEtag . '""', '""' . $bareEtag . '""'] as $malformedEtag) {
+                $xml = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+                    . $malformedEtag
+                    . '</ETag></Part></CompleteMultipartUpload>';
+                $response = $this->signedXml('POST', "/{$bucket}/{$key}?uploadId=" . rawurlencode($uploadId), $xml);
+
+                self::assertSame(400, $response->getStatusCode(), $malformedEtag);
+                self::assertStringContainsString('<Code>InvalidPart</Code>', (string) $response->getBody());
+                self::assertCount(1, self::$s3->listParts([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                ])['Parts']);
+            }
+        } finally {
+            self::$s3->abortMultipartUpload(['Bucket' => $bucket, 'Key' => $key, 'UploadId' => $uploadId]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
     public function test_signed_multipart_query_rejects_conflicting_upload_id_and_part_number(): void
     {
         $bucket = 'multipart-query-' . bin2hex(random_bytes(4));

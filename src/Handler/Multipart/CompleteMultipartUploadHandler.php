@@ -185,7 +185,17 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
             // ETag must match.
             $storedEtag = $storedPartsMap[$partNumber]['etag'];
-            if (trim($etag, '"') !== trim($storedEtag, '"')) {
+            $normalizedStoredEtag = self::multipartPartEtag($storedEtag);
+            if ($normalizedStoredEtag === null) {
+                throw new InternalErrorException('Part ETag is not a valid MD5 hex string.');
+            }
+            $requestedEtag = self::multipartPartEtag($etag);
+            if ($requestedEtag === null) {
+                throw new InvalidPartException(
+                    'One or more of the specified parts could not be found.',
+                );
+            }
+            if ($requestedEtag !== $normalizedStoredEtag) {
                 throw new InvalidPartException(
                     'One or more of the specified parts could not be found.',
                 );
@@ -781,6 +791,17 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             headers: $responseHeaders,
             body: $xml,
         );
+    }
+
+    private static function multipartPartEtag(string $etag): ?string
+    {
+        foreach (['/\A"([0-9a-f]{32})"\z/D', '/\A([0-9a-f]{32})\z/D'] as $pattern) {
+            if (preg_match($pattern, $etag, $matches) === 1) {
+                return $matches[1];
+            }
+        }
+
+        return null;
     }
 
     /**
