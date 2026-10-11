@@ -1,6 +1,7 @@
 <?php
 
 use OpsFour\S3Server\Laravel\EnvironmentNumber;
+use OpsFour\S3Server\Laravel\EnvironmentBoolean;
 
 return [
     /*
@@ -19,7 +20,7 @@ return [
     'region' => env('S3_REGION', 'us-east-1'),
 
     // UNSAFE TEST ONLY: bypass the storage late-write fence startup gate.
-    'allow_unfenced_storage_for_tests' => (bool) env('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', false),
+    'allow_unfenced_storage_for_tests' => EnvironmentBoolean::boolean('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', false),
 
     // TLS certificate path (null to disable).
     'tls_cert_path' => env('S3_TLS_CERT'),
@@ -40,7 +41,7 @@ return [
     'base_domain' => env('S3_BASE_DOMAIN'),
 
     // Reject AWS-reserved bucket name prefixes and suffixes.
-    'strict_bucket_naming' => (bool) env('S3_STRICT_BUCKET_NAMING', true),
+    'strict_bucket_naming' => EnvironmentBoolean::boolean('S3_STRICT_BUCKET_NAMING', true),
 
     // Per-client rate limit (requests per second, 0 = unlimited).
     'rate_limit' => EnvironmentNumber::integer('S3_RATE_LIMIT', 1000),
@@ -70,13 +71,13 @@ return [
     'write_timeout' => EnvironmentNumber::integer('S3_WRITE_TIMEOUT', 300),
 
     // Enforce the S3 5 MiB minimum for every non-final multipart part.
-    'enforce_min_part_size' => (bool) env('S3_ENFORCE_MIN_PART_SIZE', true),
+    'enforce_min_part_size' => EnvironmentBoolean::boolean('S3_ENFORCE_MIN_PART_SIZE', true),
 
     'notifications' => [
         // Reject plaintext HTTP webhook destinations by default.
-        'require_https' => (bool) env('S3_NOTIFICATION_REQUIRE_HTTPS', true),
+        'require_https' => EnvironmentBoolean::boolean('S3_NOTIFICATION_REQUIRE_HTTPS', true),
         // Let this server process drain queued webhook deliveries.
-        'worker_enabled' => (bool) env('S3_NOTIFICATION_WORKER', true),
+        'worker_enabled' => EnvironmentBoolean::boolean('S3_NOTIFICATION_WORKER', true),
     ],
 
     'metrics_bearer_token' => env('S3_METRICS_BEARER_TOKEN'),

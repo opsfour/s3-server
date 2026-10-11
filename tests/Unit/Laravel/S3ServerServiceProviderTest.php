@@ -136,6 +136,61 @@ final class S3ServerServiceProviderTest extends TestCase
         yield 'lifecycle interval silently changed' => ['S3_LIFECYCLE_INTERVAL_SECONDS', 'invalid'];
     }
 
+    #[DataProvider('booleanEnvironmentValues')]
+    public function test_package_config_strictly_parses_boolean_environment_values(
+        string $name,
+        string $raw,
+        ?bool $expected,
+    ): void {
+        $previous = getenv($name);
+        putenv("{$name}={$raw}");
+        new Application($this->basePath);
+
+        try {
+            if ($expected === null) {
+                $this->expectException(\InvalidArgumentException::class);
+                $this->expectExceptionMessage("{$name} must be true or false.");
+            }
+
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            if ($expected !== null) {
+                self::assertSame($expected, self::booleanPackageConfigValue($config, $name));
+            }
+        } finally {
+            putenv($previous === false ? $name : "{$name}={$previous}");
+        }
+    }
+
+    /** @return iterable<string, array{string, string, bool|null}> */
+    public static function booleanEnvironmentValues(): iterable
+    {
+        yield 'unsafe fence bypass typo fails closed' => ['S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'flase', null];
+        yield 'strict naming typo is rejected' => ['S3_STRICT_BUCKET_NAMING', 'treu', null];
+        yield 'minimum part typo is rejected' => ['S3_ENFORCE_MIN_PART_SIZE', 'enabled', null];
+        yield 'webhook HTTPS typo is rejected' => ['S3_NOTIFICATION_REQUIRE_HTTPS', 'disabled', null];
+        yield 'notification worker typo is rejected' => ['S3_NOTIFICATION_WORKER', 'nope', null];
+        yield 'unsafe fence bypass explicit false remains false' => ['S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'false', false];
+        yield 'strict naming explicit zero is false' => ['S3_STRICT_BUCKET_NAMING', '0', false];
+        yield 'minimum part explicit true remains true' => ['S3_ENFORCE_MIN_PART_SIZE', 'true', true];
+        yield 'webhook HTTPS explicit one is true' => ['S3_NOTIFICATION_REQUIRE_HTTPS', '1', true];
+        yield 'notification worker explicit off is false' => ['S3_NOTIFICATION_WORKER', 'off', false];
+    }
+
+    /**
+     * @param array<string, mixed> $config
+     */
+    private static function booleanPackageConfigValue(array $config, string $name): bool
+    {
+        return match ($name) {
+            'S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS' => $config['allow_unfenced_storage_for_tests'],
+            'S3_STRICT_BUCKET_NAMING' => $config['strict_bucket_naming'],
+            'S3_ENFORCE_MIN_PART_SIZE' => $config['enforce_min_part_size'],
+            'S3_NOTIFICATION_REQUIRE_HTTPS' => $config['notifications']['require_https'],
+            'S3_NOTIFICATION_WORKER' => $config['notifications']['worker_enabled'],
+            default => throw new \LogicException("Unknown boolean environment variable {$name}."),
+        };
+    }
+
     public function test_package_config_preserves_explicit_zero_numeric_values(): void
     {
         $names = [

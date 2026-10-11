@@ -73,6 +73,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   Public Access Block validation and error compatibility.
 - Sanitize management, webhook, storage, and worker failures so secrets and
   backend diagnostics are not exposed in responses or logs.
+- Reject invalid Laravel boolean environment values instead of treating every
+  nonempty string as enabled, including the unsafe storage-fence test bypass.
 
 ### Upgrade Notes
 
