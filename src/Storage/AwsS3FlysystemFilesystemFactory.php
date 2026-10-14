@@ -80,6 +80,16 @@ final readonly class AwsS3FlysystemFilesystemFactory implements FlysystemFilesys
         return $this->readTimeoutSeconds;
     }
 
+    /** @return array{endpoint: ?string, bucket: string, prefix: string} */
+    public function physicalNamespace(): array
+    {
+        return [
+            'endpoint' => $this->endpoint,
+            'bucket' => $this->remoteBucket,
+            'prefix' => $this->prefix === '/' ? '/' : rtrim($this->prefix, '\\/'),
+        ];
+    }
+
     public function cacheKey(): string
     {
         return self::class . ':' . hash('sha256', implode("\0", [

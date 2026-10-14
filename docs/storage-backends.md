@@ -322,9 +322,20 @@ While a restore job is pending, another request returns
 
 The tier name is a physical backend identity and is limited to 64 bytes. Two
 tier names must not point at the same physical namespace: transition cleanup
-deletes the source path after publishing the target. Startup rejects the same
-backend object, filesystem real path, or Flysystem operator/factory object
-when it can identify that duplicate configuration.
+deletes the source path after publishing the target. Startup rejects overlapping
+filesystem roots, including relative aliases and paths whose last components
+do not exist yet. It also rejects overlapping roots from built-in local
+Flysystem factories and overlapping bucket/prefix pairs from built-in AWS S3
+Flysystem factories at the same endpoint. Credentials and timeouts do not
+change that physical identity. When two local roots differ only in path case,
+startup creates and removes an empty case probe in each deepest existing
+ancestor before deciding whether they overlap. If it cannot create or remove
+the probe, startup rejects the ambiguous configuration. DNS/CNAME aliases and an
+implicit AWS endpoint versus an explicit URL cannot be resolved as the same
+remote namespace by startup. For arbitrary Flysystem operators and custom
+factories, startup detects reuse of the same object instance; configure their
+physical namespaces separately because their internal roots are not generally
+available to the package.
 Object writes, multipart uploads, and restored copies persist the exact tier
 that received their bytes. All API nodes and workers serving shared metadata
 must configure every tier referenced by objects, open uploads, restore copies,

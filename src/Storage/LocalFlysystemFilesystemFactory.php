@@ -21,4 +21,10 @@ final readonly class LocalFlysystemFilesystemFactory implements FlysystemFilesys
     {
         return self::class . ':' . hash('sha256', $this->rootPath);
     }
+
+    /** Physical root used to reject overlapping storage tiers at bootstrap. */
+    public function physicalRootPath(): string
+    {
+        return $this->rootPath;
+    }
 }

@@ -11,6 +11,8 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\LocalFlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
@@ -122,13 +124,15 @@ final class StorageBackendFactory
                     $tierName = is_string($name) ? $name : (string) ($tierConfig['name'] ?? '');
                     $driver = (string) ($tierConfig['driver'] ?? $storageConfig['driver'] ?? 'filesystem');
                     $physicalIdentity = self::configuredPhysicalIdentity($driver, $tierConfig);
-                    if ($physicalIdentity !== null && isset($physicalIdentities[$physicalIdentity])) {
-                        throw new \InvalidArgumentException(
-                            "Storage tiers {$physicalIdentities[$physicalIdentity]} and {$tierName} must not share the same physical backend.",
-                        );
-                    }
                     if ($physicalIdentity !== null) {
-                        $physicalIdentities[$physicalIdentity] = $tierName;
+                        foreach ($physicalIdentities as [$otherName, $otherIdentity]) {
+                            if (self::sharesPhysicalNamespace($physicalIdentity, $otherIdentity)) {
+                                throw new \InvalidArgumentException(
+                                    "Storage tiers {$otherName} and {$tierName} must not share the same physical backend.",
+                                );
+                            }
+                        }
+                        $physicalIdentities[] = [$tierName, $physicalIdentity];
                     }
                     $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
                     $tierConfig['temp_budget_bytes'] ??= $storageConfig['temp_budget_bytes'] ?? 10_737_418_240;
@@ -176,22 +180,180 @@ final class StorageBackendFactory
         }
     }
 
-    /** @param array<string, mixed> $config */
-    private static function configuredPhysicalIdentity(string $driver, array $config): ?string
+    /**
+     * @param array<string, mixed> $config
+     * @return array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int}|null
+     */
+    private static function configuredPhysicalIdentity(string $driver, array $config): ?array
     {
         if ($driver === 'filesystem' && is_string($config['path'] ?? null)) {
-            $path = $config['path'];
-            $resolved = realpath($path);
-
-            return 'filesystem:' . ($resolved !== false ? $resolved : rtrim($path, DIRECTORY_SEPARATOR));
+            return self::localPhysicalIdentity($config['path']);
         }
         if ($driver === 'flysystem') {
-            $operator = $config['filesystem'] ?? $config['filesystem_factory'] ?? null;
+            $workerPoolSize = filter_var(
+                $config['worker_pool_size'] ?? 0,
+                FILTER_VALIDATE_INT,
+                ['options' => ['min_range' => 0]],
+            );
+            $operator = $workerPoolSize !== false && $workerPoolSize > 0
+                ? ($config['filesystem_factory'] ?? null)
+                : ($config['filesystem'] ?? null);
+            if ($operator instanceof LocalFlysystemFilesystemFactory) {
+                return self::localPhysicalIdentity($operator->physicalRootPath());
+            }
+            if ($operator instanceof AwsS3FlysystemFilesystemFactory) {
+                $namespace = $operator->physicalNamespace();
+
+                return [
+                    'kind' => 'aws',
+                    'endpoint' => self::canonicalEndpoint($namespace['endpoint']),
+                    'bucket' => $namespace['bucket'],
+                    'prefix' => $namespace['prefix'],
+                ];
+            }
             if (is_object($operator)) {
-                return 'flysystem:' . spl_object_id($operator);
+                return ['kind' => 'object', 'id' => spl_object_id($operator)];
             }
         }
 
         return null;
+    }
+
+    /**
+     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int} $first
+     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int} $second
+     */
+    private static function sharesPhysicalNamespace(array $first, array $second): bool
+    {
+        if ($first['kind'] === 'local' && $second['kind'] === 'local') {
+            if (self::pathContains($first['root'], $second['root'])
+                || self::pathContains($second['root'], $first['root'])) {
+                return true;
+            }
+            $firstFolded = strtolower($first['root']);
+            $secondFolded = strtolower($second['root']);
+            if (! self::pathContains($firstFolded, $secondFolded)
+                && ! self::pathContains($secondFolded, $firstFolded)) {
+                return false;
+            }
+
+            return self::isCaseInsensitiveDirectory($first['existingAncestor'])
+                && self::isCaseInsensitiveDirectory($second['existingAncestor']);
+        }
+        if ($first['kind'] === 'aws' && $second['kind'] === 'aws') {
+            return $first['endpoint'] === $second['endpoint']
+                && $first['bucket'] === $second['bucket']
+                && (self::prefixContains($first['prefix'], $second['prefix'])
+                    || self::prefixContains($second['prefix'], $first['prefix']));
+        }
+
+        if ($first['kind'] !== 'object' || $second['kind'] !== 'object') {
+            return false;
+        }
+
+        return $first['id'] === $second['id'];
+    }
+
+    private static function pathContains(string $parent, string $child): bool
+    {
+        return $parent === $child || $parent === '' || $parent === '/'
+            || str_starts_with($child, rtrim($parent, '/') . '/');
+    }
+
+    private static function prefixContains(string $parent, string $child): bool
+    {
+        if ($parent === $child) {
+            return true;
+        }
+        if ($parent === '') {
+            return ! str_starts_with($child, '/');
+        }
+        if ($parent === '/') {
+            return str_starts_with($child, '/');
+        }
+
+        return str_starts_with($child, $parent . '/');
+    }
+
+    /** @return array{kind: 'local', root: string, existingAncestor: string}|null */
+    private static function localPhysicalIdentity(string $path): ?array
+    {
+        if ($path === '') {
+            return null;
+        }
+        if (! str_starts_with($path, '/')) {
+            $cwd = getcwd();
+            if ($cwd === false) {
+                return null;
+            }
+            $path = $cwd . '/' . $path;
+        }
+        $missing = [];
+        while (($resolved = realpath($path)) === false) {
+            if ($path === '/') {
+                return null;
+            }
+            array_unshift($missing, basename($path));
+            $path = dirname($path);
+        }
+        $segments = $resolved === '/' ? [] : explode('/', ltrim($resolved, '/'));
+        foreach ($missing as $segment) {
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+            if ($segment === '..') {
+                array_pop($segments);
+            } else {
+                $segments[] = $segment;
+            }
+        }
+
+        return ['kind' => 'local', 'root' => '/' . implode('/', $segments), 'existingAncestor' => $resolved];
+    }
+
+    /** An unpredictable file gives an unambiguous answer on the exact volume. */
+    private static function isCaseInsensitiveDirectory(string $directory): bool
+    {
+        $probe = rtrim($directory, '/') . '/.opsfour-s3-case-probe-' . bin2hex(random_bytes(16));
+        $handle = @fopen($probe, 'x+b');
+        if ($handle === false) {
+            throw new \RuntimeException('Cannot determine storage root case sensitivity.');
+        }
+        try {
+            $variant = dirname($probe) . '/' . strtoupper(basename($probe));
+            clearstatcache(true, $variant);
+            $probeStat = @lstat($probe);
+            $variantStat = @lstat($variant);
+            if ($probeStat === false) {
+                throw new \RuntimeException('Cannot inspect storage root case probe.');
+            }
+
+            return $variantStat !== false
+                && $probeStat['dev'] === $variantStat['dev']
+                && $probeStat['ino'] === $variantStat['ino'];
+        } finally {
+            fclose($handle);
+            if (! @unlink($probe)) {
+                throw new \RuntimeException('Cannot clean up storage root case probe.');
+            }
+        }
+    }
+
+    private static function canonicalEndpoint(?string $endpoint): ?string
+    {
+        if ($endpoint === null || $endpoint === '') {
+            return null;
+        }
+        $uri = parse_url($endpoint);
+        if (! is_array($uri) || ! isset($uri['scheme'], $uri['host'])) {
+            return $endpoint;
+        }
+        $scheme = strtolower($uri['scheme']);
+        $port = $uri['port'] ?? null;
+        $defaultPort = $scheme === 'https' ? 443 : 80;
+
+        return $scheme . '://' . strtolower($uri['host'])
+            . ($port === null || $port === $defaultPort ? '' : ':' . $port)
+            . rtrim($uri['path'] ?? '', '/');
     }
 }
