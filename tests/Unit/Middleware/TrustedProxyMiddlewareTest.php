@@ -10,6 +10,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Socket\InternetAddress;
 use Amp\Socket\TlsInfo;
+use Amp\Socket\UnixAddress;
 use League\Uri\Http;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Middleware\RateLimitMiddleware;
@@ -66,6 +67,124 @@ final class TrustedProxyMiddlewareTest extends TestCase
         $this->dispatch($request, ['2001:db8:ffff::/48']);
 
         self::assertSame('2001:db8::10', RequestNetworkContext::sourceIp($request));
+    }
+
+    public function test_forwarded_ip_aliases_share_one_canonical_rate_limit_key(): void
+    {
+        $seen = [];
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::exactly(4))->method('rateLimitCheck')
+            ->willReturnCallback(static function (string $ip) use (&$seen): bool {
+                $seen[$ip] = ($seen[$ip] ?? 0) + 1;
+
+                return $seen[$ip] === 1;
+            });
+        $rateLimit = new RateLimitMiddleware($metadata, 10.0);
+
+        $cases = [
+            ['2001:0db8:0000:0000:0000:0000:0000:0010', 204],
+            ['2001:db8::10', 503],
+            ['::ffff:198.51.100.99', 204],
+            ['198.51.100.99', 503],
+        ];
+        foreach ($cases as [$forwardedIp, $expectedStatus]) {
+            $request = $this->request('127.0.0.1');
+            $request->setHeader('X-Forwarded-For', $forwardedIp);
+            $this->dispatch($request, ['127.0.0.1/32']);
+
+            self::assertSame($expectedStatus, $rateLimit->handleRequest($request, new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(204);
+                }
+            })->getStatus());
+        }
+
+        self::assertSame(['2001:db8::10' => 2, '198.51.100.99' => 2], $seen);
+    }
+
+    public function test_direct_native_and_mapped_peer_aliases_share_policy_and_rate_limit_identity(): void
+    {
+        $seen = [];
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::exactly(4))->method('rateLimitCheck')
+            ->willReturnCallback(static function (string $ip) use (&$seen): bool {
+                $seen[$ip] = ($seen[$ip] ?? 0) + 1;
+
+                return $seen[$ip] === 1;
+            });
+        $rateLimit = new RateLimitMiddleware($metadata, 10.0);
+        $terminal = new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(204);
+            }
+        };
+
+        foreach ([
+            ['2001:0db8:0000:0000:0000:0000:0000:0010', '2001:db8::10', 204],
+            ['2001:db8::10', '2001:db8::10', 503],
+            ['::ffff:198.51.100.99', '198.51.100.99', 204],
+            ['198.51.100.99', '198.51.100.99', 503],
+        ] as [$peerIp, $canonical, $expectedStatus]) {
+            $request = $this->request($peerIp);
+            $this->dispatch($request, []);
+
+            self::assertSame($canonical, RequestNetworkContext::sourceIp($request));
+            self::assertSame($canonical, RequestNetworkContext::rateLimitIp($request));
+            self::assertSame($expectedStatus, $rateLimit->handleRequest($request, $terminal)->getStatus());
+        }
+
+        self::assertSame(['2001:db8::10' => 2, '198.51.100.99' => 2], $seen);
+        $policy = json_encode(['Statement' => [[
+            'Effect' => 'Allow', 'Principal' => '*', 'Action' => 's3:GetObject',
+            'Resource' => '*', 'Condition' => ['IpAddress' => ['aws:SourceIp' => '198.51.100.0/24']],
+        ]]], JSON_THROW_ON_ERROR);
+        self::assertSame('Allow', PolicyEvaluator::evaluate(
+            $policy,
+            's3:GetObject',
+            'arn:aws:s3:::bucket/key',
+            '*',
+            ['aws:SourceIp' => RequestNetworkContext::sourceIp($request)],
+        ));
+    }
+
+    public function test_non_ip_peer_cannot_inject_forwarding_and_uses_bounded_unknown_rate_key(): void
+    {
+        $client = $this->createMock(Client::class);
+        $client->method('getRemoteAddress')->willReturn(new UnixAddress('/tmp/s3-invalid-peer.sock'));
+        $request = new Request($client, 'GET', Http::new('http://localhost/bucket/key'));
+        $request->setHeader('X-Forwarded-For', '198.51.100.99');
+        $this->dispatch($request, ['127.0.0.1/32']);
+
+        self::assertNull(RequestNetworkContext::sourceIp($request));
+        self::assertSame('unknown', RequestNetworkContext::rateLimitIp($request));
+
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('rateLimitCheck')
+            ->with('unknown', 10.0, 10.0)->willReturn(true);
+        self::assertSame(204, (new RateLimitMiddleware($metadata, 10.0))->handleRequest(
+            $request,
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(204);
+                }
+            },
+        )->getStatus());
+    }
+
+    public function test_ipv4_mapped_proxy_peer_and_cidr_are_normalized_to_ipv4(): void
+    {
+        $mappedPeer = $this->request('::ffff:127.0.0.1');
+        $mappedPeer->setHeader('X-Forwarded-For', '::ffff:198.51.100.8');
+        $this->dispatch($mappedPeer, ['127.0.0.1/32']);
+        self::assertSame('198.51.100.8', RequestNetworkContext::sourceIp($mappedPeer));
+
+        $mappedCidr = $this->request('127.0.0.1');
+        $mappedCidr->setHeader('X-Forwarded-For', '198.51.100.9');
+        $this->dispatch($mappedCidr, ['::ffff:127.0.0.1/128']);
+        self::assertSame('198.51.100.9', RequestNetworkContext::sourceIp($mappedCidr));
     }
 
     public function test_missing_or_ambiguous_proto_is_insecure_even_with_backend_tls(): void
@@ -145,7 +264,7 @@ final class TrustedProxyMiddlewareTest extends TestCase
     public function test_invalid_proxy_cidrs_fail_at_configuration_time(): void
     {
         $rejected = 0;
-        foreach (['0', '0.0.0.0/0', '127.0.0.1/33', 'not-an-ip', '::/0'] as $cidr) {
+        foreach (['0', '0.0.0.0/0', '127.0.0.1/33', 'not-an-ip', '::/0', '::ffff:0.0.0.0/96'] as $cidr) {
             try {
                 new TrustedProxyMiddleware([$cidr]);
                 self::fail("Accepted unsafe proxy CIDR {$cidr}");
@@ -153,7 +272,7 @@ final class TrustedProxyMiddlewareTest extends TestCase
                 $rejected++;
             }
         }
-        self::assertSame(5, $rejected);
+        self::assertSame(6, $rejected);
     }
 
     public function test_rate_limit_uses_resolved_client_ip_instead_of_proxy_peer(): void

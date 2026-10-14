@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth\External;
 
+use OpsFour\S3Server\Auth\ChainCredentialProvider;
 use OpsFour\S3Server\Auth\CredentialManager;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 
 final class AdminCredentialApiFactory
@@ -24,6 +27,15 @@ final class AdminCredentialApiFactory
 
         if (!self::bool($config['enabled'])) {
             return null;
+        }
+
+        if (!$credentialProvider instanceof AtomicCredentialCreator
+            || !$credentialProvider instanceof AtomicCredentialDeleter
+            || ($credentialProvider instanceof ChainCredentialProvider
+                && !$credentialProvider->supportsAtomicCredentialLifecycle())) {
+            throw new \InvalidArgumentException(
+                'External IAM requires one credential store that supports atomic creation and revocation.',
+            );
         }
 
         $adminToken = self::string($config['admin_token'] ?? null);

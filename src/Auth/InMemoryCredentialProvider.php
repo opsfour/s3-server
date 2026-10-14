@@ -81,11 +81,7 @@ final class InMemoryCredentialProvider implements AtomicCredentialCreator, Atomi
     public function deleteCredentialIfCurrent(Credential $expected): bool
     {
         $current = $this->credentials[$expected->accessKeyId] ?? null;
-        if ($current === null
-            || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
-            || $current->ownerId !== $expected->ownerId
-            || $current->sessionToken !== $expected->sessionToken
-            || $current->isActive !== $expected->isActive) {
+        if ($current === null || !$expected->matchesSnapshot($current)) {
             return false;
         }
 
@@ -97,11 +93,7 @@ final class InMemoryCredentialProvider implements AtomicCredentialCreator, Atomi
     public function setActiveIfCurrent(Credential $expected, bool $active): bool
     {
         $current = $this->credentials[$expected->accessKeyId] ?? null;
-        if ($current === null
-            || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
-            || $current->ownerId !== $expected->ownerId
-            || $current->sessionToken !== $expected->sessionToken
-            || $current->isActive !== $expected->isActive) {
+        if ($current === null || !$expected->matchesSnapshot($current)) {
             return false;
         }
 

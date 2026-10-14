@@ -30,6 +30,20 @@ final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCr
         $this->providers = array_values($providers);
     }
 
+    /** Whether issuance and revocation can target one atomically mutable store. */
+    public function supportsAtomicCredentialLifecycle(): bool
+    {
+        if (count($this->providers) !== 1) {
+            return false;
+        }
+
+        $provider = $this->providers[0];
+
+        return $provider instanceof AtomicCredentialCreator
+            && $provider instanceof AtomicCredentialDeleter
+            && (!$provider instanceof self || $provider->supportsAtomicCredentialLifecycle());
+    }
+
     public function getCredential(string $accessKeyId): ?Credential
     {
         foreach ($this->providers as $provider) {

@@ -10,6 +10,8 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Auth\ChainCredentialProvider;
+use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\CredentialManager;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiHandler;
 use OpsFour\S3Server\Auth\External\ExternalCredentialIssuer;
@@ -17,6 +19,8 @@ use OpsFour\S3Server\Auth\External\ExternalIdentity;
 use OpsFour\S3Server\Auth\External\ExternalIdentityAuthenticationException;
 use OpsFour\S3Server\Auth\External\ExternalIdentityProvider;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
+use OpsFour\S3Server\Contracts\CredentialProvider;
 use PHPUnit\Framework\TestCase;
 
 final class AdminCredentialApiHandlerTest extends TestCase
@@ -274,6 +278,35 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertNull($credentialProvider->getCredential($credential->accessKeyId));
     }
 
+    public function test_single_provider_chain_preserves_issue_and_revoke_http_contract(): void
+    {
+        $primary = new InMemoryCredentialProvider();
+        $chain = new ChainCredentialProvider($primary);
+        $handler = $this->createHandler(credentialProvider: $chain);
+
+        $issued = $handler->handleRequest($this->request(
+            'POST',
+            '/.admin/credentials',
+            ['token' => 'idp-token'],
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+        $accessKeyId = $this->json($issued)['accessKeyId'];
+        self::assertIsString($accessKeyId);
+        self::assertSame(201, $issued->getStatus());
+        self::assertNotNull($primary->getCredential($accessKeyId));
+
+        $revoked = $handler->handleRequest($this->request(
+            'DELETE',
+            '/.admin/credentials/' . rawurlencode($accessKeyId),
+            '',
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(204, $revoked->getStatus());
+        self::assertSame('no-store', $revoked->getHeader('cache-control'));
+        self::assertNull($primary->getCredential($accessKeyId));
+    }
+
     public function test_revoke_returns_not_found_for_unknown_credential(): void
     {
         $handler = $this->createHandler();
@@ -283,6 +316,42 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame(404, $response->getStatus());
         $this->assertSame('no-store', $response->getHeader('cache-control'));
         $this->assertSame(['error' => 'not_found'], $this->json($response));
+    }
+
+    public function test_revoke_returns_conflict_when_the_observed_credential_was_replaced(): void
+    {
+        $original = new Credential('AKIAREVOKERACE00001', 'original-secret', 'original-owner');
+        $replacement = new Credential($original->accessKeyId, 'replacement-secret', 'replacement-owner');
+        $provider = new RevokeRaceCredentialProvider($original, $replacement);
+
+        $response = $this->createHandler(credentialProvider: $provider)->handleRequest($this->request(
+            'DELETE',
+            '/.admin/credentials/' . $original->accessKeyId,
+            '',
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(409, $response->getStatus());
+        self::assertSame('no-store', $response->getHeader('cache-control'));
+        self::assertSame(['error' => 'conflict'], $this->json($response));
+        self::assertSame($replacement, $provider->getCredential($original->accessKeyId));
+    }
+
+    public function test_revoke_returns_not_found_when_the_observed_credential_was_concurrently_removed(): void
+    {
+        $original = new Credential('AKIAREVOKERACE00002', 'original-secret', 'original-owner');
+        $provider = new RevokeRaceCredentialProvider($original, null);
+
+        $response = $this->createHandler(credentialProvider: $provider)->handleRequest($this->request(
+            'DELETE',
+            '/.admin/credentials/' . $original->accessKeyId,
+            '',
+            ['authorization' => 'Bearer admin-secret'],
+        ));
+
+        self::assertSame(404, $response->getStatus());
+        self::assertSame('no-store', $response->getHeader('cache-control'));
+        self::assertSame(['error' => 'not_found'], $this->json($response));
     }
 
     public function test_revoke_rejects_invalid_access_key_id_before_provider_lookup(): void
@@ -317,7 +386,7 @@ final class AdminCredentialApiHandlerTest extends TestCase
     }
 
     private function createHandler(
-        ?InMemoryCredentialProvider $credentialProvider = null,
+        ?CredentialProvider $credentialProvider = null,
         ?ExternalIdentityProvider $identityProvider = null,
         string $adminToken = 'admin-secret',
     ): AdminCredentialApiHandler {
@@ -385,6 +454,44 @@ final class RejectingExternalIdentityProvider implements ExternalIdentityProvide
     public function authenticate(string $bearerToken): ExternalIdentity
     {
         throw new ExternalIdentityAuthenticationException('Token is invalid.');
+    }
+}
+
+final class RevokeRaceCredentialProvider implements AtomicCredentialDeleter, CredentialProvider
+{
+    public function __construct(
+        private ?Credential $credential,
+        private readonly ?Credential $replacement,
+    ) {}
+
+    public function getCredential(string $accessKeyId): ?Credential
+    {
+        return $this->credential?->accessKeyId === $accessKeyId ? $this->credential : null;
+    }
+
+    /** @return list<Credential> */
+    public function listCredentials(): array
+    {
+        return $this->credential === null ? [] : [$this->credential];
+    }
+
+    public function putCredential(Credential $credential): void
+    {
+        $this->credential = $credential;
+    }
+
+    public function deleteCredential(string $accessKeyId): void
+    {
+        if ($this->credential?->accessKeyId === $accessKeyId) {
+            $this->credential = null;
+        }
+    }
+
+    public function deleteCredentialIfCurrent(Credential $expected): bool
+    {
+        $this->credential = $this->replacement;
+
+        return false;
     }
 }
 

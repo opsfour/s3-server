@@ -87,17 +87,13 @@ final readonly class OidcClaimMapper
      */
     private function stringListClaim(array $claims, string $name): array
     {
-        $value = $claims[$name] ?? null;
-        if ($value === null || $value === '') {
+        if (!array_key_exists($name, $claims)) {
             return [];
         }
+        $value = $claims[$name];
 
-        if (is_string($value)) {
-            $value = [$value];
-        }
-
-        if (!is_array($value)) {
-            throw new \InvalidArgumentException("OIDC claim '{$name}' must be a string or string list.");
+        if (!is_array($value) || !array_is_list($value)) {
+            throw new \InvalidArgumentException("OIDC claim '{$name}' must be a list of non-empty strings.");
         }
 
         $items = [];

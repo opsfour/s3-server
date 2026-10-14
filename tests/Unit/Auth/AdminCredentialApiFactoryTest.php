@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
+use OpsFour\S3Server\Auth\ChainCredentialProvider;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiHandler;
@@ -66,6 +67,38 @@ final class AdminCredentialApiFactoryTest extends TestCase
             'issuer' => 'https://issuer.example.test',
             'audience' => 's3-admin',
         ], $this->credentialProvider());
+    }
+
+    public function test_rejects_multi_provider_chain_before_external_iam_handler_is_created(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('one credential store that supports atomic creation and revocation');
+
+        AdminCredentialApiFactory::create([
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+            'public_key' => $this->publicKey(),
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
+        ], new ChainCredentialProvider(
+            new InMemoryCredentialProvider(),
+            new InMemoryCredentialProvider(),
+        ));
+    }
+
+    public function test_accepts_nested_single_provider_chain_for_external_iam(): void
+    {
+        $handler = AdminCredentialApiFactory::create([
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+            'public_key' => $this->publicKey(),
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
+        ], new ChainCredentialProvider(
+            new ChainCredentialProvider(new InMemoryCredentialProvider()),
+        ));
+
+        self::assertInstanceOf(AdminCredentialApiHandler::class, $handler);
     }
 
     public function test_requires_verification_key_when_enabled(): void

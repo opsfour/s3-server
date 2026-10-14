@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\CredentialDeletionResult;
 use OpsFour\S3Server\Auth\CredentialManager;
 use OpsFour\S3Server\Auth\ChainCredentialProvider;
 use OpsFour\S3Server\Auth\ConfigFileCredentialProvider;
@@ -298,7 +299,10 @@ final class CredentialManagerTest extends TestCase
             $second->deleteCredential($original->accessKeyId);
             $second->putCredential($replacement);
 
-            self::assertFalse($manager->deleteCredential($original->accessKeyId));
+            self::assertSame(
+                CredentialDeletionResult::Changed,
+                $manager->deleteCredentialResult($original->accessKeyId),
+            );
             $stored = $second->getCredential($original->accessKeyId);
             self::assertNotNull($stored);
             self::assertSame('second-owner', $stored->ownerId);

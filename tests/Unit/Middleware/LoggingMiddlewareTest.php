@@ -189,7 +189,7 @@ final class LoggingMiddlewareTest extends TestCase
         $request->setAttribute('s3.bucket', 'source');
         $request->setAttribute('s3.key', 'object.txt');
         $request->setAttribute('s3.cachedBucketOwner', 'alice');
-        $request->setHeader('X-Forwarded-For', '198.51.100.8');
+        $request->setHeader('X-Forwarded-For', '::ffff:198.51.100.8');
         (new TrustedProxyMiddleware(['127.0.0.1/32']))->handleRequest($request, new class implements RequestHandler {
             public function handleRequest(Request $request): Response
             {

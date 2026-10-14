@@ -110,9 +110,7 @@ final class ExternalCredentialIssuerTest extends TestCase
     public static function missingPrefixScopes(): iterable
     {
         yield 'missing' => [[]];
-        yield 'null' => [['s3_prefixes' => null]];
         yield 'empty list' => [['s3_prefixes' => []]];
-        yield 'empty string' => [['s3_prefixes' => '']];
     }
 
     /** @param array<string, mixed> $prefixClaim */
@@ -166,6 +164,62 @@ final class ExternalCredentialIssuerTest extends TestCase
         ]));
         $issued = $credentialIssuer->issue($identity);
         self::assertSame(['incoming/'], $issued->credential->allowedPrefixes);
+    }
+
+    public function test_signed_oidc_token_rejects_non_list_scope_claims_before_credential_creation(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $identityProvider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(
+                policyNamesClaim: 's3_policies',
+                allowedPrefixesClaim: 's3_prefixes',
+            ),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+        );
+        $credentials = new InMemoryCredentialProvider();
+        $credentialIssuer = new ExternalCredentialIssuer(new CredentialManager($credentials));
+        $validClaims = [
+            'sub' => 'bucket-owner',
+            'iss' => 'https://issuer.example.test',
+            'aud' => ['s3-admin'],
+            'exp' => time() + 300,
+            'groups' => ['storage-users'],
+            's3_policies' => ['uploads'],
+            's3_prefixes' => ['incoming/'],
+        ];
+
+        foreach ([
+            'audience object' => ['aud' => ['primary' => 's3-admin']],
+            'audience numeric-key object' => ['aud' => (object) ['0' => 's3-admin']],
+            'audience mixed list' => ['aud' => ['s3-admin', 7]],
+            'groups string' => ['groups' => 'storage-users'],
+            'groups null' => ['groups' => null],
+            'groups object' => ['groups' => ['primary' => 'storage-users']],
+            'groups numeric-key object' => ['groups' => (object) ['0' => 'storage-users']],
+            'policies string' => ['s3_policies' => 'uploads'],
+            'policies null' => ['s3_policies' => null],
+            'policies object' => ['s3_policies' => ['primary' => 'uploads']],
+            'policies numeric-key object' => ['s3_policies' => (object) ['0' => 'uploads']],
+            'prefixes string' => ['s3_prefixes' => 'incoming/'],
+            'prefixes null' => ['s3_prefixes' => null],
+            'prefixes object' => ['s3_prefixes' => ['primary' => 'incoming/']],
+            'prefixes numeric-key object' => ['s3_prefixes' => (object) ['0' => 'incoming/']],
+        ] as $label => $replacement) {
+            try {
+                $identity = $identityProvider->authenticate($this->signJwt(
+                    $privateKey,
+                    ['alg' => 'RS256', 'kid' => 'key-1'],
+                    [...$validClaims, ...$replacement],
+                ));
+                $credentialIssuer->issue($identity);
+                self::fail("Malformed {$label} claim issued a credential.");
+            } catch (ExternalIdentityAuthenticationException|\InvalidArgumentException) {
+            }
+
+            self::assertSame([], $credentials->listCredentials(), $label);
+        }
     }
 
     public function test_issue_creates_persisted_sigv4_credential_for_external_identity(): void

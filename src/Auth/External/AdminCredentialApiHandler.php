@@ -8,6 +8,7 @@ use Amp\ByteStream\BufferException;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Auth\CredentialDeletionResult;
 
 final readonly class AdminCredentialApiHandler implements RequestHandler
 {
@@ -95,11 +96,11 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
             return $this->json(['error' => 'invalid_request', 'message' => 'Access key ID is invalid.'], 400);
         }
 
-        if (!$this->credentialIssuer->revoke($accessKeyId)) {
-            return $this->json(['error' => 'not_found'], 404);
-        }
-
-        return new Response(status: 204, headers: ['cache-control' => 'no-store']);
+        return match ($this->credentialIssuer->revokeResult($accessKeyId)) {
+            CredentialDeletionResult::Deleted => new Response(status: 204, headers: ['cache-control' => 'no-store']),
+            CredentialDeletionResult::NotFound => $this->json(['error' => 'not_found'], 404),
+            CredentialDeletionResult::Changed => $this->json(['error' => 'conflict'], 409),
+        };
     }
 
     private function isAuthorized(Request $request): bool

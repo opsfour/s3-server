@@ -146,16 +146,28 @@ final class CredentialManager
      */
     public function deleteCredential(string $accessKeyId): bool
     {
+        return $this->deleteCredentialResult($accessKeyId) === CredentialDeletionResult::Deleted;
+    }
+
+    /** Delete only the current credential and distinguish absence from replacement. */
+    public function deleteCredentialResult(string $accessKeyId): CredentialDeletionResult
+    {
         $expected = $this->provider->getCredential($accessKeyId);
         if ($expected === null) {
-            return false;
+            return CredentialDeletionResult::NotFound;
         }
 
         if (! $this->provider instanceof AtomicCredentialDeleter) {
             throw new \RuntimeException('Credential provider does not support atomic deletion.');
         }
 
-        return $this->provider->deleteCredentialIfCurrent($expected);
+        if ($this->provider->deleteCredentialIfCurrent($expected)) {
+            return CredentialDeletionResult::Deleted;
+        }
+
+        return $this->provider->getCredential($accessKeyId) === null
+            ? CredentialDeletionResult::NotFound
+            : CredentialDeletionResult::Changed;
     }
 
     /**

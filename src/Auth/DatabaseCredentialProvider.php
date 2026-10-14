@@ -362,19 +362,9 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
 
     public function deleteCredentialIfCurrent(Credential $expected): bool
     {
-        $identityComparison = match ($this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME)) {
-            'mysql' => 'BINARY secret_access_key = BINARY ? AND BINARY owner_id = BINARY ? AND BINARY session_token <=> BINARY ?',
-            'pgsql' => 'secret_access_key COLLATE "C" = ? AND owner_id COLLATE "C" = ? AND session_token COLLATE "C" IS NOT DISTINCT FROM ?',
-            default => 'secret_access_key COLLATE BINARY = ? AND owner_id COLLATE BINARY = ? AND session_token COLLATE BINARY IS ?',
-        };
-        $stmt = $this->pdo->prepare("DELETE FROM s3_credentials WHERE access_key_id = ? AND {$identityComparison} AND is_active = ?");
-        $stmt->execute([
-            $expected->accessKeyId,
-            $expected->secretAccessKey,
-            $expected->ownerId,
-            $expected->sessionToken,
-            $expected->isActive ? 1 : 0,
-        ]);
+        $snapshotComparison = $this->snapshotComparison();
+        $stmt = $this->pdo->prepare("DELETE FROM s3_credentials WHERE access_key_id = ? AND {$snapshotComparison} AND is_active = ?");
+        $stmt->execute(self::snapshotParameters($expected));
         unset($this->cache[$expected->accessKeyId], $this->cacheExpiresAt[$expected->accessKeyId]);
 
         return $stmt->rowCount() > 0;
@@ -382,38 +372,62 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
 
     public function setActiveIfCurrent(Credential $expected, bool $active): bool
     {
-        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
-        $identityComparison = match ($driver) {
-            'mysql' => 'BINARY secret_access_key = BINARY ? AND BINARY owner_id = BINARY ? AND BINARY session_token <=> BINARY ?',
-            'pgsql' => 'secret_access_key COLLATE "C" = ? AND owner_id COLLATE "C" = ? AND session_token COLLATE "C" IS NOT DISTINCT FROM ?',
-            default => 'secret_access_key COLLATE BINARY = ? AND owner_id COLLATE BINARY = ? AND session_token COLLATE BINARY IS ?',
-        };
+        $snapshotComparison = $this->snapshotComparison();
         $stmt = $this->pdo->prepare(
-            "UPDATE s3_credentials SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE access_key_id = ? AND {$identityComparison} AND is_active = ?",
+            "UPDATE s3_credentials SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE access_key_id = ? AND {$snapshotComparison} AND is_active = ?",
         );
-        $stmt->execute([
-            $active ? 1 : 0,
-            $expected->accessKeyId,
-            $expected->secretAccessKey,
-            $expected->ownerId,
-            $expected->sessionToken,
-            $expected->isActive ? 1 : 0,
-        ]);
+        $stmt->execute([$active ? 1 : 0, ...self::snapshotParameters($expected)]);
         unset($this->cache[$expected->accessKeyId], $this->cacheExpiresAt[$expected->accessKeyId]);
         if ($stmt->rowCount() > 0) {
             return true;
         }
 
-        // MySQL may count only changed rows: an already-set status is a
-        // success only while the same credential still exists.
-        $current = $this->getCredential($expected->accessKeyId);
+        // MySQL may count only changed rows. Re-run the same full database
+        // predicate so an already-set status succeeds without weakening the
+        // comparison or depending on timestamp hydration precision.
+        if ($expected->isActive !== $active) {
+            return false;
+        }
+        $stmt = $this->pdo->prepare(
+            "SELECT 1 FROM s3_credentials WHERE access_key_id = ? AND {$snapshotComparison} AND is_active = ?",
+        );
+        $stmt->execute(self::snapshotParameters($expected));
 
-        return $expected->isActive === $active
-            && $current !== null
-            && hash_equals($expected->secretAccessKey, $current->secretAccessKey)
-            && $current->ownerId === $expected->ownerId
-            && $current->sessionToken === $expected->sessionToken
-            && $current->isActive === $active;
+        return $stmt->fetchColumn() !== false;
+    }
+
+    private function snapshotComparison(): string
+    {
+        return match ($this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME)) {
+            'mysql' => 'BINARY secret_access_key = BINARY ? AND BINARY owner_id = BINARY ? '
+                . 'AND BINARY display_name = BINARY ? AND BINARY session_token <=> BINARY ? '
+                . 'AND expires_at <=> ? AND BINARY COALESCE(policy_names, \'[]\') = BINARY ? '
+                . 'AND BINARY COALESCE(allowed_prefixes, \'[]\') = BINARY ?',
+            'pgsql' => 'secret_access_key COLLATE "C" = ? AND owner_id COLLATE "C" = ? '
+                . 'AND display_name COLLATE "C" = ? AND session_token COLLATE "C" IS NOT DISTINCT FROM ? '
+                . 'AND expires_at IS NOT DISTINCT FROM ? AND COALESCE(policy_names, \'[]\') COLLATE "C" = ? '
+                . 'AND COALESCE(allowed_prefixes, \'[]\') COLLATE "C" = ?',
+            default => 'secret_access_key COLLATE BINARY = ? AND owner_id COLLATE BINARY = ? '
+                . 'AND display_name COLLATE BINARY = ? AND session_token COLLATE BINARY IS ? '
+                . 'AND expires_at IS ? AND COALESCE(policy_names, \'[]\') COLLATE BINARY = ? '
+                . 'AND COALESCE(allowed_prefixes, \'[]\') COLLATE BINARY = ?',
+        };
+    }
+
+    /** @return array{string, string, string, string, ?string, ?string, string, string, int} */
+    private static function snapshotParameters(Credential $credential): array
+    {
+        return [
+            $credential->accessKeyId,
+            $credential->secretAccessKey,
+            $credential->ownerId,
+            $credential->displayName,
+            $credential->sessionToken,
+            $credential->expiresAt?->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s'),
+            json_encode($credential->policyNames, JSON_THROW_ON_ERROR),
+            json_encode($credential->allowedPrefixes, JSON_THROW_ON_ERROR),
+            $credential->isActive ? 1 : 0,
+        ];
     }
 
     private function addColumnIfMissing(string $column, string $definition): void

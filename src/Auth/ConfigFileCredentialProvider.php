@@ -125,11 +125,7 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
 
         try {
             $current = $this->credentials[$expected->accessKeyId] ?? null;
-            if ($current === null
-                || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
-                || $current->ownerId !== $expected->ownerId
-                || $current->sessionToken !== $expected->sessionToken
-                || $current->isActive !== $expected->isActive) {
+            if ($current === null || !$expected->matchesSnapshot($current)) {
                 return false;
             }
 
@@ -150,11 +146,7 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
 
         try {
             $current = $this->credentials[$expected->accessKeyId] ?? null;
-            if ($current === null
-                || ! hash_equals($expected->secretAccessKey, $current->secretAccessKey)
-                || $current->ownerId !== $expected->ownerId
-                || $current->sessionToken !== $expected->sessionToken
-                || $current->isActive !== $expected->isActive) {
+            if ($current === null || !$expected->matchesSnapshot($current)) {
                 return false;
             }
 

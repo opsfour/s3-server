@@ -50,17 +50,32 @@ final class TrustedProxyMiddleware implements Middleware
             $parts = explode('/', $cidr, 2);
             $address = $parts[0];
             $prefix = $parts[1] ?? null;
-            $binary = @inet_pton($address);
-            if ($binary === false || ($prefix !== null && (! ctype_digit($prefix) || (int) $prefix > strlen($binary) * 8 || (int) $prefix === 0))) {
+            $rawBinary = @inet_pton($address);
+            $canonical = RequestNetworkContext::canonicalizeIp($address);
+            $binary = $canonical === null ? false : @inet_pton($canonical);
+            if ($rawBinary === false || $binary === false
+                || ($prefix !== null && (! ctype_digit($prefix) || (int) $prefix > strlen($rawBinary) * 8 || (int) $prefix === 0))) {
                 throw new \InvalidArgumentException("Invalid trusted proxy CIDR: {$cidr}.");
             }
-            $this->trustedRanges[] = [$binary, $prefix === null ? strlen($binary) * 8 : (int) $prefix];
+            $prefixLength = $prefix === null ? strlen($rawBinary) * 8 : (int) $prefix;
+            if (strlen($rawBinary) === 16 && strlen($binary) === 4) {
+                if ($prefixLength <= 96) {
+                    throw new \InvalidArgumentException("Invalid trusted proxy CIDR: {$cidr}.");
+                }
+                $prefixLength -= 96;
+            }
+            $this->trustedRanges[] = [$binary, $prefixLength];
         }
     }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
         $peer = RequestNetworkContext::peerIp($request);
+        if ($peer !== null) {
+            // Establish one canonical source for direct and untrusted peers.
+            // A trusted forwarding chain may replace it below.
+            $request->setAttribute(RequestNetworkContext::CLIENT_IP_ATTRIBUTE, $peer);
+        }
         if ($peer !== null && $this->isTrusted($peer)) {
             $proto = $request->getHeaderArray('x-forwarded-proto');
             // Backend TLS says nothing about client-to-proxy TLS. Missing,
@@ -96,10 +111,11 @@ final class TrustedProxyMiddleware implements Middleware
         foreach ($headers as $header) {
             foreach (explode(',', $header) as $part) {
                 $ip = trim($part);
-                if ($ip === '' || @inet_pton($ip) === false) {
+                $canonical = $ip !== '' ? RequestNetworkContext::canonicalizeIp($ip) : null;
+                if ($canonical === null) {
                     return null;
                 }
-                $addresses[] = $ip;
+                $addresses[] = $canonical;
             }
         }
         for ($index = count($addresses) - 1; $index >= 0; $index--) {
@@ -115,7 +131,8 @@ final class TrustedProxyMiddleware implements Middleware
 
     private function isTrusted(string $ip): bool
     {
-        $address = @inet_pton($ip);
+        $canonical = RequestNetworkContext::canonicalizeIp($ip);
+        $address = $canonical === null ? false : @inet_pton($canonical);
         if ($address === false) {
             return false;
         }

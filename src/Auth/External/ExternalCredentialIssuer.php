@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Auth\External;
 
 use OpsFour\S3Server\Auth\CredentialManager;
+use OpsFour\S3Server\Auth\CredentialDeletionResult;
 
 /**
  * Issues regular SigV4 credentials for identities authenticated by an external IdP.
@@ -56,6 +57,11 @@ final readonly class ExternalCredentialIssuer
 
     public function revoke(string $accessKeyId): bool
     {
-        return $this->credentials->deleteCredential($accessKeyId);
+        return $this->revokeResult($accessKeyId) === CredentialDeletionResult::Deleted;
+    }
+
+    public function revokeResult(string $accessKeyId): CredentialDeletionResult
+    {
+        return $this->credentials->deleteCredentialResult($accessKeyId);
     }
 }

@@ -9,6 +9,6 @@ use OpsFour\S3Server\Auth\Credential;
 /** Prevent a concurrent revocation or key replacement from being undone by a status change. */
 interface AtomicCredentialStatusUpdater
 {
-    /** Return false if the credential was removed or its secret changed. */
+    /** Return false if the credential was removed or any field in its observed snapshot changed. */
     public function setActiveIfCurrent(Credential $expected, bool $active): bool;
 }

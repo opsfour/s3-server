@@ -64,6 +64,29 @@ final class Credential
         self::validateStringList($this->allowedPrefixes, 128, 1024, 'allowed prefixes');
     }
 
+    /** Compare the complete immutable snapshot used by atomic mutations. */
+    public function matchesSnapshot(self $other): bool
+    {
+        return $this->accessKeyId === $other->accessKeyId
+            && hash_equals($this->secretAccessKey, $other->secretAccessKey)
+            && $this->ownerId === $other->ownerId
+            && $this->displayName === $other->displayName
+            && $this->isActive === $other->isActive
+            && self::nullableSecretMatches($this->sessionToken, $other->sessionToken)
+            && $this->expiresAt?->format('U.u') === $other->expiresAt?->format('U.u')
+            && $this->policyNames === $other->policyNames
+            && $this->allowedPrefixes === $other->allowedPrefixes;
+    }
+
+    private static function nullableSecretMatches(?string $first, ?string $second): bool
+    {
+        if ($first === null || $second === null) {
+            return $first === $second;
+        }
+
+        return hash_equals($first, $second);
+    }
+
     private static function validateRequiredString(string $value, int $maxBytes, string $label): void
     {
         if ($value === '' || strlen($value) > $maxBytes || preg_match('/[\x00-\x1F\x7F]/', $value)) {

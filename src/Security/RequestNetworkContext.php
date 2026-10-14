@@ -27,9 +27,7 @@ final class RequestNetworkContext
 
     public static function rateLimitIp(Request $request): string
     {
-        return self::sourceIp($request)
-            ?? self::peerIp($request)
-            ?? $request->getClient()->getRemoteAddress()->toString();
+        return self::sourceIp($request) ?? 'unknown';
     }
 
     public static function secureTransport(Request $request): bool
@@ -45,6 +43,26 @@ final class RequestNetworkContext
     {
         $address = $request->getClient()->getRemoteAddress();
 
-        return $address instanceof InternetAddress ? $address->getAddress() : null;
+        return $address instanceof InternetAddress
+            ? self::canonicalizeIp($address->getAddress())
+            : null;
+    }
+
+    /** Return one textual identity for every valid IPv4 or IPv6 spelling. */
+    public static function canonicalizeIp(string $address): ?string
+    {
+        $binary = @inet_pton($address);
+        if ($binary === false) {
+            return null;
+        }
+        if (strlen($binary) === 16
+            && substr($binary, 0, 10) === str_repeat("\0", 10)
+            && substr($binary, 10, 2) === "\xff\xff") {
+            $binary = substr($binary, 12);
+        }
+
+        $canonical = inet_ntop($binary);
+
+        return $canonical === false ? null : $canonical;
     }
 }

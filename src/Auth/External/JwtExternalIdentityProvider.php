@@ -253,17 +253,17 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
             return in_array($audience, $this->allowedAudiences, true);
         }
 
-        if (!is_array($audience)) {
+        if (!is_array($audience) || !array_is_list($audience)) {
             return false;
         }
 
         foreach ($audience as $item) {
-            if (is_string($item) && in_array($item, $this->allowedAudiences, true)) {
-                return true;
+            if (!is_string($item)) {
+                return false;
             }
         }
 
-        return false;
+        return array_intersect($audience, $this->allowedAudiences) !== [];
     }
 
     /**
@@ -271,12 +271,45 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
      */
     private function jsonDecode(string $json, string $label): array
     {
-        $decoded = json_decode($json, true);
-        if (!is_array($decoded)) {
+        $decoded = json_decode($json);
+        if (!$decoded instanceof \stdClass) {
             throw new ExternalIdentityAuthenticationException("{$label} must be a JSON object.");
         }
 
-        return $decoded;
+        // Preserve nested JSON objects as stdClass. Converting recursively to
+        // associative arrays would make {"0":"value"} indistinguishable from
+        // a real one-element JSON array and defeat list-claim validation.
+        $values = [];
+        foreach (get_object_vars($decoded) as $name => $value) {
+            // PHP converts integer-looking array keys to integers. Reject such
+            // top-level member names rather than violate the string-keyed JWT
+            // representation expected by all claim and header consumers.
+            if (! is_string(array_key_first([$name => true]))) {
+                throw new ExternalIdentityAuthenticationException("{$label} contains an unsupported member name.");
+            }
+            $values[$name] = self::normalizeJsonValue($value);
+        }
+
+        return $values;
+    }
+
+    private static function normalizeJsonValue(mixed $value): mixed
+    {
+        if (is_array($value)) {
+            return array_map(self::normalizeJsonValue(...), $value);
+        }
+        if (!$value instanceof \stdClass) {
+            return $value;
+        }
+
+        $properties = get_object_vars($value);
+        if (array_is_list($properties)) {
+            // Empty and numerically indexed JSON objects must remain distinct
+            // from JSON arrays. List consumers then reject them fail closed.
+            return $value;
+        }
+
+        return array_map(self::normalizeJsonValue(...), $properties);
     }
 
     private function base64UrlDecode(string $value): string
