@@ -54,6 +54,20 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Revoke prepared EFS pre-bind admission after a failed binding recheck so a
+  later listener attempt must repeat the complete preparation.
+- Reject known S3 query selectors and subresources on the wrong method or
+  bucket/object scope before they can fall through to a base mutation.
+- Preserve generation-bound multipart part paths during legacy Flysystem
+  directory cleanup, recognize only S3 part numbers 1 through 10,000 as known
+  paths, and retain unknown entries for explicit reconciliation.
+- Record buffered response and S3 error-body byte counts in access logs, label
+  bucket and object ACL updates as `REST.PUT.ACL`, and restore failed flush
+  entries in chronological FIFO order so retry buffering does not evict newer
+  log records before older ones. Propagate request cancellation without
+  recording a fabricated HTTP 500 response.
+- Ignore `x-amz-expected-bucket-owner` on CreateBucket, as AWS does, while
+  continuing to enforce it on supported bucket and object operations.
 - Evaluate repeated list-valued HTTP condition, range, and ACL-grant fields as
   one value, and reject repeated singleton digest, copy, checksum, and
   encryption controls. Reject ambiguous `Content-Length` plus
@@ -109,6 +123,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   Public Access Block validation and error compatibility.
 - Sanitize management, webhook, storage, and worker failures so secrets and
   backend diagnostics are not exposed in responses or logs.
+- Return fixed External IAM authentication failure text instead of exposing
+  identity-provider exception messages through the credential admin API.
 - Reject invalid Laravel boolean environment values instead of treating every
   nonempty string as enabled, including the unsafe storage-fence test bypass.
 - Reject quota CLI values above the platform integer range instead of silently

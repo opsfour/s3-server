@@ -52,15 +52,22 @@ final class LoggingMiddleware implements Middleware
 
         try {
             $response = $requestHandler->handleRequest($request);
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
         } catch (\Throwable $e) {
+            $statusCode = $e instanceof S3Exception ? $e->getHttpStatus() : 500;
+            $responseContentLength = $e instanceof S3Exception && $method !== 'HEAD'
+                && !in_array($statusCode, [204, 304], true)
+                ? (string) strlen(ErrorHandlingMiddleware::buildS3ErrorBody($request, $e))
+                : '-';
             $this->writeLogEntry(
                 $request,
                 $method,
                 $fullPath,
                 $requestContentLength,
                 $requestId,
-                $e instanceof S3Exception ? $e->getHttpStatus() : 500,
-                '-',
+                $statusCode,
+                $responseContentLength,
                 $startTime,
                 $receivedAt,
                 $e instanceof S3Exception ? $e->getErrorCode() : '',
@@ -69,10 +76,21 @@ final class LoggingMiddleware implements Middleware
             throw $e;
         }
 
-        $responseContentLength = $response->getHeader('Content-Length') ?? '-';
         $statusCode = $response->getStatus();
-        if ($this->accessLogs !== null && $method !== 'HEAD' && !in_array($statusCode, [204, 304], true)
-            && !($response->getBody() instanceof ReadableBuffer)) {
+        $responseContentLength = $response->getHeader('Content-Length') ?? '-';
+        $eligibleResponseBody = $this->accessLogs !== null && $method !== 'HEAD'
+            && !in_array($statusCode, [204, 304], true);
+        if ($eligibleResponseBody && $responseContentLength === '-'
+            && $response->getBody() instanceof ReadableBuffer) {
+            // Amp adds Content-Length while writing buffered response bodies,
+            // after this middleware has returned. Read the in-memory body now
+            // so the access log records the bytes actually handed to the HTTP
+            // driver, then replace the consumed stream for normal delivery.
+            $payload = \Amp\ByteStream\buffer($response->getBody());
+            $response->setBody($payload);
+            $response->removeHeader('Content-Length');
+            $responseContentLength = (string) strlen($payload);
+        } elseif ($eligibleResponseBody && !($response->getBody() instanceof ReadableBuffer)) {
             // A streaming response can be closed before its advertised length
             // is consumed. Record the bytes actually read by the HTTP driver.
             $bytesRead = 0;
@@ -328,6 +346,7 @@ final class LoggingMiddleware implements Middleware
             S3Operation::GetBucketLogging => 'REST.GET.LOGGING_STATUS',
             S3Operation::GetBucketPolicy => 'REST.GET.BUCKETPOLICY',
             S3Operation::PutBucketPolicy => 'REST.PUT.BUCKETPOLICY',
+            S3Operation::PutBucketAcl, S3Operation::PutObjectAcl => 'REST.PUT.ACL',
             S3Operation::ListObjects, S3Operation::ListObjectsV2 => 'REST.GET.BUCKET',
             S3Operation::CopyObject => 'REST.COPY.OBJECT',
             S3Operation::UploadPartCopy => 'REST.COPY.PART',

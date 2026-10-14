@@ -321,9 +321,9 @@ final class AccessLogWriter
 
         // The serialized tuple is used only as an array key. Its length-framed
         // fields prevent numeric IDs or separator characters from colliding.
-        /** @var array<string, array{bucket: string, owner: string, generation: string, targetBucket: string, targetGeneration: string, targetPrefix: string, lines: list<string>}> $grouped */
+        /** @var array<string, array{bucket: string, owner: string, generation: string, targetBucket: string, targetGeneration: string, targetPrefix: string, lines: list<string>, entryIndexes: list<int>}> $grouped */
         $grouped = [];
-        foreach ($entries as $entry) {
+        foreach ($entries as $entryIndex => $entry) {
             $groupKey = 'source:' . serialize([$entry['bucket'], $entry['owner'], $entry['generation'], $entry['targetBucket'], $entry['targetGeneration'], $entry['targetPrefix']]);
             $grouped[$groupKey]['bucket'] = $entry['bucket'];
             $grouped[$groupKey]['owner'] = $entry['owner'];
@@ -332,9 +332,12 @@ final class AccessLogWriter
             $grouped[$groupKey]['targetGeneration'] = $entry['targetGeneration'];
             $grouped[$groupKey]['targetPrefix'] = $entry['targetPrefix'];
             $grouped[$groupKey]['lines'][] = $entry['line'];
+            $grouped[$groupKey]['entryIndexes'][] = $entryIndex;
         }
 
         $totalFlushed = 0;
+        /** @var array<int, true> $retryEntryIndexes */
+        $retryEntryIndexes = [];
 
         foreach ($grouped as $group) {
             $sourceBucket = $group['bucket'];
@@ -687,16 +690,8 @@ final class AccessLogWriter
                         );
                     }
                 }
-                foreach ($lines as $line) {
-                    $this->appendToBuffer([
-                        'bucket' => $sourceBucket,
-                        'owner' => $sourceOwner,
-                        'generation' => $sourceGeneration,
-                        'targetBucket' => $targetBucket,
-                        'targetGeneration' => $targetGeneration,
-                        'targetPrefix' => $targetPrefix,
-                        'line' => $line,
-                    ]);
+                foreach ($group['entryIndexes'] as $entryIndex) {
+                    $retryEntryIndexes[$entryIndex] = true;
                 }
                 $this->logger->error('Failed to flush access logs for bucket.', [
                     'bucket' => $sourceBucket,
@@ -709,6 +704,23 @@ final class AccessLogWriter
 
             if ($attempt->event !== null) {
                 $this->notifications?->dispatchInternalEvent($attempt->event);
+            }
+        }
+
+        if ($retryEntryIndexes !== []) {
+            // Storage work can yield while requests continue to append entries.
+            // Restore older failed entries before those newer entries so the
+            // bounded buffer still drops the chronologically oldest records.
+            $bufferedDuringFlush = $this->buffer;
+            $this->buffer = [];
+            $this->bufferBytes = 0;
+            foreach ($entries as $entryIndex => $entry) {
+                if (isset($retryEntryIndexes[$entryIndex])) {
+                    $this->appendToBuffer($entry);
+                }
+            }
+            foreach ($bufferedDuringFlush as $entry) {
+                $this->appendToBuffer($entry);
             }
         }
 

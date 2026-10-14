@@ -450,6 +450,59 @@ final class AccessLogWriterTest extends TestCase
         self::assertStringContainsString(' GetObject third ', $body);
     }
 
+    public function test_failed_flush_keeps_newer_entries_when_restoring_retry_exceeds_buffer_limit(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'source', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('source', 'log-target', 'access/');
+
+        $storage = $this->createMock(StorageBackend::class);
+        $writer = null;
+        $attempt = 0;
+        $delivered = '';
+        $storage->method('putObject')->willReturnCallback(
+            static function (string $bucket, string $key, ReadableStream $body) use (&$writer, &$attempt, &$delivered): StorageWriteResult {
+                $attempt++;
+                if ($attempt === 1) {
+                    self::assertInstanceOf(AccessLogWriter::class, $writer);
+                    $writer->log(
+                        'source',
+                        'new-request',
+                        'GetObject',
+                        200,
+                        0,
+                        requestUri: 'GET /' . str_repeat('y', 800) . ' HTTP/1.1',
+                    );
+
+                    throw new \RuntimeException('temporary storage failure');
+                }
+
+                $delivered = \Amp\ByteStream\buffer($body);
+
+                return new StorageWriteResult('/stored/retry', strlen($delivered), md5($delivered));
+            },
+        );
+        $writer = new AccessLogWriter($metadata, $storage, maxBufferBytes: 1_200);
+        $writer->log(
+            'source',
+            'old-request',
+            'GetObject',
+            200,
+            0,
+            requestUri: 'GET /' . str_repeat('x', 800) . ' HTTP/1.1',
+        );
+
+        $writer->flush();
+        self::assertSame(1, $writer->getBufferCount());
+
+        $writer->flush();
+
+        self::assertStringContainsString(' GetObject new-request ', $delivered);
+        self::assertStringNotContainsString(' GetObject old-request ', $delivered);
+    }
+
     public function test_oversized_untrusted_access_log_field_is_truncated_before_formatting(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');

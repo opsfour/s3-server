@@ -15,12 +15,15 @@ use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Exception\AccessControlListNotSupportedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchBucketPolicyException;
 use OpsFour\S3Server\Auth\PostObjectAuthorizationPreflight;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
+use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Middleware\LoggingMiddleware;
+use OpsFour\S3Server\Middleware\RequestIdMiddleware;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
 use OpsFour\S3Server\Logging\AccessLogWriter;
@@ -258,6 +261,41 @@ final class LoggingMiddlewareTest extends TestCase
         self::assertStringContainsString(' 200 - - - ', $lines[1]);
     }
 
+    public function test_buffered_response_without_content_length_logs_actual_bytes_and_remains_readable(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'source', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('source', 'log-target', 'access/');
+        $storage = new InMemoryBackend();
+        $writer = new AccessLogWriter($metadata, $storage);
+        $request = $this->request();
+        $request->setAttribute('s3.bucket', 'source');
+        $request->setAttribute('s3.key', 'listing');
+        $request->setAttribute('s3.cachedBucketOwner', 'alice');
+        $request->setAttribute('s3.operation', S3Operation::ListObjectsV2);
+
+        $response = $this->handleWithErrorHandling(
+            $request,
+            new LoggingMiddleware(new LoggingMiddlewareArrayLogger(), $writer),
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(200, ['Content-Type' => 'application/xml'], '<Result/>');
+                }
+            },
+        );
+
+        self::assertNull($response->getHeader('Content-Length'));
+        self::assertSame('<Result/>', \Amp\ByteStream\buffer($response->getBody()));
+        $writer->flush();
+
+        $object = $metadata->listObjects('log-target')->objects[0];
+        $line = \Amp\ByteStream\buffer($storage->getObjectByPath($object->systemMetadata['storagePath']));
+        self::assertMatchesRegularExpression('/ REST\.GET\.BUCKET listing .* 200 - 9 - /', $line);
+    }
+
     public function test_object_size_is_distinct_from_sent_bytes_for_range_head_and_empty_get(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');
@@ -328,7 +366,7 @@ final class LoggingMiddlewareTest extends TestCase
             $request->setAttribute('s3.key', $finish ? 'complete.txt' : 'aborted.txt');
             $request->setAttribute('s3.operation', S3Operation::GetObject);
             $request->setAttribute('s3.cachedBucketOwner', 'alice');
-            $response = $middleware->handleRequest($request, new class implements RequestHandler {
+            $response = $this->handleWithErrorHandling($request, $middleware, new class implements RequestHandler {
                 public function handleRequest(Request $request): Response
                 {
                     return new Response(200, ['Content-Length' => '6'], new ReadableIterableStream(['ab', 'cdef']));
@@ -407,6 +445,95 @@ final class LoggingMiddlewareTest extends TestCase
         self::assertMatchesRegularExpression('/REST\.GET\.OBJECT cancelled\.txt .* 200 - 2 - /', $lines);
     }
 
+    public function test_s3_error_response_logs_the_exact_generated_xml_bytes_with_request_context(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'test-bucket', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('test-bucket', 'log-target', 'access/');
+        $storage = new InMemoryBackend();
+        $writer = new AccessLogWriter($metadata, $storage);
+        $request = $this->request();
+        $request->setAttribute('requestId', 'error-request');
+        $request->setAttribute('amzId2', 'extended-error-request');
+        $request->setAttribute('s3.bucket', 'test-bucket');
+        $request->setAttribute('s3.cachedBucketOwner', 'alice');
+        $request->setAttribute('s3.operation', S3Operation::GetBucketPolicy);
+
+        $response = $this->handleWithErrorHandling(
+            $request,
+            new LoggingMiddleware(new LoggingMiddlewareArrayLogger(), $writer),
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    throw new NoSuchBucketPolicyException();
+                }
+            },
+        );
+        $body = \Amp\ByteStream\buffer($response->getBody());
+
+        self::assertSame(404, $response->getStatus());
+        self::assertSame('error-request', $response->getHeader('x-amz-request-id'));
+        self::assertStringContainsString('<Code>NoSuchBucketPolicy</Code>', $body);
+        self::assertStringContainsString('<RequestId>error-request</RequestId>', $body);
+        self::assertStringContainsString('<HostId>extended-error-request</HostId>', $body);
+        $writer->flush();
+
+        $object = $metadata->listObjects('log-target')->objects[0];
+        $line = \Amp\ByteStream\buffer($storage->getObjectByPath($object->systemMetadata['storagePath']));
+        self::assertStringContainsString(' error-request REST.GET.BUCKETPOLICY ', $line);
+        self::assertStringContainsString(
+            ' 404 NoSuchBucketPolicy ' . strlen($body) . ' - ',
+            $line,
+        );
+    }
+
+    public function test_current_error_handling_order_propagates_cancellation_without_logging_a_response(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'test-bucket', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('test-bucket', 'log-target', 'access/');
+        $bucket = $metadata->getBucket('test-bucket');
+        self::assertNotNull($bucket);
+        $storage = new InMemoryBackend();
+        $writer = new AccessLogWriter($metadata, $storage);
+        $logger = new LoggingMiddlewareArrayLogger();
+        $request = $this->request();
+        $request->setAttribute('requestId', 'cancelled-request');
+        $request->setAttribute('s3.bucket', 'test-bucket');
+        $request->setAttribute('s3.key', 'cancelled.txt');
+        $request->setAttribute('s3.cachedBucketOwner', 'alice');
+        $request->setAttribute('s3.cachedBucketGeneration', $bucket->generation);
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $cancellation = new \Amp\CancelledException();
+
+        try {
+            $this->handleWithErrorHandling(
+                $request,
+                new LoggingMiddleware($logger, $writer),
+                new class ($cancellation) implements RequestHandler {
+                    public function __construct(private readonly \Amp\CancelledException $cancellation) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        throw $this->cancellation;
+                    }
+                },
+            );
+            self::fail('Cancellation must not become an S3 error response.');
+        } catch (\Amp\CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        self::assertSame([], $logger->records);
+        self::assertSame(0, $writer->getBufferCount());
+        $writer->flush();
+        self::assertSame([], $metadata->listObjects('log-target')->objects);
+    }
+
     public function test_s3_exception_is_logged_before_it_is_rethrown(): void
     {
         $logger = new LoggingMiddlewareArrayLogger();
@@ -441,7 +568,7 @@ final class LoggingMiddlewareTest extends TestCase
         $accessLogs->flush();
         $object = $metadata->listObjects('log-target')->objects[0];
         $line = \Amp\ByteStream\buffer($storage->getObjectByPath($object->systemMetadata['storagePath']));
-        self::assertStringContainsString(' 404 NoSuchBucket - ', $line);
+        self::assertMatchesRegularExpression('/ 404 NoSuchBucket [1-9][0-9]* - /', $line);
     }
 
     public function test_request_without_resolved_bucket_owner_is_not_buffered_for_a_future_bucket(): void
@@ -698,6 +825,55 @@ final class LoggingMiddlewareTest extends TestCase
         self::assertStringNotContainsString(' GetBucket', $body);
     }
 
+    public function test_bucket_and_object_acl_writes_use_the_documented_access_log_operation_name(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'source', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('source', 'log-target', 'access/');
+        $storage = new InMemoryBackend();
+        $writer = new AccessLogWriter($metadata, $storage);
+        $middleware = new LoggingMiddleware(new LoggingMiddlewareArrayLogger(), $writer);
+
+        $bucketRequest = $this->request('PUT');
+        $bucketRequest->setAttribute('s3.bucket', 'source');
+        $bucketRequest->setAttribute('s3.cachedBucketOwner', 'alice');
+        $bucketRequest->setAttribute('s3.operation', S3Operation::PutBucketAcl);
+        $middleware->handleRequest($bucketRequest, new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(200);
+            }
+        });
+
+        $objectRequest = $this->request('PUT');
+        $objectRequest->setAttribute('s3.bucket', 'source');
+        $objectRequest->setAttribute('s3.key', 'object.txt');
+        $objectRequest->setAttribute('s3.cachedBucketOwner', 'alice');
+        $objectRequest->setAttribute('s3.operation', S3Operation::PutObjectAcl);
+        try {
+            $middleware->handleRequest($objectRequest, new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    throw new AccessControlListNotSupportedException();
+                }
+            });
+            self::fail('The object ACL write must fail in bucket-owner-enforced mode.');
+        } catch (AccessControlListNotSupportedException) {
+        }
+
+        $writer->flush();
+        $object = $metadata->listObjects('log-target')->objects[0];
+        $lines = explode("\n", trim(\Amp\ByteStream\buffer($storage->getObjectByPath($object->systemMetadata['storagePath']))));
+        self::assertCount(2, $lines);
+        self::assertMatchesRegularExpression('/ REST\.PUT\.ACL - .* 200 - /', $lines[0]);
+        self::assertMatchesRegularExpression(
+            '/ REST\.PUT\.ACL object\.txt .* 400 AccessControlListNotSupported /',
+            $lines[1],
+        );
+    }
+
     public function test_every_routed_operation_has_an_audited_access_log_name(): void
     {
         // Only names shown in AWS-owned log examples are mapped. The remaining
@@ -714,6 +890,8 @@ final class LoggingMiddlewareTest extends TestCase
             'GetBucketLogging' => 'REST.GET.LOGGING_STATUS',
             'GetBucketPolicy' => 'REST.GET.BUCKETPOLICY',
             'PutBucketPolicy' => 'REST.PUT.BUCKETPOLICY',
+            'PutBucketAcl' => 'REST.PUT.ACL',
+            'PutObjectAcl' => 'REST.PUT.ACL',
             'ListObjects' => 'REST.GET.BUCKET',
             'ListObjectsV2' => 'REST.GET.BUCKET',
             'CopyObject' => 'REST.COPY.OBJECT',
@@ -726,7 +904,7 @@ final class LoggingMiddlewareTest extends TestCase
             'GetBucketPolicyStatus' => 'REST.GET.POLICY.STATUS',
         ];
         self::assertCount(69, S3Operation::cases());
-        self::assertCount(21, $verified);
+        self::assertCount(23, $verified);
 
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
@@ -958,6 +1136,40 @@ final class LoggingMiddlewareTest extends TestCase
             new LoggingMiddlewareTestClient(),
             $method,
             Http::new('http://127.0.0.1/test-bucket/missing.txt'),
+        );
+    }
+
+    private function handleWithErrorHandling(
+        Request $request,
+        LoggingMiddleware $logging,
+        RequestHandler $terminal,
+    ): Response {
+        $loggingHandler = new class ($logging, $terminal) implements RequestHandler {
+            public function __construct(
+                private readonly LoggingMiddleware $logging,
+                private readonly RequestHandler $terminal,
+            ) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                return $this->logging->handleRequest($request, $this->terminal);
+            }
+        };
+        $errorHandler = new ErrorHandlingMiddleware();
+
+        return (new RequestIdMiddleware())->handleRequest(
+            $request,
+            new class ($errorHandler, $loggingHandler) implements RequestHandler {
+                public function __construct(
+                    private readonly ErrorHandlingMiddleware $errors,
+                    private readonly RequestHandler $inner,
+                ) {}
+
+                public function handleRequest(Request $request): Response
+                {
+                    return $this->errors->handleRequest($request, $this->inner);
+                }
+            },
         );
     }
 }
