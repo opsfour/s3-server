@@ -317,14 +317,25 @@ final class S3Server
                 }
             }
 
-            if ($this->metadata !== null && $this->storage !== null) {
-                \assert($configuredTiers !== null);
-                $missingTiers = array_values(array_filter(
-                    $this->metadata->listReferencedStorageTiers(),
-                    static fn(string $name): bool => ! $configuredTiers->has($name),
-                ));
-                if ($missingTiers !== []) {
-                    throw new \RuntimeException('Refusing to start with unconfigured storage tiers referenced by metadata: ' . implode(', ', $missingTiers));
+            if ($this->metadata !== null) {
+                $tierRegistries = $configuredTiers !== null ? [$configuredTiers] : [];
+                foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+                    $tierRegistries[] = $registration['tiers'];
+                }
+
+                if ($tierRegistries !== []) {
+                    $referencedTiers = $this->metadata->listReferencedStorageTiers();
+                    $missingTiers = [];
+                    foreach ($tierRegistries as $tierRegistry) {
+                        foreach ($referencedTiers as $name) {
+                            if (! $tierRegistry->has($name)) {
+                                $missingTiers[$name] = true;
+                            }
+                        }
+                    }
+                    if ($missingTiers !== []) {
+                        throw new \RuntimeException('Refusing to start with unconfigured storage tiers referenced by metadata: ' . implode(', ', array_keys($missingTiers)));
+                    }
                 }
             }
 

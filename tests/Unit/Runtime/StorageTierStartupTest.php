@@ -9,12 +9,15 @@ use Amp\File\Filesystem;
 use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\StorageTier;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -146,6 +149,48 @@ final class StorageTierStartupTest extends TestCase
             $metadata->updateRestoreJobStatus($restoreId, 'completed');
             self::assertSame([], $metadata->listReferencedStorageTiers());
         } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_api_server_checks_referenced_tiers_against_registered_handler_tiers(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-tier-handler-start-' . bin2hex(random_bytes(8)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'tier-handler-start-bucket', 'us-east-1');
+        $metadata->putObjectMetadata('tier-handler-start-bucket', 'key', 'owner', 1, '"etag"', 'text/plain', 'hot/key');
+        $metadata->updateObjectPlacement('tier-handler-start-bucket', 'key', null, 'GLACIER', 'GLACIER', 'cold/key');
+        $filesystem = new Filesystem(new BlockingFilesystemDriver());
+        $serverStorage = new FilesystemBackend(sys_get_temp_dir(), $filesystem, $filesystem);
+        $handlerStorage = new FilesystemBackend(sys_get_temp_dir(), $filesystem, $filesystem);
+        $config = new S3ServerConfig(storagePath: sys_get_temp_dir());
+        $server = new S3Server($config, $metadata, $serverStorage);
+        $server->setStorageTierRegistry(new StorageTierRegistry([
+            new StorageTier('STANDARD', $serverStorage, defaultWriteTier: true),
+            new StorageTier('GLACIER', new FilesystemBackend(sys_get_temp_dir(), $filesystem, $filesystem)),
+        ]));
+        HandlerRegistrar::registerAll(
+            $server->getHandlerRegistry(),
+            $metadata,
+            $handlerStorage,
+            $config,
+            storageTiers: StorageTierRegistry::single($handlerStorage),
+        );
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('access-key', 'secret-key', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('A handler registry missing a referenced tier was admitted.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('unconfigured storage tiers referenced by metadata: GLACIER', $error->getMessage());
+        } finally {
+            $server->stop();
             @unlink($path);
             @unlink($path . '-wal');
             @unlink($path . '-shm');
