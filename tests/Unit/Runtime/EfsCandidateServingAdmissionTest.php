@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use Amp\ByteStream;
+use Amp\ByteStream\ReadableBuffer;
+use Amp\CancelledException;
 use Amp\DeferredFuture;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
@@ -13,6 +15,7 @@ use Amp\Http\Server\Response;
 use Amp\TimeoutCancellation;
 use League\Uri\Http;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Runtime\EfsCandidateServingAdmission;
 use OpsFour\S3Server\Runtime\EfsCandidateServingAdmissionState;
 use OpsFour\S3Server\Runtime\EfsHostEvidence;
@@ -174,6 +177,80 @@ final class EfsCandidateServingAdmissionTest extends TestCase
         self::assertSame(503, $this->dispatch($admission, $handler)->getStatus());
         self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $admission->state());
         self::assertSame(0, $handler->calls);
+    }
+
+    public function test_activation_preserves_cancellation_and_remains_terminally_closed(): void
+    {
+        $cancellation = new CancelledException();
+        $evidence = new CountingEfsHostEvidence();
+        $evidence->failure = $cancellation;
+        $admission = new EfsCandidateServingAdmission($evidence);
+
+        try {
+            $admission->activate();
+            self::fail('Cancelled activation returned normally.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $admission->state());
+        $evidence->failure = null;
+        $this->assertCannotActivateAgain($admission);
+    }
+
+    public function test_active_request_preserves_cancellation_without_revoking_shared_admission(): void
+    {
+        $cancellation = new CancelledException();
+        $evidence = new CountingEfsHostEvidence();
+        $admission = new EfsCandidateServingAdmission($evidence);
+        $admission->activate();
+        $evidence->failure = $cancellation;
+        $handler = new CountingRequestHandler();
+        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/bucket/key'));
+
+        try {
+            $admission->handleRequest($request, $handler);
+            self::fail('Cancelled evidence check dispatched the request.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+
+        self::assertSame(EfsCandidateServingAdmissionState::ACTIVE, $admission->state());
+        self::assertSame(0, $handler->calls);
+        $evidence->failure = null;
+        self::assertSame(204, $this->dispatch($admission, $handler)->getStatus());
+    }
+
+    public function test_mutating_response_is_closed_when_admission_is_lost_after_handler(): void
+    {
+        $evidence = new CountingEfsHostEvidence();
+        $admission = new EfsCandidateServingAdmission($evidence);
+        $admission->activate();
+        $body = new ReadableBuffer('must-not-be-sent');
+        $handler = new class ($evidence, $body) implements RequestHandler {
+            public function __construct(
+                private readonly CountingEfsHostEvidence $evidence,
+                private readonly ReadableBuffer $body,
+            ) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                $this->evidence->failure = new \RuntimeException('private-path');
+
+                return new Response(status: 200, body: $this->body);
+            }
+        };
+        $request = new Request($this->createMock(Client::class), 'DELETE', Http::new('http://127.0.0.1/bucket/key'));
+
+        try {
+            $admission->handleRequest($request, $handler);
+            self::fail('A stale mutation response escaped admission.');
+        } catch (SlowDownException $error) {
+            self::assertSame('Storage host evidence is unavailable.', $error->getMessage());
+        }
+
+        self::assertFalse($body->isReadable());
+        self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $admission->state());
     }
 
     private function dispatch(EfsCandidateServingAdmission $admission, RequestHandler $handler): Response

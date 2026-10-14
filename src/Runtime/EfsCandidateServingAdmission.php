@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Runtime;
 
+use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
@@ -49,6 +50,9 @@ final class EfsCandidateServingAdmission implements Middleware, EfsHostEvidence
         $this->state = EfsCandidateServingAdmissionState::ACTIVATING;
         try {
             $this->evidence->assertFresh();
+        } catch (CancelledException $error) {
+            $this->revoke();
+            throw $error;
         } catch (\Throwable) {
             $this->revoke();
             throw new \RuntimeException('EFS serving admission activation failed.');
@@ -72,13 +76,36 @@ final class EfsCandidateServingAdmission implements Middleware, EfsHostEvidence
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
+        $this->assertRequestFresh();
+
         try {
-            $this->assertFresh();
-        } catch (\Throwable) {
-            throw new SlowDownException('Storage host evidence is unavailable.');
+            $response = $requestHandler->handleRequest($request);
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable $error) {
+            if ($this->requiresCommitCheck($request)) {
+                $this->assertRequestFresh();
+            }
+
+            throw $error;
         }
 
-        return $requestHandler->handleRequest($request);
+        if (! $this->requiresCommitCheck($request)) {
+            return $response;
+        }
+
+        try {
+            $this->assertRequestFresh();
+        } catch (\Throwable $error) {
+            try {
+                $response->getBody()->close();
+            } catch (\Throwable) {
+                // Preserve the admission failure or request cancellation.
+            }
+            throw $error;
+        }
+
+        return $response;
     }
 
     /** ACTIVE requests share the terminal revocation state with readiness. */
@@ -90,6 +117,8 @@ final class EfsCandidateServingAdmission implements Middleware, EfsHostEvidence
 
         try {
             $this->evidence->assertFresh();
+        } catch (CancelledException $error) {
+            throw $error;
         } catch (\Throwable) {
             $this->revoke();
             throw new \RuntimeException('EFS serving admission is unavailable.');
@@ -98,5 +127,21 @@ final class EfsCandidateServingAdmission implements Middleware, EfsHostEvidence
         if ($this->revocation->isCancelled()) {
             throw new \RuntimeException('EFS serving admission is unavailable.');
         }
+    }
+
+    private function assertRequestFresh(): void
+    {
+        try {
+            $this->assertFresh();
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            throw new SlowDownException('Storage host evidence is unavailable.');
+        }
+    }
+
+    private function requiresCommitCheck(Request $request): bool
+    {
+        return in_array($request->getMethod(), ['PUT', 'POST', 'DELETE'], true);
     }
 }

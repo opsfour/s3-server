@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Middleware;
 
+use Amp\CancelledException;
 use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
@@ -20,13 +21,36 @@ final class EfsApiAdmissionMiddleware implements Middleware, EfsHostEvidence
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
+        $this->assertRequestFresh();
+
         try {
-            $this->assertFresh();
-        } catch (\Throwable) {
-            throw new SlowDownException('Storage host evidence is unavailable.');
+            $response = $requestHandler->handleRequest($request);
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable $error) {
+            if ($this->requiresCommitCheck($request)) {
+                $this->assertRequestFresh();
+            }
+
+            throw $error;
         }
 
-        return $requestHandler->handleRequest($request);
+        if (! $this->requiresCommitCheck($request)) {
+            return $response;
+        }
+
+        try {
+            $this->assertRequestFresh();
+        } catch (\Throwable $error) {
+            try {
+                $response->getBody()->close();
+            } catch (\Throwable) {
+                // Preserve the admission failure or request cancellation.
+            }
+            throw $error;
+        }
+
+        return $response;
     }
 
     /** Share the same latched admission state with readiness checks. */
@@ -38,8 +62,37 @@ final class EfsApiAdmissionMiddleware implements Middleware, EfsHostEvidence
 
         try {
             $this->evidence->assertFresh();
+        } catch (CancelledException $error) {
+            throw $error;
         } catch (\Throwable) {
             $this->revoked = true;
+            throw new \RuntimeException('Storage host evidence is unavailable.');
+        }
+
+        // Another request can revoke the shared latch while the evidence
+        // check above is suspended. Its terminal decision must win.
+        $this->assertNotRevokedAfterYield();
+    }
+
+    private function assertRequestFresh(): void
+    {
+        try {
+            $this->assertFresh();
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            throw new SlowDownException('Storage host evidence is unavailable.');
+        }
+    }
+
+    private function requiresCommitCheck(Request $request): bool
+    {
+        return in_array($request->getMethod(), ['PUT', 'POST', 'DELETE'], true);
+    }
+
+    private function assertNotRevokedAfterYield(): void
+    {
+        if ($this->revoked) {
             throw new \RuntimeException('Storage host evidence is unavailable.');
         }
     }
