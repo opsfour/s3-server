@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -93,6 +93,15 @@ final class CachedMetadataStoreDecorator implements MetadataStore, ObjectRetenti
 
     public function lockNamedPoliciesForUpdate(array $policyNames): array
     {
+        return $this->inner->lockNamedPoliciesForUpdate($policyNames);
+    }
+
+    public function lockNamedPoliciesForRead(array $policyNames): array
+    {
+        if ($this->inner instanceof SharedAuthorizationLockStore) {
+            return $this->inner->lockNamedPoliciesForRead($policyNames);
+        }
+
         return $this->inner->lockNamedPoliciesForUpdate($policyNames);
     }
 
@@ -1264,6 +1273,24 @@ final class CachedMetadataStoreDecorator implements MetadataStore, ObjectRetenti
 
     public function lockOwnerForUpdate(string $ownerId): void
     {
+        $this->inner->lockOwnerForUpdate($ownerId);
+    }
+
+    public function prepareOwnerReadLock(string $ownerId): void
+    {
+        if ($this->inner instanceof SharedAuthorizationLockStore) {
+            $this->inner->prepareOwnerReadLock($ownerId);
+        }
+    }
+
+    public function lockOwnerForRead(string $ownerId): void
+    {
+        if ($this->inner instanceof SharedAuthorizationLockStore) {
+            $this->inner->lockOwnerForRead($ownerId);
+
+            return;
+        }
+
         $this->inner->lockOwnerForUpdate($ownerId);
     }
 

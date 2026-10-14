@@ -10,11 +10,15 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
 use Amp\Sql\SqlTransactionIsolationLevel;
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableIterableStream;
 use Amp\ByteStream\ReadableStream;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
+use Amp\Http\Server\RequestHandler;
+use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
+use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\MalformedPolicyException;
 use OpsFour\S3Server\Exception\InvalidArgumentException as S3InvalidArgumentException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
@@ -22,6 +26,8 @@ use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
+use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
@@ -35,6 +41,8 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Metadata\OwnerReadLock;
+use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Metadata\Schema\MysqlSchema;
 use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
@@ -631,6 +639,344 @@ final class MetadataBackendIntegrationTest extends TestCase
     {
         yield 'mysql' => ['mysql', 'S3_TEST_MYSQL_METADATA_DSN'];
         yield 'postgres' => ['postgres', 'S3_TEST_POSTGRES_METADATA_DSN'];
+    }
+
+    /** @return iterable<string, array{string, string, string}> */
+    public static function externalReadLockScenarios(): iterable
+    {
+        foreach (self::externalMetadataDrivers() as $driver => [$name, $dsnEnv]) {
+            yield $driver . ' object' => [$name, $dsnEnv, 'object'];
+            yield $driver . ' policy' => [$name, $dsnEnv, 'policy'];
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_shared_authorization_reads_overlap_while_owner_write_waits(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} shared read-lock tests.");
+        }
+
+        $first = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $second = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $writer = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $owner = 'shared-read-' . bin2hex(random_bytes(8));
+        OwnerReadLock::prepare($first, $owner);
+        OwnerReadLock::prepare($second, $owner);
+        $firstHeld = new \Amp\DeferredFuture();
+        $secondHeld = new \Amp\DeferredFuture();
+        $releaseFirst = new \Amp\DeferredFuture();
+        $releaseSecond = new \Amp\DeferredFuture();
+        $firstRead = \Amp\async(static function () use ($first, $owner, $firstHeld, $releaseFirst): void {
+            $first->transaction(static function () use ($first, $owner, $firstHeld, $releaseFirst): void {
+                OwnerReadLock::acquire($first, $owner);
+                $firstHeld->complete();
+                $releaseFirst->getFuture()->await();
+            });
+        });
+        $secondRead = null;
+        $ownerWrite = null;
+
+        try {
+            $firstHeld->getFuture()->await(new \Amp\TimeoutCancellation(10));
+            $secondRead = \Amp\async(static function () use ($second, $owner, $secondHeld, $releaseSecond): void {
+                $second->transaction(static function () use ($second, $owner, $secondHeld, $releaseSecond): void {
+                    OwnerReadLock::acquire($second, $owner);
+                    $secondHeld->complete();
+                    $releaseSecond->getFuture()->await();
+                });
+            });
+            $secondHeld->getFuture()->await(new \Amp\TimeoutCancellation(10));
+            self::assertFalse($firstRead->isComplete(), 'Second reader must overlap the first reader.');
+            $ownerWrite = \Amp\async(static function () use ($writer, $owner): void {
+                $writer->transaction(static function () use ($writer, $owner): void {
+                    OwnerWriteLock::acquire($writer, $owner);
+                });
+            });
+            \Amp\delay(0.05);
+            self::assertFalse($ownerWrite->isComplete(), 'Exclusive writer must wait for both readers.');
+            $releaseFirst->complete();
+            $firstRead->await(new \Amp\TimeoutCancellation(10));
+            \Amp\delay(0.05);
+            self::assertFalse($ownerWrite->isComplete(), 'Exclusive writer must still wait for the second reader.');
+        } finally {
+            if (! $releaseFirst->getFuture()->isComplete()) {
+                $releaseFirst->complete();
+            }
+            $releaseSecond->complete();
+            try {
+                $firstRead->await(new \Amp\TimeoutCancellation(10));
+            } finally {
+                try {
+                    $secondRead?->await(new \Amp\TimeoutCancellation(10));
+                } finally {
+                    $ownerWrite?->await(new \Amp\TimeoutCancellation(10));
+                }
+            }
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_shared_named_policy_reads_overlap_and_update_waits_for_both(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} shared named-policy tests.");
+        }
+
+        $first = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $second = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $updater = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(SharedAuthorizationLockStore::class, $first);
+        self::assertInstanceOf(SharedAuthorizationLockStore::class, $second);
+        $name = 'shared-policy-' . bin2hex(random_bytes(8));
+        $oldPolicy = '{"Statement":[]}';
+        $newPolicy = '{"Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"*"}]}';
+        $first->putNamedPolicy($name, $oldPolicy);
+        $firstHeld = new \Amp\DeferredFuture();
+        $secondHeld = new \Amp\DeferredFuture();
+        $releaseFirst = new \Amp\DeferredFuture();
+        $releaseSecond = new \Amp\DeferredFuture();
+        $firstRead = \Amp\async(static function () use ($first, $name, $oldPolicy, $firstHeld, $releaseFirst): void {
+            $first->transaction(static function () use ($first, $name, $oldPolicy, $firstHeld, $releaseFirst): void {
+                self::assertEquals(
+                    json_decode($oldPolicy, true, 512, JSON_THROW_ON_ERROR),
+                    json_decode((string) ($first->lockNamedPoliciesForRead([$name])[$name] ?? ''), true, 512, JSON_THROW_ON_ERROR),
+                );
+                $firstHeld->complete();
+                $releaseFirst->getFuture()->await();
+            });
+        });
+        $secondRead = null;
+        $update = null;
+
+        try {
+            try {
+                $firstHeld->getFuture()->await(new \Amp\TimeoutCancellation(10));
+                $secondRead = \Amp\async(static function () use ($second, $name, $oldPolicy, $secondHeld, $releaseSecond): void {
+                    $second->transaction(static function () use ($second, $name, $oldPolicy, $secondHeld, $releaseSecond): void {
+                        self::assertEquals(
+                            json_decode($oldPolicy, true, 512, JSON_THROW_ON_ERROR),
+                            json_decode((string) ($second->lockNamedPoliciesForRead([$name])[$name] ?? ''), true, 512, JSON_THROW_ON_ERROR),
+                        );
+                        $secondHeld->complete();
+                        $releaseSecond->getFuture()->await();
+                    });
+                });
+                $secondHeld->getFuture()->await(new \Amp\TimeoutCancellation(10));
+                self::assertFalse($firstRead->isComplete(), 'Both named-policy readers must overlap.');
+                $update = \Amp\async(static function () use ($updater, $name, $newPolicy): void {
+                    $updater->putNamedPolicy($name, $newPolicy);
+                });
+                \Amp\delay(0.05);
+                self::assertFalse($update->isComplete(), 'Policy update must wait for the shared readers.');
+                $releaseFirst->complete();
+                $firstRead->await(new \Amp\TimeoutCancellation(10));
+                \Amp\delay(0.05);
+                self::assertFalse($update->isComplete(), 'Policy update must still wait for the second reader.');
+            } finally {
+                if (! $releaseFirst->getFuture()->isComplete()) {
+                    $releaseFirst->complete();
+                }
+                $releaseSecond->complete();
+                try {
+                    $firstRead->await(new \Amp\TimeoutCancellation(10));
+                } finally {
+                    try {
+                        $secondRead?->await(new \Amp\TimeoutCancellation(10));
+                    } finally {
+                        $update?->await(new \Amp\TimeoutCancellation(10));
+                    }
+                }
+            }
+            self::assertEquals(
+                json_decode($newPolicy, true, 512, JSON_THROW_ON_ERROR),
+                json_decode((string) $updater->getNamedPolicy($name), true, 512, JSON_THROW_ON_ERROR),
+            );
+        } finally {
+            $updater->deleteNamedPolicy($name);
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_existing_owner_read_lock_preparation_does_not_wait_for_exclusive_writer(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} owner read-lock preparation tests.");
+        }
+
+        $writer = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $reader = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $owner = 'prepare-read-' . bin2hex(random_bytes(8));
+        OwnerReadLock::prepare($writer, $owner);
+        $writerHeld = new \Amp\DeferredFuture();
+        $releaseWriter = new \Amp\DeferredFuture();
+        $writerFuture = \Amp\async(static function () use ($writer, $owner, $writerHeld, $releaseWriter): void {
+            $writer->transaction(static function () use ($writer, $owner, $writerHeld, $releaseWriter): void {
+                OwnerWriteLock::acquire($writer, $owner);
+                $writerHeld->complete();
+                $releaseWriter->getFuture()->await();
+            });
+        });
+        $prepareFuture = null;
+
+        try {
+            $writerHeld->getFuture()->await(new \Amp\TimeoutCancellation(10));
+            $prepareFuture = \Amp\async(static fn() => OwnerReadLock::prepare($reader, $owner));
+            $prepareFuture->await(new \Amp\TimeoutCancellation(2));
+            self::assertTrue($prepareFuture->isComplete());
+        } finally {
+            $releaseWriter->complete();
+            $writerFuture->await(new \Amp\TimeoutCancellation(10));
+            $prepareFuture?->await(new \Amp\TimeoutCancellation(10));
+        }
+    }
+
+    #[DataProvider('externalReadLockScenarios')]
+    public function test_current_object_read_waits_for_owner_commit_before_final_authorization(
+        string $driver,
+        string $dsnEnv,
+        string $change,
+    ): void {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} read-lock tests.");
+        }
+
+        $writer = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $readerPool = null;
+        if ($driver === 'mysql') {
+            // Force the isolation where a plain SELECT before the owner lock
+            // would leave subsequent authorization reads on a stale snapshot.
+            $config = MysqlConfig::fromString(trim($dsn));
+            $constructor = new \ReflectionMethod(MysqlConnectionPool::class, '__construct');
+            $supportsIsolation = array_filter(
+                $constructor->getParameters(),
+                static fn(\ReflectionParameter $parameter): bool => $parameter->getName() === 'transactionIsolation',
+            ) !== [];
+            $arguments = $supportsIsolation
+                ? [$config, MysqlConnectionPool::DEFAULT_MAX_CONNECTIONS, MysqlConnectionPool::DEFAULT_IDLE_TIMEOUT, null, SqlTransactionIsolationLevel::Repeatable]
+                : [$config];
+            $readerPool = (new \ReflectionClass(MysqlConnectionPool::class))->newInstanceArgs($arguments);
+            self::assertInstanceOf(MysqlConnectionPool::class, $readerPool);
+            $reader = new MysqlMetadataStore($readerPool);
+            $reader->initialize();
+        } else {
+            $reader = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        }
+
+        $bucket = 'read-lock-' . bin2hex(random_bytes(8));
+        $owner = 'read-owner-' . bin2hex(random_bytes(8));
+        $oldPath = 'objects/' . $bucket . '/old';
+        $newPath = 'objects/' . $bucket . '/new';
+        $writer->createBucket($owner, $bucket, 'us-east-1');
+        $writer->putObjectMetadata($bucket, 'key', $owner, 3, '"old"', 'text/plain', $oldPath);
+        $source = new ReadableIterableStream(['old']);
+        $initialAuthorized = new \Amp\DeferredFuture();
+        $writerPrepared = new \Amp\DeferredFuture();
+        $handlerReached = new \Amp\DeferredFuture();
+        $releaseWriter = new \Amp\DeferredFuture();
+        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/' . $bucket . '/key'));
+        $request->setAttribute('s3.bucket', $bucket);
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $request->setAttribute('ownerId', $owner);
+        $readHandler = $this->createMock(RequestHandler::class);
+        $readHandler->method('handleRequest')->willReturnCallback(static function () use ($handlerReached, $source): Response {
+            $handlerReached->complete();
+
+            return new Response(200, body: $source);
+        });
+        $policyTerminal = $this->createMock(RequestHandler::class);
+        $policyTerminal->method('handleRequest')->willReturnCallback(static function (Request $request) use (
+            $reader,
+            $readHandler,
+            $initialAuthorized,
+            $writerPrepared,
+        ): Response {
+            $initialAuthorized->complete();
+            $writerPrepared->getFuture()->await();
+
+            return (new CurrentObjectReadAuthorizationMiddleware($reader))->handleRequest($request, $readHandler);
+        });
+        $readerFuture = \Amp\async(static fn(): Response => (new PolicyEnforcementMiddleware($reader))->handleRequest($request, $policyTerminal));
+        $writerFuture = null;
+
+        try {
+            try {
+                $initialAuthorized->getFuture()->await(new \Amp\TimeoutCancellation(10));
+                $writerFuture = \Amp\async(static function () use (
+                    $writer,
+                    $owner,
+                    $bucket,
+                    $change,
+                    $newPath,
+                    $writerPrepared,
+                    $releaseWriter,
+                ): void {
+                    try {
+                        $writer->transaction(static function () use (
+                            $writer,
+                            $owner,
+                            $bucket,
+                            $change,
+                            $newPath,
+                            $writerPrepared,
+                            $releaseWriter,
+                        ): void {
+                            OwnerWriteLock::acquire($writer, $owner);
+                            if ($change === 'object') {
+                                $writer->putObjectMetadata($bucket, 'key', $owner, 3, '"new"', 'text/plain', $newPath);
+                            } else {
+                                $writer->putBucketPolicy($bucket, json_encode([
+                                    'Statement' => [[
+                                        'Effect' => 'Deny', 'Principal' => '*', 'Action' => 's3:GetObject',
+                                        'Resource' => "arn:aws:s3:::{$bucket}/key",
+                                    ]],
+                                ], JSON_THROW_ON_ERROR));
+                            }
+                            $writerPrepared->complete();
+                            $releaseWriter->getFuture()->await();
+                        });
+                    } catch (\Throwable $error) {
+                        if (! $writerPrepared->getFuture()->isComplete()) {
+                            $writerPrepared->error($error);
+                        }
+                        throw $error;
+                    }
+                });
+                $handlerReached->getFuture()->await(new \Amp\TimeoutCancellation(10));
+                \Amp\delay(0.05);
+                self::assertFalse($readerFuture->isComplete(), 'The final read authorization must wait for the owner commit.');
+            } finally {
+                if (! $writerPrepared->getFuture()->isComplete()) {
+                    $writerPrepared->error(new \RuntimeException('Read-lock test did not reach writer preparation.'));
+                }
+                $releaseWriter->complete();
+                $writerFuture?->await();
+            }
+
+            try {
+                $readerFuture->await(new \Amp\TimeoutCancellation(10));
+                self::fail('Object or policy change after the initial snapshot must reject the response.');
+            } catch (AccessDeniedException) {
+                self::assertTrue($source->isClosed());
+                if ($change === 'object') {
+                    self::assertSame($newPath, $reader->getObjectMetadata($bucket, 'key')?->systemMetadata['storagePath']);
+                } else {
+                    self::assertNotNull($reader->getBucketPolicy($bucket));
+                }
+            }
+        } finally {
+            if ($writer->getBucketOwner($bucket) === $owner) {
+                $writer->deleteBucketPolicy($bucket);
+                $writer->deleteObjectMetadata($bucket, 'key');
+                $writer->deleteBucket($owner, $bucket);
+            }
+            $readerPool?->close();
+        }
     }
 
     #[DataProvider('externalMetadataDrivers')]

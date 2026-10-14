@@ -28,8 +28,9 @@ use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
+use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     public function __construct(
         private MetadataStore $inner,
@@ -121,6 +122,17 @@ final readonly class ObservedMetadataStore implements MetadataStore, ObjectReten
     public function lockNamedPoliciesForUpdate(array $policyNames): array
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->lockNamedPoliciesForUpdate($policyNames));
+    }
+
+    public function lockNamedPoliciesForRead(array $policyNames): array
+    {
+        return $this->observe(__FUNCTION__, function () use ($policyNames): array {
+            if ($this->inner instanceof SharedAuthorizationLockStore) {
+                return $this->inner->lockNamedPoliciesForRead($policyNames);
+            }
+
+            return $this->inner->lockNamedPoliciesForUpdate($policyNames);
+        });
     }
 
     public function putNamedPolicy(string $policyName, string $policyJson): void
@@ -1147,6 +1159,28 @@ final readonly class ObservedMetadataStore implements MetadataStore, ObjectReten
     public function lockOwnerForUpdate(string $ownerId): void
     {
         $this->observe(__FUNCTION__, fn() => $this->inner->lockOwnerForUpdate($ownerId));
+    }
+
+    public function prepareOwnerReadLock(string $ownerId): void
+    {
+        $this->observe(__FUNCTION__, function () use ($ownerId): void {
+            if ($this->inner instanceof SharedAuthorizationLockStore) {
+                $this->inner->prepareOwnerReadLock($ownerId);
+            }
+        });
+    }
+
+    public function lockOwnerForRead(string $ownerId): void
+    {
+        $this->observe(__FUNCTION__, function () use ($ownerId): void {
+            if ($this->inner instanceof SharedAuthorizationLockStore) {
+                $this->inner->lockOwnerForRead($ownerId);
+
+                return;
+            }
+
+            $this->inner->lockOwnerForUpdate($ownerId);
+        });
     }
 
     public function transaction(callable $callback): mixed

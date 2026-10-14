@@ -33,6 +33,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
+use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
@@ -1656,6 +1657,7 @@ final class S3Server
             $middlewares[] = new PolicyEnforcementMiddleware($this->metadata);
             $middlewares[] = new BucketOwnershipMiddleware($this->metadata);
             $middlewares[] = new AclEnforcementMiddleware($this->metadata);
+            $middlewares[] = new CurrentObjectReadAuthorizationMiddleware($this->metadata);
         }
 
         // Innermost: integrity checks right before the handler. Stateless

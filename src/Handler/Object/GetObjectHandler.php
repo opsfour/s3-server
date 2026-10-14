@@ -11,6 +11,7 @@ use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\RequestHeaderValues;
@@ -73,11 +74,7 @@ final class GetObjectHandler implements RequestHandler
         // 2. Get object metadata (version-aware).
         $versionId = $queryParams['versionId'] ?? null;
 
-        if ($versionId !== null) {
-            $objectInfo = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
-        } else {
-            $objectInfo = $this->metadata->getCurrentObjectVersion($bucket, $key);
-        }
+        $objectInfo = AuthorizedObjectSnapshot::resolve($this->metadata, $request, $bucket, $key, $versionId);
 
         if ($objectInfo === null) {
             BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);

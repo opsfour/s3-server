@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private ?\PDO $pdo = null;
 
@@ -795,6 +795,26 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $policies = [];
         foreach ($policyNames as $name) {
             $lock->execute([$name]);
+            $read->execute([$name]);
+            $row = $read->fetch(\PDO::FETCH_ASSOC);
+            if ($row !== false) {
+                $policies[$name] = (string) $row['policy_json'];
+            }
+        }
+
+        return $policies;
+    }
+
+    public function lockNamedPoliciesForRead(array $policyNames): array
+    {
+        if (! $this->connection()->inTransaction()) {
+            throw new \LogicException('lockNamedPoliciesForRead() requires an active transaction.');
+        }
+        $policyNames = array_values(array_unique(array_filter($policyNames, static fn(string $name): bool => $name !== '')));
+        sort($policyNames, SORT_STRING);
+        $read = $this->prepare('SELECT policy_json FROM s3_named_policies WHERE policy_name = ?');
+        $policies = [];
+        foreach ($policyNames as $name) {
             $read->execute([$name]);
             $row = $read->fetch(\PDO::FETCH_ASSOC);
             if ($row !== false) {
@@ -4445,6 +4465,20 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             throw new \LogicException('lockOwnerForUpdate() requires an active transaction.');
         }
         // SQLite write transactions already serialize metadata mutations.
+    }
+
+    public function prepareOwnerReadLock(string $ownerId): void
+    {
+        // SQLite read transactions use their snapshot as the read fence and
+        // therefore need no durable owner-lock row.
+    }
+
+    public function lockOwnerForRead(string $ownerId): void
+    {
+        if (! $this->connection()->inTransaction()) {
+            throw new \LogicException('lockOwnerForRead() requires an active transaction.');
+        }
+        // The transaction snapshot is established by the authorization reads.
     }
 
     public function transaction(callable $callback): mixed

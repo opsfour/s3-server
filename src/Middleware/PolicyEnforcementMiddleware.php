@@ -12,8 +12,10 @@ use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Http\ObjectTagValidator;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Policy\AdditionalActionAuthorizer;
 use OpsFour\S3Server\Policy\ExistingObjectTagResolver;
@@ -36,6 +38,17 @@ final class PolicyEnforcementMiddleware implements Middleware
     /** Recheck current policy and object tags under the write transaction. */
     public function assertAllowedAtCommit(Request $request): void
     {
+        $this->assertAllowedWithLockedPolicies($request, false);
+    }
+
+    /** Recheck read authorization under a shared owner-lock transaction. */
+    public function assertAllowedAtReadCommit(Request $request): void
+    {
+        $this->assertAllowedWithLockedPolicies($request, true);
+    }
+
+    private function assertAllowedWithLockedPolicies(Request $request, bool $shared): void
+    {
         // Direct handler callers do not pass through this middleware. Keep
         // their established contract; HTTP requests carry the first decision.
         if (! $request->hasAttribute('s3.policyResult')) {
@@ -46,7 +59,9 @@ final class PolicyEnforcementMiddleware implements Middleware
         if ($credential instanceof Credential && $credential->policyNames !== []) {
             NamedPolicySnapshot::attach(
                 $request,
-                $this->metadata->lockNamedPoliciesForUpdate($credential->policyNames),
+                $shared && $this->metadata instanceof SharedAuthorizationLockStore
+                    ? $this->metadata->lockNamedPoliciesForRead($credential->policyNames)
+                    : $this->metadata->lockNamedPoliciesForUpdate($credential->policyNames),
             );
         }
 
@@ -120,10 +135,23 @@ final class PolicyEnforcementMiddleware implements Middleware
         $requestedVersionId = $operation->selectsObjectVersion() ? ($queryParams['versionId'] ?? null) : null;
         $objectOwner = null;
         if ($key !== null && $operation->usesExistingObjectOwner()) {
-            $object = $requestedVersionId !== null
-                ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $requestedVersionId)
-                : $this->metadata->getObjectMetadata($bucket, $key);
-            $objectOwner = $object?->ownerId;
+            $readOperation = in_array($operation, [
+                S3Operation::GetObject, S3Operation::HeadObject, S3Operation::GetObjectAttributes,
+                S3Operation::GetObjectAcl, S3Operation::GetObjectTagging,
+                S3Operation::GetObjectRetention, S3Operation::GetObjectLegalHold,
+                S3Operation::SelectObjectContent,
+            ], true);
+            $object = $readOperation
+                ? AuthorizedObjectSnapshot::lookupForRead($this->metadata, $operation, $bucket, $key, $requestedVersionId)
+                : ($requestedVersionId !== null
+                    ? $this->metadata->getObjectMetadataByVersion($bucket, $key, $requestedVersionId)
+                    : $this->metadata->getObjectMetadata($bucket, $key));
+            if ($readOperation) {
+                $request->setAttribute(AuthorizedObjectSnapshot::ATTRIBUTE, $object);
+            }
+            $objectOwner = $readOperation && $requestedVersionId === null && $object?->isDeleteMarker
+                ? null
+                : $object?->ownerId;
             if ($objectOwner !== null && BucketOwnership::isEnforced($this->metadata, $bucket)) {
                 $objectOwner = $bucketOwner;
             }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use PHPUnit\Framework\TestCase;
 
 final class MetadataDirectTransactionBoundaryTest extends TestCase
@@ -46,6 +47,66 @@ final class MetadataDirectTransactionBoundaryTest extends TestCase
             $store->createBucket('owner', 'after-rejected-lock', 'us-east-1');
         });
         self::assertSame('owner', $store->getBucketOwner('after-rejected-lock'));
+    }
+
+    public function test_sqlite_shared_read_locks_require_a_transaction_and_read_named_policies(): void
+    {
+        $store = new SqliteMetadataStore(':memory:');
+        $store->initialize();
+        self::assertInstanceOf(SharedAuthorizationLockStore::class, $store);
+
+        // Preparation is intentionally a read-only compatible no-op on SQLite.
+        $store->prepareOwnerReadLock('owner');
+
+        foreach ([
+            static fn() => $store->lockOwnerForRead('owner'),
+            static fn() => $store->lockNamedPoliciesForRead(['policy']),
+        ] as $lock) {
+            try {
+                $lock();
+                self::fail('Shared lock without an active transaction must fail closed.');
+            } catch (\LogicException $error) {
+                self::assertStringContainsString('active transaction', $error->getMessage());
+            }
+        }
+
+        $store->putNamedPolicy('policy-b', '{"Statement":[]}');
+        $store->putNamedPolicy('policy-a', '{"Statement":[]}');
+        $policies = $store->transaction(static function () use ($store): array {
+            $store->lockOwnerForRead('owner');
+
+            return $store->lockNamedPoliciesForRead(['policy-b', '', 'missing', 'policy-a', 'policy-b']);
+        });
+
+        self::assertSame([
+            'policy-a' => '{"Statement":[]}',
+            'policy-b' => '{"Statement":[]}',
+        ], $policies);
+    }
+
+    public function test_sqlite_owner_read_lock_supports_a_read_only_store(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-read-lock-' . bin2hex(random_bytes(8)) . '.sqlite';
+        try {
+            $writer = new SqliteMetadataStore($path);
+            $writer->initialize();
+            $writer->putNamedPolicy('policy', '{"Statement":[]}');
+
+            $reader = new SqliteMetadataStore($path, readOnly: true);
+            $reader->prepareOwnerReadLock('owner');
+            $policies = $reader->transaction(static function () use ($reader): array {
+                $reader->lockOwnerForRead('owner');
+
+                return $reader->lockNamedPoliciesForRead(['policy']);
+            });
+
+            self::assertSame(['policy' => '{"Statement":[]}'], $policies);
+        } finally {
+            unset($reader, $writer);
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
     }
 
     public function test_queue_claims_reject_an_outer_transaction_before_sql_work(): void

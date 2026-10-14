@@ -1,0 +1,177 @@
+<?php
+
+declare(strict_types=1);
+
+namespace OpsFour\S3Server\Tests\Unit\Middleware;
+
+use Amp\ByteStream\ReadableStream;
+use Amp\ByteStream\ReadableStreamIteratorAggregate;
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\Http\Server\Driver\Client;
+use Amp\Http\Server\Request;
+use Amp\Http\Server\RequestHandler;
+use Amp\Http\Server\Response;
+use League\Uri\Http;
+use OpsFour\S3Server\Dto\BucketInfo;
+use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\OperationAbortedException;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
+use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
+use OpsFour\S3Server\Routing\S3Operation;
+use PHPUnit\Framework\TestCase;
+
+final class CurrentObjectReadAuthorizationMiddlewareTest extends TestCase
+{
+    public function test_identity_drift_closes_response_stream_without_masking_access_denied(): void
+    {
+        $authorized = $this->object('old-path');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('getCurrentObjectVersion')
+            ->with('bucket', 'key')
+            ->willReturn($this->object('new-path'));
+        $metadata->expects(self::once())->method('getBucket')->with('bucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: 'generation',
+        ));
+        $stream = new FailingCloseObjectReadStream();
+        $request = $this->request($authorized);
+
+        try {
+            (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                $request,
+                new class ($stream) implements RequestHandler {
+                    public function __construct(private readonly ReadableStream $stream) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        return new Response(200, body: $this->stream);
+                    }
+                },
+            );
+            self::fail('Identity drift must reject the already-opened response.');
+        } catch (AccessDeniedException $error) {
+            self::assertSame('Object changed during authorization.', $error->getMessage());
+            self::assertTrue($stream->closeAttempted);
+        }
+    }
+
+    public function test_handler_cancellation_is_propagated_without_follow_up_metadata_io(): void
+    {
+        $cancellation = new CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getCurrentObjectVersion');
+        $metadata->expects(self::never())->method('getObjectMetadataByVersion');
+
+        try {
+            (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                $this->request($this->object('old-path')),
+                new class ($cancellation) implements RequestHandler {
+                    public function __construct(private readonly CancelledException $cancellation) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        throw $this->cancellation;
+                    }
+                },
+            );
+            self::fail('Cancellation must leave the authorization boundary unchanged.');
+        } catch (CancelledException $error) {
+            self::assertSame($cancellation, $error);
+        }
+    }
+
+    public function test_metadata_read_does_not_rebind_to_a_recreated_bucket_generation(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('getBucket')->with('bucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: 'new-generation',
+        ));
+        $metadata->expects(self::once())->method('transaction')
+            ->willReturnCallback(static fn(callable $callback): mixed => $callback());
+        $metadata->expects(self::once())->method('lockOwnerForUpdate')->with('owner');
+        $metadata->expects(self::never())->method('getObjectMetadata');
+        $handler = $this->createMock(RequestHandler::class);
+        $handler->expects(self::never())->method('handleRequest');
+        $request = $this->request($this->object('old-path'), S3Operation::GetObjectTagging);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.cachedBucketGeneration', 'old-generation');
+
+        $this->expectException(OperationAbortedException::class);
+        $this->expectExceptionMessage('Bucket ownership changed after authorization.');
+        (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest($request, $handler);
+    }
+
+    private function request(ObjectInfo $authorized, S3Operation $operation = S3Operation::GetObject): Request
+    {
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key'),
+        );
+        $request->setAttribute('s3.operation', $operation);
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('s3.cachedBucketGeneration', 'generation');
+        $request->setAttribute(AuthorizedObjectSnapshot::ATTRIBUTE, $authorized);
+
+        return $request;
+    }
+
+    private function object(string $storagePath): ObjectInfo
+    {
+        return new ObjectInfo(
+            'bucket',
+            'key',
+            4,
+            '"etag"',
+            ownerId: 'owner',
+            systemMetadata: ['storagePath' => $storagePath],
+        );
+    }
+}
+
+/** @implements \IteratorAggregate<int, string> */
+final class FailingCloseObjectReadStream implements \IteratorAggregate, ReadableStream
+{
+    use ReadableStreamIteratorAggregate;
+
+    public bool $closeAttempted = false;
+
+    private bool $read = false;
+
+    public function read(?Cancellation $cancellation = null): ?string
+    {
+        if ($this->read) {
+            return null;
+        }
+
+        $this->read = true;
+
+        return 'data';
+    }
+
+    public function isReadable(): bool
+    {
+        return ! $this->read;
+    }
+
+    public function close(): void
+    {
+        $this->closeAttempted = true;
+
+        throw new \RuntimeException('simulated close failure');
+    }
+
+    public function isClosed(): bool
+    {
+        return false;
+    }
+
+    public function onClose(\Closure $onClose): void {}
+}

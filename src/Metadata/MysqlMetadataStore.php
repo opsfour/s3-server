@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/mysql for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class MysqlMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, MysqlTransaction> */
     private \WeakMap $fiberTxMap;
@@ -844,6 +844,24 @@ final class MysqlMetadataStore implements MetadataStore, ObjectRetentionDeletion
         $policies = [];
         foreach ($policyNames as $name) {
             $row = $this->conn()->execute('SELECT policy_json FROM s3_named_policies WHERE policy_name = ? FOR UPDATE', [$name])->fetchRow();
+            if ($row !== null) {
+                $policies[$name] = (string) $row['policy_json'];
+            }
+        }
+
+        return $policies;
+    }
+
+    public function lockNamedPoliciesForRead(array $policyNames): array
+    {
+        if ($this->fiberTransaction() === null) {
+            throw new \LogicException('lockNamedPoliciesForRead() requires an active transaction.');
+        }
+        $policyNames = array_values(array_unique(array_filter($policyNames, static fn(string $name): bool => $name !== '')));
+        sort($policyNames, SORT_STRING);
+        $policies = [];
+        foreach ($policyNames as $name) {
+            $row = $this->conn()->execute('SELECT policy_json FROM s3_named_policies WHERE policy_name = ? LOCK IN SHARE MODE', [$name])->fetchRow();
             if ($row !== null) {
                 $policies[$name] = (string) $row['policy_json'];
             }
@@ -3977,6 +3995,42 @@ final class MysqlMetadataStore implements MetadataStore, ObjectRetentionDeletion
             'SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = ? FOR UPDATE',
             [$ownerId],
         )->fetchRow();
+    }
+
+    public function prepareOwnerReadLock(string $ownerId): void
+    {
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('prepareOwnerReadLock() must be called outside an active transaction.');
+        }
+
+        $row = $this->pool->execute(
+            'SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = ?',
+            [$ownerId],
+        )->fetchRow();
+        if ($row !== null) {
+            return;
+        }
+
+        $this->pool->execute(
+            'INSERT IGNORE INTO s3_owner_write_locks (owner_id) VALUES (?)',
+            [$ownerId],
+        );
+    }
+
+    public function lockOwnerForRead(string $ownerId): void
+    {
+        $transaction = $this->fiberTransaction();
+        if ($transaction === null) {
+            throw new \LogicException('lockOwnerForRead() requires an active transaction.');
+        }
+
+        $row = $transaction->execute(
+            'SELECT owner_id FROM s3_owner_write_locks WHERE owner_id = ? LOCK IN SHARE MODE',
+            [$ownerId],
+        )->fetchRow();
+        if ($row === null) {
+            throw new \RuntimeException('Owner read lock row is missing; call prepareOwnerReadLock() before the transaction.');
+        }
     }
 
     public function transaction(callable $callback): mixed

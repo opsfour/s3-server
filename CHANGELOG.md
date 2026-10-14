@@ -54,6 +54,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Validate persisted storage-tier references against the server and every
+  registered handler tier registry before opening the listener.
+- Keep current-object reads bound to the metadata snapshot used during
+  authorization, then recheck its bucket generation, identity, and mutable
+  authorization under shared owner locks before returning a response. Parallel
+  current-object reads may overlap, while writes and mutable reads retain
+  exclusive owner locks; failed rechecks close discarded response bodies.
+- Revalidate the bucket generation before every streamed GetObject body read
+  so a reused bucket name cannot expose bytes from the former bucket.
+- Revalidate the bucket generation around every website object and
+  error-document stream read so a reused bucket name cannot expose the former
+  bucket's body.
 - Revoke prepared EFS pre-bind admission after a failed binding recheck so a
   later listener attempt must repeat the complete preparation.
 - Reject known S3 query selectors and subresources on the wrong method or

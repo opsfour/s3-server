@@ -16,6 +16,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\RequestHeaderValues;
@@ -62,11 +63,7 @@ final class HeadObjectHandler implements RequestHandler
         // 2. Get object metadata (version-aware).
         $versionId = $queryParams['versionId'] ?? null;
 
-        if ($versionId !== null) {
-            $objectInfo = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
-        } else {
-            $objectInfo = $this->metadata->getCurrentObjectVersion($bucket, $key);
-        }
+        $objectInfo = AuthorizedObjectSnapshot::resolve($this->metadata, $request, $bucket, $key, $versionId);
 
         if ($objectInfo === null) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);

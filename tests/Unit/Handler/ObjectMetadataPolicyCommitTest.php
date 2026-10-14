@@ -11,17 +11,299 @@ use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Handler\Object\PutObjectAclHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectAclHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectTaggingHandler;
+use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
+use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectTaggingHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectTaggingHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
+use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Storage\StorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class ObjectMetadataPolicyCommitTest extends TestCase
 {
+    public function test_explicit_delete_marker_keeps_its_cross_account_object_owner(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $metadata->setBucketVersioning('bucket', 'Enabled');
+            $markerVersion = $metadata->deleteObjectVersioned('bucket', 'key', 'writer');
+            $metadata->putAccountPolicy('writer', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Action' => ['s3:GetObject', 's3:GetObjectVersion'],
+                    'Resource' => 'arn:aws:s3:::bucket/key',
+                ]],
+            ], JSON_THROW_ON_ERROR));
+
+            $explicit = $this->request(
+                'GET',
+                'http://127.0.0.1/bucket/key?versionId=' . rawurlencode($markerVersion),
+                S3Operation::GetObject,
+                'writer',
+            );
+            $response = (new PolicyEnforcementMiddleware($metadata))->handleRequest($explicit, $this->terminal(
+                static fn(): Response => (new AclEnforcementMiddleware($metadata))->handleRequest(
+                    $explicit,
+                    new class implements RequestHandler {
+                        public function handleRequest(Request $request): Response
+                        {
+                            return new Response(204);
+                        }
+                    },
+                ),
+            ));
+            self::assertSame(204, $response->getStatus());
+            self::assertSame('writer', $explicit->getAttribute('s3.cachedObjectOwner'));
+            self::assertSame('Allow', $explicit->getAttribute('s3.policyResult'));
+
+            $current = $this->request('GET', 'http://127.0.0.1/bucket/key', S3Operation::GetObject, 'writer');
+            $this->expectException(AccessDeniedException::class);
+            (new PolicyEnforcementMiddleware($metadata))->handleRequest($current, $this->terminal(
+                static fn(): Response => (new AclEnforcementMiddleware($metadata))->handleRequest(
+                    $current,
+                    new class implements RequestHandler {
+                        public function handleRequest(Request $request): Response
+                        {
+                            return new Response(204);
+                        }
+                    },
+                ),
+            ));
+        });
+    }
+
+    public function test_current_delete_marker_is_missing_for_select_and_tagging(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $metadata->setBucketVersioning('bucket', 'Enabled');
+            $metadata->deleteObjectVersioned('bucket', 'key', 'owner');
+            $storage = $this->createMock(StorageBackend::class);
+            $storage->expects(self::never())->method('getObjectByPath');
+
+            foreach ([
+                [S3Operation::GetObjectTagging, 'GET', 'tagging'],
+                [S3Operation::SelectObjectContent, 'POST', 'select&select-type=2'],
+            ] as [$operation, $method, $query]) {
+                $request = $this->request($method, 'http://127.0.0.1/bucket/key?' . $query, $operation, 'owner');
+                $handler = $operation === S3Operation::GetObjectTagging
+                    ? new GetObjectTaggingHandler($metadata)
+                    : new SelectObjectContentHandler($metadata, $storage);
+                try {
+                    (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                        static fn(): Response => (new CurrentObjectReadAuthorizationMiddleware($metadata))
+                            ->handleRequest($request, $handler),
+                    ));
+                    self::fail($operation->value . ' must treat the current delete marker as missing.');
+                } catch (NoSuchKeyException $error) {
+                    self::assertSame([], $error->getExtraHeaders(), $operation->value);
+                }
+            }
+        });
+    }
+
+    public function test_current_delete_marker_keeps_attributes_error_headers(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $metadata->setBucketVersioning('bucket', 'Enabled');
+            $markerVersion = $metadata->deleteObjectVersioned('bucket', 'key', 'owner');
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key?attributes', S3Operation::GetObjectAttributes, 'owner');
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static fn(): Response => (new CurrentObjectReadAuthorizationMiddleware($metadata))
+                        ->handleRequest($request, new GetObjectAttributesHandler($metadata)),
+                ));
+                self::fail('Current delete marker must return the established attributes error.');
+            } catch (NoSuchKeyException $error) {
+                self::assertSame([
+                    'x-amz-delete-marker' => 'true',
+                    'x-amz-version-id' => $markerVersion,
+                ], $error->getExtraHeaders());
+            }
+        });
+    }
+
+    public function test_attributes_error_does_not_expose_new_delete_marker_after_null_snapshot(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $metadata->deleteObjectMetadata('bucket', 'key');
+            $metadata->setBucketVersioning('bucket', 'Enabled');
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key?attributes', S3Operation::GetObjectAttributes, 'owner');
+            $markerVersion = null;
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static function () use ($metadata, $request, &$markerVersion): Response {
+                        $markerVersion = $metadata->deleteObjectVersioned('bucket', 'key', 'owner');
+
+                        return (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                            $request,
+                            new GetObjectAttributesHandler($metadata),
+                        );
+                    },
+                ));
+                self::fail('The new marker must not be exposed through an attributes error.');
+            } catch (AccessDeniedException $error) {
+                self::assertSame([], $error->getExtraHeaders());
+                self::assertNotNull($markerVersion);
+                self::assertSame($markerVersion, $metadata->getCurrentObjectVersion('bucket', 'key')?->versionId);
+            }
+        });
+    }
+
+    public function test_attributes_error_is_preserved_when_object_identity_is_unchanged(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key?attributes', S3Operation::GetObjectAttributes, 'owner');
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static function () use ($metadata, $request): Response {
+                        return (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                            $request,
+                            new GetObjectAttributesHandler($metadata),
+                        );
+                    },
+                ));
+                self::fail('Missing attributes header must keep its original error.');
+            } catch (InvalidArgumentException $error) {
+                self::assertSame('x-amz-object-attributes header is required.', $error->getMessage());
+            }
+        });
+    }
+
+    public function test_changed_current_object_owner_blocks_tag_read_after_initial_authorization(): void
+    {
+        $this->assertChangedOwnerBlocksMetadataRead(S3Operation::GetObjectTagging);
+    }
+
+    public function test_changed_current_object_owner_blocks_acl_read_after_initial_authorization(): void
+    {
+        $this->assertChangedOwnerBlocksMetadataRead(S3Operation::GetObjectAcl);
+    }
+
+    public function test_same_owner_null_version_overwrite_blocks_stale_head_response(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $request = $this->request('HEAD', 'http://127.0.0.1/bucket/key', S3Operation::HeadObject, 'owner');
+            $request->setAttribute('credential', null);
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static function () use ($metadata, $request): Response {
+                        return (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                            $request,
+                            new class ($metadata) implements RequestHandler {
+                                public function __construct(private readonly SqliteMetadataStore $metadata) {}
+
+                                public function handleRequest(Request $request): Response
+                                {
+                                    $this->metadata->putObjectMetadata('bucket', 'key', 'owner', 3, md5('new'), 'text/plain', 'new-path');
+
+                                    return (new HeadObjectHandler($this->metadata))->handleRequest($request);
+                                }
+                            },
+                        );
+                    },
+                ));
+                self::fail('A null-version overwrite must not return the stale response.');
+            } catch (AccessDeniedException) {
+                self::assertSame('new-path', $metadata->getObjectMetadata('bucket', 'key')?->systemMetadata['storagePath']);
+            }
+        });
+    }
+
+    public function test_revoked_cross_account_policy_blocks_tag_read_before_response(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $metadata->putObjectTagging('bucket', 'key', [['key' => 'secret', 'value' => 'owner-only']]);
+            $metadata->putAccountPolicy('visitor', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow', 'Action' => 's3:GetObjectTagging',
+                    'Resource' => 'arn:aws:s3:::bucket/key',
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $metadata->putBucketPolicy('bucket', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow', 'Principal' => ['AWS' => 'visitor'],
+                    'Action' => 's3:GetObjectTagging', 'Resource' => 'arn:aws:s3:::bucket/key',
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key?tagging', S3Operation::GetObjectTagging, 'visitor');
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static function () use ($metadata, $request): Response {
+                        $metadata->deleteBucketPolicy('bucket');
+
+                        return (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                            $request,
+                            new GetObjectTaggingHandler($metadata),
+                        );
+                    },
+                ));
+                self::fail('Revoked bucket policy must block the foreign metadata read.');
+            } catch (AccessDeniedException) {
+                self::assertSame('owner-only', $metadata->getObjectTagging('bucket', 'key')[0]['value']);
+            }
+        });
+    }
+
+    private function assertChangedOwnerBlocksMetadataRead(S3Operation $operation): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata) use ($operation): void {
+            $metadata->putObjectMetadata('bucket', 'key', 'visitor', 3, md5('old'), 'text/plain', 'visitor-path');
+            $metadata->putAccountPolicy('visitor', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Action' => PolicyEnforcementMiddleware::operationToAction($operation),
+                    'Resource' => 'arn:aws:s3:::bucket/key',
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $selector = $operation === S3Operation::GetObjectAcl ? 'acl' : 'tagging';
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key?' . $selector, $operation, 'visitor');
+            $request->setAttribute('credential', null);
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static function () use ($metadata, $request, $operation): Response {
+                        $metadata->putObjectMetadata('bucket', 'key', 'owner', 3, md5('new'), 'text/plain', 'owner-path');
+                        $metadata->putObjectTagging('bucket', 'key', [['key' => 'secret', 'value' => 'owner-only']]);
+
+                        return (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                            $request,
+                            new class ($metadata, $operation) implements RequestHandler {
+                                public function __construct(
+                                    private readonly SqliteMetadataStore $metadata,
+                                    private readonly S3Operation $operation,
+                                ) {}
+
+                                public function handleRequest(Request $request): Response
+                                {
+                                    return $this->operation === S3Operation::GetObjectAcl
+                                        ? (new GetObjectAclHandler($this->metadata))->handleRequest($request)
+                                        : (new GetObjectTaggingHandler($this->metadata))->handleRequest($request);
+                                }
+                            },
+                        );
+                    },
+                ));
+                self::fail('A former object owner must not read the new owner metadata.');
+            } catch (AccessDeniedException) {
+                self::assertSame('owner', $metadata->getObjectMetadata('bucket', 'key')?->ownerId);
+            }
+        });
+    }
+
     public function test_new_deny_after_initial_authorization_blocks_tag_change(): void
     {
         $this->withMetadata(function (SqliteMetadataStore $metadata): void {

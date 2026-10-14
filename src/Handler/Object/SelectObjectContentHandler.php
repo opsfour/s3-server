@@ -25,6 +25,7 @@ use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -104,7 +105,9 @@ final class SelectObjectContentHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        $objectInfo = $this->metadata->getObjectMetadata($bucket, $key);
+        $objectInfo = $request->hasAttribute(AuthorizedObjectSnapshot::ATTRIBUTE)
+            ? AuthorizedObjectSnapshot::resolve($this->metadata, $request, $bucket, $key, null)
+            : $this->metadata->getObjectMetadata($bucket, $key);
         if ($objectInfo === null) {
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             $canList = MissingObjectListVisibility::canList($this->metadata, $request, $bucket);

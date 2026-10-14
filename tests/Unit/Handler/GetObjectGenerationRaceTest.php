@@ -12,12 +12,44 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
+use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class GetObjectGenerationRaceTest extends TestCase
 {
+    public function test_authorized_snapshot_prevents_aba_lookup_of_foreign_current_object(): void
+    {
+        $bucket = new BucketInfo('bucket', 'bucket-owner', generation: str_repeat('a', 32));
+        $authorized = new ObjectInfo(
+            'bucket',
+            'key',
+            3,
+            '"old"',
+            ownerId: 'alice',
+            systemMetadata: ['storagePath' => 'objects/alice'],
+        );
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn($bucket);
+        $metadata->method('getBucketVersioning')->willReturn('');
+        // Between authorization and handler execution the current pointer
+        // may visit another owner and return (ABA). The handler must not
+        // resolve it again, even if a later comparison sees the old value.
+        $metadata->expects(self::never())->method('getCurrentObjectVersion');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('getObjectByPath')
+            ->with('objects/alice', null, 3)
+            ->willReturn(new ReadableBuffer('old'));
+        $request = $this->request($bucket, 'key');
+        $request->setAttribute(AuthorizedObjectSnapshot::ATTRIBUTE, $authorized);
+
+        $response = (new GetObjectHandler($metadata, $storage))->handleRequest($request);
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('old', \Amp\ByteStream\buffer($response->getBody()));
+    }
+
     public function test_bucket_reuse_during_versioning_lookup_does_not_return_old_object(): void
     {
         $oldBucket = new BucketInfo('bucket', 'alice', generation: str_repeat('a', 32));
