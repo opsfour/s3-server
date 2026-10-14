@@ -181,6 +181,21 @@ final class MetricsHandlerTest extends TestCase
         ))->handleRequest($request)->getStatus());
     }
 
+    public function test_metadata_cancellation_is_propagated_unchanged(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getNotificationQueueStats')->willThrowException($cancellation);
+        $handler = new MetricsHandler(new MetricsCollector(), $metadata);
+
+        try {
+            $handler->handleRequest($this->request());
+            self::fail('Metrics scrape swallowed metadata cancellation.');
+        } catch (\Amp\CancelledException $caught) {
+            self::assertSame($cancellation, $caught);
+        }
+    }
+
     public function test_zero_string_bearer_token_does_not_open_metrics(): void
     {
         $handler = new MetricsHandler(new MetricsCollector(), bearerToken: '0');

@@ -93,6 +93,27 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         self::assertSame($this->metadata->getBucket('bucket')?->generation, $request->getAttribute('s3.cachedBucketGeneration'));
     }
 
+    public function test_create_bucket_ignores_expected_owner_header_even_for_existing_bucket(): void
+    {
+        $request = $this->request('PUT', '/bucket', ['x-amz-expected-bucket-owner' => 'wrong-owner']);
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', '');
+        $request->setAttribute('s3.operation', S3Operation::CreateBucket);
+        $request->setAttribute('ownerId', 'owner');
+
+        self::assertSame(200, (new PolicyEnforcementMiddleware($this->metadata))
+            ->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+
+        $head = $this->request('HEAD', '/bucket', ['x-amz-expected-bucket-owner' => 'wrong-owner']);
+        $head->setAttribute('s3.bucket', 'bucket');
+        $head->setAttribute('s3.key', '');
+        $head->setAttribute('s3.operation', S3Operation::HeadBucket);
+        $head->setAttribute('ownerId', 'owner');
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($head, new PolicyTerminalHandler());
+    }
+
     public function test_foreign_attributes_read_requires_both_actions_on_identity_and_object_side(): void
     {
         $resource = 'arn:aws:s3:::bucket/public/readme.txt';

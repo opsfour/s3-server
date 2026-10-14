@@ -12,7 +12,7 @@ use Psr\Http\Message\ResponseInterface;
 
 final class WriteVersionIdPolicyTest extends S3FunctionalTestCase
 {
-    public function test_ignored_destination_version_query_cannot_redirect_write_policy_conditions(): void
+    public function test_unsupported_destination_version_query_fails_closed_before_write_policy_conditions(): void
     {
         $bucket = 'write-version-policy-' . bin2hex(random_bytes(5));
         $uploadId = null;
@@ -25,15 +25,16 @@ final class WriteVersionIdPolicyTest extends S3FunctionalTestCase
             ]);
             self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'source', 'Body' => 'source']);
             $oldVersions = [];
+            $currentVersions = [];
             foreach (['put', 'copy', 'complete'] as $key) {
                 $oldVersions[$key] = (string) self::$s3->putObject([
                     'Bucket' => $bucket, 'Key' => $key, 'Body' => 'old',
                     'Tagging' => 'classification=ordinary',
                 ])['VersionId'];
-                self::$s3->putObject([
+                $currentVersions[$key] = (string) self::$s3->putObject([
                     'Bucket' => $bucket, 'Key' => $key, 'Body' => 'protected',
                     'Tagging' => 'classification=protected',
-                ]);
+                ])['VersionId'];
             }
             $uploadId = (string) self::$s3->createMultipartUpload([
                 'Bucket' => $bucket, 'Key' => 'complete',
@@ -42,11 +43,12 @@ final class WriteVersionIdPolicyTest extends S3FunctionalTestCase
                 'Bucket' => $bucket, 'Key' => 'complete', 'UploadId' => $uploadId,
                 'PartNumber' => 1, 'Body' => 'replacement',
             ]);
+            $protectedPolicy = $this->denyPolicy($bucket, [
+                'StringEquals' => ['s3:ExistingObjectTag/classification' => 'protected'],
+            ]);
             self::$s3->putBucketPolicy([
                 'Bucket' => $bucket,
-                'Policy' => $this->denyPolicy($bucket, [
-                    'StringEquals' => ['s3:ExistingObjectTag/classification' => 'protected'],
-                ]),
+                'Policy' => $protectedPolicy,
             ]);
 
             $put = $this->signedPut("/{$bucket}/put?versionId=" . rawurlencode($oldVersions['put']), 'replacement');
@@ -62,26 +64,47 @@ final class WriteVersionIdPolicyTest extends S3FunctionalTestCase
                     . '&versionId=' . rawurlencode($oldVersions['complete']),
                 $completeXml,
             );
-            self::assertSame(403, $put->getStatusCode(), (string) $put->getBody());
-            self::assertSame(403, $copy->getStatusCode(), (string) $copy->getBody());
-            self::assertSame(403, $complete->getStatusCode(), (string) $complete->getBody());
-            self::assertSame('protected', (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => 'put'])['Body']);
-            self::assertSame('protected', (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => 'copy'])['Body']);
-            self::assertSame('protected', (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => 'complete'])['Body']);
+            foreach ([$put, $copy, $complete] as $response) {
+                self::assertSame(405, $response->getStatusCode(), (string) $response->getBody());
+                self::assertStringContainsString('<Code>MethodNotAllowed</Code>', (string) $response->getBody());
+            }
+            $validPut = $this->signedPut("/{$bucket}/put", 'replacement');
+            self::assertSame(403, $validPut->getStatusCode(), (string) $validPut->getBody());
+            self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $validPut->getBody());
+            foreach (['put', 'copy', 'complete'] as $key) {
+                $current = self::$s3->getObject(['Bucket' => $bucket, 'Key' => $key]);
+                self::assertSame('protected', (string) $current['Body']);
+                self::assertSame($currentVersions[$key], $current['VersionId']);
+                self::assertSame('old', (string) self::$s3->getObject([
+                    'Bucket' => $bucket, 'Key' => $key, 'VersionId' => $oldVersions[$key],
+                ])['Body']);
+            }
+            self::assertSame([1], array_column(self::$s3->listParts([
+                'Bucket' => $bucket, 'Key' => 'complete', 'UploadId' => $uploadId,
+            ])['Parts'], 'PartNumber'));
+            self::assertSame($protectedPolicy, (string) self::$s3->getBucketPolicy(['Bucket' => $bucket])['Policy']);
 
             self::$s3->deleteBucketPolicy(['Bucket' => $bucket]);
             $oldVersion = (string) self::$s3->putObject([
                 'Bucket' => $bucket, 'Key' => 'null-condition', 'Body' => 'original',
             ])['VersionId'];
+            $nullPolicy = $this->denyPolicy($bucket, ['Null' => ['s3:VersionId' => 'true']]);
             self::$s3->putBucketPolicy([
                 'Bucket' => $bucket,
-                'Policy' => $this->denyPolicy($bucket, ['Null' => ['s3:VersionId' => 'true']]),
+                'Policy' => $nullPolicy,
             ]);
             $put = $this->signedPut("/{$bucket}/null-condition?versionId=" . rawurlencode($oldVersion), 'replacement');
-            self::assertSame(403, $put->getStatusCode(), (string) $put->getBody());
-            self::assertSame('original', (string) self::$s3->getObject([
+            self::assertSame(405, $put->getStatusCode(), (string) $put->getBody());
+            self::assertStringContainsString('<Code>MethodNotAllowed</Code>', (string) $put->getBody());
+            $validPut = $this->signedPut("/{$bucket}/null-condition", 'replacement');
+            self::assertSame(403, $validPut->getStatusCode(), (string) $validPut->getBody());
+            self::assertStringContainsString('<Code>AccessDenied</Code>', (string) $validPut->getBody());
+            $current = self::$s3->getObject([
                 'Bucket' => $bucket, 'Key' => 'null-condition', 'VersionId' => $oldVersion,
-            ])['Body']);
+            ]);
+            self::assertSame('original', (string) $current['Body']);
+            self::assertSame($oldVersion, $current['VersionId']);
+            self::assertSame($nullPolicy, (string) self::$s3->getBucketPolicy(['Bucket' => $bucket])['Policy']);
         } finally {
             self::$s3->deleteBucketPolicy(['Bucket' => $bucket]);
             if ($uploadId !== null) {

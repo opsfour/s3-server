@@ -42,11 +42,30 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
             $body = $this->decodeJsonBody($request);
             $token = $this->stringField($body, 'token');
             $ttlSeconds = $this->optionalPositiveIntField($body, 'ttlSeconds');
-
-            $identity = $this->identityProvider->authenticate($token);
-            $issued = $this->credentialIssuer->issue($identity, $ttlSeconds);
-        } catch (ExternalIdentityAuthenticationException|\InvalidArgumentException $e) {
+            if ($ttlSeconds !== null && ($ttlSeconds < ExternalCredentialIssuer::DEFAULT_TTL_SECONDS
+                || $ttlSeconds > ExternalCredentialIssuer::MAX_TTL_SECONDS)) {
+                throw new \InvalidArgumentException('Credential TTL must be between 3600 and 43200 seconds.');
+            }
+        } catch (\InvalidArgumentException $e) {
             return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
+        }
+
+        try {
+            $identity = $this->identityProvider->authenticate($token);
+        } catch (ExternalIdentityAuthenticationException|\InvalidArgumentException) {
+            return $this->json([
+                'error' => 'invalid_request',
+                'message' => 'External identity authentication failed.',
+            ], 400);
+        }
+
+        try {
+            $issued = $this->credentialIssuer->issue($identity, $ttlSeconds);
+        } catch (\InvalidArgumentException) {
+            return $this->json([
+                'error' => 'invalid_request',
+                'message' => 'External identity is invalid.',
+            ], 400);
         }
 
         return $this->json([

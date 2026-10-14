@@ -272,6 +272,21 @@ final class AdminQuotaApiHandlerTest extends TestCase
         $this->assertSame('invalid_request', $this->json($response)['error']);
     }
 
+    public function test_metadata_cancellation_is_propagated_unchanged(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('listAccountQuotasPage')->willThrowException($cancellation);
+        $handler = new AdminQuotaApiHandler($metadata, 'admin-secret');
+
+        try {
+            $handler->handleRequest($this->request('GET', '/.admin/quotas', '', $this->authHeaders()));
+            self::fail('Quota listing swallowed metadata cancellation.');
+        } catch (\Amp\CancelledException $caught) {
+            self::assertSame($cancellation, $caught);
+        }
+    }
+
     public function test_quota_mutations_share_the_owner_lock_with_object_commits(): void
     {
         $events = [];

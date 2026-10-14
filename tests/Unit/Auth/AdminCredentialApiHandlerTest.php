@@ -104,6 +104,65 @@ final class AdminCredentialApiHandlerTest extends TestCase
         $this->assertSame('invalid_request', $this->json($response)['error']);
     }
 
+    public function test_identity_provider_failure_does_not_disclose_its_exception_message(): void
+    {
+        foreach ([
+            new ExternalIdentityAuthenticationException(
+                'OIDC request to https://client:provider-secret@idp.internal/token failed.',
+            ),
+            new \InvalidArgumentException('Provider rejected tenant provider-secret.'),
+        ] as $failure) {
+            $identityProvider = new class ($failure) implements ExternalIdentityProvider {
+                public function __construct(private readonly \Throwable $failure) {}
+
+                public function authenticate(string $bearerToken): ExternalIdentity
+                {
+                    throw $this->failure;
+                }
+            };
+            $response = $this->createHandler(identityProvider: $identityProvider)->handleRequest($this->request(
+                'POST',
+                '/.admin/credentials',
+                ['token' => 'bad-token'],
+                ['authorization' => 'Bearer admin-secret'],
+            ));
+            $body = \Amp\ByteStream\buffer($response->getBody());
+
+            self::assertSame(400, $response->getStatus());
+            self::assertSame('no-store', $response->getHeader('cache-control'));
+            self::assertStringNotContainsString('provider-secret', $body);
+            self::assertSame([
+                'error' => 'invalid_request',
+                'message' => 'External identity authentication failed.',
+            ], json_decode($body, true, 512, JSON_THROW_ON_ERROR));
+        }
+    }
+
+    public function test_identity_provider_cancellation_is_propagated_unchanged(): void
+    {
+        $cancellation = new \Amp\CancelledException();
+        $identityProvider = new class ($cancellation) implements ExternalIdentityProvider {
+            public function __construct(private readonly \Amp\CancelledException $cancellation) {}
+
+            public function authenticate(string $bearerToken): ExternalIdentity
+            {
+                throw $this->cancellation;
+            }
+        };
+
+        try {
+            $this->createHandler(identityProvider: $identityProvider)->handleRequest($this->request(
+                'POST',
+                '/.admin/credentials',
+                ['token' => 'idp-token'],
+                ['authorization' => 'Bearer admin-secret'],
+            ));
+            self::fail('Credential issuance swallowed provider cancellation.');
+        } catch (\Amp\CancelledException $caught) {
+            self::assertSame($cancellation, $caught);
+        }
+    }
+
     public function test_issue_rejects_external_identity_that_cannot_be_serialized_safely(): void
     {
         $identityProvider = new class implements ExternalIdentityProvider {

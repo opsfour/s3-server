@@ -66,6 +66,54 @@ final class OperationResolver
     ];
 
     /** @var array<string, list<string>> */
+    private const array BUCKET_QUERY_MODIFIER_METHODS = [
+        'list-type' => ['GET'],
+        'continuation-token' => ['GET'],
+        'delimiter' => ['GET'],
+        'encoding-type' => ['GET'],
+        'fetch-owner' => ['GET'],
+        'key-marker' => ['GET'],
+        'marker' => ['GET'],
+        'max-keys' => ['GET'],
+        'max-uploads' => ['GET'],
+        'prefix' => ['GET'],
+        'start-after' => ['GET'],
+        'upload-id-marker' => ['GET'],
+        'version-id-marker' => ['GET'],
+        'bucket-region' => [],
+        'max-buckets' => [],
+        'max-parts' => [],
+        'part-number-marker' => [],
+        'versionId' => [],
+        'uploadId' => [],
+        'partNumber' => [],
+        'select-type' => [],
+        'response-cache-control' => [],
+        'response-content-disposition' => [],
+        'response-content-encoding' => [],
+        'response-content-language' => [],
+        'response-content-type' => [],
+        'response-expires' => [],
+    ];
+
+    /** @var array<string, list<S3Operation>> */
+    private const array BUCKET_LISTING_MODIFIER_OPERATIONS = [
+        'list-type' => [S3Operation::ListObjectsV2],
+        'continuation-token' => [S3Operation::ListObjectsV2],
+        'delimiter' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
+        'encoding-type' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
+        'fetch-owner' => [S3Operation::ListObjectsV2],
+        'key-marker' => [S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
+        'marker' => [S3Operation::ListObjects],
+        'max-keys' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions],
+        'max-uploads' => [S3Operation::ListMultipartUploads],
+        'prefix' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
+        'start-after' => [S3Operation::ListObjectsV2],
+        'upload-id-marker' => [S3Operation::ListMultipartUploads],
+        'version-id-marker' => [S3Operation::ListObjectVersions],
+    ];
+
+    /** @var array<string, list<string>> */
     private const array OBJECT_SUBRESOURCE_METHODS = [
         'acl' => ['GET', 'PUT'],
         'tagging' => ['GET', 'PUT', 'DELETE'],
@@ -84,6 +132,49 @@ final class OperationResolver
         'encryption',
         'renameObject',
         'torrent',
+    ];
+
+    /** @var array<string, list<string>> */
+    private const array OBJECT_QUERY_MODIFIER_METHODS = [
+        'list-type' => [],
+        'bucket-region' => [],
+        'continuation-token' => [],
+        'delimiter' => [],
+        'encoding-type' => [],
+        'fetch-owner' => [],
+        'key-marker' => [],
+        'marker' => [],
+        'max-buckets' => [],
+        'max-keys' => [],
+        'max-uploads' => [],
+        'prefix' => [],
+        'start-after' => [],
+        'upload-id-marker' => [],
+        'version-id-marker' => [],
+        'max-parts' => ['GET'],
+        'part-number-marker' => ['GET'],
+        'partNumber' => ['GET', 'HEAD', 'PUT'],
+        'select-type' => ['POST'],
+        'response-cache-control' => ['GET', 'HEAD'],
+        'response-content-disposition' => ['GET', 'HEAD'],
+        'response-content-encoding' => ['GET', 'HEAD'],
+        'response-content-language' => ['GET', 'HEAD'],
+        'response-content-type' => ['GET', 'HEAD'],
+        'response-expires' => ['GET', 'HEAD'],
+    ];
+
+    /** @var array<string, list<S3Operation>> */
+    private const array OBJECT_QUERY_MODIFIER_OPERATIONS = [
+        'max-parts' => [S3Operation::ListParts],
+        'part-number-marker' => [S3Operation::ListParts],
+        'partNumber' => [S3Operation::GetObject, S3Operation::HeadObject, S3Operation::UploadPart, S3Operation::UploadPartCopy],
+        'select-type' => [S3Operation::SelectObjectContent],
+        'response-cache-control' => [S3Operation::GetObject, S3Operation::HeadObject],
+        'response-content-disposition' => [S3Operation::GetObject, S3Operation::HeadObject],
+        'response-content-encoding' => [S3Operation::GetObject, S3Operation::HeadObject],
+        'response-content-language' => [S3Operation::GetObject, S3Operation::HeadObject],
+        'response-content-type' => [S3Operation::GetObject, S3Operation::HeadObject],
+        'response-expires' => [S3Operation::GetObject, S3Operation::HeadObject],
     ];
 
     /**
@@ -131,14 +222,20 @@ final class OperationResolver
      */
     private static function resolveBucket(string $method, array $queryParams): S3Operation
     {
+        self::assertQueryModifierMethods($method, $queryParams, self::BUCKET_QUERY_MODIFIER_METHODS);
         self::assertSubresourceRoutingIsValid(
             $method,
             $queryParams,
             self::BUCKET_SUBRESOURCE_METHODS,
             self::UNSUPPORTED_BUCKET_SUBRESOURCES,
         );
-
-        return match ($method) {
+        self::assertSubresourceScopeIsValid(
+            $queryParams,
+            self::OBJECT_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_OBJECT_SUBRESOURCES,
+            self::BUCKET_SUBRESOURCE_METHODS,
+        );
+        $operation = match ($method) {
             'PUT' => self::resolveBucketPut($queryParams),
             'DELETE' => self::resolveBucketDelete($queryParams),
             'HEAD' => S3Operation::HeadBucket,
@@ -148,6 +245,9 @@ final class OperationResolver
                 "Unsupported method '{$method}' for bucket scope.",
             ),
         };
+        self::assertQueryModifiersForOperation($queryParams, $operation, self::BUCKET_LISTING_MODIFIER_OPERATIONS);
+
+        return $operation;
     }
 
     /**
@@ -322,14 +422,21 @@ final class OperationResolver
      */
     private static function resolveObject(string $method, array $queryParams, array $headers): S3Operation
     {
+        self::assertQueryModifierMethods($method, $queryParams, self::OBJECT_QUERY_MODIFIER_METHODS);
         self::assertSubresourceRoutingIsValid(
             $method,
             $queryParams,
             self::OBJECT_SUBRESOURCE_METHODS,
             self::UNSUPPORTED_OBJECT_SUBRESOURCES,
         );
+        self::assertSubresourceScopeIsValid(
+            $queryParams,
+            self::BUCKET_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_BUCKET_SUBRESOURCES,
+            self::OBJECT_SUBRESOURCE_METHODS,
+        );
 
-        return match ($method) {
+        $operation = match ($method) {
             'GET' => self::resolveObjectGet($queryParams),
             'PUT' => self::resolveObjectPut($queryParams, $headers),
             'DELETE' => self::resolveObjectDelete($queryParams),
@@ -339,6 +446,12 @@ final class OperationResolver
                 "Unsupported method '{$method}' for object scope.",
             ),
         };
+        if (\array_key_exists('versionId', $queryParams) && ! $operation->selectsObjectVersion()) {
+            throw new MethodNotAllowedException('versionId is unsupported for this object operation.');
+        }
+        self::assertQueryModifiersForOperation($queryParams, $operation, self::OBJECT_QUERY_MODIFIER_OPERATIONS);
+
+        return $operation;
     }
 
     /**
@@ -489,6 +602,77 @@ final class OperationResolver
             if (! \in_array($method, $methods, true)) {
                 throw new MethodNotAllowedException(
                     "Unsupported method '{$method}' for the '{$subresource}' subresource.",
+                );
+            }
+        }
+    }
+
+    /**
+     * Query modifiers are not independent operations, but their presence must
+     * not turn a request for one API into a destructive base operation.
+     *
+     * @param array<string, mixed> $queryParams
+     * @param array<string, list<string>> $allowedMethods
+     */
+    private static function assertQueryModifierMethods(
+        string $method,
+        array $queryParams,
+        array $allowedMethods,
+    ): void {
+        foreach ($allowedMethods as $modifier => $methods) {
+            if (\array_key_exists($modifier, $queryParams) && ! \in_array($method, $methods, true)) {
+                throw new MethodNotAllowedException(
+                    "Unsupported method '{$method}' for the '{$modifier}' query modifier.",
+                );
+            }
+        }
+    }
+
+    /**
+     * A known subresource from the other scope must not become a base mutation.
+     * Subresources shared by bucket and object scope remain valid in either.
+     *
+     * @param array<string, mixed> $queryParams
+     * @param array<string, list<string>> $otherScope
+     * @param list<string> $otherUnsupported
+     * @param array<string, list<string>> $currentScope
+     */
+    private static function assertSubresourceScopeIsValid(
+        array $queryParams,
+        array $otherScope,
+        array $otherUnsupported,
+        array $currentScope,
+    ): void {
+        foreach ($otherScope as $subresource => $_methods) {
+            if (\array_key_exists($subresource, $queryParams) && ! \array_key_exists($subresource, $currentScope)) {
+                throw new MethodNotAllowedException(
+                    "The '{$subresource}' subresource is unsupported for this scope.",
+                );
+            }
+        }
+
+        foreach ($otherUnsupported as $subresource) {
+            if (\array_key_exists($subresource, $queryParams) && ! \array_key_exists($subresource, $currentScope)) {
+                throw new NotImplementedException(
+                    "The '{$subresource}' subresource is not implemented.",
+                );
+            }
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $queryParams
+     * @param array<string, list<S3Operation>> $allowedOperations
+     */
+    private static function assertQueryModifiersForOperation(
+        array $queryParams,
+        S3Operation $operation,
+        array $allowedOperations,
+    ): void {
+        foreach ($allowedOperations as $modifier => $operations) {
+            if (\array_key_exists($modifier, $queryParams) && ! \in_array($operation, $operations, true)) {
+                throw new MethodNotAllowedException(
+                    "The '{$modifier}' query modifier is unsupported for {$operation->value}.",
                 );
             }
         }

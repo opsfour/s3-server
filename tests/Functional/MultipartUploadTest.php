@@ -482,6 +482,66 @@ final class MultipartUploadTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_signed_wrong_scope_query_selectors_cannot_mutate_bucket_or_object(): void
+    {
+        $bucket = 'query-guard-' . bin2hex(random_bytes(4));
+        $key = 'guarded.txt';
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $credentials = new Credentials(self::$accessKey, self::$secretKey);
+        $client = new Client(['http_errors' => false]);
+        $bucketUrl = sprintf('http://%s:%d/%s', self::$host, self::$port, $bucket);
+        $objectUrl = $bucketUrl . '/' . $key;
+        $sendSigned = static function (string $method, string $url, string $body = '') use ($signer, $credentials, $client): \Psr\Http\Message\ResponseInterface {
+            return $client->send($signer->signRequest(new Request($method, $url, [], $body), $credentials));
+        };
+
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        try {
+            foreach ([
+                ['PUT', $bucketUrl . '?key-marker=key'],
+                ['DELETE', $bucketUrl . '?max-keys=1'],
+            ] as [$method, $url]) {
+                $response = $sendSigned($method, $url);
+                self::assertSame(405, $response->getStatusCode(), $url);
+                self::assertStringContainsString('<Code>MethodNotAllowed</Code>', (string) $response->getBody(), $url);
+                self::assertSame(200, self::$s3->headBucket(['Bucket' => $bucket])['@metadata']['statusCode']);
+            }
+
+            self::assertSame(200, $sendSigned('GET', $bucketUrl . '?list-type=2&prefix=guarded')->getStatusCode());
+
+            self::$s3->putObject(['Bucket' => $bucket, 'Key' => $key, 'Body' => 'original']);
+            foreach ([
+                ['PUT', $objectUrl . '?versionId=version', 'replacement'],
+                ['PUT', $objectUrl . '?acl&partNumber=1', 'replacement'],
+                ['DELETE', $objectUrl . '?partNumber=1', ''],
+            ] as [$method, $url, $body]) {
+                $response = $sendSigned($method, $url, $body);
+                self::assertSame(405, $response->getStatusCode(), $url);
+                self::assertStringContainsString('<Code>MethodNotAllowed</Code>', (string) $response->getBody(), $url);
+                self::assertSame('original', (string) self::$s3->getObject(['Bucket' => $bucket, 'Key' => $key])['Body']);
+            }
+
+            $wrongRead = $sendSigned('GET', $objectUrl . '?acl&response-content-type=text%2Fplain');
+            self::assertSame(405, $wrongRead->getStatusCode());
+            self::assertStringContainsString('<Code>MethodNotAllowed</Code>', (string) $wrongRead->getBody());
+            $validRead = $sendSigned('GET', $objectUrl . '?response-content-type=text%2Fplain');
+            self::assertSame(200, $validRead->getStatusCode());
+            self::assertSame('original', (string) $validRead->getBody());
+
+            $uploadId = self::$s3->createMultipartUpload(['Bucket' => $bucket, 'Key' => $key])['UploadId'];
+            try {
+                self::assertSame(200, $sendSigned('GET', $objectUrl . '?uploadId=' . rawurlencode($uploadId) . '&max-parts=1')->getStatusCode());
+            } finally {
+                self::$s3->abortMultipartUpload(['Bucket' => $bucket, 'Key' => $key, 'UploadId' => $uploadId]);
+            }
+        } finally {
+            if (self::$s3->doesBucketExistV2($bucket)) {
+                self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
+                self::$s3->deleteBucket(['Bucket' => $bucket]);
+            }
+        }
+    }
+
     public function test_abort_rejects_upload_id_for_another_key_without_consuming_parts(): void
     {
         $key = 'abort-owner-key-' . bin2hex(random_bytes(4));

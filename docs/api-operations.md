@@ -22,6 +22,8 @@ deletion commits; the response can arrive before all staged part bytes are gone.
 Custom metadata stores need generation-bound listing and bulk-cleanup
 capabilities for this endpoint; otherwise it returns HTTP 501. See
 [Metadata Backends](metadata-backends.md#generation-bound-multipart-listings).
+CreateBucket ignores `x-amz-expected-bucket-owner`; supported bucket and object
+operations reject a mismatched expected owner before processing the request.
 
 ## Object CRUD
 
@@ -34,6 +36,15 @@ capabilities for this endpoint; otherwise it returns HTTP 501. See
 | DeleteObjects | `POST` | `/{bucket}?delete` | Batch delete up to 1000 objects; requires a verified Content-MD5 or supported `x-amz-checksum-*` body digest |
 | PostObject | `POST` | `/{bucket}` | Browser-style form upload |
 | CopyObject | `PUT` | `/{bucket}/{key}` | Copy object (with `x-amz-copy-source` header) |
+
+Known S3 query selectors and subresources are checked against the request
+method, bucket/object scope, and resolved operation. Listing modifiers such as
+`marker`, `max-keys`, and `max-uploads` are accepted only for their respective
+listing operations; unknown query parameters are not rejected as a group.
+
+CopyObject and UploadPartCopy use `x-amz-source-expected-bucket-owner` to check
+the source bucket before reading its object; `x-amz-expected-bucket-owner`
+checks the destination bucket.
 
 CopyObject can copy the current object onto the same key when the request
 actually changes its supported storage class. A no-op self-copy, including one

@@ -195,6 +195,18 @@ final class OperationResolverTest extends TestCase
         yield 'put bucket location must not create the bucket' => ['PUT', ['location' => '']];
         yield 'post bucket policy must not become a form upload' => ['POST', ['policy' => '']];
         yield 'head bucket tagging must not become HeadBucket' => ['HEAD', ['tagging' => '']];
+        yield 'delete bucket list-type must not delete the bucket' => ['DELETE', ['list-type' => '2']];
+        yield 'put bucket list-type must not create the bucket' => ['PUT', ['list-type' => '2']];
+        yield 'delete bucket uploadId must not delete the bucket' => ['DELETE', ['uploadId' => 'upload']];
+        yield 'delete bucket partNumber must not delete the bucket' => ['DELETE', ['partNumber' => '1']];
+        yield 'delete bucket select must not delete the bucket' => ['DELETE', ['select' => '']];
+        yield 'delete bucket response override must not delete the bucket' => ['DELETE', ['response-content-type' => 'text/plain']];
+        yield 'delete bucket versionId must not delete the bucket' => ['DELETE', ['versionId' => 'version']];
+        yield 'delete bucket object retention must not delete the bucket' => ['DELETE', ['retention' => '']];
+        foreach (self::listingQuerySelectors() as $selector) {
+            yield "delete bucket with {$selector} must not delete the bucket" => ['DELETE', [$selector => '1']];
+            yield "put bucket with {$selector} must not create the bucket" => ['PUT', [$selector => '1']];
+        }
     }
 
     /**
@@ -216,6 +228,108 @@ final class OperationResolverTest extends TestCase
         yield 'delete object retention must not delete the object' => ['DELETE', ['retention' => '']];
         yield 'put object attributes must not overwrite the object' => ['PUT', ['attributes' => '']];
         yield 'head object tagging must not become HeadObject' => ['HEAD', ['tagging' => '']];
+        yield 'delete object partNumber must not delete the object' => ['DELETE', ['partNumber' => '1']];
+        yield 'delete object partNumber must not abort upload' => ['DELETE', ['partNumber' => '1', 'uploadId' => 'upload']];
+        yield 'delete object select-type must not delete the object' => ['DELETE', ['select-type' => '2']];
+        yield 'put object select-type must not overwrite the object' => ['PUT', ['select-type' => '2']];
+        yield 'post object select-type must not complete upload' => ['POST', ['select-type' => '2', 'uploadId' => 'upload']];
+        yield 'delete object response override must not delete the object' => ['DELETE', ['response-content-type' => 'text/plain']];
+        yield 'put object response override must not overwrite the object' => ['PUT', ['response-content-type' => 'text/plain']];
+        yield 'post object response override must not complete upload' => ['POST', ['response-content-type' => 'text/plain', 'uploadId' => 'upload']];
+        yield 'delete object list-type must not delete the object' => ['DELETE', ['list-type' => '2']];
+        yield 'delete object versions must not delete the object' => ['DELETE', ['versions' => '']];
+        yield 'delete object bucket policy must not delete the object' => ['DELETE', ['policy' => '']];
+        foreach (self::listingQuerySelectors() as $selector) {
+            yield "delete object with {$selector} must not delete the object" => ['DELETE', [$selector => '1']];
+        }
+        yield 'delete object with max-parts must not delete the object' => ['DELETE', ['max-parts' => '1']];
+        yield 'put object with part-number-marker must not overwrite the object' => ['PUT', ['part-number-marker' => '1']];
+        yield 'post object with max-parts must not complete upload' => ['POST', ['max-parts' => '1', 'uploadId' => 'upload']];
+        yield 'put object with versionId must not overwrite the object' => ['PUT', ['versionId' => 'version']];
+        yield 'delete object with versionId must not abort upload' => ['DELETE', ['versionId' => 'version', 'uploadId' => 'upload']];
+        yield 'post object with versionId must not complete upload' => ['POST', ['versionId' => 'version', 'uploadId' => 'upload']];
+    }
+
+    /** @return list<string> */
+    private static function listingQuerySelectors(): array
+    {
+        return [
+            'bucket-region', 'max-buckets',
+            'continuation-token', 'delimiter', 'encoding-type', 'fetch-owner',
+            'key-marker', 'marker', 'max-keys', 'max-uploads', 'prefix',
+            'start-after', 'upload-id-marker', 'version-id-marker',
+        ];
+    }
+
+    /** @param array<string, string> $query */
+    #[\PHPUnit\Framework\Attributes\DataProvider('incompleteListingSelectors')]
+    public function test_listing_selector_requires_its_operation_subresource(string $scope, array $query): void
+    {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve('GET', $scope, $query, []);
+    }
+
+    /** @return iterable<string, array{string, array<string, string>}> */
+    public static function incompleteListingSelectors(): iterable
+    {
+        yield 'max-parts without uploadId' => ['object', ['max-parts' => '1']];
+        yield 'part-number-marker without uploadId' => ['object', ['part-number-marker' => '1']];
+        yield 'key-marker without versions or uploads' => ['bucket', ['key-marker' => 'key']];
+        yield 'upload-id-marker without uploads' => ['bucket', ['upload-id-marker' => 'upload']];
+        yield 'upload-id-marker with versions' => ['bucket', ['versions' => '', 'upload-id-marker' => 'upload']];
+        yield 'version-id-marker without versions' => ['bucket', ['version-id-marker' => 'version']];
+        yield 'version-id-marker with uploads' => ['bucket', ['uploads' => '', 'version-id-marker' => 'version']];
+        yield 'max-uploads without uploads' => ['bucket', ['max-uploads' => '1']];
+        yield 'fetch-owner without list-type' => ['bucket', ['fetch-owner' => 'true']];
+        yield 'start-after without list-type' => ['bucket', ['start-after' => 'key']];
+        yield 'continuation-token without list-type' => ['bucket', ['continuation-token' => 'next']];
+    }
+
+    /** @param array<string, string> $query */
+    #[\PHPUnit\Framework\Attributes\DataProvider('wrongBucketListingOperations')]
+    public function test_bucket_listing_selector_is_rejected_for_the_wrong_listing_operation(array $query): void
+    {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve('GET', 'bucket', $query, []);
+    }
+
+    /** @return iterable<string, array{array<string, string>}> */
+    public static function wrongBucketListingOperations(): iterable
+    {
+        yield 'v1 marker on v2 listing' => [['list-type' => '2', 'marker' => 'key']];
+        yield 'v1 marker on versions listing' => [['versions' => '', 'marker' => 'key']];
+        yield 'max-keys on multipart listing' => [['uploads' => '', 'max-keys' => '1']];
+        yield 'fetch-owner on multipart listing' => [['uploads' => '', 'fetch-owner' => 'true']];
+        yield 'start-after on versions listing' => [['versions' => '', 'start-after' => 'key']];
+        yield 'continuation-token on multipart listing' => [['uploads' => '', 'continuation-token' => 'next']];
+        yield 'max-uploads on versions listing' => [['versions' => '', 'max-uploads' => '1']];
+        yield 'key-marker on v2 listing' => [['list-type' => '2', 'key-marker' => 'key']];
+        yield 'list-type on multipart listing' => [['uploads' => '', 'list-type' => '2']];
+        yield 'prefix on bucket policy read' => [['policy' => '', 'prefix' => 'logs/']];
+    }
+
+    /** @param array<string, string> $query */
+    #[\PHPUnit\Framework\Attributes\DataProvider('wrongObjectModifierOperations')]
+    public function test_object_modifier_is_rejected_for_the_wrong_resolved_operation(string $method, array $query): void
+    {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve($method, 'object', $query, []);
+    }
+
+    /** @return iterable<string, array{string, array<string, string>}> */
+    public static function wrongObjectModifierOperations(): iterable
+    {
+        yield 'partNumber on GetObjectTagging' => ['GET', ['tagging' => '', 'partNumber' => '1']];
+        yield 'partNumber on PutObjectAcl' => ['PUT', ['acl' => '', 'partNumber' => '1']];
+        yield 'partNumber on ListParts' => ['GET', ['uploadId' => 'upload', 'partNumber' => '1']];
+        yield 'response override on ListParts' => ['GET', ['uploadId' => 'upload', 'response-content-type' => 'text/plain']];
+        foreach ([
+            'response-cache-control', 'response-content-disposition',
+            'response-content-encoding', 'response-content-language',
+            'response-content-type', 'response-expires',
+        ] as $override) {
+            yield "{$override} on GetObjectAcl" => ['GET', ['acl' => '', $override => 'value']];
+        }
     }
 
     public function test_object_version_selector_remains_valid_for_head_and_delete(): void
@@ -261,6 +375,38 @@ final class OperationResolverTest extends TestCase
             S3Operation::SelectObjectContent,
             OperationResolver::resolve('POST', 'object', ['select' => '', 'select-type' => '2'], []),
         );
+        self::assertSame(
+            S3Operation::ListObjectsV2,
+            OperationResolver::resolve('GET', 'bucket', ['list-type' => '2', 'prefix' => 'logs/', 'continuation-token' => 'next', 'fetch-owner' => 'true', 'start-after' => 'key'], []),
+        );
+        self::assertSame(
+            S3Operation::ListObjects,
+            OperationResolver::resolve('GET', 'bucket', ['marker' => 'key', 'max-keys' => '1'], []),
+        );
+        self::assertSame(
+            S3Operation::ListMultipartUploads,
+            OperationResolver::resolve('GET', 'bucket', ['uploads' => '', 'key-marker' => 'key', 'upload-id-marker' => 'upload', 'max-uploads' => '1'], []),
+        );
+        self::assertSame(
+            S3Operation::ListObjectVersions,
+            OperationResolver::resolve('GET', 'bucket', ['versions' => '', 'key-marker' => 'key', 'version-id-marker' => 'version', 'max-keys' => '1'], []),
+        );
+        self::assertSame(
+            S3Operation::ListParts,
+            OperationResolver::resolve('GET', 'object', ['uploadId' => 'upload', 'max-parts' => '1', 'part-number-marker' => '2'], []),
+        );
+        self::assertSame(
+            S3Operation::GetObject,
+            OperationResolver::resolve('GET', 'object', ['partNumber' => '1', 'response-content-type' => 'text/plain'], []),
+        );
+        self::assertSame(
+            S3Operation::HeadObject,
+            OperationResolver::resolve('HEAD', 'object', ['response-cache-control' => 'max-age=60'], []),
+        );
+        self::assertSame(
+            S3Operation::PutObjectAcl,
+            OperationResolver::resolve('PUT', 'object', ['acl' => '', 'versionId' => 'version'], []),
+        );
     }
 
     /**
@@ -286,6 +432,8 @@ final class OperationResolverTest extends TestCase
         yield 'object encryption must not overwrite object' => ['PUT', 'object', ['encryption' => '']];
         yield 'annotation must not delete object' => ['DELETE', 'object', ['annotation' => '']];
         yield 'rename must not overwrite object' => ['PUT', 'object', ['renameObject' => '']];
+        yield 'bucket torrent must not delete bucket' => ['DELETE', 'bucket', ['torrent' => '']];
+        yield 'object replication must not delete object' => ['DELETE', 'object', ['replication' => '']];
     }
 
     public function test_every_operation_has_a_direct_route_fixture(): void

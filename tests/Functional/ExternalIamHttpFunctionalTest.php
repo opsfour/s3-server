@@ -76,8 +76,14 @@ final class ExternalIamHttpFunctionalTest extends S3FunctionalTestCase
             'headers' => ['Authorization' => 'Bearer external-test-admin-token'],
             'json' => ['token' => $this->signedToken('other-client')],
         ]);
+        $wrongAudienceBody = (string) $wrongAudience->getBody();
         self::assertSame(400, $wrongAudience->getStatusCode());
-        self::assertStringContainsString('JWT audience is not allowed', (string) $wrongAudience->getBody());
+        self::assertSame('no-store', $wrongAudience->getHeaderLine('Cache-Control'));
+        self::assertSame([
+            'error' => 'invalid_request',
+            'message' => 'External identity authentication failed.',
+        ], json_decode($wrongAudienceBody, true, 512, JSON_THROW_ON_ERROR));
+        self::assertStringNotContainsString('JWT audience is not allowed', $wrongAudienceBody);
 
         $tooLong = $client->post('/.admin/credentials', [
             'headers' => ['Authorization' => 'Bearer external-test-admin-token'],
@@ -142,8 +148,14 @@ final class ExternalIamHttpFunctionalTest extends S3FunctionalTestCase
             'headers' => ['Authorization' => 'Bearer external-test-admin-token'],
             'json' => ['token' => $this->signedToken('s3-admin', null, 'default-owner')],
         ]);
+        $missingScopeBody = (string) $missingScope->getBody();
         self::assertSame(400, $missingScope->getStatusCode());
-        self::assertStringContainsString('must contain at least one prefix', (string) $missingScope->getBody());
+        self::assertSame('no-store', $missingScope->getHeaderLine('Cache-Control'));
+        self::assertSame([
+            'error' => 'invalid_request',
+            'message' => 'External identity authentication failed.',
+        ], json_decode($missingScopeBody, true, 512, JSON_THROW_ON_ERROR));
+        self::assertStringNotContainsString('must contain at least one prefix', $missingScopeBody);
 
         $issued = $admin->post('/.admin/credentials', [
             'headers' => ['Authorization' => 'Bearer external-test-admin-token'],

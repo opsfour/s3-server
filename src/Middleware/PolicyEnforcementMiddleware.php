@@ -91,7 +91,10 @@ final class PolicyEnforcementMiddleware implements Middleware
         $bucketInfo = $this->metadata->getBucket($bucket);
         $bucketOwner = $bucketInfo?->ownerId;
         $expectedBucketOwner = $request->getHeader('x-amz-expected-bucket-owner');
-        if ($expectedBucketOwner !== null && $bucketOwner !== null && $expectedBucketOwner !== $bucketOwner) {
+        if ($operation !== S3Operation::CreateBucket
+            && $expectedBucketOwner !== null
+            && $bucketOwner !== null
+            && $expectedBucketOwner !== $bucketOwner) {
             throw new AccessDeniedException('Expected bucket owner does not match.');
         }
         // Cache for downstream middleware (AclEnforcementMiddleware) to avoid re-querying.
