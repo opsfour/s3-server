@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Socket\InternetAddress;
 use Amp\ByteStream\ReadableIterableStream;
+use Amp\ByteStream\ReadableStream;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -428,6 +429,54 @@ final class BucketGenerationWriteRaceTest extends TestCase
         $this->assertLateWebsiteReuseBlocked(errorDocument: true, duringStorageOpen: true);
     }
 
+    public function test_website_object_stream_rejects_reuse_before_first_read(): void
+    {
+        $source = new ReadableIterableStream(['old-data']);
+        $response = $this->websiteStreamingResponse(false, $source, 8);
+        self::assertSame(200, $response->getStatus());
+        $this->recreateWebsiteBucket('key');
+
+        try {
+            $response->getBody()->read();
+            self::fail('A former bucket generation must not emit its first body chunk.');
+        } catch (OperationAbortedException) {
+            self::assertTrue($source->isClosed());
+            self::assertSame('new-owner', $this->metadata->getBucketOwner('target'));
+        }
+    }
+
+    public function test_website_object_stream_rejects_reuse_between_chunks(): void
+    {
+        $first = str_repeat('a', 65_536);
+        $source = new ReadableIterableStream([$first, 'secret']);
+        $response = $this->websiteStreamingResponse(false, $source, strlen($first) + 6);
+
+        self::assertSame($first, $response->getBody()->read());
+        $this->recreateWebsiteBucket('key');
+
+        try {
+            $response->getBody()->read();
+            self::fail('A former bucket generation must not emit another body chunk.');
+        } catch (OperationAbortedException) {
+            self::assertTrue($source->isClosed());
+        }
+    }
+
+    public function test_website_error_document_stream_rejects_reuse_before_first_read(): void
+    {
+        $source = new ReadableIterableStream(['old-error']);
+        $response = $this->websiteStreamingResponse(true, $source, 9);
+        self::assertSame(404, $response->getStatus());
+        $this->recreateWebsiteBucket('error.html');
+
+        try {
+            $response->getBody()->read();
+            self::fail('A former bucket generation must not emit an error-document body.');
+        } catch (OperationAbortedException) {
+            self::assertTrue($source->isClosed());
+        }
+    }
+
     public function test_website_access_denied_redirect_rechecks_generation_after_acl_lookup(): void
     {
         $this->metadata->putBucketWebsite('target', 'index.html', routingRules: [[
@@ -534,6 +583,47 @@ final class BucketGenerationWriteRaceTest extends TestCase
                 self::assertTrue($stream->isClosed());
             }
         }
+    }
+
+    private function websiteStreamingResponse(bool $errorDocument, ReadableStream $source, int $size): \Amp\Http\Server\Response
+    {
+        $objectKey = $errorDocument ? 'error.html' : 'key';
+        $requestKey = $errorDocument ? 'missing' : $objectKey;
+        $this->metadata->putBucketWebsite('target', 'index.html', $errorDocument ? $objectKey : null);
+        $this->metadata->putObjectMetadata(
+            'target',
+            $objectKey,
+            'owner',
+            $size,
+            '"etag"',
+            'text/plain',
+            'memory://target/' . $objectKey,
+        );
+        $this->metadata->putBucketPolicy('target', '{"Statement":[{"Effect":"Allow","Principal":"*",'
+            . '"Action":"s3:GetObject","Resource":"arn:aws:s3:::target/*"}]}');
+
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('getObjectByPath')->willReturn($source);
+        $client = $this->createMock(Client::class);
+        $client->method('getRemoteAddress')->willReturn(new InternetAddress('127.0.0.1', 12345));
+        $request = new Request($client, 'GET', Http::new('http://target.s3-website.example.com/' . $requestKey), [
+            'host' => 'target.s3-website.example.com',
+        ]);
+        $downstream = $this->createMock(RequestHandler::class);
+        $downstream->expects(self::never())->method('handleRequest');
+
+        return (new WebsiteHostingMiddleware(
+            $this->metadata,
+            StorageTierRegistry::single($storage),
+            '*.s3-website.example.com',
+        ))->handleRequest($request, $downstream);
+    }
+
+    private function recreateWebsiteBucket(string $objectKey): void
+    {
+        $this->metadata->deleteObjectMetadata('target', $objectKey);
+        $this->metadata->deleteBucket('owner', 'target');
+        $this->metadata->createBucket('new-owner', 'target', 'us-east-1');
     }
 
     /**

@@ -12,10 +12,12 @@ use OpsFour\S3Server\Acl\AclEvaluator;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Http\WebsiteRedirectHost;
+use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Security\RequestNetworkContext;
+use OpsFour\S3Server\Storage\GenerationGuardedReadableStream;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -246,14 +248,19 @@ final class WebsiteHostingMiddleware implements Middleware
         return self::htmlError(404, 'NoSuchKey', 'The specified key does not exist.');
     }
 
-    private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): LimitedReadableStream
+    private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): GenerationGuardedReadableStream
     {
         $source = $storage->getObjectByPath($path);
         try {
             // Opening a remote source can yield. Close it if this bucket name
             // changed while the backend was opening the old physical path.
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            return new LimitedReadableStream($source, $size);
+            return new GenerationGuardedReadableStream(
+                new LimitedReadableStream($source, $size),
+                function () use ($bucketInfo, $request): void {
+                    BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                },
+            );
         } catch (\Throwable $error) {
             try {
                 $source->close();
