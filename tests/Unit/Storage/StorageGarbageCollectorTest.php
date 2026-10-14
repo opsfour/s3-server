@@ -289,6 +289,43 @@ final class StorageGarbageCollectorTest extends TestCase
         }
     }
 
+    public function test_flysystem_legacy_abort_with_unknown_part_name_keeps_claim_retryable(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-storage-gc-unknown-part-' . bin2hex(random_bytes(5)) . '.sqlite';
+        try {
+            $metadata = new SqliteMetadataStore($path);
+            $metadata->initialize();
+            $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+            $knownPath = '.parts/upload-id/1-' . str_repeat('a', 32);
+            $unknownPath = '.parts/upload-id/10001-' . str_repeat('b', 32);
+            $filesystem->write($unknownPath, 'unknown');
+            $filesystem->write($knownPath, 'legacy');
+            $backend = new FlysystemBackend($filesystem);
+            $connection = new \PDO('sqlite:' . $path);
+            $connection->exec("INSERT INTO s3_storage_garbage
+                (bucket, storage_tier, storage_path, operation, key_name, upload_id, next_attempt_at)
+                VALUES ('bucket', 'STANDARD', '', 'abort_multipart', 'key', 'upload-id', 0)");
+
+            $collector = new StorageGarbageCollector($metadata, StorageTierRegistry::single($backend));
+            self::assertSame(0, $collector->collect(1));
+            $row = $connection->query('SELECT status, attempts FROM s3_storage_garbage');
+            self::assertInstanceOf(\PDOStatement::class, $row);
+            self::assertSame(['status' => 'pending', 'attempts' => 1], $row->fetch(\PDO::FETCH_ASSOC));
+            self::assertTrue($filesystem->fileExists($unknownPath));
+            self::assertTrue($filesystem->fileExists($knownPath));
+
+            $filesystem->delete($unknownPath);
+            $connection->exec('UPDATE s3_storage_garbage SET next_attempt_at = 0');
+            self::assertSame(1, $collector->collect(1));
+            self::assertFalse($filesystem->fileExists($knownPath));
+            self::assertSame([], $metadata->dequeueStorageGarbage(1));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
     public function test_persisted_storage_garbage_is_deleted_and_acknowledged(): void
     {
         $path = sys_get_temp_dir() . '/s3-storage-gc-' . bin2hex(random_bytes(5)) . '.sqlite';

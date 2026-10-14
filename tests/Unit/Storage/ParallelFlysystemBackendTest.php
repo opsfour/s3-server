@@ -325,6 +325,34 @@ final class ParallelFlysystemBackendTest extends TestCase
         }
     }
 
+    public function test_worker_legacy_abort_preserves_generation_bound_part_path(): void
+    {
+        $backend = new ParallelFlysystemBackend(new SlowLocalFlysystemFactory($this->remoteRoot), $this->tempDir, 1);
+        try {
+            $uploadId = bin2hex(random_bytes(16));
+            $legacy = $backend->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer('legacy'));
+            $plannedPath = $backend->planMultipartPartPath(
+                'bucket',
+                bin2hex(random_bytes(16)),
+                $uploadId,
+                2,
+                bin2hex(random_bytes(16)),
+            );
+            $planned = $backend->putPartAtPath('bucket', 'key', $uploadId, 2, new ReadableBuffer('generation-bound'), $plannedPath);
+
+            $backend->abortMultipartUpload('bucket', 'key', $uploadId);
+
+            try {
+                $backend->getObjectByPath($legacy->path)->read();
+                self::fail('Legacy multipart part must be removed.');
+            } catch (NoSuchKeyException) {
+            }
+            self::assertSame('generation-bound', self::readAll($backend->getObjectByPath($planned->path)));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
     public function test_observed_bounded_copy_completes_with_one_shared_worker_and_caps_corrupt_source(): void
     {
         $pool = new ContextWorkerPool(1);

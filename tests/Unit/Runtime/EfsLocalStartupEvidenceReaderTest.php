@@ -1448,6 +1448,42 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         }
     }
 
+    public function test_candidate_pre_bind_fresh_failure_revokes_prepared_state_until_reprepared(): void
+    {
+        [$graph, $ingress, $config, $probe] = $this->candidateIngressGraph();
+        $server = S3Server::forQualifiedEfsCandidate($graph);
+        $management = EfsCandidateManagementResources::create($graph, $config, credentialHealthProbe: $probe);
+        try {
+            $server->attachQualifiedEfsCandidateGraph($graph, $ingress);
+            $server->attachQualifiedEfsCandidateManagement($management);
+            $server->prepareQualifiedEfsCandidatePreBindAdmission();
+            self::assertTrue($server->isQualifiedEfsCandidatePreBindAdmissionPrepared());
+
+            $probe->available = false;
+            try {
+                $server->assertQualifiedEfsCandidatePreBindAdmissionFresh();
+                self::fail('An unavailable credential store passed the fresh pre-bind check.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Credential store unavailable.', $error->getMessage());
+            }
+            self::assertFalse($server->isQualifiedEfsCandidatePreBindAdmissionPrepared());
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+
+            $probe->available = true;
+            try {
+                $server->assertQualifiedEfsCandidatePreBindAdmissionFresh();
+                self::fail('A failed fresh check was silently reused without preparation.');
+            } catch (\LogicException $error) {
+                self::assertSame('EFS candidate pre-bind admission was not prepared.', $error->getMessage());
+            }
+            $server->prepareQualifiedEfsCandidatePreBindAdmission();
+            self::assertTrue($server->isQualifiedEfsCandidatePreBindAdmissionPrepared());
+            self::assertSame(3, $probe->healthChecks);
+        } finally {
+            $server->stop();
+        }
+    }
+
     public function test_candidate_pre_bind_latches_evidence_loss_during_credential_probe(): void
     {
         [$graph, $ingress, $config, $probe] = $this->candidateIngressGraph();

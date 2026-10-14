@@ -15,8 +15,8 @@ use Amp\Socket\TlsInfo;
 use League\Flysystem\Filesystem;
 use League\Flysystem\Config;
 use League\Flysystem\FilesystemOperator;
-use League\Flysystem\UnableToDeleteDirectory;
 use League\Flysystem\UnableToDeleteFile;
+use League\Flysystem\UnableToListContents;
 use League\Flysystem\UnableToReadFile;
 use League\Uri\Http;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
@@ -195,16 +195,84 @@ final class FlysystemBackendTest extends TestCase
         (new FlysystemBackend($filesystem, $this->tempDir))->deleteObjectByPath('bucket/path', 'bucket');
     }
 
-    public function test_multipart_directory_failure_keeps_cleanup_retryable(): void
+    public function test_multipart_listing_failure_keeps_cleanup_retryable(): void
     {
         $filesystem = $this->createMock(FilesystemOperator::class);
-        $filesystem->expects(self::once())->method('deleteDirectory')
-            ->willThrowException(UnableToDeleteDirectory::atLocation('.parts/upload'));
+        $filesystem->expects(self::once())->method('listContents')
+            ->with('.parts/upload', false)
+            ->willThrowException(UnableToListContents::atLocation(
+                '.parts/upload',
+                false,
+                new \RuntimeException('listing failed'),
+            ));
         $filesystem->expects(self::once())->method('directoryExists')
             ->with('.parts/upload')->willReturn(true);
 
         $this->expectException(InternalErrorException::class);
         (new FlysystemBackend($filesystem, $this->tempDir))->abortMultipartUpload('bucket', 'key', 'upload');
+    }
+
+    public function test_legacy_abort_preserves_generation_bound_part_paths(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $backend = new FlysystemBackend($filesystem, $this->tempDir);
+        $uploadId = bin2hex(random_bytes(16));
+        $legacy = $backend->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer('legacy'));
+        $plannedPath = $backend->planMultipartPartPath(
+            'bucket',
+            bin2hex(random_bytes(16)),
+            $uploadId,
+            2,
+            bin2hex(random_bytes(16)),
+        );
+        $planned = $backend->putPartAtPath('bucket', 'key', $uploadId, 2, new ReadableBuffer('generation-bound'), $plannedPath);
+
+        $backend->abortMultipartUpload('bucket', 'key', $uploadId);
+
+        self::assertFalse($filesystem->fileExists($legacy->path));
+        self::assertTrue($filesystem->fileExists($planned->path));
+        self::assertSame('generation-bound', self::readAll($backend->getObjectByPath($planned->path)));
+    }
+
+    public function test_legacy_abort_blocks_out_of_range_and_malformed_part_names(): void
+    {
+        $token = str_repeat('a', 32);
+        foreach ([
+            '0', '10001', '01',
+            '0-' . $token, '10001-' . $token, '01-' . $token,
+            '0-' . $token . '-' . $token,
+            '10001-' . $token . '-' . $token,
+            '1-' . $token . '-broken',
+            '1-' . str_repeat('a', 31),
+        ] as $name) {
+            $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+            $path = '.parts/upload/' . $name;
+            $filesystem->write($path, 'keep');
+            $backend = new FlysystemBackend($filesystem, $this->tempDir);
+
+            try {
+                $backend->abortMultipartUpload('bucket', 'key', 'upload');
+                self::fail("Unknown multipart name {$name} must block cleanup.");
+            } catch (InternalErrorException) {
+                self::assertTrue($filesystem->fileExists($path), $name);
+            }
+        }
+    }
+
+    public function test_legacy_abort_accepts_canonical_maximum_part_number(): void
+    {
+        $filesystem = new Filesystem(new InMemoryFlysystemAdapter());
+        $token = str_repeat('a', 32);
+        $generationBound = '.parts/upload/10000-' . $token . '-' . str_repeat('b', 32);
+        foreach (['.parts/upload/10000', '.parts/upload/10000-' . $token, $generationBound] as $path) {
+            $filesystem->write($path, 'part');
+        }
+
+        (new FlysystemBackend($filesystem, $this->tempDir))->abortMultipartUpload('bucket', 'key', 'upload');
+
+        self::assertFalse($filesystem->fileExists('.parts/upload/10000'));
+        self::assertFalse($filesystem->fileExists('.parts/upload/10000-' . $token));
+        self::assertTrue($filesystem->fileExists($generationBound));
     }
 
     public function test_malformed_upload_id_cannot_turn_part_abort_into_root_deletion(): void

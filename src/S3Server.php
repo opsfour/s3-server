@@ -1328,7 +1328,14 @@ final class S3Server
         if (! $this->qualifiedEfsPreBindAdmissionPrepared) {
             throw new \LogicException('EFS candidate pre-bind admission was not prepared.');
         }
-        $this->assertQualifiedEfsCandidatePreBindBindings();
+        try {
+            $this->assertQualifiedEfsCandidatePreBindBindings();
+        } catch (\Throwable $error) {
+            // A failed recheck invalidates the earlier admission. A caller
+            // must repeat the complete preparation before considering bind.
+            $this->qualifiedEfsPreBindAdmissionPrepared = false;
+            throw $error;
+        }
     }
 
     /** @internal Read-only state for ownership and rollback tests. */

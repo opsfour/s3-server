@@ -8,7 +8,6 @@ use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\ReadableStream;
 use Amp\CancelledException;
 use League\Flysystem\FilesystemOperator;
-use League\Flysystem\UnableToDeleteDirectory;
 use League\Flysystem\UnableToDeleteFile;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -380,12 +379,50 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
     {
         StoragePath::assertSafeUploadIdSegment($uploadId);
         $path = ".parts/{$uploadId}";
+        $prefix = $path . '/';
         try {
-            $this->filesystem->deleteDirectory($path);
-        } catch (UnableToDeleteDirectory $error) {
-            if ($this->filesystem->directoryExists($path)) {
-                throw new InternalErrorException('Failed to delete multipart parts from Flysystem backend.', $error);
+            foreach ($this->filesystem->listContents($path, false) as $entry) {
+                $entryPath = $entry->path();
+                $name = str_starts_with($entryPath, $prefix) ? substr($entryPath, strlen($prefix)) : '';
+                if ($entry->isDir() || $name === '' || str_contains($name, '/')) {
+                    throw new InternalErrorException('Unexpected multipart directory blocks legacy cleanup.');
+                }
+                // Generation-bound attempts and permanent seals carry the
+                // bucket generation plus one unique attempt token. A legacy
+                // directory-abort job cannot prove ownership of those paths.
+                if (preg_match('/^(?:[1-9][0-9]{0,3}|10000)-[a-f0-9]{32}-[a-f0-9]{32}$/D', $name) === 1) {
+                    continue;
+                }
+                // Old Flysystem parts used either the part number alone or a
+                // part number followed by one random token. Unknown entries
+                // keep the durable cleanup job retryable.
+                if (preg_match('/^(?:[1-9][0-9]{0,3}|10000)(?:-[a-f0-9]{32})?$/D', $name) !== 1) {
+                    throw new InternalErrorException('Unexpected multipart path blocks legacy cleanup.');
+                }
+
+                try {
+                    $this->filesystem->delete($entryPath);
+                } catch (UnableToDeleteFile $error) {
+                    if ($this->filesystem->fileExists($entryPath)) {
+                        throw new InternalErrorException('Failed to delete multipart part from Flysystem backend.', $error);
+                    }
+                }
             }
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (InternalErrorException $error) {
+            throw $error;
+        } catch (\Throwable $error) {
+            try {
+                if (! $this->filesystem->directoryExists($path)) {
+                    return;
+                }
+            } catch (CancelledException $existenceError) {
+                throw $existenceError;
+            } catch (\Throwable $existenceError) {
+                throw new InternalErrorException('Failed to inspect multipart parts in Flysystem backend.', $existenceError);
+            }
+            throw new InternalErrorException('Failed to list multipart parts from Flysystem backend.', $error);
         }
     }
 
