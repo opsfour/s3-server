@@ -50,6 +50,7 @@ final class ListPartsHandler implements RequestHandler
         ) {
             throw new NoSuchUploadException();
         }
+        $request->setAttribute('s3.listPartsUploadOwner', $upload['owner_id']);
         $uploadGeneration = $upload['bucket_generation'] ?? '';
         if ($uploadGeneration !== $bucketInfo->generation && $upload['owner_id'] !== $bucketInfo->ownerId) {
             throw new NoSuchUploadException();

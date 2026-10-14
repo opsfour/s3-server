@@ -11,6 +11,8 @@ final class AccountQuotaWriter
 {
     public static function put(MetadataStore $metadata, string $ownerId, QuotaConfig $quota): void
     {
+        OwnerIdValidator::assertValid($ownerId);
+
         $metadata->transaction(static function () use ($metadata, $ownerId, $quota): void {
             $metadata->lockOwnerForUpdate($ownerId);
             $metadata->putAccountQuota($ownerId, $quota);
@@ -19,6 +21,8 @@ final class AccountQuotaWriter
 
     public static function delete(MetadataStore $metadata, string $ownerId): void
     {
+        OwnerIdValidator::assertValid($ownerId);
+
         $metadata->transaction(static function () use ($metadata, $ownerId): void {
             $metadata->lockOwnerForUpdate($ownerId);
             $metadata->deleteAccountQuota($ownerId);

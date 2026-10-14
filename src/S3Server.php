@@ -33,15 +33,17 @@ use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
-use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
+use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
+use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\EfsApiAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Middleware\ExpectContinueMiddleware;
 use OpsFour\S3Server\Middleware\LoggingMiddleware;
+use OpsFour\S3Server\Middleware\ManagementBoundaryMiddleware;
 use OpsFour\S3Server\Middleware\MetricsMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\RateLimitMiddleware;
@@ -493,9 +495,9 @@ final class S3Server
                 if ($this->adminQuotaApiHandler !== null) {
                     $adminQuotas = $this->managementHandler($this->adminQuotaApiHandler);
                     $router->addRoute('GET', '/.admin/quotas', $adminQuotas);
-                    $router->addRoute('GET', '/.admin/quotas/{ownerId}', $adminQuotas);
-                    $router->addRoute('PUT', '/.admin/quotas/{ownerId}', $adminQuotas);
-                    $router->addRoute('DELETE', '/.admin/quotas/{ownerId}', $adminQuotas);
+                    $router->addRoute('GET', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
+                    $router->addRoute('PUT', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
+                    $router->addRoute('DELETE', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
                 }
 
                 // Service-level GET / lists buckets; HEAD / also reaches website
@@ -567,6 +569,11 @@ final class S3Server
                     new RequestIdMiddleware(),
                     new ErrorHandlingMiddleware($this->logger),
                     new RequestHeaderContractMiddleware(),
+                    new ManagementBoundaryMiddleware(
+                        $this->adminCredentialApiHandler !== null,
+                        $this->adminQuotaApiHandler !== null,
+                        $this->logger,
+                    ),
                 );
                 $this->server->start($globalHandler, $errorHandler);
                 if ($this->startupCancellation->isCancelled()) {
@@ -1657,6 +1664,7 @@ final class S3Server
             $middlewares[] = new PolicyEnforcementMiddleware($this->metadata);
             $middlewares[] = new BucketOwnershipMiddleware($this->metadata);
             $middlewares[] = new AclEnforcementMiddleware($this->metadata);
+            $middlewares[] = new BufferedReadAuthorizationMiddleware($this->metadata);
             $middlewares[] = new CurrentObjectReadAuthorizationMiddleware($this->metadata);
         }
 

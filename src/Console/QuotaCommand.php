@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Console;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
+use OpsFour\S3Server\Quota\OwnerIdValidator;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Quota\QuotaValueParser;
 use Symfony\Component\Console\Attribute\AsCommand;
@@ -196,8 +197,16 @@ final class QuotaCommand extends Command
     private function requireOwnerId(InputInterface $input, SymfonyStyle $io): ?string
     {
         $ownerId = $input->getArgument('owner-id');
-        if ($ownerId === null || $ownerId === '') {
+        if ($ownerId === null) {
             $io->error('Owner ID argument is required for this action.');
+
+            return null;
+        }
+
+        try {
+            OwnerIdValidator::assertValid((string) $ownerId);
+        } catch (\InvalidArgumentException $e) {
+            $io->error($e->getMessage());
 
             return null;
         }

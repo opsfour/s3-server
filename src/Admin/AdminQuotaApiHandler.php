@@ -11,6 +11,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
+use OpsFour\S3Server\Quota\OwnerIdValidator;
 use OpsFour\S3Server\Quota\QuotaConfig;
 
 final readonly class AdminQuotaApiHandler implements RequestHandler
@@ -99,18 +100,39 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             }
             $hasMore = count($rows) > $limit;
             $quotas = [];
-            foreach (array_slice($rows, 0, $paged ? $limit : self::MAX_PAGE_LIMIT) as $row) {
+            $repairHints = [];
+            $pageRows = array_slice($rows, 0, $paged ? $limit : self::MAX_PAGE_LIMIT);
+            foreach ($pageRows as $row) {
+                if (!OwnerIdValidator::isValid($row['ownerId'])) {
+                    $repairHints[] = [
+                        'issue' => 'invalid_owner_id',
+                        'ownerIdSha256' => hash('sha256', $row['ownerId']),
+                        'message' => 'A quota row has an invalid owner ID and requires metadata repair.',
+                    ];
+
+                    continue;
+                }
                 $quotas[] = ['ownerId' => $row['ownerId']] + self::quotaPayload($row['quota']);
             }
 
             if (!$paged) {
-                return $this->json(['quotas' => $quotas]);
+                $payload = ['quotas' => $quotas];
+                if ($repairHints !== []) {
+                    $payload['repairHints'] = $repairHints;
+                }
+
+                return $this->json($payload);
             }
 
-            $last = end($quotas);
-            $nextCursor = $hasMore && is_array($last) ? self::encodeCursor((string) $last['ownerId']) : null;
+            $last = end($pageRows);
+            $nextCursor = $hasMore && is_array($last) ? self::encodeCursor($last['ownerId']) : null;
 
-            return $this->json(['quotas' => $quotas, 'nextCursor' => $nextCursor]);
+            $payload = ['quotas' => $quotas, 'nextCursor' => $nextCursor];
+            if ($repairHints !== []) {
+                $payload['repairHints'] = $repairHints;
+            }
+
+            return $this->json($payload);
         }
 
         $quota = $this->metadata->getAccountQuota($ownerId);
@@ -181,15 +203,11 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
         }
 
         $encoded = substr($path, strlen($prefix));
-        if ($encoded === '' || preg_match('/%(?![0-9A-Fa-f]{2})/', $encoded)) {
+        if (preg_match('/%(?![0-9A-Fa-f]{2})/', $encoded)) {
             throw new \InvalidArgumentException('Owner ID is invalid.');
         }
         $ownerId = rawurldecode($encoded);
-        if (strlen($ownerId) > 255
-            || preg_match('//u', $ownerId) !== 1
-            || preg_match('/[\x00-\x1F\x7F]/', $ownerId) === 1) {
-            throw new \InvalidArgumentException('Owner ID is invalid.');
-        }
+        OwnerIdValidator::assertValid($ownerId);
 
         return $ownerId;
     }
@@ -269,7 +287,7 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             throw new \InvalidArgumentException('Invalid quota cursor.');
         }
         $after = base64_decode(strtr($cursor, '-_', '+/'), true);
-        if ($after === false || $after === '' || preg_match('//u', $after) !== 1 || self::encodeCursor($after) !== $cursor) {
+        if ($after === false || $after === '' || self::encodeCursor($after) !== $cursor) {
             throw new \InvalidArgumentException('Invalid quota cursor.');
         }
 

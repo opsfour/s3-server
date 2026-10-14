@@ -384,6 +384,22 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertNull($app->make(MetadataStore::class)->getAccountQuota('account-a'));
     }
 
+    public function test_artisan_quota_command_rejects_invalid_owner_before_writing(): void
+    {
+        $app = $this->application();
+        $command = $app->make(S3QuotaCommand::class);
+        self::assertInstanceOf(S3QuotaCommand::class, $command);
+        $command->setLaravel($app);
+
+        $tester = new CommandTester($command);
+        self::assertSame(Command::FAILURE, $tester->execute([
+            'action' => 'set',
+            'owner-id' => str_repeat('a', 256),
+        ]));
+        self::assertStringContainsString('Owner ID must contain 1 to 255 bytes', $tester->getDisplay());
+        self::assertSame([], $app->make(MetadataStore::class)->listAccountQuotas());
+    }
+
     public function test_provider_resolves_direct_flysystem_service_like_symfony_integration(): void
     {
         $app = $this->application([

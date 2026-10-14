@@ -54,6 +54,29 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Validate quota owner IDs consistently across direct writers, the standalone,
+  Laravel, and Symfony commands, and the admin API; keep invalid legacy rows
+  from breaking JSON pagination, and route percent-encoded `/` characters in
+  valid owner IDs through the admin API.
+- Keep reserved probe, metrics, and admin paths out of S3 wildcard routing;
+  return management 404/405 responses with `Allow` and `no-store`, and keep
+  management backend and rate-limit failures in their JSON or text formats.
+- Reject object-shaped OIDC list and JWT audience claims before issuing S3
+  credentials, compare every credential field during atomic deletion and
+  status changes, and return an explicit conflict when admin revocation loses
+  a compare-and-delete race to a replacement credential.
+- Canonicalize trusted-proxy IPv6 and IPv4-mapped client addresses before
+  policy, rate-limit, and access-log use so equivalent addresses share one
+  cluster-wide identity.
+- Refuse External IAM startup with a credential-provider chain that cannot
+  atomically revoke every credential it issues.
+- Return AWS-compatible `InvalidTargetBucketForLogging` and
+  `CrossLocationLoggingProhibited` errors when enabling server access logging
+  with a missing, foreign-owned, or cross-region target bucket.
+- Reject overlapping physical storage tiers for filesystem roots and built-in
+  local or AWS S3 Flysystem factories, even when separate factory instances,
+  credentials, timeout settings, symlink aliases, or path case on an
+  insensitive volume hide the shared namespace.
 - Validate persisted storage-tier references against the server and every
   registered handler tier registry before opening the listener.
 - Keep current-object reads bound to the metadata snapshot used during
@@ -63,6 +86,10 @@ The project follows [Semantic Versioning](https://semver.org/).
   exclusive owner locks; failed rechecks close discarded response bodies.
 - Revalidate the bucket generation before every streamed GetObject body read
   so a reused bucket name cannot expose bytes from the former bucket.
+- Recheck current identity policies, bucket policies, ACLs, Public Access
+  Block settings, and bucket generation before returning buffered service,
+  bucket-configuration, listing, and multipart-listing reads. Shared metadata
+  backends keep concurrent readers parallel while serializing policy writers.
 - Revalidate the bucket generation around every website object and
   error-document stream read so a reused bucket name cannot expose the former
   bucket's body.

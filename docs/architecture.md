@@ -53,6 +53,13 @@ opsfour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concu
    - **[Auth middleware]** — SigV4 verification, sets ownerId
    - `PolicyEnforcementMiddleware` — evaluates IAM-style bucket policies
    - `AclEnforcementMiddleware` — evaluates S3 ACLs
+   - `BufferedReadAuthorizationMiddleware` — rechecks current policies, ACLs,
+     Public Access Block settings, and bucket generation under shared owner
+     locks before returning buffered service, bucket, listing, and multipart
+     listing responses
+   - `CurrentObjectReadAuthorizationMiddleware` — binds object reads to the
+     authorized object snapshot and rechecks authorization before response
+     release
    - `ContentMd5Middleware` — validates Content-MD5 header
    - `ChecksumValidationMiddleware` — validates x-amz-checksum-* headers
 5. **S3DispatchHandler** resolves the operation name and dispatches to the correct handler

@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Laravel;
 use Illuminate\Console\Command;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
+use OpsFour\S3Server\Quota\OwnerIdValidator;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Quota\QuotaValueParser;
 
@@ -154,8 +155,16 @@ final class S3QuotaCommand extends Command
     private function requireOwnerId(): ?string
     {
         $ownerId = $this->argument('owner-id');
-        if (!is_string($ownerId) || $ownerId === '') {
+        if (!is_string($ownerId)) {
             $this->error('Owner ID argument is required for this action.');
+
+            return null;
+        }
+
+        try {
+            OwnerIdValidator::assertValid($ownerId);
+        } catch (\InvalidArgumentException $e) {
+            $this->error($e->getMessage());
 
             return null;
         }

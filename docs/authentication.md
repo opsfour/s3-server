@@ -104,6 +104,10 @@ issues scoped SigV4 credentials in the configured credential provider.
 Both the expected issuer and audience are required, including when embedding
 `JwtExternalIdentityProvider` directly. Tokens signed by the same identity
 provider for another client must not issue S3 credentials.
+The JWT `aud` claim must be either one string or a JSON array containing only
+strings. Configured groups, policy-name, and allowed-prefix claims must be JSON
+arrays containing only non-empty strings when present; JSON objects, scalar
+strings, and `null` are rejected.
 
 Enable it with a protected admin token and OIDC verification keys:
 
@@ -169,6 +173,11 @@ Revoke credentials without restarting the server:
 curl -X DELETE http://127.0.0.1:9000/.admin/credentials/AKIA... \
   -H "Authorization: Bearer ${S3_EXTERNAL_IAM_ADMIN_TOKEN}"
 ```
+
+Successful revocation returns `204`. An unknown or concurrently removed key
+returns `404`; if the observed key was replaced before the compare-and-delete,
+the API preserves the replacement and returns `409` with `{"error":"conflict"}`.
+All admin responses use `Cache-Control: no-store`.
 
 With a shared database provider, revocation on another node is visible after
 its positive-lookup cache TTL (one second by default). Set
@@ -285,6 +294,17 @@ accept `limit` from 1 to 1000 (default 100 when only `cursor` is supplied) and
 return `{"quotas": [...], "nextCursor": "..."}`. Send the returned `nextCursor`
 as the next request's URL-encoded `cursor` parameter until it is `null`.
 Pages follow owner ID order; concurrent changes may appear on later pages.
+Owner IDs must contain 1 to 255 bytes of valid UTF-8, contain no control
+characters, and use only characters permitted in XML 1.0 responses. IDs may
+contain `/`; percent-encode it as `%2F` in an admin API path so the complete
+remainder identifies one owner.
+
+If legacy or manually edited metadata contains an invalid owner ID, list
+responses omit that row from `quotas` and include a `repairHints` entry with an
+`invalid_owner_id` issue and the SHA-256 digest of the stored bytes. The raw
+invalid value and its quota are not returned. Cursor pagination still advances
+past the row; use the digest to identify and repair it directly in the metadata
+database.
 
 ### Chain (Multiple Providers)
 

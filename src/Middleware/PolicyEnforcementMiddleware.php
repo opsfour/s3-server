@@ -47,6 +47,13 @@ final class PolicyEnforcementMiddleware implements Middleware
         $this->assertAllowedWithLockedPolicies($request, true);
     }
 
+    /** Recheck ListBuckets identity policies under a shared owner-lock transaction. */
+    public function assertListBucketsAllowedAtReadCommit(Request $request): void
+    {
+        $this->attachLockedNamedPolicies($request, true);
+        $this->assertListBucketsAllowed($request, (string) $request->getAttribute('ownerId'));
+    }
+
     private function assertAllowedWithLockedPolicies(Request $request, bool $shared): void
     {
         // Direct handler callers do not pass through this middleware. Keep
@@ -55,15 +62,7 @@ final class PolicyEnforcementMiddleware implements Middleware
             return;
         }
 
-        $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
-        if ($credential instanceof Credential && $credential->policyNames !== []) {
-            NamedPolicySnapshot::attach(
-                $request,
-                $shared && $this->metadata instanceof SharedAuthorizationLockStore
-                    ? $this->metadata->lockNamedPoliciesForRead($credential->policyNames)
-                    : $this->metadata->lockNamedPoliciesForUpdate($credential->policyNames),
-            );
-        }
+        $this->attachLockedNamedPolicies($request, $shared);
 
         $this->handleRequest($request, new class ($this->metadata) implements RequestHandler {
             public function __construct(private readonly MetadataStore $metadata) {}
@@ -81,6 +80,21 @@ final class PolicyEnforcementMiddleware implements Middleware
                 );
             }
         });
+    }
+
+    private function attachLockedNamedPolicies(Request $request, bool $shared): void
+    {
+        $credential = $request->hasAttribute('credential') ? $request->getAttribute('credential') : null;
+        if (! $credential instanceof Credential || $credential->policyNames === []) {
+            return;
+        }
+
+        NamedPolicySnapshot::attach(
+            $request,
+            $shared && $this->metadata instanceof SharedAuthorizationLockStore
+                ? $this->metadata->lockNamedPoliciesForRead($credential->policyNames)
+                : $this->metadata->lockNamedPoliciesForUpdate($credential->policyNames),
+        );
     }
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response

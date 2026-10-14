@@ -14,6 +14,8 @@ use League\Uri\Http;
 use OpsFour\S3Server\Admin\AdminQuotaApiHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Quota\OwnerIdValidator;
+use OpsFour\S3Server\Quota\QuotaConfig;
 use PHPUnit\Framework\TestCase;
 
 final class AdminQuotaApiHandlerTest extends TestCase
@@ -80,27 +82,52 @@ final class AdminQuotaApiHandlerTest extends TestCase
 
         self::assertSame(400, $response->getStatus());
         self::assertSame('no-store', $response->getHeader('cache-control'));
+        self::assertSame(OwnerIdValidator::ERROR_MESSAGE, $this->json($response)['message']);
         self::assertSame([], $this->metadata->listAccountQuotas());
     }
 
-    public function test_control_character_owner_is_rejected_before_quota_lookup_or_mutation(): void
+    public function test_control_and_xml_noncharacter_owners_are_rejected_before_quota_mutation(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->expects(self::never())->method('getAccountQuota');
         $metadata->expects(self::never())->method('putAccountQuota');
         $handler = new AdminQuotaApiHandler($metadata, 'admin-secret');
 
-        foreach (['GET', 'PUT'] as $method) {
+        foreach ([
+            '/.admin/quotas/tenant%00hidden',
+            '/.admin/quotas/tenant%C2%85hidden',
+            '/.admin/quotas/tenant%EF%BF%BE',
+            '/.admin/quotas/tenant%EF%BF%BF',
+        ] as $path) {
             $response = $handler->handleRequest($this->request(
-                $method,
-                '/.admin/quotas/tenant%00hidden',
-                $method === 'PUT' ? $this->fullQuota() : '',
+                'PUT',
+                $path,
+                $this->fullQuota(),
                 $this->authHeaders(),
             ));
 
             self::assertSame(400, $response->getStatus());
-            self::assertSame('invalid_request', $this->json($response)['error']);
+            $payload = $this->json($response);
+            self::assertSame('invalid_request', $payload['error']);
+            self::assertSame(OwnerIdValidator::ERROR_MESSAGE, $payload['message']);
         }
+    }
+
+    public function test_empty_and_oversized_owners_use_the_shared_validation_before_mutation(): void
+    {
+        foreach (['/.admin/quotas/', '/.admin/quotas/' . str_repeat('a', 256)] as $path) {
+            $response = $this->handler()->handleRequest($this->request(
+                'PUT',
+                $path,
+                $this->fullQuota(),
+                $this->authHeaders(),
+            ));
+
+            self::assertSame(400, $response->getStatus());
+            self::assertSame(OwnerIdValidator::ERROR_MESSAGE, $this->json($response)['message']);
+        }
+
+        self::assertSame([], $this->metadata->listAccountQuotas());
     }
 
     public function test_put_get_list_and_delete_account_quota(): void
@@ -136,6 +163,32 @@ final class AdminQuotaApiHandlerTest extends TestCase
         $missing = $handler->handleRequest($this->request('GET', '/.admin/quotas/tenant%3Aacme', '', $this->authHeaders()));
         $this->assertSame(404, $missing->getStatus());
         $this->assertSame(['error' => 'not_found'], $this->json($missing));
+    }
+
+    public function test_percent_encoded_slash_is_preserved_in_owner_id(): void
+    {
+        $handler = $this->handler();
+
+        $put = $handler->handleRequest($this->request(
+            'PUT',
+            '/.admin/quotas/tenant%2Fmember',
+            $this->fullQuota(['maxBucketsPerOwner' => 3]),
+            $this->authHeaders(),
+        ));
+
+        self::assertSame(200, $put->getStatus());
+        self::assertSame('tenant/member', $this->json($put)['ownerId']);
+        self::assertSame(3, $this->metadata->getAccountQuota('tenant/member')?->maxBucketsPerOwner);
+
+        $delete = $handler->handleRequest($this->request(
+            'DELETE',
+            '/.admin/quotas/tenant%2Fmember',
+            '',
+            $this->authHeaders(),
+        ));
+
+        self::assertSame(204, $delete->getStatus());
+        self::assertNull($this->metadata->getAccountQuota('tenant/member'));
     }
 
     public function test_put_accepts_short_aliases_for_cli_compatibility(): void
@@ -235,6 +288,54 @@ final class AdminQuotaApiHandlerTest extends TestCase
             $response = $handler->handleRequest($this->request('GET', '/.admin/quotas?' . $query, '', $this->authHeaders()));
             self::assertSame(400, $response->getStatus(), $query);
         }
+    }
+
+    public function test_corrupt_owner_row_is_redacted_and_does_not_break_cursor_pagination(): void
+    {
+        $quota = new QuotaConfig(maxBucketsPerOwner: 1);
+        foreach (['a-valid', 'b-placeholder', 'c-valid'] as $ownerId) {
+            $this->metadata->putAccountQuota($ownerId, $quota);
+        }
+
+        $pdo = new \PDO('sqlite:' . $this->path);
+        $statement = $pdo->prepare('UPDATE s3_account_quotas SET owner_id = ? WHERE owner_id = ?');
+        self::assertNotFalse($statement);
+        self::assertTrue($statement->execute(["b-\xFF", 'b-placeholder']));
+
+        $handler = $this->handler();
+        $first = $this->json($handler->handleRequest($this->request(
+            'GET',
+            '/.admin/quotas?limit=1',
+            '',
+            $this->authHeaders(),
+        )));
+        self::assertSame(['a-valid'], array_column($first['quotas'], 'ownerId'));
+        self::assertIsString($first['nextCursor']);
+
+        $secondResponse = $handler->handleRequest($this->request(
+            'GET',
+            '/.admin/quotas?limit=1&cursor=' . $first['nextCursor'],
+            '',
+            $this->authHeaders(),
+        ));
+        self::assertSame(200, $secondResponse->getStatus());
+        $second = $this->json($secondResponse);
+        self::assertSame([], $second['quotas']);
+        self::assertSame([[
+            'issue' => 'invalid_owner_id',
+            'ownerIdSha256' => hash('sha256', "b-\xFF"),
+            'message' => 'A quota row has an invalid owner ID and requires metadata repair.',
+        ]], $second['repairHints']);
+        self::assertIsString($second['nextCursor']);
+
+        $third = $this->json($handler->handleRequest($this->request(
+            'GET',
+            '/.admin/quotas?limit=1&cursor=' . $second['nextCursor'],
+            '',
+            $this->authHeaders(),
+        )));
+        self::assertSame(['c-valid'], array_column($third['quotas'], 'ownerId'));
+        self::assertNull($third['nextCursor']);
     }
 
     public function test_unpaged_list_requires_pagination_above_one_thousand_rows(): void

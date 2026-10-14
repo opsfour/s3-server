@@ -225,6 +225,16 @@ which names one entry. Vault responses are bounded to 1 MiB.
 
 Rate limit state is persisted in the metadata database and survives server restarts. On multi-node deployments with Postgres/MySQL, rate limiting is shared across nodes. An enabled limit fails closed with S3 `SlowDown` (503) when its database check fails; `/.health` reports degraded after its next rate-limit probe (within 30 seconds), while `/.live` remains available. With `S3_RATE_LIMIT=0`, no rate-limit database check runs.
 
+Management requests under `/.admin/*` and `/.metrics` also fail closed when
+their rate-limit check fails. Downstream handler, backend, and rate-limit
+errors retain the management JSON or plain-text format, include
+`Cache-Control: no-store`, and do not expose backend details. The shared HTTP
+framing and header-contract check runs before management routing and still
+returns S3 XML for malformed transport requests. Reserved management paths
+return 404 for unknown subpaths or disabled admin APIs and 405 with `Allow`
+for unsupported methods; they never fall through to S3 bucket or object
+routing.
+
 ## Notifications
 
 | Variable | Default | Description |

@@ -431,6 +431,21 @@ final class S3ServerBundleTest extends TestCase
         self::assertStringContainsString('--max-bytes must be an integer >= 0 within the supported range', $tester->getDisplay());
     }
 
+    public function test_quota_command_rejects_invalid_owner_before_writing(): void
+    {
+        $container = $this->container();
+        $tester = new CommandTester($this->service($container, S3ServerQuotaCommand::class));
+
+        self::assertSame(Command::FAILURE, $tester->execute([
+            'action' => 'set',
+            'owner-id' => "tenant\x00hidden",
+        ]));
+        self::assertStringContainsString('Owner ID must contain 1 to 255 bytes', $tester->getDisplay());
+        $metadata = $this->service($container, MetadataStore::class);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        self::assertSame([], $metadata->listAccountQuotas());
+    }
+
     public function test_flysystem_storage_can_reference_symfony_service(): void
     {
         $container = new ContainerBuilder();

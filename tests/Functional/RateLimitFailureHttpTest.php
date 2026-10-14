@@ -39,6 +39,13 @@ final class RateLimitFailureHttpTest extends S3FunctionalTestCase
         self::assertSame(503, $readiness->getStatusCode());
         self::assertSame('{"status":"degraded"}', (string) $readiness->getBody());
 
+        $metrics = $http->get('/.metrics');
+        self::assertSame(503, $metrics->getStatusCode());
+        self::assertSame('no-store', $metrics->getHeaderLine('cache-control'));
+        self::assertStringStartsWith('text/plain', $metrics->getHeaderLine('content-type'));
+        self::assertSame('1', $metrics->getHeaderLine('retry-after'));
+        self::assertSame('Service Unavailable', (string) $metrics->getBody());
+
         try {
             self::$s3->listBuckets();
             self::fail('An S3 request must not bypass a failed configured rate-limit check.');
