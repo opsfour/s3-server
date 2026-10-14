@@ -7,7 +7,9 @@ namespace OpsFour\S3Server\Handler\Bucket;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Exception\CrossLocationLoggingProhibitedException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
+use OpsFour\S3Server\Exception\InvalidTargetBucketForLoggingException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
@@ -81,10 +83,10 @@ final class PutBucketLoggingHandler implements RequestHandler
 
             $targetBucketInfo = $this->metadata->getBucket($targetBucket);
             if ($targetBucketInfo === null || $targetBucketInfo->ownerId !== $bucketInfo->ownerId) {
-                throw new NoSuchBucketException();
+                throw new InvalidTargetBucketForLoggingException();
             }
             if ($targetBucketInfo->region !== $bucketInfo->region) {
-                throw new InvalidRequestException('Logging target bucket must be in the same region as the source bucket.');
+                throw new CrossLocationLoggingProhibitedException();
             }
             if ($this->metadata->getObjectLockConfig($targetBucket) !== null) {
                 throw new InvalidRequestException('A bucket with Object Lock cannot be an access log target.');

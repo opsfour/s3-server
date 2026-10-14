@@ -478,8 +478,8 @@ final class AuthorizationSecurityTest extends S3FunctionalTestCase
                 ]);
                 self::fail('A cross-region logging target must be rejected.');
             } catch (S3Exception $exception) {
-                self::assertSame(400, $exception->getStatusCode());
-                self::assertSame('InvalidRequest', $exception->getAwsErrorCode());
+                self::assertSame(403, $exception->getStatusCode());
+                self::assertSame('CrossLocationLoggingProhibited', $exception->getAwsErrorCode());
             }
             self::assertNull(self::$s3->getBucketLogging(['Bucket' => self::$bucket])['LoggingEnabled']);
         } finally {

@@ -10,10 +10,11 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Exception\InvalidTargetBucketForLoggingException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
-use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketLoggingHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use PHPUnit\Framework\TestCase;
 
 final class PutBucketLoggingHandlerTest extends TestCase
@@ -37,9 +38,45 @@ final class PutBucketLoggingHandlerTest extends TestCase
             try {
                 $handler->handleRequest($this->request('requester-target'));
                 self::fail('A target owned by another account was accepted.');
-            } catch (NoSuchBucketException) {
+            } catch (InvalidTargetBucketForLoggingException) {
             }
             self::assertSame($logging, $metadata->getBucketLogging('source'));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_invalid_targets_return_aws_compatible_wire_errors(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-logging-target-errors-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('source-owner', 'source', 'us-east-1');
+        $metadata->createBucket('another-owner', 'foreign-target', 'us-east-1');
+        $metadata->createBucket('source-owner', 'remote-target', 'eu-west-1');
+        $handler = new PutBucketLoggingHandler($metadata);
+
+        try {
+            foreach (['missing-target', 'foreign-target'] as $target) {
+                $response = (new ErrorHandlingMiddleware())->handleRequest($this->request($target), $handler);
+
+                self::assertSame(400, $response->getStatus());
+                self::assertStringContainsString(
+                    '<Code>InvalidTargetBucketForLogging</Code>',
+                    \Amp\ByteStream\buffer($response->getBody()),
+                );
+            }
+
+            $response = (new ErrorHandlingMiddleware())->handleRequest($this->request('remote-target'), $handler);
+
+            self::assertSame(403, $response->getStatus());
+            self::assertStringContainsString(
+                '<Code>CrossLocationLoggingProhibited</Code>',
+                \Amp\ByteStream\buffer($response->getBody()),
+            );
+            self::assertNull($metadata->getBucketLogging('source'));
         } finally {
             @unlink($path);
             @unlink($path . '-wal');
