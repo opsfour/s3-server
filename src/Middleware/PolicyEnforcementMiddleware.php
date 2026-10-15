@@ -9,8 +9,11 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -31,6 +34,14 @@ use OpsFour\S3Server\Xml\XmlRequestParser;
  */
 final class PolicyEnforcementMiddleware implements Middleware
 {
+    private const string MULTIPART_POLICY_CONTEXT_INPUT_ATTRIBUTE = 's3.multipartCompletionPolicyContextInput';
+
+    public const string MULTIPART_POLICY_CONTEXT_VERSION_KEY = '__mpu-policy-context-version';
+
+    public const string MULTIPART_POLICY_CONTEXT_HEADERS_KEY = '__mpu-policy-condition-headers';
+
+    public const string MULTIPART_POLICY_CONTEXT_VERSION = '1';
+
     public function __construct(
         private readonly MetadataStore $metadata,
     ) {}
@@ -39,6 +50,154 @@ final class PolicyEnforcementMiddleware implements Middleware
     public function assertAllowedAtCommit(Request $request): void
     {
         $this->assertAllowedWithLockedPolicies($request, false);
+    }
+
+    /**
+     * Recheck the options that will actually be published by a multipart
+     * completion. CompleteMultipartUpload carries only the upload ID; its
+     * tags, ACL, and Object Lock settings were supplied at initiation.
+     *
+     * @param array<string, string> $uploadMetadata
+     * @param list<array{key: string, value: string}> $tags
+     * @param list<array{granteeType: string, granteeId: string, permission: string}> $aclGrants
+     */
+    public function assertMultipartCompletionAllowedAtCommit(
+        Request $request,
+        array $uploadMetadata,
+        array $tags,
+        array $aclGrants,
+    ): void {
+        // Direct handler callers do not have an ingress authorization decision.
+        // Preserve their validation contract without pretending to authorize them.
+        if (! $request->hasAttribute('s3.policyResult')) {
+            $this->attachMultipartCompletionContext($request, $uploadMetadata, $tags, $aclGrants);
+
+            return;
+        }
+
+        $request->setAttribute(self::MULTIPART_POLICY_CONTEXT_INPUT_ATTRIBUTE, [
+            'metadata' => $uploadMetadata,
+            'tags' => $tags,
+            'aclGrants' => $aclGrants,
+        ]);
+        try {
+            $this->assertAllowedAtCommit($request);
+        } finally {
+            $request->removeAttribute(self::MULTIPART_POLICY_CONTEXT_INPUT_ATTRIBUTE);
+        }
+    }
+
+    /**
+     * @param array<string, string> $uploadMetadata
+     * @param list<array{key: string, value: string}> $tags
+     * @param list<array{granteeType: string, granteeId: string, permission: string}> $aclGrants
+     */
+    private function attachMultipartCompletionContext(Request $request, array $uploadMetadata, array $tags, array $aclGrants): void
+    {
+        $ownerId = (string) $request->getAttribute('ownerId');
+        $requestTags = [];
+        foreach ($tags as $tag) {
+            $requestTags[$tag['key']] = $tag['value'];
+        }
+        if (($uploadMetadata[self::MULTIPART_POLICY_CONTEXT_VERSION_KEY] ?? null) !== self::MULTIPART_POLICY_CONTEXT_VERSION) {
+            throw new OperationAbortedException(
+                'This multipart upload predates exact policy-context snapshots; abort it and initiate a new upload.',
+            );
+        }
+        try {
+            $headers = json_decode(
+                $uploadMetadata[self::MULTIPART_POLICY_CONTEXT_HEADERS_KEY] ?? '',
+                true,
+                8,
+                JSON_THROW_ON_ERROR,
+            );
+        } catch (\JsonException $error) {
+            throw new InternalErrorException('Multipart upload policy header snapshot is invalid.', $error);
+        }
+        if (! is_array($headers)) {
+            throw new InternalErrorException('Multipart upload policy header snapshot is invalid.');
+        }
+        $allowedHeaders = [
+            'x-amz-acl' => true,
+            'x-amz-server-side-encryption' => true,
+            'x-amz-storage-class' => true,
+        ];
+        foreach ($headers as $header => $value) {
+            if (! is_string($header) || ! isset($allowedHeaders[$header]) || ! is_string($value) || $value === '') {
+                throw new InternalErrorException('Multipart upload policy header snapshot is invalid.');
+            }
+        }
+
+        $hasExplicitAcl = isset($uploadMetadata['__mpu-acl-explicit']);
+        $storedAclHeader = $uploadMetadata['__mpu-acl-header'] ?? null;
+        $snapshotAclHeader = $headers['x-amz-acl'] ?? null;
+        if (($hasExplicitAcl && $uploadMetadata['__mpu-acl-explicit'] !== '1')
+            || ($snapshotAclHeader !== null
+                && (! $hasExplicitAcl || $storedAclHeader !== $snapshotAclHeader))
+            || ($storedAclHeader !== null && $snapshotAclHeader !== $storedAclHeader)) {
+            throw new InternalErrorException('Multipart upload ACL policy snapshot is inconsistent.');
+        }
+        if ($snapshotAclHeader !== null) {
+            $cachedBucketOwner = $request->hasAttribute('s3.cachedBucketOwner')
+                ? $request->getAttribute('s3.cachedBucketOwner')
+                : null;
+            $bucketOwner = is_string($cachedBucketOwner)
+                ? $cachedBucketOwner
+                : $this->metadata->getBucketOwner((string) $request->getAttribute('s3.bucket'));
+            try {
+                $aclRequest = clone $request;
+                foreach (array_keys($aclRequest->getHeaders()) as $header) {
+                    $header = strtolower($header);
+                    if ($header === 'x-amz-acl' || str_starts_with($header, 'x-amz-grant-')) {
+                        $aclRequest->removeHeader($header);
+                    }
+                }
+                $aclRequest->setHeader('x-amz-acl', $snapshotAclHeader);
+                $expectedAclGrants = AclGrantResolver::fromHeaders(
+                    $aclRequest,
+                    $ownerId,
+                    'object',
+                    $bucketOwner,
+                );
+            } catch (\OpsFour\S3Server\Exception\InvalidArgumentException $error) {
+                throw new InternalErrorException('Multipart upload ACL policy snapshot is invalid.', $error);
+            }
+            if ($expectedAclGrants === null || $aclGrants !== $expectedAclGrants) {
+                throw new InternalErrorException('Multipart upload ACL policy snapshot is inconsistent.');
+            }
+        } elseif (! $hasExplicitAcl && $aclGrants !== AclGrantResolver::privateAcl($ownerId)) {
+            throw new InternalErrorException('Multipart upload ACL policy snapshot is inconsistent.');
+        }
+
+        $snapshotSse = $headers['x-amz-server-side-encryption'] ?? null;
+        if ($snapshotSse !== null
+            && ($snapshotSse !== 'AES256' || ($uploadMetadata['__sse-algorithm'] ?? null) !== 'AES256')) {
+            throw new InternalErrorException('Multipart upload encryption policy snapshot is inconsistent.');
+        }
+
+        $snapshotStorageClass = $headers['x-amz-storage-class'] ?? null;
+        $effectiveStorageClass = $uploadMetadata['__mpu-storage-class'] ?? 'STANDARD';
+        if ($snapshotStorageClass !== null) {
+            try {
+                $validatedStorageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($snapshotStorageClass);
+            } catch (\OpsFour\S3Server\Exception\InvalidArgumentException $error) {
+                throw new InternalErrorException('Multipart upload storage-class policy snapshot is invalid.', $error);
+            }
+            if ($validatedStorageClass !== $effectiveStorageClass) {
+                throw new InternalErrorException('Multipart upload storage-class policy snapshot is inconsistent.');
+            }
+        } elseif ($effectiveStorageClass !== 'STANDARD') {
+            throw new InternalErrorException('Multipart upload storage-class policy snapshot is inconsistent.');
+        }
+
+        $request->setAttribute('s3.multipartCompletionPolicyContext', [
+            'tags' => $requestTags,
+            'headers' => $headers,
+            'hasAcl' => $hasExplicitAcl,
+            'hasRetention' => isset($uploadMetadata['__object-lock-mode'])
+                || isset($uploadMetadata['__object-lock-retain-until-date']),
+            'hasLegalHold' => isset($uploadMetadata['__object-lock-legal-hold']),
+        ]);
     }
 
     /** Recheck read authorization under a shared owner-lock transaction. */
@@ -141,6 +300,59 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        $multipartPolicyContextError = null;
+        if ($operation === S3Operation::CompleteMultipartUpload) {
+            $contextInput = $request->hasAttribute(self::MULTIPART_POLICY_CONTEXT_INPUT_ATTRIBUTE)
+                ? $request->getAttribute(self::MULTIPART_POLICY_CONTEXT_INPUT_ATTRIBUTE)
+                : null;
+            if (is_array($contextInput)) {
+                // A commit-time metadata snapshot supersedes the ingress snapshot.
+                if ($request->hasAttribute('s3.multipartCompletionPolicyContext')) {
+                    $request->removeAttribute('s3.multipartCompletionPolicyContext');
+                }
+                try {
+                    /** @var array<string, string> $uploadMetadata */
+                    $uploadMetadata = $contextInput['metadata'];
+                    /** @var list<array{key: string, value: string}> $tags */
+                    $tags = $contextInput['tags'];
+                    /** @var list<array{granteeType: string, granteeId: string, permission: string}> $aclGrants */
+                    $aclGrants = $contextInput['aclGrants'];
+                    $this->attachMultipartCompletionContext($request, $uploadMetadata, $tags, $aclGrants);
+                } catch (OperationAbortedException|InternalErrorException $error) {
+                    $multipartPolicyContextError = $error;
+                } catch (\Throwable $error) {
+                    $multipartPolicyContextError = new InternalErrorException(
+                        'Multipart upload policy options are invalid.',
+                        $error,
+                    );
+                }
+            } elseif (! $request->hasAttribute('s3.multipartCompletionPolicyContext')) {
+                $upload = $this->metadata->getMultipartUpload($queryParams['uploadId'] ?? '');
+                if ($upload !== null && $upload['bucket'] === $bucket && $upload['key_name'] === $key
+                    && $upload['owner_id'] === $ownerId
+                    && ($upload['bucket_generation'] ?? '') === $bucketInfo?->generation) {
+                    try {
+                        $uploadMetadata = $upload['user_metadata'];
+                        /** @var list<array{key: string, value: string}> $tags */
+                        $tags = isset($uploadMetadata['__mpu-tags'])
+                            ? ObjectTagValidator::validate(json_decode($uploadMetadata['__mpu-tags'], true, 16, JSON_THROW_ON_ERROR), 10)
+                            : [];
+                        /** @var list<array{granteeType: string, granteeId: string, permission: string}> $aclGrants */
+                        $aclGrants = isset($uploadMetadata['__mpu-acl-grants'])
+                            ? AclGrantResolver::validateGrants(json_decode($uploadMetadata['__mpu-acl-grants'], true, 16, JSON_THROW_ON_ERROR))
+                            : AclGrantResolver::privateAcl((string) $ownerId);
+                        $this->attachMultipartCompletionContext($request, $uploadMetadata, $tags, $aclGrants);
+                    } catch (OperationAbortedException|InternalErrorException $error) {
+                        $multipartPolicyContextError = $error;
+                    } catch (\Throwable $error) {
+                        $multipartPolicyContextError = new InternalErrorException(
+                            'Multipart upload policy options are invalid.',
+                            $error,
+                        );
+                    }
+                }
+            }
+        }
         if ($operation === S3Operation::SelectObjectContent && array_key_exists('versionId', $queryParams)) {
             throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
                 'versionId is not supported for S3 Select.',
@@ -221,7 +433,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         foreach (['x-amz-acl', 'x-amz-server-side-encryption', 'x-amz-storage-class'] as $header) {
-            $value = $request->getHeader($header);
+            $value = $this->writeOptionHeader($request, $operation, $header);
             if ($value !== null && $value !== '') {
                 $conditions['s3:' . $header] = $value;
             }
@@ -408,7 +620,7 @@ final class PolicyEnforcementMiddleware implements Middleware
                 $identityResult === 'Allow' || $resourceResult === 'Allow' ? 'Allow' : 'OwnerBypass',
             );
 
-            return $requestHandler->handleRequest($request);
+            return $this->dispatchAuthorizedRequest($request, $requestHandler, $multipartPolicyContextError);
         }
 
         // An identity policy owned by another account cannot grant access to
@@ -421,6 +633,30 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         $request->setAttribute('s3.policyResult', $result);
+
+        return $this->dispatchAuthorizedRequest($request, $requestHandler, $multipartPolicyContextError);
+    }
+
+    private function dispatchAuthorizedRequest(
+        Request $request,
+        RequestHandler $requestHandler,
+        OperationAbortedException|InternalErrorException|null $multipartPolicyContextError,
+    ): Response {
+        if ($multipartPolicyContextError !== null) {
+            // Complete the ordinary authorization boundary before exposing
+            // whether an owned multipart upload has legacy or corrupt context.
+            (new AclEnforcementMiddleware($this->metadata))->handleRequest(
+                $request,
+                new class implements RequestHandler {
+                    public function handleRequest(Request $request): Response
+                    {
+                        return new Response(204);
+                    }
+                },
+            );
+
+            throw $multipartPolicyContextError;
+        }
 
         return $requestHandler->handleRequest($request);
     }
@@ -547,27 +783,45 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         $authorizer = new AdditionalActionAuthorizer($this->metadata);
+        $completion = $operation === S3Operation::CompleteMultipartUpload
+            && $request->hasAttribute('s3.multipartCompletionPolicyContext')
+            ? $request->getAttribute('s3.multipartCompletionPolicyContext') : null;
+        $completion = is_array($completion) ? $completion : null;
+        if ($operation === S3Operation::CompleteMultipartUpload && $completion === null) {
+            // Completion-time headers cannot replace the initiation snapshot.
+            return;
+        }
+        $conditionHeaders = $completion['headers'] ?? null;
         $tags = [];
         foreach ($requestTags as $tagKey => $tagValue) {
             $tags[] = ['key' => $tagKey, 'value' => $tagValue];
         }
         if ($tags !== [] && $operation !== S3Operation::CopyObject) {
-            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectTagging', $tags);
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectTagging', $tags, $conditionHeaders);
         }
-        if ($request->getHeader('x-amz-acl') !== null
+        $hasAcl = $completion !== null ? $completion['hasAcl'] : (
+            $request->getHeader('x-amz-acl') !== null
             || $request->getHeader('x-amz-grant-read') !== null
             || $request->getHeader('x-amz-grant-write') !== null
             || $request->getHeader('x-amz-grant-full-control') !== null
             || $request->getHeader('x-amz-grant-read-acp') !== null
-            || $request->getHeader('x-amz-grant-write-acp') !== null) {
-            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectAcl', $tags);
+            || $request->getHeader('x-amz-grant-write-acp') !== null
+        );
+        if ($hasAcl) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectAcl', $tags, $conditionHeaders);
         }
-        if ($request->getHeader('x-amz-object-lock-mode') !== null
-            || $request->getHeader('x-amz-object-lock-retain-until-date') !== null) {
-            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectRetention', $tags);
+        $hasRetention = $completion !== null ? $completion['hasRetention'] : (
+            $request->getHeader('x-amz-object-lock-mode') !== null
+            || $request->getHeader('x-amz-object-lock-retain-until-date') !== null
+        );
+        if ($hasRetention) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectRetention', $tags, $conditionHeaders);
         }
-        if ($request->getHeader('x-amz-object-lock-legal-hold') !== null) {
-            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectLegalHold', $tags);
+        $hasLegalHold = $completion !== null
+            ? $completion['hasLegalHold']
+            : $request->getHeader('x-amz-object-lock-legal-hold') !== null;
+        if ($hasLegalHold) {
+            $authorizer->assertAllowed($request, $bucket, $key, 's3:PutObjectLegalHold', $tags, $conditionHeaders);
         }
     }
 
@@ -576,6 +830,15 @@ final class PolicyEnforcementMiddleware implements Middleware
      */
     private function requestObjectTags(Request $request, S3Operation $operation): array
     {
+        $completion = $operation === S3Operation::CompleteMultipartUpload
+            && $request->hasAttribute('s3.multipartCompletionPolicyContext')
+            ? $request->getAttribute('s3.multipartCompletionPolicyContext') : null;
+        if (is_array($completion)) {
+            return $completion['tags'];
+        }
+        if ($operation === S3Operation::CompleteMultipartUpload) {
+            return [];
+        }
         $tags = [];
 
         $taggingHeader = $request->getHeader('x-amz-tagging');
@@ -598,6 +861,21 @@ final class PolicyEnforcementMiddleware implements Middleware
         }
 
         return $tags;
+    }
+
+    private function writeOptionHeader(Request $request, S3Operation $operation, string $header): ?string
+    {
+        $completion = $operation === S3Operation::CompleteMultipartUpload
+            && $request->hasAttribute('s3.multipartCompletionPolicyContext')
+            ? $request->getAttribute('s3.multipartCompletionPolicyContext') : null;
+        if (is_array($completion)) {
+            return $completion['headers'][$header] ?? null;
+        }
+        if ($operation === S3Operation::CompleteMultipartUpload) {
+            return null;
+        }
+
+        return $request->getHeader($header);
     }
 
     /**
@@ -644,8 +922,8 @@ final class PolicyEnforcementMiddleware implements Middleware
             S3Operation::DeleteBucketLifecycle => 's3:PutLifecycleConfiguration',
             S3Operation::GetBucketNotification => 's3:GetBucketNotification',
             S3Operation::PutBucketNotification => 's3:PutBucketNotification',
-            S3Operation::GetObjectLockConfig => 's3:GetObjectLockConfiguration',
-            S3Operation::PutObjectLockConfig => 's3:PutObjectLockConfiguration',
+            S3Operation::GetObjectLockConfig => 's3:GetBucketObjectLockConfiguration',
+            S3Operation::PutObjectLockConfig => 's3:PutBucketObjectLockConfiguration',
             S3Operation::GetObjectRetention => 's3:GetObjectRetention',
             S3Operation::PutObjectRetention => 's3:PutObjectRetention',
             S3Operation::GetObjectLegalHold => 's3:GetObjectLegalHold',

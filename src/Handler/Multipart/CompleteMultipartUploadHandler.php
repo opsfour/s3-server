@@ -511,6 +511,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $userMetadata['__mpu-cache-control'],
             $userMetadata['__mpu-storage-class'],
             $userMetadata['__mpu-acl-grants'],
+            $userMetadata['__mpu-acl-explicit'],
+            $userMetadata['__mpu-acl-header'],
+            $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY],
+            $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY],
             $userMetadata['__mpu-tags'],
             $userMetadata['__mpu-part-format'],
             $userMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY],
@@ -585,8 +589,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                             'Bucket versioning changed while the multipart upload was being committed.',
                         );
                     }
-                    (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
-                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
+                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier, $upload['user_metadata']);
+                    (new PolicyEnforcementMiddleware($this->metadata))->assertMultipartCompletionAllowedAtCommit(
+                        $request,
+                        $upload['user_metadata'],
+                        $tags,
+                        $aclGrants,
+                    );
                     $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
                     $this->quotas?->assertCanWriteObject(
                         $storedOwnerId,
@@ -693,8 +702,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                             'Bucket versioning changed while the multipart upload was being committed.',
                         );
                     }
-                    (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
-                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier);
+                    $this->assertUploadIsActive($uploadId, $bucket, $key, $ownerId, $bucketInfo->generation, $intent->storageTier, $upload['user_metadata']);
+                    (new PolicyEnforcementMiddleware($this->metadata))->assertMultipartCompletionAllowedAtCommit(
+                        $request,
+                        $upload['user_metadata'],
+                        $tags,
+                        $aclGrants,
+                    );
                     $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
                     $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
                     $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
@@ -1105,6 +1119,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         }
     }
 
+    /** @param array<string, string>|null $expectedMetadata */
     private function assertUploadIsActive(
         string $uploadId,
         string $bucket,
@@ -1112,6 +1127,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         string $ownerId,
         string $bucketGeneration,
         string $storageTier,
+        ?array $expectedMetadata = null,
     ): void {
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if (
@@ -1130,6 +1146,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         if (($upload['storage_tier'] ?? null) !== $storageTier) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                 'Multipart upload storage tier changed during completion.',
+            );
+        }
+        if ($expectedMetadata !== null && $upload['user_metadata'] !== $expectedMetadata) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Multipart upload options changed during completion.',
             );
         }
     }

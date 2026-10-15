@@ -1752,6 +1752,183 @@ final class AuthorizationSecurityTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_multipart_completion_rechecks_persisted_tag_and_acl_permissions(): void
+    {
+        foreach ([
+            's3:PutObjectTagging' => ['Tagging' => 'stage=ready'],
+            's3:PutObjectAcl' => ['ACL' => 'public-read'],
+        ] as $action => $option) {
+            $key = 'multipart-revoke-' . str_replace(':', '-', $action) . '.txt';
+            $uploadId = self::$s3->createMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+            ] + $option)['UploadId'];
+            $part = self::$s3->uploadPart([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 1,
+                'Body' => 'pending payload',
+            ]);
+            $completion = [
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ];
+
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode([
+                    'Version' => '2012-10-17',
+                    'Statement' => [[
+                        'Effect' => 'Deny',
+                        'Principal' => '*',
+                        'Action' => $action,
+                        'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $key,
+                    ]],
+                ], JSON_THROW_ON_ERROR),
+            ]);
+            try {
+                try {
+                    self::$s3->completeMultipartUpload($completion);
+                    self::fail("Revoked {$action} must prevent multipart completion.");
+                } catch (S3Exception $error) {
+                    self::assertSame('AccessDenied', $error->getAwsErrorCode(), $action);
+                }
+                self::assertCount(1, self::$s3->listParts([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                ])['Parts']);
+            } finally {
+                self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+            }
+            try {
+                self::$s3->completeMultipartUpload($completion);
+                self::assertSame('pending payload', (string) self::$s3->getObject([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                ])['Body']);
+            } finally {
+                self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            }
+        }
+    }
+
+    public function test_multipart_completion_rechecks_persisted_object_lock_permissions(): void
+    {
+        $bucket = 'multipart-lock-revoke-' . bin2hex(random_bytes(4));
+        self::$s3->createBucket(['Bucket' => $bucket, 'ObjectLockEnabledForBucket' => true]);
+        try {
+            foreach ([
+                's3:PutObjectRetention' => [
+                    'ObjectLockMode' => 'GOVERNANCE',
+                    'ObjectLockRetainUntilDate' => new \DateTimeImmutable('+1 day'),
+                ],
+                's3:PutObjectLegalHold' => ['ObjectLockLegalHoldStatus' => 'ON'],
+            ] as $action => $option) {
+                $key = str_replace(':', '-', $action) . '.txt';
+                $uploadId = self::$s3->createMultipartUpload([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                ] + $option)['UploadId'];
+                $part = self::$s3->uploadPart([
+                    'Bucket' => $bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'PartNumber' => 1,
+                    'Body' => 'pending lock payload',
+                    'ChecksumAlgorithm' => 'SHA256',
+                ]);
+                self::$s3->putBucketPolicy([
+                    'Bucket' => $bucket,
+                    'Policy' => json_encode([
+                        'Version' => '2012-10-17',
+                        'Statement' => [[
+                            'Effect' => 'Deny',
+                            'Principal' => '*',
+                            'Action' => $action,
+                            'Resource' => 'arn:aws:s3:::' . $bucket . '/' . $key,
+                        ]],
+                    ], JSON_THROW_ON_ERROR),
+                ]);
+                try {
+                    try {
+                        self::$s3->completeMultipartUpload([
+                            'Bucket' => $bucket,
+                            'Key' => $key,
+                            'UploadId' => $uploadId,
+                            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+                        ]);
+                        self::fail("Revoked {$action} must prevent multipart completion.");
+                    } catch (S3Exception $error) {
+                        self::assertSame('AccessDenied', $error->getAwsErrorCode(), $action);
+                    }
+                    self::assertCount(1, self::$s3->listParts([
+                        'Bucket' => $bucket,
+                        'Key' => $key,
+                        'UploadId' => $uploadId,
+                    ])['Parts']);
+                } finally {
+                    self::$s3->deleteBucketPolicy(['Bucket' => $bucket]);
+                    self::$s3->abortMultipartUpload([
+                        'Bucket' => $bucket,
+                        'Key' => $key,
+                        'UploadId' => $uploadId,
+                    ]);
+                }
+            }
+        } finally {
+            self::deleteBucketWithDiagnostics($bucket);
+        }
+    }
+
+    public function test_multipart_completion_evaluates_request_tag_condition_from_initiation(): void
+    {
+        $key = 'multipart-tag-condition.txt';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Tagging' => 'stage=ready',
+        ])['UploadId'];
+        $part = self::$s3->uploadPart([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'tagged payload',
+        ]);
+        self::$s3->putBucketPolicy([
+            'Bucket' => self::$bucket,
+            'Policy' => json_encode([
+                'Version' => '2012-10-17',
+                'Statement' => [[
+                    'Effect' => 'Deny',
+                    'Principal' => '*',
+                    'Action' => 's3:PutObject',
+                    'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $key,
+                    'Condition' => ['Null' => ['s3:RequestObjectTag/stage' => 'true']],
+                ]],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+        try {
+            self::$s3->completeMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ]);
+            self::assertSame('ready', self::$s3->getObjectTagging([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+            ])['TagSet'][0]['Value']);
+        } finally {
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
     public function test_restrict_public_buckets_blocks_anonymous_public_policy_access(): void
     {
         self::$s3->putBucketPolicy([

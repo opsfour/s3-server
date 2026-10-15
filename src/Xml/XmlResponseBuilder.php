@@ -841,8 +841,8 @@ final class XmlResponseBuilder
             $writer->writeElement('KMSMasterKeyID', $config['kmsMasterKeyId']);
         }
         $writer->endElement(); // ApplyServerSideEncryptionByDefault
-        if (isset($config['bucketKeyEnabled']) && $config['bucketKeyEnabled']) {
-            $writer->writeElement('BucketKeyEnabled', 'true');
+        if (array_key_exists('bucketKeyEnabled', $config)) {
+            $writer->writeElement('BucketKeyEnabled', $config['bucketKeyEnabled'] ? 'true' : 'false');
         }
         $writer->endElement(); // Rule
         $writer->endElement(); // ServerSideEncryptionConfiguration

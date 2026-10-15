@@ -894,6 +894,58 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         return $bucket;
     }
 
+    public function test_foreign_multipart_writer_cannot_complete_after_tagging_grant_is_revoked(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'foreign-multipart-tags.txt';
+        $allow = [
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => ['s3:PutObject', 's3:PutObjectTagging'],
+            'Resource' => "arn:aws:s3:::{$bucket}/{$key}",
+        ];
+        $this->putPolicy($bucket, [$allow]);
+        $uploadId = self::$writer->createMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'Tagging' => 'scope=writer',
+        ])['UploadId'];
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'writer payload',
+        ]);
+        $this->putPolicy($bucket, [$allow, [
+            'Effect' => 'Deny',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => 's3:PutObjectTagging',
+            'Resource' => "arn:aws:s3:::{$bucket}/{$key}",
+        ]]);
+        try {
+            self::assertAccessDenied(fn() => self::$writer->completeMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ]));
+            self::assertCount(1, self::$writer->listParts([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ])['Parts']);
+        } finally {
+            self::$writer->abortMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ]);
+            self::$s3->deleteBucketPolicy(['Bucket' => $bucket]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
     /** @phpstan-impure */
     private function objectOwner(string $bucket, string $key): string
     {

@@ -258,6 +258,144 @@ final class ObjectMetadataPolicyCommitTest extends TestCase
         });
     }
 
+    public function test_revoked_bucket_policy_replaces_stale_no_such_key_error(): void
+    {
+        $this->assertRevokedReadAuthorizationReplacesHandlerError('bucket-policy');
+    }
+
+    public function test_revoked_identity_policy_replaces_stale_no_such_key_error(): void
+    {
+        $this->assertRevokedReadAuthorizationReplacesHandlerError('identity-policy');
+    }
+
+    public function test_ignore_public_acls_replaces_stale_no_such_key_error(): void
+    {
+        $this->assertAclChangeReplacesHandlerError(true);
+    }
+
+    public function test_revoked_object_acl_replaces_stale_no_such_key_error(): void
+    {
+        $this->assertAclChangeReplacesHandlerError(false);
+    }
+
+    private function assertAclChangeReplacesHandlerError(bool $enableIgnorePublicAcls): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata) use ($enableIgnorePublicAcls): void {
+            $action = 's3:GetObject';
+            $resource = 'arn:aws:s3:::bucket/key';
+            $metadata->putAccountPolicy('visitor', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow', 'Action' => $action, 'Resource' => $resource,
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $metadata->putAcl('object', 'bucket/key?versionId=null', 'owner', [[
+                'granteeType' => 'Group',
+                'granteeId' => 'http://acs.amazonaws.com/groups/global/AuthenticatedUsers',
+                'permission' => 'READ',
+            ]]);
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key', S3Operation::GetObject, 'visitor');
+            $acl = new AclEnforcementMiddleware($metadata);
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static fn(): Response => $acl->handleRequest($request, new class ($metadata, $request, $enableIgnorePublicAcls) implements RequestHandler {
+                        public function __construct(
+                            private readonly SqliteMetadataStore $metadata,
+                            private readonly Request $request,
+                            private readonly bool $enableIgnorePublicAcls,
+                        ) {}
+
+                        public function handleRequest(Request $request): Response
+                        {
+                            if ($this->enableIgnorePublicAcls) {
+                                $this->metadata->putPublicAccessBlock('bucket', false, true, false, false);
+                            } else {
+                                $this->metadata->putAcl('object', 'bucket/key?versionId=null', 'owner', [[
+                                    'granteeType' => 'CanonicalUser',
+                                    'granteeId' => 'owner',
+                                    'permission' => 'FULL_CONTROL',
+                                ]]);
+                            }
+
+                            return (new CurrentObjectReadAuthorizationMiddleware($this->metadata))->handleRequest(
+                                $this->request,
+                                new class implements RequestHandler {
+                                    public function handleRequest(Request $request): Response
+                                    {
+                                        throw new NoSuchKeyException();
+                                    }
+                                },
+                            );
+                        }
+                    }),
+                ));
+                self::fail('The ACL authorization change must replace the stale handler error with AccessDenied.');
+            } catch (AccessDeniedException) {
+                if ($enableIgnorePublicAcls) {
+                    self::assertTrue($metadata->getPublicAccessBlock('bucket')['ignorePublicAcls'] ?? false);
+                } else {
+                    self::assertSame('owner', $metadata->getAcl('object', 'bucket/key?versionId=null')[0]['granteeId']);
+                }
+            }
+        });
+    }
+
+    /** @param 'bucket-policy'|'identity-policy' $revocation */
+    private function assertRevokedReadAuthorizationReplacesHandlerError(string $revocation): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata) use ($revocation): void {
+            $action = 's3:GetObject';
+            $resource = 'arn:aws:s3:::bucket/key';
+            $metadata->putAccountPolicy('visitor', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow', 'Action' => $action, 'Resource' => $resource,
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $metadata->putBucketPolicy('bucket', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow', 'Principal' => ['AWS' => 'visitor'],
+                    'Action' => $action, 'Resource' => $resource,
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $request = $this->request('GET', 'http://127.0.0.1/bucket/key', S3Operation::GetObject, 'visitor');
+            $acl = new AclEnforcementMiddleware($metadata);
+
+            try {
+                (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+                    static fn(): Response => $acl->handleRequest($request, new class ($metadata, $request, $revocation) implements RequestHandler {
+                        public function __construct(
+                            private readonly SqliteMetadataStore $metadata,
+                            private readonly Request $request,
+                            private readonly string $revocation,
+                        ) {}
+
+                        public function handleRequest(Request $request): Response
+                        {
+                            if ($this->revocation === 'bucket-policy') {
+                                $this->metadata->deleteBucketPolicy('bucket');
+                            } else {
+                                $this->metadata->putAccountPolicy('visitor', '{"Statement":[]}');
+                            }
+
+                            return (new CurrentObjectReadAuthorizationMiddleware($this->metadata))->handleRequest(
+                                $this->request,
+                                new class implements RequestHandler {
+                                    public function handleRequest(Request $request): Response
+                                    {
+                                        throw new NoSuchKeyException();
+                                    }
+                                },
+                            );
+                        }
+                    }),
+                ));
+                self::fail("Revoked {$revocation} must replace the stale handler error with AccessDenied.");
+            } catch (AccessDeniedException) {
+                self::assertNotNull($metadata->getObjectMetadata('bucket', 'key'));
+            }
+        });
+    }
+
     private function assertChangedOwnerBlocksMetadataRead(S3Operation $operation): void
     {
         $this->withMetadata(function (SqliteMetadataStore $metadata) use ($operation): void {

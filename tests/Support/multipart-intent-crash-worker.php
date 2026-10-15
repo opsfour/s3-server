@@ -18,6 +18,7 @@ use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 
@@ -34,11 +35,17 @@ $bucket = $metadata->getBucket('bucket');
 if ($bucket === null) {
     throw new \RuntimeException('Crash fixture bucket was not created.');
 }
+$policyContext = [
+    PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY
+        => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+    PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+];
 $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner', userMetadata: $usesSse
     ? [
+        ...$policyContext,
         '__sse-algorithm' => EncryptionRequestResolver::SSE_S3,
         '__mpu-part-format' => EncryptedMultipartPartCodec::FORMAT,
-    ] : []);
+    ] : $policyContext);
 $plaintext = 'multipart bytes';
 $physicalPart = $plaintext;
 if ($usesSse) {

@@ -47,6 +47,10 @@ final class CreateMultipartUploadHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        $ownerId = (string) $request->getAttribute('ownerId');
+        if ($ownerId === '') {
+            throw new AccessDeniedException('Anonymous multipart uploads are not supported.');
+        }
         if ($request->getHeader('x-amz-checksum-algorithm') !== null
             || $request->getHeader('x-amz-checksum-type') !== null) {
             throw new NotImplementedException(
@@ -55,7 +59,6 @@ final class CreateMultipartUploadHandler implements RequestHandler
         }
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
@@ -112,6 +115,26 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $userMetadata = UserMetadataExtractor::extract($request);
         $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT;
         $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
+        foreach (['x-amz-acl', 'x-amz-grant-read', 'x-amz-grant-write', 'x-amz-grant-full-control', 'x-amz-grant-read-acp', 'x-amz-grant-write-acp'] as $aclHeader) {
+            if ($request->getHeader($aclHeader) !== null) {
+                $userMetadata['__mpu-acl-explicit'] = '1';
+                break;
+            }
+        }
+        if (($cannedAcl = $request->getHeader('x-amz-acl')) !== null) {
+            $userMetadata['__mpu-acl-header'] = $cannedAcl;
+        }
+        $policyConditionHeaders = [];
+        foreach (['x-amz-acl', 'x-amz-server-side-encryption', 'x-amz-storage-class'] as $header) {
+            $value = RequestHeaderValues::singleton($request, $header);
+            if ($value !== null) {
+                $policyConditionHeaders[$header] = $value;
+            }
+        }
+        $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY]
+            = PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION;
+        $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY]
+            = json_encode($policyConditionHeaders, JSON_THROW_ON_ERROR);
         $userMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY]
             = ObjectLockConfigurationSnapshot::fingerprint($objectLockConfig);
 

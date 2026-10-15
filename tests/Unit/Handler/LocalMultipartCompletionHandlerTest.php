@@ -21,6 +21,7 @@ use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
 use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
@@ -61,9 +62,10 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
                 'key',
                 'owner',
                 userMetadata: $encrypted ? [
+                    ...self::currentPolicyContext(),
                     '__sse-algorithm' => EncryptionRequestResolver::SSE_S3,
                     '__mpu-part-format' => EncryptedMultipartPartCodec::FORMAT,
-                ] : [],
+                ] : self::currentPolicyContext(),
             );
             $plaintext = 'local multipart payload';
             $partBody = $encrypted
@@ -91,6 +93,14 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertSame(200, $response->getStatus());
             $object = $metadata->getObjectMetadata('bucket', 'key');
             self::assertNotNull($object);
+            self::assertArrayNotHasKey(
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY,
+                $object->userMetadata,
+            );
+            self::assertArrayNotHasKey(
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY,
+                $object->userMetadata,
+            );
             $path = $object->systemMetadata['storagePath'] ?? null;
             self::assertIsString($path);
             self::assertStringEndsWith($encrypted ? '/final' : '/assembly', $path);
@@ -121,7 +131,13 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             $metadata->createBucket('owner', 'bucket', 'us-east-1');
             $storage->createBucket('bucket');
             $uploadId = bin2hex(random_bytes(16));
-            $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
+            $metadata->createMultipartUpload(
+                $uploadId,
+                'bucket',
+                'key',
+                'owner',
+                userMetadata: self::currentPolicyContext(),
+            );
             $decorated = new CallbackStorageBackend($storage);
 
             try {
@@ -155,7 +171,13 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             $metadata->createBucket('owner', 'bucket', 'us-east-1');
             $storage->createBucket('bucket');
             $uploadId = bin2hex(random_bytes(16));
-            $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
+            $metadata->createMultipartUpload(
+                $uploadId,
+                'bucket',
+                'key',
+                'owner',
+                userMetadata: self::currentPolicyContext(),
+            );
             $plaintext = 'retained after lost arm acknowledgement';
             $part = $storage->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer($plaintext));
             $etag = md5($plaintext);
@@ -226,7 +248,13 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             $metadata->createBucket('owner', 'bucket', 'us-east-1');
             $storage->createBucket('bucket');
             $uploadId = bin2hex(random_bytes(16));
-            $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
+            $metadata->createMultipartUpload(
+                $uploadId,
+                'bucket',
+                'key',
+                'owner',
+                userMetadata: self::currentPolicyContext(),
+            );
             $plaintext = 'retained multipart part';
             $part = $storage->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer($plaintext));
             $etag = md5($plaintext);
@@ -349,6 +377,16 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
         $request->setAttribute('s3.operation', S3Operation::CompleteMultipartUpload);
 
         return $request;
+    }
+
+    /** @return array<string, string> */
+    private static function currentPolicyContext(): array
+    {
+        return [
+            PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY
+                => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+            PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+        ];
     }
 
     private function removeDirectory(string $directory): void

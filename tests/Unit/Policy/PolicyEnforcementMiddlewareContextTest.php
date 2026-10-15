@@ -13,11 +13,14 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
+use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Bucket\DeleteBucketPolicyHandler;
 use OpsFour\S3Server\Handler\Bucket\PutBucketPolicyHandler;
 use OpsFour\S3Server\Handler\Multipart\AbortMultipartUploadHandler;
@@ -1663,6 +1666,271 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
     }
 
+    public function test_object_lock_configuration_uses_the_aws_identity_policy_action_names(): void
+    {
+        foreach ([
+            [S3Operation::GetObjectLockConfig, 'GET', 's3:GetBucketObjectLockConfiguration', 's3:GetObjectLockConfiguration'],
+            [S3Operation::PutObjectLockConfig, 'PUT', 's3:PutBucketObjectLockConfiguration', 's3:PutObjectLockConfiguration'],
+        ] as [$operation, $method, $awsAction, $legacyAction]) {
+            $this->metadata->putBucketPolicy('bucket', $this->policy([[
+                'Effect' => 'Allow', 'Principal' => ['AWS' => 'tenant:reader'],
+                'Action' => $awsAction, 'Resource' => 'arn:aws:s3:::bucket',
+            ]]));
+            $request = $this->request($method, '/bucket?object-lock');
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('s3.key', '');
+            $request->setAttribute('s3.operation', $operation);
+            $request->setAttribute('ownerId', 'tenant:reader');
+
+            $this->metadata->putAccountPolicy('tenant:reader', $this->policy([[
+                'Effect' => 'Allow', 'Action' => $awsAction, 'Resource' => 'arn:aws:s3:::bucket',
+            ]]));
+            self::assertSame(200, (new PolicyEnforcementMiddleware($this->metadata))
+                ->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+
+            $this->metadata->putAccountPolicy('tenant:reader', $this->policy([[
+                'Effect' => 'Allow', 'Action' => $legacyAction, 'Resource' => 'arn:aws:s3:::bucket',
+            ]]));
+            try {
+                (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+                self::fail("Legacy action {$legacyAction} authorized {$operation->value}.");
+            } catch (AccessDeniedException) {
+            }
+        }
+    }
+
+    public function test_object_lock_configuration_uses_the_aws_bucket_policy_action_name(): void
+    {
+        $resource = 'arn:aws:s3:::bucket';
+        $request = $this->request('GET', '/bucket?object-lock');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', '');
+        $request->setAttribute('s3.operation', S3Operation::GetObjectLockConfig);
+        $request->setAttribute('ownerId', 'tenant:reader');
+        $this->metadata->putAccountPolicy('tenant:reader', $this->policy([[
+            'Effect' => 'Allow', 'Action' => 's3:GetBucketObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow', 'Principal' => ['AWS' => 'tenant:reader'],
+            'Action' => 's3:GetObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+        $handler = \Amp\Http\Server\Middleware\stackMiddleware(
+            new PolicyTerminalHandler(),
+            new PolicyEnforcementMiddleware($this->metadata),
+            new AclEnforcementMiddleware($this->metadata),
+        );
+        try {
+            $handler->handleRequest($request);
+            self::fail('The legacy Object Lock action authorized a cross-account read.');
+        } catch (AccessDeniedException) {
+        }
+
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow', 'Principal' => ['AWS' => 'tenant:reader'],
+            'Action' => 's3:GetBucketObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+        self::assertSame(200, $handler->handleRequest($request)->getStatus());
+    }
+
+    public function test_object_lock_configuration_commit_recheck_uses_the_aws_action_name(): void
+    {
+        $resource = 'arn:aws:s3:::bucket';
+        $request = $this->request('PUT', '/bucket?object-lock');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', '');
+        $request->setAttribute('s3.operation', S3Operation::PutObjectLockConfig);
+        $request->setAttribute('ownerId', 'tenant:reader');
+        $this->metadata->putAccountPolicy('tenant:reader', $this->policy([[
+            'Effect' => 'Allow', 'Action' => 's3:PutBucketObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow', 'Principal' => ['AWS' => 'tenant:reader'],
+            'Action' => 's3:PutBucketObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+
+        $middleware = new PolicyEnforcementMiddleware($this->metadata);
+        self::assertSame(200, $middleware->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+
+        $this->metadata->putAccountPolicy('tenant:reader', $this->policy([[
+            'Effect' => 'Allow', 'Action' => 's3:PutObjectLockConfiguration', 'Resource' => $resource,
+        ]]));
+        $this->expectException(AccessDeniedException::class);
+        $middleware->assertAllowedAtCommit($request);
+    }
+
+    public function test_bucket_acl_write_commit_recheck_rejects_a_key_created_by_another_owner(): void
+    {
+        $this->metadata->putAcl('bucket', 'bucket', 'owner', [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'tenant:writer',
+            'permission' => 'WRITE',
+        ]]);
+        $request = $this->request('PUT', '/bucket/commit-new.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'commit-new.txt');
+        $request->setAttribute('s3.operation', S3Operation::PutObject);
+        $request->setAttribute('ownerId', 'tenant:writer');
+
+        $middleware = new PolicyEnforcementMiddleware($this->metadata);
+        self::assertSame(200, $middleware->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+        self::assertSame(200, (new AclEnforcementMiddleware($this->metadata))
+            ->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+
+        $this->metadata->putObjectMetadata(
+            bucket: 'bucket',
+            key: 'commit-new.txt',
+            ownerId: 'owner',
+            size: 4,
+            etag: '"etag"',
+            contentType: 'text/plain',
+            storagePath: 'bucket/commit-new.txt',
+        );
+
+        $this->expectException(AccessDeniedException::class);
+        $middleware->assertAllowedAtCommit($request);
+    }
+
+    public function test_account_policy_deny_precedes_legacy_multipart_context_error(): void
+    {
+        $this->metadata->createMultipartUpload('legacy-account-deny', 'bucket', 'legacy.txt', 'owner');
+        $this->metadata->putAccountPolicy('owner', $this->policy([[
+            'Effect' => 'Deny',
+            'Action' => 's3:PutObject',
+            'Resource' => 'arn:aws:s3:::bucket/legacy.txt',
+        ]]));
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest(
+            $this->multipartCompletionRequest('legacy-account-deny', 'legacy.txt'),
+            new PolicyTerminalHandler(),
+        );
+    }
+
+    public function test_named_policy_deny_precedes_corrupt_multipart_context_error(): void
+    {
+        $this->metadata->createMultipartUpload(
+            'corrupt-named-deny',
+            'bucket',
+            'corrupt.txt',
+            'owner',
+            userMetadata: [
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '{',
+            ],
+        );
+        $this->metadata->putNamedPolicy('deny-completion', $this->policy([[
+            'Effect' => 'Deny',
+            'Action' => 's3:PutObject',
+            'Resource' => 'arn:aws:s3:::bucket/corrupt.txt',
+        ]]));
+        $request = $this->multipartCompletionRequest('corrupt-named-deny', 'corrupt.txt');
+        $request->setAttribute('credential', new Credential(
+            accessKeyId: 'AKIAMPUDENY123456',
+            secretAccessKey: 'secret',
+            ownerId: 'owner',
+            policyNames: ['deny-completion'],
+        ));
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+    }
+
+    public function test_missing_base_permission_precedes_legacy_multipart_context_error(): void
+    {
+        $this->metadata->createMultipartUpload('legacy-no-access', 'bucket', 'foreign.txt', 'tenant:uploader');
+        $this->metadata->putAccountPolicy('tenant:uploader', $this->policy([[
+            'Effect' => 'Allow',
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/foreign.txt',
+        ]]));
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest(
+            $this->multipartCompletionRequest('legacy-no-access', 'foreign.txt', 'tenant:uploader'),
+            new PolicyTerminalHandler(),
+        );
+    }
+
+    public function test_authorized_owner_receives_specific_multipart_context_errors(): void
+    {
+        $middleware = new PolicyEnforcementMiddleware($this->metadata);
+
+        $this->metadata->createMultipartUpload('legacy-allowed', 'bucket', 'legacy.txt', 'owner');
+        try {
+            $middleware->handleRequest(
+                $this->multipartCompletionRequest('legacy-allowed', 'legacy.txt'),
+                new PolicyTerminalHandler(),
+            );
+            self::fail('An authorized legacy multipart upload must require re-initiation.');
+        } catch (OperationAbortedException $error) {
+            self::assertStringContainsString('initiate a new upload', $error->getMessage());
+        }
+
+        $this->metadata->createMultipartUpload(
+            'corrupt-allowed',
+            'bucket',
+            'corrupt.txt',
+            'owner',
+            userMetadata: [
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '{',
+            ],
+        );
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('policy header snapshot is invalid');
+        $middleware->handleRequest(
+            $this->multipartCompletionRequest('corrupt-allowed', 'corrupt.txt'),
+            new PolicyTerminalHandler(),
+        );
+    }
+
+    public function test_valid_multipart_context_reaches_authorized_handler(): void
+    {
+        $this->metadata->createMultipartUpload(
+            'valid-context',
+            'bucket',
+            'valid.txt',
+            'owner',
+            userMetadata: [
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+                '__mpu-acl-grants' => json_encode(AclGrantResolver::privateAcl('owner'), JSON_THROW_ON_ERROR),
+            ],
+        );
+        $request = $this->multipartCompletionRequest('valid-context', 'valid.txt');
+
+        $response = (new PolicyEnforcementMiddleware($this->metadata))->handleRequest(
+            $request,
+            new PolicyTerminalHandler(),
+        );
+
+        self::assertSame(200, $response->getStatus());
+        self::assertIsArray($request->getAttribute('s3.multipartCompletionPolicyContext'));
+    }
+
+    public function test_commit_recheck_denial_precedes_newly_corrupt_multipart_context(): void
+    {
+        $request = $this->multipartCompletionRequest('commit-snapshot', 'commit.txt');
+        $request->setAttribute('s3.policyResult', 'OwnerBypass');
+        $this->metadata->putAccountPolicy('owner', $this->policy([[
+            'Effect' => 'Deny',
+            'Action' => 's3:PutObject',
+            'Resource' => 'arn:aws:s3:::bucket/commit.txt',
+        ]]));
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->assertMultipartCompletionAllowedAtCommit(
+            $request,
+            [
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '{',
+            ],
+            [],
+            AclGrantResolver::privateAcl('owner'),
+        );
+    }
+
     public function test_every_operation_maps_to_the_expected_iam_action(): void
     {
         $expectedGroups = [
@@ -1699,8 +1967,8 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
                 S3Operation::PutBucketEncryption,
                 S3Operation::DeleteBucketEncryption,
             ],
-            's3:GetObjectLockConfiguration' => [S3Operation::GetObjectLockConfig],
-            's3:PutObjectLockConfiguration' => [S3Operation::PutObjectLockConfig],
+            's3:GetBucketObjectLockConfiguration' => [S3Operation::GetObjectLockConfig],
+            's3:PutBucketObjectLockConfiguration' => [S3Operation::PutObjectLockConfig],
             's3:ListBucketMultipartUploads' => [S3Operation::ListMultipartUploads],
             's3:DeleteObject' => [S3Operation::DeleteObject, S3Operation::DeleteObjects],
             's3:PutObject' => [
@@ -1777,6 +2045,17 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
             $headers,
             $body,
         );
+    }
+
+    private function multipartCompletionRequest(string $uploadId, string $key, string $ownerId = 'owner'): Request
+    {
+        $request = $this->request('POST', '/bucket/' . $key . '?uploadId=' . $uploadId);
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', $key);
+        $request->setAttribute('s3.operation', S3Operation::CompleteMultipartUpload);
+        $request->setAttribute('ownerId', $ownerId);
+
+        return $request;
     }
 
     /**

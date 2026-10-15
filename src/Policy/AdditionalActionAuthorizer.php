@@ -20,8 +20,9 @@ final readonly class AdditionalActionAuthorizer
 
     /**
      * @param list<array{key: string, value: string}> $requestTags
+     * @param array<string, string>|null $conditionHeaders
      */
-    public function assertAllowed(Request $request, string $bucket, string $key, string $action, array $requestTags = []): void
+    public function assertAllowed(Request $request, string $bucket, string $key, string $action, array $requestTags = [], ?array $conditionHeaders = null): void
     {
         $ownerId = $request->hasAttribute('ownerId') ? (string) $request->getAttribute('ownerId') : '';
         $bucketOwner = $this->metadata->getBucketOwner($bucket);
@@ -45,7 +46,9 @@ final readonly class AdditionalActionAuthorizer
             $conditions['aws:UserAgent'] = $userAgent;
         }
         foreach (['x-amz-acl', 'x-amz-server-side-encryption', 'x-amz-storage-class'] as $header) {
-            $value = $request->getHeader($header);
+            $value = $conditionHeaders !== null
+                ? ($conditionHeaders[$header] ?? null)
+                : $request->getHeader($header);
             if ($value !== null && $value !== '') {
                 $conditions['s3:' . $header] = $value;
             }

@@ -94,6 +94,8 @@ final class EncryptionLifecycleNotificationTest extends S3FunctionalTestCase
         $rules = $getResult['ServerSideEncryptionConfiguration']['Rules'] ?? [];
         $this->assertNotEmpty($rules);
         $this->assertSame('AES256', $rules[0]['ApplyServerSideEncryptionByDefault']['SSEAlgorithm']);
+        $this->assertArrayHasKey('BucketKeyEnabled', $rules[0]);
+        $this->assertFalse($rules[0]['BucketKeyEnabled']);
     }
 
     public function test_aes256_kms_fields_are_rejected_without_changing_existing_encryption(): void

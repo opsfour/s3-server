@@ -122,6 +122,20 @@ final class StoredBucketEncryptionConfigurationTest extends TestCase
         }
     }
 
+    public function test_get_bucket_encryption_serializes_disabled_bucket_key_as_false(): void
+    {
+        $this->metadata->putBucketEncryption('bucket', 'AES256', null, false);
+
+        $response = (new GetBucketEncryptionHandler($this->metadata))->handleRequest($this->request('GET'));
+        $xml = \Amp\ByteStream\buffer($response->getBody());
+
+        self::assertSame(200, $response->getStatus());
+        self::assertStringContainsString('<BucketKeyEnabled>false</BucketKeyEnabled>', $xml);
+        $document = simplexml_load_string($xml);
+        self::assertInstanceOf(\SimpleXMLElement::class, $document);
+        self::assertSame('false', (string) $document->Rule->BucketKeyEnabled);
+    }
+
     public function test_repeated_encryption_control_headers_are_rejected(): void
     {
         foreach ([
