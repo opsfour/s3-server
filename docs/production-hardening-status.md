@@ -87,6 +87,9 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
 - [x] Background tasks and worker pools stop in deterministic order.
 - [x] Startup failures and stop-before-start paths also release storage,
   metadata, select, encryption, and request-spool worker resources.
+- [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
+  SIGTERM watchers before opening the listener and remove them when startup
+  fails, closing the unhandled-signal window at the listener boundary.
 - [x] Runtime shutdown is idempotent across standalone, Laravel, Symfony, and
   programmatic entry points.
 - [x] TLS, timeout, graceful-shutdown, repeated start/stop, and soak tests pass.

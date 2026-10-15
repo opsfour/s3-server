@@ -28,6 +28,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   for custom metadata backends.
 - Add encrypted multipart parts and authenticated encrypted temporary request
   spools.
+- Add an internal, listenerless EFS candidate pre-bind runtime that owns the
+  prepared resource graph while serving admission stays closed and background
+  work stays parked. This does not qualify or enable production EFS serving.
 
 ### Changed
 
@@ -57,9 +60,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Raise the minimum Revolt event-loop version used by asynchronous shutdown
   coordination, and require AWS Flysystem adapter 3.35.2 or newer when that
   optional integration is installed.
+- Require Symfony HttpFoundation 7.4.21 or 8.1.9 or newer within their
+  respective supported lines for framework integrations, excluding
+  CVE-2026-108082 and the whitespace-separator regression in its first fixes.
 
 ### Fixed
 
+- Arm SIGINT and SIGTERM watchers before opening the HTTP listener in the
+  standalone, Laravel, and Symfony serve commands, and remove those watchers
+  when startup fails.
+- Make the encrypted multipart completion post-sync corruption fault
+  deterministic so the integrity-fence regression cannot accidentally rewrite
+  the original leading byte.
 - Return empty bodies for HEAD errors while retaining their status and response
   headers. Method-not-allowed responses now include `Allow` when the valid
   method set is known, and S3 `SlowDown` responses include `Retry-After: 1`.
