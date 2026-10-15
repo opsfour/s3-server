@@ -218,6 +218,10 @@ can therefore differ under `BucketOwnerEnforced`.
 | GetBucketVersioning | `GET` | `/{bucket}?versioning` | Get versioning status |
 | PutBucketVersioning | `PUT` | `/{bucket}?versioning` | Enable/suspend versioning |
 
+MFA Delete configuration is outside the supported subset. A
+PutBucketVersioning request that includes `MfaDelete` fails closed with HTTP
+501 `NotImplemented` before changing the bucket's versioning state.
+
 See [Versioning & Object Lock](versioning.md) for details.
 
 ## Object Lock & Retention

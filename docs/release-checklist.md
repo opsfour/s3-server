@@ -62,11 +62,12 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The current package source passed 3,716 PHPUnit tests with 30,362 assertions
-and 219 expected opt-in or environment skips on PHP 8.5.11 in 4:33.376 with
-154.50 MB peak memory. PHPStan and the coding-style check also passed. Strict
-Composer validation, the locked dependency audit, and `git diff --check` are
-recorded immediately before publishing. External PostgreSQL/MySQL execution of
+The latest confirmed local `composer quality` run passed 4,218 PHPUnit tests
+with 32,107 assertions and 230 expected opt-in or environment skips. PHPStan
+and the coding-style check also passed. Strict Composer validation, the locked
+dependency audit, and `git diff --check` passed on the same candidate. GitHub
+Actions run [38709302239](https://github.com/opsfour/s3-server/actions/runs/38709302239)
+then passed all four jobs on `develop`. External PostgreSQL/MySQL execution of
 the newest skipped cases, the exact PHP 8.4 deployment profile, multi-host
 storage qualification, and the current-source long soak remain separate gates.
 
@@ -219,9 +220,10 @@ then makes the test fail instead of counting suspended wall time.
   lifecycle transition rules.
 - Watch `s3_server_tiering_worker_results_total` and
   `s3_server_notification_queue_depth` after rollout.
-- Rollback after migration requires a package version that understands SQLite
-  schema `14` and PostgreSQL/MySQL schema `15`, or a pre-migration metadata
-  restore.
+- Rollback after migrating this candidate requires a package version that
+  understands SQLite schema `39`, PostgreSQL schema `42`, and MySQL schema
+  `45`, or a pre-migration metadata restore. The schema `14`/`15` values above
+  describe only the historical `v1.3.1` release.
 
 ## Tagging
 

@@ -217,6 +217,12 @@ completion intent only when its stored lease matches the expected value and
 has not expired according to the database clock. Returning `false` after
 abandonment or collector takeover prevents a late assembler from publishing.
 
+Custom metadata stores that serve `CreateMultipartUpload` must implement
+`MultipartUploadTierStore` so every new upload is pinned to its physical
+storage tier. Without that capability, the endpoint returns HTTP 501 before
+creating the upload. The built-in SQLite, PostgreSQL, and MySQL stores and
+their package-provided decorators implement this contract.
+
 Custom metadata stores that accept checksummed UploadPart requests must
 implement `MultipartPartChecksumStore`. Its capability method may return
 `true` only when `putPartWithChecksum()` persists the verified algorithm and
@@ -224,6 +230,12 @@ value atomically with the part row. A missing or disabled capability returns
 HTTP 501 before metadata or storage access. Cached and observed decorators
 delegate this decision to their wrapped store instead of advertising it on the
 store's behalf.
+
+Custom metadata stores that allow an empty PutObjectRetention configuration to
+clear eligible retention must implement `ObjectRetentionDeletionStore`.
+Without that capability, the endpoint returns HTTP 501 and leaves retention
+unchanged. The built-in SQLite, PostgreSQL, and MySQL stores and their
+package-provided decorators implement this contract.
 
 ## Metadata Caching
 
