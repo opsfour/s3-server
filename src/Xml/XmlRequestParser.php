@@ -92,6 +92,9 @@ final class XmlRequestParser
             if ($key === '') {
                 throw new MalformedXmlException('Each Object element must contain a Key element.');
             }
+            if (strlen($key) > 1024) {
+                throw new MalformedXmlException('Delete Object Key must be at most 1024 bytes.');
+            }
             if ($versionId === '') {
                 throw new MalformedXmlException('VersionId must not be empty when specified.');
             }
@@ -187,8 +190,8 @@ final class XmlRequestParser
             $id = null;
             if (isset($fields['ID'])) {
                 $id = self::scalarText($fields['ID'][0], 'CORSRule ID');
-                if (strlen($id) > 255) {
-                    throw new MalformedXmlException('CORSRule ID must not exceed 255 bytes.');
+                if (self::utf8CharacterLength($id) > 255) {
+                    throw new MalformedXmlException('CORSRule ID must not exceed 255 characters.');
                 }
             }
             $allowedOrigins = [];
@@ -684,8 +687,8 @@ final class XmlRequestParser
                     throw new MalformedXmlException('Lifecycle Rule cannot combine Filter and Prefix.');
                 }
                 $ruleId = isset($rule->ID) ? self::scalarText($rule->ID, 'Lifecycle Rule ID') : bin2hex(random_bytes(8));
-                if ($ruleId === '' || strlen($ruleId) > 255 || isset($seenRuleIds["\0{$ruleId}"])) {
-                    throw new MalformedXmlException('Lifecycle Rule ID must be unique and between 1 and 255 bytes.');
+                if ($ruleId === '' || self::utf8CharacterLength($ruleId) > 255 || isset($seenRuleIds["\0{$ruleId}"])) {
+                    throw new MalformedXmlException('Lifecycle Rule ID must be unique and between 1 and 255 characters.');
                 }
                 $seenRuleIds["\0{$ruleId}"] = true;
                 $ruleData = [
@@ -887,14 +890,28 @@ final class XmlRequestParser
             throw new MalformedXmlException('Lifecycle Tag Key must not be empty.');
         }
         $key = self::scalarText($fields['Key'][0], 'Lifecycle Tag Key');
-        if ($key === '') {
-            throw new MalformedXmlException('Lifecycle Tag Key must not be empty.');
-        }
-        if (isset($fields['Value'])) {
-            self::scalarText($fields['Value'][0], 'Lifecycle Tag Value');
+        $value = isset($fields['Value'])
+            ? self::scalarText($fields['Value'][0], 'Lifecycle Tag Value')
+            : '';
+        try {
+            \OpsFour\S3Server\Http\ObjectTagValidator::validate([
+                ['key' => $key, 'value' => $value],
+            ], 1);
+        } catch (\OpsFour\S3Server\Exception\InvalidArgumentException) {
+            throw new MalformedXmlException('Lifecycle Tag does not satisfy the S3 tag constraints.');
         }
 
         return $key;
+    }
+
+    private static function utf8CharacterLength(string $value): int
+    {
+        $length = preg_match_all('/./us', $value);
+        if ($length === false) {
+            throw new MalformedXmlException('XML text must be valid UTF-8.');
+        }
+
+        return $length;
     }
 
     private static function lifecycleDate(string $value): string

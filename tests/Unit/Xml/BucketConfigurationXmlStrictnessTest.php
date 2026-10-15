@@ -46,7 +46,7 @@ final class BucketConfigurationXmlStrictnessTest extends TestCase
             '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>'
             . '<MaxAgeSeconds>2147483648</MaxAgeSeconds></CORSRule></CORSConfiguration>',
         ];
-        yield 'CORS identifier beyond 255 bytes' => [
+        yield 'CORS identifier beyond 255 characters' => [
             'parseCorsConfiguration',
             '<CORSConfiguration><CORSRule><ID>' . str_repeat('x', 256) . '</ID><AllowedOrigin>*</AllowedOrigin>'
             . '<AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>',
@@ -162,6 +162,17 @@ final class BucketConfigurationXmlStrictnessTest extends TestCase
 
         self::assertSame('sdk-rule', $rules[0]['id'] ?? null);
         self::assertSame(0, $rules[0]['maxAgeSeconds']);
+    }
+
+    public function test_cors_identifier_limit_counts_unicode_characters(): void
+    {
+        $id = str_repeat('é', 255);
+        $rules = XmlRequestParser::parseCorsConfiguration(
+            '<CORSConfiguration><CORSRule><ID>' . $id . '</ID><AllowedOrigin>https://example.test</AllowedOrigin>'
+            . '<AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>',
+        );
+
+        self::assertSame($id, $rules[0]['id'] ?? null);
     }
 
     public function test_cors_maximum_age_accepts_leading_zero_decimal_notation(): void

@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 44;
+    public const int VERSION = 45;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -314,7 +314,7 @@ final class MysqlSchema
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 bucket VARCHAR(255) NOT NULL,
                 rule_order INT NOT NULL DEFAULT 0,
-                rule_id VARBINARY(255) NULL,
+                rule_id VARBINARY(1020) NULL,
                 allowed_origins JSON NOT NULL,
                 allowed_methods JSON NOT NULL,
                 allowed_headers JSON NOT NULL,
@@ -1011,6 +1011,9 @@ final class MysqlSchema
             $statements[] = 'ALTER TABLE s3_cors_rules MODIFY COLUMN max_age_seconds INT NOT NULL DEFAULT -1';
             $statements[] = 'ALTER TABLE s3_website_configs MODIFY COLUMN index_document MEDIUMTEXT NOT NULL, MODIFY COLUMN error_document MEDIUMTEXT NULL, MODIFY COLUMN redirect_all_host MEDIUMTEXT NULL';
             $statements[] = 'ALTER TABLE s3_bucket_logging MODIFY COLUMN target_prefix MEDIUMTEXT NOT NULL';
+        }
+        if ($fromVersion < 45) {
+            $statements[] = 'ALTER TABLE s3_cors_rules MODIFY COLUMN rule_id VARBINARY(1020) NULL';
         }
 
         return $statements;

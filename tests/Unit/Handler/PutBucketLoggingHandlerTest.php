@@ -11,6 +11,7 @@ use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\InvalidTargetBucketForLoggingException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketLoggingHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -107,10 +108,40 @@ final class PutBucketLoggingHandlerTest extends TestCase
         }
     }
 
-    private function request(string $target): Request
+    public function test_target_prefix_must_leave_room_for_a_valid_generated_object_key(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-logging-prefix-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'source', 'us-east-1');
+        $metadata->createBucket('owner', 'target', 'us-east-1');
+        $handler = new PutBucketLoggingHandler($metadata);
+
+        try {
+            self::assertSame(200, $handler->handleRequest($this->request('target', str_repeat('a', 988)))->getStatus());
+            $configured = $metadata->getBucketLogging('source');
+            self::assertNotNull($configured);
+            self::assertSame(988, strlen($configured['targetPrefix']));
+
+            try {
+                $handler->handleRequest($this->request('target', str_repeat('b', 989)));
+                self::fail('A logging prefix that forces generated keys above 1024 bytes was accepted.');
+            } catch (InvalidArgumentException $exception) {
+                self::assertStringContainsString('988 bytes', $exception->getMessage());
+            }
+
+            self::assertSame($configured, $metadata->getBucketLogging('source'));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    private function request(string $target, string $prefix = 'access/'): Request
     {
         $body = '<BucketLoggingStatus><LoggingEnabled><TargetBucket>' . $target . '</TargetBucket>'
-            . '<TargetPrefix>access/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>';
+            . '<TargetPrefix>' . $prefix . '</TargetPrefix></LoggingEnabled></BucketLoggingStatus>';
         $request = new Request(new LoggingHandlerTestClient(), 'PUT', Http::new('http://127.0.0.1/source?logging'), [], $body);
         $request->setAttribute('s3.bucket', 'source');
         $request->setAttribute('ownerId', 'requester');

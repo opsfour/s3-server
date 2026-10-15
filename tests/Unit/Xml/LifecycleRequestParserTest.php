@@ -26,12 +26,38 @@ final class LifecycleRequestParserTest extends TestCase
         self::assertSame('2026-12-01T00:00:00.000Z', $rules[0]['expiration']['date'] ?? null);
         self::assertSame('2026-11-01T00:00:00+00:00', $rules[0]['transitions'][0]['date'] ?? null);
 
-        $keyOnly = XmlRequestParser::parseLifecycleConfiguration(
+    }
+
+    public function test_lifecycle_rule_id_limit_counts_unicode_characters(): void
+    {
+        $id = str_repeat('é', 255);
+        $rules = XmlRequestParser::parseLifecycleConfiguration(
+            '<LifecycleConfiguration><Rule><ID>' . $id . '</ID><Status>Enabled</Status>'
+            . '<Filter/><Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>',
+        );
+
+        self::assertSame($id, $rules[0]['id']);
+    }
+
+    public function test_lifecycle_rule_id_rejects_more_than_255_unicode_characters(): void
+    {
+        $this->expectException(MalformedXmlException::class);
+
+        XmlRequestParser::parseLifecycleConfiguration(
+            '<LifecycleConfiguration><Rule><ID>' . str_repeat('é', 256) . '</ID><Status>Enabled</Status>'
+            . '<Filter/><Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>',
+        );
+    }
+
+    public function test_lifecycle_tag_without_value_matches_an_empty_value(): void
+    {
+        $rules = XmlRequestParser::parseLifecycleConfiguration(
             '<LifecycleConfiguration><Rule><Status>Enabled</Status>'
             . '<Filter><Tag><Key>flag</Key></Tag></Filter><Expiration><Days>7</Days></Expiration>'
             . '</Rule></LifecycleConfiguration>',
         );
-        self::assertSame(['key' => 'flag', 'value' => ''], $keyOnly[0]['filter']['tag'] ?? null);
+
+        self::assertSame(['key' => 'flag', 'value' => ''], $rules[0]['filter']['tag'] ?? null);
     }
 
     #[DataProvider('malformedFilterProvider')]
@@ -52,6 +78,15 @@ final class LifecycleRequestParserTest extends TestCase
         yield 'foreign namespace prefix' => ['<Filter><x:Prefix>safe/</x:Prefix></Filter>'];
         yield 'nested prefix content' => ['<Filter><Prefix>safe/<Ignored/></Prefix></Filter>'];
         yield 'nested tag key content' => ['<Filter><Tag><Key>env<Ignored/></Key><Value>prod</Value></Tag></Filter>'];
+        yield 'tag key beyond S3 limit' => [
+            '<Filter><Tag><Key>' . str_repeat('k', 129) . '</Key><Value>prod</Value></Tag></Filter>',
+        ];
+        yield 'tag value beyond S3 limit' => [
+            '<Filter><Tag><Key>env</Key><Value>' . str_repeat('v', 257) . '</Value></Tag></Filter>',
+        ];
+        yield 'tag with unsupported character' => [
+            '<Filter><Tag><Key>env&amp;tier</Key><Value>prod</Value></Tag></Filter>',
+        ];
         yield 'single And predicate' => ['<Filter><And><Prefix>safe/</Prefix></And></Filter>'];
         yield 'duplicate And tag key' => [
             '<Filter><And>'

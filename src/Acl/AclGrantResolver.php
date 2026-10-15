@@ -10,6 +10,11 @@ use OpsFour\S3Server\Http\RequestHeaderValues;
 
 final class AclGrantResolver
 {
+    private const int MAX_GRANTS = 100;
+
+    /** Keep explicit grantee identifiers portable across every metadata backend. */
+    private const int MAX_GRANTEE_ID_BYTES = 255;
+
     public const string ALL_USERS_URI = 'http://acs.amazonaws.com/groups/global/AllUsers';
 
     public const string AUTHENTICATED_USERS_URI = 'http://acs.amazonaws.com/groups/global/AuthenticatedUsers';
@@ -67,11 +72,13 @@ final class AclGrantResolver
                 throw new InvalidArgumentException('x-amz-acl must not be empty.');
             }
 
-            return self::expandCannedAcl($cannedAcl, $ownerId, $resourceType, $bucketOwnerId);
+            return self::validateGrants(
+                self::expandCannedAcl($cannedAcl, $ownerId, $resourceType, $bucketOwnerId),
+            );
         }
 
         if ($hasGrantHeaders) {
-            return self::parseGrantHeaders($request, $ownerId);
+            return self::validateGrants(self::parseGrantHeaders($request, $ownerId));
         }
 
         return null;
@@ -99,6 +106,9 @@ final class AclGrantResolver
         if ($grants === []) {
             throw new InvalidArgumentException('The access control policy must contain at least one grant.');
         }
+        if (count($grants) > self::MAX_GRANTS) {
+            throw new InvalidArgumentException('The access control policy cannot contain more than 100 grants.');
+        }
 
         foreach ($grants as $grant) {
             if (! in_array($grant['permission'], self::PERMISSIONS, true)) {
@@ -107,6 +117,9 @@ final class AclGrantResolver
 
             if ($grant['granteeId'] === '') {
                 throw new InvalidArgumentException('Every ACL grantee must have a non-empty identifier.');
+            }
+            if (strlen($grant['granteeId']) > self::MAX_GRANTEE_ID_BYTES) {
+                throw new InvalidArgumentException('ACL grantee identifiers cannot exceed 255 bytes.');
             }
 
             if ($grant['granteeType'] === 'AmazonCustomerByEmail') {

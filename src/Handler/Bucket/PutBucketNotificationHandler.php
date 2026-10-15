@@ -17,6 +17,9 @@ final class PutBucketNotificationHandler implements RequestHandler
 {
     private const int MAX_CONFIGURATIONS = 256;
 
+    /** Portable limit of the MySQL notification destination column. */
+    private const int MAX_DESTINATION_BYTES = 512;
+
     /** @var list<string> */
     private const array EMITTED_WEBHOOK_EVENTS = [
         's3:ObjectCreated:*',
@@ -68,6 +71,9 @@ final class PutBucketNotificationHandler implements RequestHandler
             $comparisonEvents[] = array_values(array_unique($config['events']));
 
             $destination = $config['destinationArn'];
+            if (strlen($destination) > self::MAX_DESTINATION_BYTES) {
+                throw new InvalidArgumentException('Notification destination must be at most 512 bytes.');
+            }
             if (str_starts_with(strtolower($destination), 'arn:')) {
                 throw new NotImplementedException('SNS, SQS, and Lambda notification destinations are not supported.');
             }

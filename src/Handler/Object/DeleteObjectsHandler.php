@@ -41,6 +41,9 @@ use OpsFour\S3Server\Xml\XmlResponseBuilder;
  */
 final class DeleteObjectsHandler implements RequestHandler
 {
+    /** Accommodates 1000 maximum-length keys after XML entity escaping. */
+    private const int MAX_BODY_BYTES = 8_388_608;
+
     private readonly ObjectLockChecker $lockChecker;
 
     private readonly ObjectDeletePolicyGuard $policyGuard;
@@ -66,7 +69,7 @@ final class DeleteObjectsHandler implements RequestHandler
         }
 
         // Read and parse the XML body.
-        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 2_097_152);
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, self::MAX_BODY_BYTES);
         $parsed = XmlRequestParser::parseDeleteObjects($body);
 
         if (count($parsed['objects']) > 1000) {

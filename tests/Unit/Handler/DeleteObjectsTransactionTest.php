@@ -16,6 +16,38 @@ use PHPUnit\Framework\TestCase;
 
 final class DeleteObjectsTransactionTest extends TestCase
 {
+    public function test_xml_escaping_does_not_reduce_the_supported_batch_capacity(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-delete-escaped-batch-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+
+        try {
+            $object = '<Object><Key>' . str_repeat('&amp;', 1024) . '</Key></Object>';
+            $body = '<Delete><Quiet>true</Quiet>' . str_repeat($object, 420) . '</Delete>';
+            self::assertGreaterThan(2_097_152, strlen($body));
+
+            $client = $this->createMock(Client::class);
+            $client->method('getRemoteAddress')->willReturn(new InternetAddress('127.0.0.1', 12345));
+            $request = new Request($client, 'POST', Http::new('http://127.0.0.1/bucket?delete'), [], $body);
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('ownerId', 'owner');
+
+            $response = (new DeleteObjectsHandler($metadata, StorageTierRegistry::single($storage)))
+                ->handleRequest($request);
+
+            self::assertSame(200, $response->getStatus());
+            self::assertSame(0, $metadata->countObjects('bucket'));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
     public function test_unexpected_error_rolls_back_all_batch_metadata_changes(): void
     {
         $path = sys_get_temp_dir() . '/s3-delete-rollback-' . bin2hex(random_bytes(6)) . '.sqlite';

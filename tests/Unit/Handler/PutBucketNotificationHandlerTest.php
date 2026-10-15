@@ -236,4 +236,49 @@ final class PutBucketNotificationHandlerTest extends TestCase
             @unlink($path . '-shm');
         }
     }
+
+    public function test_destination_length_matches_the_portable_metadata_limit(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-notification-destination-limit-' . bin2hex(random_bytes(6)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($path);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $handler = new PutBucketNotificationHandler($metadata);
+        $request = function (string $destination): Request {
+            $request = new Request(
+                $this->createMock(Client::class),
+                'PUT',
+                Http::new('http://127.0.0.1/bucket?notification'),
+                [],
+                '<NotificationConfiguration><TopicConfiguration><Id>destination-limit</Id>'
+                    . '<Topic>' . $destination . '</Topic><Event>s3:ObjectCreated:Put</Event>'
+                    . '</TopicConfiguration></NotificationConfiguration>',
+            );
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('ownerId', 'owner');
+
+            return $request;
+        };
+        $origin = 'https://notifications.invalid/';
+
+        try {
+            $maximum = $origin . str_repeat('a', 512 - strlen($origin));
+            self::assertSame(200, $handler->handleRequest($request($maximum))->getStatus());
+            $existing = $metadata->getBucketNotification('bucket');
+            self::assertSame($maximum, $existing[0]['destinationArn']);
+
+            try {
+                $handler->handleRequest($request($maximum . 'b'));
+                self::fail('A notification destination above the portable metadata limit was accepted.');
+            } catch (InvalidArgumentException $exception) {
+                self::assertStringContainsString('512 bytes', $exception->getMessage());
+            }
+
+            self::assertSame($existing, $metadata->getBucketNotification('bucket'));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
 }

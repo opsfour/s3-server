@@ -29,6 +29,8 @@ final class DeleteObjectsRequestParserTest extends TestCase
             'invalid quiet' => ['<Delete><Object><Key>a</Key></Object><Quiet>yes</Quiet></Delete>'],
             'duplicate key' => ['<Delete><Object><Key>a</Key><Key>b</Key></Object></Delete>'],
             'missing key' => ['<Delete><Object><VersionId>v1</VersionId></Object></Delete>'],
+            'key above 1024 bytes' => ['<Delete><Object><Key>' . str_repeat('a', 1025) . '</Key></Object></Delete>'],
+            'multibyte key above 1024 bytes' => ['<Delete><Object><Key>' . str_repeat("\u{00E9}", 513) . '</Key></Object></Delete>'],
             'duplicate version' => ['<Delete><Object><Key>a</Key><VersionId>v1</VersionId><VersionId>v2</VersionId></Object></Delete>'],
             'empty version' => ['<Delete><Object><Key>a</Key><VersionId/></Object></Delete>'],
             'unsupported conditional delete field' => ['<Delete><Object><Key>a</Key><ETag>"etag"</ETag></Object></Delete>'],
@@ -49,6 +51,18 @@ final class DeleteObjectsRequestParserTest extends TestCase
             'objects' => [['key' => 'a', 'versionId' => 'v1']],
         ], XmlRequestParser::parseDeleteObjects(
             '<Delete><Quiet>false</Quiet><Object><Key>a</Key><VersionId>v1</VersionId></Object></Delete>',
+        ));
+    }
+
+    public function test_accepts_key_at_1024_byte_boundary(): void
+    {
+        $key = str_repeat("\u{00E9}", 512);
+
+        self::assertSame([
+            'quiet' => false,
+            'objects' => [['key' => $key, 'versionId' => null]],
+        ], XmlRequestParser::parseDeleteObjects(
+            '<Delete><Object><Key>' . $key . '</Key></Object></Delete>',
         ));
     }
 

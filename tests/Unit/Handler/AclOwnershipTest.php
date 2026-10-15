@@ -11,6 +11,7 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketAclHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectAclHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectAclHandler;
@@ -78,6 +79,37 @@ final class AclOwnershipTest extends TestCase
         $grants = $this->metadata->getAcl('bucket', 'bucket');
         self::assertCount(1, $grants);
         self::assertSame('bucket-owner', $grants[0]['granteeId']);
+    }
+
+    public function test_oversized_explicit_bucket_acl_does_not_replace_existing_grants(): void
+    {
+        $existing = [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'existing-reader',
+            'permission' => 'READ',
+        ]];
+        $this->metadata->putAcl('bucket', 'bucket', 'bucket-owner', $existing);
+        $readers = [];
+        for ($index = 0; $index < 100; ++$index) {
+            $readers[] = 'id="reader-' . $index . '"';
+        }
+        $request = new Request(
+            new ObjectAclOwnershipTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket?acl'),
+            ['x-amz-grant-read' => implode(',', $readers)],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('ownerId', 'bucket-owner');
+
+        try {
+            (new PutBucketAclHandler($this->metadata))->handleRequest($request);
+            self::fail('An ACL with more than 100 grants was accepted.');
+        } catch (InvalidArgumentException $error) {
+            self::assertSame('InvalidArgument', $error->getErrorCode());
+        }
+
+        self::assertSame($existing, $this->metadata->getAcl('bucket', 'bucket'));
     }
 
     public function test_updating_numbered_version_acl_does_not_clear_legacy_null_version_acl(): void

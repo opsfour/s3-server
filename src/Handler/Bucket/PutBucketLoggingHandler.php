@@ -13,12 +13,16 @@ use OpsFour\S3Server\Exception\InvalidTargetBucketForLoggingException;
 use OpsFour\S3Server\Exception\MalformedXmlException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\S3XmlDocument;
 use OpsFour\S3Server\Xml\SafeXmlParser;
 
 final class PutBucketLoggingHandler implements RequestHandler
 {
+    /** 1024-byte S3 key limit minus YYYY-mm-dd-HH-ii-ss, separator, and 16 hex bytes. */
+    private const int MAX_TARGET_PREFIX_BYTES = 988;
+
     public function __construct(
         private readonly MetadataStore $metadata,
     ) {}
@@ -79,6 +83,9 @@ final class PutBucketLoggingHandler implements RequestHandler
 
             if ($targetBucket === '') {
                 throw new MalformedXmlException('TargetBucket must not be empty.');
+            }
+            if (strlen($targetPrefix) > self::MAX_TARGET_PREFIX_BYTES) {
+                throw new InvalidArgumentException('Logging target prefix must be at most 988 bytes.');
             }
 
             $targetBucketInfo = $this->metadata->getBucket($targetBucket);

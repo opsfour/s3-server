@@ -65,6 +65,36 @@ final class AclGrantResolverTest extends TestCase
         self::assertSame(['FULL_CONTROL', 'READ', 'READ'], array_column($grants, 'permission'));
     }
 
+    public function test_explicit_grant_headers_cannot_exceed_the_acl_grant_limit(): void
+    {
+        $readers = [];
+        for ($index = 0; $index < 100; ++$index) {
+            $readers[] = 'id="reader-' . $index . '"';
+        }
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('more than 100 grants');
+
+        // The resource owner's FULL_CONTROL grant is also part of the ACL.
+        AclGrantResolver::fromHeaders(
+            $this->request(['x-amz-grant-read' => implode(',', $readers)]),
+            'owner',
+            'bucket',
+        );
+    }
+
+    public function test_grantee_identifier_cannot_exceed_the_portable_metadata_limit(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('cannot exceed 255 bytes');
+
+        AclGrantResolver::fromHeaders(
+            $this->request(['x-amz-grant-read' => 'id="' . str_repeat('a', 256) . '"']),
+            'owner',
+            'bucket',
+        );
+    }
+
     public function test_invalid_repeated_grant_field_line_is_not_ignored(): void
     {
         $this->expectException(InvalidArgumentException::class);
