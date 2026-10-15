@@ -62,16 +62,21 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,287
-PHPUnit tests with 32,729 assertions and 232 expected opt-in or environment
-skips. PHPStan and PHP CS Fixer across 960 files also passed. Strict Composer
-validation, the locked dependency audit, and `git diff --check` passed on the
-same candidate before it was committed. The earlier baseline at `6b44bc7`
+The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,303
+PHPUnit tests with 32,963 assertions and 232 expected opt-in or environment
+skips. PHPStan passed, and PHP CS Fixer reported zero fixes across 962 files.
+Strict Composer validation, the locked dependency audit, and `git diff --check`
+also passed on the same current candidate. The earlier CI baseline at `54c6542`
 passed all four jobs in GitHub Actions run
-[38808273332](https://github.com/opsfour/s3-server/actions/runs/38808273332),
+[38814433357](https://github.com/opsfour/s3-server/actions/runs/38814433357),
 including quality, metadata backends, and the lowest and highest dependency
-matrices. That run predates the host-pinning and version-timestamp batch.
-External PostgreSQL/MySQL execution without skips, the exact PHP 8.4
+matrices. That run covers the host-pin and version-timestamp batch but predates
+the listenerless heartbeat reader and delegated multipart-abort commit
+reauthorization. Both later changes are covered by the current local quality
+run, but no newer GitHub Actions result is recorded yet. The production watcher,
+runtime wiring before listener admission, and qualification of the exact
+read-only bind and stale replay contract on the intended Linux hosts remain
+open. External PostgreSQL/MySQL execution without skips, the exact PHP 8.4
 deployment profile, multi-host storage qualification, and the current-source
 long soak remain separate gates.
 

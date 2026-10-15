@@ -38,6 +38,13 @@ The project follows [Semantic Versioning](https://semver.org/).
   deployment, instance, full container ID, boot, mount, storage inode, and
   watcher epoch without accessing EFS, SQL, Docker, or a listener. Production
   EFS serving remains closed.
+- Add a listenerless schema-v2 production EFS heartbeat reader for the
+  identity-derived file on an exact root-owned, read-only local directory
+  bind. It permanently latches failed reads, pins the evidence mount and
+  directory identity across successful reads, and rejects stale replay after
+  heartbeat time progression. The production watcher and runtime wiring remain
+  unimplemented, real Linux qualification is pending, and serving remains
+  closed.
 
 ### Changed
 
@@ -114,6 +121,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Bind multipart completion policy checks to the exact ACL, standard SSE, and
   storage-class headers supplied at initiation; require ambiguous legacy
   uploads to be aborted and initiated again.
+- Reauthorize delegated cross-account `AbortMultipartUpload` requests under
+  the owner lock immediately before commit. The resource-policy Allow must
+  remain valid through that point; revocation preserves the upload and all
+  parts and returns `NoSuchUpload` without exposing their existence.
 - Validate quota owner IDs consistently across direct writers, the standalone,
   Laravel, and Symfony commands, and the admin API; keep invalid legacy rows
   from breaking JSON pagination, and route percent-encoded `/` characters in

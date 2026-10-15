@@ -62,6 +62,10 @@ Status: **Complete**
   from pending to restored during the request. Policy, ACL, ownership, and
   other object changes remain fail-closed; streamed `GetObject` and
   request-body `SelectObjectContent` operations are not replayed.
+- [x] Delegated cross-account `AbortMultipartUpload` rechecks authorization
+  under the owner lock immediately before commit. Its resource-policy Allow
+  must remain valid through that point; revocation preserves the upload and
+  all parts and returns `NoSuchUpload` without revealing their existence.
 
 ## 2. POST Object
 
@@ -101,6 +105,15 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   mutable bundle. Assembly failures retain one retryable cleanup owner. Serving
   admission remains closed, no listener is opened, and production EFS serving
   is not enabled.
+- [x] The current unreleased listenerless schema-v2 heartbeat reader accepts
+  only the identity-derived file on an exact root-owned, read-only local
+  directory bind. It permanently latches failed reads, pins the evidence mount
+  and directory device/inode identity across successful reads, and rejects
+  stale replay after monotonic validity-window progression.
+- [ ] The production watcher still needs to publish those heartbeat records,
+  the reader still needs runtime wiring before listener admission, and the
+  complete mount, replacement, and replay contract still needs qualification
+  on the intended Linux hosts. Production EFS serving remains closed.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.
