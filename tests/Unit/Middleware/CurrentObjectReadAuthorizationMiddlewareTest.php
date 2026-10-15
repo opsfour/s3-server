@@ -61,6 +61,93 @@ final class CurrentObjectReadAuthorizationMiddlewareTest extends TestCase
         }
     }
 
+    public function test_storage_tier_drift_with_same_path_closes_response_stream(): void
+    {
+        $this->assertReadRoutingDriftRejected(
+            $this->object('shared-path', storageTier: 'STANDARD'),
+            $this->object('shared-path', storageTier: 'GLACIER'),
+        );
+    }
+
+    public function test_restore_copy_drift_with_same_primary_path_closes_response_stream(): void
+    {
+        $this->assertReadRoutingDriftRejected(
+            $this->object(
+                'primary-path',
+                storageTier: 'GLACIER',
+                restoreStatus: 'restored',
+                restoredStorageTier: 'STANDARD',
+                restoredStoragePath: 'restore-path',
+                restoreExpiresAt: new \DateTimeImmutable('2030-01-01T00:00:00Z'),
+            ),
+            $this->object('primary-path', storageTier: 'GLACIER'),
+        );
+    }
+
+    public function test_object_attributes_metadata_drift_with_same_storage_path_closes_stale_response(): void
+    {
+        $lastModified = new \DateTimeImmutable('2030-01-01T00:00:00Z');
+
+        $this->assertReadRoutingDriftRejected(
+            $this->object(
+                'shared-path',
+                etag: '"old-etag"',
+                systemMetadata: ['checksum-sha256' => 'old-checksum'],
+                lastModified: $lastModified,
+            ),
+            $this->object(
+                'shared-path',
+                etag: '"new-etag"',
+                systemMetadata: ['checksum-sha256' => 'new-checksum'],
+                lastModified: $lastModified,
+            ),
+            S3Operation::GetObjectAttributes,
+        );
+    }
+
+    public function test_explicit_version_read_allows_only_version_listing_state_to_change(): void
+    {
+        $lastModified = new \DateTimeImmutable('2030-01-01T00:00:00Z');
+        $authorized = $this->object(
+            'shared-path',
+            systemMetadata: ['isLatest' => '1'],
+            lastModified: $lastModified,
+            versionId: 'version-1',
+        );
+        $current = $this->object(
+            'shared-path',
+            systemMetadata: [
+                'isLatest' => '0',
+                'noncurrentAt' => '2030-01-02T00:00:00.000000Z',
+            ],
+            lastModified: $lastModified,
+            versionId: 'version-1',
+        );
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::exactly(2))->method('getObjectMetadataByVersion')
+            ->with('bucket', 'key', 'version-1')
+            ->willReturn($current);
+        $metadata->method('getBucket')->with('bucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: 'generation',
+        ));
+        $request = $this->request($authorized, S3Operation::GetObjectAttributes);
+        $request->setUri(Http::new('http://127.0.0.1/bucket/key?attributes&versionId=version-1'));
+
+        $response = (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+            $request,
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(200);
+                }
+            },
+        );
+
+        self::assertSame(200, $response->getStatus());
+    }
+
     public function test_handler_cancellation_is_propagated_without_follow_up_metadata_io(): void
     {
         $cancellation = new CancelledException();
@@ -225,16 +312,69 @@ final class CurrentObjectReadAuthorizationMiddlewareTest extends TestCase
         return $request;
     }
 
-    private function object(string $storagePath): ObjectInfo
-    {
+    /** @param array<string, string> $systemMetadata */
+    private function object(
+        string $storagePath,
+        string $storageTier = 'STANDARD',
+        ?string $restoreStatus = null,
+        ?string $restoredStorageTier = null,
+        ?string $restoredStoragePath = null,
+        ?\DateTimeImmutable $restoreExpiresAt = null,
+        string $etag = '"etag"',
+        array $systemMetadata = [],
+        ?\DateTimeImmutable $lastModified = null,
+        ?string $versionId = null,
+    ): ObjectInfo {
         return new ObjectInfo(
             'bucket',
             'key',
             4,
-            '"etag"',
+            $etag,
+            storageTier: $storageTier,
+            restoreStatus: $restoreStatus,
+            restoredStoragePath: $restoredStoragePath,
+            restoreExpiresAt: $restoreExpiresAt,
             ownerId: 'owner',
-            systemMetadata: ['storagePath' => $storagePath],
+            versionId: $versionId,
+            systemMetadata: ['storagePath' => $storagePath, ...$systemMetadata],
+            lastModified: $lastModified ?? new \DateTimeImmutable(),
+            restoredStorageTier: $restoredStorageTier,
         );
+    }
+
+    private function assertReadRoutingDriftRejected(
+        ObjectInfo $authorized,
+        ObjectInfo $current,
+        S3Operation $operation = S3Operation::GetObject,
+    ): void {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('getCurrentObjectVersion')
+            ->with('bucket', 'key')
+            ->willReturn($current);
+        $metadata->expects(self::once())->method('getBucket')->with('bucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: 'generation',
+        ));
+        $stream = new FailingCloseObjectReadStream();
+
+        try {
+            (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                $this->request($authorized, $operation),
+                new class ($stream) implements RequestHandler {
+                    public function __construct(private readonly ReadableStream $stream) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        return new Response(200, body: $this->stream);
+                    }
+                },
+            );
+            self::fail('Read-routing drift must reject the already-opened response.');
+        } catch (AccessDeniedException $error) {
+            self::assertSame('Object changed during authorization.', $error->getMessage());
+            self::assertTrue($stream->closeAttempted);
+        }
     }
 }
 

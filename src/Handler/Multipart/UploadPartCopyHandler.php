@@ -22,6 +22,7 @@ use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
@@ -163,6 +164,10 @@ final class UploadPartCopyHandler implements RequestHandler
         $srcObject = ($srcVersionId !== null)
             ? $this->metadata->getObjectMetadataByVersion($srcBucket, $srcKey, $srcVersionId)
             : $this->metadata->getObjectMetadata($srcBucket, $srcKey);
+        if ($srcVersionId !== null && $srcObject?->isDeleteMarker === true) {
+            $request->setAttribute('s3.copySourceLogEligible', true);
+            throw new InvalidRequestException('The specified copy source is a delete marker.');
+        }
         if ($srcObject === null || $srcObject->isDeleteMarker) {
             $request->setAttribute('s3.copySourceLogEligible', true);
             if ($srcVersionId === null
@@ -299,6 +304,12 @@ final class UploadPartCopyHandler implements RequestHandler
                         $srcObject->userMetadata['__sse-key'],
                         $srcObject->userMetadata['__sse-iv'],
                         $srcObject->userMetadata['__sse-tag'],
+                    );
+                }
+
+                if (strlen($plaintext) !== $srcObject->size) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                        'Decrypted copy source size does not match metadata.',
                     );
                 }
 

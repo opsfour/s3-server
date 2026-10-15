@@ -49,18 +49,65 @@ final class AuthorizedObjectSnapshot
             : $metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
     }
 
-    /** @return array{string, ?string, bool, ?string}|null */
+    /**
+     * @return array{
+     *     string,
+     *     string,
+     *     int,
+     *     string,
+     *     string,
+     *     string,
+     *     string,
+     *     string,
+     *     ?string,
+     *     ?string,
+     *     ?string,
+     *     ?string,
+     *     ?string,
+     *     ?string,
+     *     string,
+     *     ?string,
+     *     bool,
+     *     array<string, string>,
+     *     array<string, string>,
+     *     string
+     * }|null
+     */
     public static function identity(?ObjectInfo $object): ?array
     {
         if ($object === null) {
             return null;
         }
 
+        $userMetadata = $object->userMetadata;
+        $systemMetadata = $object->systemMetadata;
+        // Version-list bookkeeping can change when a newer version is
+        // published without changing the explicitly selected object.
+        unset($systemMetadata['isLatest'], $systemMetadata['noncurrentAt']);
+        ksort($userMetadata, SORT_STRING);
+        ksort($systemMetadata, SORT_STRING);
+
         return [
+            $object->bucket,
+            $object->key,
+            $object->size,
+            $object->etag,
+            $object->contentType,
+            $object->storageClass,
+            $object->storageTier,
+            $object->transitionStatus,
+            $object->transitionTargetTier,
+            $object->transitionError,
+            $object->restoreStatus,
+            $object->restoredStorageTier,
+            $object->restoredStoragePath,
+            $object->restoreExpiresAt?->format('U.u'),
             $object->ownerId,
             $object->versionId,
             $object->isDeleteMarker,
-            $object->systemMetadata['storagePath'] ?? null,
+            $userMetadata,
+            $systemMetadata,
+            $object->lastModified->format('U.u'),
         ];
     }
 }

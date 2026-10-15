@@ -223,7 +223,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             ];
         }
 
-        // Reject an object larger than S3's 5-TiB limit before creating a
+        // Reject an object larger than S3's 50,000 GiB limit before creating a
         // durable attempt or invoking any storage assembly. The subtraction
         // inside sumObjectBytes() keeps the accumulation overflow-safe.
         $expectedSize = MultipartPartSize::sumObjectBytes(array_column($validatedParts, 'size'));

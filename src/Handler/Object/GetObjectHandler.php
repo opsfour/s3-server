@@ -19,6 +19,7 @@ use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
 use OpsFour\S3Server\Exception\InvalidRangeException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
@@ -42,6 +43,9 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
  */
 final class GetObjectHandler implements RequestHandler
 {
+    /** Amazon S3 requires ranged downloads for objects larger than 5 TiB. */
+    private const int MAX_SINGLE_GET_BYTES = 5_497_558_138_880;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -150,6 +154,12 @@ final class GetObjectHandler implements RequestHandler
             }
         }
 
+        if (! $isPartialContent && $objectInfo->size > self::MAX_SINGLE_GET_BYTES) {
+            throw new MethodNotAllowedException(
+                'Objects larger than 5 TiB must be downloaded with a Range request.',
+            );
+        }
+
         // 5. Stream body from storage — handle decryption if encrypted.
         [$readStorage, $storagePath] = $this->resolveReadableStorage($objectInfo);
         if ($storagePath === null || $storagePath === '') {
@@ -190,6 +200,12 @@ final class GetObjectHandler implements RequestHandler
                         $objectInfo->userMetadata['__sse-key'],
                         $objectInfo->userMetadata['__sse-iv'],
                         $objectInfo->userMetadata['__sse-tag'],
+                    );
+                }
+
+                if (strlen($plaintext) !== $objectInfo->size) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                        'Decrypted object size does not match metadata.',
                     );
                 }
 

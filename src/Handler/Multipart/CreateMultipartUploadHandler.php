@@ -142,6 +142,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
         $contentDisposition = $request->getHeader('content-disposition');
         $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
+        $expires = $request->getHeader('expires');
         $storageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($request->getHeader('x-amz-storage-class'));
 
         if ($contentEncoding !== null) {
@@ -152,6 +153,9 @@ final class CreateMultipartUploadHandler implements RequestHandler
         }
         if ($cacheControl !== null) {
             $userMetadata['__mpu-cache-control'] = $cacheControl;
+        }
+        if ($expires !== null && $expires !== '') {
+            $userMetadata['__expires'] = $expires;
         }
         if ($storageClass !== 'STANDARD') {
             $userMetadata['__mpu-storage-class'] = $storageClass;

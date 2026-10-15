@@ -18,6 +18,7 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidPartException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\SlowDownException;
@@ -2539,25 +2540,62 @@ final class MultipartCompletionRetryTest extends TestCase
         )->getStatus());
     }
 
-    public function test_multipart_object_over_five_tib_is_rejected_before_intent_or_storage_mutation(): void
+    public function test_multipart_completion_preserves_expires_from_initiation(): void
+    {
+        $expires = 'Wed, 21 Oct 2037 07:28:00 GMT';
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request(
+                'POST',
+                '/bucket/retry.bin?uploads',
+                headers: ['expires' => $expires],
+            ));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage))->handleRequest(
+            $this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'),
+        );
+        $etag = (string) $part->getHeader('ETag');
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))
+            ->getStatus());
+
+        $object = $this->metadata->getObjectMetadata('bucket', 'retry.bin');
+        self::assertNotNull($object);
+        self::assertSame($expires, $object->userMetadata['__expires'] ?? null);
+        $get = (new GetObjectHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('GET', '/bucket/retry.bin'));
+        self::assertSame($expires, $get->getHeader('Expires'));
+    }
+
+    public function test_upload_part_copy_rejects_explicit_delete_marker_version(): void
+    {
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned('bucket', 'source.bin', 'owner');
+        $uploadId = bin2hex(random_bytes(16));
+        $this->metadata->createMultipartUpload($uploadId, 'bucket', 'retry.bin', 'owner');
+        $request = $this->request(
+            'PUT',
+            '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+            headers: ['x-amz-copy-source' => '/bucket/source.bin?versionId=' . $deleteMarkerVersionId],
+        );
+
+        try {
+            (new UploadPartCopyHandler($this->metadata, $this->storage))->handleRequest($request);
+            self::fail('An explicit delete-marker copy source must be rejected as InvalidRequest.');
+        } catch (InvalidRequestException $error) {
+            self::assertSame('InvalidRequest', $error->getErrorCode());
+            self::assertSame('The specified copy source is a delete marker.', $error->getMessage());
+        }
+
+        self::assertSame([], $this->metadata->getParts($uploadId));
+    }
+
+    public function test_multipart_completion_rejects_part_number_above_ten_thousand_before_storage_mutation(): void
     {
         $uploadId = bin2hex(random_bytes(16));
         $this->metadata->createMultipartUpload($uploadId, 'bucket', 'retry.bin', 'owner');
-        $xmlParts = [];
-        $this->metadata->transaction(function () use ($uploadId, &$xmlParts): void {
-            for ($partNumber = 1; $partNumber <= 1025; $partNumber++) {
-                $etag = '"' . md5((string) $partNumber) . '"';
-                $this->metadata->putPart(
-                    $uploadId,
-                    $partNumber,
-                    $etag,
-                    MultipartPartSize::MAX_BYTES,
-                    'unwritten-part-' . $partNumber,
-                );
-                $xmlParts[] = '<Part><PartNumber>' . $partNumber . '</PartNumber><ETag>'
-                    . $etag . '</ETag></Part>';
-            }
-        });
 
         $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
         foreach ([
@@ -2578,24 +2616,13 @@ final class MultipartCompletionRetryTest extends TestCase
             $storage->expects(self::never())->method($method);
         }
 
-        $body = '<CompleteMultipartUpload>' . implode('', $xmlParts) . '</CompleteMultipartUpload>';
-        try {
-            (new CompleteMultipartUploadHandler($this->metadata, $storage))->handleRequest(
-                $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body),
-            );
-            self::fail('A multipart object larger than five TiB must be rejected.');
-        } catch (EntityTooLargeException $error) {
-            self::assertSame('EntityTooLarge', $error->getErrorCode());
-            self::assertSame('Multipart object exceeds the 5 TiB maximum.', $error->getMessage());
-        }
+        $body = '<CompleteMultipartUpload><Part><PartNumber>10001</PartNumber><ETag>"'
+            . md5('10001') . '"</ETag></Part></CompleteMultipartUpload>';
+        $this->expectException(\OpsFour\S3Server\Exception\MalformedXmlException::class);
 
-        self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
-        self::assertCount(1025, $this->metadata->getParts($uploadId));
-        self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
-        $intentCount = (new \PDO('sqlite:' . $this->databasePath))
-            ->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
-        self::assertInstanceOf(\PDOStatement::class, $intentCount);
-        self::assertSame(0, (int) $intentCount->fetchColumn());
+        (new CompleteMultipartUploadHandler($this->metadata, $storage))->handleRequest(
+            $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body),
+        );
     }
 
     public function test_busy_buffered_slot_cleans_copied_object_before_retry(): void
@@ -2904,6 +2931,52 @@ final class MultipartCompletionRetryTest extends TestCase
             self::fail('UploadPartCopy must reject a physical source larger than its metadata.');
         } catch (InternalErrorException $e) {
             self::assertSame('Encrypted source size does not match metadata.', $e->getMessage());
+            self::assertSame([], $this->metadata->getParts($uploadId));
+        }
+    }
+
+    public function test_encrypted_upload_part_copy_range_rejects_decrypted_size_mismatch_before_part_write(): void
+    {
+        $sourcePayload = str_repeat('a', 5_242_881);
+        $source = $this->storage->putObject(
+            'bucket',
+            'source.bin',
+            new \Amp\ByteStream\ReadableBuffer($sourcePayload),
+        );
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source.bin',
+            'owner',
+            strlen($sourcePayload),
+            '"' . md5($sourcePayload) . '"',
+            'application/octet-stream',
+            $source->path,
+            userMetadata: [
+                '__sse-algorithm' => 'AES256',
+                '__sse-key' => 'wrapped-key',
+                '__sse-iv' => 'iv',
+                '__sse-tag' => 'tag',
+            ],
+        );
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $encryption = $this->createMock(\OpsFour\S3Server\Encryption\EncryptionServiceInterface::class);
+        $encryption->expects(self::once())->method('decryptSseS3')->willReturn($sourcePayload . 'x');
+
+        try {
+            (new UploadPartCopyHandler($this->metadata, $this->storage, $encryption))
+                ->handleRequest($this->request(
+                    'PUT',
+                    '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId,
+                    headers: [
+                        'x-amz-copy-source' => '/bucket/source.bin',
+                        'x-amz-copy-source-range' => 'bytes=0-0',
+                    ],
+                ));
+            self::fail('A ranged encrypted copy accepted a decrypted source with a different full size.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Decrypted copy source size does not match metadata.', $error->getMessage());
             self::assertSame([], $this->metadata->getParts($uploadId));
         }
     }

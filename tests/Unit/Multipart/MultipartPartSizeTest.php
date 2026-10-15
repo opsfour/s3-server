@@ -21,20 +21,20 @@ final class MultipartPartSizeTest extends TestCase
         self::assertTrue($body->isClosed());
     }
 
-    public function test_object_size_sum_accepts_exactly_five_tibibytes(): void
+    public function test_object_size_sum_accepts_exactly_ten_thousand_maximum_parts(): void
     {
         self::assertSame(
             MultipartPartSize::MAX_OBJECT_BYTES,
-            MultipartPartSize::sumObjectBytes(array_fill(0, 1024, MultipartPartSize::MAX_BYTES)),
+            MultipartPartSize::sumObjectBytes(array_fill(0, 10000, MultipartPartSize::MAX_BYTES)),
         );
     }
 
     public function test_object_size_sum_rejects_one_more_maximum_part_without_overflow(): void
     {
         $this->expectException(EntityTooLargeException::class);
-        $this->expectExceptionMessage('Multipart object exceeds the 5 TiB maximum.');
+        $this->expectExceptionMessage('Multipart object exceeds the 50,000 GiB maximum.');
 
-        MultipartPartSize::sumObjectBytes(array_fill(0, 1025, MultipartPartSize::MAX_BYTES));
+        MultipartPartSize::sumObjectBytes(array_fill(0, 10001, MultipartPartSize::MAX_BYTES));
     }
 
     #[DataProvider('invalidStoredSizes')]

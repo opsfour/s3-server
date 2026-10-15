@@ -14,7 +14,7 @@ final class MultipartPartSize
 {
     public const int MAX_BYTES = 5_368_709_120;
 
-    public const int MAX_OBJECT_BYTES = 5_497_558_138_880;
+    public const int MAX_OBJECT_BYTES = 53_687_091_200_000;
 
     public static function declaredLength(?string $value): ?int
     {
@@ -65,7 +65,7 @@ final class MultipartPartSize
                 throw new InternalErrorException('Multipart part size is invalid in metadata.');
             }
             if ($size > self::MAX_OBJECT_BYTES - $total) {
-                throw new EntityTooLargeException('Multipart object exceeds the 5 TiB maximum.');
+                throw new EntityTooLargeException('Multipart object exceeds the 50,000 GiB maximum.');
             }
 
             $total += $size;
