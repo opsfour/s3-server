@@ -16,9 +16,11 @@ use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
 use PHPUnit\Framework\TestCase;
@@ -105,6 +107,106 @@ final class CurrentObjectReadAuthorizationMiddlewareTest extends TestCase
         $this->expectException(OperationAbortedException::class);
         $this->expectExceptionMessage('Bucket ownership changed after authorization.');
         (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest($request, $handler);
+    }
+
+    public function test_handler_error_revalidation_uses_custom_store_exclusive_lock_fallback(): void
+    {
+        $authorized = $this->object('old-path');
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: 'generation',
+        ));
+        $metadata->method('getCurrentObjectVersion')->willReturn($authorized);
+        $metadata->expects(self::once())->method('transaction')
+            ->willReturnCallback(static fn(callable $callback): mixed => $callback());
+        $metadata->expects(self::once())->method('lockOwnerForUpdate')->with('owner');
+        $request = $this->request($authorized);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.cachedBucketOwner', 'owner');
+        $request->setAttribute('s3.policyResult', 'OwnerBypass');
+        $expected = new NoSuchKeyException();
+
+        try {
+            (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                $request,
+                new class ($expected) implements RequestHandler {
+                    public function __construct(private readonly NoSuchKeyException $expected) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        throw $this->expected;
+                    }
+                },
+            );
+            self::fail('A stable handler error must be rethrown after the fallback lock recheck.');
+        } catch (NoSuchKeyException $error) {
+            self::assertSame($expected, $error);
+        }
+    }
+
+    public function test_handler_error_revalidation_holds_shared_lock_across_policy_and_snapshot_checks(): void
+    {
+        $authorized = $this->object('old-path');
+        $current = $authorized;
+        $events = [];
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            SharedAuthorizationLockStore::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $metadata->method('getBucket')->willReturnCallback(static function () use (&$events): BucketInfo {
+            $events[] = 'bucket-read';
+
+            return new BucketInfo('bucket', 'owner', generation: 'generation');
+        });
+        $metadata->method('getCurrentObjectVersion')->willReturnCallback(static function () use (&$current): ObjectInfo {
+            return $current;
+        });
+        $metadata->expects(self::once())->method('prepareOwnerReadLock')->with('owner');
+        $metadata->expects(self::once())->method('transaction')
+            ->willReturnCallback(static function (callable $callback) use (&$events): mixed {
+                $events = [];
+
+                return $callback();
+            });
+        $metadata->expects(self::once())->method('lockOwnerForRead')->with('owner')
+            ->willReturnCallback(static function () use (&$events): void {
+                $events[] = 'owner-lock';
+            });
+        $metadata->expects(self::never())->method('lockOwnerForUpdate');
+        $metadata->method('getBucketPolicy')->willReturnCallback(static function () use (&$current): ?string {
+            $current = new ObjectInfo(
+                'bucket',
+                'key',
+                4,
+                '"etag"',
+                ownerId: 'owner',
+                systemMetadata: ['storagePath' => 'replacement-path'],
+            );
+
+            return null;
+        });
+        $request = $this->request($authorized);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.cachedBucketOwner', 'owner');
+        $request->setAttribute('s3.policyResult', 'OwnerBypass');
+
+        try {
+            (new CurrentObjectReadAuthorizationMiddleware($metadata))->handleRequest(
+                $request,
+                new class implements RequestHandler {
+                    public function handleRequest(Request $request): Response
+                    {
+                        throw new NoSuchKeyException();
+                    }
+                },
+            );
+            self::fail('Snapshot drift during the locked error recheck must replace the handler error.');
+        } catch (AccessDeniedException) {
+            self::assertSame('owner-lock', $events[0] ?? null);
+        }
     }
 
     private function request(ObjectInfo $authorized, S3Operation $operation = S3Operation::GetObject): Request

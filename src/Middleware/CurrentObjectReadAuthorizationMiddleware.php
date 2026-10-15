@@ -90,47 +90,34 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         } catch (CancelledException $error) {
             throw $error;
         } catch (\Throwable $error) {
-            // A handler can inspect the current object while constructing an
-            // error (for example, a new delete marker's version headers).
-            // Suppress that error if it no longer describes the authorized
-            // object; otherwise preserve the original exception unchanged.
-            $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
-            $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
+            // Error responses can reveal current object state too (for
+            // example, delete-marker version headers). Revalidate them under
+            // the same authorization lock and snapshot boundary as success.
+            $this->validate(
+                $request,
+                $operation,
+                $bucket,
+                $key,
+                $versionId,
+                $authorizedBucketGeneration,
+                $authorizedBucketOwner,
+                $authorized,
+                $withinWriteTransaction,
+            );
             throw $error;
         }
         try {
-            $validate = function () use ($request, $bucket, $authorizedBucketGeneration, $authorized, $operation, $key, $versionId, $withinWriteTransaction): ?BucketInfo {
-                $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
-                $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
-                $policy = new PolicyEnforcementMiddleware($this->metadata);
-                if ($withinWriteTransaction) {
-                    $policy->assertAllowedAtCommit($request);
-                } else {
-                    $policy->assertAllowedAtReadCommit($request);
-                }
-                $observedBucket = $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
-                $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
-
-                return $observedBucket;
-            };
-            if ($request->hasAttribute('s3.policyResult') && ! $withinWriteTransaction) {
-                $readOwners = [
-                    (string) $request->getAttribute('ownerId'),
-                    $authorizedBucketOwner,
-                    $authorized === null ? '' : $authorized->ownerId,
-                ];
-                OwnerReadLock::prepare($this->metadata, ...$readOwners);
-                $observedBucket = $this->metadata->transaction(function () use ($validate, $readOwners): ?BucketInfo {
-                    OwnerReadLock::acquire(
-                        $this->metadata,
-                        ...$readOwners,
-                    );
-
-                    return $validate();
-                });
-            } else {
-                $observedBucket = $validate();
-            }
+            $observedBucket = $this->validate(
+                $request,
+                $operation,
+                $bucket,
+                $key,
+                $versionId,
+                $authorizedBucketGeneration,
+                $authorizedBucketOwner,
+                $authorized,
+                $withinWriteTransaction,
+            );
             if ($operation === S3Operation::GetObject) {
                 if ($observedBucket === null) {
                     throw new OperationAbortedException('Bucket disappeared after authorization.');
@@ -157,6 +144,49 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         }
 
         return $response;
+    }
+
+    private function validate(
+        Request $request,
+        S3Operation $operation,
+        string $bucket,
+        string $key,
+        ?string $versionId,
+        ?string $authorizedBucketGeneration,
+        string $authorizedBucketOwner,
+        ?ObjectInfo $authorized,
+        bool $withinWriteTransaction,
+    ): ?BucketInfo {
+        $validate = function () use ($request, $bucket, $authorizedBucketGeneration, $authorized, $operation, $key, $versionId, $withinWriteTransaction): ?BucketInfo {
+            $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
+            $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
+            $policy = new PolicyEnforcementMiddleware($this->metadata);
+            if ($withinWriteTransaction) {
+                $policy->assertAllowedAtCommit($request);
+            } else {
+                $policy->assertAllowedAtReadCommit($request);
+            }
+            $observedBucket = $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
+            $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
+
+            return $observedBucket;
+        };
+        if (! $request->hasAttribute('s3.policyResult') || $withinWriteTransaction) {
+            return $validate();
+        }
+
+        $readOwners = [
+            (string) $request->getAttribute('ownerId'),
+            $authorizedBucketOwner,
+            $authorized === null ? '' : $authorized->ownerId,
+        ];
+        OwnerReadLock::prepare($this->metadata, ...$readOwners);
+
+        return $this->metadata->transaction(function () use ($validate, $readOwners): ?BucketInfo {
+            OwnerReadLock::acquire($this->metadata, ...$readOwners);
+
+            return $validate();
+        });
     }
 
     private function assertBucketGenerationUnchanged(Request $request, string $bucket, ?string $authorizedGeneration): ?BucketInfo
