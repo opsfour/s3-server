@@ -59,10 +59,21 @@ final class NoncurrentTimestampTest extends TestCase
     public function test_promoting_a_version_clears_its_noncurrent_timestamp(): void
     {
         $first = $this->store->putObjectVersioned('bucket', 'object', 'owner', 1, 'first', 'text/plain', 'first');
+        $this->pdo()->prepare('UPDATE s3_objects SET updated_at = ? WHERE version_id = ?')
+            ->execute(['2000-01-02T03:04:05Z', $first]);
         $second = $this->store->putObjectVersioned('bucket', 'object', 'owner', 1, 'second', 'text/plain', 'second');
         $noncurrent = $this->store->getObjectMetadataByVersion('bucket', 'object', $first);
         self::assertNotNull($noncurrent);
         self::assertArrayHasKey('noncurrentAt', $noncurrent->systemMetadata);
+        self::assertSame('2000-01-02T03:04:05+00:00', $noncurrent->lastModified->format(DATE_ATOM));
+
+        $listed = array_values(array_filter(
+            $this->store->listObjectVersions('bucket')['versions'],
+            static fn($version): bool => $version->versionId === $first,
+        ));
+        self::assertCount(1, $listed);
+        self::assertArrayHasKey('noncurrentAt', $listed[0]->systemMetadata);
+        self::assertSame('2000-01-02T03:04:05+00:00', $listed[0]->lastModified->format(DATE_ATOM));
 
         $this->store->deleteObjectVersion('bucket', 'object', $second);
 
@@ -70,6 +81,37 @@ final class NoncurrentTimestampTest extends TestCase
         self::assertNotNull($promoted);
         self::assertSame('1', $promoted->systemMetadata['isLatest']);
         self::assertArrayNotHasKey('noncurrentAt', $promoted->systemMetadata);
+        self::assertSame('2000-01-02T03:04:05+00:00', $promoted->lastModified->format(DATE_ATOM));
+    }
+
+    public function test_suspended_null_write_and_delete_marker_preserve_numbered_last_modified(): void
+    {
+        $first = $this->store->putObjectVersioned('bucket', 'suspended', 'owner', 1, 'first', 'text/plain', 'first');
+        $this->pdo()->prepare('UPDATE s3_objects SET updated_at = ? WHERE version_id = ?')
+            ->execute(['2000-01-02T03:04:05Z', $first]);
+        $this->store->setBucketVersioning('bucket', 'Suspended');
+
+        $this->store->putObjectMetadata('bucket', 'suspended', 'owner', 1, 'null', 'text/plain', 'null');
+        $noncurrent = $this->store->getObjectMetadataByVersion('bucket', 'suspended', $first);
+        self::assertNotNull($noncurrent);
+        self::assertArrayHasKey('noncurrentAt', $noncurrent->systemMetadata);
+        self::assertSame('2000-01-02T03:04:05+00:00', $noncurrent->lastModified->format(DATE_ATOM));
+
+        $this->store->deleteObjectVersion('bucket', 'suspended', 'null');
+        $promoted = $this->store->getObjectMetadataByVersion('bucket', 'suspended', $first);
+        self::assertNotNull($promoted);
+        self::assertSame('1', $promoted->systemMetadata['isLatest']);
+        self::assertSame('2000-01-02T03:04:05+00:00', $promoted->lastModified->format(DATE_ATOM));
+
+        self::assertSame('null', $this->store->deleteObjectVersioned('bucket', 'suspended', 'owner', true));
+        $demoted = $this->store->getObjectMetadataByVersion('bucket', 'suspended', $first);
+        self::assertNotNull($demoted);
+        self::assertArrayHasKey('noncurrentAt', $demoted->systemMetadata);
+        self::assertSame('2000-01-02T03:04:05+00:00', $demoted->lastModified->format(DATE_ATOM));
+        $markers = $this->store->listObjectVersions('bucket')['deleteMarkers'];
+        self::assertCount(1, $markers);
+        self::assertNull($markers[0]->versionId);
+        self::assertSame('1', $markers[0]->systemMetadata['isLatest']);
     }
 
     public function test_legacy_noncurrent_rows_start_at_migration_time_instead_of_creation_time(): void

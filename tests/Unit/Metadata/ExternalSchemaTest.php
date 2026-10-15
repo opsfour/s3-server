@@ -16,6 +16,8 @@ final class ExternalSchemaTest extends TestCase
         $reflection = new \ReflectionClass(MysqlMetadataStore::class);
         $placementSql = $reflection->getConstant('OBJECT_PLACEMENT_UPDATE_SQL');
         $sql = $reflection->getConstant('RESTORE_STATE_UPDATE_SQL');
+        $demotionSql = $reflection->getConstant('VERSION_DEMOTION_UPDATE_SQL');
+        $promotionSql = $reflection->getConstant('VERSION_PROMOTION_UPDATE_SQL');
 
         self::assertIsString($placementSql);
         self::assertStringContainsString('updated_at = updated_at', $placementSql);
@@ -23,6 +25,14 @@ final class ExternalSchemaTest extends TestCase
         self::assertIsString($sql);
         self::assertStringContainsString('updated_at = updated_at', $sql);
         self::assertStringNotContainsString('updated_at = ?', $sql);
+        self::assertIsString($demotionSql);
+        self::assertStringContainsString('is_latest = 0', $demotionSql);
+        self::assertStringContainsString('noncurrent_at = CURRENT_TIMESTAMP', $demotionSql);
+        self::assertStringContainsString('updated_at = updated_at', $demotionSql);
+        self::assertIsString($promotionSql);
+        self::assertStringContainsString('is_latest = 1', $promotionSql);
+        self::assertStringContainsString('noncurrent_at = NULL', $promotionSql);
+        self::assertStringContainsString('updated_at = updated_at', $promotionSql);
         self::assertStringContainsString(
             'updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
             implode("\n", MysqlSchema::getCreateStatements()),

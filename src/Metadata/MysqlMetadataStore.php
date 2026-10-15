@@ -31,6 +31,33 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  */
 final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
+    /** Preserve S3 Last-Modified while changing version-list bookkeeping. */
+    private const string VERSION_DEMOTION_UPDATE_SQL = <<<'SQL'
+        UPDATE s3_objects
+        SET is_latest = 0,
+            noncurrent_at = CURRENT_TIMESTAMP,
+            updated_at = updated_at
+        WHERE bucket = ? AND key_name = ? AND is_latest = 1
+        SQL;
+
+    /** Preserve S3 Last-Modified while promoting the prior current version. */
+    private const string VERSION_PROMOTION_UPDATE_SQL = <<<'SQL'
+        UPDATE s3_objects
+        SET is_latest = 1,
+            noncurrent_at = NULL,
+            updated_at = updated_at
+        WHERE bucket = ? AND key_name = ?
+          AND id = (
+              SELECT id FROM (
+                  SELECT id FROM s3_objects
+                  WHERE bucket = ? AND key_name = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT 1
+              ) AS t
+          )
+          AND is_latest = 0
+        SQL;
+
     /** Explicit self-assignment suppresses MySQL's ON UPDATE timestamp for placement-only metadata. */
     private const string OBJECT_PLACEMENT_UPDATE_SQL = <<<'SQL'
         UPDATE s3_objects
@@ -409,10 +436,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
         ): void {
             // A suspended write replaces the null version but retains any
             // numbered version that was latest before the write.
-            $this->conn()->execute(
-                'UPDATE s3_objects SET is_latest = 0, noncurrent_at = CURRENT_TIMESTAMP WHERE bucket = ? AND key_name = ? AND is_latest = 1',
-                [$bucket, $key],
-            );
+            $this->conn()->execute(self::VERSION_DEMOTION_UPDATE_SQL, [$bucket, $key]);
 
             $this->clearNullVersionMetadata($bucket, $key);
 
@@ -1989,10 +2013,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
         $link = $ownTx ? $this->pool->beginTransaction() : $existingTx;
 
         try {
-            $link->execute(
-                'UPDATE s3_objects SET is_latest = 0, noncurrent_at = CURRENT_TIMESTAMP WHERE bucket = ? AND key_name = ? AND is_latest = 1',
-                [$bucket, $key],
-            );
+            $link->execute(self::VERSION_DEMOTION_UPDATE_SQL, [$bucket, $key]);
 
             $link->execute(
                 <<<'SQL'
@@ -2043,10 +2064,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
 
         try {
             // Mark all previous versions as non-latest (both enabled and suspended).
-            $link->execute(
-                'UPDATE s3_objects SET is_latest = 0, noncurrent_at = CURRENT_TIMESTAMP WHERE bucket = ? AND key_name = ? AND is_latest = 1',
-                [$bucket, $key],
-            );
+            $link->execute(self::VERSION_DEMOTION_UPDATE_SQL, [$bucket, $key]);
 
             if ($suspended) {
                 // Suspended: upsert delete marker with version_id='null'.
@@ -2167,23 +2185,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
                 // Promote the next most recent version to is_latest.
                 // MySQL does not allow referencing the same table in a subquery
                 // of an UPDATE, so we use a derived table workaround.
-                $link->execute(
-                    <<<'SQL'
-                    UPDATE s3_objects
-                    SET is_latest = 1, noncurrent_at = NULL
-                    WHERE bucket = ? AND key_name = ?
-                      AND id = (
-                          SELECT id FROM (
-                              SELECT id FROM s3_objects
-                              WHERE bucket = ? AND key_name = ?
-                              ORDER BY created_at DESC, id DESC
-                              LIMIT 1
-                          ) AS t
-                      )
-                      AND is_latest = 0
-                    SQL,
-                    [$bucket, $key, $bucket, $key],
-                );
+                $link->execute(self::VERSION_PROMOTION_UPDATE_SQL, [$bucket, $key, $bucket, $key]);
             }
 
             $effectiveVersionId = $versionId;
@@ -2243,7 +2245,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];

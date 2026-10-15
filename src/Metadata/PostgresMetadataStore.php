@@ -2235,7 +2235,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = $1';
 
         $params = [$bucket];

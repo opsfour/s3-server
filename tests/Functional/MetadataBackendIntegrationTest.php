@@ -641,6 +641,101 @@ final class MetadataBackendIntegrationTest extends TestCase
         yield 'postgres' => ['postgres', 'S3_TEST_POSTGRES_METADATA_DSN'];
     }
 
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_version_bookkeeping_preserves_last_modified_and_projects_noncurrent_time(
+        string $driver,
+        string $dsnEnv,
+    ): void {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} version timestamp parity tests.");
+        }
+
+        $dsn = trim($dsn);
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        $pool = self::externalPool($driver, $dsn);
+        $suffix = bin2hex(random_bytes(8));
+        $bucket = 'version-time-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $key = 'object';
+        $created = false;
+
+        try {
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            $created = true;
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $first = $metadata->putObjectVersioned($bucket, $key, $owner, 1, 'first', 'text/plain', 'first');
+            $fixedLastModified = new \DateTimeImmutable('2000-01-02T03:04:05Z');
+            $pool->execute(
+                $driver === 'mysql'
+                    ? 'UPDATE s3_objects SET updated_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                    : 'UPDATE s3_objects SET updated_at = $1::timestamptz WHERE bucket = $2 AND key_name = $3 AND version_id = $4',
+                [
+                    $fixedLastModified->format($driver === 'mysql' ? 'Y-m-d H:i:s' : DATE_ATOM),
+                    $bucket,
+                    $key,
+                    $first,
+                ],
+            );
+            $baseline = $metadata->getObjectMetadataByVersion($bucket, $key, $first);
+            self::assertNotNull($baseline);
+            self::assertSame($fixedLastModified->getTimestamp(), $baseline->lastModified->getTimestamp());
+
+            $second = $metadata->putObjectVersioned($bucket, $key, $owner, 1, 'second', 'text/plain', 'second');
+            $listed = array_values(array_filter(
+                $metadata->listObjectVersions($bucket)['versions'],
+                static fn($version): bool => $version->versionId === $first,
+            ));
+            self::assertCount(1, $listed);
+            self::assertArrayHasKey('noncurrentAt', $listed[0]->systemMetadata);
+            self::assertSame($baseline->lastModified->getTimestamp(), $listed[0]->lastModified->getTimestamp());
+
+            $metadata->deleteObjectVersion($bucket, $key, $second);
+            $promoted = $metadata->getObjectMetadataByVersion($bucket, $key, $first);
+            self::assertNotNull($promoted);
+            self::assertSame('1', $promoted->systemMetadata['isLatest']);
+            self::assertArrayNotHasKey('noncurrentAt', $promoted->systemMetadata);
+            self::assertSame($baseline->lastModified->getTimestamp(), $promoted->lastModified->getTimestamp());
+
+            $metadata->setBucketVersioning($bucket, 'Suspended');
+            $metadata->putObjectMetadata($bucket, $key, $owner, 1, 'null', 'text/plain', 'null');
+            $afterNullWrite = $metadata->getObjectMetadataByVersion($bucket, $key, $first);
+            self::assertNotNull($afterNullWrite);
+            self::assertArrayHasKey('noncurrentAt', $afterNullWrite->systemMetadata);
+            self::assertSame($baseline->lastModified->getTimestamp(), $afterNullWrite->lastModified->getTimestamp());
+
+            $metadata->deleteObjectVersion($bucket, $key, 'null');
+            $afterNullDeletion = $metadata->getObjectMetadataByVersion($bucket, $key, $first);
+            self::assertNotNull($afterNullDeletion);
+            self::assertSame('1', $afterNullDeletion->systemMetadata['isLatest']);
+            self::assertSame($baseline->lastModified->getTimestamp(), $afterNullDeletion->lastModified->getTimestamp());
+
+            self::assertSame('null', $metadata->deleteObjectVersioned($bucket, $key, $owner, true));
+            $afterDeleteMarker = $metadata->getObjectMetadataByVersion($bucket, $key, $first);
+            self::assertNotNull($afterDeleteMarker);
+            self::assertArrayHasKey('noncurrentAt', $afterDeleteMarker->systemMetadata);
+            self::assertSame($baseline->lastModified->getTimestamp(), $afterDeleteMarker->lastModified->getTimestamp());
+            $markers = $metadata->listObjectVersions($bucket)['deleteMarkers'];
+            self::assertCount(1, $markers);
+            self::assertNull($markers[0]->versionId);
+            self::assertSame('1', $markers[0]->systemMetadata['isLatest']);
+        } finally {
+            $pool->close();
+            if ($created) {
+                for ($attempt = 0; $attempt < 4; $attempt++) {
+                    $entries = $metadata->listObjectVersions($bucket)['entries'] ?? [];
+                    if ($entries === []) {
+                        break;
+                    }
+                    foreach ($entries as $entry) {
+                        $metadata->deleteObjectVersion($bucket, $entry->key, $entry->versionId ?? 'null');
+                    }
+                }
+                $metadata->deleteBucket($owner, $bucket);
+            }
+        }
+    }
+
     /** @return iterable<string, array{string, string, string}> */
     public static function externalReadLockScenarios(): iterable
     {
