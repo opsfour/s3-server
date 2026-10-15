@@ -57,8 +57,143 @@ use Psr\Log\LoggerInterface;
 final readonly class S3ServerRuntimeFactory
 {
     /**
+     * Build and consume the complete listenerless candidate without exposing
+     * its mutable graph or ingress resources to the caller. Production EFS
+     * serving remains closed.
+     *
+     * @internal Preparatory candidate API; this does not admit serving.
+     */
+    public function createQualifiedEfsCandidatePreBindRuntime(
+        EfsQualificationContext $qualification,
+        EfsNodeLocalScratch $scratch,
+        S3ServerConfig $config,
+        PostgresMetadataStore|MysqlMetadataStore $metadata,
+        CredentialProvider $credentialProvider,
+        LoggerInterface $logger,
+        ?ObservedMetadataStore $observedMetadata = null,
+        ?EncryptionServiceInterface $encryption = null,
+        float $backgroundReadyTimeoutSeconds = 5.0,
+    ): EfsCandidatePreBindRuntime {
+        return $this->assembleQualifiedEfsCandidatePreBindRuntime(
+            $qualification,
+            $scratch,
+            $config,
+            $metadata,
+            $credentialProvider,
+            $logger,
+            $observedMetadata,
+            $encryption,
+            $backgroundReadyTimeoutSeconds,
+        );
+    }
+
+    /**
+     * @internal Test-only failure boundary before ingress construction. The
+     * hook receives no resource and cannot retain the internally built graph.
+     *
+     * @param \Closure(): void $beforeIngressConstruction
+     */
+    public function createQualifiedEfsCandidatePreBindRuntimeForTests(
+        EfsQualificationContext $qualification,
+        EfsNodeLocalScratch $scratch,
+        S3ServerConfig $config,
+        PostgresMetadataStore|MysqlMetadataStore $metadata,
+        CredentialProvider $credentialProvider,
+        LoggerInterface $logger,
+        \Closure $beforeIngressConstruction,
+        ?ObservedMetadataStore $observedMetadata = null,
+        ?EncryptionServiceInterface $encryption = null,
+        float $backgroundReadyTimeoutSeconds = 5.0,
+    ): EfsCandidatePreBindRuntime {
+        return $this->assembleQualifiedEfsCandidatePreBindRuntime(
+            $qualification,
+            $scratch,
+            $config,
+            $metadata,
+            $credentialProvider,
+            $logger,
+            $observedMetadata,
+            $encryption,
+            $backgroundReadyTimeoutSeconds,
+            $beforeIngressConstruction,
+        );
+    }
+
+    /** @param (\Closure(): void)|null $beforeIngressConstruction */
+    private function assembleQualifiedEfsCandidatePreBindRuntime(
+        EfsQualificationContext $qualification,
+        EfsNodeLocalScratch $scratch,
+        S3ServerConfig $config,
+        PostgresMetadataStore|MysqlMetadataStore $metadata,
+        CredentialProvider $credentialProvider,
+        LoggerInterface $logger,
+        ?ObservedMetadataStore $observedMetadata,
+        ?EncryptionServiceInterface $encryption,
+        float $backgroundReadyTimeoutSeconds,
+        ?\Closure $beforeIngressConstruction = null,
+    ): EfsCandidatePreBindRuntime {
+        $graph = $this->createQualifiedEfsCandidateResources(
+            $qualification,
+            $scratch,
+            $config,
+            $metadata,
+            $logger,
+            observedMetadata: $observedMetadata,
+            encryption: $encryption,
+        );
+        try {
+            $beforeIngressConstruction?->__invoke();
+            $ingress = $this->createQualifiedEfsCandidateIngressResources(
+                $qualification,
+                $scratch,
+                $config,
+                $graph->metadata,
+                $credentialProvider,
+            );
+        } catch (\Throwable $bootstrapError) {
+            $partial = new EfsCandidateAssemblyPartialResources(
+                $graph,
+                $bootstrapError instanceof EfsCandidateIngressBootstrapException
+                    ? $bootstrapError->workerPool
+                    : null,
+            );
+            if ($bootstrapError instanceof EfsCandidateIngressBootstrapException) {
+                self::logCleanupFailure($logger, 'EFS candidate ingress cleanup failed.', $bootstrapError);
+                $cause = $bootstrapError->getPrevious() ?? new \RuntimeException('EFS ingress construction failed.');
+                try {
+                    $partial->shutdown();
+                } catch (\Throwable $cleanupError) {
+                    self::logCleanupFailure($logger, 'EFS candidate assembly cleanup failed.', $cleanupError);
+                    throw new EfsCandidateAssemblyBootstrapException($partial, $cause);
+                }
+
+                throw $cause;
+            }
+            try {
+                $partial->shutdown();
+            } catch (\Throwable $cleanupError) {
+                self::logCleanupFailure($logger, 'EFS candidate assembly cleanup failed.', $cleanupError);
+                throw new EfsCandidateAssemblyBootstrapException($partial, $bootstrapError);
+            }
+
+            throw $bootstrapError;
+        }
+
+        // prepare() consumes both bundles even when preparation fails. Never
+        // attempt a second cleanup here; its exception owns any retry state.
+        return EfsCandidatePreBindRuntime::prepare(
+            $graph,
+            $ingress,
+            $logger,
+            $backgroundReadyTimeoutSeconds,
+        );
+    }
+
+    /**
      * Consume one qualified graph and ingress bundle into a fully prepared,
      * listenerless owner. Production serving remains closed.
+     *
+     * @internal Tests and staged candidate construction only.
      */
     public function prepareQualifiedEfsCandidate(
         EfsCandidateRuntimeResources $graph,
@@ -79,6 +214,7 @@ final readonly class S3ServerRuntimeFactory
      * changing the EFS candidate's serving refusal. The returned bundle owns
      * its worker pool and must be shut down explicitly.
      *
+     * @internal Tests and staged candidate construction only.
      */
     public function createQualifiedEfsCandidateIngressResources(
         EfsQualificationContext $qualification,
@@ -103,6 +239,8 @@ final readonly class S3ServerRuntimeFactory
      *
      * The optional construction hook may return a before-stop fault injector
      * for candidate-only shutdown tests; the real writer close still runs.
+     *
+     * @internal Tests and staged candidate construction only.
      */
     public function createQualifiedEfsCandidateResources(
         EfsQualificationContext $qualification,

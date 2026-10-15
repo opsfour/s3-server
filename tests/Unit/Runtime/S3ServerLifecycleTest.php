@@ -376,17 +376,26 @@ final class S3ServerLifecycleTest extends TestCase
         /** @var StorageBackend&ShutdownAwareStorageBackend&\PHPUnit\Framework\MockObject\MockObject $storage */
         $storage = $this->createMockForIntersectionOfInterfaces([StorageBackend::class, ShutdownAwareStorageBackend::class]);
         $storage->expects(self::once())->method('shutdown');
-        $failedPoolCalls = 0;
         $firstPool = $this->createMock(WorkerPool::class);
-        $firstPool->expects(self::exactly(2))->method('shutdown')->willReturnCallback(
-            static function () use (&$failedPoolCalls): void {
-                if (++$failedPoolCalls === 1) {
-                    throw new \RuntimeException('private-pool-error');
+        $firstPool->expects(self::once())->method('shutdown')->willThrowException(new \RuntimeException('private-pool-error'));
+        $killCalls = 0;
+        $firstPool->expects(self::exactly(2))->method('kill')->willReturnCallback(
+            static function () use (&$killCalls): void {
+                if (++$killCalls === 1) {
+                    throw new \RuntimeException('private-pool-kill-error');
                 }
             },
         );
+        $firstPool->method('isRunning')->willReturn(false);
+        $secondShutdownCalls = 0;
         $secondPool = $this->createMock(WorkerPool::class);
-        $secondPool->expects(self::once())->method('shutdown');
+        $secondPool->expects(self::once())->method('shutdown')->willReturnCallback(
+            static function () use (&$secondShutdownCalls): void {
+                ++$secondShutdownCalls;
+            },
+        );
+        $secondPool->expects(self::never())->method('kill');
+        $secondPool->method('isRunning')->willReturn(false);
         $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage);
         $server->addWorkerPool($firstPool, 'first');
         $server->addWorkerPool($secondPool, 'second');
@@ -397,11 +406,66 @@ final class S3ServerLifecycleTest extends TestCase
         } catch (\RuntimeException $error) {
             self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
         }
-        self::assertSame(1, $failedPoolCalls);
+        self::assertStringContainsString(
+            's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="first"} 1',
+            $server->getMetricsCollector()->renderPrometheus(),
+        );
+        self::assertSame(0, $secondShutdownCalls);
+
+        try {
+            $server->stop();
+            self::fail('A failed worker kill was reported as complete.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+        self::assertSame(0, $secondShutdownCalls);
+        self::assertStringContainsString(
+            's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="first"} 2',
+            $server->getMetricsCollector()->renderPrometheus(),
+        );
 
         $server->stop();
         $server->stop();
-        self::assertSame(2, $failedPoolCalls);
+        self::assertSame(1, $secondShutdownCalls);
+        self::assertSame(2, $killCalls);
+        self::assertStringContainsString(
+            's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="first"} 2',
+            $server->getMetricsCollector()->renderPrometheus(),
+        );
+    }
+
+    public function test_worker_pool_returning_while_still_running_is_killed_before_later_pool(): void
+    {
+        $running = true;
+        $firstPool = $this->createMock(WorkerPool::class);
+        $firstPool->expects(self::once())->method('shutdown');
+        $firstPool->expects(self::once())->method('kill')->willReturnCallback(static function () use (&$running): void {
+            $running = false;
+        });
+        $firstPool->method('isRunning')->willReturnCallback(static function () use (&$running): bool {
+            return $running;
+        });
+        $laterCalls = 0;
+        $secondPool = $this->createMock(WorkerPool::class);
+        $secondPool->expects(self::once())->method('shutdown')->willReturnCallback(static function () use (&$laterCalls): void {
+            ++$laterCalls;
+        });
+        $secondPool->method('isRunning')->willReturn(false);
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()));
+        $server->addWorkerPool($firstPool, 'no_op');
+        $server->addWorkerPool($secondPool, 'later');
+
+        try {
+            $server->stop();
+            self::fail('A still-running worker pool was marked closed.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+        }
+        self::assertSame(0, $laterCalls);
+
+        $server->stop();
+        self::assertFalse($running);
+        self::assertSame(1, $laterCalls);
     }
 
     public function test_startup_configuration_setters_reject_late_changes(): void

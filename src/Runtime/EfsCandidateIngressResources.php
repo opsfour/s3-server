@@ -24,6 +24,8 @@ final class EfsCandidateIngressResources
 
     private bool $shutdownInProgress = false;
 
+    private bool $workerPoolNeedsKill = false;
+
     private ?S3Server $serverOwner = null;
 
     private function __construct(
@@ -99,7 +101,8 @@ final class EfsCandidateIngressResources
     /** May only run before API fibers, because scratch identity checks can block. */
     public function assertBoundTo(EfsQualificationContext $qualification, EfsNodeLocalScratch $scratch): void
     {
-        if ($this->closed || $this->qualification !== $qualification || $this->scratch !== $scratch) {
+        if ($this->closed || $this->workerPoolNeedsKill
+            || $this->qualification !== $qualification || $this->scratch !== $scratch) {
             throw new \RuntimeException('EFS ingress resources belong to a different qualification or were closed.');
         }
         $scratch->assertBoundTo($qualification);
@@ -125,7 +128,8 @@ final class EfsCandidateIngressResources
     /** @internal Prove the exact provider used by SigV4 and browser POST. */
     public function assertCredentialProviderBinding(CredentialProvider $credentialProvider): void
     {
-        if ($this->closed || $this->shutdownInProgress || $this->credentialProvider !== $credentialProvider) {
+        if ($this->closed || $this->shutdownInProgress || $this->workerPoolNeedsKill
+            || $this->credentialProvider !== $credentialProvider) {
             throw new \RuntimeException('EFS ingress credential provider differs from candidate provider.');
         }
         $this->auth->assertQualifiedCredentialProviderBinding($credentialProvider);
@@ -142,7 +146,8 @@ final class EfsCandidateIngressResources
     /** @internal Attach only the exact config that created this ingress graph. */
     public function assertAttachableTo(S3ServerConfig $config): void
     {
-        if ($this->closed || $this->shutdownInProgress || $this->serverOwner !== null || $this->config !== $config) {
+        if ($this->closed || $this->shutdownInProgress || $this->workerPoolNeedsKill
+            || $this->serverOwner !== null || $this->config !== $config) {
             throw new \RuntimeException('EFS ingress is closed, already owned or configured for another server.');
         }
         $this->assertBoundTo($this->qualification, $this->scratch);
@@ -173,13 +178,13 @@ final class EfsCandidateIngressResources
     /** @internal The server calls this only after its HTTP drain completed. */
     public function assertDrainedForServerStop(S3Server $server): void
     {
-        if ($this->serverOwner !== $server || $this->closed) {
-            throw new \LogicException('EFS ingress worker pool has another owner or is closed.');
-        }
-        if (! $this->workerPool->isRunning()) {
-            throw new \RuntimeException('EFS ingress worker pool stopped outside its server owner.');
-        }
-        $this->assertDrained();
+        $this->assertDrainedForServerOwner($server, requireRunningPool: true);
+    }
+
+    /** @internal Retry after this server's recorded graceful pool stop failed. */
+    public function assertDrainedForServerStopRetry(S3Server $server): void
+    {
+        $this->assertDrainedForServerOwner($server, requireRunningPool: false);
     }
 
     /** @internal Mark the already shut-down pool closed without a second close. */
@@ -191,6 +196,7 @@ final class EfsCandidateIngressResources
         if ($this->workerPool->isRunning()) {
             throw new \LogicException('EFS ingress worker pool is still running.');
         }
+        $this->workerPoolNeedsKill = false;
         $this->closed = true;
     }
 
@@ -198,6 +204,17 @@ final class EfsCandidateIngressResources
     {
         $this->requestBodySpool->assertIdle();
         $this->coordinator->assertIdle();
+    }
+
+    private function assertDrainedForServerOwner(S3Server $server, bool $requireRunningPool): void
+    {
+        if ($this->serverOwner !== $server || $this->closed) {
+            throw new \LogicException('EFS ingress worker pool has another owner or is closed.');
+        }
+        if ($requireRunningPool && ! $this->workerPool->isRunning()) {
+            throw new \RuntimeException('EFS ingress worker pool stopped outside its server owner.');
+        }
+        $this->assertDrained();
     }
 
     /** A failed worker shutdown leaves this bundle owned and retryable. */
@@ -215,7 +232,21 @@ final class EfsCandidateIngressResources
         $this->shutdownInProgress = true;
         try {
             $this->assertDrained();
-            $this->workerPool->shutdown();
+            try {
+                if ($this->workerPoolNeedsKill) {
+                    $this->workerPool->kill();
+                } else {
+                    $this->workerPool->shutdown();
+                }
+            } catch (\Throwable $error) {
+                // A graceful ContextWorkerPool shutdown Future is terminal once
+                // it fails. Retrying shutdown() would only replay that cached
+                // failure, so retain ownership and force the next retry to kill.
+                $this->workerPoolNeedsKill = true;
+
+                throw $error;
+            }
+            $this->workerPoolNeedsKill = false;
             $this->closed = true;
         } finally {
             $this->shutdownInProgress = false;

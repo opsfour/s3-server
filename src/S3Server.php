@@ -113,6 +113,12 @@ final class S3Server
     /** @var array<int, true> Successfully closed registered worker pools. */
     private array $closedWorkerPools = [];
 
+    /** @var array<int, true> Pools requiring forced termination on the next stop attempt. */
+    private array $failedWorkerPoolShutdowns = [];
+
+    /** @var array<int, true> Terminated pools awaiting final owner bookkeeping. */
+    private array $terminatedWorkerPools = [];
+
     private readonly HandlerRegistry $handlerRegistry;
 
     private readonly LoggerInterface $logger;
@@ -581,9 +587,14 @@ final class S3Server
                     $id = spl_object_id($entry['pool']);
                     try {
                         $entry['pool']->shutdown();
+                        if ($entry['pool']->isRunning()) {
+                            throw new \RuntimeException('Worker pool remained running after shutdown.');
+                        }
                         $this->closedWorkerPools[$id] = true;
                     } catch (\Throwable $cleanupError) {
+                        $this->failedWorkerPoolShutdowns[$id] = true;
                         $poolCleanupFailed = true;
+                        $this->metrics->recordWorkerPoolShutdownFailure($entry['name'], $cleanupError::class);
                         $this->logShutdown('warning', 'Startup worker pool cleanup failed.', [
                             'pool' => $entry['name'],
                             'exception' => $cleanupError::class,
@@ -597,7 +608,12 @@ final class S3Server
                 }
 
                 foreach (array_slice($this->workerPools, $startupPoolCount) as $entry) {
-                    unset($this->closedWorkerPools[spl_object_id($entry['pool'])]);
+                    $id = spl_object_id($entry['pool']);
+                    unset(
+                        $this->closedWorkerPools[$id],
+                        $this->failedWorkerPoolShutdowns[$id],
+                        $this->terminatedWorkerPools[$id],
+                    );
                 }
                 array_splice($this->workerPools, $startupPoolCount);
                 throw $e;
@@ -1033,16 +1049,38 @@ final class S3Server
             if (isset($this->closedWorkerPools[$id])) {
                 continue;
             }
+            $qualifiedIngressPool = $this->qualifiedEfsIngress !== null
+                && $entry['pool'] === $this->qualifiedEfsIngress->workerPool;
+            $poolCloseStarted = false;
             try {
-                if ($this->qualifiedEfsIngress !== null && $entry['pool'] === $this->qualifiedEfsIngress->workerPool) {
-                    $this->qualifiedEfsIngress->assertDrainedForServerStop($this);
+                if (! isset($this->terminatedWorkerPools[$id])) {
+                    if ($qualifiedIngressPool) {
+                        if (isset($this->failedWorkerPoolShutdowns[$id])) {
+                            $this->qualifiedEfsIngress?->assertDrainedForServerStopRetry($this);
+                        } else {
+                            $this->qualifiedEfsIngress?->assertDrainedForServerStop($this);
+                        }
+                    }
+                    $poolCloseStarted = true;
+                    if (isset($this->failedWorkerPoolShutdowns[$id])) {
+                        $entry['pool']->kill();
+                    } else {
+                        $entry['pool']->shutdown();
+                    }
+                    if ($entry['pool']->isRunning()) {
+                        throw new \RuntimeException('Worker pool remained running after shutdown.');
+                    }
+                    $this->terminatedWorkerPools[$id] = true;
                 }
-                $entry['pool']->shutdown();
+                if ($qualifiedIngressPool) {
+                    $this->qualifiedEfsIngress?->markServerPoolClosed($this);
+                }
                 $this->closedWorkerPools[$id] = true;
-                if ($this->qualifiedEfsIngress !== null && $entry['pool'] === $this->qualifiedEfsIngress->workerPool) {
-                    $this->qualifiedEfsIngress->markServerPoolClosed($this);
-                }
+                unset($this->failedWorkerPoolShutdowns[$id], $this->terminatedWorkerPools[$id]);
             } catch (\Throwable $e) {
+                if ($poolCloseStarted && ! isset($this->terminatedWorkerPools[$id])) {
+                    $this->failedWorkerPoolShutdowns[$id] = true;
+                }
                 $this->metrics->recordWorkerPoolShutdownFailure($entry['name'], $e::class);
                 $this->logShutdown('warning', 'Worker pool shutdown failed.', ['pool' => $entry['name'], 'exception' => $e::class]);
                 $this->abortIncompleteShutdown();
@@ -1530,7 +1568,9 @@ final class S3Server
     }
 
     /**
-     * Register a worker pool for graceful shutdown.
+     * Transfer shutdown ownership of a worker pool to this server.
+     *
+     * A later stop retry force-kills the pool if its graceful shutdown fails.
      */
     public function addWorkerPool(WorkerPool $pool, string $name = 'registered', ?int $configuredWorkers = null): void
     {

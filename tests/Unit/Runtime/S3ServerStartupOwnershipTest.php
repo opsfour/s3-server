@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\SocketHttpServer;
+use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
@@ -17,18 +19,20 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
+use Revolt\EventLoop;
 
 final class S3ServerStartupOwnershipTest extends TestCase
 {
-    public function test_failed_start_keeps_registered_worker_pool_for_shutdown_retry_and_allows_reconfiguration(): void
+    public function test_failed_start_keeps_registered_worker_pool_for_forced_shutdown_retry_and_allows_reconfiguration(): void
     {
         $pool = $this->createMock(WorkerPool::class);
         $stops = 0;
-        $pool->method('shutdown')->willReturnCallback(static function () use (&$stops): void {
-            if (++$stops === 1) {
-                throw new \RuntimeException('injected pool close failure');
-            }
+        $pool->expects(self::once())->method('shutdown')->willReturnCallback(static function () use (&$stops): void {
+            ++$stops;
+            throw new \RuntimeException('injected pool close failure');
         });
+        $pool->expects(self::once())->method('kill');
+        $pool->method('isRunning')->willReturn(false);
 
         $reservation = stream_socket_server('tcp://127.0.0.1:0');
         self::assertIsResource($reservation);
@@ -64,7 +68,7 @@ final class S3ServerStartupOwnershipTest extends TestCase
                 fclose($reservation);
             }
         }
-        self::assertSame(2, $stops);
+        self::assertSame(1, $stops);
     }
 
     public function test_failed_http_stop_keeps_server_and_workers_owned_until_shutdown_retry(): void
@@ -120,6 +124,78 @@ final class S3ServerStartupOwnershipTest extends TestCase
             $server->stop();
         }
         self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+    }
+
+    public function test_startup_pool_shutdown_failure_is_measured_and_force_killed_on_stop_retry(): void
+    {
+        $logger = new class extends NullLogger {
+            public ?S3Server $server = null;
+
+            public ?ContextWorkerPool $pool = null;
+
+            /** @param array<string, mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                if ($this->pool !== null || (string) $message !== 'Background resources prepared.') {
+                    return;
+                }
+                if ($this->server === null) {
+                    throw new \LogicException('Test server was not assigned.');
+                }
+                $registered = (new \ReflectionProperty($this->server, 'workerPools'))->getValue($this->server);
+                if (! is_array($registered) || $registered === []) {
+                    throw new \LogicException('Startup worker pool was not registered.');
+                }
+                $entry = $registered[array_key_last($registered)];
+                $pool = $entry['pool'] ?? null;
+                if (! $pool instanceof ContextWorkerPool) {
+                    throw new \LogicException('Startup worker pool has an unexpected type.');
+                }
+                $this->pool = $pool;
+                $exit = new DeferredFuture();
+                (new \ReflectionProperty($pool, 'exitStatus'))->setValue($pool, $exit->getFuture());
+                $cancellation = (new \ReflectionProperty($pool, 'deferredCancellation'))->getValue($pool);
+                if (! $cancellation instanceof DeferredCancellation) {
+                    throw new \LogicException('Startup worker cancellation was not assigned.');
+                }
+                EventLoop::queue(static function () use ($cancellation, $exit): void {
+                    $cancellation->cancel();
+                    $exit->error(new \RuntimeException('injected startup pool close failure'));
+                });
+            }
+        };
+
+        $reservation = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($reservation);
+        $address = stream_socket_get_name($reservation, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+        $server = $this->server($logger, $port);
+        $logger->server = $server;
+
+        try {
+            try {
+                $server->start();
+                self::fail('Startup worker shutdown failure was reported as complete.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('S3 server startup cleanup incomplete; dependencies remain owned.', $error->getMessage());
+            }
+            self::assertInstanceOf(ContextWorkerPool::class, $logger->pool);
+            self::assertFalse($logger->pool->isRunning());
+            self::assertStringContainsString(
+                's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="request_body_spool"} 1',
+                $server->getMetricsCollector()->renderPrometheus(),
+            );
+
+            $server->stop();
+            self::assertSame([], (new \ReflectionProperty($server, 'failedWorkerPoolShutdowns'))->getValue($server));
+            self::assertStringContainsString(
+                's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="request_body_spool"} 1',
+                $server->getMetricsCollector()->renderPrometheus(),
+            );
+        } finally {
+            fclose($reservation);
+        }
     }
 
     private function server(NullLogger $logger, ?int $port = null): S3Server

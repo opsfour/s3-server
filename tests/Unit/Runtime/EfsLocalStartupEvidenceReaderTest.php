@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
@@ -13,6 +14,7 @@ use Amp\Mysql\MysqlConnection;
 use Amp\Mysql\MysqlConnectionPool;
 use Amp\Mysql\MysqlResult;
 use Amp\Parallel\Worker\ContextWorkerPool;
+use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\WorkerPool;
 use Amp\TimeoutCancellation;
 use Amp\Sql\SqlConnector;
@@ -43,8 +45,10 @@ use OpsFour\S3Server\Routing\HandlerRegistry;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\EfsCandidateBootstrapException;
+use OpsFour\S3Server\Runtime\EfsCandidateAssemblyBootstrapException;
 use OpsFour\S3Server\Runtime\EfsCandidateBackgroundSupervisorState;
 use OpsFour\S3Server\Runtime\EfsCandidateBackgroundBarrierTimeoutException;
+use OpsFour\S3Server\Runtime\EfsCandidateIngressBootstrapException;
 use OpsFour\S3Server\Runtime\EfsCandidateIngressResources;
 use OpsFour\S3Server\Runtime\EfsCandidateManagementResources;
 use OpsFour\S3Server\Runtime\EfsCandidatePreBindBootstrapException;
@@ -1100,13 +1104,11 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         [$graph, $ingress] = $this->candidateIngressGraph();
         $server = S3Server::forQualifiedEfsCandidate($graph);
         $server->attachQualifiedEfsCandidateGraph($graph, $ingress);
-        $calls = 0;
         $failingPool = $this->createMock(WorkerPool::class);
-        $failingPool->expects(self::exactly(2))->method('shutdown')->willReturnCallback(static function () use (&$calls): void {
-            if (++$calls === 1) {
-                throw new \RuntimeException('Injected registered pool stop failure.');
-            }
-        });
+        $failingPool->expects(self::once())->method('shutdown')->willThrowException(
+            new \RuntimeException('Injected registered pool stop failure.'),
+        );
+        $failingPool->expects(self::once())->method('kill');
         $pools = new \ReflectionProperty($server, 'workerPools');
         $registered = $pools->getValue($server);
         self::assertIsArray($registered);
@@ -1118,12 +1120,10 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
             } catch (\RuntimeException $error) {
                 self::assertStringContainsString('shutdown incomplete', $error->getMessage());
             }
-            self::assertSame(1, $calls);
             self::assertFalse($ingress->workerPool->isRunning());
             self::assertTrue($graph->readPool->isRunning());
             self::assertFalse((new \ReflectionProperty($graph, 'backendClosed'))->getValue($graph));
             $server->stop();
-            self::assertSame(2, $calls);
             self::assertFalse($graph->readPool->isRunning());
         } finally {
             if ($graph->readPool->isRunning()) {
@@ -1158,6 +1158,59 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         }
     }
 
+    public function test_candidate_attached_ingress_and_select_pools_kill_after_worker_shutdown_failure(): void
+    {
+        [$graph, $ingress] = $this->candidateIngressGraph(['selectWorkerPoolSize' => 1]);
+        $server = S3Server::forQualifiedEfsCandidate($graph);
+        $select = new ContextWorkerPool(1);
+        $server->attachQualifiedEfsCandidateGraph($graph, $ingress, $select);
+        $this->armPoolWorkerShutdownFailure($ingress->workerPool, 'ingress');
+
+        try {
+            try {
+                $server->stop();
+                self::fail('An ingress worker shutdown failure was reported as complete.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+            }
+            self::assertFalse($ingress->workerPool->isRunning());
+            self::assertTrue($select->isRunning());
+            self::assertTrue($graph->readPool->isRunning());
+            self::assertFalse((new \ReflectionProperty($ingress, 'closed'))->getValue($ingress));
+
+            $this->armPoolWorkerShutdownFailure($select, 'select');
+            try {
+                $server->stop();
+                self::fail('A Select worker shutdown failure was reported as complete.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+            }
+            self::assertFalse($ingress->workerPool->isRunning());
+            self::assertTrue((new \ReflectionProperty($ingress, 'closed'))->getValue($ingress));
+            self::assertFalse($select->isRunning());
+            self::assertTrue($graph->readPool->isRunning());
+
+            $metrics = $server->getMetricsCollector()->renderPrometheus();
+            self::assertStringContainsString(
+                's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="request_body_spool"} 1',
+                $metrics,
+            );
+            self::assertStringContainsString(
+                's3_server_worker_pool_shutdown_failures_total{exception="RuntimeException",pool="select"} 1',
+                $metrics,
+            );
+
+            $server->stop();
+            $server->stop();
+            self::assertFalse($select->isRunning());
+            self::assertFalse($graph->readPool->isRunning());
+        } finally {
+            if ($graph->readPool->isRunning() || $ingress->workerPool->isRunning() || $select->isRunning()) {
+                $server->stop();
+            }
+        }
+    }
+
     public function test_candidate_graph_stop_waits_for_ingress_drain_before_closing_graph(): void
     {
         [$graph, $ingress] = $this->candidateIngressGraph();
@@ -1174,6 +1227,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
             }
             self::assertTrue($graph->readPool->isRunning());
             self::assertTrue($ingress->workerPool->isRunning());
+            self::assertSame([], (new \ReflectionProperty($server, 'failedWorkerPoolShutdowns'))->getValue($server));
             $keys->setValue($ingress->requestBodySpool, []);
             $server->stop();
             self::assertFalse($graph->readPool->isRunning());
@@ -1427,6 +1481,246 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         }
     }
 
+    public function test_factory_owned_pre_bind_assembly_hides_mutable_bundles_and_remains_listenerless(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs([
+            'notificationWorkerEnabled' => false,
+        ]);
+        $factory = new S3ServerRuntimeFactory();
+        $runtime = $factory->createQualifiedEfsCandidatePreBindRuntime(
+            $context,
+            $scratch,
+            $config,
+            $metadata,
+            $probe,
+            new NullLogger(),
+        );
+
+        try {
+            self::assertTrue($runtime->isPrepared());
+            self::assertSame(EfsCandidateServingAdmissionState::PREPARED, $runtime->servingAdmissionState());
+            self::assertSame(EfsCandidateBackgroundSupervisorState::READY, $runtime->backgroundSupervisorState());
+
+            $method = new \ReflectionMethod($factory, 'createQualifiedEfsCandidatePreBindRuntime');
+            self::assertSame(EfsCandidatePreBindRuntime::class, (string) $method->getReturnType());
+            foreach ($method->getParameters() as $parameter) {
+                $type = (string) $parameter->getType();
+                self::assertNotSame(EfsCandidateRuntimeResources::class, $type);
+                self::assertNotSame(EfsCandidateIngressResources::class, $type);
+            }
+
+            $server = (new \ReflectionProperty($runtime, 'server'))->getValue($runtime);
+            self::assertInstanceOf(S3Server::class, $server);
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_factory_owned_pre_bind_assembly_uses_exact_observed_metadata_facade(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs([
+            'notificationWorkerEnabled' => false,
+        ]);
+        $observed = new ObservedMetadataStore($metadata, new MetricsCollector(), 'mysql');
+        $runtime = (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntime(
+            $context,
+            $scratch,
+            $config,
+            $metadata,
+            $probe,
+            new NullLogger(),
+            observedMetadata: $observed,
+        );
+
+        try {
+            self::assertTrue($runtime->isPrepared());
+            $graph = (new \ReflectionProperty($runtime, 'graph'))->getValue($runtime);
+            self::assertInstanceOf(EfsCandidateRuntimeResources::class, $graph);
+            self::assertSame($observed, $graph->metadata);
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_factory_owned_pre_bind_assembly_consumes_bundles_on_admission_failure(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs([
+            'notificationWorkerEnabled' => false,
+        ]);
+        $probe->available = false;
+        $encryption = new EfsAssemblyEncryptionService();
+
+        try {
+            (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntime(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $probe,
+                new NullLogger(),
+                encryption: $encryption,
+            );
+            self::fail('Unavailable credentials prepared a factory-owned candidate.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Credential store unavailable.', $error->getMessage());
+        }
+
+        self::assertSame(1, $encryption->shutdownCalls);
+    }
+
+    public function test_factory_owned_pre_bind_assembly_closes_graph_when_ingress_construction_fails(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs([
+            'postSpoolBudgetBytes' => 1,
+        ]);
+        $encryption = new EfsAssemblyEncryptionService();
+
+        try {
+            (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntime(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $probe,
+                new NullLogger(),
+                encryption: $encryption,
+            );
+            self::fail('Mismatched ingress budget prepared a factory-owned candidate.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('EFS ingress budget must equal qualified node-local scratch budget.', $error->getMessage());
+        }
+
+        self::assertSame(1, $encryption->shutdownCalls);
+    }
+
+    public function test_factory_owned_pre_bind_assembly_returns_one_retryable_owner_when_cleanup_fails(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs([
+            'postSpoolBudgetBytes' => 1,
+        ]);
+        $encryption = new EfsAssemblyEncryptionService(shutdownFailures: 1);
+        $partial = null;
+
+        try {
+            (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntime(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $probe,
+                new NullLogger(),
+                encryption: $encryption,
+            );
+            self::fail('Incomplete assembly cleanup returned normally.');
+        } catch (EfsCandidateAssemblyBootstrapException $error) {
+            $partial = $error->resources;
+            self::assertSame(
+                'EFS candidate assembly failed and resource shutdown is incomplete.',
+                $error->getMessage(),
+            );
+            self::assertInstanceOf(\RuntimeException::class, $error->getPrevious());
+            self::assertSame(
+                'EFS ingress budget must equal qualified node-local scratch budget.',
+                $error->getPrevious()->getMessage(),
+            );
+            self::assertFalse($partial->isClosed());
+        }
+
+        self::assertSame(1, $encryption->shutdownCalls);
+        $partial->shutdown();
+        $partial->shutdown();
+        self::assertTrue($partial->isClosed());
+        self::assertSame(2, $encryption->shutdownCalls);
+    }
+
+    public function test_factory_owned_pre_bind_assembly_sanitizes_partial_ingress_pool_and_closes_it_before_graph(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs();
+        $poolKillCalls = 0;
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('shutdown');
+        $pool->expects(self::exactly(3))->method('kill')->willReturnCallback(
+            static function () use (&$poolKillCalls): void {
+                if (++$poolKillCalls <= 2) {
+                    throw new \RuntimeException('private pool cleanup failure');
+                }
+            },
+        );
+        $encryption = new EfsAssemblyEncryptionService();
+        $partial = null;
+
+        try {
+            (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntimeForTests(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $probe,
+                new NullLogger(),
+                static function () use ($pool): void {
+                    throw new EfsCandidateIngressBootstrapException(
+                        $pool,
+                        new \InvalidArgumentException('Synthetic ingress construction failure.'),
+                    );
+                },
+                encryption: $encryption,
+            );
+            self::fail('A partial ingress pool escaped the safe factory boundary.');
+        } catch (EfsCandidateAssemblyBootstrapException $error) {
+            $partial = $error->resources;
+            self::assertInstanceOf(\InvalidArgumentException::class, $error->getPrevious());
+            self::assertSame('Synthetic ingress construction failure.', $error->getPrevious()->getMessage());
+            self::assertNotInstanceOf(EfsCandidateIngressBootstrapException::class, $error->getPrevious());
+            self::assertFalse($partial->isClosed());
+        }
+
+        try {
+            $partial->shutdown();
+            self::fail('The first retry unexpectedly closed the injected failing ingress pool.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('EFS candidate assembly shutdown incomplete.', $error->getMessage());
+        }
+        self::assertSame(0, $encryption->shutdownCalls, 'Graph closed before the ingress pool stopped.');
+
+        $partial->shutdown();
+        $partial->shutdown();
+        self::assertTrue($partial->isClosed());
+        self::assertSame(1, $encryption->shutdownCalls);
+    }
+
+    public function test_factory_owned_pre_bind_assembly_completes_pool_kill_fallback_before_rethrowing_sanitized_cause(): void
+    {
+        [$context, $scratch, $config, $metadata, $probe] = $this->candidateAssemblyInputs();
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('shutdown');
+        $pool->expects(self::once())->method('kill');
+        $encryption = new EfsAssemblyEncryptionService();
+
+        try {
+            (new S3ServerRuntimeFactory())->createQualifiedEfsCandidatePreBindRuntimeForTests(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $probe,
+                new NullLogger(),
+                static function () use ($pool): void {
+                    throw new EfsCandidateIngressBootstrapException(
+                        $pool,
+                        new \InvalidArgumentException('Synthetic ingress construction failure.'),
+                    );
+                },
+                encryption: $encryption,
+            );
+            self::fail('A synthetic partial ingress construction returned normally.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertSame('Synthetic ingress construction failure.', $error->getMessage());
+        }
+
+        self::assertSame(1, $encryption->shutdownCalls);
+    }
+
     public function test_pre_bind_runtime_rolls_back_parked_resources_after_credential_failure(): void
     {
         [$graph, $ingress, , $probe] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
@@ -1509,6 +1803,46 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         $runtime->stop();
         self::assertFalse($graph->readPool->isRunning());
         self::assertFalse($ingress->workerPool->isRunning());
+    }
+
+    public function test_unattached_pre_bind_runtime_kills_ingress_pool_after_graceful_shutdown_failure(): void
+    {
+        [$graph, $ingress, $config] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $this->armPoolWorkerShutdownFailure($ingress->workerPool, 'unattached ingress');
+        $runtime = null;
+
+        try {
+            (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+            self::fail('A failed unattached ingress shutdown returned normally.');
+        } catch (EfsCandidatePreBindBootstrapException $error) {
+            $runtime = $error->runtime;
+            self::assertSame(
+                'EFS ingress worker pool was used before candidate attachment.',
+                $error->getPrevious()?->getMessage(),
+            );
+            self::assertFalse((new \ReflectionProperty($runtime, 'graphAttached'))->getValue($runtime));
+            self::assertFalse((new \ReflectionProperty($ingress, 'closed'))->getValue($ingress));
+            self::assertTrue((new \ReflectionProperty($ingress, 'workerPoolNeedsKill'))->getValue($ingress));
+            self::assertFalse($ingress->workerPool->isRunning());
+            self::assertTrue($graph->readPool->isRunning());
+            try {
+                $ingress->assertAttachableTo($config);
+                self::fail('An ingress bundle awaiting forced cleanup became attachable again.');
+            } catch (\RuntimeException $attachError) {
+                self::assertStringContainsString('closed, already owned', $attachError->getMessage());
+            }
+        }
+
+        self::assertInstanceOf(EfsCandidatePreBindRuntime::class, $runtime);
+        $runtime->stop();
+        $runtime->stop();
+
+        self::assertTrue((new \ReflectionProperty($ingress, 'closed'))->getValue($ingress));
+        self::assertFalse((new \ReflectionProperty($ingress, 'workerPoolNeedsKill'))->getValue($ingress));
+        self::assertFalse((new \ReflectionProperty($ingress, 'shutdownInProgress'))->getValue($ingress));
+        self::assertTrue((new \ReflectionProperty($runtime, 'stopped'))->getValue($runtime));
+        self::assertFalse((new \ReflectionProperty($runtime, 'stopInProgress'))->getValue($runtime));
+        self::assertFalse($graph->readPool->isRunning());
     }
 
     public function test_pre_bind_runtime_hides_prepared_bit_before_early_supervisor_stop_failure(): void
@@ -1982,11 +2316,57 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         );
     }
 
+    private function armPoolWorkerShutdownFailure(ContextWorkerPool $pool, string $name): void
+    {
+        $worker = $this->createMock(Worker::class);
+        $worker->expects(self::never())->method('shutdown');
+        $worker->expects(self::once())->method('kill');
+        $worker->method('isRunning')->willReturn(true);
+
+        $workers = (new \ReflectionProperty($pool, 'workers'))->getValue($pool);
+        self::assertInstanceOf(\SplObjectStorage::class, $workers);
+        $workers[$worker] = 0;
+
+        $exit = new DeferredFuture();
+        (new \ReflectionProperty($pool, 'exitStatus'))->setValue($pool, $exit->getFuture());
+        $cancellation = (new \ReflectionProperty($pool, 'deferredCancellation'))->getValue($pool);
+        self::assertInstanceOf(DeferredCancellation::class, $cancellation);
+        EventLoop::queue(static function () use ($cancellation, $exit, $name): void {
+            $cancellation->cancel();
+            $exit->error(new \RuntimeException("Injected cached {$name} shutdown failure."));
+        });
+    }
+
     /**
-     * @param array{selectWorkerPoolSize?: int, notificationWorkerEnabled?: bool} $configOverrides
+     * @param array{selectWorkerPoolSize?: int, notificationWorkerEnabled?: bool, postSpoolBudgetBytes?: int} $configOverrides
      * @return array{EfsCandidateRuntimeResources, EfsCandidateIngressResources, S3ServerConfig, EfsProbeCredentialProvider, EfsRecursiveCleanupQueryState}
      */
     private function candidateIngressGraph(array $configOverrides = []): array
+    {
+        [$context, $scratch, $config, $metadata, $credentialProvider, $cleanup] = $this->candidateAssemblyInputs($configOverrides);
+        $factory = new S3ServerRuntimeFactory();
+        $graph = $factory->createQualifiedEfsCandidateResources($context, $scratch, $config, $metadata, new NullLogger());
+        try {
+            $ingress = $factory->createQualifiedEfsCandidateIngressResources(
+                $context,
+                $scratch,
+                $config,
+                $metadata,
+                $credentialProvider,
+            );
+        } catch (\Throwable $error) {
+            $graph->shutdown();
+            throw $error;
+        }
+
+        return [$graph, $ingress, $config, $credentialProvider, $cleanup];
+    }
+
+    /**
+     * @param array{selectWorkerPoolSize?: int, notificationWorkerEnabled?: bool, postSpoolBudgetBytes?: int} $configOverrides
+     * @return array{EfsQualificationContext, EfsNodeLocalScratch, S3ServerConfig, MysqlMetadataStore, EfsProbeCredentialProvider, EfsRecursiveCleanupQueryState}
+     */
+    private function candidateAssemblyInputs(array $configOverrides = []): array
     {
         self::assertTrue(unlink($this->evidencePath));
         $this->evidencePath = $this->evidenceDirectory . '/' . self::RUN_ID . '-api-one-mysql.json';
@@ -2052,23 +2432,9 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         $pool = new MysqlConnectionPool(MysqlConfig::fromString(self::POSTGRES_DSN), connector: $connector);
         $metadata = new MysqlMetadataStore($pool);
         (new \ReflectionProperty($metadata, 'creationDsnFingerprint'))->setValue($metadata, hash('sha256', self::POSTGRES_DSN));
-        $factory = new S3ServerRuntimeFactory();
-        $graph = $factory->createQualifiedEfsCandidateResources($context, $scratch, $config, $metadata, new NullLogger());
         $credentialProvider = new EfsProbeCredentialProvider();
-        try {
-            $ingress = $factory->createQualifiedEfsCandidateIngressResources(
-                $context,
-                $scratch,
-                $config,
-                $metadata,
-                $credentialProvider,
-            );
-        } catch (\Throwable $error) {
-            $graph->shutdown();
-            throw $error;
-        }
 
-        return [$graph, $ingress, $config, $credentialProvider, $cleanup];
+        return [$context, $scratch, $config, $metadata, $credentialProvider, $cleanup];
     }
 
     private function candidateRegistry(S3Server $server): HandlerRegistry
@@ -3740,6 +4106,42 @@ final class EfsProbeCredentialProvider implements CredentialHealthProbe, Credent
     public function deleteCredential(string $accessKeyId): void
     {
         $this->inner->deleteCredential($accessKeyId);
+    }
+}
+
+final class EfsAssemblyEncryptionService implements EncryptionServiceInterface
+{
+    public int $shutdownCalls = 0;
+
+    public function __construct(private int $shutdownFailures = 0) {}
+
+    public function encryptSseS3(string $plaintext): array
+    {
+        return ['ciphertext' => $plaintext, 'encryptedDataKey' => '', 'iv' => '', 'tag' => ''];
+    }
+
+    public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string
+    {
+        return $ciphertext;
+    }
+
+    public function encryptSseC(string $plaintext, string $customerKey): array
+    {
+        return ['ciphertext' => $plaintext, 'iv' => '', 'tag' => ''];
+    }
+
+    public function decryptSseC(string $ciphertext, string $customerKey, string $ivB64, string $tagB64): string
+    {
+        return $ciphertext;
+    }
+
+    public function shutdown(): void
+    {
+        ++$this->shutdownCalls;
+        if ($this->shutdownFailures > 0) {
+            --$this->shutdownFailures;
+            throw new \RuntimeException('Injected encryption shutdown failure.');
+        }
     }
 }
 
