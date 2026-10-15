@@ -54,7 +54,8 @@
         "league/flysystem-aws-s3-v3": "^3.35.2"
     },
     "conflict": {
-        "league/flysystem-aws-s3-v3": "<3.35.2"
+        "league/flysystem-aws-s3-v3": "<3.35.2",
+        "symfony/http-foundation": "<7.4.21 || >=8.0,<8.1.9"
     },
     "autoload": {
         "psr-4": {
