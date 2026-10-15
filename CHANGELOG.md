@@ -28,9 +28,11 @@ The project follows [Semantic Versioning](https://semver.org/).
   for custom metadata backends.
 - Add encrypted multipart parts and authenticated encrypted temporary request
   spools.
-- Add an internal, listenerless EFS candidate pre-bind runtime that owns the
-  prepared resource graph while serving admission stays closed and background
-  work stays parked. This does not qualify or enable production EFS serving.
+- Add an internal, listenerless EFS candidate factory that constructs and
+  consumes the complete runtime graph and ingress bundle behind one ownership
+  boundary. Failed assembly retains a retryable cleanup owner; successful
+  preparation keeps serving admission closed and background work parked. This
+  does not qualify or enable production EFS serving.
 
 ### Changed
 
@@ -66,6 +68,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Preserve an object's S3 `Last-Modified` timestamp when restore state or
+  physical placement and transition metadata changes across SQLite,
+  PostgreSQL, and MySQL.
+- Retry a failed graceful worker-pool shutdown with forced termination on the
+  next server stop attempt. EFS ingress and Select pools remain ahead of graph
+  cleanup, completed pools are not closed twice, and each failed close attempt
+  is counted once.
 - Arm SIGINT and SIGTERM watchers before opening the HTTP listener in the
   standalone, Laravel, and Symfony serve commands, and remove those watchers
   when startup fails.
@@ -134,6 +143,10 @@ The project follows [Semantic Versioning](https://semver.org/).
   The snapshot now includes response-visible object metadata and checksums,
   while version-list bookkeeping does not invalidate an explicitly selected
   version.
+- Reauthorize and replay a bodyless HeadObject request once under its shared
+  owner lock when the only snapshot change is restore completion from pending
+  to restored. Policy, ACL, ownership, or other object drift remains
+  fail-closed; GetObject and SelectObjectContent responses are never replayed.
 - Revalidate the bucket generation before every streamed GetObject body read
   so a reused bucket name cannot expose bytes from the former bucket.
 - Recheck current identity policies, bucket policies, ACLs, Public Access

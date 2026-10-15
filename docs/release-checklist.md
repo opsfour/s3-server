@@ -62,16 +62,17 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run passed 4,227 PHPUnit tests
-with 32,257 assertions and 230 expected opt-in or environment skips. PHPStan
-and the coding-style check also passed. Strict Composer validation, the locked
-dependency audit, and `git diff --check` passed on the same candidate. GitHub
+The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,259
+PHPUnit tests with 32,612 assertions and 230 expected opt-in or environment
+skips. PHPStan and PHP CS Fixer across 957 files also passed. Strict Composer
+validation, the locked dependency audit, and `git diff --check` passed on the
+same candidate. The earlier committed baseline passed all four jobs in GitHub
 Actions run
-[38721610845](https://github.com/opsfour/s3-server/actions/runs/38721610845)
-passed all four jobs, including the lowest and highest dependency matrices.
-External PostgreSQL/MySQL execution of
-the newest skipped cases, the exact PHP 8.4 deployment profile, multi-host
-storage qualification, and the current-source long soak remain separate gates.
+[38721610845](https://github.com/opsfour/s3-server/actions/runs/38721610845),
+including the lowest and highest dependency matrices; that run does not cover
+this uncommitted batch. External PostgreSQL/MySQL execution without skips, the
+exact PHP 8.4 deployment profile, multi-host storage qualification, and the
+current-source long soak remain separate gates.
 
 ## Released Version
 

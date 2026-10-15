@@ -57,6 +57,11 @@ Status: **Complete**
   Public Access Block state before reading source bytes.
 - [x] Owner, foreign-account, anonymous, explicit-allow, and explicit-deny
   authorization matrices enumerate the complete operation enum.
+- [x] The current unreleased source reauthorizes and replays a bodyless
+  `HeadObject` request once under its shared owner lock when a restore changes
+  from pending to restored during the request. Policy, ACL, ownership, and
+  other object changes remain fail-closed; streamed `GetObject` and
+  request-body `SelectObjectContent` operations are not replayed.
 
 ## 2. POST Object
 
@@ -85,8 +90,17 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
 - [x] Lifecycle, cleanup, tiering, restore, notification, request-spool, and
   storage worker activity is cancelled during shutdown.
 - [x] Background tasks and worker pools stop in deterministic order.
+- [x] The current unreleased runtime records failed graceful worker-pool
+  shutdowns and force-kills those pools on the next stop attempt. Closed pools
+  are skipped on later retries, while an attached EFS graph remains owned until
+  its ingress and Select pools have stopped.
 - [x] Startup failures and stop-before-start paths also release storage,
   metadata, select, encryption, and request-spool worker resources.
+- [x] The current unreleased listenerless EFS candidate factory constructs and
+  consumes its complete graph and ingress bundle without returning either
+  mutable bundle. Assembly failures retain one retryable cleanup owner. Serving
+  admission remains closed, no listener is opened, and production EFS serving
+  is not enabled.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.
@@ -119,6 +133,8 @@ Status: **Complete**
   deletion paths are covered.
 - [x] Transition, restore, and restore-garbage workers revalidate exact object
   identity and placement under stable owner locks after physical transfers.
+- [x] Physical placement, transition state, and restore state updates preserve
+  the object's S3 `Last-Modified` timestamp across all metadata backends.
 - [x] Restore completion emits `s3:ObjectRestore:Completed` after commit.
 
 ## 6. Streaming Storage and Integrity
