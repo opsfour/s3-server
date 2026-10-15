@@ -54,6 +54,30 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Accept S3 Tagging XML in the browser POST `tagging` form field, preserve its
+  original value for signed policy conditions, and reject malformed XML or tag
+  characters before the uploaded file is spooled or published.
+- Enforce the documented S3 tag character set on header and XML writes so XML
+  controls, Unicode noncharacters, and unsupported symbols cannot be stored or
+  make GetTagging responses unparsable; rejected replacements preserve tags.
+  Validate legacy stored tags before GetTagging XML serialization or
+  `CopyObject` with `TaggingDirective=COPY`; corrupt rows return `InternalError`
+  and a copy leaves its destination unchanged.
+- Authorize object creation through the bucket ACL only, and permit replacement
+  through a bucket `WRITE` grant only for the bucket or current object owner.
+  Object ACL `WRITE` grants are inert, and object `FULL_CONTROL` no longer
+  grants PUT, copy, browser POST, or multipart write access to the object's key.
+- Attribute anonymous CopyObject results, ACLs, local write intents, quota
+  accounting, and versioned delete markers to the bucket owner while retaining
+  anonymous request and notification attribution. Assign delete markers to the
+  bucket owner while `BucketOwnerEnforced` is active, and reject anonymous
+  multipart initiation even when a public write policy exists.
+- Allow self-copy when destination encryption attributes change, including
+  SSE-S3 defaults and SSE-C key rotation, and reject impossible known-size PUT
+  and CopyObject quota requests before body or destination storage I/O.
+- Bind multipart completion policy checks to the exact ACL, standard SSE, and
+  storage-class headers supplied at initiation; require ambiguous legacy
+  uploads to be aborted and initiated again.
 - Validate quota owner IDs consistently across direct writers, the standalone,
   Laravel, and Symfony commands, and the admin API; keep invalid legacy rows
   from breaking JSON pagination, and route percent-encoded `/` characters in
@@ -84,6 +108,8 @@ The project follows [Semantic Versioning](https://semver.org/).
   authorization under shared owner locks before returning a response. Parallel
   current-object reads may overlap, while writes and mutable reads retain
   exclusive owner locks; failed rechecks close discarded response bodies.
+  Apply the same locked recheck before exposing errors derived from current
+  object state, replacing stale errors when policy, ACL, or ownership changed.
 - Revalidate the bucket generation before every streamed GetObject body read
   so a reused bucket name cannot expose bytes from the former bucket.
 - Recheck current identity policies, bucket policies, ACLs, Public Access
@@ -107,6 +133,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   recording a fabricated HTTP 500 response.
 - Ignore `x-amz-expected-bucket-owner` on CreateBucket, as AWS does, while
   continuing to enforce it on supported bucket and object operations.
+- Use the AWS `GetBucketObjectLockConfiguration` and
+  `PutBucketObjectLockConfiguration` IAM actions for Object Lock bucket
+  configuration, and serialize the disabled S3 Bucket Key status explicitly.
 - Evaluate repeated list-valued HTTP condition, range, and ACL-grant fields as
   one value, and reject repeated singleton digest, copy, checksum, and
   encryption controls. Reject ambiguous `Content-Length` plus
@@ -198,6 +227,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Abort and restart legacy multipart uploads that carry Object Lock settings or
   are subject to current default retention; they do not contain the new
   Object Lock configuration binding.
+- Abort and restart multipart uploads created before exact initiation policy
+  header snapshots were introduced; their ACL and encryption condition context
+  cannot be reconstructed safely at completion.
+- Inventory legacy bucket and object tags for characters, lengths, counts, and
+  duplicate keys that violate the current S3 tag rules. Repair or remove
+  corrupt rows during the maintenance window; GetTagging and tag-copy requests
+  now fail closed with `InternalError` until those rows are corrected.
 - Keep every storage tier referenced by objects, uploads, jobs, intents, or
   cleanup rows configured until those references are migrated or removed.
 - Review [Authentication](docs/authentication.md),

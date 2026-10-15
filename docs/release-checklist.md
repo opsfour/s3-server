@@ -45,6 +45,13 @@ gate required by the advertised deployment profile has passed.
 - Abort and restart legacy multipart uploads with explicit retention or legal
   holds, and uploads subject to current default retention, before serving with
   the new Object Lock configuration binding.
+- Abort and restart every multipart upload created before exact initiation
+  policy snapshots were introduced; the server cannot safely reconstruct its
+  ACL, encryption, and storage-class condition context at completion.
+- Inventory stored bucket and object tags for values outside the documented S3
+  character, length, count, and uniqueness rules. Repair or delete invalid
+  legacy rows before rollout; reads and `CopyObject` tag copies fail closed
+  with `InternalError` rather than serializing corrupt metadata.
 - Verify that every persisted storage tier is configured on every API node and
   that dedicated workers intentionally defer tiers they do not serve.
 - Revoke older permanent OIDC-issued credentials where indefinite access is no

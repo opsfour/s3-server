@@ -23,6 +23,11 @@ $s3->putBucketVersioning([
 | Enabled | Creates new version | Creates delete marker | Returns latest version |
 | Suspended | Overwrites `null` version | Creates delete marker with `versionId=null` | Returns latest version |
 
+Delete-marker ownership follows the Object Ownership mode at the delete
+commit. Under `BucketOwnerEnforced`, and for anonymous deletes, the bucket
+owner owns the new marker. Under `ObjectWriter`, an authenticated requester
+owns the marker it creates.
+
 ### Version IDs
 
 When versioning is enabled, every PUT returns a `x-amz-version-id` header:

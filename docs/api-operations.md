@@ -46,13 +46,24 @@ CopyObject and UploadPartCopy use `x-amz-source-expected-bucket-owner` to check
 the source bucket before reading its object; `x-amz-expected-bucket-owner`
 checks the destination bucket.
 
-CopyObject can copy the current object onto the same key when the request
-actually changes its supported storage class. A no-op self-copy, including one
-that repeats the current storage class, returns `InvalidRequest`.
+CopyObject can copy the current object onto the same key when the request uses
+`MetadataDirective=REPLACE`, changes the storage class, or changes effective
+encryption attributes. Encryption changes include applying SSE-S3 through a
+request or a newly configured bucket default and rotating an SSE-C customer
+key. A self-copy that requests none of these changes returns `InvalidRequest`.
 A single CopyObject request is limited to 5 GiB; larger sources require
 multipart copy and return `EntityTooLarge` before storage I/O.
+When the source size and current destination state are known, CopyObject also
+rejects an already impossible quota request before destination storage I/O;
+the locked metadata commit repeats the quota check to cover concurrent writes.
 CopyObject checksum selection through `x-amz-checksum-algorithm` is not in the
 documented subset and returns HTTP 501 before metadata or storage access.
+
+For anonymous writes authorized by bucket policy or ACL, copied objects and
+new delete markers are owned by the destination bucket owner. Request and
+notification attribution remains anonymous. Authenticated cross-account writes
+retain the authenticated requester as object owner unless
+`BucketOwnerEnforced` is active.
 
 PutObject accepts one CRC32, CRC32C, SHA1, or SHA256 checksum header. The
 optional `x-amz-sdk-checksum-algorithm` selector must identify that same
@@ -61,6 +72,10 @@ digest, selector, and trailer-declaration headers are rejected. Unknown
 `x-amz-checksum-*` algorithms return HTTP 501 before metadata or storage
 access. Successful responses containing a verified checksum also report
 `x-amz-checksum-type: FULL_OBJECT`.
+When a reliable logical content length is present, PutObject rejects an
+already impossible owner or bucket quota request before reading the body or
+writing object storage. The locked metadata commit repeats the quota check so
+concurrent writes cannot bypass it.
 When explicit Object Lock retention or legal-hold headers are present, or the
 bucket has effective default retention, PutObject requires `Content-MD5` or a
 supported SDK checksum. The request fails before object-storage I/O when that
@@ -91,7 +106,11 @@ prefix with a different suffix remains part of the file. A policy-covered
 is applied to the uploaded file and validated; supported
 `x-amz-checksum-*` form fields receive the same validation. Browser uploads
 with explicit Object Lock settings or effective bucket default retention must
-supply one of these checksums.
+supply one of these checksums. The policy-covered `tagging` form field uses the
+S3 `<Tagging><TagSet>...` XML document format. It is validated before the file
+is spooled, while POST-policy conditions continue to match the original XML
+field value; the query-encoded `x-amz-tagging` header format is not accepted in
+this form field.
 
 ## Listing
 
@@ -129,6 +148,18 @@ Custom metadata stores must support generation-bound multipart listings for
 [Metadata Backends](metadata-backends.md#generation-bound-multipart-listings).
 `upload-id-marker` may be supplied without `key-marker`, or with an empty
 `key-marker`; those forms are accepted rather than rejected as malformed.
+CreateMultipartUpload requires an authenticated requester. An anonymous
+`s3:PutObject` grant can authorize supported single-request writes, but cannot
+create an in-progress multipart upload identity.
+
+CreateMultipartUpload snapshots the policy condition headers that were
+actually present at initiation. CompleteMultipartUpload reuses that exact
+snapshot for `x-amz-acl`, `x-amz-server-side-encryption`, and
+`x-amz-storage-class`; effective bucket-default encryption and SSE-C do not
+invent the standard SSE header, while an explicitly supplied `STANDARD`
+storage class remains visible to policy conditions. Uploads created by older
+versions lack an unambiguous snapshot and return `OperationAborted`; abort and
+initiate them again before completion.
 
 Each uploaded or copied part is limited to 5 GiB. An oversized part returns
 `EntityTooLarge` (HTTP 400); it cannot be committed to the upload.
@@ -205,6 +236,15 @@ Supplied CRC32, CRC32C, SHA1 and SHA256 values are validated before mutation.
 | GetObjectAcl | `GET` | `/{bucket}/{key}?acl` | Get object ACL |
 | PutObjectAcl | `PUT` | `/{bucket}/{key}?acl` | Set object ACL |
 
+Bucket ACL `WRITE` and `FULL_CONTROL` grants can authorize object PUT, copy,
+browser POST, and multipart write operations for new keys. Only the bucket
+owner or current object owner can use such a grant to replace an existing key.
+An object ACL controls reads and ACL access for that object; its `WRITE` grant
+has no effect, and object `FULL_CONTROL` does not authorize replacement of the
+object data. This follows the [S3 ACL permission mapping](https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html).
+GetObjectAcl and PutObjectAcl select the requested version and return its
+`x-amz-version-id` in versioned buckets, including the literal `null` version.
+
 ## Object Ownership
 
 | Operation | Method | Path | Description |
@@ -219,7 +259,9 @@ they are not migrated automatically. `BucketOwnerEnforced` requires a private
 bucket ACL. In that mode object ACL grants are ignored, ACL updates fail, and
 object writes accept no ACL or `bucket-owner-full-control`. Objects created
 while the mode is enforced belong to the bucket owner even if the mode is
-later disabled. `BucketOwnerPreferred` is not implemented.
+later disabled. Delete markers created while the mode is enforced also belong
+to the bucket owner; with `ObjectWriter`, an authenticated requester owns its
+new delete marker. `BucketOwnerPreferred` is not implemented.
 
 ## Policies
 
@@ -256,6 +298,10 @@ matcher used for preflight requests.
 | DeleteObjectTagging | `DELETE` | `/{bucket}/{key}?tagging` | Remove object tags |
 
 Every `Tag` requires both `Key` and `Value`; an empty `<Value/>` is valid.
+Keys and values accept Unicode letters, numbers, spaces, and `+ - = . _ : / @`,
+matching the [S3 tag character set](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging.html).
+XML controls, Unicode noncharacters, and other symbols are rejected before
+existing tags are changed.
 
 ## Public Access Block
 
