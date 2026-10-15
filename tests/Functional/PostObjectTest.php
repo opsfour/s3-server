@@ -39,7 +39,7 @@ final class PostObjectTest extends S3FunctionalTestCase
                 'Content-Type' => 'text/plain',
                 'x-amz-meta-origin' => 'browser',
                 'x-amz-storage-class' => 'STANDARD_IA',
-                'tagging' => 'project=post-object',
+                'tagging' => '<Tagging><TagSet><Tag><Key>project</Key><Value>post-object</Value></Tag></TagSet></Tagging>',
             ],
         );
 
@@ -712,7 +712,9 @@ final class PostObjectTest extends S3FunctionalTestCase
                 key: $key,
                 filename: 'upload.txt',
                 body: str_repeat('x', 1_048_576),
-                extraFields: ['tagging' => 'project=private'],
+                extraFields: [
+                    'tagging' => '<Tagging><TagSet><Tag><Key>project</Key><Value>private</Value></Tag></TagSet></Tagging>',
+                ],
             );
             $this->assertSame(403, $response->getStatusCode());
             $objects = self::$s3->listObjectsV2(['Bucket' => self::$bucket, 'Prefix' => $key]);
@@ -720,6 +722,120 @@ final class PostObjectTest extends S3FunctionalTestCase
         } finally {
             self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
         }
+    }
+
+    public function test_tagging_xml_preserves_values_and_policy_condition_context(): void
+    {
+        $key = 'tagging-xml-' . bin2hex(random_bytes(4)) . '.txt';
+        $tagging = '<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            . '<TagSet>'
+            . '<Tag><Key>project name</Key><Value>opsfour + storage/@</Value></Tag>'
+            . '<Tag><Key>empty</Key><Value/></Tag>'
+            . '</TagSet></Tagging>';
+
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: 'tagged payload',
+            extraFields: ['tagging' => $tagging],
+        );
+
+        self::assertSame(204, $response->getStatusCode(), (string) $response->getBody());
+        self::assertSame('tagged payload', (string) self::$s3->getObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['Body']);
+        self::assertSame([
+            ['Key' => 'project name', 'Value' => 'opsfour + storage/@'],
+            ['Key' => 'empty', 'Value' => ''],
+        ], self::$s3->getObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['TagSet']);
+    }
+
+    public function test_tagging_xml_populates_request_object_tag_policy_conditions(): void
+    {
+        $prefix = 'tagging-condition-' . bin2hex(random_bytes(4));
+        self::$s3->putBucketPolicy([
+            'Bucket' => self::$bucket,
+            'Policy' => json_encode([
+                'Version' => '2012-10-17',
+                'Statement' => [[
+                    'Effect' => 'Deny',
+                    'Principal' => '*',
+                    'Action' => 's3:PutObject',
+                    'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $prefix . '/*',
+                    'Condition' => [
+                        'StringNotEquals' => ['s3:RequestObjectTag/project' => 'approved'],
+                    ],
+                ]],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+
+        try {
+            $acceptedKey = $prefix . '/accepted.txt';
+            $accepted = $this->postV4($acceptedKey, 'upload.txt', 'accepted', [
+                'tagging' => '<Tagging><TagSet><Tag><Key>project</Key><Value>approved</Value></Tag></TagSet></Tagging>',
+            ]);
+            self::assertSame(204, $accepted->getStatusCode(), (string) $accepted->getBody());
+
+            $deniedKey = $prefix . '/denied.txt';
+            $denied = $this->postV4($deniedKey, 'upload.txt', str_repeat('denied', 131_072), [
+                'tagging' => '<Tagging><TagSet><Tag><Key>project</Key><Value>private</Value></Tag></TagSet></Tagging>',
+            ]);
+            self::assertSame(403, $denied->getStatusCode(), (string) $denied->getBody());
+            self::assertSame([], self::$s3->listObjectsV2([
+                'Bucket' => self::$bucket,
+                'Prefix' => $deniedKey,
+            ])['Contents'] ?? []);
+        } finally {
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+        }
+    }
+
+    /** @param string $tagging */
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidBrowserPostTagging')]
+    public function test_invalid_tagging_field_fails_before_object_publication(string $tagging): void
+    {
+        $key = 'invalid-tagging-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: str_repeat('must not be published', 65_536),
+            extraFields: ['tagging' => $tagging],
+        );
+
+        self::assertSame(400, $response->getStatusCode(), (string) $response->getBody());
+        self::assertSame([], self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => $key,
+        ])['Contents'] ?? []);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidBrowserPostTagging(): iterable
+    {
+        yield 'private query format' => ['project=private'];
+        yield 'malformed XML' => ['<Tagging><TagSet>'];
+        yield 'invalid S3 tag character' => [
+            '<Tagging><TagSet><Tag><Key>project*</Key><Value>private</Value></Tag></TagSet></Tagging>',
+        ];
+    }
+
+    public function test_invalid_utf8_tagging_field_fails_before_object_publication(): void
+    {
+        $key = 'invalid-tagging-utf8-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->sendMultipart([
+            'key' => $key,
+            'tagging' => "<Tagging><TagSet><Tag><Key>project</Key><Value>\xC3\x28</Value></Tag></TagSet></Tagging>",
+        ], 'upload.txt', str_repeat('must not be published', 65_536));
+
+        self::assertSame(400, $response->getStatusCode(), (string) $response->getBody());
+        self::assertSame([], self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => $key,
+        ])['Contents'] ?? []);
     }
 
     public function test_anonymous_form_is_allowed_by_public_write_acl(): void

@@ -95,6 +95,39 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         self::assertSame([], $this->metadata->dequeueStorageGarbage(10));
     }
 
+    public function test_anonymous_copy_intent_is_reserved_for_destination_bucket_owner(): void
+    {
+        $this->source('payload');
+        $this->metadata->putBucketPolicy('source', json_encode([
+            'Version' => '2012-10-17',
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::source/*',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $this->metadata->putBucketPolicy('target', json_encode([
+            'Version' => '2012-10-17',
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:PutObject',
+                'Resource' => 'arn:aws:s3:::target/*',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $intentOwner = null;
+        $factory = $this->factory(function (string $attemptId) use (&$intentOwner): void {
+            $intentOwner = $this->metadata->getObjectWriteIntent($attemptId)?->ownerId;
+        });
+        $request = $this->request();
+        $request->setAttribute('ownerId', '');
+
+        self::assertSame(200, $this->handler(factory: $factory)->handleRequest($request)->getStatus());
+        self::assertSame('owner', $intentOwner);
+        self::assertSame('owner', $this->metadata->getObjectMetadata('target', 'copied')?->ownerId);
+    }
+
     public function test_sse_source_is_decrypted_before_one_fenced_plaintext_write(): void
     {
         $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));

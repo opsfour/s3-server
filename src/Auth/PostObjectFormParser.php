@@ -11,9 +11,11 @@ use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
+use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
  * Streams an S3 POST Object form to a temporary file and authenticates it.
@@ -159,6 +161,10 @@ final class PostObjectFormParser
                         $fields,
                         is_string($bucket) ? $bucket : null,
                     );
+                    // S3's browser POST `tagging` field contains a Tagging XML
+                    // document. Validate and normalize it before the file body
+                    // is accepted into the encrypted spool.
+                    self::taggingHeader($fields);
                     $this->authorizationPreflight?->check($request, $credential, $fields, $key);
                     $seenFile = true;
                     $spoolKey = random_bytes(32);
@@ -570,7 +576,10 @@ final class PostObjectFormParser
             if ($lower === 'acl') {
                 $request->setHeader('x-amz-acl', $value);
             } elseif ($lower === 'tagging') {
-                $request->setHeader('x-amz-tagging', $value);
+                $taggingHeader = self::taggingHeader($fields);
+                if ($taggingHeader !== null && $taggingHeader !== '') {
+                    $request->setHeader('x-amz-tagging', $taggingHeader);
+                }
             } elseif ($lower === 'content-md5') {
                 $request->setHeader('content-md5', $value);
             } elseif (str_starts_with($lower, 'x-amz-meta-')
@@ -582,6 +591,29 @@ final class PostObjectFormParser
                 $request->setHeader($lower, $value);
             }
         }
+    }
+
+    /**
+     * Convert the browser POST Tagging XML field into the query-encoded header
+     * representation consumed by the ordinary PutObject authorization and
+     * write path. The original form value remains untouched for POST-policy
+     * condition matching.
+     *
+     * @param array<string, string> $fields
+     */
+    private static function taggingHeader(array $fields): ?string
+    {
+        $xml = self::value($fields, 'tagging');
+        if ($xml === null) {
+            return null;
+        }
+
+        $tags = ObjectTagValidator::validate(XmlRequestParser::parseTagging($xml), 10);
+
+        return implode('&', array_map(
+            static fn(array $tag): string => rawurlencode($tag['key']) . '=' . rawurlencode($tag['value']),
+            $tags,
+        ));
     }
 
     private function createTempPath(): string

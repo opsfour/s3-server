@@ -381,7 +381,7 @@ final class AclEvaluatorTest extends TestCase
         ));
     }
 
-    public function test_full_control_covers_write(): void
+    public function test_bucket_full_control_covers_write(): void
     {
         $grants = [
             ['granteeType' => 'CanonicalUser', 'granteeId' => 'user-a', 'permission' => 'FULL_CONTROL'],

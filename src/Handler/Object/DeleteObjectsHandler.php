@@ -8,6 +8,7 @@ use Amp\ByteStream;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -94,6 +95,9 @@ final class DeleteObjectsHandler implements RequestHandler
                     'Bucket versioning changed while the batch delete was being committed.',
                 );
             }
+            $deleteMarkerOwnerId = $ownerId === '' || BucketOwnership::isEnforced($this->metadata, $bucket)
+                ? $bucketInfo->ownerId
+                : $ownerId;
             foreach ($parsed['objects'] as $obj) {
                 $key = $obj['key'];
                 $versionId = $obj['versionId'] ?? null;
@@ -156,7 +160,12 @@ final class DeleteObjectsHandler implements RequestHandler
                         }
 
                         // Create a delete marker.
-                        $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
+                        $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned(
+                            $bucket,
+                            $key,
+                            $deleteMarkerOwnerId,
+                            $isSuspended,
+                        );
 
                         // Only queue path for deletion after successful metadata write.
                         if ($oldSuspendedObject !== null) {

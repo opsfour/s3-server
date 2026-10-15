@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Handler\Object;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -111,7 +112,15 @@ final class DeleteObjectHandler implements RequestHandler
                         $oldObjectToClean = $nullVersion;
                     }
                 }
-                $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned($bucket, $key, $ownerId, $isSuspended);
+                $deleteMarkerOwnerId = $ownerId === '' || BucketOwnership::isEnforced($this->metadata, $bucket)
+                    ? $bucketInfo->ownerId
+                    : $ownerId;
+                $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned(
+                    $bucket,
+                    $key,
+                    $deleteMarkerOwnerId,
+                    $isSuspended,
+                );
                 if ($oldObjectToClean !== null) {
                     $this->queueStoredData($oldObjectToClean);
                 }

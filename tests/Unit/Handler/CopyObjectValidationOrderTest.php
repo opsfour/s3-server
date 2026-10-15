@@ -10,6 +10,7 @@ use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
@@ -18,6 +19,39 @@ use PHPUnit\Framework\TestCase;
 
 final class CopyObjectValidationOrderTest extends TestCase
 {
+    public function test_invalid_legacy_source_tags_are_rejected_before_storage_or_target_mutation(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'source', 'us-east-1');
+        $metadata->createBucket('owner', 'target', 'us-east-1');
+        $metadata->putObjectMetadata(
+            'source',
+            'key',
+            'owner',
+            7,
+            '"321c3cf486ed509164edec1e1981fec8"',
+            'text/plain',
+            'source/physical',
+        );
+        $metadata->putObjectTagging('source', 'key', [
+            ['key' => 'legacy', 'value' => "control\u{000B}"],
+        ]);
+
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+        $storage->expects(self::never())->method('putObject');
+        $storage->expects(self::never())->method('copyObject');
+
+        $this->expectException(InternalErrorException::class);
+        try {
+            (new CopyObjectHandler($metadata, $storage))->handleRequest($this->request());
+        } finally {
+            self::assertNull($metadata->getObjectMetadata('target', 'copied'));
+            self::assertSame([], $metadata->getObjectTagging('target', 'copied'));
+        }
+    }
+
     public function test_invalid_replacement_metadata_is_rejected_before_storage_is_read_or_written(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');

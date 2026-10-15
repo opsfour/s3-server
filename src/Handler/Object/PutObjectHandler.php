@@ -30,6 +30,7 @@ use OpsFour\S3Server\Handler\Multipart\MultipartPartLogicalValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
@@ -156,6 +157,15 @@ final class PutObjectHandler implements RequestHandler
         $requestCancellation = null;
         try {
             $declaredLength = self::declaredObjectLength($request);
+            if ($declaredLength !== null) {
+                $this->assertDeclaredLengthWithinQuota(
+                    $request,
+                    $bucketInfo,
+                    $key,
+                    $objectOwnerId,
+                    $declaredLength,
+                );
+            }
             // 3. SSE payloads are encrypted before the first object-storage write.
             // Other payloads retain the storage backend's streaming checksum path.
             $encMeta = [];
@@ -786,6 +796,43 @@ final class PutObjectHandler implements RequestHandler
         }
 
         return (int) $value;
+    }
+
+    private function assertDeclaredLengthWithinQuota(
+        Request $request,
+        BucketInfo $bucketInfo,
+        string $key,
+        string $objectOwnerId,
+        int $declaredLength,
+    ): void {
+        if ($this->quotas === null
+            || (! $this->quotas->hasQuotaForOwner($objectOwnerId)
+                && ! $this->quotas->hasQuotaForOwner($bucketInfo->ownerId))) {
+            return;
+        }
+
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $key, $objectOwnerId, $declaredLength): void {
+            OwnerWriteLock::acquire($this->metadata, $objectOwnerId, $bucketInfo->ownerId);
+            BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+
+            $versioning = $this->metadata->getBucketVersioning($bucketInfo->name);
+            $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucketInfo->name)
+                ? $bucketInfo->ownerId
+                : $objectOwnerId;
+            $existingObject = null;
+            if ($versioning !== 'Enabled') {
+                $nullVersion = $this->metadata->getObjectMetadataByVersion($bucketInfo->name, $key, 'null');
+                $existingObject = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+            }
+
+            $this->quotas->assertCanWriteObject(
+                $storedOwnerId,
+                $bucketInfo->name,
+                $existingObject,
+                $declaredLength,
+                $versioning === 'Enabled',
+            );
+        });
     }
 
     private function writeObject(

@@ -264,6 +264,45 @@ final class CopyObjectHandler implements RequestHandler
         }
     }
 
+    private function assertSourceSizeWithinQuota(
+        Request $request,
+        \OpsFour\S3Server\Dto\BucketInfo $bucketInfo,
+        string $key,
+        string $objectOwnerId,
+        int $sourceSize,
+    ): void {
+        if ($this->quotas === null
+            || (! $this->quotas->hasQuotaForOwner($objectOwnerId)
+                && ! $this->quotas->hasQuotaForOwner($bucketInfo->ownerId))) {
+            return;
+        }
+
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $key, $objectOwnerId, $sourceSize): void {
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                $this->metadata,
+                $objectOwnerId,
+                $bucketInfo->ownerId,
+            );
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $versioning = $this->metadata->getBucketVersioning($bucketInfo->name);
+            $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucketInfo->name)
+                ? $bucketInfo->ownerId
+                : $objectOwnerId;
+            $existingObject = null;
+            if ($versioning !== 'Enabled') {
+                $nullVersion = $this->metadata->getObjectMetadataByVersion($bucketInfo->name, $key, 'null');
+                $existingObject = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+            }
+            $this->quotas->assertCanWriteObject(
+                $storedOwnerId,
+                $bucketInfo->name,
+                $existingObject,
+                $sourceSize,
+                $versioning === 'Enabled',
+            );
+        });
+    }
+
     public function handleRequest(Request $request): Response
     {
         if ($request->getHeader('x-amz-checksum-algorithm') !== null) {
@@ -273,19 +312,23 @@ final class CopyObjectHandler implements RequestHandler
         }
         $dstBucket = $request->getAttribute('s3.bucket');
         $dstKey = $request->getAttribute('s3.key');
-        $ownerId = $request->getAttribute('ownerId');
+        $ownerId = (string) $request->getAttribute('ownerId');
 
         // 1. Verify destination bucket exists. Middleware enforces write access.
         $dstBucketInfo = $this->metadata->getBucket($dstBucket);
         if ($dstBucketInfo === null) {
             throw new NoSuchBucketException();
         }
+        // Anonymous writes authorized by a bucket policy are owned by the
+        // destination bucket owner. Keep the empty requester ID on the
+        // request and notification event so audit attribution stays honest.
+        $objectOwnerId = $ownerId !== '' ? $ownerId : $dstBucketInfo->ownerId;
         $requestedStorageClass = $request->getHeader('x-amz-storage-class');
         if ($requestedStorageClass !== null) {
             $requestedStorageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($requestedStorageClass);
         }
-        $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $dstBucketInfo->ownerId)
-            ?? AclGrantResolver::privateAcl($ownerId);
+        $aclGrants = AclGrantResolver::fromHeaders($request, $objectOwnerId, 'object', $dstBucketInfo->ownerId)
+            ?? AclGrantResolver::privateAcl($objectOwnerId);
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($dstBucket);
         if (
             $publicAccessBlock !== null
@@ -404,7 +447,10 @@ final class CopyObjectHandler implements RequestHandler
         }
         $taggingHeader = $request->getHeader('x-amz-tagging');
         $tags = $taggingDirective === 'COPY'
-            ? $this->metadata->getObjectTagging($srcBucket, $srcKey, $srcObjectInfo->versionId)
+            ? ObjectTagValidator::validateStored(
+                $this->metadata->getObjectTagging($srcBucket, $srcKey, $srcObjectInfo->versionId),
+                10,
+            )
             : ($taggingHeader === null || $taggingHeader === '' ? [] : ObjectTagValidator::parseHeader($taggingHeader));
         // COPY applies source tags but supplies no RequestObjectTag values.
         $policyRequestTags = $taggingDirective === 'REPLACE' ? $tags : [];
@@ -430,15 +476,27 @@ final class CopyObjectHandler implements RequestHandler
             $replacementUserMetadata['__expires'] = $replacementExpires;
         }
 
-        // Reject self-copy unless this request changes a property that this
-        // handler can persist with COPY. A different storage class is one such
-        // change; merely repeating the current class is still a no-op.
+        $changesEncryption = $sourceEncryptionMode !== $destinationEncryptionMode;
+        if (! $changesEncryption && $sourceEncryptionMode === EncryptionRequestResolver::SSE_C) {
+            $destinationKeyMd5 = RequestHeaderValues::singleton(
+                $request,
+                'x-amz-server-side-encryption-customer-key-md5',
+            );
+            $sourceKeyMd5 = $srcObjectInfo->userMetadata['__sse-customer-key-md5'] ?? null;
+            $changesEncryption = $destinationKeyMd5 !== null
+                && ($sourceKeyMd5 === null || ! hash_equals($sourceKeyMd5, $destinationKeyMd5));
+        }
+
+        // Reject a current-version self-copy only when every persisted
+        // attribute remains unchanged. Explicit encryption changes and bucket
+        // default encryption are valid reasons to rewrite the object.
         if ($srcBucket === $dstBucket && $srcKey === $dstKey
             && $metadataDirective === 'COPY' && $srcVersionId === null
-            && ($requestedStorageClass === null || $requestedStorageClass === $srcObjectInfo->storageClass)) {
+            && ($requestedStorageClass === null || $requestedStorageClass === $srcObjectInfo->storageClass)
+            && ! $changesEncryption) {
             throw new InvalidRequestException(
                 'This copy request is illegal because it is trying to copy an object to itself '
-                . 'without changing the object\'s storage class.',
+                . 'without changing its metadata, storage class, or encryption attributes.',
             );
         }
 
@@ -467,6 +525,16 @@ final class CopyObjectHandler implements RequestHandler
             $this->metadata->getCurrentObjectVersion($dstBucket, $dstKey),
             $this->metadata->getObjectMetadataByVersion($dstBucket, $dstKey, 'null'),
         ];
+        // Reject an already impossible copy from a locked metadata snapshot
+        // before touching destination storage. The final commit repeats this
+        // check and remains authoritative for later races.
+        $this->assertSourceSizeWithinQuota(
+            $request,
+            $dstBucketInfo,
+            $dstKey,
+            $objectOwnerId,
+            $srcObjectInfo->size,
+        );
 
         $preEncryptedDestination = $destinationEncryptionMode !== null;
         $preEncryptedEtag = null;
@@ -488,7 +556,7 @@ final class CopyObjectHandler implements RequestHandler
                 $dstBucket,
                 $dstKey,
                 $dstBucketInfo->generation,
-                $ownerId,
+                $objectOwnerId,
             );
         } elseif ($preEncryptedDestination) {
             [$writeResult, $preEncryptedEtag, $preEncryptedObjectSize, $preEncryptedMeta, $sourcePlaintextChecksums] = $this->writeEncryptedCopy(
@@ -703,7 +771,7 @@ final class CopyObjectHandler implements RequestHandler
         try {
             $dstVersioning = $this->metadata->getBucketVersioning($dstBucket);
             if ($dstVersioning === 'Enabled') {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $dstBucketInfo, $request);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
@@ -718,7 +786,7 @@ final class CopyObjectHandler implements RequestHandler
                         BucketOwnership::assertWriteAclAllowed($request);
                     }
                     $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $dstBucket)
-                        ? $dstBucketInfo->ownerId : $ownerId;
+                        ? $dstBucketInfo->ownerId : $objectOwnerId;
                     $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $dstBucket)
                         ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
                     if ($this->metadata->getBucketVersioning($dstBucket) !== $dstVersioning) {
@@ -793,7 +861,7 @@ final class CopyObjectHandler implements RequestHandler
                     $metadataCallbackCompleted = true;
                 });
             } else {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, &$metadataCallbackCompleted, $localDispatchToken) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $aclGrants, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, &$metadataCallbackCompleted, $localDispatchToken) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $dstBucketInfo, $request);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
@@ -808,7 +876,7 @@ final class CopyObjectHandler implements RequestHandler
                         BucketOwnership::assertWriteAclAllowed($request);
                     }
                     $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $dstBucket)
-                        ? $dstBucketInfo->ownerId : $ownerId;
+                        ? $dstBucketInfo->ownerId : $objectOwnerId;
                     $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $dstBucket)
                         ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
                     if ($this->metadata->getBucketVersioning($dstBucket) !== $dstVersioning) {

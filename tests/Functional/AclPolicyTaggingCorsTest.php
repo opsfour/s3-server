@@ -310,6 +310,138 @@ final class AclPolicyTaggingCorsTest extends S3FunctionalTestCase
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
     }
 
+    public function test_tag_character_set_is_enforced_across_every_write_path(): void
+    {
+        $suffix = bin2hex(random_bytes(4));
+        $validKey = 'Relação 42+-. _:/=@';
+        $validValue = '東京 ७';
+        $baseline = [['Key' => 'baseline', 'Value' => 'unchanged']];
+        /** @param callable(): mixed $operation */
+        $assertRejected = function (callable $operation): void {
+            try {
+                $operation();
+                self::fail('A tag outside the documented S3 character set was accepted.');
+            } catch (S3Exception $error) {
+                self::assertSame(400, $error->getStatusCode());
+            }
+        };
+
+        // Accepted Unicode and punctuation must still round-trip through
+        // GetTagging's XML response and the SDK XML parser.
+        self::$s3->putBucketTagging([
+            'Bucket' => self::$bucket,
+            'Tagging' => ['TagSet' => [['Key' => $validKey, 'Value' => $validValue]]],
+        ]);
+        self::assertSame(
+            [['Key' => $validKey, 'Value' => $validValue]],
+            self::$s3->getBucketTagging(['Bucket' => self::$bucket])['TagSet'],
+        );
+
+        self::$s3->putBucketTagging([
+            'Bucket' => self::$bucket,
+            'Tagging' => ['TagSet' => $baseline],
+        ]);
+        $assertRejected(fn() => self::$s3->putBucketTagging([
+            'Bucket' => self::$bucket,
+            'Tagging' => ['TagSet' => [['Key' => "invalid\u{FDD0}", 'Value' => 'replacement']]],
+        ]));
+        self::assertSame($baseline, self::$s3->getBucketTagging(['Bucket' => self::$bucket])['TagSet']);
+
+        $objectKey = 'tag-character-object-' . $suffix;
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+            'Body' => 'original',
+            'Tagging' => rawurlencode($validKey) . '=' . rawurlencode($validValue),
+        ]);
+        self::assertSame(
+            [['Key' => $validKey, 'Value' => $validValue]],
+            self::$s3->getObjectTagging(['Bucket' => self::$bucket, 'Key' => $objectKey])['TagSet'],
+        );
+        self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+            'Tagging' => ['TagSet' => $baseline],
+        ]);
+        $assertRejected(fn() => self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+            'Tagging' => ['TagSet' => [['Key' => 'invalid*', 'Value' => 'replacement']]],
+        ]));
+        self::assertSame($baseline, self::$s3->getObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+        ])['TagSet']);
+
+        // An XML 1.0 control is rejected before the existing tag set changes,
+        // whether rejection happens in XML parsing or the shared validator.
+        $assertRejected(fn() => self::$s3->putObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+            'Tagging' => ['TagSet' => [['Key' => 'valid', 'Value' => "control\u{000B}"]]],
+        ]));
+        self::assertSame($baseline, self::$s3->getObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $objectKey,
+        ])['TagSet']);
+
+        $putKey = 'tag-character-put-' . $suffix;
+        $assertRejected(fn() => self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $putKey,
+            'Body' => 'must not persist',
+            'Tagging' => 'invalid*=value',
+        ]));
+        try {
+            self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $putKey]);
+            self::fail('PutObject with invalid tags was published.');
+        } catch (S3Exception $error) {
+            self::assertSame(404, $error->getStatusCode());
+        }
+
+        $copySource = 'tag-character-source-' . $suffix;
+        $copyDestination = 'tag-character-copy-' . $suffix;
+        self::$s3->putObject(['Bucket' => self::$bucket, 'Key' => $copySource, 'Body' => 'source']);
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $copyDestination,
+            'Body' => 'destination',
+            'Tagging' => 'baseline=unchanged',
+        ]);
+        $assertRejected(fn() => self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => $copyDestination,
+            'CopySource' => self::$bucket . '/' . $copySource,
+            'TaggingDirective' => 'REPLACE',
+            'Tagging' => rawurlencode("invalid\u{10FFFF}") . '=value',
+        ]));
+        self::assertSame('destination', (string) self::$s3->getObject([
+            'Bucket' => self::$bucket,
+            'Key' => $copyDestination,
+        ])['Body']);
+        self::assertSame($baseline, self::$s3->getObjectTagging([
+            'Bucket' => self::$bucket,
+            'Key' => $copyDestination,
+        ])['TagSet']);
+
+        $multipartKey = 'tag-character-multipart-' . $suffix;
+        $assertRejected(fn() => self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $multipartKey,
+            'Tagging' => 'invalid*=value',
+        ]));
+        $uploads = self::$s3->listMultipartUploads([
+            'Bucket' => self::$bucket,
+            'Prefix' => $multipartKey,
+        ])['Uploads'] ?? [];
+        self::assertNotContains($multipartKey, array_column($uploads, 'Key'));
+
+        self::$s3->deleteBucketTagging(['Bucket' => self::$bucket]);
+        foreach ([$objectKey, $copySource, $copyDestination] as $key) {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
     // -----------------------------------------------------------------
     // Bucket CORS
     // -----------------------------------------------------------------

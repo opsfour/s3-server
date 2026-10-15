@@ -5,9 +5,41 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Http;
 
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 
 final class ObjectTagValidator
 {
+    /**
+     * Validate tags read from persistent metadata without exposing a client
+     * validation error for server-owned, legacy state.
+     *
+     * @param array<array-key, mixed> $tags
+     * @return list<array{key: string, value: string}>
+     */
+    public static function validateStored(array $tags, int $maximum): array
+    {
+        try {
+            if (! array_is_list($tags)) {
+                throw new InvalidArgumentException('Stored tag set must be a list.');
+            }
+
+            $normalized = [];
+            foreach ($tags as $tag) {
+                if (! is_array($tag)
+                    || ! isset($tag['key'], $tag['value'])
+                    || ! is_string($tag['key'])
+                    || ! is_string($tag['value'])) {
+                    throw new InvalidArgumentException('Stored tag entries must contain string keys and values.');
+                }
+                $normalized[] = ['key' => $tag['key'], 'value' => $tag['value']];
+            }
+
+            return self::validate($normalized, $maximum);
+        } catch (InvalidArgumentException $error) {
+            throw new InternalErrorException('Stored tag metadata is invalid.', $error);
+        }
+    }
+
     /**
      * @param list<array{key: string, value: string}> $tags
      * @return list<array{key: string, value: string}>
@@ -23,6 +55,11 @@ final class ObjectTagValidator
             if (preg_match('//u', $tag['key']) !== 1 || preg_match('//u', $tag['value']) !== 1) {
                 throw new InvalidArgumentException('Tag keys and values must be valid UTF-8.');
             }
+            if (! self::hasAllowedCharacters($tag['key'], false) || ! self::hasAllowedCharacters($tag['value'], true)) {
+                throw new InvalidArgumentException(
+                    'Tag keys and values may contain only Unicode letters, numbers, spaces, and + - = . _ : / @.',
+                );
+            }
             // S3 counts tag limits in UTF-16 character positions. A BMP
             // character occupies one position even when UTF-8 uses multiple
             // bytes; a supplementary character occupies two positions.
@@ -36,6 +73,16 @@ final class ObjectTagValidator
         }
 
         return $tags;
+    }
+
+    private static function hasAllowedCharacters(string $value, bool $allowEmpty): bool
+    {
+        $quantifier = $allowEmpty ? '*' : '+';
+
+        // This is the character set documented by S3. It is also a strict
+        // subset of XML 1.0 text, excluding controls, surrogates and Unicode
+        // noncharacters before tags can reach persistent metadata.
+        return preg_match('/\A[\p{L}\p{Z}\p{N}_.:\/=+\-@]' . $quantifier . '\z/u', $value) === 1;
     }
 
     private static function utf16Length(string $value): int

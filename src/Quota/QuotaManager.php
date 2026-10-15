@@ -23,6 +23,11 @@ final readonly class QuotaManager
         ));
     }
 
+    public function hasQuotaForOwner(string $ownerId): bool
+    {
+        return $this->quotas->hasQuotaForOwner($ownerId);
+    }
+
     public function assertCanCreateBucket(string $ownerId): void
     {
         $quota = $this->quotas->quotaForOwner($ownerId);

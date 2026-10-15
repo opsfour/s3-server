@@ -81,30 +81,56 @@ final class AclEnforcementMiddleware implements Middleware
         }
 
         // Determine resource type and name for ACL lookup.
-        // For object operations: check object ACL first, then fall back to bucket ACL.
-        // Bucket WRITE grants PutObject/DeleteObject; bucket READ grants ListObjects.
+        // Object ACLs authorize reads and ACL access to an existing object. S3
+        // defines WRITE on an object ACL as not applicable, so object writes
+        // are authorized exclusively by the bucket ACL.
         $resourceType = $key !== null ? 'object' : 'bucket';
         $ownershipEnforced = BucketOwnership::isEnforced($this->metadata, $bucket);
+        $requiredPermission = AclEvaluator::operationToPermission($operation);
         $resourceName = $bucket;
+        $currentObjectOwner = null;
         if ($key !== null) {
             $versionId = $operation->selectsObjectVersion()
                 ? (QueryStringParser::parse($request->getUri()->getQuery())['versionId'] ?? null)
                 : null;
             if ($versionId === null) {
-                $versionId = $this->metadata->getObjectMetadata($bucket, $key)?->versionId;
+                $currentObject = $this->metadata->getObjectMetadata($bucket, $key);
+                $versionId = $currentObject?->versionId;
+                $currentObjectOwner = $currentObject?->ownerId;
             }
             $resourceName = ObjectVersionResolver::aclResourceName($bucket, $key, $versionId);
+        }
+
+        // A bucket WRITE grant lets its grantee create a new key. AWS only
+        // lets the bucket owner or the current object owner use that grant to
+        // replace an existing key. Multipart initiation and part uploads do
+        // not publish object data; completion repeats this check under the
+        // handler's owner write lock.
+        if ($key !== null
+            && $requiredPermission === 'WRITE'
+            && in_array($operation, [
+                S3Operation::PutObject,
+                S3Operation::PostObject,
+                S3Operation::CopyObject,
+                S3Operation::CompleteMultipartUpload,
+            ], true)
+            && $currentObjectOwner !== null) {
+            $effectiveObjectOwner = $ownershipEnforced || $currentObjectOwner === ''
+                ? $cachedBucketOwner
+                : $currentObjectOwner;
+            if ($ownerId === '' || ($ownerId !== $cachedBucketOwner && $ownerId !== $effectiveObjectOwner)) {
+                throw new AccessDeniedException();
+            }
         }
 
         // Fetch ACL grants.
         $grants = [];
         try {
-            if ($ownershipEnforced && $key !== null) {
-                // Object ACL grants are disabled. Bucket WRITE grants remain
-                // available to authorize new object writes.
-                $grants = AclEvaluator::operationToPermission($operation) === 'WRITE'
-                    ? $this->metadata->getAcl('bucket', $bucket)
-                    : [];
+            if ($key !== null && $requiredPermission === 'WRITE') {
+                $grants = $this->metadata->getAcl('bucket', $bucket);
+            } elseif ($ownershipEnforced && $key !== null) {
+                // Object ACL grants are disabled in BucketOwnerEnforced mode.
+                $grants = [];
             } else {
                 $grants = $this->metadata->getAcl($resourceType, $resourceName);
                 if (
@@ -118,21 +144,6 @@ final class AclEnforcementMiddleware implements Middleware
         } catch (\Amp\CancelledException $error) {
             throw $error;
         } catch (\Throwable) {
-        }
-
-        // For object WRITE operations with no object-level ACL, fall back to bucket ACL.
-        // Bucket WRITE grants PutObject/DeleteObject. Bucket READ only grants ListObjects,
-        // NOT GetObject — individual object read requires object-level ACL.
-        if ($grants === [] && $key !== null) {
-            $requiredPerm = AclEvaluator::operationToPermission($operation);
-            if ($requiredPerm === 'WRITE') {
-                try {
-                    $grants = $this->metadata->getAcl('bucket', $bucket);
-                } catch (\Amp\CancelledException $error) {
-                    throw $error;
-                } catch (\Throwable) {
-                }
-            }
         }
 
         $resourceOwner = $cachedBucketOwner;

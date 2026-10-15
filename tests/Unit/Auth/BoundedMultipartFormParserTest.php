@@ -18,6 +18,7 @@ use OpsFour\S3Server\Auth\PostObjectTempFileSweeper;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
+use OpsFour\S3Server\Exception\S3Exception;
 use PHPUnit\Framework\TestCase;
 
 final class BoundedMultipartFormParserTest extends TestCase
@@ -286,6 +287,59 @@ final class BoundedMultipartFormParserTest extends TestCase
             @rmdir($tempDir . '/.opsfour-s3-post-budget');
             @rmdir($tempDir);
         }
+    }
+
+    /** @param string $tagging */
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidBrowserPostTagging')]
+    public function test_invalid_tagging_is_rejected_before_file_spooling(string $tagging): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-tagging-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700));
+        $body = "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"key\"\r\n\r\nobject\r\n"
+            . "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"tagging\"\r\n\r\n"
+            . $tagging . "\r\n"
+            . "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"file\"; filename=\"object.txt\"\r\n\r\n"
+            . str_repeat('must not reach the spool', 1_024)
+            . "\r\n--guard-boundary--\r\n";
+
+        try {
+            $parser = new PostObjectFormParser(
+                $this->createMock(CredentialProvider::class),
+                'us-east-1',
+                1_048_576,
+                new PostObjectTempFileSweeper(tempDir: $tempDir),
+                spoolCoordinator: new PostObjectSpoolCoordinator($tempDir),
+            );
+            try {
+                $parser->parse($this->request(new ReadableBuffer($body), 'guard-boundary'));
+                self::fail('Invalid browser POST Tagging XML was accepted.');
+            } catch (S3Exception $error) {
+                self::assertSame(400, $error->getHttpStatus());
+                self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
+            }
+        } finally {
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidBrowserPostTagging(): iterable
+    {
+        yield 'private query format' => ['project=private'];
+        yield 'malformed XML' => ['<Tagging><TagSet>'];
+        yield 'invalid tag character' => [
+            '<Tagging><TagSet><Tag><Key>project*</Key><Value>private</Value></Tag></TagSet></Tagging>',
+        ];
+        yield 'invalid UTF-8' => [
+            "<Tagging><TagSet><Tag><Key>project</Key><Value>\xC3\x28</Value></Tag></TagSet></Tagging>",
+        ];
     }
 
     public function test_invalid_first_boundary_is_rejected_upstream_before_any_later_part(): void

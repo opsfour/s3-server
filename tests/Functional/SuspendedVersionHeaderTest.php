@@ -31,6 +31,18 @@ final class SuspendedVersionHeaderTest extends S3FunctionalTestCase
             self::$s3->putBucketVersioning(['Bucket' => $bucket, 'VersioningConfiguration' => ['Status' => 'Enabled']]);
             $numbered = self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'key', 'Body' => 'numbered']);
             self::assertNotSame('null', self::versionHeader($numbered));
+            foreach ([
+                ['getObjectAcl', []],
+                ['putObjectAcl', ['ACL' => 'private']],
+            ] as [$operation, $operationArgs]) {
+                $result = self::$s3->execute(self::$s3->getCommand($operation, [
+                    'Bucket' => $bucket,
+                    'Key' => 'key',
+                    'VersionId' => $numbered['VersionId'],
+                    ...$operationArgs,
+                ]));
+                self::assertSame($numbered['VersionId'], self::versionHeader($result), $operation . ' numbered version');
+            }
             foreach (['getObject', 'headObject'] as $operation) {
                 $notModified = self::$s3->{$operation}([
                     'Bucket' => $bucket,

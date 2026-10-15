@@ -10,6 +10,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
@@ -50,6 +51,7 @@ final class GetObjectTaggingHandler implements RequestHandler
         $versionId = $object->versionId
             ?? ($this->metadata->getBucketVersioning($bucket) !== '' ? 'null' : null);
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        $tags = ObjectTagValidator::validateStored($tags, 10);
 
         // For objects, return empty TagSet (not an error) when no tags exist.
         $xml = XmlResponseBuilder::taggingResult($tags);

@@ -9,6 +9,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchTagSetException;
+use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -38,6 +39,7 @@ final class GetBucketTaggingHandler implements RequestHandler
 
         $tags = $this->metadata->getBucketTagging($bucket);
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        $tags = ObjectTagValidator::validateStored($tags, 50);
 
         // Real S3 throws NoSuchTagSet for bucket tagging when no tags exist.
         if ($tags === []) {
