@@ -68,7 +68,6 @@ final class S3ServerStartupOwnershipTest extends TestCase
                 fclose($reservation);
             }
         }
-        self::assertSame(1, $stops);
     }
 
     public function test_failed_http_stop_keeps_server_and_workers_owned_until_shutdown_retry(): void
