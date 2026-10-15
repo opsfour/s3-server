@@ -604,6 +604,7 @@ final class RestoreExecutorTest extends TestCase
             'application/octet-stream',
             $coldWrite->path,
             userMetadata: ['__sse-algorithm' => 'AES256'],
+            checksumSha256: base64_encode(hash('sha256', 'plain', true)),
         );
         $this->metadata->updateObjectPlacement('bucket', 'encrypted.bin', null, 'GLACIER', 'GLACIER', $coldWrite->path);
         $this->metadata->enqueueRestoreJob('bucket', 'encrypted.bin', null, 'GLACIER', $coldWrite->path, 2);
@@ -660,6 +661,44 @@ final class RestoreExecutorTest extends TestCase
         self::assertSame('failed', $object->restoreStatus);
         self::assertNull($object->restoredStoragePath);
         self::assertSame('bad-data!', \Amp\ByteStream\buffer($cold->getObjectByPath($corrupt->path)));
+    }
+
+    public function test_rejects_corrupt_multipart_source_using_persisted_checksum(): void
+    {
+        $hot = new InMemoryBackend();
+        $cold = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $cold->createBucket('bucket');
+
+        $corrupt = $cold->putObject('bucket', 'archive.bin', new ReadableBuffer('bad-data!'));
+        $this->metadata->putObjectMetadata(
+            bucket: 'bucket',
+            key: 'archive.bin',
+            ownerId: 'owner',
+            size: $corrupt->size,
+            etag: '"0123456789abcdef0123456789abcdef-2"',
+            contentType: 'application/octet-stream',
+            storagePath: $corrupt->path,
+            checksumSha256: base64_encode(hash('sha256', 'good-data', true)),
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'archive.bin', null, 'GLACIER', 'GLACIER', $corrupt->path);
+        $this->metadata->updateObjectRestoreState('bucket', 'archive.bin', null, 'pending');
+        $jobId = $this->metadata->enqueueRestoreJob('bucket', 'archive.bin', null, 'GLACIER', $corrupt->path, 2, maxAttempts: 1);
+
+        $executor = new RestoreExecutor($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+            new StorageTier('GLACIER', $cold, restoreRequired: true),
+        ]));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 0, 'retried' => 0, 'deadLetter' => 1],
+            $executor->processNext(1),
+        );
+        self::assertSame('dead_letter', $this->metadata->getRestoreJob($jobId)['status'] ?? null);
+        $object = $this->metadata->getObjectMetadata('bucket', 'archive.bin');
+        self::assertNotNull($object);
+        self::assertSame('failed', $object->restoreStatus);
+        self::assertNull($object->restoredStoragePath);
     }
 
     public function test_rejects_truncated_cold_copy_before_publishing_restore(): void

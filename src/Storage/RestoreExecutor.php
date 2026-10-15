@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Storage;
 
 use Amp\Cancellation;
 use Amp\CancelledException;
+use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Event\S3Event;
@@ -148,15 +149,17 @@ final class RestoreExecutor
             $tierStore = $this->metadata;
             $sourceSize = 0;
             $sourceMd5 = hash_init('md5');
+            $sourceChecksums = StoredObjectChecksumVerifier::shouldVerify($object) ? new ChecksumCalculator() : null;
             $sourceStream = null;
             $writeFailure = null;
             try {
                 $this->efsEvidence?->assertFresh();
                 $sourceStream = new TeeReadableStream(
                     $sourceBackend->getObjectByPath($sourceStoragePath),
-                    static function (string $chunk) use (&$sourceSize, $sourceMd5): void {
+                    static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
+                        $sourceChecksums?->update($chunk);
                     },
                 );
                 if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
@@ -204,6 +207,13 @@ final class RestoreExecutor
             // length must still equal the committed plaintext length.
             if ($sourceSize !== $object->size) {
                 throw new \RuntimeException('Restore source size does not match object metadata.');
+            }
+            if ($sourceChecksums !== null) {
+                StoredObjectChecksumVerifier::assertMatches(
+                    $object,
+                    $sourceChecksums->finalize(),
+                    'Restore source checksum does not match object metadata.',
+                );
             }
             if (! isset($object->userMetadata['__sse-algorithm'])) {
                 $etag = trim($object->etag, '"');

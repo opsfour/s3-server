@@ -11,6 +11,8 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Dto\BucketInfo;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Object\RestoreObjectHandler;
@@ -106,6 +108,48 @@ final class RestoreGarbageCollectorTest extends TestCase
         self::assertNotNull($object);
         self::assertSame('restored', $object->restoreStatus);
         self::assertSame('restored-data', \Amp\ByteStream\buffer($hot->getObjectByPath($restored->path)));
+    }
+
+    public function test_recreated_bucket_generation_does_not_clear_expired_restore_snapshot(): void
+    {
+        $expired = new ObjectInfo(
+            bucket: 'bucket',
+            key: 'archive.bin',
+            size: 4,
+            etag: '"etag"',
+            restoredStoragePath: 'stable/restore/path',
+            restoreStatus: 'restored',
+            restoreExpiresAt: new \DateTimeImmutable('2020-01-01T00:00:00Z'),
+            ownerId: 'owner',
+            systemMetadata: [
+                'storagePath' => 'stable/source/path',
+                'bucketGeneration' => str_repeat('a', 32),
+            ],
+            restoredStorageTier: 'STANDARD',
+        );
+        $metadata = $this->createMock(\OpsFour\S3Server\Metadata\MetadataStore::class);
+        $metadata->method('listExpiredRestoredObjects')->willReturn([$expired]);
+        $metadata->method('getBucketOwner')->willReturn('owner');
+        $metadata->method('getObjectMetadataByVersion')->willReturn($expired);
+        $metadata->method('getBucket')->willReturn(new BucketInfo(
+            'bucket',
+            'owner',
+            generation: str_repeat('b', 32),
+        ));
+        $metadata->method('transaction')->willReturnCallback(
+            static fn(callable $callback): mixed => $callback(),
+        );
+        $metadata->expects(self::never())->method('enqueueStorageGarbage');
+        $metadata->expects(self::never())->method('updateObjectRestoreState');
+
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('deleteObjectByPath');
+
+        self::assertSame(
+            ['scanned' => 1, 'expired' => 0, 'failed' => 0],
+            (new RestoreGarbageCollector($metadata, $storage))
+                ->collect(now: new \DateTimeImmutable('2020-01-02T00:00:00Z')),
+        );
     }
 
     public function test_expired_copy_uses_persisted_tier_after_default_changes(): void

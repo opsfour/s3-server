@@ -4129,6 +4129,9 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
         if (isset($row['storage_path'])) {
             $systemMetadata['storagePath'] = (string) $row['storage_path'];
         }
+        if (isset($row['bucket_generation'])) {
+            $systemMetadata['bucketGeneration'] = (string) $row['bucket_generation'];
+        }
         if (isset($row['content_encoding'])) {
             $systemMetadata['content-encoding'] = (string) $row['content_encoding'];
         }
@@ -4637,9 +4640,11 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
     public function listExpiredRestoredObjects(\DateTimeImmutable $now, int $limit = 1000): array
     {
         $result = $this->conn()->execute(
-            'SELECT * FROM s3_objects
-             WHERE restore_status = ? AND restored_storage_path IS NOT NULL AND restore_expires_at IS NOT NULL AND restore_expires_at <= ?
-             ORDER BY restore_expires_at ASC, bucket ASC, key_name ASC, version_id ASC
+            'SELECT o.*, b.generation AS bucket_generation
+             FROM s3_objects AS o
+             INNER JOIN s3_buckets AS b ON b.name = o.bucket
+             WHERE o.restore_status = ? AND o.restored_storage_path IS NOT NULL AND o.restore_expires_at IS NOT NULL AND o.restore_expires_at <= ?
+             ORDER BY o.restore_expires_at ASC, o.bucket ASC, o.key_name ASC, o.version_id ASC
              LIMIT ?',
             [
                 'restored',

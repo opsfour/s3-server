@@ -779,6 +779,7 @@ final class TierTransitionExecutorTest extends TestCase
             contentType: 'application/octet-stream',
             storagePath: $source->path,
             userMetadata: ['__sse-algorithm' => 'AES256'],
+            checksumSha256: base64_encode(hash('sha256', $plaintext, true)),
         );
         $this->metadata->enqueueTierTransitionJob(
             'bucket',
@@ -862,6 +863,54 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertSame('pending', $object->transitionStatus);
         self::assertSame('GLACIER', $object->transitionTargetTier);
         self::assertNotNull($object->transitionError);
+    }
+
+    public function test_rejects_corrupt_multipart_source_using_persisted_checksum(): void
+    {
+        $hot = new InMemoryBackend();
+        $archive = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $archive->createBucket('bucket');
+
+        $source = $hot->putObject('bucket', 'corrupt.bin', new ReadableBuffer('bad-data!'));
+        $this->metadata->putObjectMetadata(
+            bucket: 'bucket',
+            key: 'corrupt.bin',
+            ownerId: 'owner',
+            size: $source->size,
+            etag: '"0123456789abcdef0123456789abcdef-2"',
+            contentType: 'application/octet-stream',
+            storagePath: $source->path,
+            checksumSha256: base64_encode(hash('sha256', 'good-data', true)),
+        );
+        $jobId = $this->metadata->enqueueTierTransitionJob(
+            bucket: 'bucket',
+            key: 'corrupt.bin',
+            versionId: null,
+            sourceTier: 'STANDARD',
+            targetTier: 'GLACIER',
+            targetStorageClass: 'GLACIER',
+            sourceStoragePath: $source->path,
+            maxAttempts: 1,
+        );
+
+        $executor = new TierTransitionExecutor(
+            $this->metadata,
+            new StorageTierRegistry([
+                new StorageTier('STANDARD', $hot, defaultWriteTier: true),
+                new StorageTier('GLACIER', $archive, restoreRequired: true),
+            ]),
+        );
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 0, 'retried' => 0, 'deadLetter' => 1],
+            $executor->processNext(1),
+        );
+        self::assertSame('dead_letter', $this->metadata->getTierTransitionJob($jobId)['status'] ?? null);
+        $object = $this->metadata->getObjectMetadata('bucket', 'corrupt.bin');
+        self::assertNotNull($object);
+        self::assertSame('STANDARD', $object->storageTier);
+        self::assertSame($source->path, $object->systemMetadata['storagePath']);
     }
 
     public function test_stale_unversioned_transition_job_after_overwrite_is_completed_without_switching_new_object(): void

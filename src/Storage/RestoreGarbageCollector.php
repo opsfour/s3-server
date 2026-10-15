@@ -57,14 +57,21 @@ final class RestoreGarbageCollector
 
             try {
                 $restoreTier = RestoredCopyTierResolver::resolve($object, $this->tiers);
-                $bucketOwner = $this->metadata->getBucketOwner($object->bucket);
+                $bucketGeneration = $object->systemMetadata['bucketGeneration'] ?? null;
                 $this->efsEvidence?->assertFresh();
-                $cleared = $this->metadata->transaction(function () use ($object, $path, $restoreTier, $now, $bucketOwner): bool {
+                $cleared = $this->metadata->transaction(function () use ($object, $path, $restoreTier, $now, $bucketGeneration): bool {
                     $this->efsEvidence?->assertFresh();
-                    if ($bucketOwner === null) {
+                    $bucket = $this->metadata->getBucket($object->bucket);
+                    if ($bucket === null || ($bucketGeneration !== null && $bucketGeneration !== ''
+                        && $bucket->generation !== $bucketGeneration)) {
                         return false;
                     }
-                    OwnerWriteLock::acquire($this->metadata, $bucketOwner);
+                    $observedGeneration = $bucket->generation;
+                    OwnerWriteLock::acquire($this->metadata, $bucket->ownerId);
+                    $bucket = $this->metadata->getBucket($object->bucket);
+                    if ($bucket === null || $bucket->generation !== ($bucketGeneration ?: $observedGeneration)) {
+                        return false;
+                    }
                     // A suspended null version can become noncurrent after a
                     // newer numbered version is written. Its restored copy
                     // still belongs to that exact version, not the latest.
@@ -72,6 +79,7 @@ final class RestoreGarbageCollector
                     $current = $this->metadata->getObjectMetadataByVersion($object->bucket, $object->key, $versionId);
                     if (
                         $current === null
+                        || ! $this->sameObjectSnapshot($current, $object)
                         || $current->restoredStoragePath !== $path
                         || $current->restoredStorageTier !== $restoreTier->name
                         || $current->restoreExpiresAt === null
@@ -129,5 +137,15 @@ final class RestoreGarbageCollector
         }
 
         return $stats;
+    }
+
+    private function sameObjectSnapshot(\OpsFour\S3Server\Dto\ObjectInfo $current, \OpsFour\S3Server\Dto\ObjectInfo $observed): bool
+    {
+        return $current->versionId === $observed->versionId
+            && $current->ownerId === $observed->ownerId
+            && $current->etag === $observed->etag
+            && $current->size === $observed->size
+            && $current->lastModified->format('U.u') === $observed->lastModified->format('U.u')
+            && ($current->systemMetadata['storagePath'] ?? null) === ($observed->systemMetadata['storagePath'] ?? null);
     }
 }

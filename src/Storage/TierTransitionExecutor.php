@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Storage;
 
 use Amp\Cancellation;
 use Amp\CancelledException;
+use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Lifecycle\LifecycleRuleValidator;
@@ -146,15 +147,17 @@ final class TierTransitionExecutor
             $targetBackend = $this->tiers->tier($targetTier)->backend;
             $sourceSize = 0;
             $sourceMd5 = hash_init('md5');
+            $sourceChecksums = StoredObjectChecksumVerifier::shouldVerify($object) ? new ChecksumCalculator() : null;
             $sourceStream = null;
             $writeFailure = null;
             try {
                 $this->efsEvidence?->assertFresh();
                 $sourceStream = new TeeReadableStream(
                     $sourceBackend->getObjectByPath($sourcePath),
-                    static function (string $chunk) use (&$sourceSize, $sourceMd5): void {
+                    static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
+                        $sourceChecksums?->update($chunk);
                     },
                 );
                 if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
@@ -198,12 +201,14 @@ final class TierTransitionExecutor
                 throw $writeFailure;
             }
 
-            $this->verifyCopy(
-                $object,
-                $writeResult,
-                $sourceSize,
-                hash_final($sourceMd5),
-            );
+            $this->verifyCopy($object, $writeResult, $sourceSize, hash_final($sourceMd5));
+            if ($sourceChecksums !== null) {
+                StoredObjectChecksumVerifier::assertMatches(
+                    $object,
+                    $sourceChecksums->finalize(),
+                    'Tier transition source checksum does not match object metadata.',
+                );
+            }
 
             $this->efsEvidence?->assertFresh();
             $metadataCommitted = $this->metadata->transaction(function () use ($id, $job, $object, $sourcePath, $targetStorageClass, $targetTier, $writeResult, $bucketOwner, $targetBucket, $dispatchToken, &$leaseExpiresAt, &$publicationCallbackCompleted): bool {
