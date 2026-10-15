@@ -75,6 +75,12 @@ final class AbortMultipartUploadHandler implements RequestHandler
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $uploadOwner, $bucketInfo->ownerId);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
+            if ($ownerId !== $uploadOwner
+                && $ownerId !== $bucketInfo->ownerId
+                && (! $request->hasAttribute('s3.policyResult')
+                    || $request->getAttribute('s3.policyResult') !== 'Allow')) {
+                throw new NoSuchUploadException();
+            }
             $parts = MultipartCleanup::stage(
                 $this->metadata,
                 $bucket,

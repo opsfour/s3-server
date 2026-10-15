@@ -13,6 +13,7 @@ use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Handler\Multipart\AbortMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\UploadPartCopyHandler;
@@ -228,6 +229,73 @@ final class MultipartRestorePolicyCommitTest extends TestCase
         self::assertCount(1, $this->metadata->getParts('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'));
     }
 
+    public function test_delegated_abort_requires_resource_allow_at_commit_without_blocking_upload_or_bucket_owner(): void
+    {
+        $delegatedUploadId = str_repeat('a', 32);
+        $bucketOwnerUploadId = str_repeat('b', 32);
+        $initiatorUploadId = str_repeat('c', 32);
+        foreach ([$delegatedUploadId, $bucketOwnerUploadId, $initiatorUploadId] as $uploadId) {
+            $this->metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'tenant:uploader');
+        }
+        $part = $this->storage->putPart('bucket', 'key', $delegatedUploadId, 1, new ReadableBuffer('part-data'));
+        $this->metadata->putPart($delegatedUploadId, 1, '"' . $part->md5Hex . '"', $part->size, $part->path);
+
+        foreach (['tenant:delegate', 'tenant:uploader'] as $principal) {
+            $this->metadata->putAccountPolicy($principal, $this->allowAbortPolicy());
+        }
+        $this->metadata->putBucketPolicy('bucket', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => ['AWS' => 'tenant:delegate'],
+                'Action' => 's3:AbortMultipartUpload',
+                'Resource' => 'arn:aws:s3:::bucket/key',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+
+        $delegated = $this->request(
+            'DELETE',
+            '/bucket/key?uploadId=' . $delegatedUploadId,
+            S3Operation::AbortMultipartUpload,
+        );
+        $delegated->setAttribute('ownerId', 'tenant:delegate');
+        try {
+            $this->handle(
+                $delegated,
+                new AbortMultipartUploadHandler($this->metadata, $this->storage),
+                fn() => $this->metadata->deleteBucketPolicy('bucket'),
+            );
+            self::fail('A delegated abort must retain its resource-policy Allow through commit.');
+        } catch (NoSuchUploadException) {
+        }
+        self::assertNotNull($this->metadata->getMultipartUpload($delegatedUploadId));
+        self::assertCount(1, $this->metadata->getParts($delegatedUploadId));
+        self::assertSame('part-data', $this->storage->getObjectByPath($part->path)->read());
+
+        $bucketOwner = $this->request(
+            'DELETE',
+            '/bucket/key?uploadId=' . $bucketOwnerUploadId,
+            S3Operation::AbortMultipartUpload,
+        );
+        self::assertSame(204, $this->handle(
+            $bucketOwner,
+            new AbortMultipartUploadHandler($this->metadata, $this->storage),
+        )->getStatus());
+
+        $initiator = $this->request(
+            'DELETE',
+            '/bucket/key?uploadId=' . $initiatorUploadId,
+            S3Operation::AbortMultipartUpload,
+        );
+        $initiator->setAttribute('ownerId', 'tenant:uploader');
+        self::assertSame(204, $this->handle(
+            $initiator,
+            new AbortMultipartUploadHandler($this->metadata, $this->storage),
+        )->getStatus());
+
+        self::assertNull($this->metadata->getMultipartUpload($bucketOwnerUploadId));
+        self::assertNull($this->metadata->getMultipartUpload($initiatorUploadId));
+    }
+
     public function test_restore_revocation_during_body_read_leaves_object_unrestored(): void
     {
         $cold = new InMemoryBackend();
@@ -264,6 +332,17 @@ final class MultipartRestorePolicyCommitTest extends TestCase
                 'Effect' => 'Deny',
                 'Action' => $action,
                 'Resource' => 'arn:aws:s3:::bucket/' . $key,
+            ]],
+        ], JSON_THROW_ON_ERROR);
+    }
+
+    private function allowAbortPolicy(): string
+    {
+        return json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:AbortMultipartUpload',
+                'Resource' => 'arn:aws:s3:::bucket/key',
             ]],
         ], JSON_THROW_ON_ERROR);
     }
