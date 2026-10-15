@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
+use Amp\Parallel\Worker\ContextWorkerPool;
 use Closure;
+use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Runtime\ProductionEfsHostPin;
 use OpsFour\S3Server\Runtime\ProductionEfsIdentity;
 use OpsFour\S3Server\Runtime\ProductionEfsWatcherEvidenceFileReader;
+use OpsFour\S3Server\Runtime\ProductionEfsWorkerEvidenceScope;
+use OpsFour\S3Server\Tests\Support\ProductionEfsEvidenceScopeWorkerTask;
 use PHPUnit\Framework\TestCase;
 
 final class ProductionEfsWatcherEvidenceFileReaderTest extends TestCase
@@ -471,6 +475,181 @@ final class ProductionEfsWatcherEvidenceFileReaderTest extends TestCase
         $reader->assertFresh();
         $reader->assertFresh();
         self::addToAssertionCount(1);
+    }
+
+    public function test_worker_scope_serializes_and_reconstructs_the_exact_v2_trust_basis(): void
+    {
+        $sourceReader = $this->reader();
+        $sourceScope = $sourceReader->workerScope();
+        $scope = unserialize(serialize($sourceScope));
+        self::assertInstanceOf(ProductionEfsWorkerEvidenceScope::class, $scope);
+        self::assertSame(2, $scope->schemaVersion);
+        self::assertSame('production', $scope->profile);
+        self::assertSame(str_repeat('a', 32), $scope->deploymentId);
+        self::assertSame(str_repeat('e', 32), $scope->epoch);
+        self::assertSame('/nonexistent-efs/objects', $scope->storageRoot);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $scope->evidenceMountSha256);
+        self::assertSame(self::NOW_NS, $scope->validatedMonotonicNs);
+
+        $worker = ProductionEfsWatcherEvidenceFileReader::fromWorkerScope(
+            $scope,
+            fn(): int => $this->nowNs,
+            static fn(): string => '11111111-1234-1234-1234-123456789abc',
+            fn(): string => self::mountInfo($this->evidenceDirectory),
+            static fn(string $path): array|false => self::rootStat(@lstat($path)),
+            static fn($handle): array|false => self::rootStat(@fstat($handle)),
+        );
+        $worker->assertFresh();
+
+        $this->nowNs += 5_000_000_000;
+        $this->writeRecord(replace: true);
+        self::assertSame($sourceScope, $sourceReader->workerScope());
+        $renewed = $worker->workerScope();
+        self::assertSame($scope, $renewed);
+        self::assertSame(self::NOW_NS - 1_000_000_000, $renewed->issuedMonotonicNs);
+        self::assertSame(self::NOW_NS + 19_000_000_000, $renewed->expiresMonotonicNs);
+    }
+
+    public function test_worker_scope_crosses_a_real_amp_process_channel(): void
+    {
+        $scope = $this->reader()->workerScope();
+        $pool = new ContextWorkerPool(1);
+        try {
+            $result = $pool->submit(new ProductionEfsEvidenceScopeWorkerTask($scope))->getFuture()->await();
+            self::assertSame(
+                '2:production:' . str_repeat('a', 32) . ':' . str_repeat('e', 32),
+                $result,
+            );
+        } finally {
+            $pool->shutdown();
+        }
+    }
+
+    public function test_worker_scope_rejects_mount_directory_and_heartbeat_rollback_before_file_use(): void
+    {
+        $scope = $this->reader()->workerScope();
+
+        $fileStats = 0;
+        $worker = ProductionEfsWatcherEvidenceFileReader::fromWorkerScope(
+            $scope,
+            static fn(): int => self::NOW_NS - 1,
+            static fn(): string => '11111111-1234-1234-1234-123456789abc',
+            fn(): string => self::mountInfo($this->evidenceDirectory),
+            function (string $path) use (&$fileStats): array|false {
+                if ($path === $this->path) {
+                    $fileStats++;
+                }
+
+                return self::rootStat(@lstat($path));
+            },
+            static fn($handle): array|false => self::rootStat(@fstat($handle)),
+        );
+        $this->assertRejected($worker, 'worker monotonic clock rollback');
+        self::assertSame(0, $fileStats);
+
+        $fileStats = 0;
+        $changedMount = str_replace('2 1 0:2', '9 1 0:2', self::mountInfo($this->evidenceDirectory));
+        $worker = ProductionEfsWatcherEvidenceFileReader::fromWorkerScope(
+            $scope,
+            fn(): int => $this->nowNs,
+            static fn(): string => '11111111-1234-1234-1234-123456789abc',
+            static fn(): string => $changedMount,
+            function (string $path) use (&$fileStats): array|false {
+                if ($path === $this->path) {
+                    $fileStats++;
+                }
+
+                return self::rootStat(@lstat($path));
+            },
+            static fn($handle): array|false => self::rootStat(@fstat($handle)),
+        );
+        $this->assertRejected($worker, 'worker evidence mount replacement');
+        self::assertSame(0, $fileStats);
+
+        $fileStats = 0;
+        $worker = ProductionEfsWatcherEvidenceFileReader::fromWorkerScope(
+            $scope,
+            fn(): int => $this->nowNs,
+            static fn(): string => '11111111-1234-1234-1234-123456789abc',
+            fn(): string => self::mountInfo($this->evidenceDirectory),
+            function (string $path) use (&$fileStats): array|false {
+                $entry = self::rootStat(@lstat($path));
+                if (is_array($entry) && $path === $this->evidenceDirectory) {
+                    $entry['ino']++;
+                }
+                if ($path === $this->path) {
+                    $fileStats++;
+                }
+
+                return $entry;
+            },
+            static fn($handle): array|false => self::rootStat(@fstat($handle)),
+        );
+        $this->assertRejected($worker, 'worker evidence directory replacement');
+        self::assertSame(0, $fileStats);
+
+        $this->writeRecord([
+            'issuedMonotonicNs' => self::NOW_NS - 2_000_000_000,
+            'expiresMonotonicNs' => self::NOW_NS + 18_000_000_000,
+        ]);
+        $worker = ProductionEfsWatcherEvidenceFileReader::fromWorkerScope(
+            $scope,
+            fn(): int => $this->nowNs,
+            static fn(): string => '11111111-1234-1234-1234-123456789abc',
+            fn(): string => self::mountInfo($this->evidenceDirectory),
+            static fn(string $path): array|false => self::rootStat(@lstat($path)),
+            static fn($handle): array|false => self::rootStat(@fstat($handle)),
+        );
+        $this->assertRejected($worker, 'worker heartbeat rollback');
+    }
+
+    public function test_v2_worker_factory_cannot_accept_the_legacy_v1_scope(): void
+    {
+        $parameter = (new \ReflectionMethod(
+            ProductionEfsWatcherEvidenceFileReader::class,
+            'fromWorkerScope',
+        ))->getParameters()[0];
+        $type = $parameter->getType();
+        self::assertInstanceOf(\ReflectionNamedType::class, $type);
+        self::assertSame(ProductionEfsWorkerEvidenceScope::class, $type->getName());
+        self::assertNotSame(EfsWorkerEvidenceScope::class, $type->getName());
+
+        $constructor = (new \ReflectionClass(ProductionEfsWorkerEvidenceScope::class))->getConstructor();
+        self::assertNotNull($constructor);
+        self::assertTrue($constructor->isPrivate());
+        self::assertTrue((new \ReflectionClass(ProductionEfsWorkerEvidenceScope::class))->isReadOnly());
+    }
+
+    public function test_serialized_v2_scope_is_revalidated_on_wakeup(): void
+    {
+        $serialized = serialize($this->reader()->workerScope());
+        $tampered = str_replace(str_repeat('a', 32), str_repeat('z', 32), $serialized);
+        self::assertNotSame($serialized, $tampered);
+
+        $this->expectException(\InvalidArgumentException::class);
+        unserialize($tampered);
+    }
+
+    public function test_serialized_v2_scope_rejects_directory_identity_above_php_integer_range(): void
+    {
+        $serialized = serialize($this->reader()->workerScope());
+        $tooLarge = PHP_INT_SIZE === 8 ? '9223372036854775808' : '2147483648';
+
+        foreach (['evidenceDirectoryDev', 'evidenceDirectoryIno'] as $field) {
+            $pattern = '/s:' . strlen($field) . ':"' . $field . '";s:[0-9]+:"[0-9]+";/D';
+            $replacement = 's:' . strlen($field) . ':"' . $field . '";s:'
+                . strlen($tooLarge) . ':"' . $tooLarge . '";';
+            $tampered = preg_replace($pattern, $replacement, $serialized, 1, $count);
+            self::assertIsString($tampered);
+            self::assertSame(1, $count, $field);
+
+            try {
+                unserialize($tampered);
+                self::fail("Serialized {$field} above PHP_INT_MAX was accepted.");
+            } catch (\InvalidArgumentException $error) {
+                self::assertSame('Production EFS worker evidence scope is invalid.', $error->getMessage());
+            }
+        }
     }
 
     private function assertRejected(ProductionEfsWatcherEvidenceFileReader $reader, string $case): void

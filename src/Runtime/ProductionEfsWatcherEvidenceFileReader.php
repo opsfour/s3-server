@@ -11,7 +11,7 @@ use Closure;
  *
  * This listenerless reader never accesses EFS, SQL, Docker or a socket. Any
  * failed read permanently revokes the instance so repaired or replaced
- * evidence cannot silently readmit the same process.
+ * evidence cannot silently readmit the same reader instance.
  */
 final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
 {
@@ -44,10 +44,12 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
 
     private ?int $lastExpiresMonotonicNs = null;
 
-    private ?string $pinnedEvidenceMount = null;
+    private ?string $pinnedEvidenceMountSha256 = null;
 
     /** @var array{int, int}|null */
     private ?array $pinnedEvidenceDirectoryIdentity = null;
+
+    private ?ProductionEfsWorkerEvidenceScope $pinnedWorkerScope = null;
 
     /**
      * @param (Closure(): int)|null $monotonicClock
@@ -106,6 +108,41 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
         return hash('sha256', $scope) . '.json';
     }
 
+    /**
+     * Reconstruct a worker reader from the exact schema-v2 trust basis without
+     * touching EFS, SQL, Docker, a socket, a listener or the evidence file.
+     * The first worker check must still read a fresh matching heartbeat.
+     */
+    public static function fromWorkerScope(
+        ProductionEfsWorkerEvidenceScope $scope,
+        ?Closure $monotonicClock = null,
+        ?Closure $bootIdReader = null,
+        ?Closure $mountInfoReader = null,
+        ?Closure $lstatReader = null,
+        ?Closure $fstatReader = null,
+    ): self {
+        $reader = new self(
+            $scope->identity(),
+            $scope->hostPin(),
+            $monotonicClock,
+            $bootIdReader,
+            $mountInfoReader,
+            $lstatReader,
+            $fstatReader,
+        );
+        $reader->pinnedEvidenceMountSha256 = $scope->evidenceMountSha256;
+        $reader->pinnedEvidenceDirectoryIdentity = [
+            self::positiveDecimalInt($scope->evidenceDirectoryDev),
+            self::positiveDecimalInt($scope->evidenceDirectoryIno),
+        ];
+        $reader->lastIssuedMonotonicNs = $scope->issuedMonotonicNs;
+        $reader->lastExpiresMonotonicNs = $scope->expiresMonotonicNs;
+        $reader->lastMonotonicNs = $scope->validatedMonotonicNs;
+        $reader->pinnedWorkerScope = $scope;
+
+        return $reader;
+    }
+
     public function assertFresh(): void
     {
         $this->read();
@@ -126,10 +163,32 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
         }
     }
 
+    /** Capture the exact validated schema-v2 basis for one process worker. */
+    public function workerScope(): ProductionEfsWorkerEvidenceScope
+    {
+        $evidence = $this->read();
+        if ($this->pinnedWorkerScope !== null) {
+            return $this->pinnedWorkerScope;
+        }
+        if ($this->pinnedEvidenceMountSha256 === null
+            || $this->pinnedEvidenceDirectoryIdentity === null
+            || $this->lastMonotonicNs === null) {
+            throw new \RuntimeException('Production EFS heartbeat has no pinned local identity.');
+        }
+
+        return $this->pinnedWorkerScope = ProductionEfsWorkerEvidenceScope::fromValidatedEvidence(
+            $evidence,
+            $this->pinnedEvidenceMountSha256,
+            (string) $this->pinnedEvidenceDirectoryIdentity[0],
+            (string) $this->pinnedEvidenceDirectoryIdentity[1],
+            $this->lastMonotonicNs,
+        );
+    }
+
     private function readAndValidate(): ProductionEfsWatcherEvidence
     {
         $beforeMountInfo = $this->readMountInfo();
-        $beforeEvidenceMount = $this->exactEvidenceMount($beforeMountInfo);
+        $beforeEvidenceMountSha256 = hash('sha256', $this->exactEvidenceMount($beforeMountInfo));
         $beforeBootId = $this->readBootId();
         $beforeMonotonicNs = ($this->monotonicClock)();
         if ($beforeBootId !== $this->hostPin->bootId || $beforeMonotonicNs < 0
@@ -149,7 +208,8 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
         }
         $evidenceDirectoryIdentity = $ancestors[$this->identity->evidenceDirectory] ?? null;
         if (! is_array($evidenceDirectoryIdentity)
-            || ($this->pinnedEvidenceMount !== null && $beforeEvidenceMount !== $this->pinnedEvidenceMount)
+            || ($this->pinnedEvidenceMountSha256 !== null
+                && $beforeEvidenceMountSha256 !== $this->pinnedEvidenceMountSha256)
             || ($this->pinnedEvidenceDirectoryIdentity !== null
                 && $evidenceDirectoryIdentity !== $this->pinnedEvidenceDirectoryIdentity)) {
             throw new \RuntimeException('Production EFS heartbeat directory identity changed.');
@@ -199,9 +259,10 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
             }
         }
         $afterMountInfo = $this->readMountInfo();
-        $afterEvidenceMount = $this->exactEvidenceMount($afterMountInfo);
-        if ($afterEvidenceMount !== $beforeEvidenceMount
-            || ($this->pinnedEvidenceMount !== null && $afterEvidenceMount !== $this->pinnedEvidenceMount)
+        $afterEvidenceMountSha256 = hash('sha256', $this->exactEvidenceMount($afterMountInfo));
+        if ($afterEvidenceMountSha256 !== $beforeEvidenceMountSha256
+            || ($this->pinnedEvidenceMountSha256 !== null
+                && $afterEvidenceMountSha256 !== $this->pinnedEvidenceMountSha256)
             || ! is_array($afterEvidenceDirectoryIdentity)
             || ($this->pinnedEvidenceDirectoryIdentity !== null
                 && $afterEvidenceDirectoryIdentity !== $this->pinnedEvidenceDirectoryIdentity)) {
@@ -232,7 +293,7 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
         $this->lastMonotonicNs = $afterMonotonicNs;
         $this->lastIssuedMonotonicNs = $evidence->issuedMonotonicNs;
         $this->lastExpiresMonotonicNs = $evidence->expiresMonotonicNs;
-        $this->pinnedEvidenceMount = $afterEvidenceMount;
+        $this->pinnedEvidenceMountSha256 = $afterEvidenceMountSha256;
         $this->pinnedEvidenceDirectoryIdentity = $afterEvidenceDirectoryIdentity;
 
         return $evidence;
@@ -340,6 +401,19 @@ final class ProductionEfsWatcherEvidenceFileReader implements EfsHostEvidence
         }
 
         return [$dev, $ino];
+    }
+
+    private static function positiveDecimalInt(string $value): int
+    {
+        if (preg_match('/^[1-9][0-9]{0,18}$/D', $value) !== 1) {
+            throw new \InvalidArgumentException('Production EFS worker local identity is invalid.');
+        }
+        $integer = (int) $value;
+        if ((string) $integer !== $value) {
+            throw new \InvalidArgumentException('Production EFS worker local identity is invalid.');
+        }
+
+        return $integer;
     }
 
     private static function nativeMountInfo(): string|false
