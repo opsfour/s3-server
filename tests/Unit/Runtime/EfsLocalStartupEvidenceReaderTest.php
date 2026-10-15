@@ -43,8 +43,13 @@ use OpsFour\S3Server\Routing\HandlerRegistry;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\EfsCandidateBootstrapException;
+use OpsFour\S3Server\Runtime\EfsCandidateBackgroundSupervisorState;
+use OpsFour\S3Server\Runtime\EfsCandidateBackgroundBarrierTimeoutException;
 use OpsFour\S3Server\Runtime\EfsCandidateIngressResources;
 use OpsFour\S3Server\Runtime\EfsCandidateManagementResources;
+use OpsFour\S3Server\Runtime\EfsCandidatePreBindBootstrapException;
+use OpsFour\S3Server\Runtime\EfsCandidatePreBindRuntime;
+use OpsFour\S3Server\Runtime\EfsCandidateServingAdmissionState;
 use OpsFour\S3Server\Runtime\EfsCandidateRecoveryCapabilities;
 use OpsFour\S3Server\Runtime\EfsCandidateRuntimeResources;
 use OpsFour\S3Server\Runtime\EfsLocalStartupEvidenceReader;
@@ -242,6 +247,10 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
             $config->with(['metadataDriver' => 'mysql']),
             $config->with(['metadataDsn' => 'host=127.0.0.1 user=test db=other']),
             $config->with(['allowUnfencedStorageForTests' => true]),
+            $config->with([
+                'allowUnfencedStorageForTests' => true,
+                'localObjectWriteTestScratchPath' => $this->base . '/unsafe-test-scratch',
+            ]),
         ] as $wrongConfig) {
             try {
                 $context->assertCandidateMetadataBinding($wrongConfig, $metadata);
@@ -1183,11 +1192,24 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         try {
             $management = EfsCandidateManagementResources::create($graph, $config);
             $management->assertBoundTo($graph, $config);
-            $management->admission->assertFresh();
-            self::assertSame($graph->metadata, (new \ReflectionProperty($management->readiness, 'metadata'))->getValue($management->readiness));
-            self::assertSame($graph->tiers, (new \ReflectionProperty($management->readiness, 'storageTiers'))->getValue($management->readiness));
-            self::assertSame($graph->qualification->hostEvidenceReader(), (new \ReflectionProperty($management->readiness, 'efsEvidence'))->getValue($management->readiness));
-            self::assertSame($management->admission, (new \ReflectionProperty($management->readiness, 'admissionEvidence'))->getValue($management->readiness));
+            self::assertSame(EfsCandidateServingAdmissionState::PREPARED, $management->admission->state());
+            $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/.health'));
+            self::assertSame(503, $management->readiness->handleRequest($request)->getStatus());
+            try {
+                $management->admission->assertFresh();
+                self::fail('Prepared candidate admission accepted serving.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('EFS serving admission is unavailable.', $error->getMessage());
+            }
+
+            $management->admission->activate();
+            self::assertSame(EfsCandidateServingAdmissionState::ACTIVE, $management->admission->state());
+            $health = (new \ReflectionProperty($management->readiness, 'health'))->getValue($management->readiness);
+            self::assertInstanceOf(HealthCheckHandler::class, $health);
+            self::assertSame($graph->metadata, (new \ReflectionProperty($health, 'metadata'))->getValue($health));
+            self::assertSame($graph->tiers, (new \ReflectionProperty($health, 'storageTiers'))->getValue($health));
+            self::assertSame($graph->qualification->hostEvidenceReader(), (new \ReflectionProperty($health, 'efsEvidence'))->getValue($health));
+            self::assertSame($management->admission, (new \ReflectionProperty($health, 'admissionEvidence'))->getValue($health));
 
             $wrongConfig = $config->with(['lifecycleIntervalSeconds' => $config->lifecycleIntervalSeconds + 1.0]);
             try {
@@ -1284,6 +1306,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
                 efsEvidence: $reader,
                 admissionEvidence: $management->admission,
             );
+            $management->admission->activate();
             $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/.health'));
             self::assertSame(200, $probe->handleRequest($request)->getStatus());
             self::assertSame(503, $probe->handleRequest($request)->getStatus());
@@ -1307,6 +1330,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         [$graph, $ingress, $config] = $this->candidateIngressGraph();
         try {
             $management = EfsCandidateManagementResources::create($graph, $config);
+            $management->admission->activate();
             $record = $this->record();
             $record['epoch'] = str_repeat('c', 32);
             $this->writeRecord($record);
@@ -1322,6 +1346,7 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
     {
         [$graph, $ingress, $config] = $this->candidateIngressGraph();
         $management = EfsCandidateManagementResources::create($graph, $config);
+        $management->admission->activate();
         $ingress->shutdown();
         $graph->shutdown();
 
@@ -1369,6 +1394,180 @@ final class EfsLocalStartupEvidenceReaderTest extends TestCase
         } finally {
             $server->stop();
         }
+    }
+
+    public function test_pre_bind_runtime_owns_complete_listenerless_candidate_and_stops_it(): void
+    {
+        [$graph, $ingress] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $runtime = (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/.health'));
+
+        self::assertTrue($runtime->isPrepared());
+        self::assertTrue($runtime->isPreBindAdmissionPrepared());
+        self::assertSame(EfsCandidateServingAdmissionState::PREPARED, $runtime->servingAdmissionState());
+        self::assertSame(EfsCandidateBackgroundSupervisorState::READY, $runtime->backgroundSupervisorState());
+        self::assertSame(503, $runtime->handleReadiness($request)->getStatus());
+        self::assertTrue($graph->readPool->isRunning());
+        self::assertTrue($ingress->workerPool->isRunning());
+        self::assertTrue((new \ReflectionProperty(EfsCandidatePreBindRuntime::class, 'server'))->isPrivate());
+
+        $runtime->stop();
+        $runtime->stop();
+        self::assertFalse($runtime->isPrepared());
+        self::assertFalse($runtime->isPreBindAdmissionPrepared());
+        self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $runtime->servingAdmissionState());
+        self::assertSame(EfsCandidateBackgroundSupervisorState::STOPPED, $runtime->backgroundSupervisorState());
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
+        try {
+            $runtime->handleReadiness($request);
+            self::fail('A stopped pre-bind runtime still exposed readiness.');
+        } catch (\LogicException $error) {
+            self::assertSame('EFS candidate pre-bind runtime is unavailable.', $error->getMessage());
+        }
+    }
+
+    public function test_pre_bind_runtime_rolls_back_parked_resources_after_credential_failure(): void
+    {
+        [$graph, $ingress, , $probe] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $probe->available = false;
+
+        try {
+            (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+            self::fail('A candidate with unavailable credentials was prepared.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Credential store unavailable.', $error->getMessage());
+        }
+
+        self::assertSame(1, $probe->healthChecks);
+        self::assertFalse($graph->lifecycleRunner->isRunning());
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
+    }
+
+    public function test_pre_bind_runtime_rejects_unsafe_cleanup_and_closes_consumed_resources(): void
+    {
+        [$graph, $ingress, , , $cleanup] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $cleanup->operationByTier = ['STANDARD' => 'abort_multipart'];
+
+        try {
+            (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+            self::fail('A candidate with unsafe recursive cleanup was prepared.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Legacy recursive multipart cleanup blocks local storage admission.', $error->getMessage());
+        }
+
+        self::assertSame(['STANDARD'], $cleanup->queriedTiers);
+        self::assertFalse($graph->lifecycleRunner->isRunning());
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
+    }
+
+    public function test_pre_bind_runtime_cleanup_failure_returns_retryable_terminal_owner(): void
+    {
+        [$graph, $ingress, , $probe] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $keys = new \ReflectionProperty($ingress->requestBodySpool, 'keys');
+        $probe->available = false;
+        $probe->onHealthCheck = static function () use ($keys, $ingress): void {
+            $keys->setValue($ingress->requestBodySpool, ['synthetic-active-spool' => str_repeat('a', 32)]);
+        };
+        $runtime = null;
+
+        try {
+            (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+            self::fail('A failed bootstrap with incomplete cleanup returned normally.');
+        } catch (EfsCandidatePreBindBootstrapException $error) {
+            $runtime = $error->runtime;
+            self::assertSame(
+                'EFS candidate pre-bind bootstrap failed and resource shutdown is incomplete.',
+                $error->getMessage(),
+            );
+            self::assertInstanceOf(\RuntimeException::class, $error->getPrevious());
+            self::assertSame('Credential store unavailable.', $error->getPrevious()->getMessage());
+            self::assertFalse($runtime->isPrepared());
+            self::assertFalse($runtime->isPreBindAdmissionPrepared());
+            self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $runtime->servingAdmissionState());
+            self::assertSame(EfsCandidateBackgroundSupervisorState::STOPPED, $runtime->backgroundSupervisorState());
+            self::assertTrue($graph->readPool->isRunning());
+            self::assertTrue($ingress->workerPool->isRunning());
+            try {
+                $runtime->handleReadiness(new Request(
+                    $this->createMock(Client::class),
+                    'GET',
+                    Http::new('http://127.0.0.1/.health'),
+                ));
+                self::fail('A partly closed runtime still exposed readiness.');
+            } catch (\LogicException $readinessError) {
+                self::assertSame('EFS candidate pre-bind runtime is unavailable.', $readinessError->getMessage());
+            }
+        } finally {
+            $keys->setValue($ingress->requestBodySpool, []);
+        }
+
+        self::assertInstanceOf(EfsCandidatePreBindRuntime::class, $runtime);
+        $runtime->stop();
+        $runtime->stop();
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
+    }
+
+    public function test_pre_bind_runtime_hides_prepared_bit_before_early_supervisor_stop_failure(): void
+    {
+        [$graph, $ingress] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $runtime = (new S3ServerRuntimeFactory())->prepareQualifiedEfsCandidate($graph, $ingress);
+        $runnerStopping = new \ReflectionProperty($graph->lifecycleRunner, 'stopping');
+        $runnerStopping->setValue($graph->lifecycleRunner, true);
+
+        try {
+            try {
+                $runtime->stop();
+                self::fail('An injected supervisor stop failure was swallowed.');
+            } catch (\RuntimeException $error) {
+                self::assertSame(
+                    'EFS candidate pre-bind shutdown incomplete; dependencies remain owned.',
+                    $error->getMessage(),
+                );
+            }
+
+            self::assertFalse($runtime->isPrepared());
+            self::assertFalse($runtime->isPreBindAdmissionPrepared());
+            self::assertSame(EfsCandidateServingAdmissionState::REVOKED, $runtime->servingAdmissionState());
+            self::assertSame(EfsCandidateBackgroundSupervisorState::STOPPED, $runtime->backgroundSupervisorState());
+            self::assertTrue($graph->readPool->isRunning());
+            self::assertTrue($ingress->workerPool->isRunning());
+        } finally {
+            $runnerStopping->setValue($graph->lifecycleRunner, false);
+        }
+
+        $runtime->stop();
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
+    }
+
+    public function test_pre_bind_runtime_ready_wait_failure_stops_partially_started_resources(): void
+    {
+        [$graph, $ingress] = $this->candidateIngressGraph(['notificationWorkerEnabled' => false]);
+        $enteredReadyWait = false;
+
+        try {
+            EfsCandidatePreBindRuntime::prepareForTests(
+                $graph,
+                $ingress,
+                static function () use (&$enteredReadyWait): void {
+                    $enteredReadyWait = true;
+                    throw new EfsCandidateBackgroundBarrierTimeoutException('Injected EFS background readiness timeout.');
+                },
+                backgroundReadyTimeoutSeconds: 0.01,
+            );
+            self::fail('A candidate survived a background readiness timeout.');
+        } catch (EfsCandidateBackgroundBarrierTimeoutException $error) {
+            self::assertSame('Injected EFS background readiness timeout.', $error->getMessage());
+        }
+
+        self::assertTrue($enteredReadyWait);
+        self::assertFalse($graph->lifecycleRunner->isRunning());
+        self::assertFalse($graph->readPool->isRunning());
+        self::assertFalse($ingress->workerPool->isRunning());
     }
 
     public function test_candidate_pre_bind_admission_rejects_foreign_probe_without_committing_state(): void

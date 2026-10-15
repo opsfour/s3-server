@@ -57,6 +57,24 @@ use Psr\Log\LoggerInterface;
 final readonly class S3ServerRuntimeFactory
 {
     /**
+     * Consume one qualified graph and ingress bundle into a fully prepared,
+     * listenerless owner. Production serving remains closed.
+     */
+    public function prepareQualifiedEfsCandidate(
+        EfsCandidateRuntimeResources $graph,
+        EfsCandidateIngressResources $ingress,
+        LoggerInterface $logger = new \Psr\Log\NullLogger(),
+        float $backgroundReadyTimeoutSeconds = 5.0,
+    ): EfsCandidatePreBindRuntime {
+        return EfsCandidatePreBindRuntime::prepare(
+            $graph,
+            $ingress,
+            $logger,
+            $backgroundReadyTimeoutSeconds,
+        );
+    }
+
+    /**
      * Construct qualified ingress spools without attaching a listener or
      * changing the EFS candidate's serving refusal. The returned bundle owns
      * its worker pool and must be shut down explicitly.

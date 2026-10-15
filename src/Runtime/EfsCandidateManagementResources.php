@@ -6,7 +6,6 @@ namespace OpsFour\S3Server\Runtime;
 
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
-use OpsFour\S3Server\Middleware\EfsApiAdmissionMiddleware;
 use OpsFour\S3Server\S3ServerConfig;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -23,9 +22,10 @@ final readonly class EfsCandidateManagementResources
         private EfsCandidateRuntimeResources $graph,
         private S3ServerConfig $config,
         private EfsHostEvidenceReader $reader,
+        private EfsCandidateGraphAdmissionEvidence $graphAdmissionEvidence,
         private ?CredentialHealthProbe $credentialHealthProbe,
-        public EfsApiAdmissionMiddleware $admission,
-        public HealthCheckHandler $readiness,
+        public EfsCandidateServingAdmission $admission,
+        public EfsCandidateReadinessHandler $readiness,
     ) {}
 
     public static function create(
@@ -50,8 +50,9 @@ final readonly class EfsCandidateManagementResources
             throw new \RuntimeException('EFS management candidate requires the graph backend reader.');
         }
 
-        $admission = new EfsApiAdmissionMiddleware(new EfsCandidateGraphAdmissionEvidence($graph, $reader));
-        $readiness = new HealthCheckHandler(
+        $graphAdmissionEvidence = new EfsCandidateGraphAdmissionEvidence($graph, $reader);
+        $admission = new EfsCandidateServingAdmission($graphAdmissionEvidence);
+        $health = new HealthCheckHandler(
             metadata: $graph->metadata,
             logger: $logger,
             storageTiers: $graph->tiers,
@@ -60,9 +61,19 @@ final readonly class EfsCandidateManagementResources
             admissionEvidence: $admission,
             credentialHealthProbe: $credentialHealthProbe,
         );
-        $admission->assertFresh();
+        $readiness = new EfsCandidateReadinessHandler($admission, $health);
+        $admission->assertBoundTo($graphAdmissionEvidence);
+        $readiness->assertBoundTo($admission);
 
-        return new self($graph, $config, $reader, $credentialHealthProbe, $admission, $readiness);
+        return new self(
+            $graph,
+            $config,
+            $reader,
+            $graphAdmissionEvidence,
+            $credentialHealthProbe,
+            $admission,
+            $readiness,
+        );
     }
 
     /** This proves identity only; production route attachment remains closed. */
@@ -83,7 +94,8 @@ final readonly class EfsCandidateManagementResources
             || $graph->backend->hostEvidenceReader() !== $this->reader) {
             throw new \RuntimeException('EFS management candidate reader differs from its graph.');
         }
-        $this->admission->assertFresh();
+        $this->admission->assertBoundTo($this->graphAdmissionEvidence);
+        $this->readiness->assertBoundTo($this->admission);
     }
 
     /** Bind readiness to the exact provider used by the candidate AuthMiddleware. */

@@ -16,6 +16,8 @@ use Amp\TimeoutCancellation;
 use League\Uri\Http;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Handler\HealthCheckHandler;
+use OpsFour\S3Server\Runtime\EfsCandidateReadinessHandler;
 use OpsFour\S3Server\Runtime\EfsCandidateServingAdmission;
 use OpsFour\S3Server\Runtime\EfsCandidateServingAdmissionState;
 use OpsFour\S3Server\Runtime\EfsHostEvidence;
@@ -25,6 +27,17 @@ use function Amp\async;
 
 final class EfsCandidateServingAdmissionTest extends TestCase
 {
+    public function test_prepared_readiness_probe_does_not_poison_health_after_activation(): void
+    {
+        $admission = new EfsCandidateServingAdmission(new CountingEfsHostEvidence());
+        $readiness = new EfsCandidateReadinessHandler($admission, new HealthCheckHandler());
+        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/.health'));
+
+        self::assertSame(503, $readiness->handleRequest($request)->getStatus());
+        $admission->activate();
+        self::assertSame(200, $readiness->handleRequest($request)->getStatus());
+    }
+
     public function test_gate_returns_slow_down_until_activated_and_then_dispatches(): void
     {
         $evidence = new CountingEfsHostEvidence();

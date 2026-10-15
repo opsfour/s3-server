@@ -37,6 +37,14 @@ final class EfsCandidateServingAdmission implements Middleware, EfsHostEvidence
         return $this->state;
     }
 
+    /** Prove graph identity without opening the terminal serving latch. */
+    public function assertBoundTo(EfsHostEvidence $evidence): void
+    {
+        if ($this->evidence !== $evidence) {
+            throw new \RuntimeException('EFS serving admission belongs to another candidate graph.');
+        }
+    }
+
     /** Activate exactly once after the caller has completed every startup gate. */
     public function activate(): void
     {
