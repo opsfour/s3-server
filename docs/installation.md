@@ -24,7 +24,9 @@ composer require opsfour/s3-server
 
 ## Standalone Usage
 
-The package includes a CLI binary at `vendor/bin/s3-server`. No framework required.
+Composer exports the package CLI as `vendor/bin/s3-server`. No framework is
+required. `php vendor/bin/s3-server --version` reports the installed package
+version.
 
 ```bash
 export S3_ACCESS_KEY=myAccessKey

@@ -31,6 +31,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Export `bin/s3-server` as the Composer package binary, report the installed
+  package version from `--version`, and declare the DOM, libxml, and SimpleXML
+  PHP extensions required by the public runtime.
 - Normalize the user-facing product name to the lowercase `opsfour` spelling.
 - Cross-account signed access now requires an explicit identity-policy Allow
   plus resource-side consent from a bucket policy or applicable ACL.
@@ -57,6 +60,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Return empty bodies for HEAD errors while retaining their status and response
+  headers. Method-not-allowed responses now include `Allow` when the valid
+  method set is known, and S3 `SlowDown` responses include `Retry-After: 1`.
 - Accept S3 Tagging XML in the browser POST `tagging` form field, preserve its
   original value for signed policy conditions, and reject malformed XML or tag
   characters before the uploaded file is spooled or published.

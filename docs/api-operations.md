@@ -433,7 +433,7 @@ configuration, request-payer configuration, and Torrent.
 
 ## Error Responses
 
-All errors follow the standard S3 XML error format:
+Errors other than HEAD responses follow the standard S3 XML error format:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -444,5 +444,9 @@ All errors follow the standard S3 XML error format:
   <RequestId>abc123</RequestId>
 </Error>
 ```
+
+HEAD errors have an empty response body while retaining their status and
+protocol headers. A 405 response includes `Allow` when the valid method set is
+known. S3 `SlowDown` responses include `Retry-After: 1`.
 
 Common error codes: `AccessDenied`, `NoSuchBucket`, `NoSuchKey`, `BucketAlreadyExists`, `BucketNotEmpty`, `InvalidArgument`, `EntityTooLarge`, `SlowDown`, `InternalError`.
