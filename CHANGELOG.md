@@ -33,6 +33,11 @@ The project follows [Semantic Versioning](https://semver.org/).
   boundary. Failed assembly retains a retryable cleanup owner; successful
   preparation keeps serving admission closed and background work parked. This
   does not qualify or enable production EFS serving.
+- Add an inert schema-v2 production EFS host-pin contract and a bounded local
+  reader for an exact root-owned, read-only file bind. The pin binds one
+  deployment, instance, full container ID, boot, mount, storage inode, and
+  watcher epoch without accessing EFS, SQL, Docker, or a listener. Production
+  EFS serving remains closed.
 
 ### Changed
 
@@ -69,8 +74,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Preserve an object's S3 `Last-Modified` timestamp when restore state or
-  physical placement and transition metadata changes across SQLite,
-  PostgreSQL, and MySQL.
+  physical placement, transition metadata, or current-version bookkeeping
+  changes across SQLite, PostgreSQL, and MySQL. PostgreSQL and MySQL version
+  listings now also expose the noncurrent timestamp used by lifecycle rules.
 - Retry a failed graceful worker-pool shutdown with forced termination on the
   next server stop attempt. EFS ingress and Select pools remain ahead of graph
   cleanup, completed pools are not closed twice, and each failed close attempt

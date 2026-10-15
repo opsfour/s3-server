@@ -134,7 +134,9 @@ Status: **Complete**
 - [x] Transition, restore, and restore-garbage workers revalidate exact object
   identity and placement under stable owner locks after physical transfers.
 - [x] Physical placement, transition state, and restore state updates preserve
-  the object's S3 `Last-Modified` timestamp across all metadata backends.
+  the object's S3 `Last-Modified` timestamp across all metadata backends;
+  version demotion and promotion do the same, and every backend projects the
+  lifecycle `noncurrentAt` timestamp in version listings.
 - [x] Restore completion emits `s3:ObjectRestore:Completed` after commit.
 
 ## 6. Streaming Storage and Integrity
