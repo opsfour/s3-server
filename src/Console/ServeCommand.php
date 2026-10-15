@@ -26,6 +26,7 @@ use OpsFour\S3Server\Runtime\ProductionEfsIdentityFileReader;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\ServeFailureMessage;
 use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
+use OpsFour\S3Server\Runtime\TerminationSignalTrap;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -320,10 +321,9 @@ final class ServeCommand extends Command
                 'region' => $region,
                 'metadata' => $metadataDriver,
             ]);
-            $runtime->server->start();
-
-            // Wait for termination signal.
-            $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            $signal = (new TerminationSignalTrap())->startAndWait(
+                static fn() => $runtime->server->start(),
+            );
             $logger->info('Received signal {signal}, shutting down...', [
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);

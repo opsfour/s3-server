@@ -95,6 +95,10 @@ final class SymfonyServeCommandTest extends TestCase
         }
 
         self::assertTrue($stopped, $this->logs());
+        self::assertFalse(
+            @fsockopen('127.0.0.1', $this->port, $errno, $errstr, 0.1),
+            'Symfony listener remained reachable after SIGTERM. ' . $this->logs(),
+        );
     }
 
     private function findFreePort(): int

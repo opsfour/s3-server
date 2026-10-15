@@ -17,6 +17,7 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\ServeFailureMessage;
 use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
+use OpsFour\S3Server\Runtime\TerminationSignalTrap;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -120,9 +121,9 @@ final class S3ServerServeCommand extends Command
                 $output->writeln("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
             }
             $output->writeln('Press Ctrl+C to stop.');
-            $runtime->server->start();
-
-            $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            $signal = (new TerminationSignalTrap())->startAndWait(
+                static fn() => $runtime->server->start(),
+            );
             $logger->info('Received signal {signal}, shutting down...', [
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);

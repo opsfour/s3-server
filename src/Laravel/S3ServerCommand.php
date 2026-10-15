@@ -22,6 +22,7 @@ use OpsFour\S3Server\Runtime\BootstrapResourceCleanup;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\ServeFailureMessage;
 use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
+use OpsFour\S3Server\Runtime\TerminationSignalTrap;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -154,10 +155,9 @@ class S3ServerCommand extends Command
                 $this->info("S3 Select worker pool: {$config->selectWorkerPoolSize} workers");
             }
             $this->info('Press Ctrl+C to stop.');
-            $runtime->server->start();
-
-            // Wait for termination signal.
-            $signal = \Amp\trapSignal([\SIGINT, \SIGTERM]);
+            $signal = (new TerminationSignalTrap())->startAndWait(
+                static fn() => $runtime->server->start(),
+            );
             $logger->info('Received signal {signal}, shutting down...', [
                 'signal' => $signal === \SIGINT ? 'SIGINT' : 'SIGTERM',
             ]);
