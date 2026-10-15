@@ -36,6 +36,7 @@ see [Policy Compatibility](docs/policy-compatibility.md).
 
 - PHP 8.4+
 - Composer 2.x
+- ext-dom, ext-libxml, and ext-simplexml for S3 XML requests and responses
 - ext-openssl (required for all request-body temporary spools)
 - ext-pdo_sqlite for the default SQLite metadata backend
 - pecl-pq and its pecl-raphf dependency for PostgreSQL API nodes; the server

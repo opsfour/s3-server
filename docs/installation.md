@@ -3,6 +3,7 @@
 ## Requirements
 
 - **PHP 8.4+** with the following extensions:
+  - `ext-dom`, `ext-libxml`, and `ext-simplexml` (required for S3 XML requests and responses)
   - `ext-openssl` (always required for encrypted request-body temporary spools)
   - `ext-pdo_sqlite` (default metadata backend)
   - `ext-pdo_pgsql` (optional, for PostgreSQL metadata)

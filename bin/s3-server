@@ -3,15 +3,18 @@
 
 declare(strict_types=1);
 
-// Locate the autoloader: support both standalone and monorepo installs.
+// Composer binary proxies expose the consuming project's autoloader here.
+$proxyAutoloadPath = $GLOBALS['_composer_autoload_path'] ?? null;
 $autoloadPaths = [
+    is_string($proxyAutoloadPath) ? $proxyAutoloadPath : null,
     __DIR__ . '/../vendor/autoload.php',           // Standalone package install.
+    __DIR__ . '/../../../autoload.php',             // Installed Composer dependency.
     __DIR__ . '/../../../vendor/autoload.php',      // Monorepo (packages/s3-server/bin/).
 ];
 
 $autoloaderFound = false;
 foreach ($autoloadPaths as $autoloadPath) {
-    if (file_exists($autoloadPath)) {
+    if ($autoloadPath !== null && is_file($autoloadPath)) {
         require $autoloadPath;
         $autoloaderFound = true;
         break;
@@ -30,9 +33,13 @@ use OpsFour\S3Server\Console\MetadataMigrateCommand;
 use OpsFour\S3Server\Console\MultipartPartIntentCommand;
 use OpsFour\S3Server\Console\QuotaCommand;
 use OpsFour\S3Server\Console\ServeCommand;
+use Composer\InstalledVersions;
 use Symfony\Component\Console\Application;
 
-$app = new Application('opsfour S3 Server', '1.0.0');
+$version = InstalledVersions::isInstalled('opsfour/s3-server')
+    ? (InstalledVersions::getPrettyVersion('opsfour/s3-server') ?? 'unknown')
+    : 'unknown';
+$app = new Application('opsfour S3 Server', $version);
 $app->addCommand(new ServeCommand());
 $app->addCommand(new MetadataMigrateCommand());
 $app->addCommand(new CredentialsCommand());

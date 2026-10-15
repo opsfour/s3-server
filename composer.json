@@ -2,6 +2,9 @@
     "name": "opsfour/s3-server",
     "description": "S3-compatible object storage server as a PHP 8.4+ Composer package",
     "type": "library",
+    "bin": [
+        "bin/s3-server"
+    ],
     "license": "MIT",
     "homepage": "https://twopeaks.digital",
     "support": {
@@ -10,7 +13,10 @@
     },
     "require": {
         "php": "^8.4",
+        "ext-dom": "*",
+        "ext-libxml": "*",
         "ext-openssl": "*",
+        "ext-simplexml": "*",
         "amphp/amp": "^3.1.2",
         "amphp/http-client": "^5.3",
         "amphp/http-server": "^3.4",
