@@ -110,10 +110,22 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   directory bind. It permanently latches failed reads, pins the evidence mount
   and directory device/inode identity across successful reads, and rejects
   stale replay after monotonic validity-window progression.
+- [x] The current unreleased immutable schema-v2 worker scope transports the
+  validated production identity, host pin, local evidence mount and directory
+  identity, watcher epoch, sampled monotonic time, and frozen heartbeat
+  baseline as scalars. A worker can reconstruct a listenerless production
+  reader without touching EFS or SQL; its first guarded operation must
+  revalidate the same local heartbeat. Repeated scope reads return the original
+  snapshot, and the v2 factory cannot accept the legacy v1 qualification scope.
 - [ ] The production watcher still needs to publish those heartbeat records,
   the reader still needs runtime wiring before listener admission, and the
   complete mount, replacement, and replay contract still needs qualification
   on the intended Linux hosts. Production EFS serving remains closed.
+- [ ] Production worker integration must preserve one reader instance for each
+  worker lifetime or provide an equivalent worker-wide progression latch.
+  Separately reconstructed readers share the frozen startup baseline but do
+  not share later heartbeat observations, so worker replacement and retry
+  policy must not silently reset that later progression state.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.

@@ -62,23 +62,23 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,303
-PHPUnit tests with 32,963 assertions and 232 expected opt-in or environment
-skips. PHPStan passed, and PHP CS Fixer reported zero fixes across 962 files.
+The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,309
+PHPUnit tests with 33,028 assertions and 232 expected opt-in or environment
+skips. PHPStan passed, and PHP CS Fixer reported zero fixes across 964 files.
 Strict Composer validation, the locked dependency audit, and `git diff --check`
-also passed on the same current candidate. The earlier CI baseline at `54c6542`
+also passed on the same current candidate. The earlier CI baseline at `d9b8426`
 passed all four jobs in GitHub Actions run
-[38814433357](https://github.com/opsfour/s3-server/actions/runs/38814433357),
+[38816792329](https://github.com/opsfour/s3-server/actions/runs/38816792329),
 including quality, metadata backends, and the lowest and highest dependency
-matrices. That run covers the host-pin and version-timestamp batch but predates
-the listenerless heartbeat reader and delegated multipart-abort commit
-reauthorization. Both later changes are covered by the current local quality
-run, but no newer GitHub Actions result is recorded yet. The production watcher,
-runtime wiring before listener admission, and qualification of the exact
-read-only bind and stale replay contract on the intended Linux hosts remain
-open. External PostgreSQL/MySQL execution without skips, the exact PHP 8.4
-deployment profile, multi-host storage qualification, and the current-source
-long soak remain separate gates.
+matrices. That run covers the host-pin and version-timestamp batch, listenerless
+heartbeat reader, and delegated multipart-abort commit reauthorization. It
+predates the immutable schema-v2 worker scope at `72e1625`, which is covered by
+the current local quality run but has no recorded GitHub Actions result yet. The
+production watcher, runtime wiring before listener admission, and qualification
+of the exact read-only bind and stale replay contract on the intended Linux
+hosts remain open. External PostgreSQL/MySQL execution without skips, the exact
+PHP 8.4 deployment profile, multi-host storage qualification, and the
+current-source long soak remain separate gates.
 
 ## Released Version
 

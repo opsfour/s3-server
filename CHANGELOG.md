@@ -42,7 +42,11 @@ The project follows [Semantic Versioning](https://semver.org/).
   identity-derived file on an exact root-owned, read-only local directory
   bind. It permanently latches failed reads, pins the evidence mount and
   directory identity across successful reads, and rejects stale replay after
-  heartbeat time progression. The production watcher and runtime wiring remain
+  heartbeat time progression. A distinct immutable schema-v2 worker scope now
+  carries that exact identity, host pin, local bind identity, watcher epoch,
+  sampled monotonic time, and frozen heartbeat baseline through the process
+  channel; worker readers reject v1 scopes, replaced binds, clock rollback, and
+  heartbeat rollback. The production watcher and runtime wiring remain
   unimplemented, real Linux qualification is pending, and serving remains
   closed.
 
