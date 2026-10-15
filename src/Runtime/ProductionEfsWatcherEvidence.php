@@ -54,6 +54,8 @@ final readonly class ProductionEfsWatcherEvidence
         sort($rawKeys);
         if ($keys !== $fields || $rawKeys !== $fields
             || $record['schemaVersion'] !== 2 || $record['profile'] !== 'production'
+            || $hostPin->deploymentId !== $identity->deploymentId
+            || $hostPin->instanceId !== $identity->instanceId
             || $record['deploymentId'] !== $identity->deploymentId
             || $record['instanceId'] !== $identity->instanceId
             || $record['efsId'] !== $identity->efsId
