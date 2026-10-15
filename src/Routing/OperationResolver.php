@@ -186,7 +186,9 @@ final class OperationResolver
      * @param  array<string, string>  $headers  Lowercase header names to values.
      * @return S3Operation The resolved operation.
      *
-     * @throws \InvalidArgumentException If the method/scope combination cannot be resolved.
+     * @throws InvalidArgumentException If query selectors conflict or have invalid values.
+     * @throws MethodNotAllowedException If the method is unsupported for the resolved target.
+     * @throws NotImplementedException If a recognized S3 subresource is not implemented.
      */
     public static function resolve(string $method, string $scope, array $queryParams, array $headers): S3Operation
     {
@@ -207,6 +209,7 @@ final class OperationResolver
             'GET' => S3Operation::ListBuckets,
             default => throw new MethodNotAllowedException(
                 "Unsupported method '{$method}' for service scope.",
+                ['GET'],
             ),
         };
     }
@@ -243,6 +246,7 @@ final class OperationResolver
             'POST' => self::resolveBucketPost($queryParams),
             default => throw new MethodNotAllowedException(
                 "Unsupported method '{$method}' for bucket scope.",
+                ['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS'],
             ),
         };
         self::assertQueryModifiersForOperation($queryParams, $operation, self::BUCKET_LISTING_MODIFIER_OPERATIONS);
@@ -444,6 +448,7 @@ final class OperationResolver
             'POST' => self::resolveObjectPost($queryParams),
             default => throw new MethodNotAllowedException(
                 "Unsupported method '{$method}' for object scope.",
+                ['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS'],
             ),
         };
         if (\array_key_exists('versionId', $queryParams) && ! $operation->selectsObjectVersion()) {
@@ -602,6 +607,7 @@ final class OperationResolver
             if (! \in_array($method, $methods, true)) {
                 throw new MethodNotAllowedException(
                     "Unsupported method '{$method}' for the '{$subresource}' subresource.",
+                    $methods,
                 );
             }
         }
@@ -623,6 +629,7 @@ final class OperationResolver
             if (\array_key_exists($modifier, $queryParams) && ! \in_array($method, $methods, true)) {
                 throw new MethodNotAllowedException(
                     "Unsupported method '{$method}' for the '{$modifier}' query modifier.",
+                    $methods,
                 );
             }
         }

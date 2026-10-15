@@ -75,7 +75,8 @@ final class GetObjectAttributesHandler implements RequestHandler
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         if ($objectInfo->isDeleteMarker) {
-            throw (new MethodNotAllowedException())->withExtraHeaders([
+            throw (new MethodNotAllowedException(allowedMethods: ['DELETE']))->withExtraHeaders([
+                'Allow' => 'DELETE',
                 'x-amz-delete-marker' => 'true',
                 'x-amz-version-id' => $objectInfo->versionId ?? 'null',
                 'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),

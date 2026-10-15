@@ -80,7 +80,7 @@ final class ManagementRoutingHttpTest extends TestCase
             $response = $client->request(new ClientRequest($endpoint . '/bucket/object', 'PATCH'));
             self::assertSame(405, $response->getStatus());
             self::assertSame('application/xml', $response->getHeader('content-type'));
-            self::assertNull($response->getHeader('allow'));
+            self::assertSame('GET, PUT, POST, DELETE, HEAD, OPTIONS', $response->getHeader('allow'));
             self::assertStringContainsString(
                 '<Code>MethodNotAllowed</Code>',
                 ByteStream\buffer($response->getBody()),

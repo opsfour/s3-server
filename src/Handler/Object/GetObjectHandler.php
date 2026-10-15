@@ -105,7 +105,9 @@ final class GetObjectHandler implements RequestHandler
 
             if ($versionId !== null) {
                 $dmHeaders['Last-Modified'] = $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T');
-                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException())->withExtraHeaders($dmHeaders);
+                throw (new \OpsFour\S3Server\Exception\MethodNotAllowedException(
+                    allowedMethods: ['DELETE'],
+                ))->withExtraHeaders(['Allow' => 'DELETE', ...$dmHeaders]);
             }
 
             throw (new NoSuchKeyException())->withExtraHeaders($dmHeaders);

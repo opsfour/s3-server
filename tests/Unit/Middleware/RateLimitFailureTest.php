@@ -57,6 +57,21 @@ final class RateLimitFailureTest extends TestCase
         self::assertFalse($terminal->handled);
     }
 
+    public function test_head_slow_down_response_has_no_body(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('rateLimitCheck')->willReturn(false);
+
+        $response = (new RateLimitMiddleware($metadata, 2.0))->handleRequest(
+            $this->request('HEAD'),
+            new RateLimitTerminalHandler(),
+        );
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('1', $response->getHeader('Retry-After'));
+        self::assertSame('', \Amp\ByteStream\buffer($response->getBody()));
+    }
+
     public function test_disabled_limit_bypasses_metadata_failure(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
@@ -79,11 +94,12 @@ final class RateLimitFailureTest extends TestCase
         self::assertTrue($terminal->handled);
     }
 
-    private function request(): Request
+    /** @param non-empty-string $method */
+    private function request(string $method = 'GET'): Request
     {
         $client = $this->createMock(Client::class);
         $client->method('getRemoteAddress')->willReturn(new InternetAddress('192.0.2.55', 12345));
-        $request = new Request($client, 'GET', Http::new('http://localhost/bucket/key'));
+        $request = new Request($client, $method, Http::new('http://localhost/bucket/key'));
         $request->setAttribute('requestId', 'rate-failure-test');
         $request->setAttribute('amzId2', 'rate-failure-host-id');
 

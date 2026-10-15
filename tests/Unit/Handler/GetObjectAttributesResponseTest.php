@@ -101,6 +101,7 @@ final class GetObjectAttributesResponseTest extends TestCase
             (new GetObjectAttributesHandler($metadata))->handleRequest($request);
             self::fail('An explicit delete marker must not return object attributes.');
         } catch (MethodNotAllowedException $error) {
+            self::assertSame('DELETE', $error->getExtraHeaders()['Allow']);
             self::assertSame('true', $error->getExtraHeaders()['x-amz-delete-marker']);
             self::assertSame('marker-version', $error->getExtraHeaders()['x-amz-version-id']);
             self::assertSame('Tue, 03 Feb 2026 04:05:06 GMT', $error->getExtraHeaders()['Last-Modified']);

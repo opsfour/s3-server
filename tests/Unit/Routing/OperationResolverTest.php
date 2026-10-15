@@ -13,6 +13,24 @@ use PHPUnit\Framework\TestCase;
 
 final class OperationResolverTest extends TestCase
 {
+    #[\PHPUnit\Framework\Attributes\DataProvider('methodRejectionCases')]
+    /** @param non-empty-string $method */
+    public function test_method_rejection_exposes_the_subresource_allow_list(string $method): void
+    {
+        try {
+            OperationResolver::resolve($method, 'bucket', ['acl' => ''], []);
+            self::fail('DELETE bucket ACL must be rejected.');
+        } catch (MethodNotAllowedException $error) {
+            self::assertSame('GET, PUT', $error->getExtraHeaders()['Allow'] ?? null);
+        }
+    }
+
+    /** @return iterable<string, array{non-empty-string}> */
+    public static function methodRejectionCases(): iterable
+    {
+        yield 'delete ACL' => ['DELETE'];
+    }
+
     public function test_service_scope(): void
     {
         $op = OperationResolver::resolve('GET', 'service', [], []);

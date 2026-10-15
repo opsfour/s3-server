@@ -84,7 +84,7 @@ final class ErrorHandlingMiddleware implements Middleware
             return new Response(
                 status: $status,
                 headers: $headers,
-                body: $xml,
+                body: $request->getMethod() === 'HEAD' ? '' : $xml,
             );
         } catch (\Amp\CancelledException $e) {
             throw $e;
@@ -111,7 +111,7 @@ final class ErrorHandlingMiddleware implements Middleware
                     'content-type' => 'application/xml',
                     'x-amz-request-id' => (string) $requestId,
                 ],
-                body: $xml,
+                body: $request->getMethod() === 'HEAD' ? '' : $xml,
             );
         }
     }
@@ -124,7 +124,7 @@ final class ErrorHandlingMiddleware implements Middleware
      */
     public static function buildS3ErrorBody(Request $request, S3Exception $exception): string
     {
-        if ($exception->getHttpStatus() === 304) {
+        if ($request->getMethod() === 'HEAD' || $exception->getHttpStatus() === 304) {
             return '';
         }
 

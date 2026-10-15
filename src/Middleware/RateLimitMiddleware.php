@@ -80,7 +80,7 @@ final class RateLimitMiddleware implements Middleware
                 'Retry-After' => '1',
                 'x-amz-request-id' => $requestId,
             ],
-            body: $xml,
+            body: $request->getMethod() === 'HEAD' ? '' : $xml,
         );
     }
 }

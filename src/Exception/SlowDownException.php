@@ -10,6 +10,7 @@ final class SlowDownException extends S3Exception
     public function __construct(string $message = 'Please reduce your request rate.')
     {
         parent::__construct($message);
+        $this->setExtraHeaders(['Retry-After' => '1']);
     }
 
     public function getErrorCode(): string

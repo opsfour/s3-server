@@ -12,6 +12,8 @@ use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -62,6 +64,43 @@ final class ErrorHandlingDisclosureTest extends TestCase
 
         self::assertStringContainsString('<RequestId>disclosure-test</RequestId>', $body);
         self::assertStringContainsString('<HostId>extended-disclosure-test</HostId>', $body);
+    }
+
+    public function test_head_errors_have_no_body_and_keep_protocol_headers(): void
+    {
+        $exception = new MethodNotAllowedException(allowedMethods: ['DELETE']);
+        $exception->setExtraHeaders([
+            'Allow' => 'DELETE',
+            'x-amz-delete-marker' => 'true',
+            'x-amz-version-id' => 'marker-version',
+        ]);
+
+        $response = $this->dispatch($exception, method: 'HEAD');
+
+        self::assertSame(405, $response->getStatus());
+        self::assertSame('', ByteStream\buffer($response->getBody()));
+        self::assertSame('DELETE', $response->getHeader('Allow'));
+        self::assertSame('true', $response->getHeader('x-amz-delete-marker'));
+        self::assertSame('marker-version', $response->getHeader('x-amz-version-id'));
+    }
+
+    public function test_unexpected_head_failure_has_no_body_or_private_details(): void
+    {
+        $response = $this->dispatch(
+            new \RuntimeException('postgres://private:secret@database/internal'),
+            method: 'HEAD',
+        );
+
+        self::assertSame(500, $response->getStatus());
+        self::assertSame('', ByteStream\buffer($response->getBody()));
+    }
+
+    public function test_slow_down_exception_supplies_retry_after(): void
+    {
+        $response = $this->dispatch(new SlowDownException());
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('1', $response->getHeader('Retry-After'));
     }
 
     public function test_error_handling_remains_available_without_request_id_middleware(): void
@@ -125,9 +164,14 @@ final class ErrorHandlingDisclosureTest extends TestCase
         );
     }
 
-    private function dispatch(\Throwable $exception, ?LoggerInterface $logger = null, bool $includeRequestIds = true): Response
-    {
-        $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://localhost/bucket/key'));
+    /** @param non-empty-string $method */
+    private function dispatch(
+        \Throwable $exception,
+        ?LoggerInterface $logger = null,
+        bool $includeRequestIds = true,
+        string $method = 'GET',
+    ): Response {
+        $request = new Request($this->createMock(Client::class), $method, Http::new('http://localhost/bucket/key'));
         if ($includeRequestIds) {
             $request->setAttribute('requestId', 'disclosure-test');
             $request->setAttribute('amzId2', 'extended-disclosure-test');
