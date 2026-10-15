@@ -31,6 +31,30 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  */
 final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
+    /** Explicit self-assignment suppresses MySQL's ON UPDATE timestamp for placement-only metadata. */
+    private const string OBJECT_PLACEMENT_UPDATE_SQL = <<<'SQL'
+        UPDATE s3_objects
+        SET storage_class = ?,
+            storage_tier = ?,
+            storage_path = ?,
+            transition_status = ?,
+            transition_target_tier = ?,
+            transition_error = ?,
+            updated_at = updated_at
+        WHERE %s
+        SQL;
+
+    /** Explicit self-assignment suppresses MySQL's ON UPDATE timestamp for restore-only metadata. */
+    private const string RESTORE_STATE_UPDATE_SQL = <<<'SQL'
+        UPDATE s3_objects
+        SET restore_status = ?,
+            restored_storage_path = ?,
+            restored_storage_tier = ?,
+            restore_expires_at = ?,
+            updated_at = updated_at
+        WHERE %s
+        SQL;
+
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, MysqlTransaction> */
     private \WeakMap $fiberTxMap;
 
@@ -556,7 +580,6 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
             $transitionStatus,
             $transitionTargetTier,
             $transitionError,
-            gmdate('Y-m-d H:i:s'),
             $bucket,
             $key,
         ];
@@ -564,17 +587,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
             $params[] = $versionId;
         }
 
-        $this->conn()->execute(<<<SQL
-            UPDATE s3_objects
-            SET storage_class = ?,
-                storage_tier = ?,
-                storage_path = ?,
-                transition_status = ?,
-                transition_target_tier = ?,
-                transition_error = ?,
-                updated_at = ?
-            WHERE {$where}
-            SQL, $params);
+        $this->conn()->execute(sprintf(self::OBJECT_PLACEMENT_UPDATE_SQL, $where), $params);
     }
 
     public function updateObjectRestoreState(
@@ -611,7 +624,6 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
             $restoredStoragePath,
             $restoredStorageTier,
             $restoreExpiresAt?->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s'),
-            gmdate('Y-m-d H:i:s'),
             $bucket,
             $key,
         ];
@@ -619,15 +631,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
             $params[] = $versionId;
         }
 
-        $this->conn()->execute(<<<SQL
-            UPDATE s3_objects
-            SET restore_status = ?,
-                restored_storage_path = ?,
-                restored_storage_tier = ?,
-                restore_expires_at = ?,
-                updated_at = ?
-            WHERE {$where}
-        SQL, $params);
+        $this->conn()->execute(sprintf(self::RESTORE_STATE_UPDATE_SQL, $where), $params);
     }
 
     private static function validateRestoredCopyTier(?string $path, ?\DateTimeImmutable $expiresAt, ?string $tier): void

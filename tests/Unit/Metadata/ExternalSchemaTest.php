@@ -4,12 +4,31 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
+use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\Schema\MysqlSchema;
 use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use PHPUnit\Framework\TestCase;
 
 final class ExternalSchemaTest extends TestCase
 {
+    public function test_mysql_operational_metadata_updates_suppress_automatic_object_timestamp_change(): void
+    {
+        $reflection = new \ReflectionClass(MysqlMetadataStore::class);
+        $placementSql = $reflection->getConstant('OBJECT_PLACEMENT_UPDATE_SQL');
+        $sql = $reflection->getConstant('RESTORE_STATE_UPDATE_SQL');
+
+        self::assertIsString($placementSql);
+        self::assertStringContainsString('updated_at = updated_at', $placementSql);
+        self::assertStringNotContainsString('updated_at = ?', $placementSql);
+        self::assertIsString($sql);
+        self::assertStringContainsString('updated_at = updated_at', $sql);
+        self::assertStringNotContainsString('updated_at = ?', $sql);
+        self::assertStringContainsString(
+            'updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
+            implode("\n", MysqlSchema::getCreateStatements()),
+        );
+    }
+
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
         self::assertSame(45, MysqlSchema::VERSION);

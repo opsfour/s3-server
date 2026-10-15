@@ -541,8 +541,8 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
         $this->assertObjectTargetExists($bucket, $key, $versionId);
 
         $where = $versionId === null
-            ? 'bucket = $8 AND key_name = $9 AND is_latest = TRUE AND is_delete_marker = FALSE'
-            : 'bucket = $8 AND key_name = $9 AND version_id = $10';
+            ? 'bucket = $7 AND key_name = $8 AND is_latest = TRUE AND is_delete_marker = FALSE'
+            : 'bucket = $7 AND key_name = $8 AND version_id = $9';
         $params = [
             $storageClass,
             $storageTier,
@@ -550,7 +550,6 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
             $transitionStatus,
             $transitionTargetTier,
             $transitionError,
-            gmdate('Y-m-d\TH:i:s\Z'),
             $bucket,
             $key,
         ];
@@ -565,8 +564,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
                 storage_path = $3,
                 transition_status = $4,
                 transition_target_tier = $5,
-                transition_error = $6,
-                updated_at = $7::timestamptz
+                transition_error = $6
             WHERE {$where}
             SQL, $params);
     }
@@ -598,14 +596,13 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
         $this->assertObjectTargetExists($bucket, $key, $versionId);
 
         $where = $versionId === null
-            ? 'bucket = $6 AND key_name = $7 AND is_latest = TRUE AND is_delete_marker = FALSE'
-            : 'bucket = $6 AND key_name = $7 AND version_id = $8';
+            ? 'bucket = $5 AND key_name = $6 AND is_latest = TRUE AND is_delete_marker = FALSE'
+            : 'bucket = $5 AND key_name = $6 AND version_id = $7';
         $params = [
             $restoreStatus,
             $restoredStoragePath,
             $restoredStorageTier,
             $restoreExpiresAt?->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z'),
-            gmdate('Y-m-d\TH:i:s\Z'),
             $bucket,
             $key,
         ];
@@ -618,8 +615,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
             SET restore_status = $1,
                 restored_storage_path = $2,
                 restored_storage_tier = $3,
-                restore_expires_at = $4::timestamptz,
-                updated_at = $5::timestamptz
+                restore_expires_at = $4::timestamptz
             WHERE {$where}
         SQL, $params);
     }

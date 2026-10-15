@@ -2019,10 +2019,23 @@ final class MetadataBackendIntegrationTest extends TestCase
         $bucket = 'restore-tier-' . bin2hex(random_bytes(8));
         $metadata->createBucket('owner', $bucket, 'us-east-1');
         $versionId = $metadata->putObjectVersioned($bucket, 'key', 'owner', 1, 'etag', 'text/plain', 'cold/key');
+        $pool = $driver === 'mysql'
+            ? new MysqlConnectionPool(MysqlConfig::fromString($dsn))
+            : new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+        $fixedLastModified = new \DateTimeImmutable('2000-01-02T03:04:05Z');
+        $pool->execute(
+            $driver === 'mysql'
+                ? 'UPDATE s3_objects SET updated_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                : 'UPDATE s3_objects SET updated_at = $1::timestamptz WHERE bucket = $2 AND key_name = $3 AND version_id = $4',
+            [$driver === 'mysql' ? $fixedLastModified->format('Y-m-d H:i:s') : $fixedLastModified->format(\DateTimeInterface::ATOM), $bucket, 'key', $versionId],
+        );
+        $metadata->updateObjectRestoreState($bucket, 'key', $versionId, 'pending');
+        self::assertSame($fixedLastModified->getTimestamp(), $metadata->getObjectMetadataByVersion($bucket, 'key', $versionId)?->lastModified->getTimestamp());
         $metadata->updateObjectRestoreStateWithTier($bucket, 'key', $versionId, 'restored', 'hot/key', new \DateTimeImmutable('+1 day'), 'HOT');
         $version = $metadata->getObjectMetadataByVersion($bucket, 'key', $versionId);
         self::assertNotNull($version);
         self::assertSame(['hot/key', 'HOT'], [$version->restoredStoragePath, $version->restoredStorageTier]);
+        self::assertSame($fixedLastModified->getTimestamp(), $version->lastModified->getTimestamp());
         self::assertContains('HOT', $metadata->listReferencedStorageTiers());
 
         try {
@@ -2032,12 +2045,9 @@ final class MetadataBackendIntegrationTest extends TestCase
             self::assertSame('HOT', $metadata->getObjectMetadataByVersion($bucket, 'key', $versionId)?->restoredStorageTier);
         }
 
-        $pool = $driver === 'mysql'
-            ? new MysqlConnectionPool(MysqlConfig::fromString($dsn))
-            : new PostgresConnectionPool(PostgresConfig::fromString($dsn));
         $pool->execute(
             $driver === 'mysql'
-                ? 'UPDATE s3_objects SET restored_storage_tier = NULL WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                ? 'UPDATE s3_objects SET restored_storage_tier = NULL, updated_at = updated_at WHERE bucket = ? AND key_name = ? AND version_id = ?'
                 : 'UPDATE s3_objects SET restored_storage_tier = NULL WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
             [$bucket, 'key', $versionId],
         );
@@ -2048,11 +2058,12 @@ final class MetadataBackendIntegrationTest extends TestCase
             $legacy = $metadata->getObjectMetadataByVersion($bucket, 'key', $versionId);
             self::assertNull($legacy->restoredStorageTier);
         }
-        $metadata->updateObjectRestoreStateWithTier($bucket, 'key', $versionId, null);
+        $metadata->updateObjectRestoreState($bucket, 'key', $versionId, null);
         $cleared = $metadata->getObjectMetadataByVersion($bucket, 'key', $versionId);
         self::assertNotNull($cleared);
         self::assertNull($cleared->restoredStoragePath);
         self::assertNull($cleared->restoredStorageTier);
+        self::assertSame($fixedLastModified->getTimestamp(), $cleared->lastModified->getTimestamp());
         $metadata->deleteObjectVersion($bucket, 'key', $versionId);
         $metadata->deleteBucket('owner', $bucket);
         $pool->close();
@@ -2118,10 +2129,24 @@ final class MetadataBackendIntegrationTest extends TestCase
         $bucket = 'tier-list-' . bin2hex(random_bytes(8));
         $metadata->createBucket('owner', $bucket, 'us-east-1');
         $versionId = $metadata->putObjectVersioned($bucket, 'dir/item', 'owner', 4, 'etag', 'text/plain', 'path/original');
+        $pool = $driver === 'mysql'
+            ? new MysqlConnectionPool(MysqlConfig::fromString($dsn))
+            : new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+        $fixedLastModified = new \DateTimeImmutable('2000-01-02T03:04:05Z');
+        $pool->execute(
+            $driver === 'mysql'
+                ? 'UPDATE s3_objects SET updated_at = ? WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                : 'UPDATE s3_objects SET updated_at = $1::timestamptz WHERE bucket = $2 AND key_name = $3 AND version_id = $4',
+            [$driver === 'mysql' ? $fixedLastModified->format('Y-m-d H:i:s') : $fixedLastModified->format(\DateTimeInterface::ATOM), $bucket, 'dir/item', $versionId],
+        );
+        $pool->close();
         $metadata->updateObjectPlacement($bucket, 'dir/item', $versionId, 'STANDARD', 'COLD', 'path/cold', 'failed', 'WARM', 'transition unavailable');
         $metadata->updateObjectRestoreStateWithTier($bucket, 'dir/item', $versionId, 'restored', 'path/restore', new \DateTimeImmutable('+1 day'), 'WARM');
 
-        self::assertSame('COLD', $metadata->getObjectMetadataByVersion($bucket, 'dir/item', $versionId)?->storageTier);
+        $version = $metadata->getObjectMetadataByVersion($bucket, 'dir/item', $versionId);
+        self::assertNotNull($version);
+        self::assertSame('COLD', $version->storageTier);
+        self::assertSame($fixedLastModified->getTimestamp(), $version->lastModified->getTimestamp());
         foreach ([null, '/'] as $delimiter) {
             $objects = $metadata->listObjects($bucket, prefix: 'dir/', delimiter: $delimiter)->objects;
             self::assertCount(1, $objects);

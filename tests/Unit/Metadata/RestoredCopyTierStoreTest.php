@@ -47,6 +47,11 @@ final class RestoredCopyTierStoreTest extends TestCase
         $store->createBucket('owner', 'bucket', 'us-east-1');
         $versionId = $store->putObjectVersioned('bucket', 'versioned', 'owner', 1, 'etag', 'text/plain', 'cold/versioned');
         $store->putObjectMetadata('bucket', 'current', 'owner', 1, 'etag', 'text/plain', 'cold/current');
+        $pdo = (new \ReflectionClass($store))->getMethod('connection')->invoke($store);
+        self::assertInstanceOf(\PDO::class, $pdo);
+        $pdo->exec("UPDATE s3_objects SET updated_at = '2000-01-02T03:04:05Z' WHERE bucket = 'bucket'");
+        $store->updateObjectRestoreState('bucket', 'versioned', $versionId, 'pending');
+        $store->updateObjectRestoreState('bucket', 'current', null, 'pending');
         $expires = new \DateTimeImmutable('+1 day');
 
         $store->updateObjectRestoreStateWithTier('bucket', 'versioned', $versionId, 'restored', 'hot/versioned', $expires, 'HOT');
@@ -57,15 +62,25 @@ final class RestoredCopyTierStoreTest extends TestCase
         self::assertNotNull($current);
         self::assertSame(['hot/versioned', 'HOT'], [$versioned->restoredStoragePath, $versioned->restoredStorageTier]);
         self::assertSame(['warm/current', 'WARM'], [$current->restoredStoragePath, $current->restoredStorageTier]);
+        self::assertSame('2000-01-02T03:04:05+00:00', $versioned->lastModified->format(\DateTimeInterface::ATOM));
+        self::assertSame('2000-01-02T03:04:05+00:00', $current->lastModified->format(\DateTimeInterface::ATOM));
         self::assertContains('HOT', $store->listReferencedStorageTiers());
         self::assertContains('WARM', $store->listReferencedStorageTiers());
 
-        $store->updateObjectRestoreStateWithTier('bucket', 'versioned', $versionId, null);
-        $cleared = $store->getObjectMetadataByVersion('bucket', 'versioned', $versionId);
-        self::assertNotNull($cleared);
-        self::assertNull($cleared->restoredStoragePath);
-        self::assertNull($cleared->restoredStorageTier);
-        self::assertNull($cleared->restoreExpiresAt);
+        $store->updateObjectRestoreState('bucket', 'versioned', $versionId, null);
+        $store->updateObjectRestoreState('bucket', 'current', null, null);
+        $clearedVersion = $store->getObjectMetadataByVersion('bucket', 'versioned', $versionId);
+        $clearedCurrent = $store->getObjectMetadata('bucket', 'current');
+        self::assertNotNull($clearedVersion);
+        self::assertNotNull($clearedCurrent);
+        self::assertNull($clearedVersion->restoredStoragePath);
+        self::assertNull($clearedVersion->restoredStorageTier);
+        self::assertNull($clearedVersion->restoreExpiresAt);
+        self::assertNull($clearedCurrent->restoredStoragePath);
+        self::assertNull($clearedCurrent->restoredStorageTier);
+        self::assertNull($clearedCurrent->restoreExpiresAt);
+        self::assertSame('2000-01-02T03:04:05+00:00', $clearedVersion->lastModified->format(\DateTimeInterface::ATOM));
+        self::assertSame('2000-01-02T03:04:05+00:00', $clearedCurrent->lastModified->format(\DateTimeInterface::ATOM));
     }
 
     public function test_old_api_cannot_publish_path_without_tier_and_legacy_path_blocks_inventory(): void

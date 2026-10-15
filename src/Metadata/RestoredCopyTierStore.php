@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Metadata;
 
-/** Atomically persists a restored copy's physical path and tier. */
+/** Atomically persists restore state without changing the object's S3 Last-Modified timestamp. */
 interface RestoredCopyTierStore
 {
     public function updateObjectRestoreStateWithTier(

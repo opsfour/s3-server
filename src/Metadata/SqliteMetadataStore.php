@@ -492,7 +492,6 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             $transitionStatus,
             $transitionTargetTier,
             $transitionError,
-            gmdate('Y-m-d\TH:i:s\Z'),
             $bucket,
             $key,
         ];
@@ -507,8 +506,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 storage_path = ?,
                 transition_status = ?,
                 transition_target_tier = ?,
-                transition_error = ?,
-                updated_at = ?
+                transition_error = ?
             WHERE {$where}
             SQL);
         $stmt->execute($params);
@@ -548,7 +546,6 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             $restoredStoragePath,
             $restoredStorageTier,
             $restoreExpiresAt?->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z'),
-            gmdate('Y-m-d\TH:i:s\Z'),
             $bucket,
             $key,
         ];
@@ -561,8 +558,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             SET restore_status = ?,
                 restored_storage_path = ?,
                 restored_storage_tier = ?,
-                restore_expires_at = ?,
-                updated_at = ?
+                restore_expires_at = ?
             WHERE {$where}
             SQL);
         $stmt->execute($params);

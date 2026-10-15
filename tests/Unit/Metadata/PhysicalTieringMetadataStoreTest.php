@@ -142,6 +142,57 @@ final class PhysicalTieringMetadataStoreTest extends TestCase
         self::assertSame('2030-01-02T03:04:05+00:00', $object->restoreExpiresAt?->format(\DateTimeInterface::ATOM));
     }
 
+    public function test_placement_updates_preserve_s3_last_modified_timestamp(): void
+    {
+        $this->store->putObjectMetadata('bucket', 'latest.txt', 'owner', 4, '"latest"', 'text/plain', '/hot/latest.txt');
+        $pdo = $this->pdo();
+        $stmt = $pdo->prepare('UPDATE s3_objects SET updated_at = ? WHERE bucket = ? AND key_name = ?');
+        self::assertInstanceOf(\PDOStatement::class, $stmt);
+        $stmt->execute(['2000-01-02T03:04:05Z', 'bucket', 'latest.txt']);
+
+        $this->store->updateObjectPlacement(
+            'bucket',
+            'latest.txt',
+            null,
+            'GLACIER',
+            'cold',
+            '/cold/latest.txt',
+            'pending',
+            'deep',
+        );
+
+        $latest = $this->store->getObjectMetadata('bucket', 'latest.txt');
+        self::assertNotNull($latest);
+        self::assertSame('2000-01-02T03:04:05+00:00', $latest->lastModified->format(\DateTimeInterface::ATOM));
+        self::assertSame('pending', $latest->transitionStatus);
+
+        $this->store->setBucketVersioning('bucket', 'Enabled');
+        $versionId = $this->store->putObjectVersioned(
+            'bucket',
+            'versioned.txt',
+            'owner',
+            7,
+            '"version"',
+            'text/plain',
+            '/hot/versioned.txt',
+        );
+        $stmt->execute(['2001-02-03T04:05:06Z', 'bucket', 'versioned.txt']);
+
+        $this->store->updateObjectPlacement(
+            'bucket',
+            'versioned.txt',
+            $versionId,
+            'DEEP_ARCHIVE',
+            'deep',
+            '/deep/versioned.txt',
+        );
+
+        $version = $this->store->getObjectMetadataByVersion('bucket', 'versioned.txt', $versionId);
+        self::assertNotNull($version);
+        self::assertSame('2001-02-03T04:05:06+00:00', $version->lastModified->format(\DateTimeInterface::ATOM));
+        self::assertSame('/deep/versioned.txt', $version->systemMetadata['storagePath']);
+    }
+
     public function test_updates_specific_object_version_without_touching_latest(): void
     {
         $this->store->setBucketVersioning('bucket', 'Enabled');

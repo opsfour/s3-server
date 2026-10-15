@@ -285,7 +285,9 @@ interface MetadataStore
      *
      * This is the atomic metadata switch used by physical tier transitions after
      * the target object copy has been verified. Pass null as $versionId to target
-     * the latest non-delete-marker object.
+     * the latest non-delete-marker object. Placement and transition state are
+     * operational metadata and must not change the object's S3 Last-Modified
+     * timestamp.
      */
     public function updateObjectPlacement(
         string $bucket,
@@ -303,7 +305,8 @@ interface MetadataStore
      * Update restore metadata for an object or object version.
      *
      * A null $restoreStatus clears restore state. Pass null as $versionId to
-     * target the latest non-delete-marker object.
+     * target the latest non-delete-marker object. Restore state is operational
+     * metadata and must not change the object's S3 Last-Modified timestamp.
      */
     public function updateObjectRestoreState(
         string $bucket,
