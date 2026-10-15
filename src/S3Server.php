@@ -453,7 +453,9 @@ final class S3Server
                 //        Policy -> ACL -> ContentMd5 -> ChecksumValidation -> S3Dispatch
                 $stack = $this->buildMiddlewareStack($dispatchHandler);
 
-                // 4. Wire Amp Router with three catch-all path patterns.
+                // 4. Wire Amp Router for reserved management paths. All other
+                // paths use the S3 fallback so arbitrary HTTP methods reach the
+                // S3 operation resolver instead of Amp's generic 405 response.
                 $errorHandler = new DefaultErrorHandler();
                 $router = new Router($this->server, $this->logger, $errorHandler);
 
@@ -500,27 +502,7 @@ final class S3Server
                     $router->addRoute('DELETE', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
                 }
 
-                // Service-level GET / lists buckets; HEAD / also reaches website
-                // hosting before the API resolver rejects it on non-website hosts.
-                // POST / accepts browser uploads to a virtual-hosted bucket;
-                // OPTIONS / handles that bucket's root preflight.
-                $router->addRoute('GET', '/', $stack);
-                $router->addRoute('HEAD', '/', $stack);
-                $router->addRoute('POST', '/', $stack);
-                $router->addRoute('OPTIONS', '/', $stack);
-
-                // Bucket-level: all methods on /{bucket}
-                foreach (['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS'] as $method) {
-                    $router->addRoute($method, '/{bucket}', $stack);
-                }
-
-                // Object-level: all methods on /{bucket}/{key:.+}
-                foreach (['GET', 'PUT', 'POST', 'DELETE', 'HEAD', 'OPTIONS'] as $method) {
-                    $router->addRoute($method, '/{bucket}/{key:.+}', $stack);
-                }
-
-                // Set the router as the fallback handler too, so unmatched routes
-                // still produce proper S3 error responses.
+                // Service, bucket, and object requests all use this fallback.
                 $router->setFallback($stack);
 
                 // Prepare every background dependency before opening the

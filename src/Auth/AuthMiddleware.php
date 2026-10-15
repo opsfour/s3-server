@@ -213,7 +213,9 @@ final class AuthMiddleware implements AuthenticationMiddleware
         $scopeRegion = $authResult->credentialRegion;
 
         // Get the timestamp.
-        $timestamp = $request->getHeader('x-amz-date') ?? '';
+        $timestamp = $request->getHeader('x-amz-date')
+            ?? $request->getHeader('date')
+            ?? '';
 
         // Derive the signing key.
         $signingKey = SigningKey::derive(

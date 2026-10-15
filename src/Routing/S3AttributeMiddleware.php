@@ -8,7 +8,6 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
-use Amp\Http\Server\Router;
 use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
@@ -26,18 +25,13 @@ final class S3AttributeMiddleware implements Middleware
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
-        $routeArgs = $request->hasAttribute(Router::class)
-            ? $request->getAttribute(Router::class)
-            : [];
-
         $virtualBucket = BucketNameExtractor::extractVirtualHosted($request, $this->baseDomain);
-        $bucket = $virtualBucket ?? $this->extractBucket($request, $routeArgs);
-        $key = $virtualBucket !== null
-            ? rawurldecode(ltrim($request->getUri()->getPath(), '/'))
-            : ($routeArgs['key'] ?? null);
-
-        // Amp Router already decodes path-style route arguments. For virtual
-        // hosting the full URI path is the key, so decode that path once.
+        if ($virtualBucket !== null) {
+            $bucket = $virtualBucket;
+            $key = rawurldecode(ltrim($request->getUri()->getPath(), '/'));
+        } else {
+            [$bucket, $key] = BucketNameExtractor::extractPathStyle($request);
+        }
 
         // Short-circuit OPTIONS requests before operation resolution.
         // OperationResolver does not recognize OPTIONS, so let CORS middleware handle it.
@@ -72,20 +66,6 @@ final class S3AttributeMiddleware implements Middleware
         }
 
         return $requestHandler->handleRequest($request);
-    }
-
-    /** @param array<string, string> $routeArgs */
-    private function extractBucket(Request $request, array $routeArgs): ?string
-    {
-        $virtualBucket = BucketNameExtractor::extract($request, $this->baseDomain);
-
-        if ($virtualBucket !== null) {
-            return $virtualBucket;
-        }
-
-        $bucket = $routeArgs['bucket'] ?? null;
-
-        return ($bucket !== null && $bucket !== '') ? $bucket : null;
     }
 
     private static function determineScope(?string $bucket, ?string $key): string

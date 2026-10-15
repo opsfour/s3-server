@@ -9,6 +9,7 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\S3Exception;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use Psr\Log\LoggerInterface;
@@ -16,6 +17,8 @@ use Psr\Log\LoggerInterface;
 /** Keeps reserved management paths and failures outside S3 routing and XML errors. */
 final class ManagementBoundaryMiddleware implements Middleware
 {
+    private const int MAX_PERCENT_DECODE_DEPTH = 4;
+
     private readonly FailureIsolatingLogger $logger;
 
     public function __construct(
@@ -28,12 +31,20 @@ final class ManagementBoundaryMiddleware implements Middleware
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
-        // Amp Router decodes once before matching. Use the identical path so
-        // encoded spellings of reserved routes cannot reach its S3 wildcard.
-        $path = rawurldecode($request->getUri()->getPath());
+        // Keep the reserved namespace outside the S3 fallback even when a
+        // proxy and the application decode different numbers of times.
+        $encodedPath = $request->getUri()->getPath();
+        $routerPath = rawurldecode($encodedPath);
+        $path = self::fullyDecodedPath($encodedPath);
         $kind = $this->kind($path);
         if ($kind === null) {
             return $requestHandler->handleRequest($request);
+        }
+        // Amp Router decodes once. A reserved path that appears only after
+        // additional passes cannot be dispatched reliably, even when its HTTP
+        // method would otherwise be allowed, so never send it to the fallback.
+        if ($path !== $routerPath) {
+            return $this->error($kind, 404);
         }
 
         $allowed = $this->allowedMethods($path);
@@ -92,6 +103,22 @@ final class ManagementBoundaryMiddleware implements Middleware
         }
 
         return null;
+    }
+
+    private static function fullyDecodedPath(string $path): string
+    {
+        for ($depth = 0; $depth <= self::MAX_PERCENT_DECODE_DEPTH; ++$depth) {
+            $decoded = rawurldecode($path);
+            if ($decoded === $path) {
+                return $path;
+            }
+            if ($depth === self::MAX_PERCENT_DECODE_DEPTH) {
+                throw new InvalidArgumentException('Request path exceeds the percent-decoding limit.');
+            }
+            $path = $decoded;
+        }
+
+        throw new \LogicException('Unreachable percent-decoding state.');
     }
 
     /** @return list<string>|null */

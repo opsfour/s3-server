@@ -11,6 +11,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use League\Uri\Http;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Middleware\ManagementBoundaryMiddleware;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
@@ -81,6 +82,52 @@ final class ManagementBoundaryMiddlewareTest extends TestCase
         self::assertSame(404, $response->getStatus());
         self::assertFalse($terminal->handled);
         self::assertSame('no-store', $response->getHeader('cache-control'));
+    }
+
+    public function test_excessive_nested_path_encoding_fails_before_fallback(): void
+    {
+        $terminal = new ManagementBoundaryTestHandler(new Response(200));
+        $boundary = new ManagementBoundaryMiddleware(true, true, new NullLogger());
+
+        try {
+            $boundary->handleRequest(
+                $this->request('GET', '/.admin%252525252Fcredentials'),
+                $terminal,
+            );
+            self::fail('Excessively nested encoding reached the router fallback.');
+        } catch (InvalidArgumentException $error) {
+            self::assertSame('Request path exceeds the percent-decoding limit.', $error->getMessage());
+            self::assertFalse($terminal->handled);
+        }
+    }
+
+    public function test_four_decode_passes_on_a_data_path_remain_bounded_and_reach_fallback(): void
+    {
+        $terminal = new ManagementBoundaryTestHandler(new Response(204));
+        $boundary = new ManagementBoundaryMiddleware(true, true, new NullLogger());
+
+        $response = $boundary->handleRequest(
+            $this->request('GET', '/bucket%25252541/object'),
+            $terminal,
+        );
+
+        self::assertSame(204, $response->getStatus());
+        self::assertTrue($terminal->handled);
+    }
+
+    public function test_multiply_encoded_reserved_path_never_reaches_fallback_for_allowed_method(): void
+    {
+        $terminal = new ManagementBoundaryTestHandler(new Response(200));
+        $boundary = new ManagementBoundaryMiddleware(true, true, new NullLogger());
+
+        $response = $boundary->handleRequest(
+            $this->request('POST', '/.admin%252Fcredentials'),
+            $terminal,
+        );
+
+        self::assertSame(404, $response->getStatus());
+        self::assertSame('application/json', $response->getHeader('content-type'));
+        self::assertFalse($terminal->handled);
     }
 
     public function test_cancellation_remains_cancellation(): void

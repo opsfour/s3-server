@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
+use Amp\ByteStream\ReadableBuffer;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
@@ -51,6 +52,57 @@ final class SessionCredentialVerifierTest extends TestCase
             new InMemoryCredentialProvider($credential),
             'us-east-1',
         )->ownerId);
+    }
+
+    public function test_streaming_sigv4_uses_signed_date_header_when_amz_date_is_absent(): void
+    {
+        $credential = $this->temporaryCredential();
+        $timestamp = gmdate('Ymd\THis\Z');
+        $payload = 'payload';
+        $request = $this->signedHeaderRequest(
+            $credential,
+            $credential->sessionToken,
+            $timestamp,
+            additionalHeaders: [
+                'content-encoding' => 'aws-chunked',
+                'x-amz-content-sha256' => 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+                'x-amz-decoded-content-length' => (string) strlen($payload),
+            ],
+            useDateHeader: true,
+        );
+        $authorization = $request->getHeader('authorization');
+        self::assertNotNull($authorization);
+        if (preg_match('/Signature=([a-f0-9]{64})$/', $authorization, $matches) !== 1) {
+            self::fail('Signed streaming request did not contain a seed signature.');
+        }
+        $seedSignature = $matches[1];
+        $scope = substr($timestamp, 0, 8) . '/us-east-1/s3/aws4_request';
+        $signingKey = SigningKey::derive(
+            $credential->secretAccessKey,
+            substr($timestamp, 0, 8),
+            'us-east-1',
+            's3',
+        );
+        $dataSignature = self::chunkSignature($payload, $signingKey, $timestamp, $scope, $seedSignature);
+        $finalSignature = self::chunkSignature('', $signingKey, $timestamp, $scope, $dataSignature);
+        $request->setBody(new ReadableBuffer(
+            dechex(strlen($payload)) . ";chunk-signature={$dataSignature}\r\n"
+            . $payload . "\r\n"
+            . "0;chunk-signature={$finalSignature}\r\n\r\n",
+        ));
+        $handler = new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(200, body: \Amp\ByteStream\buffer($request->getBody()));
+            }
+        };
+
+        $response = (new AuthMiddleware(new InMemoryCredentialProvider($credential), 'us-east-1'))
+            ->handleRequest($request, $handler);
+
+        self::assertSame(200, $response->getStatus());
+        self::assertNull($request->getHeader('content-encoding'));
+        self::assertSame($payload, $response->getBody()->read());
     }
 
     public function test_header_sigv4_rejects_rfc_date_header_used_for_signing(): void
@@ -567,7 +619,7 @@ final class SessionCredentialVerifierTest extends TestCase
             queryString: $queryString,
             headers: $headers,
             signedHeaders: $signedHeaders,
-            hashedPayload: 'UNSIGNED-PAYLOAD',
+            hashedPayload: $headers['x-amz-content-sha256'][0] ?? 'UNSIGNED-PAYLOAD',
         );
         $credentialScope = "{$date}/us-east-1/s3/aws4_request";
         $stringToSign = SignatureV4Verifier::buildStringToSign($timestamp, $credentialScope, $canonicalRequest);
@@ -656,6 +708,23 @@ final class SessionCredentialVerifierTest extends TestCase
         }
 
         return implode('&', $parts);
+    }
+
+    private static function chunkSignature(
+        string $payload,
+        string $signingKey,
+        string $timestamp,
+        string $scope,
+        string $previousSignature,
+    ): string {
+        return hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-PAYLOAD',
+            $timestamp,
+            $scope,
+            $previousSignature,
+            hash('sha256', ''),
+            hash('sha256', $payload),
+        ]), $signingKey);
     }
 
     /**

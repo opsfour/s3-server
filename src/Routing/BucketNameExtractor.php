@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Routing;
 
 use Amp\Http\Server\Request;
+use OpsFour\S3Server\Exception\InvalidBucketNameException;
 
 /**
  * Extracts the bucket name from an S3 request.
@@ -22,6 +23,8 @@ use Amp\Http\Server\Request;
  */
 final class BucketNameExtractor
 {
+    private const int MAX_PERCENT_DECODE_DEPTH = 4;
+
     /**
      * Extract the bucket name from the request.
      *
@@ -37,24 +40,30 @@ final class BucketNameExtractor
             return $virtualBucket;
         }
 
-        // Path-style: extract bucket from the first path segment.
-        $path = $request->getUri()->getPath();
-        $path = \ltrim($path, '/');
+        return self::extractPathStyle($request)[0];
+    }
+
+    /** @return array{string|null, string|null} */
+    public static function extractPathStyle(Request $request): array
+    {
+        // Split the encoded path before decoding either component. Decoding
+        // first would let an encoded slash in the bucket segment redirect the
+        // request to a different bucket and move the suffix into the key.
+        $path = \ltrim($request->getUri()->getPath(), '/');
 
         if ($path === '') {
-            return null;
+            return [null, null];
         }
 
-        // The first segment before '/' is the bucket name.
         $slashPos = \strpos($path, '/');
-
         if ($slashPos === false) {
-            return self::sanitize(\rawurldecode($path));
+            return [self::decodePathBucket($path), null];
         }
 
-        $bucket = \substr($path, 0, $slashPos);
+        $bucket = self::decodePathBucket(\substr($path, 0, $slashPos));
+        $key = \rawurldecode(\substr($path, $slashPos + 1));
 
-        return $bucket !== '' ? self::sanitize(\rawurldecode($bucket)) : null;
+        return [$bucket !== '' ? $bucket : null, $key];
     }
 
     public static function extractVirtualHosted(Request $request, ?string $baseDomain): ?string
@@ -69,8 +78,8 @@ final class BucketNameExtractor
                     $hostWithoutPort = $host;
                 }
 
-                $baseDomainLower = \strtolower($baseDomain);
-                $hostLower = \strtolower($hostWithoutPort);
+                $baseDomainLower = \strtolower(\rtrim($baseDomain, '.'));
+                $hostLower = \strtolower(\rtrim($hostWithoutPort, '.'));
 
                 // If the host is a subdomain of baseDomain, extract bucket from subdomain.
                 // e.g., host = "mybucket.s3.example.com", baseDomain = "s3.example.com"
@@ -78,7 +87,7 @@ final class BucketNameExtractor
                 $suffix = '.' . $baseDomainLower;
 
                 if ($hostLower !== $baseDomainLower && \str_ends_with($hostLower, $suffix)) {
-                    $bucket = \substr($hostWithoutPort, 0, \strlen($hostWithoutPort) - \strlen($suffix));
+                    $bucket = \substr($hostLower, 0, \strlen($hostLower) - \strlen($suffix));
 
                     if ($bucket !== '') {
                         return $bucket;
@@ -92,13 +101,37 @@ final class BucketNameExtractor
         return null;
     }
 
-    /**
-     * Strip control characters (null bytes, newlines, etc.) from a decoded bucket name.
-     */
-    private static function sanitize(string $name): ?string
+    private static function validatedPathBucket(string $name): string
     {
-        $clean = preg_replace('/[\x00-\x1f\x7f]/', '', $name);
+        // Removing decoded bytes would silently redirect the request to a
+        // different bucket (for example, "victim%00" to "victim").
+        if (preg_match('/[\x00-\x1f\x7f]/', $name) === 1) {
+            throw new InvalidBucketNameException();
+        }
 
-        return $clean !== '' ? $clean : null;
+        return $name;
+    }
+
+    private static function decodePathBucket(string $encoded): string
+    {
+        // A separator at any encoding depth could be interpreted differently
+        // by a proxy and this server. Bucket names cannot contain either one,
+        // so reject the request instead of changing its bucket/key boundary.
+        $probe = $encoded;
+        for ($depth = 0; $depth <= self::MAX_PERCENT_DECODE_DEPTH; ++$depth) {
+            if (str_contains($probe, '/') || str_contains($probe, '\\')) {
+                throw new InvalidBucketNameException();
+            }
+            $decoded = rawurldecode($probe);
+            if ($decoded === $probe) {
+                return self::validatedPathBucket(rawurldecode($encoded));
+            }
+            if ($depth === self::MAX_PERCENT_DECODE_DEPTH) {
+                throw new InvalidBucketNameException();
+            }
+            $probe = $decoded;
+        }
+
+        throw new \LogicException('Unreachable percent-decoding state.');
     }
 }

@@ -509,6 +509,31 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider->authenticate($token);
     }
 
+    public function test_jwt_external_identity_provider_rejects_token_at_exact_expiration_boundary(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+
+        $token = $this->signJwt($privateKey, ['alg' => 'RS256', 'kid' => 'key-1'], [
+            'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
+            'exp' => time(),
+        ]);
+
+        $provider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+            clockSkewSeconds: 0,
+        );
+
+        $this->expectException(ExternalIdentityAuthenticationException::class);
+        $this->expectExceptionMessage('JWT has expired.');
+
+        $provider->authenticate($token);
+    }
+
     public function test_jwt_external_identity_provider_rejects_excessive_clock_skew(): void
     {
         [, $jwk] = $this->createRsaKeyPair();

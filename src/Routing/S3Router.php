@@ -7,7 +7,6 @@ namespace OpsFour\S3Server\Routing;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
-use Amp\Http\Server\Router;
 use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
@@ -45,30 +44,23 @@ final class S3Router implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
-        // 1. Extract route args set by the Amp Router.
-        //    The Router sets an attribute keyed by Router::class with an associative
-        //    array of matched route parameters (e.g., ['bucket' => 'mybucket', 'key' => 'path/to/obj']).
-        $routeArgs = $request->hasAttribute(Router::class)
-            ? $request->getAttribute(Router::class)
-            : [];
-
-        // 2. Determine bucket and key.
-        //    Virtual-hosted style takes precedence if baseDomain is set and Host header
-        //    matches. Otherwise, fall back to path-style (from Amp Router args).
+        // 1. Determine bucket and key. Virtual-hosted style takes precedence.
         $virtualBucket = BucketNameExtractor::extractVirtualHosted($request, $this->baseDomain);
-        $bucket = $virtualBucket ?? $this->extractBucket($request, $routeArgs);
-        $key = $virtualBucket !== null
-            ? rawurldecode(ltrim($request->getUri()->getPath(), '/'))
-            : ($routeArgs['key'] ?? null);
+        if ($virtualBucket !== null) {
+            $bucket = $virtualBucket;
+            $key = rawurldecode(ltrim($request->getUri()->getPath(), '/'));
+        } else {
+            [$bucket, $key] = BucketNameExtractor::extractPathStyle($request);
+        }
 
-        // 3. Determine scope.
+        // 2. Determine scope.
         $scope = self::determineScope($bucket, $key);
 
-        // 4. Build query params and headers maps for operation resolution.
+        // 3. Build query params and headers maps for operation resolution.
         $queryParams = self::extractQueryParams($request);
         $headers = self::extractHeaders($request);
 
-        // 5. Resolve the S3 operation.
+        // 4. Resolve the S3 operation.
         $operation = OperationResolver::resolve(
             method: $request->getMethod(),
             scope: $scope,
@@ -76,37 +68,15 @@ final class S3Router implements RequestHandler
             headers: $headers,
         );
 
-        // 6. Set request attributes for downstream handlers and middleware.
+        // 5. Set request attributes for downstream handlers and middleware.
         $request->setAttribute('s3.bucket', $bucket ?? '');
         $request->setAttribute('s3.key', $key ?? '');
         $request->setAttribute('s3.operation', $operation);
 
-        // 7. Dispatch to the registered handler.
+        // 6. Dispatch to the registered handler.
         $handler = $this->handlerRegistry->get($operation);
 
         return $handler->handleRequest($request);
-    }
-
-    /**
-     * Extract the bucket name, preferring virtual-hosted style when available.
-     *
-     * @param  Request  $request  The incoming request.
-     * @param  array<string, string>  $routeArgs  Route arguments from Amp Router.
-     * @return string|null The bucket name, or null for service-level requests.
-     */
-    private function extractBucket(Request $request, array $routeArgs): ?string
-    {
-        // Try virtual-hosted extraction first.
-        $virtualBucket = BucketNameExtractor::extract($request, $this->baseDomain);
-
-        if ($virtualBucket !== null) {
-            return $virtualBucket;
-        }
-
-        // Fall back to path-style from route args.
-        $bucket = $routeArgs['bucket'] ?? null;
-
-        return ($bucket !== null && $bucket !== '') ? $bucket : null;
     }
 
     /**

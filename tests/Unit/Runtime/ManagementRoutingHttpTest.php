@@ -61,8 +61,11 @@ final class ManagementRoutingHttpTest extends TestCase
                 ['DELETE', '/.%6cive', 405, 'GET', 'application/json'],
                 ['GET', '/.metrics/child', 404, null, 'text/plain'],
                 ['PUT', '/.metrics%2Fchild', 404, null, 'text/plain'],
+                ['PUT', '/.metrics%252Fchild', 404, null, 'text/plain'],
                 ['PUT', '/.admin/credentials/key/extra', 404, null, 'application/json'],
                 ['PUT', '/.%61dmin/credentials/key/extra', 404, null, 'application/json'],
+                ['GET', '/.admin%252Fcredentials', 404, null, 'application/json'],
+                ['DELETE', '/.health%252Fchild', 404, null, 'application/json'],
                 ['DELETE', '/.admin/unknown', 404, null, 'application/json'],
             ] as [$method, $path, $status, $allow, $contentType]) {
                 $response = $client->request(new ClientRequest($endpoint . $path, $method));
@@ -73,6 +76,15 @@ final class ManagementRoutingHttpTest extends TestCase
                 self::assertStringNotContainsString('<Error>', ByteStream\buffer($response->getBody()), "$method $path body");
             }
             self::assertSame([], $admin->handled, 'Rejected management paths must not reach S3 or admin handlers.');
+
+            $response = $client->request(new ClientRequest($endpoint . '/bucket/object', 'PATCH'));
+            self::assertSame(405, $response->getStatus());
+            self::assertSame('application/xml', $response->getHeader('content-type'));
+            self::assertNull($response->getHeader('allow'));
+            self::assertStringContainsString(
+                '<Code>MethodNotAllowed</Code>',
+                ByteStream\buffer($response->getBody()),
+            );
 
             foreach ([
                 ['POST', '/.admin/credentials'],

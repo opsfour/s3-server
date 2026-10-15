@@ -11,6 +11,7 @@ use Amp\Http\Server\Response;
 use Amp\Http\Server\Router;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\InvalidBucketNameException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Routing\HandlerRegistry;
@@ -28,6 +29,70 @@ final class QueryRoutingConsistencyTest extends TestCase
         (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
 
         self::assertSame(S3Operation::ListObjectsV2, $request->getAttribute('s3.operation'));
+    }
+
+    public function test_attribute_middleware_extracts_object_scope_without_router_arguments(): void
+    {
+        $request = $this->request(
+            'GET',
+            'http://127.0.0.1/bucket-a/folder%2Fobject',
+            [],
+        );
+
+        (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+
+        self::assertSame('bucket-a', $request->getAttribute('s3.bucket'));
+        self::assertSame('folder/object', $request->getAttribute('s3.key'));
+        self::assertSame(S3Operation::GetObject, $request->getAttribute('s3.operation'));
+    }
+
+    public function test_decoded_control_character_cannot_alias_another_bucket(): void
+    {
+        $request = $this->request(
+            'GET',
+            'http://127.0.0.1/bucket-a%00/object',
+            [],
+        );
+
+        $this->expectException(InvalidBucketNameException::class);
+        (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('encodedBucketSeparators')]
+    public function test_encoded_separator_in_bucket_segment_fails_closed(string $encodedBucket): void
+    {
+        $request = $this->request(
+            'GET',
+            'http://127.0.0.1/' . $encodedBucket . '/object',
+            [],
+        );
+
+        $this->expectException(InvalidBucketNameException::class);
+        (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function encodedBucketSeparators(): iterable
+    {
+        yield 'encoded slash' => ['bucket-a%2Fhidden'];
+        yield 'double encoded slash' => ['bucket-a%252Fhidden'];
+        yield 'encoded backslash' => ['bucket-a%5Chidden'];
+        yield 'double encoded backslash' => ['bucket-a%255Chidden'];
+        yield 'encoding beyond inspection limit' => ['bucket-a%2525252541hidden'];
+    }
+
+    public function test_bucket_encoding_at_inspection_limit_is_processed_in_constant_passes(): void
+    {
+        $request = $this->request(
+            'GET',
+            'http://127.0.0.1/bucket-a%25252541/object',
+            [],
+        );
+
+        (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+
+        self::assertSame('bucket-a%252541', $request->getAttribute('s3.bucket'));
+        self::assertSame('object', $request->getAttribute('s3.key'));
     }
 
     public function test_duplicate_key_only_query_does_not_override_first_value_in_legacy_router(): void

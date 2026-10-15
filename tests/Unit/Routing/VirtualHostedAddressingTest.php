@@ -40,14 +40,28 @@ final class VirtualHostedAddressingTest extends TestCase
         self::assertSame(S3Operation::GetObject, $request->getAttribute('s3.operation'));
     }
 
-    /** @param array<string, string> $routeArguments */
-    private function request(string $path, array $routeArguments): Request
+    public function test_dns_case_and_trailing_dot_are_normalized_for_virtual_bucket_resolution(): void
     {
+        $request = $this->request('/single', [], 'PHOTOS.S3.EXAMPLE.TEST.');
+
+        (new S3AttributeMiddleware('S3.EXAMPLE.TEST.'))->handleRequest($request, new VirtualHostedTerminal());
+
+        self::assertSame('photos', $request->getAttribute('s3.bucket'));
+        self::assertSame('single', $request->getAttribute('s3.key'));
+        self::assertSame(S3Operation::GetObject, $request->getAttribute('s3.operation'));
+    }
+
+    /** @param array<string, string> $routeArguments */
+    private function request(
+        string $path,
+        array $routeArguments,
+        string $host = 'photos.s3.example.test',
+    ): Request {
         $request = new Request(
             new VirtualHostedClient(),
             'GET',
             Http::new('http://127.0.0.1' . $path),
-            ['host' => 'photos.s3.example.test'],
+            ['host' => $host],
         );
         $request->setAttribute(Router::class, $routeArguments);
 
