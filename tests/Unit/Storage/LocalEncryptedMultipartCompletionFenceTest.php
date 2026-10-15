@@ -229,9 +229,19 @@ final class LocalEncryptedMultipartCompletionFenceTest extends TestCase
                 if ($position === false) {
                     return false;
                 }
-                fseek($file, 0);
-                fwrite($file, 'X');
-                fseek($file, $position);
+
+                if (fseek($file, 0) !== 0) {
+                    return false;
+                }
+                $firstByte = fread($file, 1);
+                if ($firstByte === false || strlen($firstByte) !== 1 || fseek($file, 0) !== 0) {
+                    return false;
+                }
+                $replacement = $firstByte === 'X' ? 'Y' : 'X';
+                if (fwrite($file, $replacement) !== 1 || ! fflush($file)
+                    || fseek($file, $position) !== 0) {
+                    return false;
+                }
 
                 return true;
             }
