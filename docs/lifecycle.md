@@ -6,6 +6,7 @@ A configuration contains at most 1,000 rules, and every rule must contain at
 least one action. Current-version transitions may use `Days: 0`; expiration,
 noncurrent and incomplete-upload day values must be positive. All day values
 are capped at 365,000 so date arithmetic remains portable and fail closed.
+Rule IDs contain at most 255 Unicode characters.
 
 ## Configure Lifecycle Rules
 
@@ -139,10 +140,13 @@ Apply the rule only to objects with a specific tag:
 ```
 
 An `And` filter requires at least two predicates. Every tag key in it must be
-unique; tag keys remain case-sensitive. Malformed, nested, foreign-namespace,
-or duplicate predicates are rejected before an existing configuration is
-replaced. A malformed rule found directly in legacy/imported metadata is
-skipped without applying any lifecycle action. See the
+unique; tag keys remain case-sensitive. Every tag filter requires `Key`.
+Omitting `Value` matches an empty tag value, as does an explicitly empty
+`<Value/>`. Keys and values use the same length and character constraints as
+object tags. Malformed, nested, foreign-namespace, or duplicate predicates are
+rejected before an existing configuration is replaced. A malformed rule found
+directly in legacy/imported metadata is skipped without applying any lifecycle
+action. See the
 [AWS lifecycle filter rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-filters.html).
 
 ## Lifecycle Runner

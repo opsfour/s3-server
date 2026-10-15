@@ -33,9 +33,13 @@ operations reject a mismatched expected owner before processing the request.
 | GetObject | `GET` | `/{bucket}/{key}` | Download an object (supports Range headers) |
 | HeadObject | `HEAD` | `/{bucket}/{key}` | Get object metadata without body |
 | DeleteObject | `DELETE` | `/{bucket}/{key}` | Delete an object (or create delete marker) |
-| DeleteObjects | `POST` | `/{bucket}?delete` | Batch delete up to 1000 objects; requires a verified Content-MD5 or supported `x-amz-checksum-*` body digest |
+| DeleteObjects | `POST` | `/{bucket}?delete` | Batch delete up to 1000 objects with keys of at most 1024 bytes, including XML-escaped keys, in an 8-MiB request body; requires a verified Content-MD5 or supported `x-amz-checksum-*` body digest |
 | PostObject | `POST` | `/{bucket}` | Browser-style form upload |
 | CopyObject | `PUT` | `/{bucket}/{key}` | Copy object (with `x-amz-copy-source` header) |
+
+GetObject requests without a `Range` header return HTTP 405 for objects larger
+than 5 TiB. Use byte-range requests to download those objects. HeadObject
+continues to return their metadata without an object body.
 
 Known S3 query selectors and subresources are checked against the request
 method, bucket/object scope, and resolved operation. Listing modifiers such as
@@ -160,11 +164,15 @@ invent the standard SSE header, while an explicitly supplied `STANDARD`
 storage class remains visible to policy conditions. Uploads created by older
 versions lack an unambiguous snapshot and return `OperationAborted`; abort and
 initiate them again before completion.
+Object metadata accepted at initiation, including `Expires`, is retained on
+the completed object. UploadPartCopy returns `InvalidRequest` when an explicit
+source version identifies a delete marker.
 
 Each uploaded or copied part is limited to 5 GiB. An oversized part returns
 `EntityTooLarge` (HTTP 400); it cannot be committed to the upload.
-CompleteMultipartUpload also rejects a selected part set above S3's 5-TiB
-object limit before creating a durable write attempt or invoking assembly.
+CompleteMultipartUpload also rejects a selected part set above S3's 50-TB
+object limit (50,000 GiB, about 48.8 TiB) before creating a durable write
+attempt or invoking assembly.
 UploadPart accepts one CRC32, CRC32C, SHA1, or SHA256 checksum. It validates
 the digest against the complete logical part, returns the matching checksum
 response header, persists it with the part, and includes it in ListParts.
@@ -244,6 +252,9 @@ has no effect, and object `FULL_CONTROL` does not authorize replacement of the
 object data. This follows the [S3 ACL permission mapping](https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html).
 GetObjectAcl and PutObjectAcl select the requested version and return its
 `x-amz-version-id` in versioned buckets, including the literal `null` version.
+An access-control policy may contain at most 100 grants, and each canonical
+grantee identifier is limited to 255 bytes. An invalid replacement leaves the
+stored ACL unchanged.
 
 ## Object Ownership
 
@@ -281,7 +292,8 @@ new delete marker. `BucketOwnerPreferred` is not implemented.
 | DeleteBucketCors | `DELETE` | `/{bucket}?cors` | Remove CORS rules |
 
 CORS preflight (OPTIONS) is handled automatically by the CorsMiddleware.
-`CORSRule.ID` is preserved across PUT/GET. `MaxAgeSeconds` accepts the complete
+`CORSRule.ID` is preserved across PUT/GET and is limited to 255 Unicode
+characters. `MaxAgeSeconds` accepts the complete
 non-negative signed 32-bit range, including an explicit `0`. Origins and
 allowed-header patterns may contain at most one `*`, matching the runtime
 matcher used for preflight requests.
@@ -329,6 +341,10 @@ existing tags are changed.
 | RestoreObject | `POST` | `/{bucket}/{key}?restore` | Restore a temporary hot copy from a cold tier |
 
 See [Lifecycle Rules](lifecycle.md) for rule configuration.
+Lifecycle rule IDs are limited to 255 Unicode characters. Every tag filter
+requires `Key`; omitting `Value` matches an empty tag value, as does an
+explicitly empty `<Value/>`. Tag filters use the same S3 tag length and
+character constraints as object tagging.
 RestoreObject accepts 1 through 365,000 days and implements the `Standard`
 retrieval tier. Explicit `Bulk` or `Expedited` requests return HTTP 501.
 The first accepted restore returns HTTP 202, renewing a completed temporary
@@ -354,7 +370,9 @@ specific error response.
 | GetBucketNotification | `GET` | `/{bucket}?notification` | Get notification config |
 | PutBucketNotification | `PUT` | `/{bucket}?notification` | Replace notification config (maximum 256 entries; 257 or more returns `400 InvalidArgument`) |
 
-See [Notifications](notifications.md) for webhook delivery.
+Webhook destination URLs are limited to 512 bytes. Invalid replacements leave
+the existing notification configuration unchanged. See
+[Notifications](notifications.md) for webhook delivery.
 
 ## Logging
 
@@ -362,6 +380,9 @@ See [Notifications](notifications.md) for webhook delivery.
 |-----------|--------|------|-------------|
 | GetBucketLogging | `GET` | `/{bucket}?logging` | Get access log config |
 | PutBucketLogging | `PUT` | `/{bucket}?logging` | Set same-owner, same-region access log target; target grants and custom key formats return `NotImplemented` |
+
+`TargetPrefix` is limited to 988 bytes so the generated timestamp and random
+suffix always fit within S3's 1,024-byte object-key limit.
 
 ## Website Hosting
 

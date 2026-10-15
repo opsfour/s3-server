@@ -169,7 +169,7 @@ Status: **Complete**
   against PostgreSQL 16 and MySQL 8.0 instances.
 
 The current unreleased source uses SQLite schema version `39`, PostgreSQL
-schema version `42`, and MySQL schema version `44`.
+schema version `42`, and MySQL schema version `45`.
 The external schemas include owner write locks, version-aware tags, multipart
 staging quotas, and durable physical-storage garbage collection. MySQL uses a
 generated SHA-256 tag identity so full long keys remain unique without exceeding
@@ -179,7 +179,7 @@ InnoDB's `utf8mb4` index limit.
 
 Status: **Complete**
 
-- [x] README claims are bounded by the documented 66-operation API and policy
+- [x] README claims are bounded by the documented 69-operation API and policy
   compatibility matrices.
 - [x] AWS STS Query API is explicitly optional and unsupported.
 - [x] PHPStan passes over the complete package.

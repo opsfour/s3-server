@@ -58,8 +58,10 @@ those webhook events. Internal listener patterns, including `s3:*`, have a
 separate contract.
 Each bucket accepts at most 256 notification configurations in one replacement
 request. A request with 257 or more returns `400 InvalidArgument` and preserves
-the existing configuration. The empty configuration remains valid for disabling
-notifications.
+the existing configuration. Each webhook destination URL is limited to 512
+bytes across all metadata backends; an oversized replacement also preserves
+the existing configuration. The empty configuration remains valid for
+disabling notifications.
 
 ## Supported Events
 

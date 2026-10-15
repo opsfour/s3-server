@@ -44,7 +44,10 @@ The project follows [Semantic Versioning](https://semver.org/).
   retry contract applies to HTTP(S) webhooks.
 - New objects remain unencrypted unless SSE is requested or bucket default
   encryption is configured.
-- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 44.
+- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 45.
+- Raise the completed multipart object limit to S3's 50-TB limit (50,000 GiB)
+  while retaining the 5-GiB per-part limit. A full GetObject above 5 TiB now
+  returns HTTP 405; ranged GetObject requests and HeadObject remain available.
 - Lifecycle action limits now apply across the complete sweep and resume fairly
   from a persisted bucket cursor.
 - API documentation now describes 69 routed S3 operations.
@@ -110,6 +113,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   exclusive owner locks; failed rechecks close discarded response bodies.
   Apply the same locked recheck before exposing errors derived from current
   object state, replacing stale errors when policy, ACL, or ownership changed.
+  The snapshot now includes response-visible object metadata and checksums,
+  while version-list bookkeeping does not invalidate an explicitly selected
+  version.
 - Revalidate the bucket generation before every streamed GetObject body read
   so a reused bucket name cannot expose bytes from the former bucket.
 - Recheck current identity policies, bucket policies, ACLs, Public Access
@@ -123,6 +129,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   later listener attempt must repeat the complete preparation.
 - Reject known S3 query selectors and subresources on the wrong method or
   bucket/object scope before they can fall through to a base mutation.
+- Route arbitrary S3 request methods through the S3 resolver, normalize DNS
+  case and trailing dots for virtual-hosted buckets, and reject decoded control
+  characters instead of silently aliasing a different path-style bucket.
 - Preserve generation-bound multipart part paths during legacy Flysystem
   directory cleanup, recognize only S3 part numbers 1 through 10,000 as known
   paths, and retain unknown entries for explicit reconciliation.
@@ -144,6 +153,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Reject DTDs hidden by alternate XML encodings, schema-unknown attributes,
   unsafe identity text, and out-of-range ACL or multipart XML input before
   changing state or serializing a response.
+- Enforce portable control-plane limits before replacement: 100 ACL grants,
+  255-byte ACL grantee IDs, 512-byte notification destinations, 988-byte
+  logging prefixes, and 1,024-byte DeleteObjects keys. Count CORS and lifecycle
+  rule IDs as up to 255 Unicode characters and validate lifecycle filter tags
+  with the same required-value and character rules as object tags.
 - Keep PostgreSQL account-quota cursor pagination in deterministic UTF-8 byte
   order under non-C database collations.
 - Reject malformed webhook destinations before replacing notification
@@ -157,6 +171,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Reject invalid multipart backend results before publishing part metadata,
   clean safe uncommitted paths, and normalize valid uppercase MD5 values in
   part ETags.
+- Preserve the `Expires` header from multipart initiation through completion,
+  reject explicit delete-marker UploadPartCopy sources, and fail encrypted GET
+  or multipart-copy reads whose decrypted size disagrees with metadata.
 - Preserve the shared wire order of versions and delete markers, apply full
   RFC 3986 encoding to listing response fields, accept standalone multipart
   upload ID markers, and report optional object attributes only when valid.
@@ -177,9 +194,15 @@ The project follows [Semantic Versioning](https://semver.org/).
   locked result set is fully consumed.
 - Reject ambiguous duplicate authorization, query, checksum, and XML mutation
   inputs before selecting or changing resources.
+- Use the signed HTTP `Date` value for SigV4 streaming chunk verification when
+  `x-amz-date` is absent, and treat an external JWT exactly at its expiration
+  boundary as expired.
 - Preserve checksum, version, storage-tier, object-owner, and bucket-generation
   semantics across copy, suspended versioning, restore, lifecycle, and
   multipart paths.
+- Verify persisted full-object checksums before publishing restore or lifecycle
+  tier copies, and bind expired restore cleanup to the original bucket
+  generation and object snapshot.
 - Bound S3 Select syntax, records, parser growth, result framing, and worker
   failure handling.
 - Prevent bucket-name reuse and stale generation races from deleting or
