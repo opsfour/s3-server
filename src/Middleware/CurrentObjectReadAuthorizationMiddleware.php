@@ -85,29 +85,40 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
             ? $request->getAttribute('s3.cachedBucketOwner')
             : null;
         $authorizedBucketOwner = is_string($cachedBucketOwner) ? $cachedBucketOwner : '';
+        $response = null;
+        $retryResponse = null;
+        $handlerError = null;
         try {
             $response = $requestHandler->handleRequest($request);
         } catch (CancelledException $error) {
             throw $error;
         } catch (\Throwable $error) {
-            // Error responses can reveal current object state too (for
-            // example, delete-marker version headers). Revalidate them under
-            // the same authorization lock and snapshot boundary as success.
-            $this->validate(
-                $request,
-                $operation,
-                $bucket,
-                $key,
-                $versionId,
-                $authorizedBucketGeneration,
-                $authorizedBucketOwner,
-                $authorized,
-                $withinWriteTransaction,
-            );
-            throw $error;
+            $handlerError = $error;
         }
+        $retry = $response !== null
+            && $this->isReplaySafeRead($request, $operation, $withinWriteTransaction)
+            && $request->hasAttribute('s3.policyResult')
+            ? function () use ($request, $requestHandler, $operation, $bucket, $key, $versionId, $authorizedBucketGeneration, $authorizedBucketOwner, $authorized, &$response, &$retryResponse): array {
+                \assert($response instanceof Response);
+                self::closeResponseBeforeReplay($response);
+                $response = null;
+
+                return $this->retryReadWithinAuthorizationLock(
+                    $request,
+                    $requestHandler,
+                    $operation,
+                    $bucket,
+                    $key,
+                    $versionId,
+                    $authorizedBucketGeneration,
+                    $authorizedBucketOwner,
+                    $authorized,
+                    $retryResponse,
+                );
+            }
+        : null;
         try {
-            $observedBucket = $this->validate(
+            $validation = $this->validate(
                 $request,
                 $operation,
                 $bucket,
@@ -117,35 +128,53 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
                 $authorizedBucketOwner,
                 $authorized,
                 $withinWriteTransaction,
+                $retry,
             );
-            if ($operation === S3Operation::GetObject) {
-                if ($observedBucket === null) {
-                    throw new OperationAbortedException('Bucket disappeared after authorization.');
-                }
-                $contentLength = $response->getHeader('content-length');
-                $response->setBody(new GenerationGuardedReadableStream(
-                    $response->getBody(),
-                    function () use ($observedBucket, $request): void {
-                        BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket, $request);
-                    },
-                ));
-                if ($contentLength !== null) {
-                    $response->setHeader('content-length', $contentLength);
-                }
+            if ($validation['response'] !== null) {
+                $response = $validation['response'];
+                $handlerError = null;
             }
         } catch (\Throwable $error) {
-            try {
-                $response->getBody()->close();
-            } catch (\Throwable) {
-                // Preserve the authorization or cancellation failure.
+            if ($response !== null) {
+                self::closeResponse($response);
+            }
+            if ($retryResponse !== null && $retryResponse !== $response) {
+                self::closeResponse($retryResponse);
             }
 
             throw $error;
+        }
+        $retryResponse = null;
+        if ($handlerError !== null) {
+            throw $handlerError;
+        }
+        \assert($response instanceof Response);
+
+        if ($operation === S3Operation::GetObject) {
+            if ($validation['bucket'] === null) {
+                self::closeResponse($response);
+                throw new OperationAbortedException('Bucket disappeared after authorization.');
+            }
+            $contentLength = $response->getHeader('content-length');
+            $observedBucket = $validation['bucket'];
+            $response->setBody(new GenerationGuardedReadableStream(
+                $response->getBody(),
+                function () use ($observedBucket, $request): void {
+                    BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket, $request);
+                },
+            ));
+            if ($contentLength !== null) {
+                $response->setHeader('content-length', $contentLength);
+            }
         }
 
         return $response;
     }
 
+    /**
+     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response})|null $retry
+     * @return array{bucket: ?BucketInfo, response: ?Response}
+     */
     private function validate(
         Request $request,
         S3Operation $operation,
@@ -156,20 +185,27 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         string $authorizedBucketOwner,
         ?ObjectInfo $authorized,
         bool $withinWriteTransaction,
-    ): ?BucketInfo {
-        $validate = function () use ($request, $bucket, $authorizedBucketGeneration, $authorized, $operation, $key, $versionId, $withinWriteTransaction): ?BucketInfo {
-            $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
-            $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
+        ?\Closure $retry,
+    ): array {
+        $validate = function () use ($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner, $authorized, $operation, $key, $versionId, $withinWriteTransaction, $retry): array {
+            $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
+            $current = $this->lookupObject($operation, $bucket, $key, $versionId);
+            if (! self::sameObject($authorized, $current)) {
+                return $this->retryOrDeny($retry, $authorized, $current);
+            }
             $policy = new PolicyEnforcementMiddleware($this->metadata);
             if ($withinWriteTransaction) {
                 $policy->assertAllowedAtCommit($request);
             } else {
                 $policy->assertAllowedAtReadCommit($request);
             }
-            $observedBucket = $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedBucketGeneration);
-            $this->assertObjectUnchanged($authorized, $operation, $bucket, $key, $versionId);
+            $observedBucket = $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
+            $current = $this->lookupObject($operation, $bucket, $key, $versionId);
+            if (! self::sameObject($authorized, $current)) {
+                return $this->retryOrDeny($retry, $authorized, $current);
+            }
 
-            return $observedBucket;
+            return ['bucket' => $observedBucket, 'response' => null];
         };
         if (! $request->hasAttribute('s3.policyResult') || $withinWriteTransaction) {
             return $validate();
@@ -182,11 +218,111 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         ];
         OwnerReadLock::prepare($this->metadata, ...$readOwners);
 
-        return $this->metadata->transaction(function () use ($validate, $readOwners): ?BucketInfo {
+        return $this->metadata->transaction(function () use ($validate, $readOwners): array {
             OwnerReadLock::acquire($this->metadata, ...$readOwners);
 
             return $validate();
         });
+    }
+
+    /** @return array{bucket: ?BucketInfo, response: Response} */
+    private function retryReadWithinAuthorizationLock(
+        Request $request,
+        RequestHandler $requestHandler,
+        S3Operation $operation,
+        string $bucket,
+        string $key,
+        ?string $versionId,
+        ?string $authorizedBucketGeneration,
+        string $authorizedBucketOwner,
+        ?ObjectInfo $originallyAuthorized,
+        ?Response &$retryResponse,
+    ): array {
+        $policy = new PolicyEnforcementMiddleware($this->metadata);
+        $policy->assertAllowedAtReadCommit($request);
+        $snapshot = $request->getAttribute(AuthorizedObjectSnapshot::ATTRIBUTE);
+        $refreshed = $snapshot instanceof ObjectInfo ? $snapshot : null;
+        $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
+        if (! self::sameObject($originallyAuthorized, $refreshed)
+            && ! self::isCompletedRestoreTransition($originallyAuthorized, $refreshed)) {
+            throw new AccessDeniedException('Object changed during authorization.');
+        }
+        try {
+            $retryResponse = $requestHandler->handleRequest($request);
+            $observedBucket = $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
+            $this->assertObjectUnchanged($refreshed, $operation, $bucket, $key, $versionId);
+            $policy->assertAllowedAtReadCommit($request);
+            $observedBucket = $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
+            $this->assertObjectUnchanged($refreshed, $operation, $bucket, $key, $versionId);
+
+            return ['bucket' => $observedBucket, 'response' => $retryResponse];
+        } catch (\Throwable $error) {
+            if ($retryResponse !== null) {
+                self::closeResponse($retryResponse);
+                $retryResponse = null;
+            }
+
+            throw $error;
+        }
+    }
+
+    /**
+     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response})|null $retry
+     * @return array{bucket: ?BucketInfo, response: Response}
+     */
+    private function retryOrDeny(?\Closure $retry, ?ObjectInfo $authorized, ?ObjectInfo $current): array
+    {
+        if ($retry === null || ! self::isCompletedRestoreTransition($authorized, $current)) {
+            throw new AccessDeniedException('Object changed during authorization.');
+        }
+
+        return $retry();
+    }
+
+    private function isReplaySafeRead(Request $request, S3Operation $operation, bool $withinWriteTransaction): bool
+    {
+        if ($withinWriteTransaction
+            || $operation !== S3Operation::HeadObject
+            || $request->getMethod() !== 'HEAD'
+            || $request->hasHeader('transfer-encoding')) {
+            return false;
+        }
+
+        $contentLength = $request->getHeader('content-length');
+
+        return $contentLength === null || trim($contentLength) === '0';
+    }
+
+    private static function closeResponse(Response $response): void
+    {
+        try {
+            $response->getBody()->close();
+        } catch (\Throwable) {
+            // Preserve the authorization, handler, or cancellation failure.
+        }
+    }
+
+    private static function closeResponseBeforeReplay(Response $response): void
+    {
+        try {
+            $response->getBody()->close();
+        } catch (\Throwable) {
+            throw new OperationAbortedException('Unable to dispose the stale response before retrying the request.');
+        }
+    }
+
+    private function assertBucketUnchanged(
+        Request $request,
+        string $bucket,
+        ?string $authorizedGeneration,
+        string $authorizedOwner,
+    ): ?BucketInfo {
+        $current = $this->assertBucketGenerationUnchanged($request, $bucket, $authorizedGeneration);
+        if ($authorizedOwner !== '' && $current !== null && $current->ownerId !== $authorizedOwner) {
+            throw new OperationAbortedException('Bucket ownership changed after authorization.');
+        }
+
+        return $current;
     }
 
     private function assertBucketGenerationUnchanged(Request $request, string $bucket, ?string $authorizedGeneration): ?BucketInfo
@@ -213,9 +349,69 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
 
     private function assertObjectUnchanged(?ObjectInfo $authorized, S3Operation $operation, string $bucket, string $key, ?string $versionId): void
     {
-        $current = AuthorizedObjectSnapshot::lookupForRead($this->metadata, $operation, $bucket, $key, $versionId);
-        if (AuthorizedObjectSnapshot::identity($authorized) !== AuthorizedObjectSnapshot::identity($current)) {
+        if (! self::sameObject($authorized, $this->lookupObject($operation, $bucket, $key, $versionId))) {
             throw new AccessDeniedException('Object changed during authorization.');
         }
+    }
+
+    /** @phpstan-impure */
+    private function lookupObject(S3Operation $operation, string $bucket, string $key, ?string $versionId): ?ObjectInfo
+    {
+        return AuthorizedObjectSnapshot::lookupForRead($this->metadata, $operation, $bucket, $key, $versionId);
+    }
+
+    private static function sameObject(?ObjectInfo $left, ?ObjectInfo $right): bool
+    {
+        return AuthorizedObjectSnapshot::identity($left) === AuthorizedObjectSnapshot::identity($right);
+    }
+
+    private static function isCompletedRestoreTransition(?ObjectInfo $authorized, ?ObjectInfo $current): bool
+    {
+        if ($authorized === null
+            || $current === null
+            || $authorized->restoreStatus !== 'pending'
+            || $current->restoreStatus !== 'restored'
+            || $current->restoredStorageTier === null
+            || $current->restoredStoragePath === null
+            || $current->restoreExpiresAt === null) {
+            return false;
+        }
+
+        return self::restoreStableIdentity($authorized) === self::restoreStableIdentity($current);
+    }
+
+    /**
+     * Identify every authorization and routing field that a restore completion
+     * is not allowed to change. Version-list bookkeeping is intentionally
+     * ignored for the same reason as AuthorizedObjectSnapshot::identity().
+     *
+     * @return array<string, bool|int|string|null|array<string, string>>
+     */
+    private static function restoreStableIdentity(ObjectInfo $object): array
+    {
+        $userMetadata = $object->userMetadata;
+        $systemMetadata = $object->systemMetadata;
+        unset($systemMetadata['isLatest'], $systemMetadata['noncurrentAt']);
+        ksort($userMetadata, SORT_STRING);
+        ksort($systemMetadata, SORT_STRING);
+
+        return [
+            'bucket' => $object->bucket,
+            'key' => $object->key,
+            'size' => $object->size,
+            'etag' => $object->etag,
+            'contentType' => $object->contentType,
+            'storageClass' => $object->storageClass,
+            'storageTier' => $object->storageTier,
+            'transitionStatus' => $object->transitionStatus,
+            'transitionTargetTier' => $object->transitionTargetTier,
+            'transitionError' => $object->transitionError,
+            'ownerId' => $object->ownerId,
+            'versionId' => $object->versionId,
+            'isDeleteMarker' => $object->isDeleteMarker,
+            'userMetadata' => $userMetadata,
+            'systemMetadata' => $systemMetadata,
+            'lastModified' => $object->lastModified->format('U.u'),
+        ];
     }
 }

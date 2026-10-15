@@ -113,6 +113,9 @@ final class CurrentObjectReadStreamGenerationTest extends TestCase
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->method('getBucket')->willReturn(null);
         $metadata->method('getCurrentObjectVersion')->willReturn(null);
+        $metadata->expects(self::once())->method('transaction')->willReturnCallback(
+            static fn(callable $callback): mixed => $callback(),
+        );
         $request = new Request($this->createMock(Client::class), 'GET', Http::new('http://127.0.0.1/missing/key'));
         $request->setAttribute('s3.bucket', 'missing');
         $request->setAttribute('s3.key', 'key');
