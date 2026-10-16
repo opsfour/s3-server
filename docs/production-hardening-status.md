@@ -121,11 +121,16 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   the reader still needs runtime wiring before listener admission, and the
   complete mount, replacement, and replay contract still needs qualification
   on the intended Linux hosts. Production EFS serving remains closed.
-- [ ] Production worker integration must preserve one reader instance for each
-  worker lifetime or provide an equivalent worker-wide progression latch.
-  Separately reconstructed readers share the frozen startup baseline but do
-  not share later heartbeat observations, so worker replacement and retry
-  policy must not silently reset that later progression state.
+- [x] The current unreleased inert, bounded worker primitive keeps one
+  schema-v2 reader and progression latch for an Amp worker process. Evidence
+  failure or a byte-different scope poisons that process terminally; only
+  worker replacement can validate repaired evidence anew. Its fixed, dedicated
+  failure class is identifiable after Amp IPC without exposing evidence
+  details.
+- [ ] Parent admission must still treat that dedicated failure and ambiguous
+  worker/IPC loss as terminal for the shared candidate. All 14 guarded EFS
+  tasks must move to the latch atomically before production wiring; no task or
+  listener uses this inert primitive yet.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.

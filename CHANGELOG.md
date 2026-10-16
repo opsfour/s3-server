@@ -49,6 +49,12 @@ The project follows [Semantic Versioning](https://semver.org/).
   heartbeat rollback. The production watcher and runtime wiring remain
   unimplemented, real Linux qualification is pending, and serving remains
   closed.
+- Add an inert, bounded worker-wide production EFS evidence latch. Each Amp
+  worker binds its first immutable schema-v2 scope and one heartbeat reader;
+  evidence failure or a byte-different scope poisons that process terminally.
+  The dedicated fixed-message failure remains identifiable across Amp IPC
+  without exposing evidence details. Parent admission feedback and atomic
+  migration of all guarded EFS tasks remain required before production wiring.
 
 ### Changed
 
