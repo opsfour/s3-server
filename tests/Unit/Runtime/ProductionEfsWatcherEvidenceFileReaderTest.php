@@ -12,6 +12,7 @@ use OpsFour\S3Server\Runtime\ProductionEfsIdentity;
 use OpsFour\S3Server\Runtime\ProductionEfsWatcherEvidenceFileReader;
 use OpsFour\S3Server\Runtime\ProductionEfsWorkerEvidenceScope;
 use OpsFour\S3Server\Tests\Support\ProductionEfsEvidenceScopeWorkerTask;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class ProductionEfsWatcherEvidenceFileReaderTest extends TestCase
@@ -630,26 +631,29 @@ final class ProductionEfsWatcherEvidenceFileReaderTest extends TestCase
         unserialize($tampered);
     }
 
-    public function test_serialized_v2_scope_rejects_directory_identity_above_php_integer_range(): void
+    #[DataProvider('directoryIdentityFields')]
+    public function test_serialized_v2_scope_rejects_directory_identity_above_php_integer_range(string $field): void
     {
         $serialized = serialize($this->reader()->workerScope());
         $tooLarge = PHP_INT_SIZE === 8 ? '9223372036854775808' : '2147483648';
 
-        foreach (['evidenceDirectoryDev', 'evidenceDirectoryIno'] as $field) {
-            $pattern = '/s:' . strlen($field) . ':"' . $field . '";s:[0-9]+:"[0-9]+";/D';
-            $replacement = 's:' . strlen($field) . ':"' . $field . '";s:'
-                . strlen($tooLarge) . ':"' . $tooLarge . '";';
-            $tampered = preg_replace($pattern, $replacement, $serialized, 1, $count);
-            self::assertIsString($tampered);
-            self::assertSame(1, $count, $field);
+        $pattern = '/s:' . strlen($field) . ':"' . $field . '";s:[0-9]+:"[0-9]+";/D';
+        $replacement = 's:' . strlen($field) . ':"' . $field . '";s:'
+            . strlen($tooLarge) . ':"' . $tooLarge . '";';
+        $tampered = preg_replace($pattern, $replacement, $serialized, 1, $count);
+        self::assertIsString($tampered);
+        self::assertSame(1, $count, $field);
 
-            try {
-                unserialize($tampered);
-                self::fail("Serialized {$field} above PHP_INT_MAX was accepted.");
-            } catch (\InvalidArgumentException $error) {
-                self::assertSame('Production EFS worker evidence scope is invalid.', $error->getMessage());
-            }
-        }
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Production EFS worker evidence scope is invalid.');
+        unserialize($tampered);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function directoryIdentityFields(): iterable
+    {
+        yield 'device' => ['evidenceDirectoryDev'];
+        yield 'inode' => ['evidenceDirectoryIno'];
     }
 
     private function assertRejected(ProductionEfsWatcherEvidenceFileReader $reader, string $case): void
