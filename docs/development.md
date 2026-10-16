@@ -199,7 +199,7 @@ and Laravel 13 with Symfony 8.1 or newer.
 The complete local package gate for the current `develop` source records:
 
 ```
-3350 tests, 29192 assertions, 217 expected opt-in/environment skips, 0 failures
+4328 tests, 33171 assertions, 232 expected opt-in/environment skips, 0 failures
 ```
 
 External database, remote-storage, multi-host, load-balancer, and long-soak

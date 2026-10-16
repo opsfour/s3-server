@@ -55,6 +55,13 @@ The project follows [Semantic Versioning](https://semver.org/).
   The dedicated fixed-message failure remains identifiable across Amp IPC
   without exposing evidence details. Parent admission feedback and atomic
   migration of all guarded EFS tasks remain required before production wiring.
+- Add inert parent-process feedback for production EFS worker failures. A
+  dedicated evidence failure, serialization ambiguity, or narrowly typed
+  worker/context loss terminally revokes candidate admission and attempts to
+  kill every registered worker pool. Failed kills remain visible and
+  retryable, while cancellation and unrelated task failures preserve normal
+  handling. The guarded tasks and pool-owning runtime components are not wired
+  to it yet.
 
 ### Changed
 

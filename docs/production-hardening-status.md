@@ -127,10 +127,16 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   worker replacement can validate repaired evidence anew. Its fixed, dedicated
   failure class is identifiable after Amp IPC without exposing evidence
   details.
-- [ ] Parent admission must still treat that dedicated failure and ambiguous
-  worker/IPC loss as terminal for the shared candidate. All 14 guarded EFS
-  tasks must move to the latch atomically before production wiring; no task or
-  listener uses this inert primitive yet.
+- [x] The current unreleased inert parent feedback primitive treats that
+  dedicated evidence failure, native or task-serialized serialization failure,
+  and narrowly typed worker/context ambiguity as terminal. It publishes the
+  terminal state, revokes shared candidate admission, and attempts to kill every
+  registered pool. Failed kills remain visible and retryable, and late pool or
+  admission registration fails closed. Native and serialized cancellation and
+  unrelated domain task failures are rethrown without revocation.
+- [ ] All 14 guarded EFS tasks and seven pool-owning runtime components must
+  adopt the latch and parent feedback atomically before production wiring. No
+  task, runtime factory, or listener uses these inert primitives yet.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.

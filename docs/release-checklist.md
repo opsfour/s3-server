@@ -30,6 +30,8 @@ gate required by the advertised deployment profile has passed.
 - Run the long soak only after the selected storage backend and proxy profile
   satisfy their correctness gates; a soak cannot establish a missing write
   fence.
+- Run adversarial S3 Select small-row and output-expansion profiles with the
+  selected storage adapter, PHP memory limit, and worker count.
 - For a strict at-rest claim, verify encrypted request spools, encrypted
   multipart staging, private temporary directories, swap, core dumps, proxy
   logs, worker memory, and cleanup of legacy plaintext multipart parts.
@@ -62,25 +64,24 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,314
-PHPUnit tests with 33,089 assertions and 232 expected opt-in or environment
-skips in 5:55 with 195 MB peak memory. PHPStan passed, and PHP CS Fixer
-reported zero fixes across 968 files.
+The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,328
+PHPUnit tests with 33,171 assertions and 232 expected opt-in or environment
+skips in 4:20 with 195 MB peak memory. PHPStan passed, and PHP CS Fixer
+reported zero fixes across 971 files.
 Strict Composer validation, the locked dependency audit, and `git diff --check`
-also passed on the same current candidate. The earlier CI baseline at `d9b8426`
+also passed on the same current candidate. The CI baseline at `6c98e72`
 passed all four jobs in GitHub Actions run
-[38816792329](https://github.com/opsfour/s3-server/actions/runs/38816792329),
+[38925435830](https://github.com/opsfour/s3-server/actions/runs/38925435830),
 including quality, metadata backends, and the lowest and highest dependency
-matrices. That run covers the host-pin and version-timestamp batch, listenerless
-heartbeat reader, and delegated multipart-abort commit reauthorization. It
-predates the immutable schema-v2 worker scope at `72e1625` and the terminal
-worker evidence latch at `7003ed3`; both are covered by the current local
-quality run but have no recorded green GitHub Actions result yet. Parent-side
-terminal admission revocation, atomic migration of the physical EFS tasks, and
-qualification of the exact read-only bind and stale replay contract on the
-intended Linux hosts remain open. External PostgreSQL/MySQL execution without
-skips, the exact PHP 8.4 deployment profile, multi-host storage qualification,
-and the current-source long soak remain separate gates.
+matrices. That run covers the immutable schema-v2 worker scope and terminal
+worker evidence latch. The later inert parent feedback at `7f6664e` is covered
+by the current local quality run but has no recorded green GitHub Actions
+result yet. Atomic migration of all 14 guarded EFS tasks and seven pool-owning
+runtime components, plus qualification of the exact read-only bind and stale
+replay contract on the intended Linux hosts, remain open. External
+PostgreSQL/MySQL execution without skips, the exact PHP 8.4 deployment profile,
+multi-host storage qualification, and the current-source long soak remain
+separate gates.
 
 ## Released Version
 
