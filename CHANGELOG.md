@@ -8,6 +8,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Add an offline `storage:audit` command for bounded, non-repairing reference
+  existence and size checks across explicitly mapped local filesystem tiers.
+- Add exclusive `.opsfour/runtime.lock` ownership for local storage roots so a
+  second server process is rejected before its listener starts.
 - Add the three S3 Object Ownership control operations with `ObjectWriter` as
   the compatibility default and explicit `BucketOwnerEnforced` support.
 - Add full-object CRC32, CRC32C, SHA1, and SHA256 handling across object writes,

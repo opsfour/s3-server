@@ -23,7 +23,7 @@ interface StorageIntegrityReferenceEnumerator
     ];
 
     /**
-     * @return list<array{source: string, id: string, path: string, expected_size: ?int}>
+     * @return list<array{source: string, id: string, storage_tier: ?string, path: string, expected_size: ?int}>
      */
     public function page(string $source, ?string $afterId, int $limit): array;
 

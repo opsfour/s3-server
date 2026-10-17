@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use OpsFour\S3Server\Metadata\StorageIntegrityReferenceEnumerator;
+use OpsFour\S3Server\Storage\LocalStorageAuditRoots;
 use OpsFour\S3Server\Storage\StorageIntegrityAuditor;
 use PHPUnit\Framework\TestCase;
 
@@ -41,7 +42,7 @@ final class StorageIntegrityAuditorTest extends TestCase
         }
         $enumerator = new InMemoryStorageIntegrityReferenceEnumerator($rows);
 
-        $result = (new StorageIntegrityAuditor($this->root, $enumerator, 2))->run();
+        $result = (new StorageIntegrityAuditor($this->roots(), $enumerator, 2))->run();
 
         self::assertSame(15, $result->checked);
         self::assertSame(0, $result->failed);
@@ -83,7 +84,7 @@ final class StorageIntegrityAuditorTest extends TestCase
         }
 
         $result = (new StorageIntegrityAuditor(
-            $this->root,
+            $this->roots(),
             new InMemoryStorageIntegrityReferenceEnumerator($rows),
             maxReportedIssues: 10,
         ))->run();
@@ -96,6 +97,7 @@ final class StorageIntegrityAuditorTest extends TestCase
         );
         foreach ($result->reportedIssues as $issue) {
             self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $issue['reference_sha256']);
+            self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $issue['tier_sha256']);
             self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $issue['path_sha256']);
             foreach ($paths as [$path]) {
                 self::assertStringNotContainsString($path, implode('|', $issue));
@@ -109,10 +111,45 @@ final class StorageIntegrityAuditorTest extends TestCase
         @rmdir($realParent);
     }
 
-    /** @return array{source: string, id: string, path: string, expected_size: ?int} */
-    private function row(string $source, string $id, string $path, ?int $size): array
+    public function test_audit_routes_each_tier_to_its_exact_root_and_rejects_unmapped_tiers(): void
     {
-        return ['source' => $source, 'id' => $id, 'path' => $path, 'expected_size' => $size];
+        $coldRoot = $this->root . '-cold';
+        self::assertTrue(mkdir($coldRoot, 0o700));
+        $coldRoot = (string) realpath($coldRoot);
+        $hotPath = $this->root . '/hot';
+        $coldPath = $coldRoot . '/cold';
+        self::assertSame(3, file_put_contents($hotPath, 'hot'));
+        self::assertSame(4, file_put_contents($coldPath, 'cold'));
+        $rows = [StorageIntegrityReferenceEnumerator::OBJECT => [
+            $this->row(StorageIntegrityReferenceEnumerator::OBJECT, '1', $hotPath, 3, 'HOT'),
+            $this->row(StorageIntegrityReferenceEnumerator::OBJECT, '2', $coldPath, 4, 'COLD'),
+            $this->row(StorageIntegrityReferenceEnumerator::OBJECT, '3', $hotPath, 3, 'REMOTE'),
+        ]];
+        $roots = new LocalStorageAuditRoots([
+            ['tier' => 'HOT', 'root' => $this->root],
+            ['tier' => 'COLD', 'root' => $coldRoot],
+        ]);
+
+        $result = (new StorageIntegrityAuditor($roots, new InMemoryStorageIntegrityReferenceEnumerator($rows)))->run();
+
+        self::assertSame(3, $result->checked);
+        self::assertSame(1, $result->failed);
+        self::assertSame('unsupported_or_unmapped_tier', $result->reportedIssues[0]['reason']);
+        self::assertSame(hash('sha256', 'REMOTE'), $result->reportedIssues[0]['tier_sha256']);
+
+        @unlink($coldPath);
+        @rmdir($coldRoot);
+    }
+
+    /** @return array{source: string, id: string, storage_tier: ?string, path: string, expected_size: ?int} */
+    private function row(string $source, string $id, string $path, ?int $size, ?string $tier = 'STANDARD'): array
+    {
+        return ['source' => $source, 'id' => $id, 'storage_tier' => $tier, 'path' => $path, 'expected_size' => $size];
+    }
+
+    private function roots(): LocalStorageAuditRoots
+    {
+        return new LocalStorageAuditRoots([['tier' => 'STANDARD', 'root' => $this->root]]);
     }
 }
 
@@ -121,7 +158,7 @@ final class InMemoryStorageIntegrityReferenceEnumerator implements StorageIntegr
 {
     public int $pageCalls = 0;
 
-    /** @param array<string, list<array{source: string, id: string, path: string, expected_size: ?int}>> $rows */
+    /** @param array<string, list<array{source: string, id: string, storage_tier: ?string, path: string, expected_size: ?int}>> $rows */
     public function __construct(private readonly array $rows) {}
 
     public function page(string $source, ?string $afterId, int $limit): array

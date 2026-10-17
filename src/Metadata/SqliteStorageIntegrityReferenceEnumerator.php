@@ -39,13 +39,12 @@ final class SqliteStorageIntegrityReferenceEnumerator implements StorageIntegrit
             self::RESTORE_SOURCE, self::RESTORE_TARGET => 'j.id > :after',
             default => 'o.id > :after',
         };
-        $objectSize = self::restoreObjectSizeSql();
         $sql = match ($source) {
-            self::OBJECT => "SELECT o.id, o.storage_path AS path, o.size AS expected_size FROM s3_objects o WHERE {$cursor} AND NOT o.is_delete_marker ORDER BY o.id LIMIT :limit",
-            self::RESTORED_OBJECT => "SELECT o.id, o.restored_storage_path AS path, o.size AS expected_size FROM s3_objects o WHERE {$cursor} AND o.restored_storage_path IS NOT NULL ORDER BY o.id LIMIT :limit",
-            self::MULTIPART_PART => "SELECT p.id, p.storage_path AS path, CASE WHEN json_extract(u.user_metadata, '$.\"__mpu-part-format\"') = 'encrypted-v2' THEN NULL ELSE p.size END AS expected_size FROM s3_parts p LEFT JOIN s3_multipart_uploads u ON u.upload_id = p.upload_id COLLATE BINARY WHERE {$cursor} ORDER BY p.id LIMIT :limit",
-            self::RESTORE_SOURCE => "SELECT j.id, j.source_storage_path AS path, {$objectSize} AS expected_size FROM s3_restore_jobs j WHERE {$cursor} AND j.status IN ('pending', 'processing') ORDER BY j.id LIMIT :limit",
-            self::RESTORE_TARGET => "SELECT j.id, j.restored_storage_path AS path, {$objectSize} AS expected_size FROM s3_restore_jobs j WHERE {$cursor} AND j.status IN ('pending', 'processing') AND j.restored_storage_path IS NOT NULL ORDER BY j.id LIMIT :limit",
+            self::OBJECT => "SELECT o.id, o.storage_tier, o.storage_path AS path, o.size AS expected_size FROM s3_objects o WHERE {$cursor} AND NOT o.is_delete_marker ORDER BY o.id LIMIT :limit",
+            self::RESTORED_OBJECT => "SELECT o.id, o.restored_storage_tier AS storage_tier, o.restored_storage_path AS path, o.size AS expected_size FROM s3_objects o WHERE {$cursor} AND o.restored_storage_path IS NOT NULL ORDER BY o.id LIMIT :limit",
+            self::MULTIPART_PART => "SELECT p.id, u.storage_tier, p.storage_path AS path, CASE WHEN json_extract(u.user_metadata, '$.\"__mpu-part-format\"') = 'encrypted-v2' THEN NULL ELSE p.size END AS expected_size FROM s3_parts p LEFT JOIN s3_multipart_uploads u ON u.upload_id = p.upload_id COLLATE BINARY WHERE {$cursor} ORDER BY p.id LIMIT :limit",
+            self::RESTORE_SOURCE => "SELECT j.id, o.storage_tier, j.source_storage_path AS path, o.size AS expected_size FROM s3_restore_jobs j JOIN s3_objects o ON " . self::restoreObjectMatchSql() . " AND o.storage_tier = j.source_tier COLLATE BINARY AND o.storage_path = j.source_storage_path COLLATE BINARY WHERE {$cursor} AND j.status IN ('pending', 'processing') ORDER BY j.id LIMIT :limit",
+            self::RESTORE_TARGET => "SELECT j.id, o.restored_storage_tier AS storage_tier, j.restored_storage_path AS path, o.size AS expected_size FROM s3_restore_jobs j JOIN s3_objects o ON " . self::restoreObjectMatchSql() . " AND o.restored_storage_path = j.restored_storage_path COLLATE BINARY WHERE {$cursor} AND j.status IN ('pending', 'processing') AND j.restored_storage_path IS NOT NULL ORDER BY j.id LIMIT :limit",
             default => throw new \InvalidArgumentException('Unknown storage audit source.'),
         };
 
@@ -70,7 +69,7 @@ final class SqliteStorageIntegrityReferenceEnumerator implements StorageIntegrit
 
     private static function validatePage(string $source, ?string $afterId, int $limit): void
     {
-        if (! in_array($source, self::SOURCES, true) || $limit < 1 || $limit > 500
+        if (! in_array($source, self::SOURCES, true) || $limit < 1 || $limit > 10_000
             || ($afterId !== null && (preg_match('/^(?:0|[1-9][0-9]*)$/D', $afterId) !== 1
                 || filter_var($afterId, FILTER_VALIDATE_INT) === false))) {
             throw new \InvalidArgumentException('Unknown storage audit source, cursor, or page size.');
@@ -78,7 +77,7 @@ final class SqliteStorageIntegrityReferenceEnumerator implements StorageIntegrit
     }
 
     /** @param array<array-key, mixed> $rows
-     *  @return list<array{source: string, id: string, path: string, expected_size: ?int}>
+     *  @return list<array{source: string, id: string, storage_tier: ?string, path: string, expected_size: ?int}>
      */
     private static function normalizeRows(array $rows, string $source): array
     {
@@ -89,14 +88,17 @@ final class SqliteStorageIntegrityReferenceEnumerator implements StorageIntegrit
             }
             $id = $row['id'] ?? null;
             $path = $row['path'] ?? null;
+            $tier = $row['storage_tier'] ?? null;
             $size = $row['expected_size'] ?? null;
             if ((! is_int($id) && ! is_string($id)) || ! is_string($path)
-                || strlen($path) > self::MAX_PATH_BYTES || str_contains($path, "\0")) {
+                || strlen($path) > self::MAX_PATH_BYTES || str_contains($path, "\0")
+                || ($tier !== null && (! is_string($tier) || strlen($tier) > 64 || str_contains($tier, "\0")))) {
                 throw new \UnexpectedValueException('Storage audit inventory row is invalid.');
             }
             $normalized[] = [
                 'source' => $source,
                 'id' => (string) $id,
+                'storage_tier' => $tier,
                 'path' => $path,
                 'expected_size' => self::normalizeSize($size),
             ];
@@ -120,13 +122,9 @@ final class SqliteStorageIntegrityReferenceEnumerator implements StorageIntegrit
         throw new \UnexpectedValueException('Storage audit inventory size is invalid.');
     }
 
-    private static function restoreObjectSizeSql(): string
+    private static function restoreObjectMatchSql(): string
     {
-        return <<<'SQL'
-            (SELECT o.size FROM s3_objects o
-             WHERE o.bucket = j.bucket AND o.key_name = j.key_name
-               AND ((j.version_id IS NULL AND o.is_latest = 1) OR o.version_id = j.version_id)
-             ORDER BY o.is_latest DESC, o.id DESC LIMIT 1)
-            SQL;
+        return 'o.bucket = j.bucket COLLATE BINARY AND o.key_name = j.key_name COLLATE BINARY '
+            . 'AND ((j.version_id IS NULL AND o.is_latest = 1) OR o.version_id = j.version_id COLLATE BINARY)';
     }
 }

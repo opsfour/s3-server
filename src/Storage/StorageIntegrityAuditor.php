@@ -6,24 +6,19 @@ namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Metadata\StorageIntegrityReferenceEnumerator;
 
-/** Offline, read-only verification of metadata references against a local root. */
+/** Offline, non-repairing verification of metadata references against local roots. */
 final class StorageIntegrityAuditor
 {
-    private readonly string $root;
-
     public function __construct(
-        string $storageRoot,
+        private readonly LocalStorageAuditRoots $roots,
         private readonly StorageIntegrityReferenceEnumerator $references,
-        private readonly int $pageSize = 100,
+        private readonly int $pageSize = 5_000,
         private readonly int $maxReportedIssues = 100,
     ) {
-        $canonical = realpath($storageRoot);
-        if (! str_starts_with($storageRoot, '/') || $canonical === false || $canonical !== rtrim($storageRoot, '/')
-            || is_link($storageRoot) || ! is_dir($storageRoot) || $pageSize < 1 || $pageSize > 500
+        if ($pageSize < 1 || $pageSize > 10_000
             || $maxReportedIssues < 0 || $maxReportedIssues > 10_000) {
-            throw new \InvalidArgumentException('Storage audit requires a canonical absolute local directory and valid limits.');
+            throw new \InvalidArgumentException('Storage audit page and issue limits are invalid.');
         }
-        $this->root = $canonical;
     }
 
     public function run(): StorageIntegrityAuditResult
@@ -44,13 +39,18 @@ final class StorageIntegrityAuditor
                 foreach ($page as $reference) {
                     ++$checked;
                     $counts[$source] = ($counts[$source] ?? 0) + 1;
-                    $reason = $this->inspect($reference['path'], $reference['expected_size']);
+                    $tier = $reference['storage_tier'];
+                    $root = $this->roots->rootFor($tier);
+                    $reason = $root === null
+                        ? 'unsupported_or_unmapped_tier'
+                        : $this->inspect($root, $reference['path'], $reference['expected_size']);
                     if ($reason !== null) {
                         ++$failed;
                         if (count($issues) < $this->maxReportedIssues) {
                             $issues[] = [
                                 'source' => $source,
                                 'reference_sha256' => hash('sha256', $source . "\0" . $reference['id']),
+                                'tier_sha256' => hash('sha256', $tier ?? "\0missing"),
                                 'path_sha256' => hash('sha256', $reference['path']),
                                 'reason' => $reason,
                             ];
@@ -68,9 +68,9 @@ final class StorageIntegrityAuditor
         return new StorageIntegrityAuditResult($checked, $failed, $counts, $issues);
     }
 
-    private function inspect(string $path, ?int $expectedSize): ?string
+    private function inspect(string $root, string $path, ?int $expectedSize): ?string
     {
-        $prefix = $this->root . '/';
+        $prefix = $root . '/';
         if (! str_starts_with($path, $prefix) || str_contains($path, "\0") || str_contains($path, '\\')) {
             return 'invalid_path';
         }
@@ -80,7 +80,7 @@ final class StorageIntegrityAuditor
             return 'invalid_path';
         }
 
-        $candidate = $this->root;
+        $candidate = $root;
         $last = array_key_last($parts);
         foreach ($parts as $index => $part) {
             $candidate .= '/' . $part;

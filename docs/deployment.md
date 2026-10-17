@@ -484,23 +484,51 @@ rsync -av /var/data/s3/ /backups/s3-storage/
 For tiered deployments, back up every configured physical storage tier. Metadata
 and object storage must be restored to a mutually consistent point in time. If
 that is not possible, restore metadata first, then stop every API and worker
-process and run the read-only local-storage audit before accepting writes:
+process and run the local-storage reference audit before accepting writes:
 
 ```bash
 php bin/s3-server storage:audit \
-  --storage-path=/var/data/s3 \
+  --storage-tier-root=STANDARD=/var/data/s3 \
   --metadata-driver=sqlite \
   --metadata-path=/var/data/s3/.opsfour/metadata.sqlite
 ```
 
+Repeat `--storage-tier-root=TIER=/canonical/root` for every referenced local
+filesystem tier. Tier names are byte-exact. `--storage-path=/var/data/s3`
+remains a shorthand for a single `STANDARD` tier. An unmapped tier fails the
+audit; do not map a remote or Flysystem tier to a local staging directory,
+because this command does not audit remote storage.
+
 Use `--metadata-driver=postgres|mysql --metadata-dsn=...` for an external
-metadata database. The command pages through object versions, restored copies,
-multipart parts, and active restore-job paths. It rejects paths outside the
-canonical storage root, symlinks, non-regular files, missing files, and size
-mismatches where metadata records the expected size. Output contains counts and
-SHA-256 identifiers only; it does not print object keys or physical paths. The
-audit never repairs or mutates data. A zero exit status means every enumerated
-reference passed; any finding or inventory error returns a nonzero status.
+metadata database, using a dedicated account with only `SELECT` privileges.
+The external connection issues only reads but does not enforce server-side
+read-only mode. SQLite is opened with `mode=ro` and `query_only`.
+
+The command takes the same exclusive per-root runtime locks as `S3Server` before
+opening metadata and retains them through the audit. Any running `S3Server`
+process using a mapped root therefore makes the command fail instead of
+producing a live, cross-page view. Operators must also stop every separate or
+custom writer and worker that does not run inside that lifecycle lock. The
+persistent `.opsfour/runtime.lock` coordination file may be created; object files
+and metadata are never repaired or changed.
+
+The audit pages through every object version, committed restored copy, multipart
+part, and restore-job path that still exactly matches the referenced object
+placement. Stale restore jobs whose tier or path no longer matches the object
+are not required to exist. It rejects paths outside their mapped canonical root,
+symlinks, non-regular files, missing files, and size mismatches where the stored
+format has an exact metadata size. Encrypted multipart envelopes are checked for
+reference existence and file type, while their physical size is not compared to
+the smaller logical part size.
+
+This is a reference-existence check for restoring a matched backup. It does not
+inventory unreferenced files or reconcile garbage rows, write intents,
+multipart assembly intents, transition targets, or anomalous delete-marker
+paths: those records can legitimately name bytes that are absent or awaiting
+cleanup and need their recovery-specific gates. Output contains counts and
+SHA-256 identifiers only; it does not print object keys, tier names, or physical
+paths. A zero exit status means every enumerated required reference passed; any
+finding or inventory error returns a nonzero status.
 
 ### Retained encrypted multipart part intents
 

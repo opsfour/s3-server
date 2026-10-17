@@ -7,7 +7,7 @@ namespace OpsFour\S3Server\Storage;
 final class StorageIntegrityAuditResult
 {
     /** @param array<string, int> $sourceCounts
-     *  @param list<array{source: string, reference_sha256: string, path_sha256: string, reason: string}> $reportedIssues
+     *  @param list<array{source: string, reference_sha256: string, tier_sha256: string, path_sha256: string, reason: string}> $reportedIssues
      */
     public function __construct(
         public readonly int $checked,

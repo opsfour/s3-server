@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Tests\Unit\Console;
 use OpsFour\S3Server\Console\StorageAuditCommand;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\SqliteStorageIntegrityReferenceEnumerator;
+use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Tester\CommandTester;
@@ -30,6 +31,8 @@ final class StorageAuditCommandTest extends TestCase
 
     protected function tearDown(): void
     {
+        @unlink($this->root . '/.opsfour/runtime.lock');
+        @rmdir($this->root . '/.opsfour');
         foreach (glob($this->root . '/*') ?: [] as $path) {
             @unlink($path);
         }
@@ -115,6 +118,45 @@ final class StorageAuditCommandTest extends TestCase
         self::assertFileDoesNotExist($this->root . '/.opsfour/metadata.sqlite');
     }
 
+    public function test_command_requires_an_explicit_local_root_for_every_referenced_tier(): void
+    {
+        $coldRoot = $this->root . '-cold';
+        self::assertTrue(mkdir($coldRoot, 0o700));
+        $coldRoot = (string) realpath($coldRoot);
+        $metadata = new SqliteMetadataStore($this->databasePath);
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $coldPath = $coldRoot . '/cold-object';
+        self::assertSame(4, file_put_contents($coldPath, 'cold'));
+        $metadata->putObjectMetadata('bucket', 'cold', 'owner', 4, 'etag', 'text/plain', $coldPath);
+        $writer = new \PDO('sqlite:' . $this->databasePath);
+        self::assertSame(1, $writer->exec("UPDATE s3_objects SET storage_tier = 'COLD' WHERE key_name = 'cold'"));
+        unset($writer);
+
+        try {
+            $missing = new CommandTester(new StorageAuditCommand());
+            self::assertSame(Command::FAILURE, $missing->execute([
+                '--metadata-path' => $this->databasePath,
+                '--storage-tier-root' => ['STANDARD=' . $this->root],
+            ]), $missing->getDisplay());
+            self::assertStringContainsString('unsupported_or_unmapped_tier', $missing->getDisplay());
+
+            $mapped = new CommandTester(new StorageAuditCommand());
+            self::assertSame(Command::SUCCESS, $mapped->execute([
+                '--metadata-path' => $this->databasePath,
+                '--storage-tier-root' => [
+                    'STANDARD=' . $this->root,
+                    'COLD=' . $coldRoot,
+                ],
+            ]), $mapped->getDisplay());
+        } finally {
+            @unlink($coldRoot . '/.opsfour/runtime.lock');
+            @rmdir($coldRoot . '/.opsfour');
+            @unlink($coldPath);
+            @rmdir($coldRoot);
+        }
+    }
+
     public function test_binary_registers_offline_audit_help(): void
     {
         $process = new Process([PHP_BINARY, __DIR__ . '/../../../bin/s3-server', 'storage:audit', '--help']);
@@ -122,7 +164,29 @@ final class StorageAuditCommandTest extends TestCase
 
         self::assertTrue($process->isSuccessful(), $process->getErrorOutput());
         self::assertStringContainsString('Verify local storage references while the server is offline', $process->getOutput());
+        self::assertStringContainsString('non-repairing', $process->getOutput());
         self::assertStringContainsString('--metadata-dsn', $process->getOutput());
         self::assertStringContainsString('--storage-path', $process->getOutput());
+        self::assertStringContainsString('--storage-tier-root', $process->getOutput());
+    }
+
+    public function test_command_refuses_to_run_while_the_local_root_is_owned(): void
+    {
+        $locks = LocalStorageRootLocks::create();
+        $locks->acquireRoots([$this->root]);
+
+        try {
+            $tester = new CommandTester(new StorageAuditCommand());
+            $exit = $tester->execute([
+                '--metadata-path' => $this->databasePath,
+                '--storage-path' => $this->root,
+            ]);
+
+            self::assertSame(Command::FAILURE, $exit, $tester->getDisplay());
+            self::assertStringContainsString('Storage integrity audit failed', $tester->getDisplay());
+            self::assertFileDoesNotExist($this->databasePath);
+        } finally {
+            $locks->release();
+        }
     }
 }
