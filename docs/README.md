@@ -18,7 +18,6 @@ available on request under separately agreed terms.
 - [Configuration Reference](configuration.md) — All environment variables, defaults, and validation rules
 - [Laravel Integration](laravel-integration.md) — Service provider, Artisan commands, publishing config
 - [Symfony Integration](symfony-integration.md) — Bundle registration, console commands, config, and production setup
-- [Symfony Integration Plan](symfony-integration-plan.md) — Completed Symfony Bundle checklist and optional follow-ups
 
 ## Core Concepts
 
@@ -33,15 +32,14 @@ available on request under separately agreed terms.
 - [Versioning & Object Lock](versioning.md) — Bucket versioning, retention, legal holds
 - [Notifications](notifications.md) — Event notifications and webhook delivery
 - [Lifecycle Rules](lifecycle.md) — Object expiration and automated cleanup
-- [Production Feature Roadmap](production-feature-roadmap.md) — Quotas, IAM/OIDC, eventing, lifecycle hardening, and deferred AWS features
-- [Production Hardening Status](production-hardening-status.md) — Release blockers, remediation progress, and verified acceptance criteria
+- [Production Feature Roadmap](production-feature-roadmap.md) — Status definitions, current production target, next profiles, and deferred scope
 - [Policy Compatibility Matrix](policy-compatibility.md) — Supported bucket policy principals, actions, resources, conditions, and fail-closed behavior
 - [S3 Select](s3-select.md) — SQL queries over unencrypted CSV and JSON objects
 
 ## Operations
 
 - [Production Deployment](deployment.md) — TLS, scaling, monitoring, health checks, backups
-- [Release Checklist](release-checklist.md) — Production readiness checks before tagging
+- [Release Checklist](release-checklist.md) — Universal and profile-specific gates before tagging
 - [Changelog](../CHANGELOG.md) — Versioned release history and upgrade scope
 - [Architecture](architecture.md) — Internals, middleware stack, async design
 - [Development](development.md) — Running tests, extending handlers, contributing

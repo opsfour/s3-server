@@ -29,6 +29,22 @@ vendor/bin/phpunit tests/Unit/Parallel/ParallelEncryptionServiceTest.php
 vendor/bin/phpunit --filter test_small_payload_runs_inline_sse_s3
 ```
 
+Before a release, run the complete quality gate:
+
+```bash
+composer quality
+composer validate --strict
+composer audit --locked
+git diff --check
+```
+
+Tests that need an external database, object-storage provider, destructive
+migration fixture, long soak, or other opt-in environment may skip in the
+default local suite. A skip is acceptable only when that profile is outside the
+current run. When a release advertises the profile, configure its dependencies
+and treat every required skip as a failure. Review the skip list rather than
+relying on a fixed expected count.
+
 ### Test Structure
 
 ```
@@ -194,15 +210,10 @@ PHPStan level 8 covers both `src/` and `tests/`. CI also installs the lowest
 and highest allowed Composer dependency sets: Laravel 12 with Symfony 7.4 LTS,
 and Laravel 13 with Symfony 8.1 or newer.
 
-## Current Test Baseline
+## Release Profiles
 
-The current unreleased correction records this focused local result:
-
-```
-198 tests, 1548 assertions, 2 expected environment skips, 0 failures
-```
-
-PHPStan and PHP CS Fixer across 957 files also pass. The complete package gate,
-external database, remote-storage, load-balancer, and long-soak profiles remain
-separate gates; see the [release checklist](release-checklist.md). Multi-host
-storage qualification applies only to profiles advertised by a release.
+The default suite is the universal starting point. Database, framework,
+storage, proxy, load, and topology profiles add gates only when the release
+advertises them. Do not copy test counts or timings into maintained docs;
+record commit-specific evidence with the release artifacts. See the
+[release checklist](release-checklist.md).

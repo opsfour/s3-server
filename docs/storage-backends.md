@@ -2,6 +2,18 @@
 
 The storage backend is responsible for persisting object data (the actual bytes). Metadata (bucket/object records, ACLs, etc.) is handled separately by the [metadata backend](metadata-backends.md).
 
+The status terms below come from the
+[production feature roadmap](production-feature-roadmap.md). This is the
+canonical storage support matrix:
+
+| Backend | Status | Current use |
+|---------|--------|-------------|
+| Persistent local filesystem on Linux | Implemented and Supported | Current single-host production target; qualification is pending the release gates and the durability blocker below |
+| Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
+| Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
+| NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
+| Custom `StorageBackend` | Implemented extension point; unqualified by default | Qualification belongs to the concrete implementation and deployment profile |
+
 Bucket names can be reused after deletion. The current server therefore never calls the backend's bucket-wide delete from `DeleteBucket`; it removes only recorded object and multipart paths. Custom `StorageBackend` implementations must keep `createBucket()` idempotent and contents-preserving. The name-only `deleteBucket()` method must not be used for automatic cleanup while name reuse is possible. Filesystem and direct/worker-backed Flysystem reject that method with `LogicException`. This changes the public backend contract for callers that invoked it directly; delete only known exact paths. Automatic marker and orphan reclamation requires a separately qualified, generation-scoped implementation.
 
 The S3 AbortMultipartUpload inline path now deletes only the committed part
@@ -81,14 +93,17 @@ is an optional, currently unqualified profile and does not gate releases for
 the qualified local-filesystem or provider-specific storage profiles.
 
 The backend closes temporary files and renames them into place, but it does
-not currently `fsync` the file and containing directory. Atomic visibility
-therefore does not prove that an acknowledged write survives sudden host
-power loss. Qualify the chosen filesystem, mount options, and crash-recovery
-behavior before making a power-loss durability claim for local production.
+not currently `fsync` the file and containing directory. This is a
+qualification blocker for acknowledged-write durability across sudden host
+power loss. The local-filesystem profile must not be marked Qualified for that
+durability contract until the implementation performs the required syncs and
+the exact filesystem and mount pass the crash-recovery gate.
 
 ## Flysystem
 
-Stores objects via the [League\Flysystem](https://flysystem.thephpleague.com/) abstraction. Supports any Flysystem adapter: S3, GCS, Azure Blob, SFTP, and more.
+Stores objects via the [League\Flysystem](https://flysystem.thephpleague.com/)
+abstraction. The integration accepts adapters for S3, GCS, Azure Blob, SFTP,
+and other services, but adapter compatibility does not grant production status.
 
 ```bash
 S3_STORAGE_DRIVER=flysystem
@@ -116,11 +131,11 @@ S3_BACKING_READ_TIMEOUT_SECONDS=15
 S3_BACKING_REQUEST_TIMEOUT_SECONDS=0
 ```
 
-Flysystem remains available for development and integration testing. The first
-production release will qualify a remote provider only after a provider-side
-write fence proves that an abandoned multipart path cannot reappear after
-cleanup. A generic Flysystem adapter does not provide that guarantee; its
-current retained-intent cap can eventually stop an owner's new completions.
+Flysystem remains available for development and integration testing. A remote
+provider can move beyond this status only after a provider-side write fence
+proves that an abandoned multipart path cannot reappear after cleanup. A
+generic Flysystem adapter does not provide that guarantee; its current
+retained-intent cap can eventually stop an owner's new completions.
 API startup now refuses every configured direct or worker-backed Flysystem tier,
 including tiers wrapped for metrics, and unknown custom storage backends. The
 built-in filesystem backend starts normally on recognized persistent local
@@ -279,18 +294,12 @@ S3_STORAGE_DRIVER=memory
 
 ## Choosing a Backend
 
-| Backend | Persistence | Speed | Multi-Node | Use Case |
-|---------|-------------|-------|------------|----------|
-| Filesystem | Disk | Fast | No | Production (single node) |
-| Flysystem workers | Depends on adapter | Bounded worker pool | Technically shared; production fence pending | Integration and fault testing |
-| Memory | None | Fastest | No | Testing only |
-
-For production single-node deployments, use `filesystem`. PostgreSQL and MySQL
-support multi-node metadata, but the first production release must not use a
-remote Flysystem tier until its provider-side write fence is qualified. Worker
-mode bounds event-loop blocking and remains necessary for remote testing; it
-does not supply that fence. Direct `FilesystemOperator` mode can stall unrelated
-requests in a 24/7 Amp process.
+Use `filesystem` for the current single-host production target and complete its
+release gates before deployment. PostgreSQL and MySQL can share metadata, but
+that does not change the storage status or qualify multiple hosts. Flysystem
+worker mode bounds event-loop blocking during experiments; it does not qualify
+an adapter or provider. Direct `FilesystemOperator` mode can stall unrelated
+requests in the Amp process.
 
 ## Physical Storage Tiers
 

@@ -37,13 +37,15 @@ This wraps SQLite operations in `amphp/parallel` workers, preventing lock conten
 ### When to Use SQLite
 
 - Development and testing
-- Single-node production with < 1000 requests/second
-- Archival servers with bursty read patterns
+- The current single-host, single-process production target
+- Deployments that accept a local database and SQLite's single-writer model
 
 ## PostgreSQL
 
-Designed for multi-node production metadata. A shared metadata database does
-not by itself qualify the selected object-storage backend for multiple hosts.
+PostgreSQL provides shared metadata and non-blocking database I/O. It is
+supported for the current single-host target and can later support qualified
+multi-process or multi-host profiles. A shared metadata database does not by
+itself qualify object storage, process coordination, or a multi-host topology.
 
 ```bash
 S3_METADATA_DRIVER=postgres
@@ -76,16 +78,18 @@ S3_METADATA_DSN="host=pgbouncer.internal port=6432 dbname=s3server user=s3 passw
 
 ### When to Use PostgreSQL
 
-- Multi-node deployments
-- High-availability requirements
-- > 1000 requests/second sustained
+- Teams that already operate PostgreSQL or need database-level availability
+- Workloads that should avoid SQLite's single-writer constraint
 - Shared rate limiting across nodes using metadata-database time for refill and cleanup
 - A failed rate-limit database check returns S3 `SlowDown` (503) when the limit is enabled; readiness probes that write path every 30 seconds
-- Notification queue with multi-node processing
+- Notification queue coordination for later qualified multi-process or
+  multi-host profiles
 
 ## MySQL
 
-Alternative to PostgreSQL for teams with MySQL expertise.
+MySQL is the supported alternative for teams with MySQL expertise. As with
+PostgreSQL, shared metadata does not qualify shared object storage or multiple
+hosts.
 
 ```bash
 S3_METADATA_DRIVER=mysql
@@ -95,10 +99,9 @@ S3_METADATA_DSN="host=db.internal;port=3306;dbname=s3server;user=s3;password=sec
 Uses `amphp/mysql` connection pooling with the same non-blocking Fiber-based
 execution as Postgres. The supported baseline is MySQL 8.0 or newer with
 InnoDB. The default `REPEATABLE READ` isolation level is supported; owner-scoped
-write-lock rows serialize quota-sensitive writes across nodes. MariaDB 10.6 has
-disposable baseline coverage, and MariaDB 11.8 passed the latest migration,
-notification-lease, multipart-cleanup, and two-node profiles. Production
-rollout and distributed MySQL variants remain untested.
+write-lock rows serialize quota-sensitive writes across processes. MariaDB and
+distributed MySQL variants are outside the current production target and
+remain experimental compatibility profiles.
 
 The `transaction()` convenience method can be called from normal synchronous
 CLI code or from an Amp Fiber. Direct `beginTransaction()`, `commit()`, and
@@ -112,7 +115,7 @@ commits or rolls back.
 
 - Teams already operating MySQL infrastructure
 - MySQL-managed services that preserve InnoDB transactions and row locks
-- Same capabilities as PostgreSQL backend
+- Workloads that should avoid SQLite's single-writer constraint
 
 ## Schema Migrations
 
@@ -307,8 +310,9 @@ operations must be safe to repeat.
 | Criteria | SQLite | PostgreSQL | MySQL |
 |----------|--------|------------|-------|
 | Setup complexity | Zero | Moderate | Moderate |
-| Single-node | Excellent | Excellent | Excellent |
-| Multi-node | Not supported | Excellent | Excellent |
+| Current single-host target | Supported | Supported | Supported |
+| Shared metadata | No | Yes | Yes |
+| Qualified multi-host object storage | No | No; separate storage profile required | No; separate storage profile required |
 | Shared rate limiting | Per-process only | Across all nodes | Across all nodes |
 | Notification queue | Single consumer | Multi-consumer (SKIP LOCKED) | Multi-consumer (SKIP LOCKED) |
 | Throughput | Measure on the target workload and deployment | Measure on the target workload and deployment | Measure on the target workload and deployment |

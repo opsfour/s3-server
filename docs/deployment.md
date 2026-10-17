@@ -3,25 +3,19 @@
 ## Architecture Overview
 
 ```
-                    ┌──────────────┐
-                    │  Load Balancer│
-                    │  (TLS term)   │
-                    └──────┬───────┘
-                           │
-              ┌────────────┼───────────┐
-              │            │           │
-        ┌─────▼──┐  ┌──────▼─┐  ┌──────▼─┐
-        │ S3 Node│  │ S3 Node│  │ S3 Node│
-        │  :9000 │  │  :9000 │  │  :9000 │
-        └────┬───┘  └────┬───┘  └────┬───┘
-             │           │           │
-             └─────┬─────┘───────────┘
-                   │
-            ┌──────▼──────┐    ┌──────────┐
-            │ PostgreSQL  │    │ Shared   │
-            │ (metadata)  │    │ Storage  │
-            └─────────────┘    └──────────┘
+Client ──TLS──▶ reverse proxy (optional) ──▶ one S3 API process
+                                                  │
+                                  ┌───────────────┴───────────────┐
+                                  ▼                               ▼
+                        persistent local filesystem      metadata database
+                                                        SQLite/PostgreSQL/MySQL
 ```
+
+This is the current production target: Linux, one host, one API process, and a
+persistent local filesystem. The proxy is optional, but if present it must
+preserve the signed `Host` header exactly. Additional processes, remote storage,
+shared filesystems, and multiple hosts are separate experimental profiles; see
+the [roadmap](production-feature-roadmap.md).
 
 ## Single-Node Deployment
 
@@ -39,17 +33,15 @@ S3_RATE_LIMIT=1000
 S3_ENCRYPTION_MASTER_KEYS='{"key-2025":"BASE64_KEY_HERE"}'
 ```
 
-## Multiple API Processes on One Host
+## Experimental: Multiple API Processes on One Host
 
-Multiple API processes on one host can share a qualified local filesystem and
-PostgreSQL/MySQL metadata. The local two-node proxy gate covers this shape;
-it does not establish host-level failover or remote-mount semantics. NFS, EFS,
-SMB, and FUSE mounts are not qualified for `S3_STORAGE_PATH`; see
-[Storage Backends](storage-backends.md#requirements). A multi-host production
-storage backend is required to pass a separate release gate before the first
-release that advertises that profile; the one-host proxy result does not
-qualify it. NFS/EFS filesystem storage is optional and its qualification does
-not gate package releases for other supported storage profiles.
+Multiple API processes on one host are implemented but are outside the initial
+qualified profile. They may share a local filesystem and PostgreSQL/MySQL
+metadata only after the exact process, lock, temporary-directory, and shutdown
+configuration passes the profile-specific release gates. This does not
+establish host-level failover or remote-mount semantics. NFS, EFS, SMB, and
+FUSE mounts are not qualified for `S3_STORAGE_PATH`; see
+[Storage Backends](storage-backends.md#requirements).
 PostgreSQL API nodes require `pecl-pq` and its `raphf` dependency. The server
 refuses to start with only `ext-pgsql`, because an abrupt database disconnect
 can terminate that event-loop backend. Verify both extensions with `php -m`
@@ -57,7 +49,7 @@ before starting the API process. The PostgreSQL `S3_CREDENTIALS_DRIVER=database`
 example also uses `pdo_pgsql` for credential storage.
 
 ```bash
-# All nodes share these settings
+# All API processes share these settings
 S3_METADATA_DRIVER=postgres
 S3_METADATA_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=secret"
 S3_CREDENTIALS_DRIVER=database
@@ -66,24 +58,24 @@ S3_CREDENTIALS_USERNAME=s3
 S3_CREDENTIALS_PASSWORD=secret
 S3_CREDENTIALS_CACHE_TTL=1
 S3_STORAGE_DRIVER=filesystem
-S3_STORAGE_PATH=/srv/s3-data   # Same qualified local filesystem for both API processes
+S3_STORAGE_PATH=/srv/s3-data   # Same local filesystem under evaluation
 ```
 
-In multi-node mode:
-- Give every node the same credential source, account owner IDs, global quota
+When evaluating this profile:
+- Give every API process the same credential source, account owner IDs, global quota
   defaults, storage tiers, and encryption keys. Different owner IDs or quota
   defaults can produce inconsistent authorization and limits for the same
-  access key across nodes.
-- An API node refuses to start if persisted objects, lifecycle transitions,
+  access key across processes.
+- An API process refuses to start if persisted objects, lifecycle transitions,
   queued tier work, or storage garbage reference a tier absent from its
   configuration. Keep retired tier backends available until their references
   have been migrated or removed. Dedicated tier workers may use a subset and
   defer jobs they cannot perform.
-- Rate limiting is shared across all nodes (database-backed)
-- Credential revocations and rotations become visible on every node within
+- Rate limiting is shared across all processes (database-backed)
+- Credential revocations and rotations become visible to every process within
   `S3_CREDENTIALS_CACHE_TTL` seconds; set it to `0` for a database read on
   every authenticated request
-- Notification workers use `FOR UPDATE SKIP LOCKED` so two nodes do not lease
+- Notification workers use `FOR UPDATE SKIP LOCKED` so two processes do not lease
   the same pending row at once. A delivery may still repeat after a worker
   crashes or the receiver times out; consumers should handle duplicate events.
 - Stop old API and background-worker processes before a schema upgrade. Run
@@ -527,12 +519,11 @@ Run the test suite for the deployment driver mix before rollout:
 vendor/bin/phpunit
 ```
 
-For external S3-compatible storage backends, run the opt-in integration tests
-with real credentials in a non-production bucket. Use a dedicated bucket and
-short object retention so failed test data is easy to clean up.
-These tests do not qualify remote production. A provider-side fence for delayed
-writes to abandoned multipart paths is a separate release gate; generic
-Flysystem adapters have not passed it.
+For an experimental external S3-compatible storage profile, run the opt-in
+integration tests with real credentials in a non-production bucket. Use a
+dedicated bucket and short object retention so failed test data is easy to
+clean up. Passing those tests does not qualify the profile; complete the
+provider-specific gates in the [release checklist](release-checklist.md).
 
 ## Network Hardening
 

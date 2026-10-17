@@ -179,8 +179,10 @@ The command operates on the metadata store configured in
 
 ## Production Configuration
 
-Use PostgreSQL or MySQL metadata for long-running production deployments.
-SQLite is useful for local development and tests.
+SQLite, PostgreSQL, and MySQL are supported for the current single-host,
+single-process target. Use SQLite when a local database and its single-writer
+model fit the workload. Use PostgreSQL or MySQL when the deployment already
+operates that database or needs to avoid SQLite's single-writer constraint.
 
 ```yaml
 opsfour_s3_server:
@@ -543,5 +545,5 @@ Optional follow-ups:
 
 - Additional convenience commands if needed
 
-See [Symfony Integration Plan](symfony-integration-plan.md) for the completed
-checklist and remaining optional ecosystem work.
+See the [production feature roadmap](production-feature-roadmap.md) for current
+scope and optional future profiles.

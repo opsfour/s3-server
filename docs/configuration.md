@@ -53,13 +53,18 @@ list ignores forwarded headers.
 
 ## Storage
 
+`filesystem` is the storage driver for the current production target.
+`flysystem`, remote or shared storage, and `memory` belong to experimental or
+test-only profiles until the exact deployment is qualified. See the canonical
+[storage support matrix](storage-backends.md).
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_STORAGE_DRIVER` | `filesystem` | Storage backend: `filesystem`, `flysystem`, or `memory` |
+| `S3_STORAGE_DRIVER` | `filesystem` | Storage backend. `flysystem` and `memory` do not belong to the current production target. |
 | `S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS` | `false` | **Unsafe test-only override:** permits API startup with Flysystem or unverified custom storage tiers. Never enable in production; a remote late write may recreate an abandoned path after cleanup. Laravel uses `allow_unfenced_storage_for_tests`; Symfony uses `server.allow_unfenced_storage_for_tests`. |
 | `S3_STORAGE_TEMP_DIR` | system temp directory | Local staging directory for Flysystem transfers |
 | `S3_STORAGE_TEMP_BUDGET` | `10737418240` (10 GiB) | Maximum concurrent temporary bytes for direct and worker-backed Flysystem staging, including PUT, UploadPart, CopyObject, and multipart assembly, among processes sharing `S3_STORAGE_TEMP_DIR`; writes that exceed the budget receive 503 SlowDown. GET streams directly from a read worker. Worker mode may need space for both its API and worker copy. |
-| `S3_FLYSYSTEM_WORKERS` | `0` | Workers per Flysystem pool; remote mode creates separate read and write pools, each with this limit (up to twice this many processes). A positive value is required for non-blocking remote production I/O. |
+| `S3_FLYSYSTEM_WORKERS` | `0` | Workers per Flysystem pool; remote mode creates separate read and write pools, each with this limit (up to twice this many processes). A positive value is required when evaluating non-blocking remote I/O. It does not qualify that profile for production. |
 | `S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS` | `20` | Maximum time for a worker-backed GET to acquire a read worker and produce its first byte; expiry returns 503 SlowDown. At most one extra GET waits per read worker; excess requests receive immediate 503. A third-party adapter blocked in synchronous I/O may retain its worker until that call ends. |
 | `S3_FLYSYSTEM_FACTORY_SERVICE` | none | Laravel service ID of a serializable `FlysystemFilesystemFactory` |
 | `S3_BACKING_BUCKET` | - | Backing S3 bucket; required by standalone Flysystem mode |
@@ -223,7 +228,13 @@ which names one entry. Vault responses are bounded to 1 MiB.
 |----------|---------|-------------|
 | `S3_RATE_LIMIT` | `1000` | Max requests per second per IP (0 = unlimited) |
 
-Rate limit state is persisted in the metadata database and survives server restarts. On multi-node deployments with Postgres/MySQL, rate limiting is shared across nodes. An enabled limit fails closed with S3 `SlowDown` (503) when its database check fails; `/.health` reports degraded after its next rate-limit probe (within 30 seconds), while `/.live` remains available. With `S3_RATE_LIMIT=0`, no rate-limit database check runs.
+Rate limit state is persisted in the metadata database and survives server
+restarts. PostgreSQL and MySQL can share rate-limit state when evaluating an
+experimental multi-process or multi-host profile; that capability alone does
+not qualify the topology. An enabled limit fails closed with S3 `SlowDown`
+(503) when its database check fails; `/.health` reports degraded after its next
+rate-limit probe (within 30 seconds), while `/.live` remains available. With
+`S3_RATE_LIMIT=0`, no rate-limit database check runs.
 
 Management requests under `/.admin/*` and `/.metrics` also fail closed when
 their rate-limit check fails. Downstream handler, backend, and rate-limit

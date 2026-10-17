@@ -31,6 +31,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Clarify the production target, shared support-status definitions, and the
+  separation between universal release gates and optional deployment profiles.
 - Export `bin/s3-server` as the Composer package binary, report the installed
   package version from `--version`, and declare the DOM, libxml, and SimpleXML
   PHP extensions required by the public runtime.

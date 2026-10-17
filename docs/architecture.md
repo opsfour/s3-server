@@ -2,7 +2,11 @@
 
 ## Overview
 
-opsfour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concurrency framework for PHP. It uses PHP 8.4 Fibers for cooperative multitasking — a single process handles thousands of concurrent connections without threads or child processes.
+opsfour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking
+concurrency framework for PHP. It uses PHP 8.4 Fibers for cooperative
+multitasking. The API event loop may also use bounded child-process pools for
+blocking SQLite, encryption, checksum, S3 Select, temporary-file, or
+experimental Flysystem work.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -33,6 +37,11 @@ opsfour S3 Server is built on [Amp v3](https://amphp.org/), a non-blocking concu
 │  └─────────┘  └──────────┘  └────────────────────┘      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+The current production target uses one API process, a persistent local
+filesystem, and SQLite, PostgreSQL, or MySQL metadata. The Flysystem and memory
+drivers shown in the component model are experimental or test-only deployment
+profiles; see [Storage Backends](storage-backends.md).
 
 ## Request Lifecycle
 
@@ -94,12 +103,14 @@ Request-path I/O uses PHP Fibers:
 - **PostgreSQL** — `amphp/postgres` (non-blocking protocol, connection pool)
 - **MySQL** — `amphp/mysql` (non-blocking protocol, connection pool)
 - **SQLite** — PDO (blocking, optionally offloaded to `amphp/parallel` worker pool)
-- **Flysystem** — synchronous adapters; production worker mode offloads every
+- **Flysystem** — synchronous adapters; experimental worker mode offloads every
   adapter call to a bounded `amphp/parallel` process pool
 - **DNS** — `amphp/dns` (async resolution for webhook SSRF checks)
 - **HTTP client** — `amphp/http-client` (for webhook delivery)
 
-A single server process can handle thousands of concurrent requests because Fibers yield during I/O waits, allowing other requests to proceed.
+Fibers let other requests proceed while supported I/O waits. Capacity depends
+on the endpoint, backend, object size, worker limits, PHP configuration, and
+host; the package does not make a general throughput claim.
 
 ## Storage Architecture
 
@@ -157,16 +168,25 @@ synchronous; the processor runs as a background Fiber with its own polling
 loop. Internal listeners and optional Redis/Kafka/AMQP/NATS broker adapters
 run in-process without this persistent queue or its retry schedule.
 
-## Multi-Tenancy
+## Identity, Accounts, and Administration
 
 Every credential has an `ownerId`. The ownership model is enforced at every level:
 
 - **Bucket creation** — assigns `ownerId` to the bucket
 - **Bucket access** — verifies `ownerId` matches on every operation
 - **ListBuckets** — filters by `ownerId`
-- **Object operations** — inherit bucket ownership
+- **Object operations** — use bucket and object ownership plus policy and ACL
+  evaluation
 
-There is no global admin concept. Each tenant sees only their own buckets and objects.
+Signed cross-account access requires an identity-side Allow and resource-side
+consent through a bucket policy or applicable ACL. Explicit Deny takes
+precedence. See [Policy Compatibility](policy-compatibility.md) for the exact
+surface.
+
+The S3 data plane is separate from the optional administration plane under
+`/.admin/*`. Admin endpoints use their configured bearer or OIDC protection and
+manage credentials, policies, and quotas; they do not bypass S3 authorization
+for object requests. Keep admin endpoints private in production.
 
 ## Handler Registry
 

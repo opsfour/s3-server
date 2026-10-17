@@ -9,9 +9,11 @@ PHP Fibers.
 - **Broad S3 API coverage** — 69 routed S3 operations including multipart uploads, versioning, Object Ownership controls, object lock, lifecycle rules, S3 Select, restore, and website hosting
 - **AWS SDK compatible** — Tested with the AWS SDK for PHP; standard S3 clients can use the documented operation subset
 - **Multiple metadata backends** — SQLite for one node; PostgreSQL and MySQL
-  for shared cluster metadata. Review the documented storage requirements
-  before deploying API nodes on separate hosts.
-- **Multiple storage backends** — Local filesystem, Flysystem (S3, GCS, Azure, SFTP), or in-memory for development with volatile SQLite metadata; remote Flysystem production qualification requires a provider-verified write fence
+  are also supported for the initial single-host target and provide shared
+  metadata for later qualified profiles
+- **Multiple storage backends** — Persistent local filesystem for the current
+  production target; Flysystem and in-memory drivers for experimental and test
+  profiles
 - **Optional server-side encryption** — SSE-S3 with key rotation support and SSE-C (customer-provided keys), using AES-256-GCM when configured
 - **Authentication** — AWS Signature V4, presigned URLs, signed and unsigned `aws-chunked` checksum trailers
 - **Multi-tenant** — Owner IDs isolate buckets by default; explicit grants can allow cross-account object access. Credential providers include memory, database, file, and chain.
@@ -21,16 +23,26 @@ PHP Fibers.
 - **S3 Select** — SQL queries over unencrypted CSV and JSON objects
 - **Lifecycle management** — Expiration, noncurrent version cleanup, abort incomplete uploads
 - **Rate limiting** — Per-IP token bucket persisted to database, survives restarts
-- **Release checks** — Default suite plus opt-in large-object, high-concurrency,
-  remote-storage, and long-soak profiles. A current-source 12-hour soak is
-  required before advertising a qualified remote backend and is deferred until
-  that backend has a provider-verified write fence; see the
+- **Release checks** — Universal gates for the package plus separate gates for
+  every advertised deployment profile; see the
   [release checklist](docs/release-checklist.md)
 
 Signed access across local accounts requires an explicit Allow in the requester's
 account or attached credential policy and a bucket-policy or ACL grant from the
 resource side. Existing cross-account grants need both permissions when upgrading;
 see [Policy Compatibility](docs/policy-compatibility.md).
+
+## Production Target
+
+The initial production target is Linux on one host with one API process,
+persistent local filesystem storage, and SQLite, PostgreSQL, or MySQL metadata.
+It supports the standalone CLI, Laravel, and Symfony, either directly or behind
+a reverse proxy that preserves the signed `Host` header exactly.
+
+Memory storage is test-only. Flysystem, remote and shared filesystems, NFS/EFS,
+multiple API processes, and multiple hosts remain experimental until each exact
+profile completes its own qualification gates. See the
+[roadmap and status definitions](docs/production-feature-roadmap.md).
 
 ## Requirements
 
