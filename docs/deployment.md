@@ -453,18 +453,18 @@ process and run the local-storage reference audit before accepting writes:
 
 ```bash
 php bin/s3-server storage:audit \
-  --storage-tier-root='{"tier":"STANDARD","root":"/var/data/s3"}' \
+  --storage-tier-root='["STANDARD","/var/data/s3"]' \
   --metadata-driver=sqlite \
   --metadata-path=/var/data/s3/.opsfour/metadata.sqlite
 ```
 
-Repeat `--storage-tier-root='{"tier":"TIER","root":"/canonical/root"}'` for
-every referenced local filesystem tier. Each value must be a JSON object with
-exactly the string fields `tier` and `root`; this keeps tier names such as
-`HOT=ARCHIVE` byte-exact. `--storage-path=/var/data/s3` remains a shorthand for
-a single `STANDARD` tier. An unmapped tier fails the audit; do not map a remote
-or Flysystem tier to a local staging directory, because this command does not
-audit remote storage.
+Repeat `--storage-tier-root='["TIER","/canonical/root"]'` for every referenced
+local filesystem tier. Each value must be a two-string JSON tuple containing
+the tier and root in that order; this keeps tier names such as `HOT=ARCHIVE`
+byte-exact. `--storage-path=/var/data/s3` remains a shorthand for a single
+`STANDARD` tier. An unmapped tier fails the audit; do not map a remote or
+Flysystem tier to a local staging directory, because this command does not audit
+remote storage.
 
 Use `--metadata-driver=postgres|mysql --metadata-dsn=...` for an external
 metadata database, using a dedicated account with only `SELECT` privileges.

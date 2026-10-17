@@ -28,7 +28,7 @@ final class StorageAuditCommand extends Command
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', getenv('S3_METADATA_DSN') ?: '')
             ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root (shorthand)', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping JSON: {"tier":"HOT","root":"/canonical/root"}')
+            ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping JSON tuple: ["HOT","/canonical/root"]')
             ->addOption('page-size', null, InputOption::VALUE_REQUIRED, 'Metadata rows per page, 1-10000', '5000')
             ->addOption('max-errors', null, InputOption::VALUE_REQUIRED, 'Maximum issue rows to print, 0-10000', '100');
     }
@@ -141,16 +141,15 @@ final class StorageAuditCommand extends Command
             try {
                 $decoded = json_decode($mapping, true, 3, JSON_THROW_ON_ERROR);
             } catch (\JsonException) {
-                throw new \InvalidArgumentException('Local tier mappings must be valid JSON objects.');
+                throw new \InvalidArgumentException('Local tier mappings must be valid JSON tuples.');
             }
-            if (! is_array($decoded) || array_is_list($decoded) || count($decoded) !== 2
-                || ! array_key_exists('tier', $decoded) || ! is_string($decoded['tier'])
-                || ! array_key_exists('root', $decoded) || ! is_string($decoded['root'])) {
-                throw new \InvalidArgumentException('Local tier mappings require exactly string fields tier and root.');
+            if (! is_array($decoded) || ! array_is_list($decoded) || count($decoded) !== 2
+                || ! is_string($decoded[0]) || ! is_string($decoded[1])) {
+                throw new \InvalidArgumentException('Local tier mappings require exactly a two-string JSON tuple.');
             }
             $mappings[] = [
-                'tier' => $decoded['tier'],
-                'root' => $decoded['root'],
+                'tier' => $decoded[0],
+                'root' => $decoded[1],
             ];
         }
 

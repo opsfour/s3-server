@@ -137,7 +137,7 @@ final class StorageAuditCommandTest extends TestCase
             $missing = new CommandTester(new StorageAuditCommand());
             self::assertSame(Command::FAILURE, $missing->execute([
                 '--metadata-path' => $this->databasePath,
-                '--storage-tier-root' => [json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR)],
+                '--storage-tier-root' => [json_encode(['STANDARD', $this->root], JSON_THROW_ON_ERROR)],
             ]), $missing->getDisplay());
             self::assertStringContainsString('unsupported_or_unmapped_tier', $missing->getDisplay());
 
@@ -145,8 +145,8 @@ final class StorageAuditCommandTest extends TestCase
             self::assertSame(Command::SUCCESS, $mapped->execute([
                 '--metadata-path' => $this->databasePath,
                 '--storage-tier-root' => [
-                    json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR),
-                    json_encode(['tier' => 'COLD=ARCHIVE', 'root' => $coldRoot], JSON_THROW_ON_ERROR),
+                    json_encode(['STANDARD', $this->root], JSON_THROW_ON_ERROR),
+                    json_encode(['COLD=ARCHIVE', $coldRoot], JSON_THROW_ON_ERROR),
                 ],
             ]), $mapped->getDisplay());
         } finally {
@@ -161,8 +161,10 @@ final class StorageAuditCommandTest extends TestCase
     {
         $invalidMappings = [
             'STANDARD=/private/raw-value',
-            json_encode(['tier' => 'STANDARD', 'root' => $this->root, 'private' => 'extra'], JSON_THROW_ON_ERROR),
-            json_encode(['tier' => 42, 'root' => $this->root], JSON_THROW_ON_ERROR),
+            json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR),
+            json_encode(['STANDARD'], JSON_THROW_ON_ERROR),
+            json_encode(['STANDARD', $this->root, 'extra'], JSON_THROW_ON_ERROR),
+            json_encode([42, $this->root], JSON_THROW_ON_ERROR),
         ];
 
         foreach ($invalidMappings as $mapping) {
@@ -186,7 +188,7 @@ final class StorageAuditCommandTest extends TestCase
         self::assertStringContainsString('--metadata-dsn', $process->getOutput());
         self::assertStringContainsString('--storage-path', $process->getOutput());
         self::assertStringContainsString('--storage-tier-root', $process->getOutput());
-        self::assertStringContainsString('local tier mapping JSON', $process->getOutput());
+        self::assertStringContainsString('local tier mapping JSON tuple', $process->getOutput());
     }
 
     public function test_command_refuses_to_run_while_the_local_root_is_owned(): void
