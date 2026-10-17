@@ -15,6 +15,7 @@ use Amp\Parallel\Worker\TaskFailureException;
 use OpsFour\S3Server\Parallel\LocalMultipartPublishTask;
 use OpsFour\S3Server\Parallel\LocalMultipartAssemblyTask;
 use OpsFour\S3Server\Parallel\LocalMultipartSealTask;
+use OpsFour\S3Server\Parallel\LocalDurableFilesystemTask;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
@@ -28,8 +29,9 @@ use OpsFour\S3Server\Exception\SlowDownException;
  *   Temp writes: {basePath}/.tmp/{uuid}
  *   Multipart parts: {basePath}/.parts/{uploadId}/{partNumber}
  *
- * Write strategy: data is first written to a temp file, then atomically
- * moved to the final path. This prevents partial reads on concurrent access.
+ * Write strategy: data is first written to a temp file, synchronized, and
+ * linked create-only to its final path. This prevents partial reads and
+ * replacement of an already published path.
  */
 final class FilesystemBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
 {
@@ -45,6 +47,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     private array $ownedWorkerPools = [];
 
     private ?ContextWorkerPool $multipartFencePool = null;
+
+    private ?ContextWorkerPool $durabilityPool = null;
 
     /** IPC uncertainty retains a slot until backend shutdown. */
     private int $multipartFenceAdmissions = 0;
@@ -85,6 +89,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         }
         $this->ownedWorkerPools = [];
         $this->multipartFencePool = null;
+        $this->durabilityPool = null;
         $this->multipartFenceAdmissions = 0;
     }
 
@@ -101,7 +106,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
      * {@inheritDoc}
      *
      * Writes the body stream to a temp file, computing MD5 incrementally,
-     * then atomically moves it to a unique path sharded by the key hash.
+     * then durably publishes it to a unique path sharded by the key hash.
      */
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
     {
@@ -174,22 +179,28 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
         $checksums = $calculator->finalize();
 
-        // Create target directory and atomically move temp to final path
+        // Create the target directory and durably publish the staged file.
         $targetDir = dirname($finalPath);
 
+        $publicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
+            $publicationStarted = true;
             if ($fencedMultipart) {
                 $this->publishFencedMultipartPath($tempPath, $finalPath);
                 $this->safeDelete($tempPath);
             } else {
-                $this->atomicMove($tempPath, $finalPath);
+                $this->publishDurably($tempPath, $finalPath);
             }
         } catch (CancelledException $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw $e;
         } catch (\Throwable $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw new InternalErrorException('Failed to finalize object in filesystem backend.', $e);
         }
 
@@ -245,55 +256,17 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         $storagePath = $this->storedPathForAccess($storagePath);
         FlysystemPathScope::assertDeletePath(substr($storagePath, strlen($this->basePath) + 1), $bucket);
 
-        if (! $this->assertStoredPathConfined($storagePath)) {
-            return; // Idempotent: silently succeed if already gone
-        }
-
         try {
-            $this->metadataFilesystem->deleteFile($storagePath);
-        } catch (FilesystemException) {
-            // TOCTOU: file was deleted between exists() and deleteFile() — idempotent success.
-            if ($this->pathExists($storagePath)) {
-                throw new InternalErrorException('Failed to delete object file.');
+            $this->runDurabilityTask(LocalDurableFilesystemTask::delete($this->basePath, $storagePath));
+        } catch (CancelledException $e) {
+            throw $e;
+        } catch (TaskFailureException|TaskFailureError $e) {
+            if ($e->getOriginalClassName() === \InvalidArgumentException::class) {
+                throw new \InvalidArgumentException($e->getOriginalMessage(), previous: $e);
             }
-            return;
-        }
-
-        // Clean up empty parent directories without removing a shared root.
-        // Multipart garbage paths live outside the bucket directory.
-        $bucketDir = $this->basePath . '/' . $bucket;
-        $partsDir = $this->basePath . '/.parts';
-        $assembliesDir = $this->basePath . '/.assemblies';
-        if (str_starts_with($storagePath, $bucketDir . '/')) {
-            $root = $bucketDir;
-        } elseif (str_starts_with($storagePath, $partsDir . '/')) {
-            // A collector may install a same-path seal after this delete.
-            // Keep the namespace directory even if it looks empty now.
-            return;
-        } elseif (str_starts_with($storagePath, $assembliesDir . '/')) {
-            return;
-        } else {
-            return;
-        }
-        $dir = dirname($storagePath);
-
-        while ($dir !== $root && str_starts_with($dir, $root . '/')) {
-            if (! $this->metadataFilesystem->isDirectory($dir)) {
-                break;
-            }
-
-            $entries = $this->metadataFilesystem->listFiles($dir);
-
-            if (count($entries) > 0) {
-                break;
-            }
-
-            try {
-                $this->metadataFilesystem->deleteDirectory($dir);
-            } catch (FilesystemException) {
-                break; // Concurrent write made directory non-empty — stop climbing.
-            }
-            $dir = dirname($dir);
+            throw new InternalErrorException('Failed to delete object file.', $e);
+        } catch (\Throwable $e) {
+            throw new InternalErrorException('Failed to delete object file.', $e);
         }
     }
 
@@ -408,13 +381,11 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                 $this->publishFencedMultipartPath($tempPath, $partPath);
                 $this->safeDelete($tempPath);
             } else {
-                $this->atomicMove($tempPath, $partPath);
+                $this->publishDurably($tempPath, $partPath);
             }
         } catch (CancelledException $e) {
-            $this->safeDelete($tempPath);
             throw $e;
         } catch (\Throwable $e) {
-            $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize multipart part in filesystem backend.', $e);
         }
 
@@ -597,15 +568,21 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Move assembled file to final path
         $targetDir = dirname($finalPath);
 
+        $publicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
+            $publicationStarted = true;
             $this->publishFencedMultipartPath($tempPath, $finalPath);
             $this->safeDelete($tempPath);
         } catch (CancelledException $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw $e;
         } catch (\Throwable $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw new InternalErrorException('Failed to finalize assembled object in filesystem backend.', $e);
         }
 
@@ -638,7 +615,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     /**
      * Copy an object from one storage path to a new location.
      *
-     * The copy is performed via temp file + atomic move, same as putObject.
+     * The copy is staged and durably published, same as putObject.
      * MD5 is computed on the copied data.
      *
      * @param  string  $srcPath  Absolute path of the source object.
@@ -695,14 +672,20 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Move to final destination
         $targetDir = dirname($finalPath);
 
+        $publicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
-            $this->atomicMove($tempPath, $finalPath);
+            $publicationStarted = true;
+            $this->publishDurably($tempPath, $finalPath);
         } catch (CancelledException $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw $e;
         } catch (\Throwable $e) {
-            $this->safeDelete($tempPath);
+            if (! $publicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw new InternalErrorException('Failed to finalize copied object in filesystem backend.', $e);
         }
 
@@ -779,28 +762,39 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
     private function ensureDirectory(string $path): void
     {
-        if ($this->metadataFilesystem->isDirectory($path)) {
-            return;
-        }
-
         try {
-            $this->metadataFilesystem->createDirectoryRecursively($path, 0700);
-        } catch (FilesystemException $e) {
-            if ($this->isDirectoryPath($path)) {
-                return;
-            }
-
+            $this->runDurabilityTask(LocalDurableFilesystemTask::ensureDirectory($this->basePath, $path));
+        } catch (CancelledException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
             throw new InternalErrorException('Failed to create filesystem storage directory.', $e);
         }
     }
 
-    private function atomicMove(string $from, string $to): void
+    private function publishDurably(string $from, string $to): void
     {
         try {
-            $this->metadataFilesystem->move($from, $to);
-        } catch (FilesystemException $e) {
-            throw new InternalErrorException('Failed to move filesystem storage file.', $e);
+            $this->runDurabilityTask(LocalDurableFilesystemTask::publish($this->basePath, $from, $to));
+        } catch (CancelledException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new InternalErrorException('Failed to publish filesystem storage file.', $e);
         }
+    }
+
+    private function runDurabilityTask(LocalDurableFilesystemTask $task): void
+    {
+        $this->durabilityPool()->submit($task)->getFuture()->await();
+    }
+
+    private function durabilityPool(): ContextWorkerPool
+    {
+        if ($this->durabilityPool === null) {
+            $this->durabilityPool = new ContextWorkerPool(2);
+            $this->ownedWorkerPools[] = $this->durabilityPool;
+        }
+
+        return $this->durabilityPool;
     }
 
     /**
@@ -885,17 +879,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             self::closeAndRelease($file);
         } catch (\Throwable) {
             // Cleanup must never replace the exception that triggered it.
+        } finally {
+            $file = null;
         }
-    }
-
-    private function pathExists(string $path): bool
-    {
-        return $this->metadataFilesystem->exists($path);
-    }
-
-    private function isDirectoryPath(string $path): bool
-    {
-        return $this->metadataFilesystem->isDirectory($path);
     }
 
     /**
@@ -943,11 +929,11 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             }
 
             try {
-                $this->metadataFilesystem->deleteFile($filePath);
-            } catch (FilesystemException) {
-                if ($this->metadataFilesystem->exists($filePath)) {
-                    throw new InternalErrorException('Failed to delete multipart part from filesystem backend.');
-                }
+                $this->runDurabilityTask(LocalDurableFilesystemTask::delete($this->basePath, $filePath));
+            } catch (CancelledException $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                throw new InternalErrorException('Failed to delete multipart part from filesystem backend.', $e);
             }
         }
 

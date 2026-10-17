@@ -82,6 +82,28 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         self::assertFileDoesNotExist($this->basePath . '/escape');
     }
 
+    public function test_normal_planned_publication_never_replaces_an_existing_target(): void
+    {
+        $backend = new FilesystemBackend($this->basePath);
+        $backend->createBucket('bucket');
+        $path = $backend->planObjectWritePath(
+            'bucket',
+            'key',
+            bin2hex(random_bytes(16)),
+            bin2hex(random_bytes(16)),
+        );
+        $backend->putObjectAtPath('bucket', 'key', new ReadableBuffer('first'), $path);
+
+        try {
+            $backend->putObjectAtPath('bucket', 'key', new ReadableBuffer('second'), $path);
+            self::fail('A normal create-only publication replaced an existing target.');
+        } catch (InternalErrorException) {
+            self::assertSame('first', file_get_contents($path));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
     public function test_cancelled_object_write_cleans_staging_file_and_propagates_same_cancellation(): void
     {
         $backend = new FilesystemBackend($this->basePath);
