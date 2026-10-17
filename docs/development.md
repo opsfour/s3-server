@@ -204,17 +204,31 @@ evidence-aware directory-sync path whenever a namespace mutation requires a
 durability barrier. Descriptor-only cleanup is permitted only when it performs
 no further path lookup or namespace mutation.
 
+The inert schema-v2 heartbeat writer must remain local-only and non-cloneable.
+It publishes the canonical `issue()`/`toJson()` record through an exact
+read-write directory bind while pinning root-owned ancestor, directory, and
+persistent single-writer lock identities. Preserve exclusive same-directory
+staging, file and directory synchronization, atomic rename postchecks, the
+4096-byte reader limit, bounded same-scope cleanup and enumeration, monotonic
+restart progression, terminal ambiguity handling, best-effort invalidation,
+and durable idempotent revoke behavior. Do not add EFS, SQL, or socket access
+to this class.
+
 The production path remains closed until all 14 guarded tasks and seven
 pool-owning runtime components migrate atomically. Worker termination also
 needs join-capable process-exit evidence or fail-closed serving-process
 termination; return from `kill()` alone is not sufficient evidence.
+Writer and reader wiring additionally requires host-RW to API-RO bind proof,
+immediate invalidation of older containers or watcher epochs, bounded cleanup
+of old-epoch targets and locks, and service-manager termination of the exact
+container after uncertain publish or revoke completion.
 
 ## Current Test Baseline
 
 The complete local package gate for the current `develop` source records:
 
 ```
-4345 tests, 33331 assertions, 232 expected opt-in/environment skips, 0 failures
+4366 tests, 33586 assertions, 232 expected opt-in/environment skips, 0 failures
 ```
 
 External database, remote-storage, multi-host, load-balancer, and long-soak

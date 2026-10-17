@@ -110,6 +110,17 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   directory bind. It permanently latches failed reads, pins the evidence mount
   and directory device/inode identity across successful reads, and rejects
   stale replay after monotonic validity-window progression.
+- [x] The current unreleased inert schema-v2 heartbeat writer emits the
+  canonical `issue()`/`toJson()` record through an exact local read-write
+  directory bind. It pins root-owned ancestor, directory, and persistent
+  nonblocking single-writer lock identities; requires a reader-compatible
+  0644 target of at most 4096 bytes; and preserves monotonic lease progression
+  from an existing restart baseline. Same-directory `x+b` staging, file and
+  directory synchronization, atomic rename with postchecks, bounded
+  same-scope temporary and directory enumeration, and durable idempotent
+  revocation protect publication. Publication or revocation ambiguity makes
+  the writer terminal and triggers best-effort invalidation. The non-cloneable
+  writer does not access EFS, SQL, or sockets.
 - [x] The current unreleased immutable schema-v2 worker scope transports the
   validated production identity, host pin, local evidence mount and directory
   identity, watcher epoch, sampled monotonic time, and frozen heartbeat
@@ -117,10 +128,14 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   reader without touching EFS or SQL; its first guarded operation must
   revalidate the same local heartbeat. Repeated scope reads return the original
   snapshot, and the v2 factory cannot accept the legacy v1 qualification scope.
-- [ ] The production watcher still needs to publish those heartbeat records,
-  the reader still needs runtime wiring before listener admission, and the
-  complete mount, replacement, and replay contract still needs qualification
-  on the intended Linux hosts. Production EFS serving remains closed.
+- [ ] The heartbeat writer and reader still need runtime, factory, watcher-loop,
+  and listener wiring. External qualification must prove the host read-write
+  bind to API read-only bind relationship, immediately stop or invalidate an
+  older container or watcher epoch, bound cleanup of old-epoch targets and
+  locks, and make the service manager terminate the exact container whenever
+  publish or revoke completion is uncertain. The complete mount, replacement,
+  and replay contract still needs qualification on the intended Linux hosts.
+  Production EFS serving remains closed.
 - [x] The current unreleased inert, bounded worker primitive keeps one
   schema-v2 reader and progression latch for an Amp worker process. Evidence
   failure or a byte-different scope poisons that process terminally; only

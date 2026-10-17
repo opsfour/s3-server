@@ -49,6 +49,17 @@ The project follows [Semantic Versioning](https://semver.org/).
   heartbeat rollback. The production watcher and runtime wiring remain
   unimplemented, real Linux qualification is pending, and serving remains
   closed.
+- Add an inert schema-v2 production EFS heartbeat writer. It publishes the
+  canonical `issue()`/`toJson()` record through an exact local read-write bind,
+  pins the root-owned ancestor, directory, and persistent nonblocking
+  single-writer lock identities, and preserves monotonic lease progression
+  across watcher restarts. Same-directory exclusive staging, file and
+  directory synchronization, atomic rename with postchecks, bounded temporary
+  and directory enumeration, and durable idempotent revocation protect the
+  reader-compatible 0644 record. Ambiguous publication or revocation poisons
+  the writer terminally and attempts best-effort invalidation. The writer is
+  non-cloneable, does not access EFS, SQL, or sockets, and has no runtime,
+  factory, watcher-loop, or listener wiring yet.
 - Add an inert, bounded worker-wide production EFS evidence latch. Each Amp
   worker binds its first immutable schema-v2 scope and one heartbeat reader;
   evidence failure or a byte-different scope poisons that process terminally.
