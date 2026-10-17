@@ -1,4 +1,4 @@
-# Production Deployment
+# Deployment
 
 ## Architecture Overview
 
@@ -17,9 +17,11 @@ preserve the signed `Host` header exactly. Additional processes, remote storage,
 shared filesystems, and multiple hosts are separate experimental profiles; see
 the [roadmap](production-feature-roadmap.md).
 
-## Single-Node Deployment
+## Current One-Process Deployment
 
-Simplest production setup. Use SQLite for metadata and local filesystem for storage.
+The current release target runs exactly one S3 API process for each configured
+local storage root. Use SQLite for a self-contained deployment, or PostgreSQL
+or MySQL when that database is already part of the operating environment.
 
 ```bash
 S3_HOST=0.0.0.0
@@ -33,59 +35,16 @@ S3_RATE_LIMIT=1000
 S3_ENCRYPTION_MASTER_KEYS='{"key-2025":"BASE64_KEY_HERE"}'
 ```
 
-## Experimental: Multiple API Processes on One Host
+The server acquires an exclusive lock under `.opsfour/runtime.lock` in every
+configured local storage root before opening its listener. A second process
+using the same root fails startup. The lock file is persistent control state;
+do not delete or replace it. This lock enforces the supported process topology.
+It does not by itself prove durability after a crash or power loss.
 
-Multiple API processes on one host are implemented but are outside the initial
-qualified profile. They may share a local filesystem and PostgreSQL/MySQL
-metadata only after the exact process, lock, temporary-directory, and shutdown
-configuration passes the profile-specific release gates. This does not
-establish host-level failover or remote-mount semantics. NFS, EFS, SMB, and
-FUSE mounts are not qualified for `S3_STORAGE_PATH`; see
-[Storage Backends](storage-backends.md#requirements).
-PostgreSQL API nodes require `pecl-pq` and its `raphf` dependency. The server
-refuses to start with only `ext-pgsql`, because an abrupt database disconnect
-can terminate that event-loop backend. Verify both extensions with `php -m`
-before starting the API process. The PostgreSQL `S3_CREDENTIALS_DRIVER=database`
-example also uses `pdo_pgsql` for credential storage.
-
-```bash
-# All API processes share these settings
-S3_METADATA_DRIVER=postgres
-S3_METADATA_DSN="host=db.internal port=5432 dbname=s3server user=s3 password=secret"
-S3_CREDENTIALS_DRIVER=database
-S3_CREDENTIALS_DSN="pgsql:host=db.internal;port=5432;dbname=s3server"
-S3_CREDENTIALS_USERNAME=s3
-S3_CREDENTIALS_PASSWORD=secret
-S3_CREDENTIALS_CACHE_TTL=1
-S3_STORAGE_DRIVER=filesystem
-S3_STORAGE_PATH=/srv/s3-data   # Same local filesystem under evaluation
-```
-
-When evaluating this profile:
-- Give every API process the same credential source, account owner IDs, global quota
-  defaults, storage tiers, and encryption keys. Different owner IDs or quota
-  defaults can produce inconsistent authorization and limits for the same
-  access key across processes.
-- An API process refuses to start if persisted objects, lifecycle transitions,
-  queued tier work, or storage garbage reference a tier absent from its
-  configuration. Keep retired tier backends available until their references
-  have been migrated or removed. Dedicated tier workers may use a subset and
-  defer jobs they cannot perform.
-- Rate limiting is shared across all processes (database-backed)
-- Credential revocations and rotations become visible to every process within
-  `S3_CREDENTIALS_CACHE_TTL` seconds; set it to `0` for a database read on
-  every authenticated request
-- Notification workers use `FOR UPDATE SKIP LOCKED` so two processes do not lease
-  the same pending row at once. A delivery may still repeat after a worker
-  crashes or the receiver times out; consumers should handle duplicate events.
-- Stop old API and background-worker processes before a schema upgrade. Run
-  one `metadata:migrate` command with a DDL-capable role. If database-backed
-  credentials are configured, also run one `credentials:migrate` with the
-  credential database's DDL-capable role. Verify both schemas, then start
-  serving processes with DML-only roles. PostgreSQL/MySQL metadata startup
-  checks the version; credential startup checks the columns and MySQL key type
-  without applying DDL. Simultaneous migration commands are not supported;
-  there is no cross-process DDL lock.
+Multiple API processes, multiple hosts, shared filesystems, and remote storage
+are later experimental profiles. They are not alternative deployment recipes
+for the current release target; see the
+[production feature roadmap](production-feature-roadmap.md).
 
 ## TLS
 
@@ -96,17 +55,17 @@ S3_TLS_CERT=/etc/ssl/certs/s3.pem
 S3_TLS_KEY=/etc/ssl/private/s3.key
 ```
 
-### Behind a Load Balancer
+### Behind a Reverse Proxy or Load Balancer
 
-Terminate TLS at the load balancer and run the S3 server on HTTP internally:
+Terminate TLS at the proxy and run the S3 server on HTTP internally:
 
 ```bash
 S3_HOST=0.0.0.0
 S3_PORT=9000
-# No TLS_CERT/TLS_KEY — load balancer handles TLS
+# No TLS_CERT/TLS_KEY — the proxy handles TLS
 ```
 
-Configure the load balancer to preserve `Host`, including any port. Set
+Configure the proxy to preserve `Host`, including any port. Set
 `S3_TRUSTED_PROXY_CIDRS` to its direct peer CIDRs and have the last trusted
 proxy overwrite `X-Forwarded-For` and `X-Forwarded-Proto` with authoritative
 client values; see [Network Hardening](#network-hardening) below.
@@ -122,10 +81,9 @@ curl -f http://localhost:9000/.health
 ```
 
 The readiness handler rechecks persisted storage-tier references at most once
-every 30 seconds. If another API node writes a lifecycle rule, object, or job
-that needs a tier absent on this node, `/.health` returns 503 after the next
-check. Configure the load balancer to remove unready nodes; `/.live` remains a
-process-liveness probe.
+every 30 seconds. If metadata references a tier absent from this process,
+`/.health` returns 503 after the next check. Configure the proxy to stop routing
+to an unready process; `/.live` remains a process-liveness probe.
 
 For Kubernetes:
 
@@ -338,6 +296,12 @@ Apply the same host-memory and diagnostic rules to every TLS terminator or
 load balancer that decrypts S3 traffic. Its access and error logs must not
 retain presigned request queries or SSE-C headers; verify this for the actual
 proxy in use before claiming strict at-rest handling.
+
+### Experimental Flysystem Transfer Limits
+
+The following limits apply only when evaluating the experimental Flysystem
+profile. They are not configuration guidance for the current local-filesystem
+release target.
 
 Worker-backed Flysystem transfers use `S3_STORAGE_TEMP_DIR` and a separate
 `S3_STORAGE_TEMP_BUDGET=10737418240` reservation limit for API and worker
@@ -636,23 +600,12 @@ location / {
 }
 ```
 
-For an AWS Application Load Balancer, enable **Preserve host header**. Its
-default behavior can remove or add a port in `Host`, invalidating a SigV4
-signature. Use `GET /.health` with success code `200` for target-group
-readiness. Keep at least one healthy target while injecting a node failure:
-an ALB with *all* targets unhealthy can route requests to those unhealthy
-targets. Test signed path-style and virtual-hosted requests through the public
-listener, including a non-default port if used, before relying on the proxy
-configuration. Keep the API target port reachable only from the load balancer
-security group. Configure `S3_TRUSTED_PROXY_CIDRS` with only the ALB target-side
-source CIDRs if policy and access logs should describe the client connection.
-The proxy must supply a single, authoritative `X-Forwarded-Proto`; test the
-actual ALB header behavior before enabling the trust list. Access-log TLS
-cipher/version fields still describe the proxy-to-node TLS connection.
-
-See [AWS ALB host-header preservation](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html),
-[target health and fail-open behavior](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html),
-and [Nginx Host forwarding](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
+Test the chosen proxy with signed path-style and virtual-hosted requests before
+deployment. It must preserve the exact `Host` value, supply one authoritative
+`X-Forwarded-Proto` value when trusted forwarding is enabled, and keep the
+direct API port private. Use `GET /.health` for readiness. Provider-specific
+health-routing and fail-open behavior belongs to the proxy's own deployment
+review and does not change the server's one-process storage contract.
 
 ## Filesystem and Secret Permissions
 
@@ -689,15 +642,13 @@ For production deployments:
 
 ## Rollout and Rollback
 
-For a package version with **no metadata schema change**, roll API processes
-only after verifying that old and new code can share the current schema:
+The current local-filesystem profile does not support a rolling overlap on the
+same storage root. Drain traffic, stop the existing process, deploy the new
+package, and then start exactly one replacement process. Check `/.health`,
+`/.metrics`, and a signed S3 request before restoring traffic.
 
-1. Start one new process outside load-balancer traffic.
-2. Check `/.health` and `/.metrics`, then send a signed S3 request to it.
-3. Add it to traffic, drain one old process, and repeat.
-
-For a **schema upgrade** such as PostgreSQL v29 or MySQL v31, do not use that
-rolling sequence. Drain and stop all old API and background workers; back up
+For a **schema upgrade** such as PostgreSQL v29 or MySQL v31, drain and stop the
+API process and all background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a
 DDL-capable role and the matching package version. If
 `S3_CREDENTIALS_DRIVER=database`, also run one `php bin/s3-server
@@ -705,7 +656,7 @@ credentials:migrate` with its DDL-capable credential role, which may use a
 separate database. Set both metadata and credential DSNs and passwords through
 the bootstrap environment rather than placing secrets in shell arguments.
 Verify the metadata version and expected indexes/column types, and verify
-the credential table and columns. Then start the new API and workers with
+the credential table and columns. Then start the new API process and workers with
 DML-only roles and restore traffic after readiness and signed-request checks.
 Serving nodes check the PostgreSQL/MySQL version without applying DDL and
 refuse an old or unverifiable schema; database credentials likewise refuse

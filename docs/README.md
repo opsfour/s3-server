@@ -38,8 +38,8 @@ available on request under separately agreed terms.
 
 ## Operations
 
-- [Production Deployment](deployment.md) — TLS, scaling, monitoring, health checks, backups
-- [Release Checklist](release-checklist.md) — Universal and profile-specific gates before tagging
+- [Deployment](deployment.md) — Current deployment profile, TLS, monitoring, health checks, backups
+- [Release Checklist](release-checklist.md) — Current release gates before tagging
 - [Changelog](../CHANGELOG.md) — Versioned release history and upgrade scope
 - [Architecture](architecture.md) — Internals, middleware stack, async design
 - [Development](development.md) — Running tests, extending handlers, contributing

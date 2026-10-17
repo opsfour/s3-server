@@ -4,7 +4,7 @@ The metadata backend stores all non-data state: bucket records, object metadata,
 
 ## SQLite (Default)
 
-Best for development and single-node production deployments.
+Best for development and the current one-host, one-process release target.
 
 ```bash
 S3_METADATA_DRIVER=sqlite
@@ -72,14 +72,16 @@ The Postgres backend uses `amphp/postgres` connection pooling. All queries are
 non-blocking and executed via PHP Fibers. `amphp/postgres` selects `pecl-pq`
 when it is loaded.
 
-### HA Setup
+### Database Availability
 
 The supported baseline is PostgreSQL 14 or newer with the default
-`READ COMMITTED` isolation level. Use PostgreSQL streaming replication or a
-managed service (RDS, Cloud SQL, etc.):
+`READ COMMITTED` isolation level. The metadata database may use PostgreSQL
+replication or a managed service, but that does not turn the S3 server into a
+multi-process or multi-host deployment. Point the server at one writable
+endpoint:
 
 ```bash
-# Primary + read replicas behind a connection pooler (PgBouncer)
+# Writable PostgreSQL endpoint, optionally through PgBouncer
 S3_METADATA_DSN="host=pgbouncer.internal port=6432 dbname=s3server user=s3 password=secret"
 ```
 
@@ -87,7 +89,7 @@ S3_METADATA_DSN="host=pgbouncer.internal port=6432 dbname=s3server user=s3 passw
 
 - Teams that already operate PostgreSQL or need database-level availability
 - Workloads that should avoid SQLite's single-writer constraint
-- Shared rate limiting across nodes using metadata-database time for refill and cleanup
+- Shared rate-limit state for a later separately qualified multi-process profile
 - A failed rate-limit database check returns S3 `SlowDown` (503) when the limit is enabled; readiness probes that write path every 30 seconds
 - Notification queue coordination for later qualified multi-process or
   multi-host profiles
@@ -317,11 +319,11 @@ operations must be safe to repeat.
 | Criteria | SQLite | PostgreSQL | MySQL |
 |----------|--------|------------|-------|
 | Setup complexity | Zero | Moderate | Moderate |
-| Current single-host target | Supported | Supported | Supported |
+| Current one-host, one-process target | Supported | Supported | Supported |
 | Shared metadata | No | Yes | Yes |
 | Qualified multi-host object storage | No | No; separate storage profile required | No; separate storage profile required |
-| Shared rate limiting | Per-process only | Across all nodes | Across all nodes |
-| Notification queue | Single consumer | Multi-consumer (SKIP LOCKED) | Multi-consumer (SKIP LOCKED) |
+| Shared rate limiting | Per-process only | Implemented for a later profile | Implemented for a later profile |
+| Notification queue | Single consumer | Multi-consumer capability; later profile | Multi-consumer capability; later profile |
 | Throughput | Measure on the target workload and deployment | Measure on the target workload and deployment | Measure on the target workload and deployment |
 | Operational overhead | None | Backup, replication | Backup, replication |
 

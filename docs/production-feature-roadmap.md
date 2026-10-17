@@ -57,7 +57,7 @@ experimental until the exact profile has its own qualification record.
 - Publish a release only when the [release checklist](release-checklist.md) is
   complete for this target contract.
 
-## Next
+## Later
 
 These profiles may be qualified after the initial target is stable. Each needs
 its own evidence and only then becomes an advertised production profile:
@@ -74,7 +74,7 @@ Work on these profiles must remain isolated from the universal product contract.
 Passing a soak does not qualify storage semantics, and sharing PostgreSQL or
 MySQL metadata does not qualify shared object storage.
 
-## Deferred
+## Out of Current Scope
 
 - Generic production approval for arbitrary Flysystem adapters or arbitrary
   NFS, EFS, SMB, FUSE, or other shared mounts.

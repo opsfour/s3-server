@@ -39,6 +39,9 @@ The initial production profile adds these gates:
 
 - [ ] Run the complete functional suite with persistent local filesystem
   storage on Linux and one API process.
+- [ ] Verify a second API process cannot acquire the same local storage root,
+  orderly shutdown releases ownership, and a failed shutdown keeps ownership
+  until process exit.
 - [ ] Exercise restart, abrupt process termination, disk-full behavior,
   temporary-file recovery, orphan cleanup, backup, and restore.
 - [ ] With API and worker processes stopped, restore a matched metadata and
@@ -61,47 +64,19 @@ The initial production profile adds these gates:
 - [ ] Verify access-log, metrics, notification, lifecycle, quota, encryption,
   and cleanup behavior under failure.
 
-## Profile-Specific Gates
+## Later Profiles
 
-Run this section only for profiles advertised by the release. Record the exact
-software versions, configuration, limits, and results with the release
-artifacts. A pass for one provider, filesystem, or topology does not transfer to
-another.
+Multiple API processes, multiple hosts, remote storage, shared filesystems,
+strict whole-system encryption-at-rest claims, and larger scale profiles are
+not gates for this release. Promote one only for a concrete deployment need,
+define its own acceptance evidence, and keep it experimental until that exact
+profile passes. See the [roadmap](production-feature-roadmap.md).
 
-### Multiple API Processes on One Host
+## Out of Current Scope
 
-- [ ] Test the exact process count with the selected metadata backend and local
-  temporary directories.
-- [ ] Verify interprocess locks, spool budgets, lifecycle and queue leases,
-  graceful shutdown, and forced worker termination.
-
-### Remote Storage Through Flysystem
-
-- [ ] Test the exact adapter and provider with real credentials in an isolated
-  bucket.
-- [ ] Establish provider-specific behavior for late writes, multipart abort,
-  exact-path cleanup, timeouts, retries, and ambiguous completion.
-- [ ] Measure local staging capacity and worker limits under cancellation and
-  provider failure.
-- [ ] Keep the profile experimental if these correctness gates are incomplete,
-  regardless of soak duration.
-
-### Shared Filesystem or Multiple Hosts
-
-- [ ] Test the exact filesystem, service, mount options, kernel, and topology on
-  separate hosts.
-- [ ] Verify atomic rename, locking, cache visibility, close-to-open behavior,
-  failover, reconnect, and cleanup races.
-- [ ] Verify that shared PostgreSQL or MySQL metadata cannot expose bytes before
-  they are durable and visible on every serving host.
-
-### Strict Encryption at Rest
-
-- [ ] Verify encryption of object data, request spools, multipart parts,
-  assembly files, copy and checksum staging, swap, core dumps, logs, and
-  backups.
-- [ ] Inventory and resolve legacy plaintext temporary or multipart data before
-  making the claim.
+Do not use the current release checklist to imply generic approval for
+arbitrary Flysystem adapters, shared mounts, cluster topologies, or performance
+and scale levels that were not measured for the exact deployment.
 
 ## Upgrade Checks
 

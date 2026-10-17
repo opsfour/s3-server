@@ -1,8 +1,7 @@
 # opsfour S3 Server
 
-A production-oriented S3-compatible object storage server built as a PHP 8.4+
-Composer package. Powered by [Amp v3](https://amphp.org/) for async I/O with
-PHP Fibers.
+An S3-compatible object storage server built as a PHP 8.4+ Composer package.
+Powered by [Amp v3](https://amphp.org/) for async I/O with PHP Fibers.
 
 ## Features
 
@@ -131,10 +130,10 @@ Full documentation is in the [docs/](docs/) directory:
 | [Lifecycle Rules](docs/lifecycle.md) | Object expiration and cleanup |
 | [S3 Select](docs/s3-select.md) | SQL queries over stored objects |
 | [Policy Compatibility](docs/policy-compatibility.md) | Supported IAM-style actions and condition keys |
-| [Production Feature Roadmap](docs/production-feature-roadmap.md) | Implemented production features and deferred AWS scope |
+| [Production Feature Roadmap](docs/production-feature-roadmap.md) | Current, later, and out-of-scope work |
 | [Release Checklist](docs/release-checklist.md) | Production readiness checks before tagging |
 | [Changelog](CHANGELOG.md) | Versioned release history and upgrade scope |
-| [Production Deployment](docs/deployment.md) | TLS, scaling, monitoring, backups |
+| [Deployment](docs/deployment.md) | Current deployment profile, TLS, monitoring, backups |
 | [Architecture](docs/architecture.md) | Internals, middleware stack, design decisions |
 | [Development](docs/development.md) | Running tests, contributing, extending |
 

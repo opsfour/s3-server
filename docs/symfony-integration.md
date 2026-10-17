@@ -157,7 +157,7 @@ php bin/console opsfour:s3:credentials delete ACCESS_KEY_ID
 
 The command operates on the credential provider configured in
 `opsfour_s3_server.credentials`. The file provider is loaded once during
-server startup; restart running API processes after changing its file. Use the
+server startup; restart the API process after changing its file. Use the
 database provider when credential changes must become visible without restart.
 
 ### Quotas
@@ -375,9 +375,10 @@ Supported event patterns match the core dispatcher:
 - wildcard suffixes, for example `s3:ObjectCreated:*`
 - global wildcard `s3:*`
 
-To keep an API node enqueueing webhooks while a separate node drains the
-shared queue, set `notifications.worker_enabled: false` on that API node.
-At least one node using the same metadata database must keep it enabled.
+For the current one-process profile, keep `notifications.worker_enabled: true`
+so queued webhooks are drained. Disabling it in favor of a separate consumer
+belongs to a later multi-process profile and requires that profile's own
+qualification.
 
 You can also bridge every matching S3 event into Symfony's EventDispatcher:
 

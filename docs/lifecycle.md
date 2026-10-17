@@ -151,7 +151,13 @@ action. See the
 
 ## Lifecycle Runner
 
-The lifecycle executor runs automatically in the background when the server starts (if metadata and storage backends are available). It periodically evaluates all bucket lifecycle rules and applies them. The configured maximum action count is shared by all buckets and stale multipart cleanup in one sweep. When that budget is exhausted, a metadata-backed cursor lets the next process or cluster node resume at the following bucket.
+The lifecycle executor runs automatically in the background when the server
+starts (if metadata and storage backends are available). It periodically
+evaluates all bucket lifecycle rules and applies them. The configured maximum
+action count is shared by all buckets and stale multipart cleanup in one sweep.
+When that budget is exhausted, a metadata-backed cursor lets the next sweep
+resume at the following bucket. The same mechanism can coordinate runners in a
+later separately qualified multi-process profile.
 
 There is no manual trigger needed — the runner handles scheduling internally.
 

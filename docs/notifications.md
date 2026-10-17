@@ -142,10 +142,10 @@ operations include the committed `versionId`; unversioned and suspended
 a durable hexadecimal `sequencer` from the notification queue. Compare it only
 for the same bucket and key, padding shorter values with zeros on the left. Multiple matching
 destinations for one event receive the same value. Later committed changes to
-that key receive larger values across API nodes sharing the metadata database;
-delivery itself can still be retried or arrive out of order. Sequence values
-can have gaps and are not object version IDs. ObjectRestore events omit this
-PUT/DELETE-only field.
+that key receive larger values. PostgreSQL and MySQL retain this ordering
+capability for a later multi-process profile, but delivery itself can still be
+retried or arrive out of order. Sequence values can have gaps and are not
+object version IDs. ObjectRestore events omit this PUT/DELETE-only field.
 Delete and restore events also omit `size` and `eTag` when those values were
 not captured. A zero-byte creation or completed restore with a known object
 size still includes `size: 0`. Completed restore events include
@@ -250,11 +250,14 @@ Configured webhook notifications are enqueued in the metadata database
 
 - Notifications survive server restarts
 - Pending webhook messages remain queued across process restarts
-- Multi-node Postgres/MySQL deployments share the queue
+- PostgreSQL and MySQL implement coordinated queue consumers for a later,
+  separately qualified multi-process profile
 
 `S3_NOTIFICATION_WORKER=false` disables delivery on that server instance while
-keeping enqueueing active. Keep a worker enabled on at least one instance that
-uses the same metadata database; otherwise queued webhooks remain pending.
+keeping enqueueing active. In the current one-process profile, leave the worker
+enabled unless another explicitly operated worker drains the queue; otherwise
+queued webhooks remain pending. A separate consumer process belongs to the
+later multi-process profile.
 
 ### Retry with Exponential Backoff
 

@@ -173,4 +173,4 @@ curl http://localhost:9000/.health
 - [Configuration Reference](configuration.md) — Tune storage paths, rate limits, TLS, and more
 - [Authentication](authentication.md) — Set up multi-user credential providers
 - [Symfony Integration](symfony-integration.md) — Bundle config, services, and console commands
-- [Production Deployment](deployment.md) — TLS, PostgreSQL, monitoring
+- [Deployment](deployment.md) — Current release profile, TLS, PostgreSQL, monitoring

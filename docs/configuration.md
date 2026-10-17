@@ -15,23 +15,21 @@ encryption services are configured in YAML rather than environment variables.
 | `S3_REGION` | `us-east-1` | AWS region identifier (returned in location responses) |
 | `S3_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections |
 | `S3_BODY_SIZE_LIMIT` | `5368709120` | Max request body size in bytes (default 5 GiB) |
-| `S3_POST_SPOOL_BUDGET` | `10737418240` | Maximum concurrent browser POST temporary bytes among API processes sharing one local temp directory (default 10 GiB); further uploads receive 503 SlowDown until space is released |
+| `S3_POST_SPOOL_BUDGET` | `10737418240` | Maximum concurrent browser POST temporary bytes in the local temp directory (default 10 GiB); further uploads receive 503 SlowDown until space is released |
 | `S3_BASE_DOMAIN` | - | Base domain for virtual-hosted-style requests (e.g., `s3.example.com`) |
 | `S3_STRICT_BUCKET_NAMING` | `true` | Reject AWS-reserved bucket name prefixes and suffixes |
 
 The browser POST spool budget uses locked lease files under
 `sys_get_temp_dir()/.opsfour-s3-post-budget` to count active forms across API
-processes on one node. Configure the same local temp directory and budget for
-all API processes on that node under the same service account. A later
-reservation recovers leases and files abandoned by a crashed process. The
-coordinator rejects a different budget while another process has an active
-form; the value can change after all other reservations are released. Provision
-a separate temporary volume or filesystem quota with headroom for other temporary writers
-and crash files before recovery. A temporary volume shared between nodes also
-needs its own volume limit or a cluster-wide coordinator; local file locks alone
-do not establish a cluster-wide limit. Do not remove the reservation directory
-while API processes are running. The stale-file sweep also reclaims abandoned
-browser POST files older than 24 hours during later uploads.
+and helper processes. A later reservation recovers leases and files abandoned
+by a crashed process. The coordinator rejects a different budget while another
+process has an active form; the value can change after all reservations are
+released. Provision a separate temporary volume or filesystem quota with
+headroom for other temporary writers and crash files before recovery. Do not
+remove the reservation directory while the server is running. The stale-file
+sweep also reclaims abandoned browser POST files older than 24 hours during
+later uploads. Sharing the directory between API processes belongs to a later
+deployment profile and is not qualified by this accounting mechanism alone.
 
 ## TLS
 
@@ -251,7 +249,7 @@ routing.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3_NOTIFICATION_REQUIRE_HTTPS` | `true` | Reject plaintext HTTP webhook configurations and redirects; the worker also blocks legacy stored HTTP destinations |
-| `S3_NOTIFICATION_WORKER` | `true` | Process queued webhooks on this server instance; set to `false` only when another worker instance drains the shared queue |
+| `S3_NOTIFICATION_WORKER` | `true` | Process queued webhooks in the current server; disabling it for a separate consumer belongs to a later multi-process profile |
 
 The standalone command reads this environment variable directly. Laravel
 reads it through the published `s3-server.php` config. For Symfony, set
@@ -289,7 +287,7 @@ transitioned incrementally.
 | `S3_LIFECYCLE_INTERVAL_SECONDS` | `60` | Seconds between lifecycle sweeps |
 | `S3_LIFECYCLE_BATCH_SIZE` | `1000` | Maximum rows fetched per lifecycle query |
 | `S3_LIFECYCLE_MAX_ACTIONS_PER_RUN` | `1000` | Maximum destructive or mutating actions per sweep |
-| `S3_LIFECYCLE_LOCK_TTL_SECONDS` | `300` | Metadata-backed lease TTL for multi-node runners |
+| `S3_LIFECYCLE_LOCK_TTL_SECONDS` | `300` | Metadata-backed lifecycle claim TTL; coordinated multi-process runners are a later profile |
 | `S3_MULTIPART_MAX_AGE_SECONDS` | `604800` | Global maximum age for incomplete multipart uploads; exact seconds, `0` disables global cleanup |
 
 Lifecycle rules can expire objects, clean noncurrent versions, abort incomplete

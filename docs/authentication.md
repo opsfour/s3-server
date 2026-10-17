@@ -30,9 +30,10 @@ S3_DISPLAY_NAME=Admin
 
 Store credentials in a JSON file. Supports multiple users with active/inactive status.
 The file is loaded when the process starts. Its writer mutex protects only one
-process, so do not use a shared credential file for concurrent cluster writers
-or expect another running node to observe edits. Use the database provider
-for clustered credential management.
+process. This matches the current deployment profile; do not use a shared
+credential file to evaluate concurrent API processes or expect another running
+process to observe edits. A later multi-process profile requires the database
+provider and its own qualification.
 On Unix, file-provider writes require `ext-posix` so the writer can verify the
 effective user and every ancestor of the canonical credential directory.
 The directory must be private or root-owned and sticky (such as `/tmp`);
@@ -92,7 +93,7 @@ partial migration. Use a DML-only role for serving after the bootstrap. The
 DSN uses PDO syntax; credentials are passed separately so the
 same configuration works for PostgreSQL and MySQL. Positive lookups are cached
 for one second by default. Set
-`S3_CREDENTIALS_CACHE_TTL=0` when revocation must be observed by every node on
+`S3_CREDENTIALS_CACHE_TTL=0` when the running process must observe revocation on
 the next request.
 
 ## External IAM / OIDC Credential Issuer
@@ -179,10 +180,10 @@ returns `404`; if the observed key was replaced before the compare-and-delete,
 the API preserves the replacement and returns `409` with `{"error":"conflict"}`.
 All admin responses use `Cache-Control: no-store`.
 
-With a shared database provider, revocation on another node is visible after
-its positive-lookup cache TTL (one second by default). Set
-`S3_CREDENTIALS_CACHE_TTL=0` on every API node when the next request must see
-revocation; this causes a database lookup for each signed request.
+With a database provider, revocation becomes visible after the positive-lookup
+cache TTL (one second by default). Set `S3_CREDENTIALS_CACHE_TTL=0` when the
+next request must see revocation; this causes a database lookup for each signed
+request.
 
 ### Multiple OIDC issuers and owner migration
 
@@ -216,8 +217,8 @@ Changing an existing one-issuer deployment to multiple issuers is a cutover:
 the new scoped IDs differ even for its original issuer. Previously issued S3
 credentials keep their old owner IDs until revoked or expired, including any
 older permanent credentials. Revoke them before enabling the new configuration,
-wait out every node's positive credential-cache TTL (or set it to zero), then
-issue new credentials.
+wait out the running process's positive credential-cache TTL (or set it to
+zero), then issue new credentials.
 
 Inventory and back up credentials and metadata before the cutover. Existing
 buckets, account quotas, account policies, ACL principals, and other owner

@@ -8,7 +8,7 @@ canonical storage support matrix:
 
 | Backend | Status | Current use |
 |---------|--------|-------------|
-| Persistent local filesystem on Linux | Implemented and Supported | Current single-host production target; qualification is pending the release gates and the durability blocker below |
+| Persistent local filesystem on Linux | Implemented and Supported | Current one-host, one-process release target; qualification is pending the release gates and the durability blocker below |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -67,7 +67,8 @@ the call. S3 bucket naming remains checked separately at the API boundary.
 
 ## Filesystem (Default)
 
-Stores objects as files on the local filesystem. Best for single-server deployments.
+Stores objects as files on the local filesystem for the current one-host,
+one-process deployment target.
 
 ```bash
 S3_STORAGE_DRIVER=filesystem
@@ -89,8 +90,17 @@ SMB/CIFS, FUSE, volatile tmpfs/ramfs, unknown types, and unreadable mount
 data fail closed outside the explicit unsafe test override. This check cannot
 prove persistence of an underlying overlay or qualify a shared mount; do not
 use a remote mount for default serving. NFS/EFS multi-host filesystem operation
-is an optional, currently unqualified profile and does not gate releases for
-the qualified local-filesystem or provider-specific storage profiles.
+is a later, currently unqualified profile and does not gate the current local
+filesystem release.
+
+Before opening its listener, the server acquires a non-blocking exclusive lock
+at `.opsfour/runtime.lock` under every configured local filesystem root. A
+second S3 API process using any of those roots fails startup. Keep this regular
+file private with the storage root and do not delete, replace, or symlink it.
+The lock is retained until orderly shutdown has stopped the server's internal
+writers; if shutdown cannot prove that, it remains held until process exit.
+It enforces the one-process topology and is not evidence of crash or
+power-loss durability.
 
 The backend closes temporary files and renames them into place, but it does
 not currently `fsync` the file and containing directory. This is a
