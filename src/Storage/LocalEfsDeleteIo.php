@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use Closure;
+
 /** Blocking physical operations used only by the optional EFS delete worker. */
 interface LocalEfsDeleteIo
 {
@@ -20,5 +22,6 @@ interface LocalEfsDeleteIo
 
     public function unlinkFile(string $path): bool;
 
-    public function syncDirectory(string $path): bool;
+    /** @param (Closure(): void)|null $afterSyscall */
+    public function syncDirectory(string $path, ?Closure $afterSyscall = null): bool;
 }

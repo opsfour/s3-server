@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use Closure;
+
 final class NativeLocalEfsDeleteIo implements LocalEfsDeleteIo
 {
     public function listDirectory(string $path): array|false
@@ -41,8 +43,8 @@ final class NativeLocalEfsDeleteIo implements LocalEfsDeleteIo
         return @unlink($path);
     }
 
-    public function syncDirectory(string $path): bool
+    public function syncDirectory(string $path, ?Closure $afterSyscall = null): bool
     {
-        return (new NativeLocalObjectWriteIo())->syncDirectory($path);
+        return (new NativeLocalObjectWriteIo())->syncDirectoryWithCallback($path, $afterSyscall);
     }
 }

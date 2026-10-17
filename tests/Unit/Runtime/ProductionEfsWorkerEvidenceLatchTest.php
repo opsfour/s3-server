@@ -6,13 +6,19 @@ namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\TaskFailureThrowable;
+use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
+use OpsFour\S3Server\Runtime\EfsStorageEvidence;
 use OpsFour\S3Server\Runtime\ProductionEfsHostPin;
 use OpsFour\S3Server\Runtime\ProductionEfsIdentity;
 use OpsFour\S3Server\Runtime\ProductionEfsWatcherEvidenceFileReader;
 use OpsFour\S3Server\Runtime\ProductionEfsWorkerEvidenceException;
 use OpsFour\S3Server\Runtime\ProductionEfsWorkerEvidenceLatch;
 use OpsFour\S3Server\Runtime\ProductionEfsWorkerEvidenceScope;
+use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
+use OpsFour\S3Server\Storage\LocalEfsStoredPathCheck;
 use OpsFour\S3Server\Tests\Support\ProductionEfsEvidenceLatchWorkerTask;
+use OpsFour\S3Server\Tests\Support\ProductionEfsStorageEvidenceWorkerTask;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class ProductionEfsWorkerEvidenceLatchTest extends TestCase
@@ -170,6 +176,95 @@ final class ProductionEfsWorkerEvidenceLatchTest extends TestCase
             ProductionEfsWorkerEvidenceLatch::class,
             'assertFreshWithIo',
         ))->isPublic());
+    }
+
+    public function test_storage_adapter_revalidates_in_a_real_worker_and_binds_the_scope_root(): void
+    {
+        $scope = $this->scope();
+        $pool = new ContextWorkerPool(1);
+        try {
+            $result = $pool->submit(new ProductionEfsStorageEvidenceWorkerTask($scope))->getFuture()->await();
+            self::assertGreaterThan(0, $result['pid']);
+            self::assertSame($scope->storageRoot, $result['storageRoot']);
+            self::assertSame(2, $result['successfulChecks']);
+            self::assertTrue($result['rejectedAfterRemoval']);
+        } finally {
+            $pool->shutdown();
+        }
+    }
+
+    public function test_storage_adapter_is_accepted_by_root_bound_physical_fences(): void
+    {
+        $scope = $this->scope();
+        $evidence = new ProductionEfsWorkerStorageEvidence($scope);
+        self::assertSame($scope->storageRoot, $evidence->storageRoot());
+
+        new LocalEfsStoredPathCheck($scope->storageRoot, $evidence);
+
+        $this->expectException(\InvalidArgumentException::class);
+        new LocalEfsStoredPathCheck($scope->storageRoot . '/other', $evidence);
+    }
+
+    public function test_physical_fence_rejects_an_untrusted_interface_implementation(): void
+    {
+        $untrusted = new readonly class implements EfsStorageEvidence {
+            public function assertFresh(): void {}
+
+            public function storageRoot(): string
+            {
+                return '/untrusted';
+            }
+        };
+
+        $this->expectException(\TypeError::class);
+        (new \ReflectionClass(LocalEfsStoredPathCheck::class))->newInstance('/untrusted', $untrusted);
+    }
+
+    /** @param class-string $class */
+    #[DataProvider('closedPhysicalEvidenceBoundaries')]
+    public function test_physical_evidence_boundary_accepts_only_the_two_final_readers(
+        string $class,
+        string $parameterName,
+    ): void {
+        $constructor = (new \ReflectionClass($class))->getConstructor();
+        self::assertInstanceOf(\ReflectionMethod::class, $constructor);
+        $parameter = array_values(array_filter(
+            $constructor->getParameters(),
+            static fn(\ReflectionParameter $parameter): bool => $parameter->getName() === $parameterName,
+        ))[0] ?? null;
+        self::assertInstanceOf(\ReflectionParameter::class, $parameter);
+        $type = $parameter->getType();
+        self::assertInstanceOf(\ReflectionUnionType::class, $type);
+        $names = [];
+        foreach ($type->getTypes() as $namedType) {
+            if (! $namedType instanceof \ReflectionNamedType) {
+                throw new \LogicException('Physical evidence boundary contains a nested intersection.');
+            }
+            $names[] = $namedType->getName();
+        }
+        sort($names);
+        $expected = [EfsHostEvidenceReader::class, ProductionEfsWorkerStorageEvidence::class];
+        if ($parameter->allowsNull()) {
+            $expected[] = 'null';
+        }
+        sort($expected);
+        self::assertSame($expected, $names);
+    }
+
+    /** @return iterable<string, array{class-string, string}> */
+    public static function closedPhysicalEvidenceBoundaries(): iterable
+    {
+        yield 'bucket namespace' => [\OpsFour\S3Server\Storage\LocalEfsBucketNamespace::class, 'evidence'];
+        yield 'chunk read' => [\OpsFour\S3Server\Storage\LocalEfsChunkReadFence::class, 'evidence'];
+        yield 'delete' => [\OpsFour\S3Server\Storage\LocalEfsDeleteFence::class, 'evidence'];
+        yield 'stored path' => [LocalEfsStoredPathCheck::class, 'evidence'];
+        yield 'temp cleanup' => [\OpsFour\S3Server\Storage\LocalEfsTempCleanup::class, 'evidence'];
+        yield 'temp size' => [\OpsFour\S3Server\Storage\LocalEfsTempSizeFence::class, 'evidence'];
+        yield 'encrypted completion' => [\OpsFour\S3Server\Storage\LocalEncryptedMultipartCompletionFence::class, 'evidence'];
+        yield 'assembly' => [\OpsFour\S3Server\Storage\LocalMultipartAssemblyFence::class, 'evidence'];
+        yield 'part write' => [\OpsFour\S3Server\Storage\LocalMultipartPartWriteFence::class, 'evidence'];
+        yield 'multipart path' => [\OpsFour\S3Server\Storage\LocalMultipartPathFence::class, 'efsEvidence'];
+        yield 'object write' => [\OpsFour\S3Server\Storage\LocalObjectWriteFence::class, 'efsEvidence'];
     }
 
     private function scope(): ProductionEfsWorkerEvidenceScope

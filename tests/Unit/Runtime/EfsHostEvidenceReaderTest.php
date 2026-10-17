@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableStream;
+use Amp\Cancellation;
 use Amp\DeferredFuture;
 use Amp\File\Driver\BlockingFilesystemDriver;
 use Amp\File\File;
@@ -57,6 +59,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentReconciler;
 use OpsFour\S3Server\Storage\LocalObjectWriteOutcome;
+use OpsFour\S3Server\Storage\EfsAwareLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\LocalMultipartPathFence;
 use OpsFour\S3Server\Storage\LocalMultipartAssemblyFence;
 use OpsFour\S3Server\Storage\LocalEfsDeleteFence;
@@ -67,6 +70,7 @@ use OpsFour\S3Server\Storage\LocalEfsTempSizeFence;
 use OpsFour\S3Server\Storage\LocalEfsStoredPathCheck;
 use OpsFour\S3Server\Storage\LocalEfsDeleteIo;
 use OpsFour\S3Server\Storage\NativeLocalEfsDeleteIo;
+use OpsFour\S3Server\Storage\NativeLocalEfsBucketNamespaceIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\MultipartWriteIntentCollector;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
@@ -249,6 +253,30 @@ final class EfsHostEvidenceReaderTest extends TestCase
         self::assertTrue($namespace->bucketExists('bucket'));
         $namespace->createBucket('bucket');
         self::assertSame(0700, fileperms($this->storageRoot . '/bucket') & 0o7777);
+    }
+
+    public function test_native_bucket_and_delete_directory_sync_stop_after_evidence_loss_at_open(): void
+    {
+        foreach ([new NativeLocalEfsBucketNamespaceIo(), new NativeLocalEfsDeleteIo()] as $io) {
+            $this->writeRecord($this->record());
+            $reader = $this->reader();
+            $checks = 0;
+
+            try {
+                $io->syncDirectory($this->storageRoot, function () use ($reader, &$checks): void {
+                    $checks++;
+                    if ($checks === 1) {
+                        self::assertTrue(unlink($this->evidencePath));
+                    }
+                    $reader->assertFresh();
+                });
+                self::fail('Directory sync continued after EFS host evidence loss.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('evidence', strtolower($error->getMessage()));
+            }
+
+            self::assertSame(1, $checks);
+        }
     }
 
     public function test_bucket_namespace_rejects_symlink_and_loose_permissions(): void
@@ -888,6 +916,24 @@ final class EfsHostEvidenceReaderTest extends TestCase
         $this->assertRejected($worker);
     }
 
+    public function test_guarded_object_and_multipart_fences_reject_non_evidence_aware_io(): void
+    {
+        $io = $this->createStub(LocalObjectWriteIo::class);
+        $factories = [
+            fn(): LocalObjectWriteFence => new LocalObjectWriteFence($this->storageRoot, $io, $this->reader()),
+            fn(): LocalMultipartPathFence => new LocalMultipartPathFence($this->storageRoot, $io, $this->reader()),
+        ];
+
+        foreach ($factories as $factory) {
+            try {
+                $factory();
+                self::fail('Guarded storage accepted I/O without evidence-aware directory synchronization.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('evidence-aware', $error->getMessage());
+            }
+        }
+    }
+
     public function test_worker_scope_crosses_a_real_amp_process_channel(): void
     {
         $scope = $this->reader()->workerScope();
@@ -962,6 +1008,37 @@ final class EfsHostEvidenceReaderTest extends TestCase
         self::assertSame(0, $io->linkCalls);
         self::assertFileDoesNotExist($intent->storagePath);
         self::assertSame('active', $metadata->getObjectWriteIntent($attempt)?->state);
+    }
+
+    public function test_object_write_stops_before_the_next_efs_chunk_after_evidence_loss(): void
+    {
+        $reader = $this->reader();
+        $reader->workerScope();
+        $fence = new LocalObjectWriteFence($this->storageRoot, new NativeLocalObjectWriteIo(), $reader);
+        $attempt = str_repeat('f', 32);
+        $generation = str_repeat('a', 32);
+        $intent = new ObjectWriteIntent(
+            $attempt,
+            'bucket',
+            $generation,
+            'owner',
+            'STANDARD',
+            StoragePath::forPlannedObject($this->storageRoot, 'bucket', 'key', $generation, $attempt),
+            'put_object',
+        );
+        $body = new EvidenceDroppingReadableStream($this->evidencePath);
+
+        try {
+            $fence->write($intent, 'key', $body);
+            self::fail('The EFS write continued after host evidence loss.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('evidence', strtolower($error->getMessage()));
+        }
+
+        self::assertFileDoesNotExist($intent->storagePath);
+        $stages = glob($this->storageRoot . '/.tmp/*') ?: [];
+        self::assertCount(1, $stages);
+        self::assertSame('first-chunk', file_get_contents($stages[0]));
     }
 
     public function test_guarded_object_writer_rejects_existing_public_namespace_directory(): void
@@ -2749,7 +2826,7 @@ final class EfsHostEvidenceReaderTest extends TestCase
             );
             self::fail('Assembly published after the host evidence disappeared.');
         } catch (\RuntimeException $error) {
-            self::assertSame('EFS host evidence is unavailable or invalid.', $error->getMessage());
+            self::assertStringContainsString('evidence', strtolower($error->getMessage()));
             self::assertFileDoesNotExist($target);
             self::assertSame('first', file_get_contents($partPath));
         }
@@ -3491,7 +3568,79 @@ final class EfsHostEvidenceReaderTest extends TestCase
     }
 }
 
-final class EvidenceDropBeforeLinkIo implements LocalObjectWriteIo
+/** @implements \IteratorAggregate<int, string> */
+final class EvidenceDroppingReadableStream implements ReadableStream, \IteratorAggregate
+{
+    private int $read = 0;
+
+    private bool $closed = false;
+
+    /** @var list<\Closure(): void> */
+    private array $onClose = [];
+
+    public function __construct(private readonly string $evidencePath) {}
+
+    public function read(?Cancellation $cancellation = null): ?string
+    {
+        $cancellation?->throwIfRequested();
+        if ($this->closed) {
+            return null;
+        }
+        if ($this->read++ === 0) {
+            return 'first-chunk';
+        }
+        if ($this->read === 2) {
+            if (! @unlink($this->evidencePath)) {
+                throw new \RuntimeException('Test evidence could not be removed.');
+            }
+
+            return 'must-not-be-written';
+        }
+        $this->close();
+
+        return null;
+    }
+
+    public function isReadable(): bool
+    {
+        return ! $this->closed;
+    }
+
+    public function close(): void
+    {
+        if ($this->closed) {
+            return;
+        }
+        $this->closed = true;
+        foreach ($this->onClose as $callback) {
+            $callback();
+        }
+        $this->onClose = [];
+    }
+
+    public function isClosed(): bool
+    {
+        return $this->closed;
+    }
+
+    public function onClose(\Closure $onClose): void
+    {
+        if ($this->closed) {
+            $onClose();
+            return;
+        }
+        $this->onClose[] = $onClose;
+    }
+
+    public function getIterator(): \Traversable
+    {
+        while (($chunk = $this->read()) !== null) {
+            yield $chunk;
+        }
+    }
+}
+
+final class EvidenceDropBeforeLinkIo implements EfsAwareLocalObjectWriteIo
 {
     public int $linkCalls = 0;
 
@@ -3516,9 +3665,16 @@ final class EvidenceDropBeforeLinkIo implements LocalObjectWriteIo
         return $result;
     }
 
-    public function syncDirectory(string $path): bool
+    public function syncDirectory(string $path, ?\Closure $afterSyscall = null): bool
     {
-        return $this->inner->syncDirectory($path);
+        return $this->inner->syncDirectoryWithCallback($path, $afterSyscall);
+    }
+
+    public function syncDirectoryWithEvidence(
+        string $path,
+        EfsHostEvidenceReader|\OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence $evidence,
+    ): bool {
+        return $this->inner->syncDirectoryWithEvidence($path, $evidence);
     }
 
     public function link(string $source, string $target): bool
@@ -3596,8 +3752,8 @@ final class EvidenceDropDeleteIo implements LocalEfsDeleteIo
         return $this->reportFailureAfterUnlink ? false : $result;
     }
 
-    public function syncDirectory(string $path): bool
+    public function syncDirectory(string $path, ?\Closure $afterSyscall = null): bool
     {
-        return $this->inner->syncDirectory($path);
+        return $this->inner->syncDirectory($path, $afterSyscall);
     }
 }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use Closure;
+
 /** Blocking filesystem calls confined to the optional bucket namespace worker. */
 interface LocalEfsBucketNamespaceIo
 {
@@ -15,5 +17,6 @@ interface LocalEfsBucketNamespaceIo
 
     public function mkdir(string $path): bool;
 
-    public function syncDirectory(string $path): bool;
+    /** @param (Closure(): void)|null $afterSyscall */
+    public function syncDirectory(string $path, ?Closure $afterSyscall = null): bool;
 }

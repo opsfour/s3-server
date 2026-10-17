@@ -9,6 +9,8 @@ use Amp\Cancellation;
 use Amp\Parallel\Worker\Task;
 use Amp\Sync\Channel;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
+use OpsFour\S3Server\Storage\EfsAwareLocalObjectWriteIo;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Storage\LocalObjectWriteFence;
@@ -78,7 +80,7 @@ final readonly class LocalObjectWriteTask implements Task
 }
 
 /** Tracks the first possibly ambiguous create-only syscall. */
-final class TrackingLocalObjectWriteIo implements LocalObjectWriteIo
+final class TrackingLocalObjectWriteIo implements EfsAwareLocalObjectWriteIo
 {
     private bool $publicationAttempted = false;
 
@@ -97,6 +99,17 @@ final class TrackingLocalObjectWriteIo implements LocalObjectWriteIo
     public function syncDirectory(string $path): bool
     {
         return $this->inner->syncDirectory($path);
+    }
+
+    public function syncDirectoryWithEvidence(
+        string $path,
+        EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+    ): bool {
+        if (! $this->inner instanceof EfsAwareLocalObjectWriteIo) {
+            throw new \RuntimeException('Guarded object worker I/O cannot synchronize EFS safely.');
+        }
+
+        return $this->inner->syncDirectoryWithEvidence($path, $evidence);
     }
 
     public function link(string $source, string $target): bool

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use Closure;
+
 final class NativeLocalEfsBucketNamespaceIo implements LocalEfsBucketNamespaceIo
 {
     public function lstat(string $path): array|false
@@ -23,8 +25,8 @@ final class NativeLocalEfsBucketNamespaceIo implements LocalEfsBucketNamespaceIo
         return @mkdir($path, 0700, false);
     }
 
-    public function syncDirectory(string $path): bool
+    public function syncDirectory(string $path, ?Closure $afterSyscall = null): bool
     {
-        return (new NativeLocalObjectWriteIo())->syncDirectory($path);
+        return (new NativeLocalObjectWriteIo())->syncDirectoryWithCallback($path, $afterSyscall);
     }
 }

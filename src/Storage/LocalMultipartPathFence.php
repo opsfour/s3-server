@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
+use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /**
  * Physical create-only publication and permanent same-path sealing for local
@@ -20,9 +21,12 @@ final readonly class LocalMultipartPathFence
     public function __construct(
         string $storageRoot,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private ?EfsHostEvidenceReader $efsEvidence = null,
+        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence|null $efsEvidence = null,
     ) {
         if ($efsEvidence !== null) {
+            if (! $io instanceof EfsAwareLocalObjectWriteIo) {
+                throw new \InvalidArgumentException('Guarded multipart I/O must support evidence-aware directory synchronization.');
+            }
             if ($storageRoot !== $efsEvidence->storageRoot()) {
                 throw new \InvalidArgumentException('Guarded local multipart root differs from EFS evidence.');
             }
@@ -62,27 +66,37 @@ final readonly class LocalMultipartPathFence
 
         $this->efsEvidence?->assertFresh();
         $file = @fopen($stagedPath, 'rb');
+        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Local multipart staging file is unavailable.');
         }
         try {
             $this->efsEvidence?->assertFresh();
             $opened = @fstat($file);
+            $this->efsEvidence?->assertFresh();
             if ($verifiedInode !== null && (! is_array($opened)
                 || $opened['dev'] !== $verifiedInode[0] || $opened['ino'] !== $verifiedInode[1])) {
                 throw new \RuntimeException('Verified multipart staging inode changed before publication.');
             }
-            if ($verifiedInode === null && ! $this->io->syncFile($file)) {
-                throw new \RuntimeException('Failed to synchronize local multipart data.');
+            if ($verifiedInode === null) {
+                $synced = $this->io->syncFile($file);
+                $this->efsEvidence?->assertFresh();
+                if (! $synced) {
+                    throw new \RuntimeException('Failed to synchronize local multipart data.');
+                }
             }
         } finally {
+            // Descriptor-only cleanup is the sole best-effort syscall allowed
+            // after evidence loss; it cannot start a new pathname operation.
             @fclose($file);
         }
 
         // A failed link may already have reached another host. Never retry a
         // different payload at this path or remove the possible publication.
         $this->efsEvidence?->assertFresh();
-        if (! $this->io->link($stagedPath, $targetPath)) {
+        $linked = $this->io->link($stagedPath, $targetPath);
+        $this->efsEvidence?->assertFresh();
+        if (! $linked) {
             throw new \RuntimeException('Local multipart create-only publication is uncertain.');
         }
         $this->syncDirectoryChain(dirname($targetPath));
@@ -104,23 +118,31 @@ final readonly class LocalMultipartPathFence
         $sealPath = $directory . '/.seal-' . $attemptId . '-' . bin2hex(random_bytes(16));
         $this->efsEvidence?->assertFresh();
         $file = @fopen($sealPath, 'x+b');
+        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Failed to create local multipart seal.');
         }
         try {
             $this->efsEvidence?->assertFresh();
-            if (! @chmod($sealPath, 0600)) {
+            $protected = @chmod($sealPath, 0600);
+            $this->efsEvidence?->assertFresh();
+            if (! $protected) {
                 throw new \RuntimeException('Failed to protect local multipart seal.');
             }
             $this->writeAll($file, $marker);
             $this->efsEvidence?->assertFresh();
-            if (! $this->io->syncFile($file) || ! @fclose($file)) {
+            $synced = $this->io->syncFile($file);
+            $this->efsEvidence?->assertFresh();
+            $closed = $synced && @fclose($file);
+            $this->efsEvidence?->assertFresh();
+            if (! $synced || ! $closed) {
                 throw new \RuntimeException('Failed to synchronize local multipart seal.');
             }
             $file = null;
 
             $this->efsEvidence?->assertFresh();
             $renamed = $this->io->rename($sealPath, $targetPath);
+            $this->efsEvidence?->assertFresh();
             $this->syncDirectoryChain($directory);
             $this->efsEvidence?->assertFresh();
             if (! $this->hasMarker($targetPath, $marker)) {
@@ -130,14 +152,12 @@ final readonly class LocalMultipartPathFence
             }
         } finally {
             if (is_resource($file)) {
+                // Descriptor-only best-effort cleanup; no new EFS path lookup.
                 @fclose($file);
             }
-            try {
-                $this->efsEvidence?->assertFresh();
-                @unlink($sealPath);
-            } catch (\Throwable) {
-                // Keep the uncertain seal staging path on evidence loss.
-            }
+            $this->efsEvidence?->assertFresh();
+            @unlink($sealPath);
+            $this->efsEvidence?->assertFresh();
         }
     }
 
@@ -165,14 +185,20 @@ final readonly class LocalMultipartPathFence
             }
             $current .= '/' . $segment;
             clearstatcache(true, $current);
-            if (is_link($current) || realpath($current) !== $current) {
+            $linked = is_link($current);
+            $this->efsEvidence?->assertFresh();
+            $resolved = realpath($current);
+            $this->efsEvidence?->assertFresh();
+            if ($linked || $resolved !== $current) {
                 throw new \InvalidArgumentException('Local multipart path has an unsafe directory.');
             }
             $this->assertPrivateEfsDirectory($current);
         }
         $basename = end($segments);
         $this->efsEvidence?->assertFresh();
-        if ($basename === '' || $basename === '.' || $basename === '..' || is_link($path)) {
+        $linked = is_link($path);
+        $this->efsEvidence?->assertFresh();
+        if ($basename === '' || $basename === '.' || $basename === '..' || $linked) {
             throw new \InvalidArgumentException('Invalid local multipart target.');
         }
     }
@@ -199,13 +225,28 @@ final readonly class LocalMultipartPathFence
             }
             $current .= '/' . $segment;
             clearstatcache(true, $current);
-            if (is_link($current)) {
+            $linked = is_link($current);
+            $this->efsEvidence?->assertFresh();
+            if ($linked) {
                 throw new \InvalidArgumentException('Local multipart seal directory is a symbolic link.');
             }
-            if (! is_dir($current) && ! @mkdir($current, 0700) && ! is_dir($current)) {
+            $directoryExists = is_dir($current);
+            $this->efsEvidence?->assertFresh();
+            $created = $directoryExists;
+            if (! $directoryExists) {
+                $created = @mkdir($current, 0700);
+                $this->efsEvidence?->assertFresh();
+                if (! $created) {
+                    $directoryExists = is_dir($current);
+                    $this->efsEvidence?->assertFresh();
+                }
+            }
+            if (! $directoryExists && ! $created) {
                 throw new \RuntimeException('Failed to create local multipart seal directory.');
             }
-            if (realpath($current) !== $current) {
+            $resolved = realpath($current);
+            $this->efsEvidence?->assertFresh();
+            if ($resolved !== $current) {
                 throw new \InvalidArgumentException('Local multipart seal directory escapes its storage root.');
             }
             $this->assertPrivateEfsDirectory($current);
@@ -219,6 +260,7 @@ final readonly class LocalMultipartPathFence
         }
         $this->efsEvidence->assertFresh();
         $entry = @lstat($path);
+        $this->efsEvidence->assertFresh();
         if (! function_exists('posix_geteuid') || $entry === false
             || ($entry['mode'] & 0o170000) !== 0o040000
             || ($entry['mode'] & 0o077) !== 0
@@ -231,7 +273,14 @@ final readonly class LocalMultipartPathFence
     {
         while (true) {
             $this->efsEvidence?->assertFresh();
-            if (! $this->io->syncDirectory($directory)) {
+            if ($this->efsEvidence !== null && ! $this->io instanceof EfsAwareLocalObjectWriteIo) {
+                throw new \LogicException('Guarded multipart I/O lost evidence-aware directory synchronization.');
+            }
+            $synced = $this->efsEvidence !== null
+                ? $this->io->syncDirectoryWithEvidence($directory, $this->efsEvidence)
+                : $this->io->syncDirectory($directory);
+            $this->efsEvidence?->assertFresh();
+            if (! $synced) {
                 throw new \RuntimeException('Failed to synchronize local multipart directory.');
             }
             if ($directory === $this->root) {
@@ -248,6 +297,7 @@ final readonly class LocalMultipartPathFence
         while ($offset < strlen($bytes)) {
             $this->efsEvidence?->assertFresh();
             $written = @fwrite($file, substr($bytes, $offset));
+            $this->efsEvidence?->assertFresh();
             if ($written === false || $written === 0) {
                 throw new \RuntimeException('Failed to write local multipart seal.');
             }
@@ -263,14 +313,34 @@ final readonly class LocalMultipartPathFence
         }
         $this->efsEvidence?->assertFresh();
         $file = @fopen($path, 'rb');
+        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             return false;
         }
         try {
-            $stat = fstat($file);
-            return $stat !== false && $stat['size'] === $length
-                && hash_equals($marker, (string) fread($file, $length));
+            $stat = @fstat($file);
+            $this->efsEvidence?->assertFresh();
+            if ($stat === false || $stat['size'] !== $length) {
+                return false;
+            }
+            $actual = '';
+            while (strlen($actual) < $length) {
+                $this->efsEvidence?->assertFresh();
+                $remaining = $length - strlen($actual);
+                if ($remaining < 1) {
+                    break;
+                }
+                $chunk = @fread($file, $remaining);
+                $this->efsEvidence?->assertFresh();
+                if ($chunk === false || $chunk === '') {
+                    return false;
+                }
+                $actual .= $chunk;
+            }
+
+            return hash_equals($marker, $actual);
         } finally {
+            // Descriptor-only best-effort cleanup after the last validated read.
             @fclose($file);
         }
     }

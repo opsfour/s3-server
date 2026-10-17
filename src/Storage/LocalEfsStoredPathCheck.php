@@ -6,13 +6,14 @@ namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
+use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /** Blocking stored-path confinement check for an optional EFS process worker. */
 final readonly class LocalEfsStoredPathCheck
 {
     public function __construct(
         private string $root,
-        private EfsHostEvidenceReader $evidence,
+        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
     ) {
         if ($root !== $evidence->storageRoot()) {
             throw new \InvalidArgumentException('Guarded stored-path root differs from EFS evidence.');
