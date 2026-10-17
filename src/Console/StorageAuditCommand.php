@@ -28,7 +28,7 @@ final class StorageAuditCommand extends Command
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', getenv('S3_METADATA_DSN') ?: '')
             ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root (shorthand)', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping: TIER=/canonical/root')
+            ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping JSON: {"tier":"HOT","root":"/canonical/root"}')
             ->addOption('page-size', null, InputOption::VALUE_REQUIRED, 'Metadata rows per page, 1-10000', '5000')
             ->addOption('max-errors', null, InputOption::VALUE_REQUIRED, 'Maximum issue rows to print, 0-10000', '100');
     }
@@ -138,13 +138,19 @@ final class StorageAuditCommand extends Command
             if (! is_string($mapping)) {
                 throw new \InvalidArgumentException('Local tier mappings are invalid.');
             }
-            $separator = strpos($mapping, '=');
-            if ($separator === false) {
-                throw new \InvalidArgumentException('Local tier mappings must use TIER=/canonical/root.');
+            try {
+                $decoded = json_decode($mapping, true, 3, JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                throw new \InvalidArgumentException('Local tier mappings must be valid JSON objects.');
+            }
+            if (! is_array($decoded) || array_is_list($decoded) || count($decoded) !== 2
+                || ! array_key_exists('tier', $decoded) || ! is_string($decoded['tier'])
+                || ! array_key_exists('root', $decoded) || ! is_string($decoded['root'])) {
+                throw new \InvalidArgumentException('Local tier mappings require exactly string fields tier and root.');
             }
             $mappings[] = [
-                'tier' => substr($mapping, 0, $separator),
-                'root' => substr($mapping, $separator + 1),
+                'tier' => $decoded['tier'],
+                'root' => $decoded['root'],
             ];
         }
 

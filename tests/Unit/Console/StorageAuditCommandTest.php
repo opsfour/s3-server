@@ -130,14 +130,14 @@ final class StorageAuditCommandTest extends TestCase
         self::assertSame(4, file_put_contents($coldPath, 'cold'));
         $metadata->putObjectMetadata('bucket', 'cold', 'owner', 4, 'etag', 'text/plain', $coldPath);
         $writer = new \PDO('sqlite:' . $this->databasePath);
-        self::assertSame(1, $writer->exec("UPDATE s3_objects SET storage_tier = 'COLD' WHERE key_name = 'cold'"));
+        self::assertSame(1, $writer->exec("UPDATE s3_objects SET storage_tier = 'COLD=ARCHIVE' WHERE key_name = 'cold'"));
         unset($writer);
 
         try {
             $missing = new CommandTester(new StorageAuditCommand());
             self::assertSame(Command::FAILURE, $missing->execute([
                 '--metadata-path' => $this->databasePath,
-                '--storage-tier-root' => ['STANDARD=' . $this->root],
+                '--storage-tier-root' => [json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR)],
             ]), $missing->getDisplay());
             self::assertStringContainsString('unsupported_or_unmapped_tier', $missing->getDisplay());
 
@@ -145,8 +145,8 @@ final class StorageAuditCommandTest extends TestCase
             self::assertSame(Command::SUCCESS, $mapped->execute([
                 '--metadata-path' => $this->databasePath,
                 '--storage-tier-root' => [
-                    'STANDARD=' . $this->root,
-                    'COLD=' . $coldRoot,
+                    json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR),
+                    json_encode(['tier' => 'COLD=ARCHIVE', 'root' => $coldRoot], JSON_THROW_ON_ERROR),
                 ],
             ]), $mapped->getDisplay());
         } finally {
@@ -154,6 +154,24 @@ final class StorageAuditCommandTest extends TestCase
             @rmdir($coldRoot . '/.opsfour');
             @unlink($coldPath);
             @rmdir($coldRoot);
+        }
+    }
+
+    public function test_command_rejects_non_json_or_non_exact_tier_mappings_without_echoing_them(): void
+    {
+        $invalidMappings = [
+            'STANDARD=/private/raw-value',
+            json_encode(['tier' => 'STANDARD', 'root' => $this->root, 'private' => 'extra'], JSON_THROW_ON_ERROR),
+            json_encode(['tier' => 42, 'root' => $this->root], JSON_THROW_ON_ERROR),
+        ];
+
+        foreach ($invalidMappings as $mapping) {
+            $tester = new CommandTester(new StorageAuditCommand());
+            self::assertSame(Command::FAILURE, $tester->execute([
+                '--metadata-path' => $this->databasePath,
+                '--storage-tier-root' => [$mapping],
+            ]), $tester->getDisplay());
+            self::assertStringNotContainsString($mapping, $tester->getDisplay());
         }
     }
 
@@ -168,6 +186,7 @@ final class StorageAuditCommandTest extends TestCase
         self::assertStringContainsString('--metadata-dsn', $process->getOutput());
         self::assertStringContainsString('--storage-path', $process->getOutput());
         self::assertStringContainsString('--storage-tier-root', $process->getOutput());
+        self::assertStringContainsString('local tier mapping JSON', $process->getOutput());
     }
 
     public function test_command_refuses_to_run_while_the_local_root_is_owned(): void
