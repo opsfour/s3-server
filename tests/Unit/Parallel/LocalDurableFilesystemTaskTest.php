@@ -55,6 +55,19 @@ final class LocalDurableFilesystemTaskTest extends TestCase
         }
     }
 
+    public function test_directory_task_bootstraps_a_missing_storage_root(): void
+    {
+        $root = $this->root . '/new/storage';
+        $pool = new ContextWorkerPool(1);
+
+        try {
+            $pool->submit(LocalDurableFilesystemTask::ensureDirectory($root, $root . '/bucket'))->await();
+            self::assertDirectoryExists($root . '/bucket');
+        } finally {
+            $pool->shutdown();
+        }
+    }
+
     public function test_task_state_contains_only_scalar_properties(): void
     {
         $task = LocalDurableFilesystemTask::publish(

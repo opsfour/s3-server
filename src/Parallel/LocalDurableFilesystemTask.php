@@ -62,7 +62,10 @@ final readonly class LocalDurableFilesystemTask implements Task
     public function run(Channel $channel, Cancellation $cancellation): null
     {
         $cancellation->throwIfRequested();
-        $publisher = new LocalDurableFilePublisher($this->root);
+        $publisher = new LocalDurableFilePublisher(
+            $this->root,
+            createRoot: $this->operation === self::ENSURE_DIRECTORY,
+        );
 
         match ($this->operation) {
             self::PUBLISH => $publisher->publish($this->path, $this->targetPath),

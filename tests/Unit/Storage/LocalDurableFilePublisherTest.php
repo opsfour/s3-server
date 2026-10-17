@@ -275,6 +275,24 @@ final class LocalDurableFilePublisherTest extends TestCase
         }
     }
 
+    public function test_directory_creation_can_durably_bootstrap_a_missing_storage_root(): void
+    {
+        $root = $this->root . '/new/storage';
+        $io = new RecordingDurableFileIo();
+        $publisher = new LocalDurableFilePublisher($root, $io, createRoot: true);
+
+        $publisher->ensureDirectory($root . '/bucket');
+
+        self::assertDirectoryExists($root . '/bucket');
+        self::assertSame([
+            'sync-directory:' . $root,
+            'sync-directory:' . dirname($root),
+            'sync-directory:' . $this->root,
+            'sync-directory:' . $root . '/bucket',
+            'sync-directory:' . $root,
+        ], $io->events);
+    }
+
     public function test_delete_can_retry_after_unlink_succeeded_but_parent_sync_failed(): void
     {
         $directory = $this->root . '/bucket/aa/bb';

@@ -19,13 +19,17 @@ final readonly class LocalDurableFilePublisher
     public function __construct(
         string $storageRoot,
         private LocalDurableFileIo $io = new NativeLocalObjectWriteIo(),
+        bool $createRoot = false,
     ) {
+        $this->inputRoot = rtrim($storageRoot, '/');
         $root = realpath($storageRoot);
+        if ($root === false && $createRoot) {
+            $root = $this->createStorageRoot($this->inputRoot);
+        }
         if ($root === false || ! is_dir($root)) {
             throw new \InvalidArgumentException('Local storage root must be an existing directory.');
         }
         $this->root = rtrim($root, '/');
-        $this->inputRoot = rtrim($storageRoot, '/');
     }
 
     /** Publish a complete staging file at a previously unused target path. */
@@ -164,6 +168,54 @@ final readonly class LocalDurableFilePublisher
         }
 
         return $path;
+    }
+
+    private function createStorageRoot(string $path): string
+    {
+        if ($path === '' || ! str_starts_with($path, '/')) {
+            throw new \InvalidArgumentException('Local storage root must be an absolute directory.');
+        }
+
+        $missing = [];
+        $ancestor = $path;
+        while (realpath($ancestor) === false) {
+            $segment = basename($ancestor);
+            $this->assertSegment($segment);
+            array_unshift($missing, $segment);
+            $parent = dirname($ancestor);
+            if ($parent === $ancestor) {
+                throw new \InvalidArgumentException('Local storage root has no existing ancestor.');
+            }
+            $ancestor = $parent;
+        }
+
+        $canonicalAncestor = realpath($ancestor);
+        if ($canonicalAncestor === false || ! is_dir($canonicalAncestor)) {
+            throw new \InvalidArgumentException('Local storage root has an unsafe ancestor.');
+        }
+        $current = rtrim($canonicalAncestor, '/');
+        foreach ($missing as $segment) {
+            $current .= '/' . $segment;
+            clearstatcache(true, $current);
+            if (! @mkdir($current, 0700) && ! is_dir($current)) {
+                throw new \RuntimeException('Failed to create local storage root.');
+            }
+            $stat = @lstat($current);
+            if (! is_array($stat) || ($stat['mode'] & 0170000) !== 0040000 || realpath($current) !== $current) {
+                throw new \InvalidArgumentException('Local storage root is unsafe.');
+            }
+        }
+
+        $root = $current;
+        while (true) {
+            if (! $this->io->syncDirectory($current)) {
+                throw new \RuntimeException('Failed to synchronize local storage root.');
+            }
+            if ($current === rtrim($canonicalAncestor, '/')) {
+                return $root;
+            }
+            $current = dirname($current);
+        }
     }
 
     private function assertSegment(string $segment): void
