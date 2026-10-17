@@ -4547,16 +4547,23 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             \PDO::ATTR_STRINGIFY_FETCHES => false,
         ]);
 
-        // Use FULL synchronous durability on every connection. Schema migrations
-        // may not run when an existing database is already current, and PRAGMA
-        // synchronous is scoped to the connection rather than the database file.
+        // Apply connection-scoped durability and performance settings here.
+        // Schema migrations may not run when an existing database is current.
         $pragmas = $this->readOnly
-            ? ['PRAGMA synchronous=FULL', 'PRAGMA query_only=ON', 'PRAGMA busy_timeout=5000']
+            ? [
+                'PRAGMA synchronous=FULL',
+                'PRAGMA query_only=ON',
+                'PRAGMA busy_timeout=5000',
+                'PRAGMA cache_size=-64000',
+                'PRAGMA mmap_size=268435456',
+            ]
             : [
                 'PRAGMA journal_mode=WAL',
                 'PRAGMA synchronous=FULL',
                 'PRAGMA busy_timeout=5000',
                 'PRAGMA foreign_keys=ON',
+                'PRAGMA cache_size=-64000',
+                'PRAGMA mmap_size=268435456',
             ];
         foreach ($pragmas as $pragma) {
             $this->pdo->query($pragma);

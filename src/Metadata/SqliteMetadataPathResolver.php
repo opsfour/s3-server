@@ -18,14 +18,21 @@ final class SqliteMetadataPathResolver
         }
 
         $legacyPath = self::join($storagePath, self::DATABASE_FILENAME);
+        $internalPath = self::join(
+            self::join($storagePath, self::INTERNAL_DIRECTORY),
+            self::DATABASE_FILENAME,
+        );
+        if (is_file($legacyPath) && is_file($internalPath)) {
+            throw new \RuntimeException(
+                'Both the legacy and internal SQLite metadata files exist. '
+                . 'Set S3_METADATA_PATH explicitly to select the active database.',
+            );
+        }
         if (is_file($legacyPath)) {
             return $legacyPath;
         }
 
-        return self::join(
-            self::join($storagePath, self::INTERNAL_DIRECTORY),
-            self::DATABASE_FILENAME,
-        );
+        return $internalPath;
     }
 
     private static function join(string $directory, string $name): string

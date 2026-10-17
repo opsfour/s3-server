@@ -92,6 +92,28 @@ final class S3ServerServiceProviderTest extends TestCase
         @rmdir($this->basePath . '/.opsfour');
     }
 
+    public function test_ambiguous_default_sqlite_files_require_an_explicit_metadata_path(): void
+    {
+        self::assertTrue(mkdir($this->basePath . '/.opsfour'));
+        self::assertNotFalse(file_put_contents($this->basePath . '/metadata.sqlite', 'legacy'));
+        self::assertNotFalse(file_put_contents($this->basePath . '/.opsfour/metadata.sqlite', 'internal'));
+
+        try {
+            $app = $this->application([
+                'storage' => ['path' => $this->basePath],
+                'metadata' => ['path' => null],
+            ]);
+
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Set S3_METADATA_PATH explicitly');
+            $app->make(MetadataStore::class);
+        } finally {
+            @unlink($this->basePath . '/.opsfour/metadata.sqlite');
+            @unlink($this->basePath . '/metadata.sqlite');
+            @rmdir($this->basePath . '/.opsfour');
+        }
+    }
+
     public function test_artisan_serve_does_not_echo_dependency_exception_details(): void
     {
         $app = $this->application();

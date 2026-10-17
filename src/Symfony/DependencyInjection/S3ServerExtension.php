@@ -6,12 +6,10 @@ namespace OpsFour\S3Server\Symfony\DependencyInjection;
 
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
-use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
-use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
@@ -23,6 +21,7 @@ use OpsFour\S3Server\Symfony\Command\S3ServerServeCommand;
 use OpsFour\S3Server\Symfony\Encryption\SymfonyEncryptionFactory;
 use OpsFour\S3Server\Symfony\Event\SymfonyEventDispatcherListener;
 use OpsFour\S3Server\Symfony\S3ServerConfigFactory;
+use OpsFour\S3Server\Symfony\SymfonyMetadataStoreFactory;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Argument\ServiceClosureArgument;
 use Symfony\Component\DependencyInjection\Definition;
@@ -40,9 +39,6 @@ final class S3ServerExtension extends Extension
         $config = $this->processConfiguration($configuration, $configs);
 
         $metadataConfig = $config['metadata'];
-        if ($metadataConfig['driver'] === 'sqlite' && $metadataConfig['path'] === null) {
-            $metadataConfig['path'] = SqliteMetadataPathResolver::resolve((string) $config['storage']['path']);
-        }
         $metadataConfig['worker_pool_size'] = $config['parallel']['sqlite_workers'];
 
         $container->setParameter('opsfour_s3_server.config', $config);
@@ -71,13 +67,11 @@ final class S3ServerExtension extends Extension
 
         $metadataStoreServiceId = 'opsfour_s3_server.metadata.inner';
         $container->setDefinition($metadataStoreServiceId, (new Definition(MetadataStore::class))
-            ->setFactory([MetadataStoreFactory::class, 'create'])
+            ->setFactory([SymfonyMetadataStoreFactory::class, 'create'])
             ->setArguments([
-                $metadataConfig['driver'],
                 $metadataConfig,
-                null,
+                (string) $config['storage']['path'],
                 new Reference(MetricsCollector::class),
-                $metadataConfig['driver'] === 'sqlite',
             ])
             ->setPublic(false));
 

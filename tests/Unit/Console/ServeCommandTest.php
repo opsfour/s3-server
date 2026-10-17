@@ -91,6 +91,32 @@ final class ServeCommandTest extends TestCase
         self::assertSame('metrics-secret', $config->metricsBearerToken);
     }
 
+    public function test_ambiguous_default_sqlite_files_fail_before_server_start(): void
+    {
+        self::assertTrue(mkdir($this->tempDir . '/.opsfour'));
+        self::assertNotFalse(file_put_contents($this->tempDir . '/metadata.sqlite', 'legacy'));
+        self::assertNotFalse(file_put_contents($this->tempDir . '/.opsfour/metadata.sqlite', 'internal'));
+
+        try {
+            $command = new ServeCommand();
+            $input = $this->input($command, ['--storage-path' => $this->tempDir]);
+
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Set S3_METADATA_PATH explicitly');
+            $this->invoke($command, 'buildMetadataStore', [
+                $input,
+                'sqlite',
+                '',
+                $this->tempDir,
+                new MetricsCollector(),
+            ]);
+        } finally {
+            @unlink($this->tempDir . '/.opsfour/metadata.sqlite');
+            @unlink($this->tempDir . '/metadata.sqlite');
+            @rmdir($this->tempDir . '/.opsfour');
+        }
+    }
+
     public function test_cli_memory_and_external_metadata_options_reach_the_start_guard(): void
     {
         $command = new ServeCommand();

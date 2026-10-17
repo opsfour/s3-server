@@ -464,7 +464,8 @@ sqlite3 /var/data/s3/.opsfour/metadata.sqlite ".backup /backups/metadata-$(date 
 ```
 
 Use the path configured by `S3_METADATA_PATH` when set. Installations upgraded
-from the legacy default continue to use `/var/data/s3/metadata.sqlite`.
+from the legacy default continue to use `/var/data/s3/metadata.sqlite`. If both
+paths exist, set `S3_METADATA_PATH` explicitly before starting the server.
 
 ### PostgreSQL
 

@@ -67,12 +67,78 @@ final class S3ServerBundleTest extends TestCase
         $container = new ContainerBuilder();
         (new S3ServerExtension())->load([[
             'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
-            'metadata' => ['driver' => 'sqlite'],
+            'metadata' => ['driver' => 'sqlite', 'cache_ttl' => 0.0],
         ]], $container);
 
         $metadataConfig = $container->getParameter('opsfour_s3_server.metadata_config');
         self::assertIsArray($metadataConfig);
-        self::assertSame($storagePath . '/.opsfour/metadata.sqlite', $metadataConfig['path']);
+        self::assertNull($metadataConfig['path']);
+
+        $container->compile();
+        $metadata = $this->service($container, MetadataStore::class);
+        self::assertInstanceOf(SqliteMetadataStore::class, $metadata);
+        self::assertSame($storagePath . '/.opsfour/metadata.sqlite', $metadata->databaseFilePath());
+
+        $this->cleanupPaths = [
+            $storagePath,
+            $storagePath . '/.opsfour',
+            $storagePath . '/.opsfour/metadata.sqlite',
+            $storagePath . '/.opsfour/metadata.sqlite-wal',
+            $storagePath . '/.opsfour/metadata.sqlite-shm',
+        ];
+    }
+
+    public function test_compiled_container_discovers_legacy_sqlite_after_runtime_mount(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-symfony-runtime-metadata-' . bin2hex(random_bytes(6));
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
+            'metadata' => ['driver' => 'sqlite', 'cache_ttl' => 0.0],
+        ]], $container);
+        $container->compile();
+
+        self::assertTrue(mkdir($storagePath, 0o700, true));
+        $legacyPath = $storagePath . '/metadata.sqlite';
+        $legacy = new SqliteMetadataStore($legacyPath);
+        $legacy->initialize();
+        unset($legacy);
+
+        $metadata = $this->service($container, MetadataStore::class);
+        self::assertInstanceOf(SqliteMetadataStore::class, $metadata);
+        self::assertSame($legacyPath, $metadata->databaseFilePath());
+        self::assertDirectoryDoesNotExist($storagePath . '/.opsfour');
+
+        $this->cleanupPaths = [
+            $storagePath,
+            $legacyPath,
+            $legacyPath . '-wal',
+            $legacyPath . '-shm',
+        ];
+    }
+
+    public function test_ambiguous_default_sqlite_files_require_an_explicit_metadata_path(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-symfony-ambiguous-metadata-' . bin2hex(random_bytes(6));
+        self::assertTrue(mkdir($storagePath . '/.opsfour', 0o700, true));
+        self::assertNotFalse(file_put_contents($storagePath . '/metadata.sqlite', 'legacy'));
+        self::assertNotFalse(file_put_contents($storagePath . '/.opsfour/metadata.sqlite', 'internal'));
+        $this->cleanupPaths = [
+            $storagePath,
+            $storagePath . '/.opsfour',
+            $storagePath . '/metadata.sqlite',
+            $storagePath . '/.opsfour/metadata.sqlite',
+        ];
+
+        (new S3ServerExtension())->load([[
+            'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
+            'metadata' => ['driver' => 'sqlite', 'cache_ttl' => 0.0],
+        ]], $container = new ContainerBuilder());
+        $container->compile();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Set S3_METADATA_PATH explicitly');
+        $this->service($container, MetadataStore::class);
     }
 
     public function test_external_metadata_service_uses_read_only_admission(): void
@@ -84,8 +150,6 @@ final class S3ServerBundleTest extends TestCase
                 'metadata' => ['driver' => $driver, 'dsn' => 'host=127.0.0.1 port=1 dbname=s3audit_unreachable'],
                 'credentials' => ['driver' => 'memory', 'access_key' => 'key', 'secret_key' => 'secret'],
             ]], $container);
-            $definition = $container->getDefinition('opsfour_s3_server.metadata.inner');
-            self::assertFalse($definition->getArguments()[4]);
             $container->compile();
             try {
                 $container->get(MetadataStore::class);

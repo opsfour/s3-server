@@ -16,7 +16,9 @@ first start. Schema migrations run automatically. If
 `{storagePath}/metadata.sqlite` already exists as a file from an earlier
 release, it continues to be used automatically. A directory with that legacy
 name is left available as ordinary bucket storage. Set `S3_METADATA_PATH` to
-select a different file explicitly.
+select a different file explicitly. If both the legacy and internal database
+files exist, automatic selection fails so an older database cannot silently
+become active; set `S3_METADATA_PATH` to choose the intended database.
 
 ### SQLite Configuration
 

@@ -60,6 +60,18 @@ final class SqliteMetadataPathResolverTest extends TestCase
         );
     }
 
+    public function test_ambiguous_legacy_and_internal_databases_require_an_explicit_path(): void
+    {
+        self::assertNotFalse(file_put_contents($this->storagePath . '/metadata.sqlite', 'legacy'));
+        self::assertTrue(mkdir($this->storagePath . '/.opsfour'));
+        self::assertNotFalse(file_put_contents($this->storagePath . '/.opsfour/metadata.sqlite', 'internal'));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Set S3_METADATA_PATH explicitly');
+
+        SqliteMetadataPathResolver::resolve($this->storagePath);
+    }
+
     private function remove(string $path): void
     {
         if (! is_dir($path)) {

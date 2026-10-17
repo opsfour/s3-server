@@ -92,7 +92,7 @@ YAML, because each tier needs a named backend and optional service references.
 |----------|---------|-------------|
 | `S3_METADATA_DRIVER` | `sqlite` | Metadata backend: `sqlite`, `postgres`, or `mysql` |
 | `S3_METADATA_DSN` | - | Connection string for postgres/mysql |
-| `S3_METADATA_PATH` | `{storagePath}/.opsfour/metadata.sqlite` | Explicit standalone SQLite database path; an existing legacy `{storagePath}/metadata.sqlite` file remains the automatic default |
+| `S3_METADATA_PATH` | `{storagePath}/.opsfour/metadata.sqlite` | Explicit standalone SQLite database path; an existing legacy `{storagePath}/metadata.sqlite` file remains the automatic default, while the presence of both files requires an explicit choice |
 | `S3_METADATA_CACHE_TTL` | `5.0` | Finite, non-negative CORS metadata cache TTL in seconds (0 to disable); ownership, policies, Public Access Block, encryption, and versioning are always read from the shared store |
 
 See [Metadata Backends](metadata-backends.md) for driver-specific configuration.
