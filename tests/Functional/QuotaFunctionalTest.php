@@ -8,6 +8,7 @@ use Aws\CommandPool;
 use Aws\ResultInterface;
 use Aws\S3\S3Client;
 use Aws\S3\Exception\S3Exception;
+use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -915,8 +916,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
 
         // Cross-account quota profiles need consent from each account as well
         // as the bucket ACL or policy established in the individual test.
-        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
-        $metadata->initialize();
+        $metadata = MetadataStoreFactory::create('sqlite', ['path' => self::sqliteMetadataPath()]);
         $identityPolicy = json_encode([
             'Statement' => [[
                 'Effect' => 'Allow', 'Action' => 's3:*', 'Resource' => '*',
@@ -942,8 +942,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
      */
     private static function putAccountQuotas(array $quotas): void
     {
-        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
-        $metadata->initialize();
+        $metadata = MetadataStoreFactory::create('sqlite', ['path' => self::sqliteMetadataPath()]);
 
         foreach ($quotas as $ownerId => $quota) {
             $metadata->putAccountQuota($ownerId, $quota);
