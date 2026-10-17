@@ -67,6 +67,27 @@ final class LocalStorageRootLocksTest extends TestCase
         }
     }
 
+    public function test_reacquiring_the_same_roots_is_idempotent_but_cannot_change_the_set(): void
+    {
+        $root = $this->base . '/same';
+        $otherRoot = $this->base . '/other';
+        self::assertTrue(mkdir($root));
+        self::assertTrue(mkdir($otherRoot));
+        $locks = LocalStorageRootLocks::create();
+        $locks->acquireRoots([$root]);
+
+        $locks->acquireRoots([$root]);
+        $this->assertContended($root);
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Local storage root ownership was already acquired for different roots.');
+        try {
+            $locks->acquireRoots([$root, $otherRoot]);
+        } finally {
+            $locks->release();
+        }
+    }
+
     public function test_overlapping_roots_are_rejected_before_any_lock_is_taken(): void
     {
         $root = $this->base . '/objects';
@@ -97,6 +118,55 @@ final class LocalStorageRootLocksTest extends TestCase
 
         $this->assertContended($root);
         $locks->release();
+    }
+
+    public function test_missing_root_is_created_with_private_permissions(): void
+    {
+        $root = $this->base . '/new/nested';
+        $locks = LocalStorageRootLocks::create();
+        $locks->acquireRoots([$root]);
+
+        self::assertDirectoryExists($root);
+        self::assertSame(0o700, fileperms($root) & 0o777);
+
+        $locks->release();
+    }
+
+    public function test_runtime_lock_must_be_a_single_link_regular_file(): void
+    {
+        $root = $this->base . '/hardlink';
+        self::assertTrue(mkdir($root . '/.opsfour', 0o700, true));
+        $outside = $this->base . '/outside-file';
+        self::assertSame(4, file_put_contents($outside, 'safe'));
+        self::assertTrue(link($outside, $root . '/.opsfour/runtime.lock'));
+        $permissions = fileperms($outside) & 0o777;
+
+        try {
+            LocalStorageRootLocks::create()->acquireRoots([$root]);
+            self::fail('A hard-linked runtime lock was accepted.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Cannot safely acquire the local storage runtime lock.', $error->getMessage());
+        }
+
+        clearstatcache(true, $outside);
+        self::assertSame($permissions, fileperms($outside) & 0o777);
+        self::assertSame('safe', file_get_contents($outside));
+    }
+
+    public function test_reacquired_lock_can_still_be_retained_after_a_successful_retry(): void
+    {
+        $root = $this->base . '/retry';
+        self::assertTrue(mkdir($root));
+        $locks = LocalStorageRootLocks::create();
+        $locks->acquireRoots([$root]);
+        $locks->retainUntilProcessExit();
+        $locks->release();
+        $locks->acquireRoots([$root]);
+        $locks->retainUntilProcessExit();
+        unset($locks);
+        gc_collect_cycles();
+
+        $this->assertContended($root);
     }
 
     public function test_reserved_internal_namespace_must_not_be_a_symlink(): void

@@ -23,6 +23,9 @@ final class LocalStorageRootLocks
     /** @var list<resource> */
     private array $handles = [];
 
+    /** @var list<string> */
+    private array $acquiredRoots = [];
+
     /** @var array<int, resource> Intentionally leaked until PHP closes process resources. */
     private static array $retainedHandles = [];
 
@@ -54,13 +57,20 @@ final class LocalStorageRootLocks
         $this->acquireRoots($roots);
     }
 
-    /** @param iterable<string> $configuredRoots */
+    /**
+     * Initialize and acquire roots. The persistent internal lock file is
+     * control state and may be created by this operation.
+     *
+     * @param iterable<string> $configuredRoots
+     */
     public function acquireRoots(iterable $configuredRoots): void
     {
-        if ($this->handles !== []) {
-            throw new \LogicException('Local storage root ownership was already acquired.');
-        }
+        $this->acquireConfiguredRoots($configuredRoots);
+    }
 
+    /** @param iterable<string> $configuredRoots */
+    private function acquireConfiguredRoots(iterable $configuredRoots): void
+    {
         $roots = [];
         foreach ($configuredRoots as $configuredRoot) {
             $root = self::canonicalRoot($configuredRoot);
@@ -77,10 +87,19 @@ final class LocalStorageRootLocks
             }
         }
 
+        if ($this->handles !== []) {
+            if ($paths === $this->acquiredRoots) {
+                return;
+            }
+
+            throw new \LogicException('Local storage root ownership was already acquired for different roots.');
+        }
+
         try {
             foreach ($paths as $root) {
                 $this->acquireRoot($root);
             }
+            $this->acquiredRoots = $paths;
         } catch (\Throwable $error) {
             $this->release();
             throw $error;
@@ -94,6 +113,8 @@ final class LocalStorageRootLocks
             fclose($handle);
         }
         $this->handles = [];
+        $this->acquiredRoots = [];
+        $this->retained = false;
     }
 
     /** Keep ownership when shutdown cannot prove that every writer stopped. */
@@ -105,19 +126,16 @@ final class LocalStorageRootLocks
 
         $this->retained = true;
         foreach ($this->handles as $handle) {
-            $id = get_resource_id($handle);
-            if (! isset(self::$retainedHandles[$id])) {
-                self::$retainedHandles[$id] = $handle;
-            }
+            self::$retainedHandles[count(self::$retainedHandles)] = $handle;
         }
     }
 
     private static function canonicalRoot(string $configuredRoot): string
     {
-        if (! is_dir($configuredRoot)
-            && ! @mkdir($configuredRoot, 0o755, true)
-            && ! is_dir($configuredRoot)) {
-            throw new \RuntimeException('Cannot prepare a configured local storage root for exclusive ownership.');
+        if (! is_dir($configuredRoot)) {
+            if (! @mkdir($configuredRoot, 0o700, true) && ! is_dir($configuredRoot)) {
+                throw new \RuntimeException('Cannot prepare a configured local storage root for exclusive ownership.');
+            }
         }
 
         $root = realpath($configuredRoot);
@@ -134,10 +152,10 @@ final class LocalStorageRootLocks
         if (is_link($internalDirectory)) {
             throw new \RuntimeException('Cannot use the reserved local storage runtime namespace.');
         }
-        if (! is_dir($internalDirectory)
-            && ! @mkdir($internalDirectory, 0o700)
-            && ! is_dir($internalDirectory)) {
-            throw new \RuntimeException('Cannot create the reserved local storage runtime namespace.');
+        if (! is_dir($internalDirectory)) {
+            if (! @mkdir($internalDirectory, 0o700) && ! is_dir($internalDirectory)) {
+                throw new \RuntimeException('Cannot create the reserved local storage runtime namespace.');
+            }
         }
 
         $canonicalInternalDirectory = realpath($internalDirectory);
@@ -150,18 +168,32 @@ final class LocalStorageRootLocks
         if (is_link($lockPath)) {
             throw new \RuntimeException('Cannot use the reserved local storage runtime lock.');
         }
-
+        clearstatcache(true, $lockPath);
+        $existingStat = @lstat($lockPath);
+        if ($existingStat !== false
+            && (($existingStat['mode'] & 0o170000) !== 0o100000 || $existingStat['nlink'] !== 1)) {
+            throw new \RuntimeException('Cannot safely acquire the local storage runtime lock.');
+        }
         $handle = @fopen($lockPath, 'c+b');
         if ($handle === false) {
             throw new \RuntimeException('Cannot acquire exclusive ownership of a configured local storage root.');
         }
 
         try {
-            @chmod($lockPath, 0o600);
+            $handleStat = @fstat($handle);
+            if ($handleStat === false
+                || ($handleStat['mode'] & 0o170000) !== 0o100000
+                || $handleStat['nlink'] !== 1) {
+                throw new \RuntimeException('Cannot safely acquire the local storage runtime lock.');
+            }
+            if (! @chmod($lockPath, 0o600)) {
+                throw new \RuntimeException('Cannot protect the local storage runtime lock.');
+            }
             clearstatcache(true, $lockPath);
             $pathStat = @lstat($lockPath);
-            $handleStat = @fstat($handle);
-            if ($pathStat === false || $handleStat === false
+            if ($pathStat === false
+                || ($pathStat['mode'] & 0o170000) !== 0o100000
+                || $pathStat['nlink'] !== 1
                 || $pathStat['dev'] !== $handleStat['dev']
                 || $pathStat['ino'] !== $handleStat['ino']) {
                 throw new \RuntimeException('Cannot safely acquire the local storage runtime lock.');
