@@ -104,6 +104,19 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         }
     }
 
+    public function test_delete_reports_a_missing_storage_root_as_an_internal_failure(): void
+    {
+        $root = $this->basePath . '/missing-storage-root';
+        $backend = new FilesystemBackend($root);
+
+        $this->expectException(InternalErrorException::class);
+        try {
+            $backend->deleteObjectByPath($root . '/bucket/aa/bb/object', 'bucket');
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
     public function test_cancelled_object_write_cleans_staging_file_and_propagates_same_cancellation(): void
     {
         $backend = new FilesystemBackend($this->basePath);

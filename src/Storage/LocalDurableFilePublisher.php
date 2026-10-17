@@ -26,8 +26,11 @@ final readonly class LocalDurableFilePublisher
         if ($root === false && $createRoot) {
             $root = $this->createStorageRoot($this->inputRoot);
         }
-        if ($root === false || ! is_dir($root)) {
-            throw new \InvalidArgumentException('Local storage root must be an existing directory.');
+        if ($root === false) {
+            throw new \RuntimeException('Local storage root is unavailable.');
+        }
+        if (! is_dir($root)) {
+            throw new \InvalidArgumentException('Local storage root must be a directory.');
         }
         $this->root = rtrim($root, '/');
     }

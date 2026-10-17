@@ -182,23 +182,22 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Create the target directory and durably publish the staged file.
         $targetDir = dirname($finalPath);
 
-        $publicationStarted = false;
+        $durablePublicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
-            $publicationStarted = true;
             if ($fencedMultipart) {
                 $this->publishFencedMultipartPath($tempPath, $finalPath);
-                $this->safeDelete($tempPath);
             } else {
+                $durablePublicationStarted = true;
                 $this->publishDurably($tempPath, $finalPath);
             }
         } catch (CancelledException $e) {
-            if (! $publicationStarted) {
+            if (! $durablePublicationStarted) {
                 $this->safeDelete($tempPath);
             }
             throw $e;
         } catch (\Throwable $e) {
-            if (! $publicationStarted) {
+            if (! $durablePublicationStarted) {
                 $this->safeDelete($tempPath);
             }
             throw new InternalErrorException('Failed to finalize object in filesystem backend.', $e);
@@ -379,13 +378,18 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         try {
             if ($planned) {
                 $this->publishFencedMultipartPath($tempPath, $partPath);
-                $this->safeDelete($tempPath);
             } else {
                 $this->publishDurably($tempPath, $partPath);
             }
         } catch (CancelledException $e) {
+            if ($planned) {
+                $this->safeDelete($tempPath);
+            }
             throw $e;
         } catch (\Throwable $e) {
+            if ($planned) {
+                $this->safeDelete($tempPath);
+            }
             throw new InternalErrorException('Failed to finalize multipart part in filesystem backend.', $e);
         }
 
@@ -568,21 +572,14 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Move assembled file to final path
         $targetDir = dirname($finalPath);
 
-        $publicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
-            $publicationStarted = true;
             $this->publishFencedMultipartPath($tempPath, $finalPath);
-            $this->safeDelete($tempPath);
         } catch (CancelledException $e) {
-            if (! $publicationStarted) {
-                $this->safeDelete($tempPath);
-            }
+            $this->safeDelete($tempPath);
             throw $e;
         } catch (\Throwable $e) {
-            if (! $publicationStarted) {
-                $this->safeDelete($tempPath);
-            }
+            $this->safeDelete($tempPath);
             throw new InternalErrorException('Failed to finalize assembled object in filesystem backend.', $e);
         }
 
