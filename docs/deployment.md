@@ -460,8 +460,11 @@ $s3->putBucketLogging([
 
 ```bash
 # Hot backup while server is running (WAL mode supports this)
-sqlite3 /var/data/s3/metadata.sqlite ".backup /backups/metadata-$(date +%Y%m%d).sqlite"
+sqlite3 /var/data/s3/.opsfour/metadata.sqlite ".backup /backups/metadata-$(date +%Y%m%d).sqlite"
 ```
+
+Use the path configured by `S3_METADATA_PATH` when set. Installations upgraded
+from the legacy default continue to use `/var/data/s3/metadata.sqlite`.
 
 ### PostgreSQL
 

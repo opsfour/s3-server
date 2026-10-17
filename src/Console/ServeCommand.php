@@ -14,6 +14,7 @@ use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
@@ -380,8 +381,10 @@ final class ServeCommand extends Command
             'worker_pool_size' => $this->integerOption($input, 'sqlite-workers'),
         ];
         if ($metadataDriver === 'sqlite') {
-            $path = $this->nullableString($input->getOption('metadata-path'))
-                ?? rtrim($storagePath ?? (string) $input->getOption('storage-temp-dir'), '/') . '/metadata.sqlite';
+            $path = SqliteMetadataPathResolver::resolve(
+                $storagePath ?? (string) $input->getOption('storage-temp-dir'),
+                $this->nullableString($input->getOption('metadata-path')),
+            );
             $this->ensureDirectory(dirname($path), 'SQLite metadata');
             $metadataConfig['path'] = $path;
         }

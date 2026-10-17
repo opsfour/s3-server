@@ -11,6 +11,7 @@ use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
@@ -40,7 +41,7 @@ final class S3ServerExtension extends Extension
 
         $metadataConfig = $config['metadata'];
         if ($metadataConfig['driver'] === 'sqlite' && $metadataConfig['path'] === null) {
-            $metadataConfig['path'] = rtrim((string) $config['storage']['path'], '/') . '/metadata.sqlite';
+            $metadataConfig['path'] = SqliteMetadataPathResolver::resolve((string) $config['storage']['path']);
         }
         $metadataConfig['worker_pool_size'] = $config['parallel']['sqlite_workers'];
 

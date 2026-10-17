@@ -128,7 +128,7 @@ final class QuotaCommandTest extends TestCase
         self::assertSame(Command::FAILURE, $exit, $tester->getDisplay());
         self::assertStringContainsString('Owner ID must contain 1 to 255 bytes', $tester->getDisplay());
         self::assertStringContainsString('characters.', $tester->getDisplay());
-        $metadata = new SqliteMetadataStore($this->storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore($this->storagePath . '/.opsfour/metadata.sqlite');
         $metadata->initialize();
         self::assertSame([], $metadata->listAccountQuotas());
     }

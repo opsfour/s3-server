@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Console;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
@@ -27,7 +28,7 @@ final class MultipartPartIntentCommand extends Command
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path');
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null);
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -48,7 +49,7 @@ final class MultipartPartIntentCommand extends Command
         if ($driver === 'sqlite') {
             $metadataPath = $input->getOption('metadata-path');
             if (is_string($metadataPath) && $metadataPath !== '') {
-                $sqlitePath = $metadataPath;
+                $sqlitePath = SqliteMetadataPathResolver::resolve('', $metadataPath);
             } else {
                 $storagePath = $input->getOption('storage-path');
                 if (! is_string($storagePath) || $storagePath === '') {
@@ -56,7 +57,7 @@ final class MultipartPartIntentCommand extends Command
 
                     return Command::FAILURE;
                 }
-                $sqlitePath = rtrim($storagePath, '/') . '/metadata.sqlite';
+                $sqlitePath = SqliteMetadataPathResolver::resolve($storagePath);
             }
         }
 

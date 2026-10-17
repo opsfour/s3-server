@@ -199,6 +199,7 @@ return [
     'metadata' => [
         'driver' => env('S3_METADATA_DRIVER', 'sqlite'),
         'dsn' => env('S3_METADATA_DSN', ''),
+        'path' => env('S3_METADATA_PATH'),
         // TTL in seconds for bucket-level metadata cache (0 = disabled).
         'cache_ttl' => EnvironmentNumber::finiteFloat('S3_METADATA_CACHE_TTL', 5.0),
     ],

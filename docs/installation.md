@@ -152,7 +152,7 @@ $config = new S3ServerConfig(
 // 2. Create backends
 $storage  = StorageBackendFactory::create('filesystem', ['path' => '/var/data/s3']);
 $metadata = MetadataStoreFactory::create('sqlite', [
-    'path' => '/var/data/s3/metadata.sqlite',
+    'path' => '/var/data/s3/.opsfour/metadata.sqlite',
 ]);
 $metadata->initialize();
 

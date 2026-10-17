@@ -8,10 +8,15 @@ Best for development and single-node production deployments.
 
 ```bash
 S3_METADATA_DRIVER=sqlite
-S3_STORAGE_PATH=/var/data/s3   # metadata.sqlite is created here
+S3_STORAGE_PATH=/var/data/s3   # .opsfour/metadata.sqlite is created here
 ```
 
-The database file is created at `{storagePath}/metadata.sqlite` on first start. Schema migrations run automatically.
+The database file is created at `{storagePath}/.opsfour/metadata.sqlite` on
+first start. Schema migrations run automatically. If
+`{storagePath}/metadata.sqlite` already exists as a file from an earlier
+release, it continues to be used automatically. A directory with that legacy
+name is left available as ordinary bucket storage. Set `S3_METADATA_PATH` to
+select a different file explicitly.
 
 ### SQLite Configuration
 

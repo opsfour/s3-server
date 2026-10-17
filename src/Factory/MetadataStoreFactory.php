@@ -29,7 +29,10 @@ final class MetadataStoreFactory
      */
     public static function create(string $driver, array $config = [], ?LoggerInterface $logger = null, ?MetricsCollector $metrics = null, bool $migrate = true): MetadataStore
     {
+        $sqlitePath = null;
         if ($driver === 'sqlite') {
+            $sqlitePath = $config['path'] ?? throw new \InvalidArgumentException('SQLite requires "path"');
+            self::ensureSqliteDirectory($sqlitePath);
             $logger?->warning(
                 'SQLite metadata driver is intended for development/testing only. '
                 . 'Use Postgres or MySQL for production deployments.',
@@ -53,8 +56,10 @@ final class MetadataStoreFactory
         }
 
         if ($driver === 'sqlite' && $workerPoolSize > 0) {
-            $path = $config['path'] ?? throw new \InvalidArgumentException('SQLite requires "path"');
-            $store = new ParallelSqliteMetadataStore($path, $workerPoolSize, $metrics);
+            if ($sqlitePath === null) {
+                throw new \LogicException('Resolved SQLite path is unavailable.');
+            }
+            $store = new ParallelSqliteMetadataStore($sqlitePath, $workerPoolSize, $metrics);
             try {
                 $store->initialize();
             } catch (\Throwable $error) {
@@ -70,7 +75,7 @@ final class MetadataStoreFactory
 
         $store = match ($driver) {
             'sqlite' => new SqliteMetadataStore(
-                $config['path'] ?? throw new \InvalidArgumentException('SQLite requires "path"'),
+                $sqlitePath ?? throw new \LogicException('Resolved SQLite path is unavailable.'),
             ),
             'postgres' => PostgresMetadataStore::fromDsn(
                 $config['dsn'] ?? throw new \InvalidArgumentException('Postgres requires "dsn"'),
@@ -86,5 +91,20 @@ final class MetadataStoreFactory
         }
 
         return $store;
+    }
+
+    private static function ensureSqliteDirectory(string $path): void
+    {
+        if ($path === ':memory:') {
+            return;
+        }
+
+        $directory = dirname($path);
+        if (is_dir($directory)) {
+            return;
+        }
+        if (! @mkdir($directory, 0o700, true) && ! is_dir($directory)) {
+            throw new \RuntimeException('Cannot create the SQLite metadata directory.');
+        }
     }
 }

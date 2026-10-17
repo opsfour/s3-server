@@ -11,6 +11,7 @@ use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\S3ServerConfig;
@@ -110,10 +111,10 @@ class S3ServerServiceProvider extends ServiceProvider
             $config = $app['config']['s3-server'];
             $metadataConfig = $config['metadata'] ?? [];
 
-            // For SQLite, derive path from storage path if no DSN given.
+            // For SQLite, derive a package-internal path from storage unless explicitly configured.
             if (($metadataConfig['driver'] ?? 'sqlite') === 'sqlite' && empty($metadataConfig['path'])) {
                 $storagePath = $config['storage']['path'] ?? storage_path('s3');
-                $metadataConfig['path'] = $storagePath . '/metadata.sqlite';
+                $metadataConfig['path'] = SqliteMetadataPathResolver::resolve($storagePath);
             }
 
             $parallelConfig = $config['parallel'] ?? [];

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Console;
 
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -31,17 +32,18 @@ final class MetadataMigrateCommand extends Command
         $config = [];
 
         if ($driver === 'sqlite') {
-            $path = $input->getOption('metadata-path');
-            if (! is_string($path) || $path === '') {
+            $configuredPath = $input->getOption('metadata-path');
+            if (is_string($configuredPath) && $configuredPath !== '') {
+                $config['path'] = SqliteMetadataPathResolver::resolve('', $configuredPath);
+            } else {
                 $storagePath = $input->getOption('storage-path');
                 if (! is_string($storagePath) || $storagePath === '') {
                     $io->error('--metadata-path or --storage-path is required for SQLite.');
 
                     return Command::FAILURE;
                 }
-                $path = rtrim($storagePath, '/') . '/metadata.sqlite';
+                $config['path'] = SqliteMetadataPathResolver::resolve($storagePath);
             }
-            $config['path'] = $path;
         } elseif (in_array($driver, ['postgres', 'mysql'], true)) {
             $dsn = $input->getOption('metadata-dsn');
             if (! is_string($dsn) || $dsn === '') {

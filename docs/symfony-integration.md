@@ -48,7 +48,7 @@ opsfour_s3_server:
 
   metadata:
     driver: sqlite
-    path: '%kernel.project_dir%/var/s3/metadata.sqlite'
+    path: '%kernel.project_dir%/var/s3/.opsfour/metadata.sqlite'
     cache_ttl: 5.0
 
   credentials:

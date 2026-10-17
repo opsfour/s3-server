@@ -61,6 +61,20 @@ final class S3ServerBundleTest extends TestCase
         self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle())->getContainerExtension());
     }
 
+    public function test_default_sqlite_metadata_uses_the_internal_storage_namespace(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-symfony-metadata-' . bin2hex(random_bytes(6));
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
+            'metadata' => ['driver' => 'sqlite'],
+        ]], $container);
+
+        $metadataConfig = $container->getParameter('opsfour_s3_server.metadata_config');
+        self::assertIsArray($metadataConfig);
+        self::assertSame($storagePath . '/.opsfour/metadata.sqlite', $metadataConfig['path']);
+    }
+
     public function test_external_metadata_service_uses_read_only_admission(): void
     {
         foreach (['postgres', 'mysql'] as $driver) {

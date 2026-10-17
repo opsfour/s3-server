@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Console;
 
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\OwnerIdValidator;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -32,7 +33,7 @@ final class QuotaCommand extends Command
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path')
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
             ->addOption('max-buckets', null, InputOption::VALUE_REQUIRED, 'Maximum buckets for the account (0 = unlimited)', '0')
             ->addOption('max-objects-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum objects per bucket (0 = unlimited)', '0')
             ->addOption('max-bytes-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum bytes per bucket (0 = unlimited)', '0')
@@ -81,7 +82,7 @@ final class QuotaCommand extends Command
         if ($driver === 'sqlite') {
             $metadataPath = $input->getOption('metadata-path');
             if ($metadataPath !== null && $metadataPath !== '') {
-                $config['path'] = (string) $metadataPath;
+                $config['path'] = SqliteMetadataPathResolver::resolve('', (string) $metadataPath);
             } else {
                 $storagePath = $input->getOption('storage-path');
                 if ($storagePath === null || $storagePath === '') {
@@ -90,7 +91,7 @@ final class QuotaCommand extends Command
                     return null;
                 }
 
-                $config['path'] = rtrim((string) $storagePath, '/') . '/metadata.sqlite';
+                $config['path'] = SqliteMetadataPathResolver::resolve((string) $storagePath);
             }
         }
 

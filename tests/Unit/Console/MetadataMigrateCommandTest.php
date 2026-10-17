@@ -113,6 +113,74 @@ final class MetadataMigrateCommandTest extends TestCase
         }
     }
 
+    public function test_sqlite_migration_derives_the_internal_default_from_storage_path(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-metadata-storage-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storagePath, 0o700, true));
+
+        try {
+            $tester = new CommandTester(new MetadataMigrateCommand());
+            self::assertSame(Command::SUCCESS, $tester->execute([
+                '--metadata-driver' => 'sqlite',
+                '--storage-path' => $storagePath,
+            ]), $tester->getDisplay());
+            self::assertFileExists($storagePath . '/.opsfour/metadata.sqlite');
+            self::assertFileDoesNotExist($storagePath . '/metadata.sqlite');
+        } finally {
+            foreach (glob($storagePath . '/.opsfour/metadata.sqlite*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($storagePath . '/.opsfour');
+            @rmdir($storagePath);
+        }
+    }
+
+    public function test_sqlite_migration_reuses_a_legacy_database_file(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-metadata-legacy-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storagePath, 0o700, true));
+        $legacyPath = $storagePath . '/metadata.sqlite';
+        self::assertNotFalse(file_put_contents($legacyPath, ''));
+
+        try {
+            $tester = new CommandTester(new MetadataMigrateCommand());
+            self::assertSame(Command::SUCCESS, $tester->execute([
+                '--metadata-driver' => 'sqlite',
+                '--storage-path' => $storagePath,
+            ]), $tester->getDisplay());
+            self::assertSame(SqliteSchema::VERSION, (new SchemaManager(new \PDO('sqlite:' . $legacyPath)))->getCurrentVersion());
+            self::assertDirectoryDoesNotExist($storagePath . '/.opsfour');
+        } finally {
+            foreach (glob($legacyPath . '*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($storagePath);
+        }
+    }
+
+    public function test_sqlite_migration_preserves_a_legacy_named_bucket_directory(): void
+    {
+        $storagePath = sys_get_temp_dir() . '/s3-metadata-bucket-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storagePath . '/metadata.sqlite', 0o700, true));
+
+        try {
+            $tester = new CommandTester(new MetadataMigrateCommand());
+            self::assertSame(Command::SUCCESS, $tester->execute([
+                '--metadata-driver' => 'sqlite',
+                '--storage-path' => $storagePath,
+            ]), $tester->getDisplay());
+            self::assertDirectoryExists($storagePath . '/metadata.sqlite');
+            self::assertFileExists($storagePath . '/.opsfour/metadata.sqlite');
+        } finally {
+            foreach (glob($storagePath . '/.opsfour/metadata.sqlite*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($storagePath . '/.opsfour');
+            @rmdir($storagePath . '/metadata.sqlite');
+            @rmdir($storagePath);
+        }
+    }
+
     public function test_missing_connection_configuration_fails_without_exposing_dsn(): void
     {
         $tester = new CommandTester(new MetadataMigrateCommand());

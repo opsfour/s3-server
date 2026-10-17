@@ -16,6 +16,7 @@ use OpsFour\S3Server\Laravel\S3ServerCommand;
 use OpsFour\S3Server\Laravel\S3ServerServiceProvider;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -70,6 +71,25 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame(Command::FAILURE, $tester->execute([]));
         self::assertStringContainsString('PostgreSQL API servers require the pecl-pq PHP extension.', $tester->getDisplay());
         self::assertStringNotContainsString('private-dsn-secret', $tester->getDisplay());
+    }
+
+    public function test_default_sqlite_metadata_uses_the_internal_storage_namespace(): void
+    {
+        $app = $this->application([
+            'storage' => ['path' => $this->basePath],
+            'metadata' => ['path' => null, 'cache_ttl' => 0.0],
+        ]);
+
+        $metadata = $app->make(MetadataStore::class);
+        self::assertInstanceOf(SqliteMetadataStore::class, $metadata);
+        self::assertSame($this->basePath . '/.opsfour/metadata.sqlite', $metadata->databaseFilePath());
+        self::assertFileExists($this->basePath . '/.opsfour/metadata.sqlite');
+
+        unset($metadata, $app);
+        foreach (glob($this->basePath . '/.opsfour/metadata.sqlite*') ?: [] as $path) {
+            @unlink($path);
+        }
+        @rmdir($this->basePath . '/.opsfour');
     }
 
     public function test_artisan_serve_does_not_echo_dependency_exception_details(): void
