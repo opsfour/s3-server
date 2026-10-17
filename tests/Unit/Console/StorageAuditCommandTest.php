@@ -162,6 +162,7 @@ final class StorageAuditCommandTest extends TestCase
         $invalidMappings = [
             'STANDARD=/private/raw-value',
             json_encode(['tier' => 'STANDARD', 'root' => $this->root], JSON_THROW_ON_ERROR),
+            '{"0":"HOT","1":"/root"}',
             json_encode(['STANDARD'], JSON_THROW_ON_ERROR),
             json_encode(['STANDARD', $this->root, 'extra'], JSON_THROW_ON_ERROR),
             json_encode([42, $this->root], JSON_THROW_ON_ERROR),

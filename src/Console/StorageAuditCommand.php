@@ -139,7 +139,7 @@ final class StorageAuditCommand extends Command
                 throw new \InvalidArgumentException('Local tier mappings are invalid.');
             }
             try {
-                $decoded = json_decode($mapping, true, 3, JSON_THROW_ON_ERROR);
+                $decoded = json_decode($mapping, false, 3, JSON_THROW_ON_ERROR);
             } catch (\JsonException) {
                 throw new \InvalidArgumentException('Local tier mappings must be valid JSON tuples.');
             }
