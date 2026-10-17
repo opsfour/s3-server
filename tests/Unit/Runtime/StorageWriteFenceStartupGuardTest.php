@@ -370,9 +370,11 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
 
     public function test_api_start_rejects_unreferenced_remote_tier_before_metadata_query_or_bind(): void
     {
+        $storageRoot = sys_get_temp_dir() . '/s3-write-fence-preflight-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storageRoot, 0o700));
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->expects(self::never())->method('listReferencedStorageTiers');
-        $storage = $this->filesystemPlaceholder();
+        $storage = $this->filesystemPlaceholder($storageRoot);
         $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), $metadata, $storage);
         $server->setStorageTierRegistry(new StorageTierRegistry([
             new StorageTier('STANDARD', $storage, defaultWriteTier: true),
@@ -390,8 +392,10 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
             self::assertStringContainsString('storage tier COLD', $exception->getMessage());
             self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
             self::assertSame([], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
+            self::assertDirectoryDoesNotExist($storageRoot . '/.opsfour');
         } finally {
             $server->stop();
+            rmdir($storageRoot);
         }
     }
 

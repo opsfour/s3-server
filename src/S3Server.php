@@ -245,8 +245,6 @@ final class S3Server
         $registryFreezeToken = $this->handlerRegistry->freeze();
         $this->starting = true;
         try {
-            $this->localStorageRootLocks->acquireBackends($this->registeredStorageBackends());
-
             $configuredTiers = $this->storageTiers
                 ?? ($this->storage !== null ? StorageTierRegistry::single($this->storage) : null);
             if ($configuredTiers !== null) {
@@ -357,6 +355,11 @@ final class S3Server
                 }
                 $this->metadata->assertNoLegacyLocalMultipartIntents($configuredTiers->defaultTier()->name);
             }
+
+            // Storage admission above is side-effect free. Take exclusive
+            // ownership after every storage preflight, but before TLS setup,
+            // worker creation, or listener binding.
+            $this->localStorageRootLocks->acquireBackends($this->registeredStorageBackends());
 
             // Validate TLS files before creating the request-body worker pool or
             // assigning an HTTP server. A failed preflight must leave start clean.
