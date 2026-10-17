@@ -4547,12 +4547,14 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             \PDO::ATTR_STRINGIFY_FETCHES => false,
         ]);
 
-        // Enable WAL mode for concurrent reads during writes, and set busy timeout.
+        // Use FULL synchronous durability on every connection. Schema migrations
+        // may not run when an existing database is already current, and PRAGMA
+        // synchronous is scoped to the connection rather than the database file.
         $pragmas = $this->readOnly
-            ? ['PRAGMA query_only=ON', 'PRAGMA busy_timeout=5000']
+            ? ['PRAGMA synchronous=FULL', 'PRAGMA query_only=ON', 'PRAGMA busy_timeout=5000']
             : [
                 'PRAGMA journal_mode=WAL',
-                'PRAGMA synchronous=NORMAL',
+                'PRAGMA synchronous=FULL',
                 'PRAGMA busy_timeout=5000',
                 'PRAGMA foreign_keys=ON',
             ];
