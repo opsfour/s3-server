@@ -18,11 +18,8 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
 use OpsFour\S3Server\Quota\QuotaConfig;
-use OpsFour\S3Server\Runtime\EfsStorageStartupPreflight;
 use OpsFour\S3Server\Runtime\BootstrapResourceCleanup;
-use OpsFour\S3Server\Runtime\EfsStartupIdentityFactory;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
-use OpsFour\S3Server\Runtime\ProductionEfsIdentityFileReader;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\ServeFailureMessage;
 use OpsFour\S3Server\Runtime\ServeRuntimeShutdown;
@@ -39,28 +36,12 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'serve', description: 'Start the opsfour S3-compatible server')]
 final class ServeCommand extends Command
 {
-    /** Internal only: there is no CLI or environment switch for EFS serving. */
-    public function __construct(
-        ?string $name = null,
-        private readonly ?EfsStorageStartupPreflight $efsStartupPreflight = null,
-        private readonly ?EfsStartupIdentityFactory $efsStartupIdentityFactory = null,
-    ) {
-        parent::__construct($name);
-    }
-
     protected function configure(): void
     {
         $this
             ->addOption('host', null, InputOption::VALUE_REQUIRED, 'Listen address', getenv('S3_HOST') ?: '0.0.0.0')
             ->addOption('port', 'p', InputOption::VALUE_REQUIRED, 'Listen port', self::envOption('S3_PORT', '9000'))
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Root directory for object storage', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('efs-identity-file', null, InputOption::VALUE_REQUIRED, 'Production EFS candidate: local root-owned identity file; serving is not admitted')
-            ->addOption('efs-evidence-directory', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: local evidence directory')
-            ->addOption('efs-run-id', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: exact run ID')
-            ->addOption('efs-id', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: exact filesystem ID')
-            ->addOption('efs-node', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: API node identity')
-            ->addOption('efs-source-sha256', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: deployed source SHA-256')
-            ->addOption('efs-scratch-path', null, InputOption::VALUE_REQUIRED, 'Internal EFS candidate: private node-local scratch')
             ->addOption('storage-driver', null, InputOption::VALUE_REQUIRED, 'Storage backend: filesystem|flysystem|memory', getenv('S3_STORAGE_DRIVER') ?: 'filesystem')
             ->addOption('allow-unfenced-storage-for-tests', null, InputOption::VALUE_REQUIRED, 'UNSAFE TEST ONLY: allow storage without a verified late-write fence (true|false)', self::envOption('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'false'))
             ->addOption('storage-temp-dir', null, InputOption::VALUE_REQUIRED, 'Local staging directory for remote storage transfers', getenv('S3_STORAGE_TEMP_DIR') ?: sys_get_temp_dir())
@@ -157,100 +138,7 @@ final class ServeCommand extends Command
         $metadataDsn = (string) $input->getOption('metadata-dsn');
         $metrics = new MetricsCollector();
 
-        // Any explicit EFS identity option selects the internal candidate
-        // path. Validate all inputs before looking at the NFS root, opening a
-        // metadata connection or binding a socket. This path deliberately
-        // stops after identity qualification until runtime admission exists.
-        $efsNames = [
-            'efs-evidence-directory', 'efs-run-id', 'efs-id',
-            'efs-node', 'efs-source-sha256', 'efs-scratch-path',
-        ];
-        $efsValues = [];
-        $efsRequested = false;
-        foreach ($efsNames as $name) {
-            $value = $input->getOption($name);
-            $efsValues[$name] = $value;
-            $efsRequested = $efsRequested || $value !== null;
-        }
-        $productionIdentityPath = $input->getOption('efs-identity-file');
-        if ($productionIdentityPath !== null) {
-            try {
-                if ($efsRequested || $this->efsStartupPreflight !== null || $this->efsStartupIdentityFactory !== null
-                    || $storageDriver !== 'filesystem'
-                    || ! is_string($storagePath) || $storagePath === ''
-                    || ! is_string($productionIdentityPath) || $productionIdentityPath === ''
-                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
-                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
-                    || trim($metadataDsn) === ''
-                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
-                    throw new \RuntimeException('Invalid production EFS startup profile.');
-                }
-                $identity = (new ProductionEfsIdentityFileReader($productionIdentityPath))->read();
-                if ($identity->storageRoot !== $storagePath || $identity->metadataDriver !== $metadataDriver) {
-                    throw new \RuntimeException('Production EFS identity differs from the CLI profile.');
-                }
-
-                // Schema v2 alone cannot prove a live watcher, host mount or
-                // full runtime graph. Do not touch the EFS root or serve.
-                throw new \RuntimeException('Production EFS serving is not yet admitted.');
-            } catch (\Throwable) {
-                $output->writeln('<error>Error: EFS production identity or runtime admission failed.</error>');
-
-                return Command::FAILURE;
-            }
-        }
-        if ($efsRequested) {
-            try {
-                if ($this->efsStartupPreflight !== null || $storageDriver !== 'filesystem'
-                    || ! is_string($storagePath) || $storagePath === ''
-                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
-                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
-                    || trim($metadataDsn) === ''
-                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
-                    throw new \RuntimeException('Invalid internal EFS startup profile.');
-                }
-                foreach ($efsValues as $value) {
-                    if (! is_string($value) || $value === '' || trim($value) !== $value) {
-                        throw new \RuntimeException('Incomplete internal EFS startup identity.');
-                    }
-                }
-                $identity = ($this->efsStartupIdentityFactory ?? new EfsStartupIdentityFactory())->qualify(
-                    (string) $efsValues['efs-evidence-directory'],
-                    $storagePath,
-                    (string) $efsValues['efs-run-id'],
-                    (string) $efsValues['efs-id'],
-                    (string) $efsValues['efs-node'],
-                    $metadataDriver,
-                    (string) $efsValues['efs-source-sha256'],
-                    (string) $efsValues['efs-scratch-path'],
-                );
-                $identity->scratch->assertBoundTo($identity->context);
-                throw new \RuntimeException('Qualified EFS candidate serving is not yet admitted.');
-            } catch (\Throwable) {
-                $output->writeln('<error>Error: EFS startup identity or runtime admission failed.</error>');
-
-                return Command::FAILURE;
-            }
-        }
-
-        // The internal EFS candidate must reject before any storage-root path
-        // operation or backend construction. Ordinary local serving is unchanged.
-        if ($this->efsStartupPreflight !== null) {
-            try {
-                if ($storageDriver !== 'filesystem'
-                    || $this->booleanOption($input, 'allow-unfenced-storage-for-tests')
-                    || ! in_array($metadataDriver, ['postgres', 'mysql'], true)
-                    || trim($metadataDsn) === ''
-                    || $this->floatOption($input, 'metadata-cache-ttl') !== 0.0) {
-                    throw new \RuntimeException('Invalid internal EFS startup profile.');
-                }
-                $storagePath = $this->efsStartupPreflight->assertExistingRoot((string) $storagePath);
-            } catch (\Throwable) {
-                $output->writeln('<error>Error: EFS startup preflight failed.</error>');
-
-                return Command::FAILURE;
-            }
-        } elseif ($storageDriver === 'filesystem' && $storagePath !== null && $storagePath !== '') {
+        if ($storageDriver === 'filesystem' && $storagePath !== null && $storagePath !== '') {
             $storagePath = realpath($storagePath) ?: $storagePath;
             if (! is_dir($storagePath)) {
                 if (! @mkdir($storagePath, 0o755, true) && ! is_dir($storagePath)) {
