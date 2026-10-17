@@ -37,9 +37,6 @@ final class S3ServerRuntime
         public readonly ?WorkerPool $selectWorkerPool = null,
         private readonly LoggerInterface $logger = new NullLogger(),
     ) {
-        if ($server->isQualifiedEfsGraphShell()) {
-            throw new \LogicException('Qualified EFS graph dependencies have one server owner.');
-        }
     }
 
     /** Transfer the isolated test profile's worker resources to runtime shutdown. */
@@ -47,9 +44,6 @@ final class S3ServerRuntime
         LocalFencedObjectWriter $writer,
         DedicatedAmpObjectWriteLeaseRenewer $renewer,
     ): void {
-        if ($this->server->isConfigurationSealedForQualifiedEfsCandidate()) {
-            throw new \LogicException('Runtime resources cannot be changed after EFS candidate seal.');
-        }
         if ($this->stopped || $this->stopInProgress || $this->localObjectWriter !== null || $this->localObjectRenewer !== null) {
             throw new \LogicException('Local object write test resources were already attached or runtime stopped.');
         }

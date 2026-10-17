@@ -79,8 +79,6 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Routing\HandlerRegistry;
 use OpsFour\S3Server\Routing\S3Operation;
-use OpsFour\S3Server\Runtime\EfsCandidateRecoveryCapabilities;
-use OpsFour\S3Server\Runtime\EfsCandidateRuntimeResources;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -151,84 +149,6 @@ final class HandlerRegistrar
         );
     }
 
-    /**
-     * Attach one qualified EFS resource graph to an inert handler registry.
-     * This seals the registry but does not admit HTTP serving.
-     *
-     * @internal EFS production admission remains closed in S3Server::start().
-     */
-    public static function registerQualifiedEfsCandidate(
-        HandlerRegistry $registry,
-        EfsCandidateRuntimeResources $resources,
-        S3ServerConfig $config,
-        ?EncryptionServiceInterface $encryption = null,
-        ?NotificationDispatcher $notifications = null,
-        ?WorkerPool $selectWorkerPool = null,
-        ?\OpsFour\S3Server\Contracts\CredentialProvider $credentialProvider = null,
-        ?MetricsCollector $metrics = null,
-    ): void {
-        if ($resources->buildConfig !== $config) {
-            throw new \RuntimeException('EFS candidate handlers require the exact resource-graph configuration.');
-        }
-        if ($registry->storageRegistrations() !== []) {
-            throw new \InvalidArgumentException('EFS candidate requires an empty handler registry.');
-        }
-        foreach (S3Operation::cases() as $operation) {
-            if ($registry->has($operation)) {
-                throw new \InvalidArgumentException('EFS candidate requires an empty handler registry.');
-            }
-        }
-
-        if ($encryption !== $resources->accessLogEncryption) {
-            throw new \InvalidArgumentException('EFS candidate handlers require the exact qualified encryption service.');
-        }
-
-        $resources->qualification->assertCandidateRuntimeInputs(
-            $config,
-            $resources->metadata,
-            $resources->backend,
-            $resources->tiers,
-            $resources->scratch,
-        );
-        $tier = $resources->tiers->defaultTier();
-        if ($tier->backend !== $resources->backend) {
-            throw new \RuntimeException('EFS candidate handler backend differs from the qualified tier.');
-        }
-        $resources->objectWriter->assertBoundTo($resources->backend, $tier->name, $resources->qualification->hostEvidenceReader());
-        $resources->objectLeaseFactory->assertBoundTo($resources->rawMetadata, $resources->objectRenewer);
-        $resources->partWriter->assertBoundTo($resources->metadata, $resources->backend, $tier->name);
-        $resources->objectCollector->assertBoundTo($resources->metadata, $resources->objectWriter);
-        $reader = $resources->qualification->hostEvidenceReader();
-        $resources->storageGarbageCollector->assertBoundTo($resources->metadata, $resources->tiers, $reader);
-        $resources->multipartIntentCollector->assertBoundTo(
-            EfsCandidateRecoveryCapabilities::assertReady($resources->metadata),
-            $resources->tiers,
-            $reader,
-        );
-        if ($notifications !== null && $notifications !== $resources->notifications) {
-            throw new \InvalidArgumentException('EFS candidate handlers require the exact qualified notification dispatcher.');
-        }
-        $resources->notifications->assertBoundTo($resources->metadata, $reader);
-
-        self::registerHandlers(
-            $registry,
-            $resources->metadata,
-            $resources->backend,
-            $config,
-            $encryption,
-            $resources->notifications,
-            $selectWorkerPool,
-            $credentialProvider,
-            $metrics,
-            $resources->tiers,
-            $resources->objectWriter,
-            $resources->objectLeaseFactory,
-            $resources->partWriter,
-            true,
-        );
-        $registry->sealForQualifiedEfsCandidate();
-    }
-
     private static function registerHandlers(
         HandlerRegistry $registry,
         MetadataStore $metadata,
@@ -243,7 +163,6 @@ final class HandlerRegistrar
         ?LocalFencedObjectWriter $localFencedWriter,
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory,
         ?LocalFencedMultipartPartWriter $localPartWriter = null,
-        bool $qualifiedEfsCandidate = false,
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
@@ -358,7 +277,6 @@ final class HandlerRegistrar
                 $quotas,
                 $storage,
                 $storageTiers,
-                requireWorkerCompatibleSseS3: $qualifiedEfsCandidate,
             ),
         );
 

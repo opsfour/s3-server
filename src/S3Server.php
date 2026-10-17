@@ -59,16 +59,10 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Parallel\ParallelSqliteMetadataStore;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Routing\HandlerRegistry;
-use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Routing\S3AttributeMiddleware;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Runtime\EfsHostEvidence;
-use OpsFour\S3Server\Runtime\EfsCandidateIngressResources;
-use OpsFour\S3Server\Runtime\EfsCandidateManagementResources;
-use OpsFour\S3Server\Runtime\EfsCandidateMetadataStartupAdmission;
-use OpsFour\S3Server\Runtime\EfsCandidateRuntimeResources;
-use OpsFour\S3Server\Runtime\EfsRecursiveCleanupAdmission;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
@@ -174,20 +168,6 @@ final class S3Server
 
     private bool $starting = false;
 
-    private bool $qualifiedEfsCandidateSealed = false;
-
-    private ?EfsCandidateIngressResources $qualifiedEfsIngress = null;
-
-    private ?EfsCandidateRuntimeResources $pendingQualifiedEfsGraph = null;
-
-    private ?EfsCandidateRuntimeResources $qualifiedEfsGraph = null;
-
-    private ?EfsCandidateManagementResources $qualifiedEfsManagement = null;
-
-    private bool $qualifiedEfsPreBindAdmissionPrepared = false;
-
-    private ?ContextWorkerPool $qualifiedEfsSelectPool = null;
-
     private readonly DeferredCancellation $startupCancellation;
 
     /**
@@ -202,18 +182,12 @@ final class S3Server
         private readonly ?StorageBackend $storage = null,
         ?LoggerInterface $logger = null,
         ?MetricsCollector $metrics = null,
-        ?EfsCandidateRuntimeResources $candidateGraph = null,
     ) {
-        if ($candidateGraph !== null && ($candidateGraph->buildConfig !== $config
-            || $candidateGraph->metadata !== $metadata || $candidateGraph->backend !== $storage)) {
-            throw new \LogicException('EFS candidate server constructor requires its exact resource graph.');
-        }
         $this->logger = new FailureIsolatingLogger($logger ?? new NullLogger());
         $this->startupCancellation = new DeferredCancellation();
         $this->handlerRegistry = new HandlerRegistry();
         $this->metrics = $metrics ?? new MetricsCollector();
-        $this->pendingQualifiedEfsGraph = $candidateGraph;
-        $this->accessLogs = $candidateGraph !== null ? $candidateGraph->accessLogs : ($metadata !== null && $storage !== null
+        $this->accessLogs = $metadata !== null && $storage !== null
             ? new AccessLogWriter(
                 $metadata,
                 $storage,
@@ -223,7 +197,7 @@ final class S3Server
                 localFencedWriter: $this->localObjectTestWriter,
                 localLeaseFactory: $this->localObjectTestLeaseFactory,
             )
-            : null);
+            : null;
     }
 
     public function getMetricsCollector(): MetricsCollector
@@ -250,14 +224,6 @@ final class S3Server
 
         if ($this->starting) {
             throw new \LogicException('S3 server startup is already in progress.');
-        }
-
-        // The candidate seal freezes configuration but does not yet bind all
-        // physical writers, handlers, recovery workers and admission to one
-        // EFS qualification. Reject before any metadata or hard-NFS syscall.
-        if ($this->qualifiedEfsCandidateSealed || $this->qualifiedEfsIngress !== null
-            || $this->pendingQualifiedEfsGraph !== null) {
-            throw new \RuntimeException('Qualified EFS candidate serving is not yet admitted.');
         }
 
         if (! $this->authenticationConfigured) {
@@ -632,10 +598,7 @@ final class S3Server
         try {
             // 7. Activate the resources prepared before listener binding.
             if ($preparedLifecycleRunner !== null) {
-                // The qualified graph remains the sole lifecycle owner.
-                if ($this->qualifiedEfsGraph === null) {
-                    $this->lifecycleRunner = $preparedLifecycleRunner;
-                }
+                $this->lifecycleRunner = $preparedLifecycleRunner;
                 $preparedLifecycleRunner->start();
                 $this->logger->info('Lifecycle runner started.');
             }
@@ -884,13 +847,7 @@ final class S3Server
     private function stopOwnedResources(): void
     {
         $this->shutdown = true;
-        $this->qualifiedEfsPreBindAdmissionPrepared = false;
         $this->startupCancellation->cancel();
-        if ($this->pendingQualifiedEfsGraph !== null && $this->qualifiedEfsGraph === null) {
-            // The caller still owns every candidate resource if attachment did
-            // not commit, including after a failed registry construction.
-            return;
-        }
 
         $timeout = $this->config->shutdownDrainTimeout;
         if ($this->server !== null) {
@@ -954,34 +911,18 @@ final class S3Server
             $this->abortIncompleteShutdown();
         }
         $this->localObjectIntentCollector = null;
-        $qualifiedGraph = $this->qualifiedEfsGraph;
-        if ($qualifiedGraph === null) {
-            try {
-                $this->flushAccessLogsIfAdmitted();
-            } catch (\Throwable $e) {
-                $this->logShutdown('warning', 'Access log flush failed during shutdown.', ['exception' => $e::class]);
-            }
+        try {
+            $this->flushAccessLogsIfAdmitted();
+        } catch (\Throwable $e) {
+            $this->logShutdown('warning', 'Access log flush failed during shutdown.', ['exception' => $e::class]);
         }
-        if ($qualifiedGraph !== null) {
-            // Candidate pools must be quiescent and closed while their graph
-            // still retains storage, SQL and the read pool for a stop retry.
-            $this->shutdownWorkerPools();
-            try {
-                $qualifiedGraph->shutdownForServer($this);
-            } catch (\Throwable $e) {
-                $this->logShutdown('warning', 'EFS candidate graph shutdown failed.', ['exception' => $e::class]);
-                $this->abortIncompleteShutdown();
-            }
-            $this->notifications = null;
-        } else {
-            try {
-                $this->notifications?->shutdown($timeout);
-            } catch (\Throwable $e) {
-                $this->logShutdown('warning', 'Notification shutdown failed.', ['exception' => $e::class]);
-                $this->abortIncompleteShutdown();
-            }
-            $this->notifications = null;
+        try {
+            $this->notifications?->shutdown($timeout);
+        } catch (\Throwable $e) {
+            $this->logShutdown('warning', 'Notification shutdown failed.', ['exception' => $e::class]);
+            $this->abortIncompleteShutdown();
         }
+        $this->notifications = null;
 
         $shutdownStorage = [];
         $storageBackends = [];
@@ -997,7 +938,7 @@ final class S3Server
             }
             $storageBackends[] = $registration['storage'];
         }
-        foreach ($this->qualifiedEfsGraph === null ? $storageBackends : [] as $backend) {
+        foreach ($storageBackends as $backend) {
             while ($backend instanceof ObservedStorageBackend) {
                 $backend = $backend->innerBackend();
             }
@@ -1021,9 +962,7 @@ final class S3Server
             }
         }
 
-        if ($qualifiedGraph === null) {
-            $this->shutdownWorkerPools();
-        }
+        $this->shutdownWorkerPools();
 
         // Shut down ParallelSqliteMetadataStore if applicable, even when wrapped by decorators.
         $parallelSqlite = $this->parallelSqliteMetadataStore($this->metadata);
@@ -1049,18 +988,9 @@ final class S3Server
             if (isset($this->closedWorkerPools[$id])) {
                 continue;
             }
-            $qualifiedIngressPool = $this->qualifiedEfsIngress !== null
-                && $entry['pool'] === $this->qualifiedEfsIngress->workerPool;
             $poolCloseStarted = false;
             try {
                 if (! isset($this->terminatedWorkerPools[$id])) {
-                    if ($qualifiedIngressPool) {
-                        if (isset($this->failedWorkerPoolShutdowns[$id])) {
-                            $this->qualifiedEfsIngress?->assertDrainedForServerStopRetry($this);
-                        } else {
-                            $this->qualifiedEfsIngress?->assertDrainedForServerStop($this);
-                        }
-                    }
                     $poolCloseStarted = true;
                     if (isset($this->failedWorkerPoolShutdowns[$id])) {
                         $entry['pool']->kill();
@@ -1071,9 +1001,6 @@ final class S3Server
                         throw new \RuntimeException('Worker pool remained running after shutdown.');
                     }
                     $this->terminatedWorkerPools[$id] = true;
-                }
-                if ($qualifiedIngressPool) {
-                    $this->qualifiedEfsIngress?->markServerPoolClosed($this);
                 }
                 $this->closedWorkerPools[$id] = true;
                 unset($this->failedWorkerPoolShutdowns[$id], $this->terminatedWorkerPools[$id]);
@@ -1165,9 +1092,6 @@ final class S3Server
      */
     public function getHandlerRegistry(): HandlerRegistry
     {
-        if ($this->pendingQualifiedEfsGraph !== null && $this->qualifiedEfsGraph === null) {
-            throw new \LogicException('EFS candidate handler registry is reserved for graph attachment.');
-        }
         return $this->handlerRegistry;
     }
 
@@ -1177,357 +1101,6 @@ final class S3Server
     public function getConfig(): S3ServerConfig
     {
         return $this->config;
-    }
-
-    /** @internal Construct one listenerless candidate without a second access-log writer. */
-    public static function forQualifiedEfsCandidate(
-        EfsCandidateRuntimeResources $resources,
-        ?LoggerInterface $logger = null,
-        ?MetricsCollector $metrics = null,
-    ): self {
-        $config = $resources->buildConfig
-            ?? throw new \LogicException('EFS candidate requires a factory-built configuration.');
-
-        return new self($config, $resources->metadata, $resources->backend, $logger, $metrics, $resources);
-    }
-
-    /**
-     * Attach exactly one qualified graph and ingress to this prelistener server.
-     * Registry construction is the last fallible step before ownership transfer.
-     * Production serving remains refused by start().
-     *
-     * @internal
-     */
-    public function attachQualifiedEfsCandidateGraph(
-        EfsCandidateRuntimeResources $resources,
-        EfsCandidateIngressResources $ingress,
-        ?ContextWorkerPool $selectWorkerPool = null,
-    ): void {
-        $this->assertConfigurationMutable('EFS candidate graph', allowPendingGraph: true);
-        if ($this->pendingQualifiedEfsGraph !== $resources || $this->qualifiedEfsGraph !== null
-            || $this->metadata !== $resources->metadata || $this->storage !== $resources->backend
-            || $this->accessLogs !== $resources->accessLogs || $this->storageTiers !== null
-            || $this->notifications !== null || $this->encryption !== null
-            || $this->extraMiddleware !== [] || $this->workerPools !== []
-            || $this->authenticationConfigured || $this->adminCredentialApiHandler !== null
-            || $this->adminQuotaApiHandler !== null || $this->efsApiAdmissionForTests !== null
-            || $this->handlerRegistry->storageRegistrations() !== []) {
-            throw new \LogicException('EFS candidate graph requires its unmodified server shell.');
-        }
-        foreach (S3Operation::cases() as $operation) {
-            if ($this->handlerRegistry->has($operation)) {
-                throw new \LogicException('EFS candidate graph requires an empty handler registry.');
-            }
-        }
-        if (($this->config->selectWorkerPoolSize === 0) !== ($selectWorkerPool === null)
-            || ($selectWorkerPool !== null && (! $selectWorkerPool->isRunning()
-                || $selectWorkerPool->getWorkerLimit() !== $this->config->selectWorkerPoolSize
-                || $selectWorkerPool->getWorkerCount() !== 0
-                || $selectWorkerPool === $ingress->workerPool || $selectWorkerPool === $resources->readPool))) {
-            throw new \LogicException('EFS candidate Select worker pool does not match its configuration.');
-        }
-        $resources->qualification->assertCandidateRuntimeInputs(
-            $this->config,
-            $resources->metadata,
-            $resources->backend,
-            $resources->tiers,
-            $resources->scratch,
-        );
-        $ingress->assertBoundTo($resources->qualification, $resources->scratch);
-        $ingress->assertAttachableTo($this->config);
-        $ingress->assertMetadataBinding($resources->metadata);
-        $resources->assertAttachableTo($this);
-
-        // Register directly into the registry dispatched by this server. A
-        // failed registration leaves all resources with their caller and this
-        // listenerless shell permanently unsuitable for another attachment.
-        HandlerRegistrar::registerQualifiedEfsCandidate(
-            $this->handlerRegistry,
-            $resources,
-            $this->config,
-            encryption: $resources->accessLogEncryption,
-            notifications: $resources->notifications,
-            selectWorkerPool: $selectWorkerPool,
-            metrics: $this->metrics,
-        );
-
-        $this->storageTiers = $resources->tiers;
-        $this->notifications = $resources->notifications;
-        $this->encryption = $resources->accessLogEncryption;
-        $this->qualifiedEfsSelectPool = $selectWorkerPool;
-        $this->extraMiddleware[] = $ingress->auth;
-        $this->workerPools[] = ['pool' => $ingress->workerPool, 'name' => 'request_body_spool'];
-        if ($selectWorkerPool !== null) {
-            $this->workerPools[] = ['pool' => $selectWorkerPool, 'name' => 'select'];
-        }
-        $this->authenticationConfigured = true;
-        $this->authenticationCredentialProvider = $ingress->credentialProvider();
-        $this->qualifiedEfsIngress = $ingress;
-        $this->qualifiedEfsGraph = $resources;
-        $this->qualifiedEfsCandidateSealed = true;
-        $ingress->transferOwnershipTo($this);
-        $resources->transferOwnershipTo($this);
-    }
-
-    /**
-     * @internal Verify that the attached graph is the one used by dispatch and shutdown.
-     * @phpstan-impure Host evidence and shutdown ownership may change between calls.
-     */
-    public function ownsQualifiedEfsCandidateGraph(EfsCandidateRuntimeResources $resources): bool
-    {
-        return $this->qualifiedEfsCandidateSealed
-            && $this->qualifiedEfsGraph === $resources
-            && $this->pendingQualifiedEfsGraph === $resources
-            && $this->config === $resources->buildConfig
-            && $this->metadata === $resources->metadata
-            && $this->storage === $resources->backend
-            && $this->storageTiers === $resources->tiers
-            && $this->accessLogs === $resources->accessLogs
-            && $this->notifications === $resources->notifications
-            && $this->encryption === $resources->accessLogEncryption
-            && $this->qualifiedEfsIngress !== null
-            && $this->ownsQualifiedEfsCandidateIngress($this->qualifiedEfsIngress)
-            && $this->handlerRegistry->storageRegistrations() === [[
-                'storage' => $resources->backend,
-                'tiers' => $resources->tiers,
-            ]];
-    }
-
-    /**
-     * Bind one graph's inert readiness handler and admission latch to this
-     * listenerless candidate. This does not register routes or enable start().
-     *
-     * @internal
-     */
-    public function attachQualifiedEfsCandidateManagement(EfsCandidateManagementResources $management): void
-    {
-        $graph = $this->qualifiedEfsGraph;
-        if ($graph === null || $this->qualifiedEfsManagement !== null || $this->shutdown
-            || $this->starting || $this->server !== null || ! $this->ownsQualifiedEfsCandidateGraph($graph)) {
-            throw new \LogicException('EFS management requires one attached, open candidate graph.');
-        }
-        $management->assertBoundTo($graph, $this->config);
-        $this->qualifiedEfsManagement = $management;
-    }
-
-    /** @internal Exact graph-owned management bundle; no route is attached. */
-    public function qualifiedEfsCandidateManagement(): EfsCandidateManagementResources
-    {
-        $management = $this->qualifiedEfsManagement;
-        if ($management === null || ! $this->ownsQualifiedEfsCandidateManagement($management)) {
-            throw new \LogicException('EFS management candidate is not attached to an open graph.');
-        }
-
-        return $management;
-    }
-
-    /** @internal Verify the readiness handler and admission latch came from this graph's bundle. */
-    public function ownsQualifiedEfsCandidateManagement(EfsCandidateManagementResources $management): bool
-    {
-        $graph = $this->qualifiedEfsGraph;
-        if ($graph === null || $this->qualifiedEfsManagement !== $management
-            || $this->shutdown || ! $this->ownsQualifiedEfsCandidateGraph($graph)) {
-            return false;
-        }
-        try {
-            $management->assertBoundTo($graph, $this->config);
-        } catch (\Throwable) {
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * Prepare an inert, exact candidate admission. This never creates or opens
-     * an HTTP server; the production start latch remains closed.
-     *
-     * @internal
-     */
-    public function prepareQualifiedEfsCandidatePreBindAdmission(): void
-    {
-        if ($this->qualifiedEfsPreBindAdmissionPrepared) {
-            throw new \LogicException('EFS candidate pre-bind admission was already prepared.');
-        }
-
-        // Commit the prepared bit only after every identity, dependency and
-        // freshness check succeeds. A failure leaves this shell unadmitted.
-        $this->assertQualifiedEfsCandidatePreBindBindings();
-        $this->qualifiedEfsPreBindAdmissionPrepared = true;
-    }
-
-    /**
-     * Repeat the complete local admission immediately before a future expose().
-     * No current production path calls expose for an EFS candidate.
-     *
-     * @internal
-     */
-    public function assertQualifiedEfsCandidatePreBindAdmissionFresh(): void
-    {
-        if (! $this->qualifiedEfsPreBindAdmissionPrepared) {
-            throw new \LogicException('EFS candidate pre-bind admission was not prepared.');
-        }
-        try {
-            $this->assertQualifiedEfsCandidatePreBindBindings();
-        } catch (\Throwable $error) {
-            // A failed recheck invalidates the earlier admission. A caller
-            // must repeat the complete preparation before considering bind.
-            $this->qualifiedEfsPreBindAdmissionPrepared = false;
-            throw $error;
-        }
-    }
-
-    /** @internal Read-only state for ownership and rollback tests. */
-    public function isQualifiedEfsCandidatePreBindAdmissionPrepared(): bool
-    {
-        return $this->qualifiedEfsPreBindAdmissionPrepared;
-    }
-
-    private function assertQualifiedEfsCandidatePreBindBindings(): void
-    {
-        $graph = $this->qualifiedEfsGraph;
-        $ingress = $this->qualifiedEfsIngress;
-        $management = $this->qualifiedEfsManagement;
-        if ($graph === null || $ingress === null || $management === null
-            || $this->shutdown || $this->starting || $this->server !== null
-            || ! $this->ownsQualifiedEfsCandidateGraph($graph)
-            || ! $this->ownsQualifiedEfsCandidateIngress($ingress)
-            || ! $this->ownsQualifiedEfsCandidateManagement($management)) {
-            throw new \LogicException('EFS pre-bind admission requires one exact, open candidate graph.');
-        }
-
-        $graph->qualification->assertCandidateRuntimeInputs(
-            $this->config,
-            $graph->metadata,
-            $graph->backend,
-            $graph->tiers,
-            $graph->scratch,
-        );
-        $ingress->assertBoundTo($graph->qualification, $graph->scratch);
-        $ingress->assertMetadataBinding($graph->metadata);
-        $credentialProvider = $ingress->credentialProvider();
-        if (! $credentialProvider instanceof CredentialHealthProbe) {
-            throw new \RuntimeException('EFS candidate authentication requires a credential readiness probe.');
-        }
-        if ($this->authenticationCredentialProvider !== $credentialProvider) {
-            throw new \RuntimeException('EFS candidate authentication provider differs from its ingress graph.');
-        }
-        $management->assertCredentialHealthProbe($credentialProvider);
-        $credentialProvider->assertCredentialStoreAvailable();
-        EfsCandidateMetadataStartupAdmission::assertReady($this->config, $graph->metadata, $graph->tiers);
-        EfsRecursiveCleanupAdmission::assertReady($graph->metadata, $graph->tiers);
-
-        // Credential and SQL admissions may yield. Recheck the entire graph
-        // and shared latching admission after all return, immediately before
-        // a future listener bind can be considered.
-        if (! $this->ownsQualifiedEfsCandidateGraph($graph)
-            || ! $this->ownsQualifiedEfsCandidateIngress($ingress)
-            || ! $this->ownsQualifiedEfsCandidateManagement($management)) {
-            throw new \RuntimeException('EFS candidate identity changed during pre-bind admission.');
-        }
-        $management->assertBoundTo($graph, $this->config);
-    }
-
-    /** @internal The generic runtime must not become a second graph owner. */
-    public function isQualifiedEfsGraphShell(): bool
-    {
-        return $this->pendingQualifiedEfsGraph !== null;
-    }
-
-    /** @internal Irreversible configuration seal; it does not admit EFS serving. */
-    public function sealConfigurationForQualifiedEfsCandidate(): void
-    {
-        $this->assertConfigurationMutable('EFS candidate');
-        $this->handlerRegistry->sealForQualifiedEfsCandidate();
-        $this->qualifiedEfsCandidateSealed = true;
-    }
-
-    /**
-     * Bind one qualified ingress graph to an otherwise empty candidate shell.
-     * The candidate remains unable to start; storage graph ownership stays
-     * with its caller until a separate production serving design exists.
-     *
-     * @internal
-     */
-    public function attachQualifiedEfsCandidateIngress(
-        EfsCandidateRuntimeResources $resources,
-        EfsCandidateIngressResources $ingress,
-    ): void {
-        $this->assertConfigurationMutable('EFS ingress');
-        if ($this->qualifiedEfsIngress !== null || $this->metadata !== null || $this->storage !== null
-            || $this->storageTiers !== null || $this->accessLogs !== null || $this->notifications !== null
-            || $this->encryption !== null || $this->extraMiddleware !== [] || $this->workerPools !== []
-            || $this->authenticationConfigured || $this->adminCredentialApiHandler !== null
-            || $this->adminQuotaApiHandler !== null || $this->efsApiAdmissionForTests !== null
-            || $this->handlerRegistry->storageRegistrations() !== []) {
-            throw new \LogicException('EFS ingress requires an empty candidate server shell with one resource owner.');
-        }
-        foreach (S3Operation::cases() as $operation) {
-            if ($this->handlerRegistry->has($operation)) {
-                throw new \LogicException('EFS ingress requires an empty handler registry.');
-            }
-        }
-        $resources->qualification->assertCandidateRuntimeInputs(
-            $this->config,
-            $resources->metadata,
-            $resources->backend,
-            $resources->tiers,
-            $resources->scratch,
-        );
-        if ($resources->buildConfig !== $this->config) {
-            throw new \RuntimeException('EFS candidate runtime graph was built for another server configuration.');
-        }
-        $ingress->assertBoundTo($resources->qualification, $resources->scratch);
-        $ingress->assertAttachableTo($this->config);
-        $ingress->assertMetadataBinding($resources->metadata);
-
-        // Seal before transfer. If it fails, the bundle still owns its pool;
-        // no server state or listener has changed.
-        $this->handlerRegistry->sealForQualifiedEfsCandidate();
-        $this->extraMiddleware[] = $ingress->auth;
-        $this->workerPools[] = ['pool' => $ingress->workerPool, 'name' => 'request_body_spool'];
-        $this->authenticationConfigured = true;
-        $this->authenticationCredentialProvider = $ingress->credentialProvider();
-        $this->qualifiedEfsIngress = $ingress;
-        $this->qualifiedEfsCandidateSealed = true;
-        $ingress->transferOwnershipTo($this);
-    }
-
-    /** @internal Verify the server has really taken every ingress component. */
-    public function ownsQualifiedEfsCandidateIngress(EfsCandidateIngressResources $ingress): bool
-    {
-        $expectedPools = [['pool' => $ingress->workerPool, 'name' => 'request_body_spool']];
-        if ($this->qualifiedEfsSelectPool !== null) {
-            $expectedPools[] = ['pool' => $this->qualifiedEfsSelectPool, 'name' => 'select'];
-        }
-        if (! $this->qualifiedEfsCandidateSealed
-            || $this->qualifiedEfsIngress !== $ingress
-            || $this->authenticationCredentialProvider === null
-            || $this->extraMiddleware !== [$ingress->auth]
-            || $this->workerPools !== $expectedPools
-            || $this->requestBodySpoolForStack() !== $ingress->requestBodySpool) {
-            return false;
-        }
-
-        try {
-            $ingress->assertCredentialProviderBinding($this->authenticationCredentialProvider);
-            $ingress->requestBodySpool->assertQualifiedBinding(
-                $ingress->tempDir,
-                $ingress->budgetBytes,
-                $ingress->coordinator,
-                $ingress->workerPool,
-            );
-        } catch (\RuntimeException) {
-            return false;
-        }
-
-        return true;
-    }
-
-    /** @internal Used only to reject late runtime resource attachment. */
-    public function isConfigurationSealedForQualifiedEfsCandidate(): bool
-    {
-        return $this->qualifiedEfsCandidateSealed;
     }
 
     /**
@@ -1587,14 +1160,8 @@ final class S3Server
         }
     }
 
-    private function assertConfigurationMutable(string $component, bool $allowPendingGraph = false): void
+    private function assertConfigurationMutable(string $component): void
     {
-        if ($this->pendingQualifiedEfsGraph !== null && ! $allowPendingGraph) {
-            throw new \LogicException("{$component} cannot change a reserved EFS candidate server.");
-        }
-        if ($this->qualifiedEfsCandidateSealed) {
-            throw new \LogicException("{$component} cannot be changed after EFS candidate seal.");
-        }
         if ($this->server !== null || $this->starting || $this->shutdown) {
             throw new \LogicException("{$component} must be configured before the S3 server starts.");
         }
@@ -1704,9 +1271,6 @@ final class S3Server
 
     private function requestBodySpoolForStack(): RequestBodySpool
     {
-        if ($this->qualifiedEfsIngress !== null) {
-            return $this->qualifiedEfsIngress->requestBodySpool;
-        }
         $spoolWorkers = $this->config->requestBodySpoolWorkerPoolSize;
         $spoolPool = new ContextWorkerPool($spoolWorkers);
         $this->registerWorkerPool($spoolPool, 'request_body_spool', $spoolWorkers);
@@ -1732,29 +1296,6 @@ final class S3Server
      */
     private function prepareBackgroundComponents(): array
     {
-        if ($this->pendingQualifiedEfsGraph !== null) {
-            $graph = $this->pendingQualifiedEfsGraph;
-            if (! $this->ownsQualifiedEfsCandidateGraph($graph)) {
-                throw new \LogicException('EFS background components require the attached candidate graph.');
-            }
-            // The generic processor has no EFS admission check. Keep this
-            // path closed until a qualified notification worker exists.
-            if ($this->config->notificationWorkerEnabled) {
-                throw new \LogicException('EFS notification background processing is not qualified.');
-            }
-
-            return [
-                'lifecycleRunner' => $graph->lifecycleRunner,
-                'notificationProcessor' => null,
-                'objectCollector' => $graph->objectCollector,
-                'transitionExecutor' => $graph->transitionExecutor,
-                'restoreExecutor' => $graph->restoreExecutor,
-                'restoreGarbageCollector' => $graph->restoreGarbageCollector,
-                'storageGarbageCollector' => $graph->storageGarbageCollector,
-                'multipartIntentCollector' => $graph->multipartIntentCollector,
-            ];
-        }
-
         $lifecycleRunner = null;
         $notificationProcessor = null;
         $transitionExecutor = null;

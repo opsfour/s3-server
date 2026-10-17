@@ -26,8 +26,6 @@ final class HandlerRegistry
 
     private ?object $freezeToken = null;
 
-    private bool $qualifiedEfsCandidateSealed = false;
-
     /**
      * Register a handler for an S3 operation.
      *
@@ -36,9 +34,6 @@ final class HandlerRegistry
      */
     public function register(S3Operation $operation, RequestHandler $handler): void
     {
-        if ($this->qualifiedEfsCandidateSealed) {
-            throw new \LogicException('S3 handlers cannot be changed after EFS candidate seal.');
-        }
         if ($this->freezeToken !== null) {
             throw new \LogicException('S3 handlers cannot be changed after the server starts.');
         }
@@ -48,9 +43,6 @@ final class HandlerRegistry
 
     public function registerStorage(StorageBackend $storage, StorageTierRegistry $tiers): void
     {
-        if ($this->qualifiedEfsCandidateSealed) {
-            throw new \LogicException('S3 handler storage cannot be changed after EFS candidate seal.');
-        }
         if ($this->freezeToken !== null) {
             throw new \LogicException('S3 handler storage cannot be changed after the server starts.');
         }
@@ -62,16 +54,6 @@ final class HandlerRegistry
     public function storageRegistrations(): array
     {
         return $this->storageRegistrations;
-    }
-
-    /** @internal Irreversible candidate seal; it does not admit EFS serving. */
-    public function sealForQualifiedEfsCandidate(): void
-    {
-        if ($this->qualifiedEfsCandidateSealed || $this->freezeToken !== null) {
-            throw new \LogicException('S3 handler registry cannot be sealed after an EFS seal or startup freeze.');
-        }
-
-        $this->qualifiedEfsCandidateSealed = true;
     }
 
     public function freeze(): object
