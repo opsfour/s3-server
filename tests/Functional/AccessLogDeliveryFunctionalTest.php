@@ -356,7 +356,7 @@ final class AccessLogDeliveryFunctionalTest extends S3FunctionalTestCase
         $target = 'log-target-secure-' . $suffix;
         self::$s3->createBucket(['Bucket' => $source]);
         self::$s3->createBucket(['Bucket' => $target]);
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $ownerId = $metadata->getBucketOwner($target);
         self::assertNotNull($ownerId);
@@ -388,7 +388,7 @@ final class AccessLogDeliveryFunctionalTest extends S3FunctionalTestCase
             self::$s3->putObject(['Bucket' => $source, 'Key' => 'logged.txt', 'Body' => 'payload']);
 
             self::restartServer();
-            $afterRestart = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+            $afterRestart = new SqliteMetadataStore(self::sqliteMetadataPath());
             $afterRestart->initialize();
             $keys = array_column(self::$s3->listObjectsV2(['Bucket' => $target, 'Prefix' => 'secure/'])['Contents'] ?? [], 'Key');
             self::assertNotEmpty($keys);

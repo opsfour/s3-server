@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\S3Client;
+use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -91,6 +92,20 @@ abstract class S3FunctionalTestCase extends TestCase
         self::startServer();
         self::waitForServer();
         self::$s3 = self::makeClient($clientTimeout);
+    }
+
+    protected static function sqliteMetadataPath(): string
+    {
+        $configuredPath = getenv('S3_METADATA_PATH');
+        $storageDriver = getenv('S3_TEST_SERVER_STORAGE_DRIVER') ?: 'filesystem';
+        $storagePath = $storageDriver === 'flysystem'
+            ? self::$storagePath . '/.tmp'
+            : self::$storagePath;
+
+        return SqliteMetadataPathResolver::resolve(
+            $storagePath,
+            $configuredPath === false ? null : trim($configuredPath),
+        );
     }
 
     public static function tearDownAfterClass(): void

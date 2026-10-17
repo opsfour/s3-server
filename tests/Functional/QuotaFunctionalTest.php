@@ -239,7 +239,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
             'Key' => 'same-key.txt',
             'VersionId' => $versionId,
         ])['Body']);
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         self::assertSame(['objectCount' => 1, 'bytesUsed' => 10], $metadata->getBucketStorageStats($bucket));
     }
@@ -270,7 +270,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
             $this->assertSame('QuotaExceeded', $e->getAwsErrorCode());
         }
 
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $stats = $metadata->getBucketStorageStats($bucket);
 
@@ -306,7 +306,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
             $this->assertSame('QuotaExceeded', $e->getAwsErrorCode());
         }
 
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $metadata->putBucketLifecycle($bucket, [[
             'id' => 'expire-all',
@@ -915,7 +915,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
 
         // Cross-account quota profiles need consent from each account as well
         // as the bucket ACL or policy established in the individual test.
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $identityPolicy = json_encode([
             'Statement' => [[
@@ -942,7 +942,7 @@ final class QuotaFunctionalTest extends S3FunctionalTestCase
      */
     private static function putAccountQuotas(array $quotas): void
     {
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
 
         foreach ($quotas as $ownerId => $quota) {

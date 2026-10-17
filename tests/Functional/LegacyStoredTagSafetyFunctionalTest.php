@@ -21,7 +21,7 @@ final class LegacyStoredTagSafetyFunctionalTest extends S3FunctionalTestCase
             'Tagging' => 'baseline=unchanged',
         ]);
 
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $metadata->putBucketTagging($bucket, [
             ['key' => 'legacy', 'value' => "control\u{000B}"],

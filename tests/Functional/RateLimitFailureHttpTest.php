@@ -28,10 +28,7 @@ final class RateLimitFailureHttpTest extends S3FunctionalTestCase
         self::assertSame(200, $http->get('/.live')->getStatusCode());
         self::assertArrayHasKey('Buckets', self::$s3->listBuckets()->toArray());
 
-        $metadataPath = $storageDriver === 'flysystem'
-            ? self::$storagePath . '/.tmp/metadata.sqlite'
-            : self::$storagePath . '/metadata.sqlite';
-        $pdo = new \PDO('sqlite:' . $metadataPath);
+        $pdo = new \PDO('sqlite:' . self::sqliteMetadataPath());
         $pdo->exec('DROP TABLE s3_rate_limit_buckets');
 
         self::assertSame(200, $http->get('/.live')->getStatusCode());

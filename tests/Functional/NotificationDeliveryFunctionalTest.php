@@ -58,7 +58,7 @@ final class NotificationDeliveryFunctionalTest extends S3FunctionalTestCase
         self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'other/ignored.txt', 'Body' => 'ignored']);
         $putResult = self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'logs/space + sign.txt', 'Body' => 'delivered']);
 
-        $databasePath = self::$storagePath . '/metadata.sqlite';
+        $databasePath = self::sqliteMetadataPath();
         $beforeRestart = new SqliteMetadataStore($databasePath);
         $beforeRestart->initialize();
         self::assertSame(['pending' => 1], $beforeRestart->getNotificationQueueStats());
@@ -262,7 +262,7 @@ final class NotificationDeliveryFunctionalTest extends S3FunctionalTestCase
             ]],
         ]);
 
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $rows = $metadata->dequeueNotifications(10);
         self::assertCount(4, $rows);
@@ -287,7 +287,7 @@ final class NotificationDeliveryFunctionalTest extends S3FunctionalTestCase
         self::assertSame($expectedVersions, $deletedVersions);
 
         // Keep this class's queue-stat assertions independent of test order.
-        $connection = new \PDO('sqlite:' . self::$storagePath . '/metadata.sqlite');
+        $connection = new \PDO('sqlite:' . self::sqliteMetadataPath());
         $deleteRows = $connection->prepare('DELETE FROM s3_notification_queue WHERE bucket = ?');
         $deleteRows->execute([$bucket]);
     }

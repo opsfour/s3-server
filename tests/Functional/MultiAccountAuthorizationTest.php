@@ -39,7 +39,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         parent::setUpBeforeClass();
         self::$writer = self::client('writerAccessKey', 'writerSecretKey');
         self::$stranger = self::client('strangerAccessKey', 'strangerSecretKey');
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         foreach (['bucket-owner', 'object-writer', 'stranger'] as $ownerId) {
             $metadata->putAccountPolicy($ownerId, self::allowAllIdentityPolicy());
@@ -48,7 +48,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
 
     public static function tearDownAfterClass(): void
     {
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         foreach (['bucket-owner', 'object-writer', 'stranger'] as $ownerId) {
             $metadata->deleteAccountPolicy($ownerId);
@@ -119,7 +119,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         $bucket = 'missing-visibility-' . bin2hex(random_bytes(5));
         self::$s3->createBucket(['Bucket' => $bucket]);
         self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'present.txt', 'Body' => 'present']);
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $objectActions = ['s3:GetObject', 's3:GetObjectAttributes'];
         $objectStatement = [
@@ -404,7 +404,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
             'Action' => ['s3:GetObject', 's3:PutObject', 's3:PutObjectAcl', 's3:DeleteObject'],
             'Resource' => "arn:aws:s3:::{$bucket}/*",
         ]]);
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
 
         try {
@@ -478,7 +478,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
     public function test_foreign_object_ownership_does_not_bypass_identity_permission(): void
     {
         $bucket = $this->bucketWithWriterGrant();
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         try {
             $metadata->deleteAccountPolicy('object-writer');
@@ -514,7 +514,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
             'Action' => 's3:PutObject',
             'Resource' => "arn:aws:s3:::{$bucket}/*",
         ]]);
-        $metadata = new SqliteMetadataStore(self::$storagePath . '/metadata.sqlite');
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
         $metadata->initialize();
         $ownerBytesBefore = $metadata->getOwnerStorageStats('bucket-owner')['bytesUsed'];
         $writerBytesBefore = $metadata->getOwnerStorageStats('object-writer')['bytesUsed'];

@@ -103,7 +103,7 @@ final class ExternalIamTwoNodeHttpTest extends S3FunctionalTestCase
                 '--port=' . self::$secondPort,
                 '--storage-driver=filesystem',
                 '--storage-path=' . self::$storagePath,
-                '--metadata-path=' . self::$storagePath . '/metadata.sqlite',
+                '--metadata-path=' . self::sqliteMetadataPath(),
             ], dirname(__DIR__, 2));
             self::$secondServer->setEnv($environment);
             self::$secondServer->setTimeout(null);
@@ -236,7 +236,7 @@ final class ExternalIamTwoNodeHttpTest extends S3FunctionalTestCase
             'retries' => 0,
             'credentials' => false,
         ]);
-        $metadata = MetadataStoreFactory::create('sqlite', ['path' => self::$storagePath . '/metadata.sqlite']);
+        $metadata = MetadataStoreFactory::create('sqlite', ['path' => self::sqliteMetadataPath()]);
         $bucket = 'two-node-policy-' . bin2hex(random_bytes(8));
         $resource = 'arn:aws:s3:::' . $bucket . '/key';
         $owner->createBucket(['Bucket' => $bucket]);
