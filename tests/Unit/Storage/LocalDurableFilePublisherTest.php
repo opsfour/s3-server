@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use OpsFour\S3Server\Storage\LocalDurableFilePublisher;
-use OpsFour\S3Server\Storage\LocalObjectWriteIo;
+use OpsFour\S3Server\Storage\LocalDurableFileIo;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -102,10 +102,89 @@ final class LocalDurableFilePublisherTest extends TestCase
         self::assertFalse($io->renameCalled);
     }
 
+    public function test_ambiguous_link_keeps_both_paths_occupied(): void
+    {
+        [$publisher, $io, $temp, $target] = $this->fixture();
+        $io->linkThenFail = true;
+
+        $this->expectException(\RuntimeException::class);
+        try {
+            $publisher->publish($temp, $target);
+        } finally {
+            self::assertSame('payload', file_get_contents($target));
+            self::assertSame('payload', file_get_contents($temp));
+            self::assertSame(['sync-file', 'link'], $io->events);
+        }
+    }
+
+    public function test_ambiguous_unlink_keeps_the_published_target(): void
+    {
+        [$publisher, $io, $temp, $target] = $this->fixture();
+        $io->unlinkThenFail = true;
+
+        $this->expectException(\RuntimeException::class);
+        try {
+            $publisher->publish($temp, $target);
+        } finally {
+            self::assertSame('payload', file_get_contents($target));
+            self::assertFileDoesNotExist($temp);
+            self::assertSame([
+                'sync-file',
+                'link',
+                'sync-directory:' . dirname($target),
+                'unlink',
+            ], $io->events);
+        }
+    }
+
+    public function test_operations_reject_paths_outside_the_storage_root(): void
+    {
+        $io = new RecordingDurableFileIo();
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
+        $outside = dirname($this->root) . '/outside-' . bin2hex(random_bytes(8));
+
+        foreach (['ensure', 'delete'] as $operation) {
+            try {
+                $operation === 'ensure' ? $publisher->ensureDirectory($outside) : $publisher->delete($outside);
+                self::fail("{$operation} accepted a path outside its storage root.");
+            } catch (\InvalidArgumentException) {
+            }
+        }
+    }
+
+    public function test_operations_reject_dot_dot_and_symbolic_link_parents(): void
+    {
+        $io = new RecordingDurableFileIo();
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
+        $outside = dirname($this->root) . '/outside-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($outside, 0o700));
+        self::assertTrue(symlink($outside, $this->root . '/linked'));
+
+        try {
+            foreach ([$this->root . '/bucket/../escape', $this->root . '/linked/child'] as $path) {
+                try {
+                    $publisher->ensureDirectory($path);
+                    self::fail('Unsafe directory path was accepted.');
+                } catch (\InvalidArgumentException) {
+                }
+            }
+        } finally {
+            unlink($this->root . '/linked');
+            rmdir($outside);
+        }
+    }
+
+    public function test_publish_rejects_a_target_in_the_temporary_namespace(): void
+    {
+        [$publisher, , $temp] = $this->fixture();
+        $this->expectException(\InvalidArgumentException::class);
+        $publisher->publish($temp, $this->root . '/.tmp/target');
+    }
+
     public function test_ensure_directory_syncs_a_new_shard_chain_from_leaf_to_root(): void
     {
         $io = new RecordingDurableFileIo();
-        $publisher = new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...));
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
         $target = $this->root . '/bucket/aa/bb';
 
         $publisher->ensureDirectory($target);
@@ -123,7 +202,7 @@ final class LocalDurableFilePublisherTest extends TestCase
     {
         $io = new RecordingDurableFileIo();
         $io->failedDirectory = $this->root . '/bucket';
-        $publisher = new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...));
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
 
         $this->expectException(\RuntimeException::class);
         try {
@@ -141,7 +220,7 @@ final class LocalDurableFilePublisherTest extends TestCase
         $path = $directory . '/object';
         self::assertSame(7, file_put_contents($path, 'payload'));
         $io = new RecordingDurableFileIo();
-        $publisher = new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...));
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
 
         $publisher->delete($path);
 
@@ -154,11 +233,46 @@ final class LocalDurableFilePublisherTest extends TestCase
         $directory = $this->root . '/bucket/aa/bb';
         self::assertTrue(mkdir($directory, 0o700, true));
         $io = new RecordingDurableFileIo();
-        $publisher = new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...));
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
 
         $publisher->delete($directory . '/missing');
 
         self::assertSame(['sync-directory:' . $directory], $io->events);
+    }
+
+    public function test_delete_accepts_a_temporary_file_for_durable_cleanup(): void
+    {
+        $directory = $this->root . '/.tmp';
+        self::assertTrue(mkdir($directory, 0o700));
+        $path = $directory . '/attempt';
+        self::assertSame(7, file_put_contents($path, 'payload'));
+        $io = new RecordingDurableFileIo();
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
+
+        $publisher->delete($path);
+
+        self::assertFileDoesNotExist($path);
+        self::assertSame(['unlink', 'sync-directory:' . $directory], $io->events);
+    }
+
+    public function test_canonical_root_accepts_paths_using_the_configured_symlink(): void
+    {
+        $link = dirname($this->root) . '/storage-link-' . bin2hex(random_bytes(8));
+        self::assertTrue(symlink($this->root, $link));
+        try {
+            $io = new RecordingDurableFileIo();
+            $publisher = new LocalDurableFilePublisher($link, $io);
+
+            $publisher->ensureDirectory($link . '/bucket');
+
+            self::assertDirectoryExists($this->root . '/bucket');
+            self::assertSame([
+                'sync-directory:' . $this->root . '/bucket',
+                'sync-directory:' . $this->root,
+            ], $io->events);
+        } finally {
+            unlink($link);
+        }
     }
 
     public function test_delete_can_retry_after_unlink_succeeded_but_parent_sync_failed(): void
@@ -169,7 +283,7 @@ final class LocalDurableFilePublisherTest extends TestCase
         self::assertSame(7, file_put_contents($path, 'payload'));
         $io = new RecordingDurableFileIo();
         $io->failedDirectory = $directory;
-        $publisher = new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...));
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
 
         try {
             $publisher->delete($path);
@@ -197,7 +311,7 @@ final class LocalDurableFilePublisherTest extends TestCase
         self::assertSame(7, file_put_contents($temp, 'payload'));
         $io = new RecordingDurableFileIo();
 
-        return [new LocalDurableFilePublisher($this->root, $io, $io->unlinkPath(...)), $io, $temp, $target];
+        return [new LocalDurableFilePublisher($this->root, $io), $io, $temp, $target];
     }
 
     private function removeDirectory(string $path): void
@@ -221,7 +335,7 @@ final class LocalDurableFilePublisherTest extends TestCase
 }
 
 /** @internal */
-final class RecordingDurableFileIo implements LocalObjectWriteIo
+final class RecordingDurableFileIo implements LocalDurableFileIo
 {
     /** @var list<string> */
     public array $events = [];
@@ -231,6 +345,10 @@ final class RecordingDurableFileIo implements LocalObjectWriteIo
     public ?string $failedDirectory = null;
 
     public bool $renameCalled = false;
+
+    public bool $linkThenFail = false;
+
+    public bool $unlinkThenFail = false;
 
     public function syncFile($file): bool
     {
@@ -256,19 +374,24 @@ final class RecordingDurableFileIo implements LocalObjectWriteIo
     {
         $this->events[] = 'link';
 
+        if ($this->linkThenFail) {
+            @link($source, $target);
+
+            return false;
+        }
+
         return $this->failure !== 'link' && @link($source, $target);
     }
 
-    public function rename(string $source, string $target): bool
-    {
-        $this->renameCalled = true;
-
-        return @rename($source, $target);
-    }
-
-    public function unlinkPath(string $path): bool
+    public function unlink(string $path): bool
     {
         $this->events[] = 'unlink';
+
+        if ($this->unlinkThenFail) {
+            @unlink($path);
+
+            return false;
+        }
 
         return $this->failure !== 'unlink' && @unlink($path);
     }

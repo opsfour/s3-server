@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 /** Linux/POSIX file operations; shared-filesystem semantics require separate qualification. */
-final class NativeLocalObjectWriteIo implements LocalObjectWriteIo
+final class NativeLocalObjectWriteIo implements LocalObjectWriteIo, LocalDurableFileIo
 {
     public function syncFile($file): bool
     {
@@ -32,5 +32,10 @@ final class NativeLocalObjectWriteIo implements LocalObjectWriteIo
     public function rename(string $source, string $target): bool
     {
         return @rename($source, $target);
+    }
+
+    public function unlink(string $path): bool
+    {
+        return @unlink($path);
     }
 }
