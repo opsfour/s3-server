@@ -105,23 +105,49 @@ final readonly class LocalDurableFilePublisher
     /** Delete a file and durably record its absence. */
     public function delete(string $path): void
     {
-        $path = $this->validateFilePath($path, false, null);
-        clearstatcache(true, $path);
-        $stat = @lstat($path);
-        if (is_array($stat)) {
-            if (($stat['mode'] & 0170000) !== 0100000) {
-                throw new \InvalidArgumentException('Local delete path is not a regular file.');
+        $path = $this->normalizeDescendant($path);
+        $segments = explode('/', substr($path, strlen($this->root) + 1));
+        if (count($segments) < 2) {
+            throw new \InvalidArgumentException('Local delete path has no parent below its storage root.');
+        }
+        foreach ($segments as $segment) {
+            $this->assertSegment($segment);
+        }
+
+        $directory = $this->root;
+        $parentExists = true;
+        foreach (array_slice($segments, 0, -1) as $segment) {
+            $candidate = $directory . '/' . $segment;
+            clearstatcache(true, $candidate);
+            $stat = @lstat($candidate);
+            if ($stat === false) {
+                $parentExists = false;
+                break;
             }
-            if (! $this->io->unlink($path)) {
-                throw new \RuntimeException('Local file deletion is uncertain.');
+            if (($stat['mode'] & 0170000) !== 0040000 || realpath($candidate) !== $candidate) {
+                throw new \InvalidArgumentException('Local delete path has an unsafe parent directory.');
+            }
+            $directory = $candidate;
+        }
+
+        if ($parentExists) {
+            clearstatcache(true, $path);
+            $stat = @lstat($path);
+            if (is_array($stat)) {
+                if (($stat['mode'] & 0170000) !== 0100000) {
+                    throw new \InvalidArgumentException('Local delete path is not a regular file.');
+                }
+                if (! $this->io->unlink($path)) {
+                    throw new \RuntimeException('Local file deletion is uncertain.');
+                }
             }
         }
-        if (! $this->io->syncDirectory(dirname($path))) {
+        if (! $this->io->syncDirectory($directory)) {
             throw new \RuntimeException('Failed to synchronize local deletion directory.');
         }
     }
 
-    private function validateFilePath(string $path, bool $mustExist, ?bool $staging): string
+    private function validateFilePath(string $path, bool $mustExist, bool $staging): string
     {
         $path = $this->normalizeDescendant($path);
         $relative = substr($path, strlen($this->root) + 1);
@@ -129,7 +155,7 @@ final readonly class LocalDurableFilePublisher
         if (count($segments) < 2) {
             throw new \InvalidArgumentException('Local file path has no parent below its storage root.');
         }
-        if ($staging !== null && (($segments[0] === '.tmp') !== $staging)) {
+        if (($segments[0] === '.tmp') !== $staging) {
             throw new \InvalidArgumentException($staging
                 ? 'Local staging path is outside the temporary namespace.'
                 : 'Local target path uses the temporary namespace.');
@@ -193,9 +219,9 @@ final readonly class LocalDurableFilePublisher
         if ($canonicalAncestor === false || ! is_dir($canonicalAncestor)) {
             throw new \InvalidArgumentException('Local storage root has an unsafe ancestor.');
         }
-        $current = rtrim($canonicalAncestor, '/');
+        $current = rtrim($canonicalAncestor, '/') ?: '/';
         foreach ($missing as $segment) {
-            $current .= '/' . $segment;
+            $current = $current === '/' ? '/' . $segment : $current . '/' . $segment;
             clearstatcache(true, $current);
             if (! @mkdir($current, 0700) && ! is_dir($current)) {
                 throw new \RuntimeException('Failed to create local storage root.');
@@ -211,7 +237,7 @@ final readonly class LocalDurableFilePublisher
             if (! $this->io->syncDirectory($current)) {
                 throw new \RuntimeException('Failed to synchronize local storage root.');
             }
-            if ($current === rtrim($canonicalAncestor, '/')) {
+            if ($current === (rtrim($canonicalAncestor, '/') ?: '/')) {
                 return $root;
             }
             $current = dirname($current);

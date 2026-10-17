@@ -240,6 +240,18 @@ final class LocalDurableFilePublisherTest extends TestCase
         self::assertSame(['sync-directory:' . $directory], $io->events);
     }
 
+    public function test_missing_delete_with_removed_parents_syncs_the_nearest_existing_ancestor(): void
+    {
+        $bucket = $this->root . '/bucket';
+        self::assertTrue(mkdir($bucket, 0o700));
+        $io = new RecordingDurableFileIo();
+        $publisher = new LocalDurableFilePublisher($this->root, $io);
+
+        $publisher->delete($bucket . '/missing/shard/object');
+
+        self::assertSame(['sync-directory:' . $bucket], $io->events);
+    }
+
     public function test_delete_accepts_a_temporary_file_for_durable_cleanup(): void
     {
         $directory = $this->root . '/.tmp';
