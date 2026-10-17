@@ -33,10 +33,6 @@ final class MetadataStoreFactory
         if ($driver === 'sqlite') {
             $sqlitePath = $config['path'] ?? throw new \InvalidArgumentException('SQLite requires "path"');
             self::ensureSqliteDirectory($sqlitePath);
-            $logger?->warning(
-                'SQLite metadata driver is intended for development/testing only. '
-                . 'Use Postgres or MySQL for production deployments.',
-            );
         }
 
         $workerPoolSize = filter_var(
