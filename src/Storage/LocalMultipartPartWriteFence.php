@@ -9,10 +9,15 @@ use OpsFour\S3Server\Checksum\ChecksumCalculator;
 /** Blocking, worker-only transfer from private node scratch to one planned part path. */
 final readonly class LocalMultipartPartWriteFence
 {
+    private LocalDurableFilePublisher $durability;
+
     public function __construct(
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-    ) {}
+        LocalDurableFileIo $durableIo = new NativeLocalObjectWriteIo(),
+    ) {
+        $this->durability = new LocalDurableFilePublisher($root, $durableIo);
+    }
 
     public function publish(
         string $source,
@@ -152,9 +157,7 @@ final readonly class LocalMultipartPartWriteFence
                 $writtenInode['dev'],
                 $writtenInode['ino'],
             );
-            if (! @unlink($tempPath)) {
-                throw new \RuntimeException('Could not unlink multipart staging inode.');
-            }
+            $this->durability->delete($tempPath);
             $tempPath = '';
 
             return new StorageWriteResult(
@@ -204,5 +207,6 @@ final readonly class LocalMultipartPartWriteFence
                 throw new \RuntimeException('Multipart worker directory must be private and process-owned.');
             }
         }
+        $this->durability->ensureDirectory($path);
     }
 }

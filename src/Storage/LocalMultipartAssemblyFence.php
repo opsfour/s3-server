@@ -14,15 +14,19 @@ final readonly class LocalMultipartAssemblyFence
 
     private string $canonicalRoot;
 
+    private LocalDurableFilePublisher $durability;
+
     public function __construct(
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
+        LocalDurableFileIo $durableIo = new NativeLocalObjectWriteIo(),
     ) {
         $canonical = realpath($root);
         if ($canonical === false || ! is_dir($canonical)) {
             throw new \InvalidArgumentException('Multipart assembly worker root is unavailable.');
         }
         $this->canonicalRoot = rtrim($canonical, '/');
+        $this->durability = new LocalDurableFilePublisher($root, $durableIo);
     }
 
     /**
@@ -169,6 +173,8 @@ final readonly class LocalMultipartAssemblyFence
                 $writtenInode['dev'],
                 $writtenInode['ino'],
             );
+            $this->durability->delete($tempPath);
+            $tempPath = '';
 
             return new StorageWriteResult(
                 $target,
@@ -188,7 +194,9 @@ final readonly class LocalMultipartAssemblyFence
                 @flock($tempLease, LOCK_UN);
                 @fclose($tempLease);
             }
-            @unlink($tempPath);
+            if ($tempPath !== '') {
+                @unlink($tempPath);
+            }
         }
     }
 
@@ -216,5 +224,6 @@ final readonly class LocalMultipartAssemblyFence
                 throw new \RuntimeException('Multipart assembly directory must be private and process-owned.');
             }
         }
+        $this->durability->ensureDirectory($path);
     }
 }
