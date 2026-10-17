@@ -483,8 +483,24 @@ rsync -av /var/data/s3/ /backups/s3-storage/
 
 For tiered deployments, back up every configured physical storage tier. Metadata
 and object storage must be restored to a mutually consistent point in time. If
-that is not possible, restore metadata first, then run an object-integrity audit
-before accepting writes.
+that is not possible, restore metadata first, then stop every API and worker
+process and run the read-only local-storage audit before accepting writes:
+
+```bash
+php bin/s3-server storage:audit \
+  --storage-path=/var/data/s3 \
+  --metadata-driver=sqlite \
+  --metadata-path=/var/data/s3/.opsfour/metadata.sqlite
+```
+
+Use `--metadata-driver=postgres|mysql --metadata-dsn=...` for an external
+metadata database. The command pages through object versions, restored copies,
+multipart parts, and active restore-job paths. It rejects paths outside the
+canonical storage root, symlinks, non-regular files, missing files, and size
+mismatches where metadata records the expected size. Output contains counts and
+SHA-256 identifiers only; it does not print object keys or physical paths. The
+audit never repairs or mutates data. A zero exit status means every enumerated
+reference passed; any finding or inventory error returns a nonzero status.
 
 ### Retained encrypted multipart part intents
 

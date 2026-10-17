@@ -41,6 +41,9 @@ The initial production profile adds these gates:
   storage on Linux and one API process.
 - [ ] Exercise restart, abrupt process termination, disk-full behavior,
   temporary-file recovery, orphan cleanup, backup, and restore.
+- [ ] With API and worker processes stopped, restore a matched metadata and
+  storage backup, run `storage:audit` against the restored local root, and
+  require exit status 0 before accepting writes.
 - [ ] Confirm the filesystem and mount support atomic rename. Do not claim
   sudden-power-loss durability until file and directory synchronization is
   implemented and qualified.
