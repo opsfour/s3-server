@@ -67,6 +67,8 @@ final class S3ServerLifecycleTest extends TestCase
             @unlink($database);
             @unlink($database . '-wal');
             @unlink($database . '-shm');
+            @unlink($root . '/.opsfour/runtime.lock');
+            @rmdir($root . '/.opsfour');
             @rmdir($root);
         }
     }

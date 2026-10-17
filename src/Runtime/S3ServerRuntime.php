@@ -30,13 +30,25 @@ final class S3ServerRuntime
 
     private ?DedicatedAmpObjectWriteLeaseRenewer $localObjectRenewer = null;
 
+    private ?LocalStorageRootLocks $localStorageRootLocks;
+
     public function __construct(
         public readonly S3Server $server,
         public readonly NotificationDispatcher $notifications,
         public readonly ?EncryptionServiceInterface $encryption = null,
         public readonly ?WorkerPool $selectWorkerPool = null,
         private readonly LoggerInterface $logger = new NullLogger(),
-    ) {}
+        ?LocalStorageRootLocks $localStorageRootLocks = null,
+    ) {
+        $this->localStorageRootLocks = $localStorageRootLocks;
+    }
+
+    public function __destruct()
+    {
+        // An abandoned or incompletely stopped runtime must not let another
+        // process enter the same roots while workers may still be alive.
+        $this->localStorageRootLocks?->retainUntilProcessExit();
+    }
 
     /** Transfer the isolated test profile's worker resources to runtime shutdown. */
     public function attachLocalObjectWriteTestResources(
@@ -111,6 +123,9 @@ final class S3ServerRuntime
                 $this->abortIncompleteShutdown();
             }
         }
+
+        $this->localStorageRootLocks?->release();
+        $this->localStorageRootLocks = null;
     }
 
     private function abortIncompleteShutdown(): never

@@ -62,6 +62,7 @@ use OpsFour\S3Server\Routing\S3AttributeMiddleware;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
+use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -166,6 +167,10 @@ final class S3Server
 
     private readonly DeferredCancellation $startupCancellation;
 
+    private readonly LocalStorageRootLocks $localStorageRootLocks;
+
+    private bool $ownsLocalStorageRootLockRelease = true;
+
     /**
      * @param  S3ServerConfig  $config  Server configuration.
      * @param  MetadataStore|null  $metadata  Metadata store for middleware wiring (CORS, policy, ACL enforcement).
@@ -183,6 +188,7 @@ final class S3Server
         $this->startupCancellation = new DeferredCancellation();
         $this->handlerRegistry = new HandlerRegistry();
         $this->metrics = $metrics ?? new MetricsCollector();
+        $this->localStorageRootLocks = LocalStorageRootLocks::create();
         $this->accessLogs = $metadata !== null && $storage !== null
             ? new AccessLogWriter(
                 $metadata,
@@ -239,6 +245,7 @@ final class S3Server
         $registryFreezeToken = $this->handlerRegistry->freeze();
         $this->starting = true;
         try {
+            $this->localStorageRootLocks->acquireBackends($this->registeredStorageBackends());
 
             $configuredTiers = $this->storageTiers
                 ?? ($this->storage !== null ? StorageTierRegistry::single($this->storage) : null);
@@ -581,6 +588,11 @@ final class S3Server
             $this->starting = false;
             if (! $this->shutdown) {
                 $this->handlerRegistry->rollbackFreeze($registryFreezeToken);
+                if ($this->ownsLocalStorageRootLockRelease) {
+                    $this->localStorageRootLocks->release();
+                }
+            } elseif ($this->ownsLocalStorageRootLockRelease) {
+                $this->localStorageRootLocks->retainUntilProcessExit();
             }
             throw $error;
         }
@@ -971,7 +983,50 @@ final class S3Server
         $this->server = null;
         $this->backgroundCancellation = null;
         $this->backgroundFutures = [];
+        if ($this->ownsLocalStorageRootLockRelease) {
+            $this->localStorageRootLocks->release();
+        }
         $this->logShutdown('info', 'S3 server stopped.');
+    }
+
+    /**
+     * Let the encompassing runtime release root ownership after its additional
+     * writer and encryption resources have stopped.
+     */
+    public function transferLocalStorageRootLockOwnership(): LocalStorageRootLocks
+    {
+        $this->assertConfigurationMutable('Local storage root lock ownership');
+        if (! $this->ownsLocalStorageRootLockRelease) {
+            throw new \LogicException('Local storage root lock ownership was already transferred.');
+        }
+
+        $this->ownsLocalStorageRootLockRelease = false;
+
+        return $this->localStorageRootLocks;
+    }
+
+    /** @return iterable<StorageBackend> */
+    private function registeredStorageBackends(): iterable
+    {
+        foreach ($this->storageTiers?->all() ?? [] as $tier) {
+            yield $tier->backend;
+        }
+        if ($this->storage !== null) {
+            yield $this->storage;
+        }
+        foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+            foreach ($registration['tiers']->all() as $tier) {
+                yield $tier->backend;
+            }
+            yield $registration['storage'];
+        }
+    }
+
+    public function __destruct()
+    {
+        if ($this->ownsLocalStorageRootLockRelease) {
+            $this->localStorageRootLocks->retainUntilProcessExit();
+        }
     }
 
     private function shutdownWorkerPools(): void

@@ -79,6 +79,7 @@ final readonly class S3ServerRuntimeFactory
         );
         $server->setStorageTierRegistry($storageTiers);
         $runtime = null;
+        $localStorageRootLocks = $server->transferLocalStorageRootLockOwnership();
 
         try {
             PostgresApiDriverGuard::assertAvailable($config);
@@ -116,7 +117,14 @@ final readonly class S3ServerRuntimeFactory
                 metrics: $metrics,
             );
             $server->setNotificationDispatcher($notifications);
-            $runtime = new S3ServerRuntime($server, $notifications, $encryption, $selectWorkerPool, $logger);
+            $runtime = new S3ServerRuntime(
+                $server,
+                $notifications,
+                $encryption,
+                $selectWorkerPool,
+                $logger,
+                $localStorageRootLocks,
+            );
 
             $localFencedWriter = null;
             $localLeaseFactory = null;
@@ -170,18 +178,25 @@ final readonly class S3ServerRuntimeFactory
             return $runtime;
         } catch (\Throwable $e) {
             if ($runtime !== null) {
+                $cleanupComplete = false;
                 for ($attempt = 1; $attempt <= 2; ++$attempt) {
                     try {
                         $runtime->stop();
+                        $cleanupComplete = true;
                         break;
                     } catch (\Throwable $cleanupError) {
                         self::logCleanupFailure($logger, 'Runtime factory shutdown failed.', $cleanupError);
                     }
                 }
+                if (! $cleanupComplete) {
+                    $localStorageRootLocks->retainUntilProcessExit();
+                }
             } else {
+                $cleanupComplete = true;
                 try {
                     $server->stop();
                 } catch (\Throwable $cleanupError) {
+                    $cleanupComplete = false;
                     self::logCleanupFailure($logger, 'Runtime factory server cleanup failed.', $cleanupError);
                 }
 
@@ -189,8 +204,14 @@ final readonly class S3ServerRuntimeFactory
                     try {
                         $encryption->shutdown();
                     } catch (\Throwable $cleanupError) {
+                        $cleanupComplete = false;
                         self::logCleanupFailure($logger, 'Runtime factory encryption cleanup failed.', $cleanupError);
                     }
+                }
+                if ($cleanupComplete) {
+                    $localStorageRootLocks->release();
+                } else {
+                    $localStorageRootLocks->retainUntilProcessExit();
                 }
             }
 
