@@ -42,7 +42,7 @@ deployment profile and is not qualified by this accounting mechanism alone.
 When both are set, the server listens on HTTPS. Use HTTPS for presigned URLs in
 production, either directly or through a TLS-terminating trusted proxy.
 If TLS terminates at a reverse proxy, configure only its direct peer addresses
-in `S3_TRUSTED_PROXY_CIDRS` and block direct access to API nodes. Missing or
+in `S3_TRUSTED_PROXY_CIDRS` and block direct access to the API process. Missing or
 ambiguous `X-Forwarded-Proto` is insecure even when the backend connection uses
 TLS. S3 and admin requests from a trusted peer require a valid
 `X-Forwarded-For`; liveness and readiness probes ignore missing or invalid
@@ -120,9 +120,9 @@ S3_METADATA_DSN="host=localhost;port=3306;dbname=s3server;user=s3;password=secre
 
 When a database credential provider is configured, `/.health` performs a
 read-only availability probe against that same provider. Credential database
-outages therefore remove the API node from readiness while `/.live` remains
+outages therefore remove the server from readiness while `/.live` remains
 available for process supervision.
-| `S3_CREDENTIALS_CACHE_TTL` | `1.0` | Positive lookup cache in seconds; `0` observes cross-node revocations on every request |
+| `S3_CREDENTIALS_CACHE_TTL` | `1.0` | Positive lookup cache in seconds; `0` observes revocations on the next request |
 | `S3_CREDENTIALS_PATH` | - | JSON file path (file driver) |
 
 See [Authentication](authentication.md) for multi-user setup.

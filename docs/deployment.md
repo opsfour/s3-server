@@ -19,9 +19,10 @@ the [roadmap](production-feature-roadmap.md).
 
 ## Current One-Process Deployment
 
-The current release target runs exactly one S3 API process for each configured
-local storage root. Use SQLite for a self-contained deployment, or PostgreSQL
-or MySQL when that database is already part of the operating environment.
+The current release target runs exactly one S3 API process in total. That
+process owns every configured local storage root. Use SQLite for a
+self-contained deployment, or PostgreSQL or MySQL when that database is already
+part of the operating environment.
 
 ```bash
 S3_HOST=0.0.0.0
@@ -258,26 +259,26 @@ S3_RATE_LIMIT=1000   # Per IP, per second (0 = unlimited)
 When enabled, a failed rate-limit database check returns S3 `SlowDown` (503)
 with `Retry-After: 1`; requests do not bypass the configured limit. Liveness
 (`/.live`) remains available. Readiness (`/.health`) probes the rate-limit write
-path at most once every 30 seconds per node and reports 503/degraded while it
+path at most once every 30 seconds and reports 503/degraded while it
 fails. Set `S3_RATE_LIMIT=0` only when rate limiting is deliberately disabled.
 
 ### Temporary Upload Storage
 
 Browser POST uploads use `sys_get_temp_dir()`. The default
 `S3_POST_SPOOL_BUDGET=10737418240` caps concurrent browser POST and request-body
-checksum spool bytes across API processes sharing that local temp directory
-and returns S3 `SlowDown` (503) when full. Keep the same temp directory and
-budget on each process of a node under the same service account. Locked lease
-files recover a crashed process's reservations on the next browser POST. A
+checksum spool bytes for the server and its helper processes in that local
+directory, and returns S3 `SlowDown` (503) when full. Locked lease files recover
+a crashed process's reservations on the next browser POST. A
 request carrying both Content-MD5 and literal SigV4 SHA-256 can occupy two
 spools; a full 5-GiB body slightly exceeds the default 10-GiB budget after
 ciphertext-frame overhead and is rejected with 503. Raise the configured
 budget or lower the accepted body size for that case. Set a filesystem quota
 or use an isolated temporary volume with headroom for storage staging and
-crash files before recovery. A volume shared between nodes still needs its own
-quota or cluster-wide coordinator. Do not remove `.opsfour-s3-post-budget` while API
-processes are running. The stale-file sweep reclaims abandoned browser POST
-files older than 24 hours on a later upload.
+crash files before recovery. Do not remove `.opsfour-s3-post-budget` while the
+server is running. Sharing this temporary directory between API processes
+belongs to a later profile and needs its own acceptance evidence. The stale-file
+sweep reclaims abandoned browser POST files older than 24 hours on a later
+upload.
 
 Browser POST and request-body checksum spools now write authenticated encrypted
 frames, including for SSE requests. Their files are created with `0600` mode;
@@ -285,11 +286,11 @@ each ephemeral key remains in the API process and a crashed spool cannot be
 resumed. Use a private service-account directory where possible; a shared
 writable directory must have the sticky bit so another local user cannot
 replace an active file. A sticky directory alone does not rule out hard links
-on every filesystem. A node with no later uploads needs operator cleanup of
+on every filesystem. A server with no later uploads needs operator cleanup of
 abandoned ciphertext files; the checksum spool also uses a bounded 24-hour
-stale sweep. An active checksum spool holds a file lock, so another process's
-sweep preserves it even when its modification time is old. A crashed process
-releases its lock and its stale file is removed on a later sweep. For the
+stale sweep. An active checksum spool holds a file lock, so a concurrent sweep
+preserves it even when its modification time is old. A crashed process releases
+its lock and its stale file is removed on a later sweep. For the
 strict at-rest guarantee, also disable or encrypt swap and prevent core dumps
 that could contain plaintext request buffers or SSE-C keys.
 Apply the same host-memory and diagnostic rules to every TLS terminator or
@@ -305,13 +306,13 @@ release target.
 
 Worker-backed Flysystem transfers use `S3_STORAGE_TEMP_DIR` and a separate
 `S3_STORAGE_TEMP_BUDGET=10737418240` reservation limit for API and worker
-staging across processes on one node, including copies and multipart assembly.
+staging within the server's worker pools, including copies and multipart
+assembly.
 A multipart assembly larger than this budget returns 503 until the budget is
 raised. The storage lease directory is
-`.opsfour-s3-storage-budget`; keep it private and do not remove it while API
-processes run. Give every API and Flysystem worker process using the same
-temporary directory the same storage budget. Abandoned reservations are
-recovered when a later transfer starts. The browser POST and Flysystem budgets
+`.opsfour-s3-storage-budget`; keep it private and do not remove it while the
+server or its Flysystem workers run. Abandoned reservations are recovered when
+a later transfer starts. The browser POST and Flysystem budgets
 are separate, so a shared temporary volume must accommodate both limits plus
 other temporary writers,
 or enforce a smaller volume quota and suitable admission limits.
@@ -514,7 +515,7 @@ cleanup fence.
 
 ## Production Preflight
 
-Before exposing a node to client traffic:
+Before exposing the server to client traffic:
 
 ```bash
 php -v
@@ -535,7 +536,8 @@ For an experimental external S3-compatible storage profile, run the opt-in
 integration tests with real credentials in a non-production bucket. Use a
 dedicated bucket and short object retention so failed test data is easy to
 clean up. Passing those tests does not qualify the profile; complete the
-provider-specific gates in the [release checklist](release-checklist.md).
+provider-specific acceptance evidence for that Later profile as described in
+the [roadmap](production-feature-roadmap.md).
 
 ## Network Hardening
 
@@ -543,14 +545,14 @@ Recommended layout:
 
 - Expose only the S3 data-plane host publicly.
 - Terminate TLS at a load balancer or reverse proxy.
-- Keep `/.metrics`, `/.admin/*`, and direct node ports private.
+- Keep `/.metrics`, `/.admin/*`, and the direct server port private.
 - Allow `/.live` and `/.health` only from the load balancer, orchestrator, or monitoring
   network.
 - Preserve the client `Host` header exactly, including any port: SigV4 signs
-  this header. Set `S3_TRUSTED_PROXY_CIDRS` to the exact proxy-to-node peer
+  this header. Set `S3_TRUSTED_PROXY_CIDRS` to the exact proxy-to-server peer
   CIDRs when TLS ends at the proxy. Without that opt-in, forwarded headers are
   ignored and `aws:SecureTransport` describes only the direct connection.
-  Restrict direct node access so clients cannot bypass the proxy. Do not trust
+  Restrict direct server access so clients cannot bypass the proxy. Do not trust
   client networks or `0.0.0.0/0` as proxy peers.
 - Have the last trusted proxy overwrite `X-Forwarded-Proto` with one value
   (`https` or `http`) and `X-Forwarded-For` with the observed client address.
@@ -564,6 +566,10 @@ Recommended layout:
 Example Nginx policy for admin surfaces:
 
 ```nginx
+upstream s3_server {
+    server 127.0.0.1:9000;
+}
+
 proxy_set_header Host $http_host;
 proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header X-Forwarded-Proto $scheme;
@@ -571,32 +577,32 @@ proxy_set_header X-Forwarded-Proto $scheme;
 location = /.health {
     allow 10.0.0.0/8;
     deny all;
-    proxy_pass http://s3_nodes;
+    proxy_pass http://s3_server;
 }
 
 location = /.live {
     allow 10.0.0.0/8;
     deny all;
-    proxy_pass http://s3_nodes;
+    proxy_pass http://s3_server;
 }
 
 location = /.metrics {
     allow 10.0.0.0/8;
     deny all;
-    proxy_pass http://s3_nodes;
+    proxy_pass http://s3_server;
 }
 
 location ^~ /.admin/ {
     allow 10.0.0.0/8;
     deny all;
-    proxy_pass http://s3_nodes;
+    proxy_pass http://s3_server;
 }
 
 location / {
     proxy_request_buffering off;
     proxy_buffering off;
     client_max_body_size 0;
-    proxy_pass http://s3_nodes;
+    proxy_pass http://s3_server;
 }
 ```
 
@@ -624,13 +630,13 @@ keys in a repository.
 
 ## Database Least Privilege
 
-Use a DML-only database role for PostgreSQL/MySQL runtime access. Serving
-nodes check the schema version and cannot migrate it on startup.
+Use a DML-only database role for PostgreSQL/MySQL runtime access. The serving
+process checks the schema version and cannot migrate it on startup.
 
 For production deployments:
 
 - Run migrations with a separate migration role during deploy.
-- Run serving nodes with a runtime role limited to `SELECT`, `INSERT`,
+- Run the serving process with a runtime role limited to `SELECT`, `INSERT`,
   `UPDATE`, and `DELETE` on the application tables. For PostgreSQL, also grant
   `USAGE` on the application's `BIGSERIAL` sequences: inserts call `nextval()`
   and otherwise fail even though the role has table `INSERT`. Recheck table
@@ -648,7 +654,7 @@ package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
 For a **schema upgrade** such as PostgreSQL v29 or MySQL v31, drain and stop the
-API process and all background workers; back up
+API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a
 DDL-capable role and the matching package version. If
 `S3_CREDENTIALS_DRIVER=database`, also run one `php bin/s3-server
@@ -656,10 +662,10 @@ credentials:migrate` with its DDL-capable credential role, which may use a
 separate database. Set both metadata and credential DSNs and passwords through
 the bootstrap environment rather than placing secrets in shell arguments.
 Verify the metadata version and expected indexes/column types, and verify
-the credential table and columns. Then start the new API process and workers with
-DML-only roles and restore traffic after readiness and signed-request checks.
-Serving nodes check the PostgreSQL/MySQL version without applying DDL and
-refuse an old or unverifiable schema; database credentials likewise refuse
+the credential table and columns. Then start the new API process with its
+configured workers and DML-only roles, and restore traffic after readiness and
+signed-request checks. The serving process checks the PostgreSQL/MySQL version
+without applying DDL and refuses an old or unverifiable schema; database credentials likewise refuse
 missing or legacy columns. Measure index-build/ALTER time and locks on a
 representative disposable snapshot before scheduling the maintenance window.
 The migrator has no cross-process DDL lock: run exactly one bootstrap job;

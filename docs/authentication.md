@@ -79,7 +79,7 @@ S3_CREDENTIALS_PASSWORD=secret
 S3_CREDENTIALS_CACHE_TTL=1
 ```
 
-Before starting API processes or running credential management, execute
+Before starting the API process or running credential management, execute
 `php bin/s3-server credentials:migrate` once with a DDL-capable credential
 database role. Set `S3_CREDENTIALS_DSN`, `S3_CREDENTIALS_USERNAME`, and
 `S3_CREDENTIALS_PASSWORD` in that bootstrap environment; the migrator preserves

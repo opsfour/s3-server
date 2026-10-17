@@ -304,12 +304,12 @@ S3_STORAGE_DRIVER=memory
 
 ## Choosing a Backend
 
-Use `filesystem` for the current single-host production target and complete its
-release gates before deployment. PostgreSQL and MySQL can share metadata, but
-that does not change the storage status or qualify multiple hosts. Flysystem
-worker mode bounds event-loop blocking during experiments; it does not qualify
-an adapter or provider. Direct `FilesystemOperator` mode can stall unrelated
-requests in the Amp process.
+Use `filesystem` for the current one-host, one-process release target and
+complete its release gates before deployment. PostgreSQL and MySQL can share
+metadata, but that does not change the storage status or qualify multiple
+hosts. Flysystem worker mode bounds event-loop blocking during experiments; it
+does not qualify an adapter or provider. Direct `FilesystemOperator` mode can
+stall unrelated requests in the Amp process.
 
 ## Physical Storage Tiers
 
@@ -358,10 +358,11 @@ factories, startup detects reuse of the same object instance; configure their
 physical namespaces separately because their internal roots are not generally
 available to the package.
 Object writes, multipart uploads, and restored copies persist the exact tier
-that received their bytes. All API nodes and workers serving shared metadata
-must configure every tier referenced by objects, open uploads, restore copies,
-write intents, lifecycle rules, or cleanup jobs. Startup refuses an unknown
-tier. Schema upgrades leave older open multipart uploads and restored copies
+that received their bytes. The API process and its workers must configure every
+tier referenced by objects, open uploads, restore copies, write intents,
+lifecycle rules, or cleanup jobs. Startup refuses an unknown tier. A later
+multi-process profile must enforce the same invariant in every participant.
+Schema upgrades leave older open multipart uploads and restored copies
 with no verifiable physical tier unresolved; stop old writers and map each
 remaining path from the actual backend or drain it before starting the new
 API. Changing the configured default cannot safely backfill that history.
