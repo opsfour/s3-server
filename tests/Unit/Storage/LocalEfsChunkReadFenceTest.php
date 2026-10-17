@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\NullCancellation;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
+use OpsFour\S3Server\Runtime\EfsHostEvidence;
 use OpsFour\S3Server\Storage\LocalEfsChunkReadFence;
 use PHPUnit\Framework\TestCase;
 
@@ -16,38 +16,15 @@ final class LocalEfsChunkReadFenceTest extends TestCase
 {
     private string $path;
 
-    private string $root;
-
-    private string $evidenceDirectory;
-
-    private string $evidencePath;
-
     protected function setUp(): void
     {
-        $temporaryRoot = realpath(sys_get_temp_dir());
-        self::assertIsString($temporaryRoot);
-        $this->root = $temporaryRoot . '/s3-efs-chunk-' . bin2hex(random_bytes(8));
-        $this->evidenceDirectory = $this->root . '-evidence';
-        self::assertTrue(mkdir($this->root, 0o700));
-        self::assertTrue(mkdir($this->evidenceDirectory, 0o700));
-        $this->path = $this->root . '/object';
-        $this->evidencePath = $this->evidenceDirectory . '/' . str_repeat('a', 32) . '-api-one-postgres.json';
-        $this->writeEvidence();
+        $this->path = sys_get_temp_dir() . '/s3-efs-chunk-' . bin2hex(random_bytes(8));
     }
 
     protected function tearDown(): void
     {
         if (is_file($this->path)) {
             unlink($this->path);
-        }
-        if (is_file($this->evidencePath)) {
-            unlink($this->evidencePath);
-        }
-        if (is_dir($this->root)) {
-            rmdir($this->root);
-        }
-        if (is_dir($this->evidenceDirectory)) {
-            rmdir($this->evidenceDirectory);
         }
     }
 
@@ -56,7 +33,7 @@ final class LocalEfsChunkReadFenceTest extends TestCase
         $bytes = str_repeat('a', 1_048_576) . 'tail';
         file_put_contents($this->path, $bytes);
         [$parent, $worker] = createChannelPair();
-        $evidence = $this->evidence();
+        $evidence = new ChunkReadEvidence();
         $fence = new LocalEfsChunkReadFence($evidence, static function (string $path): bool {
             self::assertFileExists($path);
             return true;
@@ -76,7 +53,7 @@ final class LocalEfsChunkReadFenceTest extends TestCase
     {
         file_put_contents($this->path, '0123456789');
         [$parent, $worker] = createChannelPair();
-        $fence = new LocalEfsChunkReadFence($this->evidence(), static fn(): bool => true);
+        $fence = new LocalEfsChunkReadFence(new ChunkReadEvidence(), static fn(): bool => true);
         $task = async(fn(): null => $fence->run($this->path, 3, 4, $worker, new NullCancellation()));
 
         self::assertSame(['chunk' => '3456'], $parent->receive());
@@ -89,7 +66,7 @@ final class LocalEfsChunkReadFenceTest extends TestCase
     {
         file_put_contents($this->path, '0123456789');
         [$parent, $worker] = createChannelPair();
-        $fence = new LocalEfsChunkReadFence($this->evidence(), static fn(): bool => true);
+        $fence = new LocalEfsChunkReadFence(new ChunkReadEvidence(), static fn(): bool => true);
         $task = async(fn(): null => $fence->run($this->path, 8, 4, $worker, new NullCancellation()));
 
         self::assertSame(['chunk' => '89'], $parent->receive());
@@ -106,18 +83,18 @@ final class LocalEfsChunkReadFenceTest extends TestCase
     {
         file_put_contents($this->path, str_repeat('x', 1_048_577));
         [$parent, $worker] = createChannelPair();
-        $evidence = $this->evidence();
+        $evidence = new ChunkReadEvidence();
         $fence = new LocalEfsChunkReadFence($evidence, static fn(): bool => true);
         $task = async(fn(): null => $fence->run($this->path, null, null, $worker, new NullCancellation()));
 
         self::assertSame(1_048_576, strlen($parent->receive()['chunk']));
-        self::assertTrue(unlink($this->evidencePath));
+        $evidence->revoked = true;
         $parent->send('next');
         try {
             $task->await();
             self::fail('A revoked worker completed its read.');
         } catch (\RuntimeException $error) {
-            self::assertStringContainsString('evidence', strtolower($error->getMessage()));
+            self::assertSame('EFS evidence is unavailable.', $error->getMessage());
         }
     }
 
@@ -125,7 +102,7 @@ final class LocalEfsChunkReadFenceTest extends TestCase
     {
         file_put_contents($this->path, 'secret');
         [$parent, $worker] = createChannelPair();
-        $fence = new LocalEfsChunkReadFence($this->evidence(), static fn(): bool => false);
+        $fence = new LocalEfsChunkReadFence(new ChunkReadEvidence(), static fn(): bool => false);
         try {
             $fence->run($this->path, null, null, $worker, new NullCancellation());
             self::fail('An unconfined path was accepted.');
@@ -136,62 +113,16 @@ final class LocalEfsChunkReadFenceTest extends TestCase
         $parent->close();
         $worker->close();
     }
+}
 
-    private function evidence(): EfsHostEvidenceReader
-    {
-        return new EfsHostEvidenceReader(
-            $this->evidenceDirectory,
-            $this->root,
-            str_repeat('a', 32),
-            'fs-12345678',
-            'api-one',
-            'postgres',
-            str_repeat('b', 64),
-            static fn(): int => 1_000_000_000_000,
-            static fn(): string => '11111111-1234-1234-1234-123456789abc',
-            static fn(string $path): array|false => self::rootOwned(@lstat($path)),
-            static fn($handle): array|false => self::rootOwned(@fstat($handle)),
-            fn(): string => "1 0 0:1 / / rw - ext4 /dev/root rw\n"
-                . "2 1 0:2 /evidence {$this->evidenceDirectory} ro - tmpfs tmpfs rw\n",
-        );
-    }
+final class ChunkReadEvidence implements EfsHostEvidence
+{
+    public bool $revoked = false;
 
-    private function writeEvidence(): void
+    public function assertFresh(): void
     {
-        $storage = stat($this->root);
-        self::assertIsArray($storage);
-        self::assertIsInt(file_put_contents($this->evidencePath, json_encode([
-            'schemaVersion' => 1,
-            'runId' => str_repeat('a', 32),
-            'efsId' => 'fs-12345678',
-            'sourceSha256' => str_repeat('b', 64),
-            'node' => 'api-one',
-            'driver' => 'postgres',
-            'containerId' => str_repeat('c', 64),
-            'containerPid' => 1234,
-            'relayPort' => 20049,
-            'relayPid' => 5432,
-            'hostMountId' => '39',
-            'storageDev' => $storage['dev'],
-            'storageIno' => $storage['ino'],
-            'bootId' => '11111111-1234-1234-1234-123456789abc',
-            'epoch' => str_repeat('d', 32),
-            'issuedMonotonicNs' => 999_000_000_000,
-            'expiresMonotonicNs' => 1_019_000_000_000,
-        ], JSON_THROW_ON_ERROR) . "\n"));
-        self::assertTrue(chmod($this->evidencePath, 0o644));
-    }
-
-    /** @param array<array-key, int>|false $entry
-     *  @return array<array-key, int>|false
-     */
-    private static function rootOwned(array|false $entry): array|false
-    {
-        if ($entry !== false) {
-            $entry['uid'] = 0;
-            $entry['mode'] &= ~0o022;
+        if ($this->revoked) {
+            throw new \RuntimeException('EFS evidence is unavailable.');
         }
-
-        return $entry;
     }
 }

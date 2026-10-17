@@ -18,7 +18,7 @@ use Closure;
  * and Python monotonic_ns must be compared on a real Linux host before use.
  * Server admission does not construct or inject this reader yet.
  */
-final class EfsHostEvidenceReader implements EfsStorageEvidence
+final class EfsHostEvidenceReader implements EfsHostEvidence
 {
     private const int MAX_RECORD_BYTES = 4096;
 

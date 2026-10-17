@@ -6,14 +6,13 @@ namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /** Blocking staged-size verification confined to an optional EFS worker. */
 final readonly class LocalEfsTempSizeFence
 {
     public function __construct(
         private string $root,
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+        private EfsHostEvidenceReader $evidence,
     ) {
         if ($root !== $evidence->storageRoot()) {
             throw new \InvalidArgumentException('Guarded staging root differs from EFS evidence.');
@@ -28,11 +27,7 @@ final readonly class LocalEfsTempSizeFence
 
         $this->evidence->assertFresh();
         $directory = dirname($path);
-        $linked = is_link($directory);
-        $this->evidence->assertFresh();
-        $resolved = realpath($directory);
-        $this->evidence->assertFresh();
-        if ($linked || $resolved !== $directory) {
+        if (is_link($directory) || realpath($directory) !== $directory) {
             throw new InternalErrorException('Filesystem staging directory is unsafe.');
         }
         $this->evidence->assertFresh();

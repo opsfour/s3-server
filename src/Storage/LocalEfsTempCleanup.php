@@ -5,14 +5,13 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /** Blocking stale-temp sweep confined to an optional EFS process worker. */
 final readonly class LocalEfsTempCleanup
 {
     public function __construct(
         private string $root,
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+        private EfsHostEvidenceReader $evidence,
     ) {
         if ($root !== $evidence->storageRoot()) {
             throw new \InvalidArgumentException('Guarded temp cleanup root differs from EFS evidence.');
@@ -27,19 +26,14 @@ final readonly class LocalEfsTempCleanup
 
         $this->evidence->assertFresh();
         $directory = $this->root . '/.tmp';
-        $linked = is_link($directory);
-        $this->evidence->assertFresh();
-        if ($linked) {
+        if (is_link($directory)) {
             throw new \RuntimeException('EFS temporary directory is unsafe.');
         }
-        $exists = is_dir($directory);
-        $this->evidence->assertFresh();
-        if (! $exists) {
+        if (! is_dir($directory)) {
             // A failed is_dir() can be an NFS I/O error. Only a successful
             // listing of the root proves the directory is absent.
             $this->evidence->assertFresh();
             $rootEntries = @scandir($this->root);
-            $this->evidence->assertFresh();
             if ($rootEntries === false || in_array('.tmp', $rootEntries, true)) {
                 throw new \RuntimeException('EFS temporary directory is unavailable.');
             }
@@ -47,14 +41,11 @@ final readonly class LocalEfsTempCleanup
             return 0;
         }
         $this->evidence->assertFresh();
-        $resolved = realpath($directory);
-        $this->evidence->assertFresh();
-        if ($resolved !== $directory) {
+        if (realpath($directory) !== $directory) {
             throw new \RuntimeException('EFS temporary directory is unsafe.');
         }
         $this->evidence->assertFresh();
         $entries = @scandir($directory);
-        $this->evidence->assertFresh();
         if ($entries === false) {
             throw new \RuntimeException('EFS temporary directory is unavailable.');
         }
@@ -73,7 +64,6 @@ final readonly class LocalEfsTempCleanup
             }
             $path = $directory . '/' . $entry;
             $before = @lstat($path);
-            $this->evidence->assertFresh();
             if ($before === false) {
                 throw new \RuntimeException('EFS temporary file identity is unavailable.');
             }
@@ -82,21 +72,17 @@ final readonly class LocalEfsTempCleanup
             }
             $this->evidence->assertFresh();
             $handle = @fopen($path, 'rb');
-            $this->evidence->assertFresh();
             if ($handle === false) {
                 throw new \RuntimeException('EFS temporary file cannot be opened.');
             }
             try {
                 $this->evidence->assertFresh();
                 // An active writer holds a shared lease until publication.
-                $locked = flock($handle, LOCK_EX | LOCK_NB);
-                $this->evidence->assertFresh();
-                if (! $locked) {
+                if (! flock($handle, LOCK_EX | LOCK_NB)) {
                     continue;
                 }
                 $this->evidence->assertFresh();
                 $opened = fstat($handle);
-                $this->evidence->assertFresh();
                 if ($opened === false || ! self::sameFile($before, $opened)) {
                     throw new \RuntimeException('EFS temporary file identity changed.');
                 }
@@ -109,19 +95,16 @@ final readonly class LocalEfsTempCleanup
                 }
                 $this->evidence->assertFresh();
                 $current = @lstat($path);
-                $this->evidence->assertFresh();
                 if ($current === false || ! self::sameFile($opened, $current)) {
                     throw new \RuntimeException('EFS temporary file identity changed before deletion.');
                 }
                 $this->evidence->assertFresh();
-                $unlinked = @unlink($path);
-                $this->evidence->assertFresh();
-                if (! $unlinked) {
+                if (! @unlink($path)) {
                     throw new \RuntimeException('EFS temporary file deletion is uncertain.');
                 }
+                $this->evidence->assertFresh();
                 $cleaned++;
             } finally {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @flock($handle, LOCK_UN);
                 fclose($handle);
             }

@@ -76,7 +76,9 @@ mount and admits only known local filesystem types. NFS/EFS,
 SMB/CIFS, FUSE, volatile tmpfs/ramfs, unknown types, and unreadable mount
 data fail closed outside the explicit unsafe test override. This check cannot
 prove persistence of an underlying overlay or qualify a shared mount; do not
-use a remote mount for default serving.
+use a remote mount for default serving. NFS/EFS multi-host filesystem operation
+is an optional, currently unqualified profile and does not gate releases for
+the qualified local-filesystem or provider-specific storage profiles.
 
 The backend closes temporary files and renames them into place, but it does
 not currently `fsync` the file and containing directory. Atomic visibility

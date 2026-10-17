@@ -7,8 +7,7 @@ namespace OpsFour\S3Server\Storage;
 use Amp\Cancellation;
 use Amp\Sync\Channel;
 use Closure;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
+use OpsFour\S3Server\Runtime\EfsHostEvidence;
 
 /**
  * One worker owns one opened inode until EOF or an explicit cancellation.
@@ -23,7 +22,7 @@ final readonly class LocalEfsChunkReadFence
 
     /** @param Closure(string): bool $assertConfined */
     public function __construct(
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+        private EfsHostEvidence $evidence,
         private Closure $assertConfined,
     ) {}
 
@@ -41,30 +40,23 @@ final readonly class LocalEfsChunkReadFence
         $this->evidence->assertFresh();
         clearstatcache(true, $path);
         $entry = @lstat($path);
-        $this->evidence->assertFresh();
         if (! is_array($entry) || ! self::regular($entry)) {
             throw new \RuntimeException('Guarded read path is not a regular file.');
         }
         $this->evidence->assertFresh();
         $file = @fopen($path, 'rb');
-        $this->evidence->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Guarded read source could not be opened.');
         }
         $closed = false;
         try {
             $opened = @fstat($file);
-            $this->evidence->assertFresh();
             if (! is_array($opened) || ! self::sameInode($entry, $opened)) {
                 throw new \RuntimeException('Guarded read source changed during open.');
             }
-            if ($offset !== null && $offset > 0) {
-                $this->evidence->assertFresh();
-                $seeked = @fseek($file, $offset, SEEK_SET);
-                $this->evidence->assertFresh();
-                if ($seeked !== 0) {
-                    throw new \RuntimeException('Guarded read source could not be seeked.');
-                }
+            $this->evidence->assertFresh();
+            if ($offset !== null && $offset > 0 && @fseek($file, $offset, SEEK_SET) !== 0) {
+                throw new \RuntimeException('Guarded read source could not be seeked.');
             }
             $remaining = $length;
             while (true) {
@@ -77,14 +69,11 @@ final readonly class LocalEfsChunkReadFence
                 $chunk = @fread($file, $want);
                 $this->evidence->assertFresh();
                 $after = @fstat($file);
-                $this->evidence->assertFresh();
                 if (! is_array($after) || ! self::sameInode($opened, $after)
                     || ($after['size'] ?? null) !== ($opened['size'] ?? null)) {
                     throw new \RuntimeException('Guarded read source changed during transfer.');
                 }
-                $eof = feof($file);
-                $this->evidence->assertFresh();
-                if (! is_string($chunk) || ($chunk === '' && ! $eof)) {
+                if (! is_string($chunk) || ($chunk === '' && ! feof($file))) {
                     throw new \RuntimeException('Guarded read source returned an incomplete chunk.');
                 }
                 if ($chunk === '') {
@@ -100,7 +89,6 @@ final readonly class LocalEfsChunkReadFence
                 $channel->send(['chunk' => $chunk]);
                 $command = $channel->receive();
                 $cancellation->throwIfRequested();
-                $this->evidence->assertFresh();
                 if ($command === 'cancel') {
                     return;
                 }
@@ -109,16 +97,14 @@ final readonly class LocalEfsChunkReadFence
                 }
             }
             $this->evidence->assertFresh();
-            $didClose = @fclose($file);
-            $this->evidence->assertFresh();
-            $closed = $didClose;
-            if (! $didClose) {
+            $closed = true;
+            if (! @fclose($file)) {
                 throw new \RuntimeException('Guarded read source could not be closed.');
             }
+            $this->evidence->assertFresh();
             $channel->send(['eof' => true]);
         } finally {
             if (! $closed) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @fclose($file);
             }
         }

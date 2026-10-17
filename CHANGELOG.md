@@ -28,58 +28,6 @@ The project follows [Semantic Versioning](https://semver.org/).
   for custom metadata backends.
 - Add encrypted multipart parts and authenticated encrypted temporary request
   spools.
-- Add an internal, listenerless EFS candidate factory that constructs and
-  consumes the complete runtime graph and ingress bundle behind one ownership
-  boundary. Failed assembly retains a retryable cleanup owner; successful
-  preparation keeps serving admission closed and background work parked. This
-  does not qualify or enable production EFS serving.
-- Add an inert schema-v2 production EFS host-pin contract and a bounded local
-  reader for an exact root-owned, read-only file bind. The pin binds one
-  deployment, instance, full container ID, boot, mount, storage inode, and
-  watcher epoch without accessing EFS, SQL, Docker, or a listener. Production
-  EFS serving remains closed.
-- Add a listenerless schema-v2 production EFS heartbeat reader for the
-  identity-derived file on an exact root-owned, read-only local directory
-  bind. It permanently latches failed reads, pins the evidence mount and
-  directory identity across successful reads, and rejects stale replay after
-  heartbeat time progression. A distinct immutable schema-v2 worker scope now
-  carries that exact identity, host pin, local bind identity, watcher epoch,
-  sampled monotonic time, and frozen heartbeat baseline through the process
-  channel; worker readers reject v1 scopes, replaced binds, clock rollback, and
-  heartbeat rollback. The production watcher and runtime wiring remain
-  unimplemented, real Linux qualification is pending, and serving remains
-  closed.
-- Add an inert schema-v2 production EFS heartbeat writer. It publishes the
-  canonical `issue()`/`toJson()` record through an exact local read-write bind,
-  pins the root-owned ancestor, directory, and persistent nonblocking
-  single-writer lock identities, and preserves monotonic lease progression
-  across watcher restarts. Same-directory exclusive staging, file and
-  directory synchronization, atomic rename with postchecks, bounded temporary
-  and directory enumeration, and durable idempotent revocation protect the
-  reader-compatible 0644 record. Ambiguous publication or revocation poisons
-  the writer terminally and attempts best-effort invalidation. The writer is
-  non-cloneable, does not access EFS, SQL, or sockets, and has no runtime,
-  factory, watcher-loop, or listener wiring yet.
-- Add an inert, bounded worker-wide production EFS evidence latch. Each Amp
-  worker binds its first immutable schema-v2 scope and one heartbeat reader;
-  evidence failure or a byte-different scope poisons that process terminally.
-  The dedicated fixed-message failure remains identifiable across Amp IPC
-  without exposing evidence details. Parent admission feedback and atomic
-  migration of all guarded EFS tasks remain required before production wiring.
-- Add inert parent-process feedback for production EFS worker failures. A
-  dedicated evidence failure, serialization ambiguity, or narrowly typed
-  worker/context loss terminally revokes candidate admission and attempts to
-  kill every registered worker pool. Failed kills remain visible and
-  retryable, while cancellation and unrelated task failures preserve normal
-  handling. The guarded tasks and pool-owning runtime components are not wired
-  to it yet.
-- Add a schema-v2 production EFS worker storage-evidence adapter and a shared
-  storage-evidence abstraction. The 11 physical EFS primitives revalidate
-  evidence around potentially blocking filesystem calls, including
-  evidence-aware directory synchronization; physical fence constructors still
-  accept only the two final trusted reader implementations. Descriptor-only
-  cleanup is retained as a bounded exception. Task, runtime-factory, and
-  listener wiring remain open.
 
 ### Changed
 
@@ -95,6 +43,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   Run one metadata and, when used, credential migration before starting nodes.
 - Remote Flysystem and unqualified shared filesystem backends fail startup by
   default. The unfenced-storage override is restricted to isolated tests.
+- Treat NFS/EFS multi-host filesystem deployments as an optional, currently
+  unqualified profile. They do not gate releases for the package's qualified
+  local-filesystem or provider-specific storage profiles.
 - Broker adapters remain Best Effort in process; the durable database queue and
   retry contract applies to HTTP(S) webhooks.
 - New objects remain unencrypted unless SSE is requested or bucket default
@@ -115,14 +66,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Preserve an object's S3 `Last-Modified` timestamp when restore state or
+- Preserve an object's S3 `Last-Modified` timestamp when restore state,
   physical placement, transition metadata, or current-version bookkeeping
   changes across SQLite, PostgreSQL, and MySQL. PostgreSQL and MySQL version
-  listings now also expose the noncurrent timestamp used by lifecycle rules.
+  listings also expose the noncurrent timestamp used by lifecycle rules.
 - Retry a failed graceful worker-pool shutdown with forced termination on the
-  next server stop attempt. EFS ingress and Select pools remain ahead of graph
-  cleanup, completed pools are not closed twice, and each failed close attempt
-  is counted once.
+  next server stop attempt. Storage ingress and Select pools remain ahead of
+  graph cleanup, completed pools are not closed twice, and each failed close
+  attempt is counted once.
 - Arm SIGINT and SIGTERM watchers before opening the HTTP listener in the
   standalone, Laravel, and Symfony serve commands, and remove those watchers
   when startup fails.
@@ -208,8 +159,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Revalidate the bucket generation around every website object and
   error-document stream read so a reused bucket name cannot expose the former
   bucket's body.
-- Revoke prepared EFS pre-bind admission after a failed binding recheck so a
-  later listener attempt must repeat the complete preparation.
+- Revoke prepared optional shared-filesystem pre-bind admission after a failed
+  binding recheck so a later listener attempt must repeat preparation.
 - Reject known S3 query selectors and subresources on the wrong method or
   bucket/object scope before they can fall through to a base mutation.
 - Route arbitrary S3 request methods through the S3 resolver, normalize DNS

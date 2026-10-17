@@ -22,7 +22,9 @@ gate required by the advertised deployment profile has passed.
 - Qualify the exact local filesystem, mount options, shutdown path, backup, and
   sudden-power-loss behavior used by a single-host deployment.
 - Qualify each advertised multi-host storage backend on separate hosts. Shared
-  PostgreSQL or MySQL metadata alone does not qualify object storage.
+  PostgreSQL or MySQL metadata alone does not qualify object storage. NFS/EFS
+  is an optional deployment profile and does not gate releases for other
+  qualified storage profiles.
 - Keep generic Flysystem and unverified shared mounts out of production until
   their provider-specific delayed-write and cleanup fence has passed.
 - Exercise signed path-style and virtual-hosted requests through the intended
@@ -64,30 +66,14 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,366
-PHPUnit tests with 33,586 assertions and 232 expected opt-in or environment
-skips in 5:00 with 193 MB peak memory. PHPStan passed, and PHP CS Fixer
-reported zero fixes across 977 files.
-Strict Composer validation, the locked dependency audit, and `git diff --check`
-also passed on the same current candidate. The CI baseline at `bebca06`
-passed all four jobs in GitHub Actions run
-[39023440024](https://github.com/opsfour/s3-server/actions/runs/39023440024),
-including quality, metadata backends, and the lowest and highest dependency
-matrices. That run covers the immutable schema-v2 worker scope, terminal worker
-evidence latch, inert parent feedback, schema-v2 worker storage adapter, and
-physical EFS revalidation. The later inert schema-v2 heartbeat writer at
-`886ceb8` is covered by the current local quality run but has no recorded green
-GitHub Actions result yet. Atomic
-migration of all 14 guarded EFS tasks and seven pool-owning runtime components,
-join-capable process-exit evidence or fail-closed serving-process termination,
-runtime wiring of the heartbeat writer and reader, proof of the exact host-RW
-to API-RO bind relationship, old-container and old-epoch invalidation, bounded
-old-epoch cleanup, and service-manager termination after uncertain publish or
-revoke completion remain open. Return from `kill()` alone is not accepted as
-worker-exit evidence. External
-PostgreSQL/MySQL execution without skips, the exact PHP 8.4 deployment profile,
-multi-host storage qualification, and the current-source long soak remain
-separate gates.
+The current unreleased correction passed 198 focused PHPUnit tests with 1,548
+assertions and two expected environment skips on PHP 8.5.11. PHPStan and PHP CS
+Fixer across 957 files also passed, as did `git diff --check`. A complete
+`composer quality` run, strict Composer validation, the locked dependency
+audit, external PostgreSQL/MySQL execution without skips, the exact PHP 8.4
+deployment profile, each advertised storage profile, and the current-source
+long soak remain separate gates. Optional NFS/EFS qualification is required
+only for a release that advertises that deployment profile.
 
 ## Released Version
 

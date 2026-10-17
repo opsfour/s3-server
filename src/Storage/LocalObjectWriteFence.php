@@ -8,7 +8,6 @@ use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /**
  * Isolated filesystem primitive for a planned object path. Publication needs
@@ -27,12 +26,9 @@ final readonly class LocalObjectWriteFence
     public function __construct(
         string $basePath,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence|null $efsEvidence = null,
+        private ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         if ($efsEvidence !== null) {
-            if (! $io instanceof EfsAwareLocalObjectWriteIo) {
-                throw new \InvalidArgumentException('Guarded object I/O must support evidence-aware directory synchronization.');
-            }
             if ($basePath !== $efsEvidence->storageRoot()) {
                 throw new \InvalidArgumentException('Guarded local object root differs from EFS evidence.');
             }
@@ -65,9 +61,7 @@ final readonly class LocalObjectWriteFence
         $this->ensureDirectory($targetDirectory);
         $this->ensureDirectory($tempDirectory);
         $tempPath = $tempDirectory . '/' . $intent->attemptId . '-' . bin2hex(random_bytes(16));
-        $this->efsEvidence?->assertFresh();
         $file = @fopen($tempPath, 'x+b');
-        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Failed to create local object staging file.');
         }
@@ -76,29 +70,20 @@ final readonly class LocalObjectWriteFence
         $calculator = new ChecksumCalculator();
         $size = 0;
         try {
-            $this->efsEvidence?->assertFresh();
-            $protected = @chmod($tempPath, 0600);
-            $this->efsEvidence?->assertFresh();
-            $locked = $protected && @flock($file, LOCK_SH | LOCK_NB);
-            $this->efsEvidence?->assertFresh();
-            if (! $protected || ! $locked) {
+            if (! @chmod($tempPath, 0600) || ! @flock($file, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Failed to protect local object staging file.');
             }
-            $this->efsEvidence?->assertFresh();
             while (($chunk = $body->read()) !== null) {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
                 $this->writeAll($file, $chunk);
             }
             $checksums = $calculator->finalize();
-            $this->efsEvidence?->assertFresh();
-            $synced = $this->io->syncFile($file);
-            $this->efsEvidence?->assertFresh();
-            if (! $synced) {
+            if (! $this->io->syncFile($file)) {
                 throw new \RuntimeException('Failed to synchronize local object data.');
             }
-            $writtenInode = @fstat($file);
             $this->efsEvidence?->assertFresh();
+            $writtenInode = @fstat($file);
             if (! is_array($writtenInode)) {
                 throw new \RuntimeException('Failed to verify local object staging file.');
             }
@@ -106,37 +91,27 @@ final readonly class LocalObjectWriteFence
             // link, so the stale-temp sweeper cannot claim the old inode.
             $this->efsEvidence?->assertFresh();
             $tempLease = @fopen($tempPath, 'rb');
-            $this->efsEvidence?->assertFresh();
             $leaseInode = $tempLease !== false ? @fstat($tempLease) : false;
-            $this->efsEvidence?->assertFresh();
-            $leaseLocked = $tempLease !== false && @flock($tempLease, LOCK_SH | LOCK_NB);
-            $this->efsEvidence?->assertFresh();
             if ($tempLease === false || ! is_array($leaseInode)
                 || $leaseInode['dev'] !== $writtenInode['dev']
-                || $leaseInode['ino'] !== $writtenInode['ino'] || ! $leaseLocked) {
+                || $leaseInode['ino'] !== $writtenInode['ino']
+                || ! @flock($tempLease, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Failed to hold local object staging file.');
             }
-            $unlocked = @flock($file, LOCK_UN);
-            $this->efsEvidence?->assertFresh();
-            $closed = $unlocked && @fclose($file);
-            $this->efsEvidence?->assertFresh();
-            if (! $unlocked || ! $closed) {
+            if (! @flock($file, LOCK_UN) || ! @fclose($file)) {
                 throw new \RuntimeException('Failed to close local object staging file.');
             }
             $file = null;
-            $this->efsEvidence?->assertFresh();
 
             // Reopen the synced inode before its create-only link. Reading the
             // original handle would miss a close-to-open visibility failure.
             $this->efsEvidence?->assertFresh();
             $verified = @fopen($tempPath, 'rb');
-            $this->efsEvidence?->assertFresh();
             if ($verified === false) {
                 throw new \RuntimeException('Failed to verify local object staging file.');
             }
             try {
                 $openedInode = @fstat($verified);
-                $this->efsEvidence?->assertFresh();
                 if (! is_array($openedInode)
                     || $openedInode['dev'] !== $writtenInode['dev']
                     || $openedInode['ino'] !== $writtenInode['ino']) {
@@ -146,13 +121,11 @@ final readonly class LocalObjectWriteFence
                 while (! feof($verified)) {
                     $this->efsEvidence?->assertFresh();
                     $written = @fread($verified, 65536);
-                    $this->efsEvidence?->assertFresh();
                     if ($written === false || ($written === '' && ! feof($verified))) {
                         throw new \RuntimeException('Failed to verify local object staging file.');
                     }
                     $physicalCalculator->update($written);
                 }
-                $this->efsEvidence?->assertFresh();
                 $physical = $physicalCalculator->finalize();
                 if ($physical->size !== $checksums->size
                     || ! hash_equals($checksums->sha256Hex, $physical->sha256Hex)) {
@@ -164,32 +137,22 @@ final readonly class LocalObjectWriteFence
 
             $this->efsEvidence?->assertFresh();
             clearstatcache(true, $tempPath);
-            $actualSize = @filesize($tempPath);
-            $this->efsEvidence?->assertFresh();
-            if ($actualSize !== $size) {
+            if (@filesize($tempPath) !== $size) {
                 throw new \RuntimeException('Local object staging file is incomplete.');
             }
-            $this->efsEvidence?->assertFresh();
 
             // A failed link can still have succeeded on NFS. Never overwrite or
             // infer a successful publication from an ambiguous response.
             $this->efsEvidence?->assertFresh();
-            $linked = $this->io->link($tempPath, $intent->storagePath);
-            $this->efsEvidence?->assertFresh();
-            if (! $linked) {
+            if (! $this->io->link($tempPath, $intent->storagePath)) {
                 throw new \RuntimeException('Local create-only object publication is uncertain.');
             }
             $this->syncDirectoryChain($targetDirectory);
 
-            $this->efsEvidence?->assertFresh();
-            $unlinked = @unlink($tempPath);
-            $this->efsEvidence?->assertFresh();
-            if (! $unlinked) {
+            if (! @unlink($tempPath)) {
                 throw new \RuntimeException('Failed to remove local object staging link.');
             }
-            $this->efsEvidence?->assertFresh();
             $this->syncDirectoryChain($tempDirectory);
-            $this->efsEvidence?->assertFresh();
 
             return new StorageWriteResult(
                 path: $intent->storagePath,
@@ -202,12 +165,10 @@ final readonly class LocalObjectWriteFence
             );
         } finally {
             if (is_resource($file)) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @flock($file, LOCK_UN);
                 @fclose($file);
             }
             if (is_resource($tempLease)) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @flock($tempLease, LOCK_UN);
                 @fclose($tempLease);
             }
@@ -216,9 +177,13 @@ final readonly class LocalObjectWriteFence
             if ($this->efsEvidence === null) {
                 @unlink($tempPath);
             } else {
-                $this->efsEvidence->assertFresh();
-                @unlink($tempPath);
-                $this->efsEvidence->assertFresh();
+                try {
+                    $this->efsEvidence->assertFresh();
+                    @unlink($tempPath);
+                } catch (\Throwable) {
+                    // Leave an orphaned temp path for a healthy node rather
+                    // than issue another hard-NFS call after host evidence loss.
+                }
             }
         }
     }
@@ -242,37 +207,25 @@ final readonly class LocalObjectWriteFence
         $this->ensureDirectory($targetDirectory);
         $marker = "OPSFOUR-LOCAL-OBJECT-SEAL-V1\n" . $claimed->attemptId . "\n" . bin2hex(random_bytes(32)) . "\n";
         $sealPath = $targetDirectory . '/.seal-' . $claimed->attemptId . '-' . bin2hex(random_bytes(16));
-        $this->efsEvidence?->assertFresh();
         $file = @fopen($sealPath, 'x+b');
-        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Failed to create local object seal.');
         }
 
         try {
-            $this->efsEvidence?->assertFresh();
-            $protected = @chmod($sealPath, 0600);
-            $this->efsEvidence?->assertFresh();
-            if (! $protected) {
+            if (! @chmod($sealPath, 0600)) {
                 throw new \RuntimeException('Failed to protect local object seal.');
             }
             $this->writeAll($file, $marker);
-            $this->efsEvidence?->assertFresh();
-            $synced = $this->io->syncFile($file);
-            $this->efsEvidence?->assertFresh();
-            $closed = $synced && @fclose($file);
-            $this->efsEvidence?->assertFresh();
-            if (! $synced || ! $closed) {
+            if (! $this->io->syncFile($file) || ! @fclose($file)) {
                 throw new \RuntimeException('Failed to synchronize local object seal.');
             }
             $file = null;
-            $this->efsEvidence?->assertFresh();
 
             // NFS may report failure after a successful rename. Verify the
             // unique marker even then; retry is safe while SQL retains claim.
             $this->efsEvidence?->assertFresh();
             $renamed = $this->io->rename($sealPath, $claimed->storagePath);
-            $this->efsEvidence?->assertFresh();
             $this->syncDirectoryChain($targetDirectory);
             if (! $this->hasExactMarker($claimed->storagePath, $marker)) {
                 throw new \RuntimeException($renamed
@@ -281,15 +234,18 @@ final readonly class LocalObjectWriteFence
             }
         } finally {
             if (is_resource($file)) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @fclose($file);
             }
             if ($this->efsEvidence === null) {
                 @unlink($sealPath);
             } else {
-                $this->efsEvidence->assertFresh();
-                @unlink($sealPath);
-                $this->efsEvidence->assertFresh();
+                try {
+                    $this->efsEvidence->assertFresh();
+                    @unlink($sealPath);
+                } catch (\Throwable) {
+                    // A healthy collector can reclaim the orphaned seal temp
+                    // after a watcher trip; do not issue another EFS syscall.
+                }
             }
         }
     }
@@ -310,46 +266,24 @@ final readonly class LocalObjectWriteFence
         $relative = $path === $this->root ? '' : substr($path, strlen($this->root) + 1);
         foreach ($relative === '' ? [] : explode('/', $relative) as $segment) {
             $current .= '/' . $segment;
-            $this->efsEvidence?->assertFresh();
             clearstatcache(true, $current);
-            $linked = is_link($current);
-            $this->efsEvidence?->assertFresh();
-            if ($linked) {
+            if (is_link($current)) {
                 throw new \RuntimeException('Local object directory escapes its storage root.');
             }
-            $directory = is_dir($current);
-            $this->efsEvidence?->assertFresh();
-            $created = $directory;
-            if (! $directory) {
-                $created = @mkdir($current, 0700);
-                $this->efsEvidence?->assertFresh();
-                if (! $created) {
-                    $directory = is_dir($current);
-                    $this->efsEvidence?->assertFresh();
-                }
-            }
-            if (! $directory && ! $created) {
+            if (! is_dir($current) && ! @mkdir($current, 0700) && ! is_dir($current)) {
                 throw new \RuntimeException('Failed to create local object directory.');
             }
-            $this->efsEvidence?->assertFresh();
             clearstatcache(true, $current);
-            $linked = is_link($current);
-            $this->efsEvidence?->assertFresh();
-            $resolved = realpath($current);
-            $this->efsEvidence?->assertFresh();
-            if ($linked || $resolved !== $current) {
+            if (is_link($current) || realpath($current) !== $current) {
                 throw new \RuntimeException('Local object directory escapes its storage root.');
             }
             if ($this->efsEvidence !== null) {
-                $this->efsEvidence->assertFresh();
                 $entry = @lstat($current);
-                $this->efsEvidence->assertFresh();
                 if (! is_array($entry) || ($entry['mode'] & 0o170000) !== 0o040000
                     || ($entry['mode'] & 0o7777) !== 0o700
                     || ! function_exists('posix_geteuid') || $entry['uid'] !== posix_geteuid()) {
                     throw new \RuntimeException('Local object directory must be private and process-owned.');
                 }
-                $this->efsEvidence->assertFresh();
             }
         }
     }
@@ -357,15 +291,7 @@ final readonly class LocalObjectWriteFence
     private function syncDirectoryChain(string $path): void
     {
         while (true) {
-            $this->efsEvidence?->assertFresh();
-            if ($this->efsEvidence !== null && ! $this->io instanceof EfsAwareLocalObjectWriteIo) {
-                throw new \LogicException('Guarded object I/O lost evidence-aware directory synchronization.');
-            }
-            $synced = $this->efsEvidence !== null
-                ? $this->io->syncDirectoryWithEvidence($path, $this->efsEvidence)
-                : $this->io->syncDirectory($path);
-            $this->efsEvidence?->assertFresh();
-            if (! $synced) {
+            if (! $this->io->syncDirectory($path)) {
                 throw new \RuntimeException('Failed to synchronize local object directory.');
             }
             if ($path === $this->root) {
@@ -381,9 +307,7 @@ final readonly class LocalObjectWriteFence
         $offset = 0;
         $length = strlen($bytes);
         while ($offset < $length) {
-            $this->efsEvidence?->assertFresh();
             $written = @fwrite($file, substr($bytes, $offset));
-            $this->efsEvidence?->assertFresh();
             if ($written === false || $written === 0) {
                 throw new \RuntimeException('Failed to write local object bytes.');
             }
@@ -397,28 +321,22 @@ final readonly class LocalObjectWriteFence
         if ($length === 0) {
             return false;
         }
-        $this->efsEvidence?->assertFresh();
         $file = @fopen($path, 'rb');
-        $this->efsEvidence?->assertFresh();
         if ($file === false) {
             return false;
         }
         try {
-            $status = @fstat($file);
-            $this->efsEvidence?->assertFresh();
+            $status = fstat($file);
             if ($status === false || $status['size'] !== $length) {
                 return false;
             }
-            $this->efsEvidence?->assertFresh();
             $actual = '';
             while (strlen($actual) < $length) {
-                $this->efsEvidence?->assertFresh();
                 $remaining = $length - strlen($actual);
                 if ($remaining < 1) {
                     break;
                 }
                 $chunk = @fread($file, $remaining);
-                $this->efsEvidence?->assertFresh();
                 if ($chunk === false || $chunk === '') {
                     return false;
                 }
@@ -427,8 +345,7 @@ final readonly class LocalObjectWriteFence
 
             return hash_equals($marker, $actual);
         } finally {
-            // Descriptor-only best-effort cleanup after evidence loss.
-            @fclose($file);
+            fclose($file);
         }
     }
 }

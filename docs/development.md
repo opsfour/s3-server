@@ -194,42 +194,15 @@ PHPStan level 8 covers both `src/` and `tests/`. CI also installs the lowest
 and highest allowed Composer dependency sets: Laravel 12 with Symfony 7.4 LTS,
 and Laravel 13 with Symfony 8.1 or newer.
 
-## Production EFS Development Boundary
-
-The schema-v2 worker adapter and host reader implement the shared
-storage-evidence abstraction. Physical EFS fence constructors accept only these
-two final trusted implementations. Keep evidence revalidation between
-potentially blocking EFS system calls and after final or failed calls; use the
-evidence-aware directory-sync path whenever a namespace mutation requires a
-durability barrier. Descriptor-only cleanup is permitted only when it performs
-no further path lookup or namespace mutation.
-
-The inert schema-v2 heartbeat writer must remain local-only and non-cloneable.
-It publishes the canonical `issue()`/`toJson()` record through an exact
-read-write directory bind while pinning root-owned ancestor, directory, and
-persistent single-writer lock identities. Preserve exclusive same-directory
-staging, file and directory synchronization, atomic rename postchecks, the
-4096-byte reader limit, bounded same-scope cleanup and enumeration, monotonic
-restart progression, terminal ambiguity handling, best-effort invalidation,
-and durable idempotent revoke behavior. Do not add EFS, SQL, or socket access
-to this class.
-
-The production path remains closed until all 14 guarded tasks and seven
-pool-owning runtime components migrate atomically. Worker termination also
-needs join-capable process-exit evidence or fail-closed serving-process
-termination; return from `kill()` alone is not sufficient evidence.
-Writer and reader wiring additionally requires host-RW to API-RO bind proof,
-immediate invalidation of older containers or watcher epochs, bounded cleanup
-of old-epoch targets and locks, and service-manager termination of the exact
-container after uncertain publish or revoke completion.
-
 ## Current Test Baseline
 
-The complete local package gate for the current `develop` source records:
+The current unreleased correction records this focused local result:
 
 ```
-4366 tests, 33586 assertions, 232 expected opt-in/environment skips, 0 failures
+198 tests, 1548 assertions, 2 expected environment skips, 0 failures
 ```
 
-External database, remote-storage, multi-host, load-balancer, and long-soak
-profiles remain separate gates; see the [release checklist](release-checklist.md).
+PHPStan and PHP CS Fixer across 957 files also pass. The complete package gate,
+external database, remote-storage, load-balancer, and long-soak profiles remain
+separate gates; see the [release checklist](release-checklist.md). Multi-host
+storage qualification applies only to profiles advertised by a release.

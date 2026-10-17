@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /**
  * Partial physical delete primitive. The caller must retain its SQL job until
@@ -17,7 +16,7 @@ final readonly class LocalEfsDeleteFence
 {
     public function __construct(
         private string $root,
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+        private EfsHostEvidenceReader $evidence,
         private LocalEfsDeleteIo $io = new NativeLocalEfsDeleteIo(),
     ) {
         if ($root !== $evidence->storageRoot()) {
@@ -47,7 +46,6 @@ final readonly class LocalEfsDeleteFence
         }
         $this->evidence->assertFresh();
         $entries = $this->io->listDirectory($directory);
-        $this->evidence->assertFresh();
         if ($entries === false) {
             throw new \RuntimeException('Local multipart abort directory is unavailable.');
         }
@@ -73,7 +71,6 @@ final readonly class LocalEfsDeleteFence
         }
         $this->evidence->assertFresh();
         $entries = $this->io->listDirectory($directory);
-        $this->evidence->assertFresh();
         if ($entries === false) {
             throw new \RuntimeException('Local delete directory is unavailable.');
         }
@@ -82,24 +79,17 @@ final readonly class LocalEfsDeleteFence
             return;
         }
         $this->evidence->assertFresh();
-        $linked = $this->io->isLink($path);
-        $this->evidence->assertFresh();
-        $file = $this->io->isFile($path);
-        $this->evidence->assertFresh();
-        if ($linked || ! $file) {
+        if ($this->io->isLink($path) || ! $this->io->isFile($path)) {
             throw new \RuntimeException('Local delete target is not a regular file.');
         }
         $this->evidence->assertFresh();
-        $unlinked = $this->io->unlinkFile($path);
-        $this->evidence->assertFresh();
-        if (! $unlinked) {
+        if (! $this->io->unlinkFile($path)) {
             // A failed NFS unlink may already have taken effect. SQL must keep
             // the exact-path job until a healthy worker verifies absence.
             throw new \RuntimeException('Local EFS deletion is uncertain.');
         }
-        $synced = $this->io->syncDirectory($directory, $this->evidence->assertFresh(...));
         $this->evidence->assertFresh();
-        if (! $synced) {
+        if (! $this->io->syncDirectory($directory)) {
             throw new \RuntimeException('Failed to synchronize local EFS deletion.');
         }
         $this->evidence->assertFresh();
@@ -118,34 +108,26 @@ final readonly class LocalEfsDeleteFence
                 throw new \InvalidArgumentException('Invalid local delete directory.');
             }
             $current .= '/' . $segment;
-            $linked = $this->io->isLink($current);
-            $this->evidence->assertFresh();
-            if ($linked) {
+            if ($this->io->isLink($current)) {
                 throw new \RuntimeException('Local delete directory is unavailable or unsafe.');
             }
-            $isDirectory = $this->io->isDirectory($current);
-            $this->evidence->assertFresh();
-            if (! $isDirectory) {
+            if (! $this->io->isDirectory($current)) {
                 // is_dir() alone cannot distinguish an absent component from
                 // an EFS I/O error. Require a successful parent listing, then
                 // recheck local host evidence before accepting absence.
                 $this->evidence->assertFresh();
                 $entries = $this->io->listDirectory(dirname($current));
-                $this->evidence->assertFresh();
                 if ($entries === false || in_array($segment, $entries, true)) {
                     throw new \RuntimeException('Local delete directory is unavailable or unsafe.');
                 }
                 $this->evidence->assertFresh();
                 return false;
             }
-            $resolved = $this->io->realPath($current);
-            $this->evidence->assertFresh();
-            if ($resolved !== $current) {
+            if ($this->io->realPath($current) !== $current) {
                 throw new \RuntimeException('Local delete directory is unavailable or unsafe.');
             }
         }
 
-        $this->evidence->assertFresh();
         return true;
     }
 }

@@ -10,7 +10,6 @@ use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /**
  * Blocking candidate-only SSE-v2 completion. Plaintext exists only in this
@@ -30,16 +29,13 @@ final readonly class LocalEncryptedMultipartCompletionFence
         private EncryptionServiceInterface $encryption,
         private int $maxPlaintextBytes,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence|null $evidence = null,
+        private ?EfsHostEvidenceReader $evidence = null,
     ) {
         if ($maxPlaintextBytes < 1 || ($evidence !== null && $root !== $evidence->storageRoot())) {
             throw new \InvalidArgumentException('Encrypted completion root or size limit is invalid.');
         }
         $canonical = $evidence !== null ? $root : realpath($root);
-        $evidence?->assertFresh();
-        $directory = $canonical !== false && is_dir($canonical);
-        $evidence?->assertFresh();
-        if ($canonical === false || ! $directory) {
+        if ($canonical === false || ! is_dir($canonical)) {
             throw new \InvalidArgumentException('Encrypted completion root is unavailable.');
         }
         $this->canonicalRoot = rtrim($canonical, '/');
@@ -146,54 +142,37 @@ final readonly class LocalEncryptedMultipartCompletionFence
         $this->evidence?->assertFresh();
         $tempPath = $this->root . '/.tmp/' . bin2hex(random_bytes(16));
         $file = @fopen($tempPath, 'x+b');
-        $this->evidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Could not create encrypted completion staging inode.');
         }
         $lease = null;
         try {
-            $protected = @chmod($tempPath, 0600);
-            $this->evidence?->assertFresh();
-            $locked = $protected && @flock($file, LOCK_SH | LOCK_NB);
-            $this->evidence?->assertFresh();
-            if (! $protected || ! $locked) {
+            if (! @chmod($tempPath, 0600) || ! @flock($file, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Could not protect encrypted completion staging inode.');
             }
             $offset = 0;
             while ($offset < strlen($ciphertext)) {
                 $this->evidence?->assertFresh();
                 $written = @fwrite($file, substr($ciphertext, $offset, self::CHUNK_BYTES));
-                $this->evidence?->assertFresh();
                 if ($written === false || $written === 0) {
                     throw new \RuntimeException('Could not write encrypted completion staging inode.');
                 }
                 $offset += $written;
             }
             $this->evidence?->assertFresh();
-            $synced = $this->io->syncFile($file);
-            $this->evidence?->assertFresh();
-            if (! $synced) {
+            if (! $this->io->syncFile($file)) {
                 throw new \RuntimeException('Could not synchronize encrypted completion staging inode.');
             }
             $writtenInode = @fstat($file);
-            $this->evidence?->assertFresh();
             if ($writtenInode === false) {
                 throw new \RuntimeException('Could not identify encrypted completion staging inode.');
             }
-            $this->evidence?->assertFresh();
             $lease = @fopen($tempPath, 'rb');
-            $this->evidence?->assertFresh();
             $leaseInode = $lease !== false ? @fstat($lease) : false;
-            $this->evidence?->assertFresh();
-            $leaseLocked = $lease !== false && @flock($lease, LOCK_SH | LOCK_NB);
-            $this->evidence?->assertFresh();
-            $writerUnlocked = @flock($file, LOCK_UN);
-            $this->evidence?->assertFresh();
-            $writerClosed = $writerUnlocked && @fclose($file);
-            $this->evidence?->assertFresh();
             if ($lease === false || $leaseInode === false
                 || $leaseInode['dev'] !== $writtenInode['dev'] || $leaseInode['ino'] !== $writtenInode['ino']
-                || ! $leaseLocked || ! $writerUnlocked || ! $writerClosed) {
+                || ! @flock($lease, LOCK_SH | LOCK_NB)
+                || ! @flock($file, LOCK_UN) || ! @fclose($file)) {
                 throw new \RuntimeException('Could not close encrypted completion staging inode.');
             }
             $file = null;
@@ -215,18 +194,19 @@ final readonly class LocalEncryptedMultipartCompletionFence
             );
         } finally {
             if (is_resource($file)) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @flock($file, LOCK_UN);
                 @fclose($file);
             }
             if (is_resource($lease)) {
-                // Descriptor-only best-effort cleanup after evidence loss.
                 @flock($lease, LOCK_UN);
                 @fclose($lease);
             }
-            $this->evidence?->assertFresh();
-            @unlink($tempPath);
-            $this->evidence?->assertFresh();
+            try {
+                $this->evidence?->assertFresh();
+                @unlink($tempPath);
+            } catch (\Throwable) {
+                // The temp collector handles an orphan after evidence loss.
+            }
         }
     }
 
@@ -234,20 +214,16 @@ final readonly class LocalEncryptedMultipartCompletionFence
     {
         $this->evidence?->assertFresh();
         $entry = @lstat($path);
-        $this->evidence?->assertFresh();
         if ($entry === false || ($entry['mode'] & 0o170000) !== 0o100000
             || ($entry['mode'] & 0o077) !== 0 || $entry['uid'] !== posix_geteuid()) {
             throw new \RuntimeException('Encrypted completion part is unavailable or unsafe.');
         }
-        $this->evidence?->assertFresh();
         $file = @fopen($path, 'rb');
-        $this->evidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Encrypted completion part could not be opened.');
         }
         try {
             $opened = @fstat($file);
-            $this->evidence?->assertFresh();
             if ($opened === false || $opened['dev'] !== $entry['dev'] || $opened['ino'] !== $entry['ino']) {
                 throw new \RuntimeException('Encrypted completion part changed while opening.');
             }
@@ -259,7 +235,6 @@ final readonly class LocalEncryptedMultipartCompletionFence
                     throw new \RuntimeException('Encrypted completion part exceeds its encoded limit.');
                 }
                 $chunk = @fread($file, min(self::CHUNK_BYTES, $remaining + 1));
-                $this->evidence?->assertFresh();
                 if ($chunk === false || ($chunk === '' && ! feof($file))) {
                     throw new \RuntimeException('Encrypted completion part could not be read completely.');
                 }
@@ -268,7 +243,6 @@ final readonly class LocalEncryptedMultipartCompletionFence
                     throw new \RuntimeException('Encrypted completion part exceeds its encoded limit.');
                 }
             }
-            $this->evidence?->assertFresh();
             return $stored;
         } finally {
             @fclose($file);
@@ -281,12 +255,9 @@ final readonly class LocalEncryptedMultipartCompletionFence
             $this->evidence?->assertFresh();
             clearstatcache(true, $path);
             $entry = @lstat($path);
-            $this->evidence?->assertFresh();
-            $resolved = realpath($path);
-            $this->evidence?->assertFresh();
             if ($entry === false || ($entry['mode'] & 0o170000) !== 0o040000
                 || ($entry['mode'] & 0o077) !== 0 || $entry['uid'] !== posix_geteuid()
-                || $resolved !== $this->canonicalRoot . substr($path, strlen(rtrim($this->root, '/')))) {
+                || realpath($path) !== $this->canonicalRoot . substr($path, strlen(rtrim($this->root, '/')))) {
                 throw new \RuntimeException('Encrypted completion part directory is unsafe or unavailable.');
             }
         }
@@ -296,13 +267,11 @@ final readonly class LocalEncryptedMultipartCompletionFence
     {
         $this->evidence?->assertFresh();
         $file = @fopen($path, 'rb');
-        $this->evidence?->assertFresh();
         if ($file === false) {
             throw new \RuntimeException('Encrypted completion staging inode could not be reopened.');
         }
         try {
             $opened = @fstat($file);
-            $this->evidence?->assertFresh();
             if ($opened === false || $opened['dev'] !== $device || $opened['ino'] !== $inode || $opened['size'] !== $size) {
                 throw new \RuntimeException('Encrypted completion staging inode changed before verification.');
             }
@@ -311,7 +280,6 @@ final readonly class LocalEncryptedMultipartCompletionFence
             while (! feof($file)) {
                 $this->evidence?->assertFresh();
                 $chunk = @fread($file, self::CHUNK_BYTES);
-                $this->evidence?->assertFresh();
                 if ($chunk === false || ($chunk === '' && ! feof($file))) {
                     throw new \RuntimeException('Encrypted completion staging inode could not be verified.');
                 }
@@ -321,7 +289,6 @@ final readonly class LocalEncryptedMultipartCompletionFence
                 }
                 hash_update($hash, $chunk);
             }
-            $this->evidence?->assertFresh();
             if ($read !== $size) {
                 throw new \RuntimeException('Encrypted completion staging inode changed size during verification.');
             }
@@ -346,26 +313,11 @@ final readonly class LocalEncryptedMultipartCompletionFence
             $current .= '/' . $segment;
             $expected .= '/' . $segment;
             clearstatcache(true, $current);
-            $linked = is_link($current);
-            $this->evidence?->assertFresh();
-            $directory = is_dir($current);
-            $this->evidence?->assertFresh();
-            $created = $directory;
-            if (! $directory) {
-                $created = @mkdir($current, 0700);
-                $this->evidence?->assertFresh();
-                if (! $created) {
-                    $directory = is_dir($current);
-                    $this->evidence?->assertFresh();
-                }
-            }
-            $resolved = realpath($current);
-            $this->evidence?->assertFresh();
-            if ($linked || (! $directory && ! $created) || $resolved !== $expected) {
+            if (is_link($current) || (! is_dir($current) && ! @mkdir($current, 0700) && ! is_dir($current))
+                || realpath($current) !== $expected) {
                 throw new \RuntimeException('Encrypted completion directory is unsafe or unavailable.');
             }
             $entry = @lstat($current);
-            $this->evidence?->assertFresh();
             if ($entry === false || ($entry['mode'] & 0o170000) !== 0o040000
                 || ($entry['mode'] & 0o077) !== 0 || $entry['uid'] !== posix_geteuid()) {
                 throw new \RuntimeException('Encrypted completion directory must be private and process-owned.');

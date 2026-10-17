@@ -47,7 +47,9 @@ it does not establish host-level failover or remote-mount semantics. NFS, EFS,
 SMB, and FUSE mounts are not qualified for `S3_STORAGE_PATH`; see
 [Storage Backends](storage-backends.md#requirements). A multi-host production
 storage backend is required to pass a separate release gate before the first
-cluster release; the one-host proxy result does not qualify it.
+release that advertises that profile; the one-host proxy result does not
+qualify it. NFS/EFS filesystem storage is optional and its qualification does
+not gate package releases for other supported storage profiles.
 PostgreSQL API nodes require `pecl-pq` and its `raphf` dependency. The server
 refuses to start with only `ext-pgsql`, because an abrupt database disconnect
 can terminate that event-loop backend. Verify both extensions with `php -m`

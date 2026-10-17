@@ -7,7 +7,7 @@ namespace OpsFour\S3Server\Runtime;
 /**
  * Inert schema-v2 heartbeat. Validation does not read a file, inspect a host,
  * contact EFS or admit serving. The host pin and clock must be independently
- * supplied by the production file reader or writer.
+ * supplied by a future production reader.
  */
 final readonly class ProductionEfsWatcherEvidence
 {
@@ -21,45 +21,6 @@ final readonly class ProductionEfsWatcherEvidence
         public int $issuedMonotonicNs,
         public int $expiresMonotonicNs,
     ) {}
-
-    public static function issue(
-        ProductionEfsIdentity $identity,
-        ProductionEfsHostPin $hostPin,
-        int $issuedMonotonicNs,
-        int $leaseNs,
-    ): self {
-        if ($hostPin->deploymentId !== $identity->deploymentId
-            || $hostPin->instanceId !== $identity->instanceId
-            || $issuedMonotonicNs < 0 || $leaseNs < 1 || $leaseNs > self::MAX_LEASE_NS
-            || $issuedMonotonicNs > PHP_INT_MAX - $leaseNs) {
-            throw new \InvalidArgumentException('Production EFS heartbeat lease is invalid.');
-        }
-
-        return new self($identity, $hostPin, $issuedMonotonicNs, $issuedMonotonicNs + $leaseNs);
-    }
-
-    public function toJson(): string
-    {
-        return json_encode([
-            'schemaVersion' => 2,
-            'profile' => 'production',
-            'deploymentId' => $this->identity->deploymentId,
-            'instanceId' => $this->identity->instanceId,
-            'efsId' => $this->identity->efsId,
-            'sourceSha256' => $this->identity->sourceSha256,
-            'metadataDriver' => $this->identity->metadataDriver,
-            'mountPoint' => $this->identity->mountPoint,
-            'storageRoot' => $this->identity->storageRoot,
-            'containerId' => $this->hostPin->containerId,
-            'bootId' => $this->hostPin->bootId,
-            'hostMountId' => $this->hostPin->hostMountId,
-            'storageDev' => $this->hostPin->storageDev,
-            'storageIno' => $this->hostPin->storageIno,
-            'epoch' => $this->hostPin->epoch,
-            'issuedMonotonicNs' => $this->issuedMonotonicNs,
-            'expiresMonotonicNs' => $this->expiresMonotonicNs,
-        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
-    }
 
     public static function fromJson(
         string $json,
@@ -93,8 +54,6 @@ final readonly class ProductionEfsWatcherEvidence
         sort($rawKeys);
         if ($keys !== $fields || $rawKeys !== $fields
             || $record['schemaVersion'] !== 2 || $record['profile'] !== 'production'
-            || $hostPin->deploymentId !== $identity->deploymentId
-            || $hostPin->instanceId !== $identity->instanceId
             || $record['deploymentId'] !== $identity->deploymentId
             || $record['instanceId'] !== $identity->instanceId
             || $record['efsId'] !== $identity->efsId

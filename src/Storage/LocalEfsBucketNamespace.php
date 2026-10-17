@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
 
 /**
  * Idempotent, one-segment namespace operations for an optional EFS worker.
@@ -16,7 +15,7 @@ final readonly class LocalEfsBucketNamespace
 {
     public function __construct(
         private string $root,
-        private EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
+        private EfsHostEvidenceReader $evidence,
         private LocalEfsBucketNamespaceIo $io = new NativeLocalEfsBucketNamespaceIo(),
     ) {
         if ($root !== $evidence->storageRoot()) {
@@ -29,7 +28,6 @@ final readonly class LocalEfsBucketNamespace
         $path = $this->bucketPath($bucket);
         $this->evidence->assertFresh();
         $entry = $this->io->lstat($path);
-        $this->evidence->assertFresh();
         if ($entry === false) {
             $this->assertAbsentInRoot($bucket);
             $this->evidence->assertFresh();
@@ -38,13 +36,10 @@ final readonly class LocalEfsBucketNamespace
             $this->io->mkdir($path);
             $this->evidence->assertFresh();
             $entry = $this->io->lstat($path);
-            $this->evidence->assertFresh();
         }
         $this->assertPrivateDirectory($entry);
         $this->evidence->assertFresh();
-        $synced = $this->io->syncDirectory($this->root, $this->evidence->assertFresh(...));
-        $this->evidence->assertFresh();
-        if (! $synced) {
+        if (! $this->io->syncDirectory($this->root)) {
             throw new \RuntimeException('EFS bucket namespace durability is uncertain.');
         }
         $this->evidence->assertFresh();
@@ -55,7 +50,6 @@ final readonly class LocalEfsBucketNamespace
         $path = $this->bucketPath($bucket);
         $this->evidence->assertFresh();
         $entry = $this->io->lstat($path);
-        $this->evidence->assertFresh();
         if ($entry === false) {
             $this->assertAbsentInRoot($bucket);
             return false;
@@ -75,10 +69,10 @@ final readonly class LocalEfsBucketNamespace
     {
         $this->evidence->assertFresh();
         $entries = $this->io->listDirectory($this->root);
-        $this->evidence->assertFresh();
         if ($entries === false || in_array($bucket, $entries, true)) {
             throw new \RuntimeException('EFS bucket namespace is unavailable or unsafe.');
         }
+        $this->evidence->assertFresh();
     }
 
     /** @param array<array-key, int>|false $entry */

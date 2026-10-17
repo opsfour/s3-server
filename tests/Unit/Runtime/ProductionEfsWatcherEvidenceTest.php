@@ -90,13 +90,10 @@ final class ProductionEfsWatcherEvidenceTest extends TestCase
     {
         $rejected = 0;
         foreach ([
-            ['deploymentId' => 'deployment'],
-            ['instanceId' => str_repeat('F', 32)],
             ['containerId' => 'api-one'],
             ['bootId' => 'unknown'],
             ['hostMountId' => '039'],
             ['storageDev' => '0'],
-            ['storageDev' => '18446744073709551616'],
             ['storageIno' => '-1'],
             ['epoch' => 'old'],
         ] as $changes) {
@@ -107,27 +104,7 @@ final class ProductionEfsWatcherEvidenceTest extends TestCase
                 $rejected++;
             }
         }
-        self::assertSame(9, $rejected);
-    }
-
-    public function test_host_pin_must_belong_to_the_same_deployment_and_instance(): void
-    {
-        foreach ([
-            ['deploymentId' => str_repeat('f', 32)],
-            ['instanceId' => str_repeat('f', 32)],
-        ] as $changes) {
-            try {
-                ProductionEfsWatcherEvidence::fromJson(
-                    self::json(self::validRecord()),
-                    self::identity(),
-                    self::pin($changes),
-                    self::NOW_NS,
-                );
-                self::fail('A host pin from another production scope was accepted.');
-            } catch (\InvalidArgumentException $error) {
-                self::assertStringContainsString('scope', $error->getMessage());
-            }
-        }
+        self::assertSame(6, $rejected);
     }
 
     /** @return array<string, mixed> */
@@ -175,10 +152,6 @@ final class ProductionEfsWatcherEvidenceTest extends TestCase
     private static function pin(array $changes = []): ProductionEfsHostPin
     {
         $fields = array_replace([
-            'schemaVersion' => 2,
-            'profile' => 'production',
-            'deploymentId' => str_repeat('a', 32),
-            'instanceId' => str_repeat('b', 32),
             'containerId' => str_repeat('d', 64),
             'bootId' => '11111111-1234-1234-1234-123456789abc',
             'hostMountId' => '39',
@@ -187,7 +160,7 @@ final class ProductionEfsWatcherEvidenceTest extends TestCase
             'epoch' => str_repeat('e', 32),
         ], $changes);
 
-        return ProductionEfsHostPin::fromJson(json_encode($fields, JSON_THROW_ON_ERROR));
+        return new ProductionEfsHostPin(...$fields);
     }
 
     /** @param array<string, mixed> $record */

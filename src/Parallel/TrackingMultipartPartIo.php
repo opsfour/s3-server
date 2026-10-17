@@ -4,13 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Parallel;
 
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\ProductionEfsWorkerStorageEvidence;
-use OpsFour\S3Server\Storage\EfsAwareLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 
 /** Records whether a link call can have reached the shared filesystem. */
-final class TrackingMultipartPartIo implements EfsAwareLocalObjectWriteIo
+final class TrackingMultipartPartIo implements LocalObjectWriteIo
 {
     private bool $publicationAttempted = false;
 
@@ -29,17 +26,6 @@ final class TrackingMultipartPartIo implements EfsAwareLocalObjectWriteIo
     public function syncDirectory(string $path): bool
     {
         return $this->inner->syncDirectory($path);
-    }
-
-    public function syncDirectoryWithEvidence(
-        string $path,
-        EfsHostEvidenceReader|ProductionEfsWorkerStorageEvidence $evidence,
-    ): bool {
-        if (! $this->inner instanceof EfsAwareLocalObjectWriteIo) {
-            throw new \RuntimeException('Guarded multipart worker I/O cannot synchronize EFS safely.');
-        }
-
-        return $this->inner->syncDirectoryWithEvidence($path, $evidence);
     }
 
     public function link(string $source, string $target): bool

@@ -96,72 +96,13 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
 - [x] Background tasks and worker pools stop in deterministic order.
 - [x] The current unreleased runtime records failed graceful worker-pool
   shutdowns and force-kills those pools on the next stop attempt. Closed pools
-  are skipped on later retries, while an attached EFS graph remains owned until
-  its ingress and Select pools have stopped.
+  are skipped on later retries, while an attached storage graph remains owned
+  until its ingress and Select pools have stopped.
 - [x] Startup failures and stop-before-start paths also release storage,
   metadata, select, encryption, and request-spool worker resources.
-- [x] The current unreleased listenerless EFS candidate factory constructs and
-  consumes its complete graph and ingress bundle without returning either
-  mutable bundle. Assembly failures retain one retryable cleanup owner. Serving
-  admission remains closed, no listener is opened, and production EFS serving
-  is not enabled.
-- [x] The current unreleased listenerless schema-v2 heartbeat reader accepts
-  only the identity-derived file on an exact root-owned, read-only local
-  directory bind. It permanently latches failed reads, pins the evidence mount
-  and directory device/inode identity across successful reads, and rejects
-  stale replay after monotonic validity-window progression.
-- [x] The current unreleased inert schema-v2 heartbeat writer emits the
-  canonical `issue()`/`toJson()` record through an exact local read-write
-  directory bind. It pins root-owned ancestor, directory, and persistent
-  nonblocking single-writer lock identities; requires a reader-compatible
-  0644 target of at most 4096 bytes; and preserves monotonic lease progression
-  from an existing restart baseline. Same-directory `x+b` staging, file and
-  directory synchronization, atomic rename with postchecks, bounded
-  same-scope temporary and directory enumeration, and durable idempotent
-  revocation protect publication. Publication or revocation ambiguity makes
-  the writer terminal and triggers best-effort invalidation. The non-cloneable
-  writer does not access EFS, SQL, or sockets.
-- [x] The current unreleased immutable schema-v2 worker scope transports the
-  validated production identity, host pin, local evidence mount and directory
-  identity, watcher epoch, sampled monotonic time, and frozen heartbeat
-  baseline as scalars. A worker can reconstruct a listenerless production
-  reader without touching EFS or SQL; its first guarded operation must
-  revalidate the same local heartbeat. Repeated scope reads return the original
-  snapshot, and the v2 factory cannot accept the legacy v1 qualification scope.
-- [ ] The heartbeat writer and reader still need runtime, factory, watcher-loop,
-  and listener wiring. External qualification must prove the host read-write
-  bind to API read-only bind relationship, immediately stop or invalidate an
-  older container or watcher epoch, bound cleanup of old-epoch targets and
-  locks, and make the service manager terminate the exact container whenever
-  publish or revoke completion is uncertain. The complete mount, replacement,
-  and replay contract still needs qualification on the intended Linux hosts.
-  Production EFS serving remains closed.
-- [x] The current unreleased inert, bounded worker primitive keeps one
-  schema-v2 reader and progression latch for an Amp worker process. Evidence
-  failure or a byte-different scope poisons that process terminally; only
-  worker replacement can validate repaired evidence anew. Its fixed, dedicated
-  failure class is identifiable after Amp IPC without exposing evidence
-  details.
-- [x] The current unreleased inert parent feedback primitive treats that
-  dedicated evidence failure, native or task-serialized serialization failure,
-  and narrowly typed worker/context ambiguity as terminal. It publishes the
-  terminal state, revokes shared candidate admission, and attempts to kill every
-  registered pool. Failed kills remain visible and retryable, and late pool or
-  admission registration fails closed. Native and serialized cancellation and
-  unrelated domain task failures are rethrown without revocation.
-- [x] The current unreleased schema-v2 worker storage-evidence adapter shares
-  one storage-evidence abstraction with the host reader while physical fence
-  constructors accept only those two final trusted implementations. All 11 EFS
-  physical primitives revalidate evidence between potentially blocking EFS
-  system calls and after final or failed calls. Directory synchronization is
-  evidence-aware; descriptor-only cleanup remains a bounded exception when no
-  further path lookup or namespace mutation occurs.
-- [ ] All 14 guarded EFS tasks and seven pool-owning runtime components must
-  adopt the latch, storage revalidation, and parent feedback atomically before
-  production wiring. No task, runtime factory, or listener uses these inert
-  primitives yet. Pool shutdown must also gain join-capable process-exit
-  evidence or fail closed by terminating the serving process; return from
-  `kill()` alone does not prove that a worker has exited.
+- [ ] NFS/EFS multi-host filesystem operation is an optional, currently
+  unqualified deployment profile. It is outside the generic package release
+  gate; advertise it only after its own multi-host correctness gate passes.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.
@@ -194,10 +135,10 @@ Status: **Complete**
   deletion paths are covered.
 - [x] Transition, restore, and restore-garbage workers revalidate exact object
   identity and placement under stable owner locks after physical transfers.
-- [x] Physical placement, transition state, and restore state updates preserve
-  the object's S3 `Last-Modified` timestamp across all metadata backends;
-  version demotion and promotion do the same, and every backend projects the
-  lifecycle `noncurrentAt` timestamp in version listings.
+- [x] Physical placement, transition state, restore state, and current-version
+  bookkeeping preserve the object's S3 `Last-Modified` timestamp across all
+  metadata backends. Every backend projects the lifecycle `noncurrentAt`
+  timestamp in version listings.
 - [x] Restore completion emits `s3:ObjectRestore:Completed` after commit.
 
 ## 6. Streaming Storage and Integrity
