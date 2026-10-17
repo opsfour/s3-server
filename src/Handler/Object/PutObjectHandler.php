@@ -91,9 +91,7 @@ final class PutObjectHandler implements RequestHandler
             }
             if (! $backend instanceof FilesystemBackend || $storage !== $default->backend
                 || $default->name !== $localFencedWriter->storageTierName()
-                || ($backend->hostEvidenceReader() !== null
-                    ? $backend->getBasePath()
-                    : realpath($backend->getBasePath())) !== $localFencedWriter->storageRoot()) {
+                || realpath($backend->getBasePath()) !== $localFencedWriter->storageRoot()) {
                 throw new \InvalidArgumentException('Local object writer must match the default filesystem tier and root.');
             }
         }
@@ -879,7 +877,6 @@ final class PutObjectHandler implements RequestHandler
         if ($token === null) {
             return;
         }
-        $this->localFencedWriter?->assertHostEvidenceFresh();
         if (! $this->metadata instanceof ObjectWriteIntentStore
             || ! $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId)) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(

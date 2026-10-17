@@ -7,7 +7,7 @@ namespace OpsFour\S3Server\Tests\Support;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
 
-/** Serializable worker fault: a synchronized EFS temp inode changes at the same length. */
+/** Serializable worker fault: a synchronized temp inode changes at the same length. */
 final class LocalMultipartSyncCorruptIo implements LocalObjectWriteIo
 {
     private readonly NativeLocalObjectWriteIo $inner;

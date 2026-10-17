@@ -92,9 +92,7 @@ final class CopyObjectHandler implements RequestHandler
             ! $this->metadata instanceof ObjectWriteIntentStore
             || ! $localBackend instanceof FilesystemBackend
             || $this->localFencedWriter->storageTierName() !== $this->storageTiers->defaultTier()->name
-            || ($localBackend->hostEvidenceReader() !== null
-                ? $localBackend->getBasePath()
-                : realpath($localBackend->getBasePath())) !== $this->localFencedWriter->storageRoot()
+            || realpath($localBackend->getBasePath()) !== $this->localFencedWriter->storageRoot()
         )) {
             throw new \InvalidArgumentException('Local copy fencing does not match the default filesystem tier and intent store.');
         }
@@ -257,7 +255,6 @@ final class CopyObjectHandler implements RequestHandler
         if ($token === null) {
             return;
         }
-        $this->localFencedWriter?->assertHostEvidenceFresh();
         if (! $this->metadata instanceof ObjectWriteIntentStore
             || ! $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId)) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('The local copy write lost its publication lease.');

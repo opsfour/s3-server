@@ -70,25 +70,6 @@ final class AuthMiddleware implements AuthenticationMiddleware
         );
     }
 
-    /** @internal Prove the inert EFS candidate has no default temp fallback. */
-    public function assertQualifiedIngressBinding(
-        string $tempDir,
-        int $budgetBytes,
-        PostObjectTempFileSweeper $sweeper,
-        PostObjectSpoolCoordinator $coordinator,
-    ): void {
-        $this->postObjectFormParser->assertQualifiedBinding($tempDir, $budgetBytes, $sweeper, $coordinator);
-    }
-
-    /** @internal SigV4 and browser POST must share the exact ingress provider. */
-    public function assertQualifiedCredentialProviderBinding(CredentialProvider $credentialProvider): void
-    {
-        if ($this->credentialProvider !== $credentialProvider) {
-            throw new \RuntimeException('EFS authentication credential provider differs from qualified ingress.');
-        }
-        $this->postObjectFormParser->assertQualifiedCredentialProviderBinding($credentialProvider);
-    }
-
     /** @internal The server binds readiness to the exact provider used for authentication. */
     public function credentialProvider(): CredentialProvider
     {

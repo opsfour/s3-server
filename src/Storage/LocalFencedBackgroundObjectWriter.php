@@ -21,7 +21,7 @@ final readonly class LocalFencedBackgroundObjectWriter
     public function assertBoundTo(LocalFencedObjectWriter $writer, LocalObjectWriteLeaseGuardFactory $leases): void
     {
         if ($this->writer !== $writer || $this->leases !== $leases) {
-            throw new \RuntimeException('Background local writer differs from the EFS candidate publisher or lease factory.');
+            throw new \RuntimeException('Background local writer differs from the configured publisher or lease factory.');
         }
     }
 
@@ -47,9 +47,7 @@ final readonly class LocalFencedBackgroundObjectWriter
             $backend = $backend->innerBackend();
         }
         if (! $backend instanceof FilesystemBackend
-            || ($backend->hostEvidenceReader() !== null
-                ? $backend->getBasePath()
-                : realpath($backend->getBasePath())) !== $this->writer->storageRoot()
+            || realpath($backend->getBasePath()) !== $this->writer->storageRoot()
             || $tier !== $this->writer->storageTierName()
             || $bucket->name !== $object->bucket
             || $bucket->generation === '') {

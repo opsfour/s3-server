@@ -134,7 +134,7 @@ final readonly class S3ServerRuntimeFactory
                     $logger,
                 ));
                 $server->setLocalObjectWriteTestWriter($localFencedWriter, $localLeaseFactory);
-                $logger->warning('Isolated local write fence test profile active; two-host EFS fault qualification and production admission remain open.');
+                $logger->warning('Isolated local write fence test profile active; shared-filesystem fault qualification remains open.');
             }
 
             foreach ($notificationListeners as $listenerConfig) {
@@ -240,8 +240,8 @@ final readonly class S3ServerRuntimeFactory
         }
 
         // This scoped test profile accepts only a private directory beneath
-        // the process temp root on its same device. It does not certify EFS or
-        // prove that an operator mounted the process temp root node-locally.
+        // the process temp root on its same device. It does not certify a
+        // network filesystem or prove that the temp root is node-local.
         $scratch = realpath($scratchPath);
         $tempRoot = realpath(sys_get_temp_dir());
         $scratchStat = $scratch !== false ? @stat($scratch) : false;

@@ -13,7 +13,6 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\BufferedSsePayload;
 use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
-use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\EntityTooSmallException;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -136,9 +135,6 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         if ($uploadEncryptionMode !== null && ! $encryptedV2) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('Legacy encrypted multipart upload must be aborted.');
         }
-        $guardedEncryptedBackend = $encryptedV2 && $this->requireLocalFencedCompletion
-            && self::localFilesystemBackend($uploadStorage)?->hostEvidenceReader() !== null
-                ? self::localFilesystemBackend($uploadStorage) : null;
         if ($uploadEncryptionMode !== null) {
             EncryptionRequestResolver::requireEncryptionService($this->encryption);
         }
@@ -152,19 +148,6 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 'SSE-C headers are not valid for this multipart upload.',
             );
         }
-        $workerKeyringFingerprint = '';
-        if ($guardedEncryptedBackend !== null) {
-            if ($uploadEncryptionMode === EncryptionRequestResolver::SSE_S3) {
-                $workerKeyringFingerprint = $this->encryption instanceof ConfigWorkerKeyringCompatible
-                    ? $this->encryption->configWorkerKeyringFingerprint() : null;
-                if ($workerKeyringFingerprint === null) {
-                    throw new InternalErrorException('Guarded SSE-S3 completion requires the injected worker-compatible Config keyring.');
-                }
-            } elseif ($uploadEncryptionMode !== EncryptionRequestResolver::SSE_C || $completionCustomerKey === null) {
-                throw new InternalErrorException('Guarded encrypted multipart completion has no valid encryption mode.');
-            }
-        }
-
         // Parse XML body for parts list.
         $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 2_097_152);
         $requestedParts = XmlRequestParser::parseCompleteMultipartUpload($body);
@@ -369,50 +352,20 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $encMeta = [];
         try {
             if ($encryptedV2) {
-                if ($guardedEncryptedBackend !== null) {
-                    if ($localDispatchId === null || $uploadEncryptionMode === null) {
-                        throw new InternalErrorException('Guarded encrypted completion has no armed dispatch or mode.');
-                    }
-                    $completed = $guardedEncryptedBackend->completeEncryptedMultipartUploadFencedAtPath(
-                        $bucket,
-                        $key,
-                        $bucketInfo->generation,
-                        $attemptId,
-                        $uploadId,
-                        $validatedParts,
-                        $intent->finalPath,
-                        $uploadEncryptionMode,
-                        $this->maxEncryptedObjectSize,
-                        $completionCustomerKey,
-                        $workerKeyringFingerprint,
-                    );
-                    $writeResult = $completed->write;
-                    $encMeta = $completed->encryptionMetadata;
-                    $this->assertEncryptedWorkerResult(
-                        $writeResult,
-                        $encMeta,
-                        $intent->finalPath,
-                        $expectedSize,
-                        $etag,
-                        $uploadEncryptionMode,
-                        $completionCustomerKey,
-                    );
-                } else {
-                    [$writeResult, $encMeta] = $this->completeEncryptedParts(
-                        $uploadStorage,
-                        $bucket,
-                        $key,
-                        $uploadId,
-                        $bucketInfo->generation,
-                        $validatedParts,
-                        $expectedSize,
-                        $etag,
-                        $uploadEncryptionMode,
-                        $completionCustomerKey,
-                        $intent->finalPath,
-                        $request,
-                    );
-                }
+                [$writeResult, $encMeta] = $this->completeEncryptedParts(
+                    $uploadStorage,
+                    $bucket,
+                    $key,
+                    $uploadId,
+                    $bucketInfo->generation,
+                    $validatedParts,
+                    $expectedSize,
+                    $etag,
+                    $uploadEncryptionMode,
+                    $completionCustomerKey,
+                    $intent->finalPath,
+                    $request,
+                );
             } else {
                 $local = $this->requireLocalFencedCompletion ? self::localFilesystemBackend($uploadStorage) : null;
                 if ($local !== null) {
@@ -962,40 +915,6 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 $completionCancellation,
                 $lock->release(...),
             );
-        }
-    }
-
-    /** @param array<string, string> $metadata */
-    private function assertEncryptedWorkerResult(
-        StorageWriteResult $write,
-        array $metadata,
-        string $plannedPath,
-        int $expectedSize,
-        string $etag,
-        string $mode,
-        ?string $customerKey,
-    ): void {
-        if ($write->path !== $plannedPath || $write->size !== $expectedSize
-            || ! hash_equals(strtolower(trim($etag, '"')), strtolower($write->md5Hex))) {
-            throw new InternalErrorException('Encrypted completion worker result differs from its selected SQL attempt.');
-        }
-        $expectedKeys = $mode === EncryptionRequestResolver::SSE_S3
-            ? ['sse-algorithm', 'sse-iv', 'sse-key', 'sse-tag']
-            : ['sse-algorithm', 'sse-customer-key-md5', 'sse-iv', 'sse-tag'];
-        $actualKeys = array_keys($metadata);
-        sort($actualKeys);
-        if ($actualKeys !== $expectedKeys
-            || ($mode === EncryptionRequestResolver::SSE_S3 && $metadata['sse-algorithm'] !== 'AES256')
-            || ($mode === EncryptionRequestResolver::SSE_C && ($customerKey === null
-                || $metadata['sse-algorithm'] !== 'SSE-C'
-                || ! hash_equals(base64_encode(md5($customerKey, true)), $metadata['sse-customer-key-md5'])))
-            || ! in_array($mode, [EncryptionRequestResolver::SSE_S3, EncryptionRequestResolver::SSE_C], true)
-            || strlen(base64_decode($metadata['sse-iv'], true) ?: '') !== 12
-            || strlen(base64_decode($metadata['sse-tag'], true) ?: '') !== 16
-            || ($mode === EncryptionRequestResolver::SSE_S3
-                && (($wrappedKey = base64_decode($metadata['sse-key'], true)) === false
-                    || strlen($wrappedKey) < 60 || strlen($wrappedKey) > 320))) {
-            throw new InternalErrorException('Encrypted completion worker returned invalid encryption metadata.');
         }
     }
 

@@ -217,7 +217,7 @@ final class LocalObjectWriteRuntimeTest extends TestCase
                 MysqlMetadataStore::fromDsn(self::MYSQL_DSN),
                 new InMemoryBackend(),
             );
-            self::fail('In-memory default storage must not receive a local EFS writer.');
+            self::fail('In-memory default storage must not receive a local filesystem writer.');
         } catch (\RuntimeException $error) {
             self::assertStringContainsString('filesystem default tier', $error->getMessage());
         }

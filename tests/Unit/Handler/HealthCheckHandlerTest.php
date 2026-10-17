@@ -18,7 +18,6 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
-use OpsFour\S3Server\Runtime\EfsHostEvidence;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
@@ -96,140 +95,6 @@ final class HealthCheckHandlerTest extends TestCase
             self::assertSame($cancellation, $error);
         }
         self::assertSame([], $logger->records);
-    }
-
-    public function test_arbitrary_efs_evidence_cannot_suppress_the_filesystem_probe(): void
-    {
-        $probeCount = 0;
-        $storage = $this->filesystemProbeBackend($probeCount);
-        $evidence = new HealthCheckEfsEvidence();
-        try {
-            new HealthCheckHandler(
-                storageTiers: StorageTierRegistry::single($storage),
-                efsEvidence: $evidence,
-            );
-            self::fail('Arbitrary evidence suppressed a filesystem readiness probe.');
-        } catch (\InvalidArgumentException $error) {
-            self::assertStringContainsString('does not match', $error->getMessage());
-        }
-        self::assertSame(0, $evidence->checkCount);
-        self::assertSame(503, (new HealthCheckHandler(
-            storageTiers: StorageTierRegistry::single($storage),
-        ))->handleRequest($this->request())->getStatus());
-        self::assertSame(1, $probeCount);
-    }
-
-    public function test_admission_evidence_lost_during_metadata_probe_stays_degraded(): void
-    {
-        $evidence = new HealthCheckEfsEvidence();
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->method('getBucket')->willReturnCallback(static function () use ($evidence): null {
-            $evidence->failOnCheck = 2;
-            return null;
-        });
-        $metadata->method('listReferencedStorageTiers')->willReturn([]);
-        $logger = new HealthCheckArrayLogger();
-        $handler = new HealthCheckHandler(
-            metadata: $metadata,
-            logger: $logger,
-            storageTiers: StorageTierRegistry::single(new InMemoryBackend()),
-            admissionEvidence: $evidence,
-        );
-
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame('efs_admission', $logger->records[0]['context']['component']);
-        self::assertStringNotContainsString('private marker', json_encode($logger->records, JSON_THROW_ON_ERROR));
-        self::assertSame(2, $evidence->checkCount);
-        $evidence->failOnCheck = null;
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame(2, $evidence->checkCount);
-        self::assertCount(1, $logger->records);
-    }
-
-    public function test_admission_evidence_failure_degrades_before_metadata_and_latches(): void
-    {
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::never())->method('getBucket');
-        $evidence = new HealthCheckEfsEvidence();
-        $evidence->failOnCheck = 1;
-        $handler = new HealthCheckHandler(
-            metadata: $metadata,
-            storageTiers: StorageTierRegistry::single(new InMemoryBackend()),
-            admissionEvidence: $evidence,
-        );
-
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame(1, $evidence->checkCount);
-        $evidence->failOnCheck = null;
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame(1, $evidence->checkCount);
-    }
-
-    public function test_admission_revoked_during_storage_probe_never_returns_ready(): void
-    {
-        $evidence = new HealthCheckEfsEvidence();
-        $storage = new CallbackStorageBackend(
-            new InMemoryBackend(),
-            beforeBucketExists: static function () use ($evidence): void {
-                $evidence->failOnCheck = 3;
-            },
-        );
-        $handler = new HealthCheckHandler(
-            storageTiers: StorageTierRegistry::single($storage),
-            admissionEvidence: $evidence,
-        );
-
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame(3, $evidence->checkCount);
-        $evidence->failOnCheck = null;
-        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
-    }
-
-    public function test_arbitrary_efs_evidence_is_rejected_before_metadata_probe(): void
-    {
-        $probeCount = 0;
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::never())->method('getBucket');
-        $evidence = new HealthCheckEfsEvidence();
-        try {
-            new HealthCheckHandler(
-                metadata: $metadata,
-                storageTiers: StorageTierRegistry::single($this->filesystemProbeBackend($probeCount)),
-                efsEvidence: $evidence,
-            );
-            self::fail('Arbitrary evidence reached the metadata probe.');
-        } catch (\InvalidArgumentException $error) {
-            self::assertStringContainsString('does not match', $error->getMessage());
-        }
-        self::assertSame(0, $probeCount);
-        self::assertSame(0, $evidence->checkCount);
-    }
-
-    public function test_efs_evidence_cannot_suppress_probe_for_unrelated_backend(): void
-    {
-        $evidence = new HealthCheckEfsEvidence();
-        try {
-            new HealthCheckHandler(
-                storageTiers: StorageTierRegistry::single(new InMemoryBackend()),
-                efsEvidence: $evidence,
-            );
-            self::fail('Non-filesystem evidence binding was accepted.');
-        } catch (\InvalidArgumentException $error) {
-            self::assertStringContainsString('filesystem tier', $error->getMessage());
-        }
-        self::assertSame(0, $evidence->checkCount);
-    }
-
-    public function test_efs_evidence_requires_one_exact_tier(): void
-    {
-        $probeCount = 0;
-        $evidence = new HealthCheckEfsEvidence();
-        $tiers = new StorageTierRegistry([
-            new StorageTier('STANDARD', $this->filesystemProbeBackend($probeCount), defaultWriteTier: true),
-            new StorageTier('OTHER', new InMemoryBackend()),
-        ]);
-        self::expectException(\InvalidArgumentException::class);
-        new HealthCheckHandler(storageTiers: $tiers, efsEvidence: $evidence);
     }
 
     public function test_filesystem_probe_remains_active_without_evidence(): void
@@ -431,26 +296,6 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame([], $logger->records);
     }
 
-    public function test_admission_evidence_cancellation_does_not_latch_readiness_degraded(): void
-    {
-        $cancellation = new CancelledException();
-        $evidence = new HealthCheckEfsEvidence();
-        $evidence->failure = $cancellation;
-        $logger = new HealthCheckArrayLogger();
-        $handler = new HealthCheckHandler(logger: $logger, admissionEvidence: $evidence);
-
-        try {
-            $handler->handleRequest($this->request());
-            self::fail('Expected readiness cancellation.');
-        } catch (CancelledException $error) {
-            self::assertSame($cancellation, $error);
-        }
-
-        $evidence->failure = null;
-        self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
-        self::assertSame([], $logger->records);
-    }
-
     public function test_readiness_detects_and_recovers_from_post_start_tier_drift(): void
     {
         $references = [];
@@ -632,25 +477,5 @@ final class HealthCheckArrayLogger extends AbstractLogger
             'message' => $message,
             'context' => $context,
         ];
-    }
-}
-
-final class HealthCheckEfsEvidence implements EfsHostEvidence
-{
-    public int $checkCount = 0;
-
-    public ?int $failOnCheck = null;
-
-    public ?\Throwable $failure = null;
-
-    public function assertFresh(): void
-    {
-        $this->checkCount++;
-        if ($this->failure !== null) {
-            throw $this->failure;
-        }
-        if ($this->checkCount === $this->failOnCheck) {
-            throw new \RuntimeException('evidence failed: private marker');
-        }
     }
 }

@@ -24,7 +24,6 @@ use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
-use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -287,53 +286,6 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
         } finally {
             $storage->shutdown();
             $this->removeDirectory($root);
-        }
-    }
-
-    public function test_encrypted_worker_response_requires_exact_attempt_and_encryption_metadata(): void
-    {
-        $handler = new CompleteMultipartUploadHandler($this->createMock(\OpsFour\S3Server\Metadata\MetadataStore::class), new \OpsFour\S3Server\Storage\InMemoryBackend());
-        $validate = new \ReflectionMethod($handler, 'assertEncryptedWorkerResult');
-        $path = '/qualified/.assemblies/bucket/generation/attempt/final';
-        $etag = '"' . md5(md5('part', true)) . '-1"';
-        $encrypted = (new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32)))))->encryptSseS3('part');
-        $metadata = [
-            'sse-algorithm' => 'AES256',
-            'sse-key' => $encrypted['encryptedDataKey'],
-            'sse-iv' => $encrypted['iv'],
-            'sse-tag' => $encrypted['tag'],
-        ];
-        $write = new StorageWriteResult($path, 4, trim($etag, '"'));
-        self::assertNull($validate->invoke($handler, $write, $metadata, $path, 4, $etag, 'AES256', null));
-
-        foreach ([
-            'foreign final path' => [new StorageWriteResult($path . '-other', 4, trim($etag, '"')), $metadata],
-            'wrong logical size' => [new StorageWriteResult($path, 3, trim($etag, '"')), $metadata],
-            'wrong multipart ETag' => [new StorageWriteResult($path, 4, md5('other') . '-1'), $metadata],
-            'unexpected metadata' => [$write, $metadata + ['unexpected' => 'value']],
-            'missing wrapped key' => [$write, array_diff_key($metadata, ['sse-key' => true])],
-            'invalid IV' => [$write, array_replace($metadata, ['sse-iv' => base64_encode('short')])],
-            'invalid tag' => [$write, array_replace($metadata, ['sse-tag' => base64_encode('short')])],
-        ] as $case => [$candidateWrite, $candidateMetadata]) {
-            try {
-                $validate->invoke($handler, $candidateWrite, $candidateMetadata, $path, 4, $etag, 'AES256', null);
-                self::fail('Encrypted completion accepted ' . $case . '.');
-            } catch (InternalErrorException) {
-            }
-        }
-
-        $customerKey = random_bytes(32);
-        $customerMetadata = [
-            'sse-algorithm' => 'SSE-C',
-            'sse-customer-key-md5' => base64_encode(md5($customerKey, true)),
-            'sse-iv' => $encrypted['iv'],
-            'sse-tag' => $encrypted['tag'],
-        ];
-        self::assertNull($validate->invoke($handler, $write, $customerMetadata, $path, 4, $etag, 'SSE-C', $customerKey));
-        try {
-            $validate->invoke($handler, $write, array_replace($customerMetadata, ['sse-customer-key-md5' => 'wrong']), $path, 4, $etag, 'SSE-C', $customerKey);
-            self::fail('Encrypted completion accepted a different SSE-C key digest.');
-        } catch (InternalErrorException) {
         }
     }
 

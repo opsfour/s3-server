@@ -47,7 +47,6 @@ final class LifecycleRunner
             return;
         }
 
-        $this->executor->assertAdmissionFresh();
         $this->executor->resumeRunnerAfterStop();
         $this->callbackId = EventLoop::repeat($this->intervalSeconds, function (): void {
             if ($this->executionFuture !== null && ! $this->executionFuture->isComplete()) {
@@ -61,7 +60,6 @@ final class LifecycleRunner
 
             $this->executionFuture = \Amp\async(function (): void {
                 try {
-                    $this->executor->assertAdmissionFresh();
                     $this->executor->execute();
                 } catch (\Throwable $e) {
                     $this->logger->error('Lifecycle runner failed.', $this->lifecycleContext([

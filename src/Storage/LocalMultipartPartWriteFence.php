@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 
 /** Blocking, worker-only transfer from private node scratch to one planned part path. */
 final readonly class LocalMultipartPartWriteFence
@@ -13,12 +12,7 @@ final readonly class LocalMultipartPartWriteFence
     public function __construct(
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private ?EfsHostEvidenceReader $evidence = null,
-    ) {
-        if ($evidence !== null && $root !== $evidence->storageRoot()) {
-            throw new \InvalidArgumentException('Multipart worker root differs from EFS evidence.');
-        }
-    }
+    ) {}
 
     public function publish(
         string $source,
@@ -31,7 +25,6 @@ final readonly class LocalMultipartPartWriteFence
         int $expectedSize,
         string $expectedSha256,
     ): StorageWriteResult {
-        $this->evidence?->assertFresh();
         if ($target !== StoragePath::forPlannedPart($this->root, $bucket, $generation, $uploadId, $partNumber, $attemptId)
             || $expectedSize < 0 || strlen($expectedSha256) !== 32
             || ! str_starts_with($source, '/') || str_starts_with($source, rtrim($this->root, '/') . '/')
@@ -68,13 +61,12 @@ final readonly class LocalMultipartPartWriteFence
             $this->ensureDirectory($this->root . '/.tmp');
             $this->ensureDirectory(dirname($target));
             $tempPath = $this->root . '/.tmp/' . bin2hex(random_bytes(16));
-            $this->evidence?->assertFresh();
             $temp = @fopen($tempPath, 'x+b');
             if ($temp === false) {
-                throw new \RuntimeException('Could not create multipart EFS staging inode.');
+                throw new \RuntimeException('Could not create multipart staging inode.');
             }
             if (! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
-                throw new \RuntimeException('Could not protect multipart EFS staging inode.');
+                throw new \RuntimeException('Could not protect multipart staging inode.');
             }
             $calculator = new ChecksumCalculator();
             while (! feof($input)) {
@@ -88,10 +80,9 @@ final readonly class LocalMultipartPartWriteFence
                 $calculator->update($chunk);
                 $offset = 0;
                 while ($offset < strlen($chunk)) {
-                    $this->evidence?->assertFresh();
                     $written = @fwrite($temp, substr($chunk, $offset));
                     if ($written === false || $written === 0) {
-                        throw new \RuntimeException('Could not write multipart EFS staging inode.');
+                        throw new \RuntimeException('Could not write multipart staging inode.');
                     }
                     $offset += $written;
                 }
@@ -102,26 +93,25 @@ final readonly class LocalMultipartPartWriteFence
                 || ! hash_equals($expectedSha256, $sha256)) {
                 throw new \RuntimeException('Multipart node-local stage failed integrity verification.');
             }
-            $this->evidence?->assertFresh();
             if (! $this->io->syncFile($temp)) {
-                throw new \RuntimeException('Could not synchronize multipart EFS staging inode.');
+                throw new \RuntimeException('Could not synchronize multipart staging inode.');
             }
             $writtenInode = @fstat($temp);
             if (! is_array($writtenInode)) {
-                throw new \RuntimeException('Could not identify synchronized multipart EFS staging inode.');
+                throw new \RuntimeException('Could not identify synchronized multipart staging inode.');
             }
             // Keep a second shared lock while closing the writer descriptor.
-            // This gives EFS close-to-open visibility without a stale-temp
-            // sweeper taking the inode during the verification gap.
+            // Keep the stale-temp sweeper from taking the inode during the
+            // verification gap.
             $tempLease = @fopen($tempPath, 'rb');
             $leaseInode = $tempLease !== false ? @fstat($tempLease) : false;
             if ($tempLease === false || ! is_array($leaseInode)
                 || $leaseInode['dev'] !== $writtenInode['dev'] || $leaseInode['ino'] !== $writtenInode['ino']
                 || ! @flock($tempLease, LOCK_SH | LOCK_NB)) {
-                throw new \RuntimeException('Could not hold synchronized multipart EFS staging inode.');
+                throw new \RuntimeException('Could not hold synchronized multipart staging inode.');
             }
             if (! @flock($temp, LOCK_UN) || ! @fclose($temp)) {
-                throw new \RuntimeException('Could not close multipart EFS staging inode before verification.');
+                throw new \RuntimeException('Could not close multipart staging inode before verification.');
             }
             $temp = null;
 
@@ -129,20 +119,19 @@ final readonly class LocalMultipartPartWriteFence
             // stream or the still-open writer descriptor.
             $verified = @fopen($tempPath, 'rb');
             if ($verified === false) {
-                throw new \RuntimeException('Could not reopen multipart EFS staging inode for verification.');
+                throw new \RuntimeException('Could not reopen multipart staging inode for verification.');
             }
             try {
                 $openedInode = @fstat($verified);
                 if (! is_array($openedInode)
                     || $openedInode['dev'] !== $writtenInode['dev'] || $openedInode['ino'] !== $writtenInode['ino']) {
-                    throw new \RuntimeException('Multipart EFS staging inode changed before verification.');
+                    throw new \RuntimeException('Multipart staging inode changed before verification.');
                 }
                 $physicalCalculator = new ChecksumCalculator();
                 while (! feof($verified)) {
-                    $this->evidence?->assertFresh();
                     $chunk = @fread($verified, 65_536);
                     if ($chunk === false || ($chunk === '' && ! feof($verified))) {
-                        throw new \RuntimeException('Could not verify multipart EFS staging inode.');
+                        throw new \RuntimeException('Could not verify multipart staging inode.');
                     }
                     if ($chunk !== '') {
                         $physicalCalculator->update($chunk);
@@ -155,18 +144,16 @@ final readonly class LocalMultipartPartWriteFence
             $physicalSha256 = hex2bin($physicalChecksums->sha256Hex);
             if ($physicalChecksums->size !== $expectedSize || $physicalSha256 === false
                 || ! hash_equals($expectedSha256, $physicalSha256)) {
-                throw new \RuntimeException('Multipart EFS staging inode failed physical integrity verification.');
+                throw new \RuntimeException('Multipart staging inode failed physical integrity verification.');
             }
-            $this->evidence?->assertFresh();
-            (new LocalMultipartPathFence($this->root, $this->io, $this->evidence))->publishVerifiedTemp(
+            (new LocalMultipartPathFence($this->root, $this->io))->publishVerifiedTemp(
                 $tempPath,
                 $target,
                 $writtenInode['dev'],
                 $writtenInode['ino'],
             );
-            $this->evidence?->assertFresh();
             if (! @unlink($tempPath)) {
-                throw new \RuntimeException('Could not unlink multipart EFS staging inode.');
+                throw new \RuntimeException('Could not unlink multipart staging inode.');
             }
             $tempPath = '';
 
@@ -190,12 +177,7 @@ final readonly class LocalMultipartPartWriteFence
             }
             @fclose($input);
             if ($tempPath !== '') {
-                try {
-                    $this->evidence?->assertFresh();
-                    @unlink($tempPath);
-                } catch (\Throwable) {
-                    // A healthy temp collector handles the orphan after evidence loss.
-                }
+                @unlink($tempPath);
             }
         }
     }
@@ -207,7 +189,6 @@ final readonly class LocalMultipartPartWriteFence
         }
         $current = rtrim($this->root, '/');
         foreach (explode('/', substr($path, strlen($current) + 1)) as $segment) {
-            $this->evidence?->assertFresh();
             if ($segment === '' || $segment === '.' || $segment === '..') {
                 throw new \InvalidArgumentException('Invalid multipart worker directory.');
             }

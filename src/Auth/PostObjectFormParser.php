@@ -52,29 +52,6 @@ final class PostObjectFormParser
         $this->spoolCoordinator = $spoolCoordinator ?? new PostObjectSpoolCoordinator($tempDir);
     }
 
-    /** @internal Prove the form parser shares the exact qualified ingress components. */
-    public function assertQualifiedBinding(
-        string $tempDir,
-        int $budgetBytes,
-        PostObjectTempFileSweeper $sweeper,
-        PostObjectSpoolCoordinator $coordinator,
-    ): void {
-        if ($this->spoolBudgetBytes !== $budgetBytes
-            || $this->tempFileSweeper !== $sweeper
-            || $this->spoolCoordinator !== $coordinator) {
-            throw new \RuntimeException('EFS browser POST parser differs from qualified ingress components.');
-        }
-        $coordinator->assertQualifiedBinding($tempDir);
-    }
-
-    /** @internal Browser POST must use the same provider as SigV4 admission. */
-    public function assertQualifiedCredentialProviderBinding(CredentialProvider $credentialProvider): void
-    {
-        if ($this->credentialProvider !== $credentialProvider) {
-            throw new \RuntimeException('EFS browser POST credential provider differs from qualified ingress.');
-        }
-    }
-
     public function parse(Request $request): PostObjectForm
     {
         $contentType = RequestHeaderValues::singleton($request, 'content-type') ?? '';

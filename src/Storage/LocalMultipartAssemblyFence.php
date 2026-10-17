@@ -6,7 +6,6 @@ namespace OpsFour\S3Server\Storage;
 
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 
 /** Blocking physical half of an already armed, one-shot completion attempt. */
 final readonly class LocalMultipartAssemblyFence
@@ -18,12 +17,8 @@ final readonly class LocalMultipartAssemblyFence
     public function __construct(
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private ?EfsHostEvidenceReader $evidence = null,
     ) {
-        if ($evidence !== null && $root !== $evidence->storageRoot()) {
-            throw new \InvalidArgumentException('Multipart assembly worker root differs from EFS evidence.');
-        }
-        $canonical = $evidence !== null ? $root : realpath($root);
+        $canonical = realpath($root);
         if ($canonical === false || ! is_dir($canonical)) {
             throw new \InvalidArgumentException('Multipart assembly worker root is unavailable.');
         }
@@ -42,7 +37,6 @@ final readonly class LocalMultipartAssemblyFence
         array $parts,
         string $target,
     ): StorageWriteResult {
-        $this->evidence?->assertFresh();
         $planned = StoragePath::forMultipartCompletion($this->root, $bucket, $key, $generation, $attemptId);
         StoragePath::assertSafeUploadIdSegment($uploadId);
         if ($target !== $planned['assembly'] || $parts === []) {
@@ -70,7 +64,6 @@ final readonly class LocalMultipartAssemblyFence
         $temp = null;
         $tempLease = null;
         try {
-            $this->evidence?->assertFresh();
             $temp = @fopen($tempPath, 'x+b');
             if ($temp === false || ! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Could not create protected multipart assembly inode.');
@@ -78,7 +71,6 @@ final readonly class LocalMultipartAssemblyFence
             $calculator = new ChecksumCalculator();
             $partMd5s = '';
             foreach ($parts as $part) {
-                $this->evidence?->assertFresh();
                 $path = $part['storagePath'];
                 $entry = @lstat($path);
                 if ($entry === false || ($entry['mode'] & 0o170000) !== 0o100000
@@ -97,7 +89,6 @@ final readonly class LocalMultipartAssemblyFence
                     $partHash = hash_init('md5');
                     $partBytes = 0;
                     while (! feof($input)) {
-                        $this->evidence?->assertFresh();
                         $chunk = @fread($input, self::CHUNK_BYTES);
                         if ($chunk === false || ($chunk === '' && ! feof($input))) {
                             throw new \RuntimeException('Committed multipart part could not be read completely.');
@@ -113,7 +104,6 @@ final readonly class LocalMultipartAssemblyFence
                         $calculator->update($chunk);
                         $offset = 0;
                         while ($offset < strlen($chunk)) {
-                            $this->evidence?->assertFresh();
                             $written = @fwrite($temp, substr($chunk, $offset));
                             if ($written === false || $written === 0) {
                                 throw new \RuntimeException('Could not write multipart assembly inode.');
@@ -130,7 +120,6 @@ final readonly class LocalMultipartAssemblyFence
                 }
             }
             $checksums = $calculator->finalize();
-            $this->evidence?->assertFresh();
             if (! $this->io->syncFile($temp)) {
                 throw new \RuntimeException('Could not synchronize multipart assembly inode.');
             }
@@ -158,7 +147,6 @@ final readonly class LocalMultipartAssemblyFence
                 }
                 $physical = new ChecksumCalculator();
                 while (! feof($verified)) {
-                    $this->evidence?->assertFresh();
                     $chunk = @fread($verified, self::CHUNK_BYTES);
                     if ($chunk === false || ($chunk === '' && ! feof($verified))) {
                         throw new \RuntimeException('Could not verify multipart assembly inode.');
@@ -175,8 +163,7 @@ final readonly class LocalMultipartAssemblyFence
                 || ! hash_equals($checksums->sha256Hex, $actual->sha256Hex)) {
                 throw new \RuntimeException('Multipart assembly inode failed physical integrity verification.');
             }
-            $this->evidence?->assertFresh();
-            (new LocalMultipartPathFence($this->root, $this->io, $this->evidence))->publishVerifiedTemp(
+            (new LocalMultipartPathFence($this->root, $this->io))->publishVerifiedTemp(
                 $tempPath,
                 $target,
                 $writtenInode['dev'],
@@ -201,12 +188,7 @@ final readonly class LocalMultipartAssemblyFence
                 @flock($tempLease, LOCK_UN);
                 @fclose($tempLease);
             }
-            try {
-                $this->evidence?->assertFresh();
-                @unlink($tempPath);
-            } catch (\Throwable) {
-                // The temp collector handles an orphan after evidence loss.
-            }
+            @unlink($tempPath);
         }
     }
 
@@ -218,7 +200,6 @@ final readonly class LocalMultipartAssemblyFence
         $current = rtrim($this->root, '/');
         $expected = $this->canonicalRoot;
         foreach (explode('/', substr($path, strlen($current) + 1)) as $segment) {
-            $this->evidence?->assertFresh();
             if ($segment === '' || $segment === '.' || $segment === '..') {
                 throw new \InvalidArgumentException('Invalid multipart assembly directory.');
             }

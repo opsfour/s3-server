@@ -39,7 +39,6 @@ use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
-use OpsFour\S3Server\Middleware\EfsApiAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Middleware\ExpectContinueMiddleware;
 use OpsFour\S3Server\Middleware\LoggingMiddleware;
@@ -62,7 +61,6 @@ use OpsFour\S3Server\Routing\HandlerRegistry;
 use OpsFour\S3Server\Routing\S3AttributeMiddleware;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
-use OpsFour\S3Server\Runtime\EfsHostEvidence;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
@@ -163,8 +161,6 @@ final class S3Server
     private bool $authenticationConfigured = false;
 
     private ?CredentialProvider $authenticationCredentialProvider = null;
-
-    private ?EfsApiAdmissionMiddleware $efsApiAdmissionForTests = null;
 
     private bool $starting = false;
 
@@ -437,7 +433,6 @@ final class S3Server
                     new HealthCheckHandler(logger: $this->logger),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
-                    requireEfsAdmission: false,
                 ));
                 $router->addRoute('GET', '/.health', $this->managementHandler(
                     new HealthCheckHandler(
@@ -447,20 +442,18 @@ final class S3Server
                         storageTiers: $this->storageTiers ?? (
                             $this->storage !== null ? StorageTierRegistry::single($this->storage) : null
                         ),
-                        admissionEvidence: $this->efsApiAdmissionForTests,
                         credentialHealthProbe: $this->authenticationCredentialProvider instanceof CredentialHealthProbe
                             ? $this->authenticationCredentialProvider
                             : null,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
-                    requireEfsAdmission: false,
                 ));
                 $router->addRoute('GET', '/.metrics', $this->managementHandler(new MetricsHandler(
                     $this->metrics,
                     $this->metadata,
                     $this->config->metricsBearerToken,
-                ), requireEfsAdmission: false));
+                )));
                 if ($this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler($this->adminCredentialApiHandler);
                     $router->addRoute('POST', '/.admin/credentials', $adminCredentials);
@@ -988,10 +981,8 @@ final class S3Server
             if (isset($this->closedWorkerPools[$id])) {
                 continue;
             }
-            $poolCloseStarted = false;
             try {
                 if (! isset($this->terminatedWorkerPools[$id])) {
-                    $poolCloseStarted = true;
                     if (isset($this->failedWorkerPoolShutdowns[$id])) {
                         $entry['pool']->kill();
                     } else {
@@ -1005,7 +996,7 @@ final class S3Server
                 $this->closedWorkerPools[$id] = true;
                 unset($this->failedWorkerPoolShutdowns[$id], $this->terminatedWorkerPools[$id]);
             } catch (\Throwable $e) {
-                if ($poolCloseStarted && ! isset($this->terminatedWorkerPools[$id])) {
+                if (! isset($this->terminatedWorkerPools[$id])) {
                     $this->failedWorkerPoolShutdowns[$id] = true;
                 }
                 $this->metrics->recordWorkerPoolShutdownFailure($entry['name'], $e::class);
@@ -1038,20 +1029,10 @@ final class S3Server
         }
     }
 
-    /** Never start a best-effort physical log write after test EFS admission is revoked. */
     private function flushAccessLogsIfAdmitted(): void
     {
         if ($this->accessLogs === null) {
             return;
-        }
-        if ($this->efsApiAdmissionForTests !== null) {
-            try {
-                $this->efsApiAdmissionForTests->assertFresh();
-            } catch (\Throwable) {
-                $this->logShutdown('warning', 'Access log flush skipped after EFS admission loss.');
-
-                return;
-            }
         }
         $this->accessLogs->flush();
     }
@@ -1130,16 +1111,6 @@ final class S3Server
         }
     }
 
-    /** Attach an API entry gate only to the explicit, unsafe EFS qualification profile. */
-    public function setEfsApiAdmissionForTests(EfsHostEvidence $evidence): void
-    {
-        $this->assertConfigurationMutable('EFS API admission');
-        if (! $this->config->allowUnfencedStorageForTests || $this->efsApiAdmissionForTests !== null) {
-            throw new \LogicException('EFS API admission requires the explicit unsafe test profile and can be attached only once.');
-        }
-        $this->efsApiAdmissionForTests = new EfsApiAdmissionMiddleware($evidence);
-    }
-
     /**
      * Transfer shutdown ownership of a worker pool to this server.
      *
@@ -1204,10 +1175,9 @@ final class S3Server
      * Build the complete middleware stack wrapping the S3DispatchHandler.
      *
      * Middleware is applied outermost-first. Request ID, metrics and error
-     * handling wrap the optional EFS test admission. Admission precedes proxy,
-     * logging, header-contract validation, rate-limit, website, CORS, auth and
-     * S3 handler work. Management routes use a separate stack; admin mutations
-     * share the EFS test gate.
+     * handling precede proxy, logging, header-contract validation, rate-limit,
+     * website, CORS, auth and S3 handler work. Management routes use a separate
+     * stack.
      *
      * @param  RequestHandler  $innerHandler  The S3DispatchHandler to wrap.
      * @return RequestHandler The fully stacked handler.
@@ -1220,7 +1190,6 @@ final class S3Server
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware(logger: $this->logger),
-            ...($this->efsApiAdmissionForTests !== null ? [$this->efsApiAdmissionForTests] : []),
             new TrustedProxyMiddleware($this->config->trustedProxyCidrs),
             new LoggingMiddleware(logger: $this->logger, accessLogs: $this->accessLogs),
             new RequestHeaderContractMiddleware(),
@@ -1363,13 +1332,11 @@ final class S3Server
         RequestHandler $handler,
         bool $rateLimited = true,
         bool $bypassForwardedForValidation = false,
-        bool $requireEfsAdmission = true,
     ): RequestHandler {
         $middlewares = [
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware($this->logger),
-            ...($requireEfsAdmission && $this->efsApiAdmissionForTests !== null ? [$this->efsApiAdmissionForTests] : []),
             new TrustedProxyMiddleware($this->config->trustedProxyCidrs, enforceForwardedFor: ! $bypassForwardedForValidation),
         ];
         if ($rateLimited) {

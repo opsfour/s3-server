@@ -14,7 +14,6 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -29,7 +28,6 @@ final readonly class MultipartWriteIntentCollector
         LoggerInterface $logger = new NullLogger(),
         private float $claimLeaseSeconds = 300.0,
         private float $renewIntervalSeconds = 100.0,
-        private ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0
@@ -39,18 +37,9 @@ final readonly class MultipartWriteIntentCollector
         }
     }
 
-    /** Bind a candidate recovery worker to the same SQL facade, tier and watcher. */
-    public function assertBoundTo(MultipartWriteIntentStore $metadata, StorageTierRegistry $tiers, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->metadata !== $metadata || $this->tiers !== $tiers || $this->efsEvidence !== $evidence) {
-            throw new \RuntimeException('Multipart collector differs from the EFS candidate resources.');
-        }
-    }
-
     public function collect(int $limit = 100, ?Cancellation $cancellation = null): int
     {
         $cancellation?->throwIfRequested();
-        $this->efsEvidence?->assertFresh();
         if (! $this->metadata instanceof FencedMultipartWriteIntentStore) {
             throw new \LogicException('Multipart collection requires generation-fenced claim renewal.');
         }
@@ -81,7 +70,6 @@ final readonly class MultipartWriteIntentCollector
 
         for (; $processed < $limit; $processed++) {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $now = $this->metadata->multipartWriteIntentNow();
             $claimed = $this->metadata->claimDueMultipartWriteIntents(1, $now, $now + $this->claimLeaseSeconds);
             if ($claimed === []) {
@@ -89,7 +77,6 @@ final readonly class MultipartWriteIntentCollector
             }
             $intent = $claimed[0];
             // A watcher trip during SQL claim leaves its lease for recovery.
-            $this->efsEvidence?->assertFresh();
             $leaseUntil = $intent->nextAttemptAt;
             $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$leaseUntil): bool {
                 $next = $this->metadata->multipartWriteIntentNow() + $this->claimLeaseSeconds;
@@ -143,16 +130,6 @@ final readonly class MultipartWriteIntentCollector
                 $failed = $error;
             }
             try {
-                $this->efsEvidence?->assertFresh();
-            } catch (\RuntimeException $error) {
-                try {
-                    $heartbeat->stop();
-                } catch (\Throwable) {
-                    // Keep the claim leased for another collector.
-                }
-                throw $error;
-            }
-            try {
                 $heartbeat->stop();
             } catch (\Throwable $error) {
                 $this->logger->warning('Multipart completion claim was lost during physical cleanup.', [
@@ -167,7 +144,6 @@ final readonly class MultipartWriteIntentCollector
             $nextAttemptAt = $failed === null && $localBackend instanceof FilesystemBackend
                 ? 1.0e300
                 : $this->metadata->multipartWriteIntentNow() + ($failed === null ? 3600 : 60);
-            $this->efsEvidence?->assertFresh();
             $retained = $this->metadata->retryMultipartCollectorClaim(
                 $intent->attemptId,
                 $nextAttemptAt,

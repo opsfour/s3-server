@@ -7,8 +7,6 @@ namespace OpsFour\S3Server\Parallel;
 use Amp\Cancellation;
 use Amp\Parallel\Worker\Task;
 use Amp\Sync\Channel;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Storage\LocalMultipartAssemblyFence;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
@@ -25,16 +23,12 @@ final readonly class LocalMultipartAssemblyTask implements Task
         private string $uploadId,
         private array $parts,
         private string $target,
-        private ?EfsWorkerEvidenceScope $scope = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): StorageWriteResult
     {
         $cancellation->throwIfRequested();
-        $evidence = $this->scope !== null ? EfsHostEvidenceReader::fromWorkerScope($this->scope) : null;
-        $evidence?->assertFresh();
-
-        return (new LocalMultipartAssemblyFence($this->root, evidence: $evidence))->assemble(
+        return (new LocalMultipartAssemblyFence($this->root))->assemble(
             $this->bucket,
             $this->key,
             $this->generation,

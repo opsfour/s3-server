@@ -36,8 +36,7 @@ final class S3ServerRuntime
         public readonly ?EncryptionServiceInterface $encryption = null,
         public readonly ?WorkerPool $selectWorkerPool = null,
         private readonly LoggerInterface $logger = new NullLogger(),
-    ) {
-    }
+    ) {}
 
     /** Transfer the isolated test profile's worker resources to runtime shutdown. */
     public function attachLocalObjectWriteTestResources(

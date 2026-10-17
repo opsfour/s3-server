@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
-/** Linux/POSIX file operations; actual EFS semantics require a two-host gate. */
+/** Linux/POSIX file operations; shared-filesystem semantics require separate qualification. */
 final class NativeLocalObjectWriteIo implements LocalObjectWriteIo
 {
     public function syncFile($file): bool

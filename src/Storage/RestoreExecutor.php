@@ -19,7 +19,6 @@ use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Metadata\QueueLease;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use Psr\Log\LoggerInterface;
@@ -36,7 +35,6 @@ final class RestoreExecutor
         private readonly ?NotificationDispatcher $notifications = null,
         private readonly float $leaseRenewalIntervalSeconds = 100.0,
         private readonly ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($this->leaseRenewalIntervalSeconds)
@@ -49,19 +47,6 @@ final class RestoreExecutor
         }
     }
 
-    public function assertBoundTo(
-        MetadataStore $metadata,
-        StorageTierRegistry $tiers,
-        EfsHostEvidenceReader $evidence,
-        ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
-        ?NotificationDispatcher $notifications = null,
-    ): void {
-        if ($this->metadata !== $metadata || $this->tiers !== $tiers || $this->efsEvidence !== $evidence
-            || $this->localFencedWriter !== $localFencedWriter || $this->notifications !== $notifications) {
-            throw new \RuntimeException('Restore executor differs from the EFS candidate resources.');
-        }
-    }
-
     /**
      * Counters describe this worker's claimed attempts, not authoritative SQL
      * queue status. "completed" also includes stale or lost-lease claims.
@@ -71,19 +56,16 @@ final class RestoreExecutor
      */
     public function processNext(int $limit = 100, ?Cancellation $cancellation = null): array
     {
-        $this->efsEvidence?->assertFresh();
         $stats = ['processed' => 0, 'completed' => 0, 'retried' => 0, 'deadLetter' => 0];
 
         $limit = max(1, $limit);
         while ($stats['processed'] < $limit) {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $jobs = $this->metadata->dequeueRestoreJobs(1);
             if ($jobs === []) {
                 break;
             }
 
-            $this->efsEvidence?->assertFresh();
             $job = $jobs[0];
             $stats['processed']++;
             $stats[$this->processDequeuedJob($job)]++;
@@ -99,7 +81,6 @@ final class RestoreExecutor
      */
     public function processDequeuedJob(array $job): string
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         $targetBackend = null;
         $targetTierName = '';
@@ -153,7 +134,6 @@ final class RestoreExecutor
             $sourceStream = null;
             $writeFailure = null;
             try {
-                $this->efsEvidence?->assertFresh();
                 $sourceStream = new TeeReadableStream(
                     $sourceBackend->getObjectByPath($sourceStoragePath),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
@@ -163,7 +143,6 @@ final class RestoreExecutor
                     },
                 );
                 if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
-                    $this->efsEvidence?->assertFresh();
                     $fencedTarget = true;
                     [$write, $dispatchToken] = $this->localFencedWriter->publish(
                         $object,
@@ -174,7 +153,6 @@ final class RestoreExecutor
                         'restore_copy',
                     );
                 } else {
-                    $this->efsEvidence?->assertFresh();
                     $write = $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
                 }
             } catch (\Throwable $e) {
@@ -257,9 +235,7 @@ final class RestoreExecutor
                 bucketGeneration: $targetBucket->generation,
             );
 
-            $this->efsEvidence?->assertFresh();
             $metadataCommitted = $this->metadata->transaction(function () use ($id, $job, $object, $sourceTier, $sourceStoragePath, $write, $targetTierName, $tierStore, $expiresAt, $event, $bucketOwner, $targetBucket, $dispatchToken, &$leaseExpiresAt): bool {
-                $this->efsEvidence?->assertFresh();
                 if ($bucketOwner !== null) {
                     OwnerWriteLock::acquire($this->metadata, $bucketOwner);
                 }
@@ -334,14 +310,12 @@ final class RestoreExecutor
 
             return 'completed';
         } catch (CancelledException $e) {
-            $this->efsEvidence?->assertFresh();
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $write !== null) {
                 $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
             }
 
             throw $e;
         } catch (\Throwable $e) {
-            $this->efsEvidence?->assertFresh();
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $write !== null) {
                 $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
             }
@@ -367,9 +341,7 @@ final class RestoreExecutor
      */
     private function prepareJob(array $job, ?string $bucketOwner, float &$leaseExpiresAt): ?array
     {
-        $this->efsEvidence?->assertFresh();
         return $this->metadata->transaction(function () use ($job, $bucketOwner, &$leaseExpiresAt): ?array {
-            $this->efsEvidence?->assertFresh();
             if ($bucketOwner !== null) {
                 OwnerWriteLock::acquire($this->metadata, $bucketOwner);
             }
@@ -414,7 +386,6 @@ final class RestoreExecutor
      */
     private function cleanTargetIfUnreferenced(array $job, StorageBackend $targetBackend, string $targetTierName, string $path): void
     {
-        $this->efsEvidence?->assertFresh();
         try {
             $mayBeReferenced = $this->metadata->transaction(function () use ($job, $targetTierName, $path): bool {
                 $bucket = (string) ($job['bucket'] ?? '');
@@ -465,7 +436,6 @@ final class RestoreExecutor
      */
     private function cleanTarget(array $job, StorageBackend $targetBackend, string $targetTierName, string $path): void
     {
-        $this->efsEvidence?->assertFresh();
         try {
             DurableStorageDelete::run(
                 $this->metadata,
@@ -514,7 +484,6 @@ final class RestoreExecutor
      */
     private function retryOrDeadLetter(array $job, \Throwable $e, float &$leaseExpiresAt, bool $consumeAttempt = true): string
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         $attempts = (int) ($job['attempts'] ?? 0);
         $maxAttempts = max(1, (int) ($job['maxAttempts'] ?? 1));
@@ -577,7 +546,6 @@ final class RestoreExecutor
                 return 'completed';
             }
         } catch (\Throwable $stateError) {
-            $this->efsEvidence?->assertFresh();
             if ($deadLetter) {
                 $this->logger->error('Restore job was dead-lettered but object state could not be marked failed.', [
                     'job_id' => $id,
@@ -603,7 +571,6 @@ final class RestoreExecutor
     /** @param array<string, mixed> $job */
     private function renewOwnedLease(array $job, float &$currentLease, ?float $newLease = null): bool
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         // An immediate renewal must change the stored value even on drivers
         // that round floating-point timestamps before reporting affected rows.
@@ -637,7 +604,6 @@ final class RestoreExecutor
         ?string $restoredStoragePath = null,
         ?float $expectedLeaseExpiresAt = null,
     ): bool {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         if ($expectedLeaseExpiresAt !== null && $this->metadata instanceof FencedQueueStore && isset($job['leaseGeneration'])) {
             return $this->metadata->updateRestoreJobStatusLease(

@@ -7,8 +7,6 @@ namespace OpsFour\S3Server\Parallel;
 use Amp\Cancellation;
 use Amp\Parallel\Worker\Task;
 use Amp\Sync\Channel;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Storage\LocalMultipartPartWriteFence;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
@@ -30,7 +28,6 @@ final readonly class LocalMultipartPartWriteTask implements Task
         private int $expectedSize,
         private string $expectedSha256,
         private ?LocalObjectWriteIo $io = null,
-        private ?EfsWorkerEvidenceScope $scope = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): LocalMultipartPartWriteTaskResult
@@ -40,9 +37,7 @@ final readonly class LocalMultipartPartWriteTask implements Task
         try {
             $cancellation->throwIfRequested();
             $lease = StorageTempWorkerLease::acquire($this->leasePath, $this->source);
-            $evidence = $this->scope !== null ? EfsHostEvidenceReader::fromWorkerScope($this->scope) : null;
-            $evidence?->assertFresh();
-            $result = (new LocalMultipartPartWriteFence($this->root, $tracking, $evidence))->publish(
+            $result = (new LocalMultipartPartWriteFence($this->root, $tracking))->publish(
                 $this->source,
                 $this->target,
                 $this->bucket,

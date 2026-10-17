@@ -17,7 +17,6 @@ use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Quota\QuotaManager;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Storage\DurableStorageDelete;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -57,8 +56,6 @@ final class AccessLogWriter
 
     private ?NotificationDispatcher $notifications;
 
-    private ?NotificationDispatcher $qualifiedNotifications = null;
-
     private readonly LoggerInterface $logger;
 
     public function __construct(
@@ -73,7 +70,6 @@ final class AccessLogWriter
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         private readonly int $maxBufferBytes = self::MAX_BUFFER_BYTES,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if ($maxBufferBytes < 1 || $maxBufferBytes > self::MAX_BUFFER_BYTES) {
@@ -92,55 +88,14 @@ final class AccessLogWriter
                 $backend = $backend->innerBackend();
             }
             if (! $backend instanceof FilesystemBackend
-                || ($backend->hostEvidenceReader() !== null
-                    ? $backend->getBasePath()
-                    : realpath($backend->getBasePath())) !== $localFencedWriter->storageRoot()) {
+                || realpath($backend->getBasePath()) !== $localFencedWriter->storageRoot()) {
                 throw new \InvalidArgumentException('Access log local writer requires the matching filesystem root.');
             }
         }
-        if ($efsEvidence !== null) {
-            if ($localFencedWriter === null || $localLeaseFactory === null) {
-                throw new \InvalidArgumentException('EFS access logging requires a fenced writer and lease factory.');
-            }
-            $backend = $storage;
-            while ($backend instanceof ObservedStorageBackend) {
-                $backend = $backend->innerBackend();
-            }
-            if (! $backend instanceof FilesystemBackend) {
-                throw new \InvalidArgumentException('EFS access logging requires the qualified filesystem backend.');
-            }
-            $localFencedWriter->assertBoundTo($backend, $storageTier, $efsEvidence);
-        }
-    }
-
-    /** Bind the candidate log delivery path to its exact graph before serving. */
-    public function assertBoundTo(
-        MetadataStore $metadata,
-        StorageBackend $storage,
-        string $tier,
-        LocalFencedObjectWriter $writer,
-        LocalObjectWriteLeaseGuardFactory $leaseFactory,
-        EfsHostEvidenceReader $evidence,
-        NotificationDispatcher $notifications,
-        ?QuotaManager $quotas,
-        ?EncryptionServiceInterface $encryption,
-    ): void {
-        if ($this->metadata !== $metadata || $this->storage !== $storage
-            || $this->storageTier !== $tier || $this->localFencedWriter !== $writer
-            || $this->localLeaseFactory !== $leaseFactory || $this->efsEvidence !== $evidence
-            || $this->notifications !== $notifications || $this->quotas !== $quotas
-            || $this->encryption !== $encryption) {
-            throw new \RuntimeException('Access log delivery differs from the qualified EFS resources.');
-        }
-        $evidence->assertFresh();
-        $this->qualifiedNotifications = $notifications;
     }
 
     public function setNotificationDispatcher(NotificationDispatcher $notifications): void
     {
-        if ($this->qualifiedNotifications !== null && $this->qualifiedNotifications !== $notifications) {
-            throw new \LogicException('Qualified EFS access log notifications cannot be changed.');
-        }
         $this->notifications = $notifications;
     }
 
@@ -176,7 +131,6 @@ final class AccessLogWriter
         // flush time could send an old owner's request details to an account
         // that has since created a bucket with the same name.
         try {
-            $this->efsEvidence?->assertFresh();
             $sourceInfo = $this->metadata->getBucket($bucket);
             if ($sourceInfo === null || ($bucketOwnerId !== '' && $sourceInfo->ownerId !== $bucketOwnerId)
                 || ($bucketGeneration !== '' && $sourceInfo->generation !== $bucketGeneration)) {
@@ -184,11 +138,9 @@ final class AccessLogWriter
             }
             $sourceOwner = $sourceInfo->ownerId;
             $sourceGeneration = $sourceInfo->generation;
-            $this->efsEvidence?->assertFresh();
             $loggingConfig = $this->metadata->getBucketLogging($bucket);
             $targetAtRecord = null;
             if ($loggingConfig !== null) {
-                $this->efsEvidence?->assertFresh();
                 $targetAtRecord = $this->metadata->getBucket($loggingConfig['targetBucket']);
             }
         } catch (\Throwable $e) {
@@ -310,7 +262,6 @@ final class AccessLogWriter
      */
     public function flush(): void
     {
-        $this->efsEvidence?->assertFresh();
         if ($this->buffer === []) {
             return;
         }
@@ -366,13 +317,11 @@ final class AccessLogWriter
                 public ?LocalObjectWriteLeaseGuard $lease = null;
             };
             try {
-                $this->efsEvidence?->assertFresh();
                 $sourceAtWrite = $this->metadata->getBucket($sourceBucket);
                 if ($sourceAtWrite === null || $sourceAtWrite->ownerId !== $sourceOwner
                     || $sourceAtWrite->generation !== $sourceGeneration) {
                     continue;
                 }
-                $this->efsEvidence?->assertFresh();
                 $targetAtWrite = $this->metadata->getBucket($targetBucket);
                 if ($targetAtWrite !== null && $targetGeneration !== ''
                     && $targetAtWrite->generation !== $targetGeneration) {
@@ -382,7 +331,6 @@ final class AccessLogWriter
                     || $targetAtWrite->region !== $sourceAtWrite->region) {
                     throw new \RuntimeException('Access log target is no longer owned by the source bucket owner in the same region.');
                 }
-                $this->efsEvidence?->assertFresh();
                 if ($this->metadata->getObjectLockConfig($targetBucket) !== null) {
                     throw new \RuntimeException('Access log target has Object Lock enabled.');
                 }
@@ -394,13 +342,10 @@ final class AccessLogWriter
                 $logKey = $targetPrefix . $timestamp . '-' . bin2hex(random_bytes(8));
                 $logContent = implode("\n", $lines) . "\n";
                 $this->assertTargetPolicyDoesNotDeny($targetBucket, $logKey);
-                $this->efsEvidence?->assertFresh();
                 if ($this->metadata->getObjectMetadata($targetBucket, $logKey) !== null) {
                     throw new \RuntimeException('Access log target key already exists.');
                 }
-                $this->efsEvidence?->assertFresh();
                 $versioningAtWrite = $this->metadata->getBucketVersioning($targetBucket);
-                $this->efsEvidence?->assertFresh();
                 $this->quotas?->assertCanWriteObject(
                     $sourceOwner,
                     $targetBucket,
@@ -408,7 +353,6 @@ final class AccessLogWriter
                     strlen($logContent),
                     $versioningAtWrite === 'Enabled',
                 );
-                $this->efsEvidence?->assertFresh();
                 $bucketEncryption = $this->metadata->getBucketEncryption($targetBucket);
                 \OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration::assertSupported($bucketEncryption);
                 $payload = $logContent;
@@ -455,7 +399,6 @@ final class AccessLogWriter
                         purpose: 'access_log',
                     );
                     $attempt->plannedPath = $planned->storagePath;
-                    $this->efsEvidence?->assertFresh();
                     $attempt->lease = $this->localLeaseFactory->reserve($planned);
                     $outcome = $this->localFencedWriter->publishWithLease(
                         $attempt->lease->reservedIntent(),
@@ -504,22 +447,17 @@ final class AccessLogWriter
                 }
                 $attempt->writeResultValidated = true;
 
-                $this->efsEvidence?->assertFresh();
                 $dispatchToken = $attempt->lease?->stopForCommit();
 
-                $this->efsEvidence?->assertFresh();
                 $this->metadata->transaction(function () use ($sourceBucket, $sourceOwner, $sourceGeneration, $targetBucket, $targetGeneration, $logKey, $logContent, $bucketEncryption, $userMetadata, $attempt, $dispatchToken): void {
-                    $this->efsEvidence?->assertFresh();
                     // External metadata stores share this owner lock with bucket
                     // deletion. SQLite keeps the read and write in one transaction.
                     // Do not publish a log object to a target with a reused name.
                     $this->metadata->lockOwnerForUpdate($sourceOwner);
-                    $this->efsEvidence?->assertFresh();
                     $sourceInfo = $this->metadata->getBucket($sourceBucket);
                     if ($sourceInfo === null || $sourceInfo->ownerId !== $sourceOwner || $sourceInfo->generation !== $sourceGeneration) {
                         return;
                     }
-                    $this->efsEvidence?->assertFresh();
                     $targetInfo = $this->metadata->getBucket($targetBucket);
                     if ($targetInfo !== null && $targetGeneration !== '' && $targetInfo->generation !== $targetGeneration) {
                         return;
@@ -527,22 +465,17 @@ final class AccessLogWriter
                     if ($targetInfo === null || $targetInfo->ownerId !== $sourceOwner || $targetInfo->region !== $sourceInfo->region) {
                         throw new \RuntimeException('Access log target is no longer owned by the source bucket owner in the same region.');
                     }
-                    $this->efsEvidence?->assertFresh();
                     if ($this->metadata->getObjectLockConfig($targetBucket) !== null) {
                         throw new \RuntimeException('Access log target has Object Lock enabled.');
                     }
-                    $this->efsEvidence?->assertFresh();
                     if ($this->metadata->getBucketEncryption($targetBucket) !== $bucketEncryption) {
                         throw new \RuntimeException('Access log target encryption changed during delivery.');
                     }
                     $this->assertTargetPolicyDoesNotDeny($targetBucket, $logKey);
-                    $this->efsEvidence?->assertFresh();
                     if ($this->metadata->getObjectMetadata($targetBucket, $logKey) !== null) {
                         throw new \RuntimeException('Access log target key already exists.');
                     }
-                    $this->efsEvidence?->assertFresh();
                     $versioning = $this->metadata->getBucketVersioning($targetBucket);
-                    $this->efsEvidence?->assertFresh();
                     $this->quotas?->assertCanWriteObject(
                         $sourceOwner,
                         $targetBucket,
@@ -550,13 +483,11 @@ final class AccessLogWriter
                         strlen($logContent),
                         $versioning === 'Enabled',
                     );
-                    $this->efsEvidence?->assertFresh();
                     if ($dispatchToken !== null && (! $this->metadata instanceof ObjectWriteIntentStore
                         || ! $this->metadata->consumeArmedObjectWriteIntent($dispatchToken->attemptId, $dispatchToken->dispatchId))) {
                         throw new \RuntimeException('Access log local write lease was lost before metadata publication.');
                     }
                     $etag = '"' . md5($logContent) . '"';
-                    $this->efsEvidence?->assertFresh();
                     $versionId = $versioning === 'Enabled'
                         ? $this->metadata->putObjectVersioned(
                             bucket: $targetBucket,
@@ -571,7 +502,6 @@ final class AccessLogWriter
                         : null;
                     $attempt->publishedVersionId = $versionId;
                     if ($versionId === null) {
-                        $this->efsEvidence?->assertFresh();
                         $this->metadata->putObjectMetadata(
                             bucket: $targetBucket,
                             key: $logKey,
@@ -583,7 +513,6 @@ final class AccessLogWriter
                             userMetadata: $userMetadata,
                         );
                     }
-                    $this->efsEvidence?->assertFresh();
                     $this->metadata->updateObjectPlacement(
                         $targetBucket,
                         $logKey,
@@ -592,9 +521,7 @@ final class AccessLogWriter
                         $this->storageTier,
                         $attempt->writeResult->path,
                     );
-                    $this->efsEvidence?->assertFresh();
                     $this->metadata->putAcl('object', $targetBucket . '/' . $logKey, $sourceOwner, []);
-                    $this->efsEvidence?->assertFresh();
                     $this->metadata->putAcl(
                         'object',
                         ObjectVersionResolver::aclResourceName($targetBucket, $logKey, $versionId),
@@ -641,7 +568,6 @@ final class AccessLogWriter
                     // Never enqueue a delete for a path that may be published.
                     $publicationConfirmed = false;
                     try {
-                        $this->efsEvidence?->assertFresh();
                         $published = $attempt->publishedVersionId !== null
                             ? $this->metadata->getObjectMetadataByVersion($targetBucket, $logKey, $attempt->publishedVersionId)
                             : $this->metadata->getObjectMetadata($targetBucket, $logKey);
@@ -742,7 +668,6 @@ final class AccessLogWriter
 
     private function assertTargetPolicyDoesNotDeny(string $bucket, string $key): void
     {
-        $this->efsEvidence?->assertFresh();
         $policy = $this->metadata->getBucketPolicy($bucket);
         if ($policy === null) {
             return;

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use Closure;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Runtime\LinuxMountInfo;
 
 /**
@@ -21,13 +20,11 @@ final class LocalTierPhysicalInventorySet
 
     /**
      * @param array<string, string> $tierRoots
-     * @param array<string, EfsHostEvidenceReader> $efsEvidenceByTier
      * @param Closure(): (string|false)|null $mountInfoReader Test seam; production reads /proc/self/mountinfo.
-     * @param (Closure(string): (array{dev: int, ino: int}|false))|null $localRootIdentityReader Test seam; never called for NFS.
+     * @param (Closure(string): (array{dev: int, ino: int}|false))|null $localRootIdentityReader Test seam.
      */
     public function __construct(
         array $tierRoots,
-        array $efsEvidenceByTier = [],
         ?Closure $mountInfoReader = null,
         ?Closure $localRootIdentityReader = null,
     ) {
@@ -57,31 +54,18 @@ final class LocalTierPhysicalInventorySet
             if ($type === null) {
                 throw new \RuntimeException('Physical inventory root mount is unknown.');
             }
-            $evidence = $efsEvidenceByTier[$tier] ?? null;
-            if (in_array($type, ['nfs', 'nfs4'], true)) {
-                if (! $evidence instanceof EfsHostEvidenceReader || $evidence->storageRoot() !== $root) {
-                    throw new \RuntimeException('NFS physical inventory requires exact per-tier host evidence.');
-                }
-                $evidence->assertFresh();
-            } elseif ($evidence !== null || ! LinuxMountInfo::isQualifiedLocalFilesystem($type)) {
-                throw new \RuntimeException('Unsupported physical inventory tier mount or evidence.');
+            if (! LinuxMountInfo::isQualifiedLocalFilesystem($type)) {
+                throw new \RuntimeException('Unsupported physical inventory tier mount.');
             }
             if (realpath($root) !== $root || ! is_dir($root)) {
                 throw new \RuntimeException('Physical inventory root must be an existing canonical directory.');
             }
-            if ($evidence instanceof EfsHostEvidenceReader) {
-                // The host watcher pinned these values at startup. Do not add
-                // an NFS stat merely to detect a bind-mount alias.
-                $scope = $evidence->workerScope();
-                $identity = $scope->storageDev . ':' . $scope->storageIno;
-            } else {
-                $stat = $localRootIdentityReader($root);
-                if (! is_array($stat) || ! is_int($stat['dev'] ?? null)
-                    || ! is_int($stat['ino'] ?? null) || $stat['ino'] < 1) {
-                    throw new \RuntimeException('Physical inventory root identity is unavailable.');
-                }
-                $identity = $stat['dev'] . ':' . $stat['ino'];
+            $stat = $localRootIdentityReader($root);
+            if (! is_array($stat) || ! is_int($stat['dev'] ?? null)
+                || ! is_int($stat['ino'] ?? null) || $stat['ino'] < 1) {
+                throw new \RuntimeException('Physical inventory root identity is unavailable.');
             }
+            $identity = $stat['dev'] . ':' . $stat['ino'];
             foreach ($canonicalRoots as $existingRoot) {
                 if ($root === $existingRoot || str_starts_with($root, $existingRoot . '/')
                     || str_starts_with($existingRoot, $root . '/')) {
@@ -94,19 +78,12 @@ final class LocalTierPhysicalInventorySet
             $canonicalRoots[$tier] = $root;
             $rootIdentities[$tier] = $identity;
         }
-        foreach ($efsEvidenceByTier as $tier => $evidence) {
-            if (! isset($canonicalRoots[$tier]) || ! $evidence instanceof EfsHostEvidenceReader) {
-                throw new \InvalidArgumentException('Unexpected physical inventory host evidence tier.');
-            }
-        }
-
         $inventories = [];
         foreach ($canonicalRoots as $tier => $root) {
             $inventories[$tier] = new LocalTierPhysicalInventory(
                 $tier,
                 $root,
                 $reader,
-                $efsEvidenceByTier[$tier] ?? null,
             );
         }
         $this->inventories = $inventories;

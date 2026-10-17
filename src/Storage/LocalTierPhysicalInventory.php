@@ -6,14 +6,13 @@ namespace OpsFour\S3Server\Storage;
 
 use Closure;
 use DirectoryIterator;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Runtime\LinuxMountInfo;
 
 /**
  * Sequential, read-only physical inventory of a stopped local tier.
  *
  * This is an inventory slice, not a release gate. PHP pathname operations
- * cannot exclude an adversarial concurrent rename or a hard-NFS syscall stall.
+ * cannot exclude an adversarial concurrent rename.
  */
 final class LocalTierPhysicalInventory
 {
@@ -50,7 +49,6 @@ final class LocalTierPhysicalInventory
         private readonly string $storageTier,
         private readonly string $root,
         ?Closure $mountInfoReader = null,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         if ($storageTier === '' || ! str_starts_with($root, '/') || $root === '/'
             || str_ends_with($root, '/') || str_contains($root, "\0") || str_contains($root, '//')
@@ -60,14 +58,7 @@ final class LocalTierPhysicalInventory
         $this->mountInfoReader = $mountInfoReader ?? self::nativeMountInfo(...);
         $mounts = $this->mounts();
         $this->rootMount = self::mountFor($root, $mounts);
-        if (in_array($this->rootMount['type'], ['nfs', 'nfs4'], true)) {
-            if ($efsEvidence === null || $efsEvidence->storageRoot() !== $root) {
-                throw new \RuntimeException('NFS inventory requires exact host evidence.');
-            }
-            $efsEvidence->assertFresh();
-        } elseif ($efsEvidence !== null) {
-            throw new \RuntimeException('Host evidence does not match a network storage root.');
-        } elseif (! LinuxMountInfo::isQualifiedLocalFilesystem($this->rootMount['type'])) {
+        if (! LinuxMountInfo::isQualifiedLocalFilesystem($this->rootMount['type'])) {
             throw new \RuntimeException('Unsupported physical inventory filesystem.');
         }
         if (realpath($root) !== $root) {
@@ -139,7 +130,7 @@ final class LocalTierPhysicalInventory
         if ($this->complete) {
             try {
                 // An explicit EOF page must still bind the current mount,
-                // root identity and EFS evidence to the completed scan.
+                // root identity to the completed scan.
                 $this->assertPageBoundary();
             } catch (\Throwable) {
                 $this->revoked = true;
@@ -222,7 +213,6 @@ final class LocalTierPhysicalInventory
     /** @return list<array{point: string, identity: string, type: string}> */
     private function assertPageBoundary(): array
     {
-        $this->efsEvidence?->assertFresh();
         $mounts = $this->mounts();
         if (self::mountFor($this->root, $mounts) !== $this->rootMount) {
             throw new \RuntimeException('Physical inventory root mount changed.');

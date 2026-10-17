@@ -73,25 +73,12 @@ final class RequestBodySpool
         $this->coordinator = $coordinator ?? new PostObjectSpoolCoordinator($this->tempDir);
     }
 
-    /** @internal Prove checksum spooling uses the exact qualified ingress resources. */
-    public function assertQualifiedBinding(
-        string $tempDir,
-        int $budgetBytes,
-        PostObjectSpoolCoordinator $coordinator,
-        WorkerPool $pool,
-    ): void {
-        if ($this->tempDir !== $tempDir || $this->budgetBytes !== $budgetBytes
-            || $this->coordinator !== $coordinator || $this->pool !== $pool) {
-            throw new \RuntimeException('EFS request-body spool differs from qualified ingress resources.');
-        }
-    }
-
     /** @internal Closing the worker pool requires every request spool to drain. */
     public function assertIdle(): void
     {
         if ($this->activeHandles !== [] || $this->reservations !== []
             || $this->keys !== [] || $this->plainSizes !== [] || $this->frameIndexes !== []) {
-            throw new \RuntimeException('EFS request-body spool still has active files or keys.');
+            throw new \RuntimeException('Request-body spool still has active files or keys.');
         }
     }
 

@@ -19,14 +19,9 @@ use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Parallel\LocalMultipartPartWriteTask;
 use OpsFour\S3Server\Parallel\LocalMultipartPartWriteTaskResult;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsNodeLocalScratch;
-use OpsFour\S3Server\Runtime\EfsQualificationContext;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 
 /**
- * @internal Isolated one-shot publisher. Handlers may bind it explicitly;
- * production EFS admission still does not construct this worker.
+ * @internal Isolated one-shot publisher. Handlers may bind it explicitly.
  */
 final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBackend
 {
@@ -38,14 +33,12 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
 
     private readonly LocalObjectWriteLeaseAdmission $admission;
 
-    private readonly ?EfsWorkerEvidenceScope $scope;
-
     /** @var list<array{LocalScratchStage, Lock, Worker}> */
     private array $unknownSubmissions = [];
 
     private bool $shuttingDown = false;
 
-    /** Bind a handler's exact metadata store, immutable tier, backend root and host watcher. */
+    /** Bind a handler's exact metadata store, immutable tier and backend root. */
     public function assertBoundTo(MetadataStore $metadata, StorageBackend $backend, string $storageTier): void
     {
         $inner = $backend;
@@ -54,11 +47,9 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         }
         if ($metadata !== $this->intents || $storageTier !== $this->storageTier
             || ! $inner instanceof FilesystemBackend
-            || $inner->getBasePath() !== $this->root
-            || $inner->hostEvidenceReader() !== $this->evidence) {
+            || $inner->getBasePath() !== $this->root) {
             throw new \InvalidArgumentException('Multipart writer is not bound to this exact metadata store, tier and filesystem.');
         }
-        $this->evidence?->assertFresh();
     }
 
     public function __construct(
@@ -69,32 +60,11 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         int $budgetBytes = 10_737_418_240,
         ?WorkerPool $budgetPool = null,
         private readonly ?LocalObjectWriteIo $workerIo = null,
-        private readonly ?EfsHostEvidenceReader $evidence = null,
-        ?EfsQualificationContext $qualification = null,
-        ?EfsNodeLocalScratch $qualifiedScratch = null,
         ?WorkerPool $writePool = null,
     ) {
-        if ($evidence !== null) {
-            $evidence->assertFresh();
-            if ($qualification === null || $qualifiedScratch === null || $writePool !== null
-                || $storageRoot !== $evidence->storageRoot()
-                || $storageRoot !== $qualification->storageRoot()) {
-                throw new \InvalidArgumentException('Multipart writer needs the exact qualified EFS root and watcher.');
-            }
-            $qualification->assertHostEvidenceReader($evidence);
-            $qualifiedScratch->assertBoundTo($qualification);
-            if ($scratchDirectory !== $qualifiedScratch->path() || $budgetBytes !== $qualifiedScratch->budgetBytes()) {
-                throw new \InvalidArgumentException('Multipart writer needs its qualified node-local scratch and budget.');
-            }
-            $root = $storageRoot;
-        } else {
-            if ($qualification !== null || $qualifiedScratch !== null) {
-                throw new \InvalidArgumentException('Multipart qualification requires host evidence.');
-            }
-            $root = realpath($storageRoot);
-            if ($root === false || ! is_dir($root)) {
-                throw new \InvalidArgumentException('Multipart writer root does not exist.');
-            }
+        $root = realpath($storageRoot);
+        if ($root === false || ! is_dir($root)) {
+            throw new \InvalidArgumentException('Multipart writer root does not exist.');
         }
         $scratch = realpath($scratchDirectory);
         if ($scratch === false || $scratch === $root || str_starts_with($scratch, rtrim($root, '/') . '/')
@@ -102,7 +72,6 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             throw new \InvalidArgumentException('Multipart scratch and tier must be separate from the storage root.');
         }
         $this->root = rtrim($root, '/');
-        $this->scope = $evidence?->workerScope();
         $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
         $this->writePool = $writePool ?? new ContextWorkerPool(2);
         $this->admission = new LocalObjectWriteLeaseAdmission(2);
@@ -144,7 +113,6 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         try {
             $cancellation?->throwIfRequested();
             $this->assertActive();
-            $this->evidence?->assertFresh();
             $permit = $this->admission->acquire();
             $worker = $this->checkoutWorker($cancellation);
             $physicalLimit = MultipartPartSize::MAX_BYTES
@@ -166,7 +134,6 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             }
             $cancellation?->throwIfRequested();
             $this->assertActive();
-            $this->evidence?->assertFresh();
             $this->intents->reserveLocalMultipartPartWriteIntent($bucket, $generation, $this->storageTier, $uploadId, $path);
             $reserved = true;
             $dispatchId = bin2hex(random_bytes(16));
@@ -175,7 +142,6 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             }
             $cancellation?->throwIfRequested();
             $this->assertActive();
-            $this->evidence?->assertFresh();
         } catch (\Throwable $error) {
             if ($reserved) {
                 try {
@@ -220,14 +186,13 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 $stage->size,
                 $stage->sha256,
                 $this->workerIo,
-                $this->scope,
             ))->getFuture();
         } catch (\Throwable $error) {
             // A failed submission may still have reached the worker.
             $this->unknownSubmissions[] = [$stage, $permit, $worker];
             return new LocalMultipartPartWriteOutcome($path, LocalMultipartPartWriteOutcome::UNCERTAIN, $dispatchId, null, $error);
         }
-        // A Future can fail because IPC died while a hard-NFS child is still
+        // A Future can fail because IPC died while a child process is still
         // alive. Keep scratch, its byte reservation and this worker handle in
         // that case; only a returned task result proves the child finished.
         $future->catch(function (\Throwable $error) use ($stage, $permit, $worker): null {
@@ -251,7 +216,6 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 throw new \RuntimeException('Multipart worker returned an invalid result.');
             }
             if ($result->result !== null) {
-                $this->evidence?->assertFresh();
                 return new LocalMultipartPartWriteOutcome($path, LocalMultipartPartWriteOutcome::COMPLETED, $dispatchId, $result->result, null);
             }
             $error = new \RuntimeException(($result->failureClass ?? 'Multipart worker failure') . ': '

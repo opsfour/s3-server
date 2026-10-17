@@ -12,8 +12,6 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Parallel\LocalObjectSealTask;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 
 use function Amp\async;
 use function Amp\delay;
@@ -29,15 +27,12 @@ final readonly class LocalObjectWriteIntentReconciler
 
     private string $root;
 
-    private ?EfsWorkerEvidenceScope $efsWorkerScope;
-
     public function __construct(
         private ObjectWriteIntentStore $metadata,
         StorageTierRegistry $tiers,
         private string $tierName,
         ?LocalObjectWriteIo $io = null,
         private ?WorkerPool $sealPool = null,
-        private ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $backend = $tiers->tier($tierName)->backend;
         while ($backend instanceof ObservedStorageBackend) {
@@ -47,23 +42,12 @@ final readonly class LocalObjectWriteIntentReconciler
             throw new \InvalidArgumentException('Object write reconciliation requires a local filesystem tier.');
         }
 
-        if ($efsEvidence !== null) {
-            $efsEvidence->assertFresh();
-            if ($backend->getBasePath() !== $efsEvidence->storageRoot()
-                || $backend->hostEvidenceReader() !== $efsEvidence) {
-                throw new \InvalidArgumentException('Object seal backend differs from EFS host evidence.');
-            }
-            // The qualification preflight owns the hard-NFS root check.
-            $root = $efsEvidence->storageRoot();
-        } else {
-            $root = realpath($backend->getBasePath());
-            if ($root === false) {
-                throw new \InvalidArgumentException('Local object storage root must exist.');
-            }
+        $root = realpath($backend->getBasePath());
+        if ($root === false) {
+            throw new \InvalidArgumentException('Local object storage root must exist.');
         }
         $this->root = $root;
-        $this->efsWorkerScope = $efsEvidence?->workerScope();
-        $this->fence = new LocalObjectWriteFence($root, $io ?? new NativeLocalObjectWriteIo(), $efsEvidence);
+        $this->fence = new LocalObjectWriteFence($root, $io ?? new NativeLocalObjectWriteIo());
     }
 
     public function storageRoot(): string
@@ -104,11 +88,9 @@ final readonly class LocalObjectWriteIntentReconciler
             $this->fence->seal($persisted);
         } else {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $this->submitAndAwaitSealWithHeartbeat($this->sealPool, $persisted, $claimLeaseSeconds);
         }
         $cancellation?->throwIfRequested();
-        $this->efsEvidence?->assertFresh();
         if (! $this->metadata->sealObjectWriteIntent($persisted->attemptId, $persisted->claimGeneration)) {
             throw new \RuntimeException('Object write seal could not be committed in SQL.');
         }
@@ -144,7 +126,7 @@ final readonly class LocalObjectWriteIntentReconciler
             // Pool submission can itself wait for capacity. Start renewing
             // before it and never pass caller cancellation into submission:
             // after acceptance, the worker may still rename the target path.
-            $worker = $pool->submit(new LocalObjectSealTask($this->root, $claimed, $this->efsWorkerScope))->getFuture();
+            $worker = $pool->submit(new LocalObjectSealTask($this->root, $claimed))->getFuture();
             $worker->await();
         } catch (CancelledException $error) {
             $workerCancellation = $error;

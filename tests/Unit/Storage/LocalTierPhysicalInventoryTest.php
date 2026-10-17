@@ -213,10 +213,10 @@ final class LocalTierPhysicalInventoryTest extends TestCase
         }
     }
 
-    public function test_rejects_nfs_without_exact_host_evidence_before_root_stat(): void
+    public function test_rejects_network_filesystem_before_root_stat(): void
     {
         $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('NFS inventory requires exact host evidence');
+        $this->expectExceptionMessage('Unsupported physical inventory filesystem');
         $this->inventory(static fn(): string => "1 0 0:1 / / rw - nfs4 server:/ rw\n");
     }
 

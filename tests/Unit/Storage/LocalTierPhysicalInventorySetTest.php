@@ -121,7 +121,7 @@ final class LocalTierPhysicalInventorySetTest extends TestCase
         }
     }
 
-    public function test_nfs_without_explicit_evidence_fails_before_accessing_missing_root(): void
+    public function test_network_filesystem_fails_before_accessing_missing_root(): void
     {
         $missingRoot = $this->base . '/does-not-exist';
         try {
@@ -129,9 +129,9 @@ final class LocalTierPhysicalInventorySetTest extends TestCase
                 ['HOT' => $missingRoot],
                 mountInfoReader: static fn(): string => "1 0 0:1 / / rw - nfs4 server:/ rw\n",
             );
-            self::fail('NFS root without evidence was accepted.');
+            self::fail('Network filesystem root was accepted.');
         } catch (\RuntimeException $error) {
-            self::assertSame('NFS physical inventory requires exact per-tier host evidence.', $error->getMessage());
+            self::assertSame('Unsupported physical inventory tier mount.', $error->getMessage());
         }
     }
 

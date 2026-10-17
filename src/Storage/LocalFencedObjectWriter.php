@@ -12,15 +12,13 @@ use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Parallel\LocalObjectWriteTask;
 use OpsFour\S3Server\Parallel\LocalObjectWriteTaskResult;
 
 /**
  * Isolated writer for a separately committed SQL intent. The scratch directory
  * must be node-local and private; SSE callers must supply ciphertext. Amp file
- * workers stage bytes, then a process worker performs all EFS write syscalls.
+ * workers stage bytes, then a process worker performs filesystem writes.
  * A canceled dispatched task may still publish later: the caller must retain
  * its SQL intent until the collector seals the exact path.
  * Scratch requires ext-posix, private process ownership and trusted parent
@@ -37,8 +35,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
 
     private readonly LocalObjectWriteLeaseAdmission $workerAdmission;
 
-    private readonly ?EfsWorkerEvidenceScope $efsWorkerScope;
-
     /** @var list<array{LocalScratchStage, Lock, Worker}> */
     private array $unknownSubmissions = [];
 
@@ -52,28 +48,17 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         private readonly ?LocalObjectWriteIo $workerIo = null,
         ?WorkerPool $budgetPool = null,
         ?LocalObjectWriteLeaseAdmission $workerAdmission = null,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
-        if ($efsEvidence !== null) {
-            $efsEvidence->assertFresh();
-            if ($storageRoot !== $efsEvidence->storageRoot()) {
-                throw new \InvalidArgumentException('Local object writer root differs from EFS host evidence.');
-            }
-            // A qualified candidate has already checked this hard-NFS root.
-            // Never repeat realpath/is_dir on the API fiber during wiring.
-            $root = $storageRoot;
-        } else {
-            $root = realpath($storageRoot);
-            if ($root === false || ! is_dir($root)) {
-                throw new \InvalidArgumentException('Local object storage directory must exist.');
-            }
+        $root = realpath($storageRoot);
+        if ($root === false || ! is_dir($root)) {
+            throw new \InvalidArgumentException('Local object storage directory must exist.');
         }
         $scratch = realpath($scratchDirectory);
         if ($scratch === false || ! is_dir($scratch) || ! is_writable($scratch)) {
             throw new \InvalidArgumentException('Local object scratch directory must exist and be writable.');
         }
         if ($scratch === $root || str_starts_with($scratch, rtrim($root, '/') . '/')) {
-            throw new \InvalidArgumentException('Local object scratch must be outside the EFS storage root.');
+            throw new \InvalidArgumentException('Local object scratch must be outside the storage root.');
         }
         $scratchPermissions = @fileperms($scratch);
         if ($scratchPermissions === false || ($scratchPermissions & 0077) !== 0) {
@@ -91,7 +76,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         }
 
         $this->root = rtrim($root, '/');
-        $this->efsWorkerScope = $efsEvidence?->workerScope();
         $this->workerAdmission = $workerAdmission ?? new LocalObjectWriteLeaseAdmission(2);
         $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
         $this->writePool = new ContextWorkerPool(2);
@@ -122,25 +106,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         return $this->storageTier;
     }
 
-    /** Prove that a candidate handler receives this exact guarded writer. */
-    public function assertBoundTo(FilesystemBackend $backend, string $storageTier, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->shuttingDown
-            || $this->root !== $backend->getBasePath()
-            || $this->storageTier !== $storageTier
-            || $this->efsEvidence !== $evidence
-            || $backend->hostEvidenceReader() !== $evidence) {
-            throw new \RuntimeException('Local object writer differs from the qualified filesystem tier and watcher.');
-        }
-        $evidence->assertFresh();
-    }
-
-    /** Final local check before a caller consumes the SQL dispatch token. */
-    public function assertHostEvidenceFresh(): void
-    {
-        $this->efsEvidence?->assertFresh();
-    }
-
     /** @internal Legacy isolated primitive tests; runtime must use publishWithLease(). */
     public function publish(
         ObjectWriteIntent $reserved,
@@ -165,7 +130,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         try {
             $cancellation?->throwIfRequested();
             $this->assertActive();
-            $this->efsEvidence?->assertFresh();
             if ($reserved->state !== 'active' || $reserved->storageTier !== $this->storageTier
                 || $reserved->storagePath !== StoragePath::forPlannedObject(
                     $this->root,
@@ -179,14 +143,13 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             $lease?->assertReadyForStaging($reserved);
             // Reserve one of the two physical worker slots before staging.
             // There is no unbounded pool queue retaining scratch files or
-            // waiting for an EFS syscall held by another upload.
+            // waiting for a filesystem syscall held by another upload.
             $permit = $this->workerAdmission->acquire();
             $writeWorker = $this->checkoutWriteWorker($cancellation);
             $stage = $this->stager->stage($reserved->attemptId, $body, $cancellation);
             $cancellation?->throwIfRequested();
             $this->assertActive();
             if ($lease !== null) {
-                $this->efsEvidence?->assertFresh();
                 $token = $lease->arm();
                 if ($token->attemptId !== $reserved->attemptId
                     || ! preg_match('/^[0-9a-f]{32}$/D', $token->dispatchId)
@@ -234,7 +197,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
                 $stage->size,
                 $stage->sha256,
                 $this->workerIo,
-                $this->efsWorkerScope,
             ))->getFuture();
         } catch (\Throwable $error) {
             // A transport error cannot prove the task was never accepted.
@@ -244,7 +206,7 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             return LocalObjectWriteOutcome::uncertain($reserved, $error);
         }
         // A resolved task result proves the worker has stopped using its
-        // scratch input. An IPC error does not: a hard-NFS child may still
+        // scratch input. An IPC error does not: a child process may still
         // hold the file open after Amp has sent it SIGKILL. Keep its byte
         // reservation and worker slot until shutdown joins the worker.
         $future->map(function (mixed $result) use ($stage, $permit): void {
@@ -265,11 +227,6 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
                 throw new \RuntimeException('Local object worker returned an invalid result.');
             }
             if ($worker->result !== null) {
-                try {
-                    $this->efsEvidence?->assertFresh();
-                } catch (\Throwable $error) {
-                    return LocalObjectWriteOutcome::uncertain($reserved, $error);
-                }
                 return LocalObjectWriteOutcome::completed($reserved, $worker->result);
             }
             $error = new \RuntimeException(($worker->failureClass ?? 'Local worker failure') . ': '

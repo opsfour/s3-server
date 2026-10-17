@@ -7,7 +7,6 @@ namespace OpsFour\S3Server\Storage;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -22,7 +21,6 @@ final class RestoreGarbageCollector
         StorageTierRegistry|StorageBackend $hotStorage,
         LoggerInterface $logger = new NullLogger(),
         string $hotTier = 'STANDARD',
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         $this->tiers = $hotStorage instanceof StorageTierRegistry
@@ -30,26 +28,16 @@ final class RestoreGarbageCollector
             : StorageTierRegistry::single($hotStorage, $hotTier);
     }
 
-    public function assertBoundTo(MetadataStore $metadata, StorageTierRegistry $tiers, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->metadata !== $metadata || $this->tiers !== $tiers || $this->efsEvidence !== $evidence) {
-            throw new \RuntimeException('Restore garbage collector differs from the EFS candidate resources.');
-        }
-    }
-
     /**
      * @return array{scanned: int, expired: int, failed: int}
      */
     public function collect(int $limit = 1000, ?\DateTimeImmutable $now = null): array
     {
-        $this->efsEvidence?->assertFresh();
         $now ??= new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $objects = $this->metadata->listExpiredRestoredObjects($now, $limit);
-        $this->efsEvidence?->assertFresh();
         $stats = ['scanned' => count($objects), 'expired' => 0, 'failed' => 0];
 
         foreach ($objects as $object) {
-            $this->efsEvidence?->assertFresh();
             $path = $object->restoredStoragePath;
             if ($path === null || $path === '') {
                 continue;
@@ -58,9 +46,7 @@ final class RestoreGarbageCollector
             try {
                 $restoreTier = RestoredCopyTierResolver::resolve($object, $this->tiers);
                 $bucketGeneration = $object->systemMetadata['bucketGeneration'] ?? null;
-                $this->efsEvidence?->assertFresh();
                 $cleared = $this->metadata->transaction(function () use ($object, $path, $restoreTier, $now, $bucketGeneration): bool {
-                    $this->efsEvidence?->assertFresh();
                     $bucket = $this->metadata->getBucket($object->bucket);
                     if ($bucket === null || ($bucketGeneration !== null && $bucketGeneration !== ''
                         && $bucket->generation !== $bucketGeneration)) {
@@ -110,7 +96,6 @@ final class RestoreGarbageCollector
                     continue;
                 }
 
-                $this->efsEvidence?->assertFresh();
                 StorageGarbageDiscard::afterDelete(
                     $this->metadata,
                     $restoreTier->backend,
@@ -124,7 +109,6 @@ final class RestoreGarbageCollector
                 // stop the sweep; the storage collector can finish it later.
                 throw $e;
             } catch (\Throwable $e) {
-                $this->efsEvidence?->assertFresh();
                 $stats['failed']++;
                 $this->logger->warning('Expired restore cleanup failed.', [
                     'bucket' => $object->bucket,

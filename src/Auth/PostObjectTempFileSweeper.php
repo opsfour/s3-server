@@ -29,14 +29,6 @@ final class PostObjectTempFileSweeper
         $this->tempDir = rtrim($resolved === false ? $directory : $resolved, DIRECTORY_SEPARATOR) ?: DIRECTORY_SEPARATOR;
     }
 
-    /** @internal Prove the inert EFS candidate uses its owned worker pool. */
-    public function assertQualifiedBinding(string $tempDir, WorkerPool $pool): void
-    {
-        if ($this->tempDir !== $tempDir || $this->pool !== $pool) {
-            throw new \RuntimeException('EFS browser POST sweeper differs from qualified ingress scratch.');
-        }
-    }
-
     public function sweepIfDue(): void
     {
         $now = time();

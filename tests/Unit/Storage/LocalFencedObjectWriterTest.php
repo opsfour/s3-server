@@ -820,7 +820,7 @@ final class LocalFencedObjectWriterTest extends TestCase
 
             $pendingThird = async(fn(): LocalObjectWriteOutcome => $writer->publish($third, 'key', new ReadableBuffer('third')));
             delay(0.05);
-            self::assertTrue($pendingThird->isComplete(), 'A saturated EFS worker pool must reject before staging or queuing.');
+            self::assertTrue($pendingThird->isComplete(), 'A saturated worker pool must reject before staging or queuing.');
             self::assertSame(LocalObjectWriteOutcome::BEFORE_DISPATCH, $pendingThird->await()->state);
             self::assertSame([], glob($this->scratch . '/s3fw-put-' . $third->attemptId . '*'));
             self::assertFileDoesNotExist($third->storagePath);

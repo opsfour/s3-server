@@ -331,7 +331,7 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         }
     }
 
-    public function test_same_length_corruption_of_synchronized_efs_temp_never_publishes_part(): void
+    public function test_same_length_corruption_of_synchronized_temp_never_publishes_part(): void
     {
         $directory = sys_get_temp_dir() . '/s3-part-worker-' . bin2hex(random_bytes(8));
         $root = $directory . '/storage';

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use Closure;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Runtime\LinuxMountInfo;
 
 /**
@@ -27,7 +26,6 @@ final class NodeLocalPhysicalInventorySet
     /**
      * @param list<array{kind: string, root: string}> $localRoots
      * @param array<string, string> $tierRoots Complete configured local-tier roots.
-     * @param array<string, EfsHostEvidenceReader> $efsEvidenceByTier
      * @param Closure(): (string|false)|null $mountInfoReader
      * @param (Closure(string): (array{dev: int, ino: int}|false))|null $localRootIdentityReader Test seam.
      */
@@ -35,7 +33,6 @@ final class NodeLocalPhysicalInventorySet
         string $hostIdentity,
         array $localRoots,
         array $tierRoots,
-        array $efsEvidenceByTier = [],
         ?Closure $mountInfoReader = null,
         ?Closure $localRootIdentityReader = null,
     ) {
@@ -43,12 +40,6 @@ final class NodeLocalPhysicalInventorySet
             || $localRoots === [] || ! array_is_list($localRoots) || $tierRoots === []) {
             throw new \InvalidArgumentException('Node-local inventory requires a host and explicit roots.');
         }
-        foreach ($efsEvidenceByTier as $tier => $_evidence) {
-            if (! array_key_exists($tier, $tierRoots)) {
-                throw new \InvalidArgumentException('Node-local inventory evidence belongs to an unknown tier.');
-            }
-        }
-
         $reader = $mountInfoReader ?? self::nativeMountInfo(...);
         $mountInfo = $reader();
         if (! is_string($mountInfo) || $mountInfo === '' || strlen($mountInfo) > self::MAX_MOUNTINFO_BYTES) {
@@ -80,7 +71,6 @@ final class NodeLocalPhysicalInventorySet
         // dev+inode alias checks across both tier and node-local roots.
         $guard = new LocalTierPhysicalInventorySet(
             $guardRoots,
-            $efsEvidenceByTier,
             $reader,
             $localRootIdentityReader,
         );

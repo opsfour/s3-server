@@ -17,7 +17,6 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Metadata\QueueLease;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -35,7 +34,6 @@ final class TierTransitionExecutor
         private readonly bool $deleteSourceAfterCommit = true,
         private readonly float $leaseRenewalIntervalSeconds = 100.0,
         private readonly ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($this->leaseRenewalIntervalSeconds)
@@ -48,18 +46,6 @@ final class TierTransitionExecutor
         }
     }
 
-    public function assertBoundTo(
-        MetadataStore $metadata,
-        StorageTierRegistry $tiers,
-        EfsHostEvidenceReader $evidence,
-        ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
-    ): void {
-        if ($this->metadata !== $metadata || $this->tiers !== $tiers || $this->efsEvidence !== $evidence
-            || $this->localFencedWriter !== $localFencedWriter) {
-            throw new \RuntimeException('Tier transition executor differs from the EFS candidate resources.');
-        }
-    }
-
     /**
      * Counters describe this worker's claimed attempts, not authoritative SQL
      * queue status. "completed" also includes stale or lost-lease claims.
@@ -69,7 +55,6 @@ final class TierTransitionExecutor
      */
     public function processNext(int $limit = 100, ?Cancellation $cancellation = null): array
     {
-        $this->efsEvidence?->assertFresh();
         $stats = [
             'processed' => 0,
             'completed' => 0,
@@ -80,13 +65,11 @@ final class TierTransitionExecutor
         $limit = max(1, $limit);
         while ($stats['processed'] < $limit) {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $jobs = $this->metadata->dequeueTierTransitionJobs(1);
             if ($jobs === []) {
                 break;
             }
 
-            $this->efsEvidence?->assertFresh();
             $job = $jobs[0];
             $stats['processed']++;
             $result = $this->processDequeuedJob($job);
@@ -103,7 +86,6 @@ final class TierTransitionExecutor
      */
     public function processDequeuedJob(array $job): string
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         $targetBackend = null;
         $targetTier = null;
@@ -151,7 +133,6 @@ final class TierTransitionExecutor
             $sourceStream = null;
             $writeFailure = null;
             try {
-                $this->efsEvidence?->assertFresh();
                 $sourceStream = new TeeReadableStream(
                     $sourceBackend->getObjectByPath($sourcePath),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
@@ -161,7 +142,6 @@ final class TierTransitionExecutor
                     },
                 );
                 if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
-                    $this->efsEvidence?->assertFresh();
                     $fencedTarget = true;
                     $targetBucket = $this->metadata->getBucket($object->bucket);
                     if ($targetBucket === null) {
@@ -176,7 +156,6 @@ final class TierTransitionExecutor
                         'tier_transition',
                     );
                 } else {
-                    $this->efsEvidence?->assertFresh();
                     $writeResult = $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
                 }
             } catch (\Throwable $e) {
@@ -210,9 +189,7 @@ final class TierTransitionExecutor
                 );
             }
 
-            $this->efsEvidence?->assertFresh();
             $metadataCommitted = $this->metadata->transaction(function () use ($id, $job, $object, $sourcePath, $targetStorageClass, $targetTier, $writeResult, $bucketOwner, $targetBucket, $dispatchToken, &$leaseExpiresAt, &$publicationCallbackCompleted): bool {
-                $this->efsEvidence?->assertFresh();
                 if ($bucketOwner !== null) {
                     OwnerWriteLock::acquire($this->metadata, $bucketOwner);
                 }
@@ -307,7 +284,6 @@ final class TierTransitionExecutor
                 && ($this->stringJobValue($job, 'sourceTier') !== $targetTier || $sourcePath !== $writeResult->path)
             ) {
                 try {
-                    $this->efsEvidence?->assertFresh();
                     StorageGarbageDiscard::afterDelete(
                         $this->metadata,
                         $sourceBackend,
@@ -316,7 +292,6 @@ final class TierTransitionExecutor
                         $sourcePath,
                     );
                 } catch (\Throwable $e) {
-                    $this->efsEvidence?->assertFresh();
                     if ($e instanceof CancelledException) {
                         throw $e;
                     }
@@ -333,7 +308,6 @@ final class TierTransitionExecutor
 
             return 'completed';
         } catch (CancelledException $e) {
-            $this->efsEvidence?->assertFresh();
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $writeResult !== null
                 && (! $publicationCallbackCompleted || $targetTier === null || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
                 $this->cleanTarget($job, $targetBackend, $writeResult->path);
@@ -341,7 +315,6 @@ final class TierTransitionExecutor
 
             throw $e;
         } catch (\Throwable $e) {
-            $this->efsEvidence?->assertFresh();
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $writeResult !== null) {
                 if ($publicationCallbackCompleted && $targetTier !== null && $this->targetMayBePublished($job, $targetTier, $writeResult->path)) {
                     // A lost COMMIT acknowledgement cannot authorize removal
@@ -387,9 +360,7 @@ final class TierTransitionExecutor
         ?string $bucketOwner,
         float &$leaseExpiresAt,
     ): ?ObjectInfo {
-        $this->efsEvidence?->assertFresh();
         return $this->metadata->transaction(function () use ($job, $sourcePath, $targetTier, $bucketOwner, &$leaseExpiresAt): ?ObjectInfo {
-            $this->efsEvidence?->assertFresh();
             if ($bucketOwner !== null) {
                 OwnerWriteLock::acquire($this->metadata, $bucketOwner);
             }
@@ -425,7 +396,6 @@ final class TierTransitionExecutor
                 return null;
             }
 
-            $this->efsEvidence?->assertFresh();
             $this->metadata->updateObjectPlacement(
                 bucket: $object->bucket,
                 key: $object->key,
@@ -608,7 +578,6 @@ final class TierTransitionExecutor
      */
     private function cleanTarget(array $job, StorageBackend $targetBackend, string $path): void
     {
-        $this->efsEvidence?->assertFresh();
         try {
             DurableStorageDelete::run(
                 $this->metadata,
@@ -629,7 +598,6 @@ final class TierTransitionExecutor
     /** @param array<string, mixed> $job */
     private function targetMayBePublished(array $job, string $targetTier, string $path): bool
     {
-        $this->efsEvidence?->assertFresh();
         try {
             $bucket = $this->stringJobValue($job, 'bucket');
             $owner = $this->metadata->getBucketOwner($bucket);
@@ -743,7 +711,6 @@ final class TierTransitionExecutor
      */
     private function retryOrDeadLetter(array $job, \Throwable $e, float &$leaseExpiresAt, bool $consumeAttempt = true): string
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         $attempts = (int) ($job['attempts'] ?? 0);
         $maxAttempts = max(1, (int) ($job['maxAttempts'] ?? 1));
@@ -814,7 +781,6 @@ final class TierTransitionExecutor
                 return 'completed';
             }
         } catch (\Throwable) {
-            $this->efsEvidence?->assertFresh();
             // The queue state is authoritative for retry/dead-letter handling.
         }
 
@@ -843,7 +809,6 @@ final class TierTransitionExecutor
     /** @param array<string, mixed> $job */
     private function renewOwnedLease(array $job, float &$currentLease, ?float $newLease = null): bool
     {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         // An immediate renewal must change the stored value even on drivers
         // that round floating-point timestamps before reporting affected rows.
@@ -877,7 +842,6 @@ final class TierTransitionExecutor
         ?string $targetStoragePath = null,
         ?float $expectedLeaseExpiresAt = null,
     ): bool {
-        $this->efsEvidence?->assertFresh();
         $id = (int) $job['id'];
         if ($expectedLeaseExpiresAt !== null && $this->metadata instanceof FencedQueueStore && isset($job['leaseGeneration'])) {
             return $this->metadata->updateTierTransitionJobStatusLease(

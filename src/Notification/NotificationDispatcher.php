@@ -12,7 +12,6 @@ use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Observability\MetricsCollector;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Security\RequestNetworkContext;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -43,8 +42,6 @@ final class NotificationDispatcher
 
     private int $nextListenerTaskId = 0;
 
-    private bool $efsCandidateSealed = false;
-
     private readonly LoggerInterface $logger;
 
     public function __construct(
@@ -54,7 +51,6 @@ final class NotificationDispatcher
         private readonly int $maxConcurrentListeners = 100,
         private readonly int $maxQueuedListenerTasks = 10_000,
         private readonly ?MetricsCollector $metrics = null,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         if ($this->maxConcurrentListeners < 1) {
             throw new \InvalidArgumentException('Notification listener concurrency must be >= 1.');
@@ -66,16 +62,6 @@ final class NotificationDispatcher
 
         $this->listenerSemaphore = new LocalSemaphore($this->maxConcurrentListeners);
         $this->logger = new FailureIsolatingLogger($logger);
-    }
-
-    /** Prove that an inert EFS candidate uses the exact SQL facade and watcher. */
-    public function assertBoundTo(MetadataStore $metadata, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->metadata !== $metadata || $this->efsEvidence !== $evidence || $this->listeners !== []) {
-            throw new \RuntimeException('Notification dispatcher differs from the EFS candidate resources.');
-        }
-        $evidence->assertFresh();
-        $this->efsCandidateSealed = true;
     }
 
     /**
@@ -90,17 +76,11 @@ final class NotificationDispatcher
      */
     public function listen(string $eventPattern, callable $listener): void
     {
-        if ($this->efsEvidence !== null) {
-            throw new \LogicException('Internal listeners are unavailable for the EFS candidate.');
-        }
         $this->listeners[$eventPattern][] = $listener;
     }
 
     public function removeListeners(?string $eventPattern = null): void
     {
-        if ($this->efsEvidence !== null) {
-            throw new \LogicException('EFS candidate listener registrations are frozen.');
-        }
         if ($eventPattern === null) {
             $this->listeners = [];
 
@@ -129,7 +109,6 @@ final class NotificationDispatcher
         string $ownerId = '',
         string $bucketGeneration = '',
     ): void {
-        $this->assertCandidateReady();
         $event = $this->createEvent(
             name: $eventName,
             bucket: $bucket,
@@ -190,14 +169,12 @@ final class NotificationDispatcher
 
     public function enqueueWebhooks(S3Event $event): void
     {
-        $this->assertCandidateReady();
         // A delayed event must not use the notification configuration of a
         // later bucket with the same name. Unscoped external events can still
         // reach internal listeners, but cannot enqueue a webhook.
         if ($event->bucketGeneration === '') {
             return;
         }
-        $this->assertCandidateReady();
         $bucketInfo = $this->metadata->getBucket($event->bucket);
         if ($bucketInfo === null || $bucketInfo->generation !== $event->bucketGeneration) {
             return;
@@ -208,11 +185,8 @@ final class NotificationDispatcher
         // It makes queue IDs comparable for one key even when different nodes
         // enqueue the events. Re-read the bucket and its config after locking:
         // both may have changed since the event was created.
-        $this->assertCandidateReady();
         $queued = $this->metadata->transaction(function () use ($event, $bucketOwnerId): int {
-            $this->assertCandidateReady();
             OwnerWriteLock::acquire($this->metadata, $bucketOwnerId);
-            $this->assertCandidateReady();
             $current = $this->metadata->getBucket($event->bucket);
             if ($current === null || $current->ownerId !== $bucketOwnerId
                 || $current->generation !== $event->bucketGeneration) {
@@ -220,7 +194,6 @@ final class NotificationDispatcher
             }
 
             $destinations = [];
-            $this->assertCandidateReady();
             foreach ($this->metadata->getBucketNotification($event->bucket) as $config) {
                 if (! $this->eventsMatch($event->name, $config['events'])) {
                     continue;
@@ -259,7 +232,6 @@ final class NotificationDispatcher
             $sequencer = null;
             foreach ($destinations as $config) {
                 $payload = $this->eventPayload($event, $bucketOwnerId, $config['id'], $sequencer, $eventTime);
-                $this->assertCandidateReady();
                 $id = $this->metadata->enqueueNotification(
                     $event->bucket,
                     $event->key,
@@ -269,7 +241,6 @@ final class NotificationDispatcher
                 );
                 if ($orderedEvent && $sequencer === null) {
                     $sequencer = strtoupper(str_pad(dechex($id), 16, '0', STR_PAD_LEFT));
-                    $this->assertCandidateReady();
                     $this->metadata->updateNotificationPayload(
                         $id,
                         $this->eventPayload($event, $bucketOwnerId, $config['id'], $sequencer, $eventTime),
@@ -309,13 +280,6 @@ final class NotificationDispatcher
 
     public function dispatchInternalEvent(S3Event $event): void
     {
-        // Qualified candidates never admit internal listeners. There is no
-        // callback or SQL to protect here, and post-commit notification cleanup
-        // must not turn an already committed S3 write into an error response.
-        if ($this->efsEvidence !== null && $this->listeners === []) {
-            return;
-        }
-        $this->assertCandidateReady();
         foreach ($this->matchingListeners($event->name) as $pattern => $listener) {
             if ($this->queuedListenerTasks >= $this->maxQueuedListenerTasks) {
                 $this->metrics?->recordNotificationEvent('listener', 'dropped');
@@ -340,7 +304,6 @@ final class NotificationDispatcher
                 $lock = null;
                 try {
                     $lock = $this->listenerSemaphore->acquire();
-                    $this->assertCandidateReady();
                     $listener($event);
                     $this->metrics?->recordNotificationEvent('listener', 'success');
                 } catch (\Throwable $e) {
@@ -478,14 +441,5 @@ final class NotificationDispatcher
         return true;
     }
 
-    private function assertCandidateReady(): void
-    {
-        if ($this->efsEvidence === null) {
-            return;
-        }
-        if (! $this->efsCandidateSealed) {
-            throw new \LogicException('EFS candidate notification dispatcher is not sealed.');
-        }
-        $this->efsEvidence->assertFresh();
-    }
+
 }

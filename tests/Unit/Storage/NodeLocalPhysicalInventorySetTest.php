@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Storage\NodeLocalPhysicalInventorySet;
 use PHPUnit\Framework\TestCase;
 
@@ -227,22 +226,6 @@ final class NodeLocalPhysicalInventorySetTest extends TestCase
         $this->expectExceptionMessage('Node-local inventory requires a qualified local filesystem.');
         $this->inventorySet(fn(): string => "1 0 0:1 / / rw - ext4 /dev/mock rw\n"
             . "2 1 0:2 / {$this->base}/scratch rw - nfs4 server:/ rw\n");
-    }
-
-    public function test_synthetic_scope_cannot_receive_nfs_evidence(): void
-    {
-        // Key validation must precede every evidence method or scratch stat.
-        $evidence = (new \ReflectionClass(EfsHostEvidenceReader::class))->newInstanceWithoutConstructor();
-        $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('evidence belongs to an unknown tier');
-        new NodeLocalPhysicalInventorySet(
-            'private-host-id',
-            [['kind' => 'node_scratch', 'root' => $this->base . '/scratch']],
-            ['HOT' => $this->base . '/tier'],
-            ['__node_local_physical_inventory_0' => $evidence],
-            fn(): string => "1 0 0:1 / / rw - ext4 /dev/mock rw\n"
-                . "2 1 0:2 / {$this->base}/scratch rw - nfs4 server:/ rw\n",
-        );
     }
 
     /**

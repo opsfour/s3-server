@@ -18,7 +18,6 @@ use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -68,7 +67,6 @@ final class LifecycleExecutor
         private readonly ?NotificationDispatcher $notifications = null,
         ?StorageTierRegistry $storageTiers = null,
         private readonly int $multipartMaxAgeSeconds = 604_800,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if ($this->batchSize < 1) {
@@ -91,39 +89,11 @@ final class LifecycleExecutor
         $this->objectLockChecker = new ObjectLockChecker($metadata);
     }
 
-    /** Bind the optional EFS lifecycle worker to its exact SQL facade, tier and watcher. */
-    public function assertBoundTo(MetadataStore $metadata, StorageBackend $storage, StorageTierRegistry $tiers, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->metadata !== $metadata || $this->storage !== $storage
-            || $this->storageTiers !== $tiers || $this->efsEvidence !== $evidence) {
-            throw new \RuntimeException('Lifecycle executor differs from the EFS candidate resources.');
-        }
-    }
-
-    /** The EFS graph must dispatch lifecycle events through its own notifier. */
-    public function assertNotificationDispatcher(NotificationDispatcher $notifications): void
-    {
-        if ($this->notifications !== $notifications) {
-            throw new \RuntimeException('Lifecycle notifications differ from the EFS candidate resources.');
-        }
-    }
-
-    /** Check the pinned local watcher before timer admission or a sweep step. */
-    public function assertAdmissionFresh(): void
-    {
-        try {
-            $this->efsEvidence?->assertFresh();
-        } catch (\RuntimeException) {
-            throw new \OpsFour\S3Server\Exception\OperationAbortedException('EFS lifecycle admission was revoked.');
-        }
-    }
-
     /**
      * Process lifecycle rules for all buckets.
      */
     public function execute(): void
     {
-        $this->assertAdmissionFresh();
         $startedAt = hrtime(true);
         $status = 'completed';
         $lockAcquired = false;
@@ -174,7 +144,6 @@ final class LifecycleExecutor
             $this->leaseHeld = false;
             if ($lockAcquired) {
                 try {
-                    $this->assertAdmissionFresh();
                     $this->metadata->releaseLock('lifecycle:global', $this->lockOwnerId);
                 } catch (\Throwable $e) {
                     $this->logger->warning('Lifecycle lock release failed.', $this->lifecycleContext([
@@ -201,7 +170,6 @@ final class LifecycleExecutor
         if ($this->stopRequested || $this->runnerStopRequested) {
             return;
         }
-        $this->assertAdmissionFresh();
         $backends = [$this->storage];
         foreach ($this->storageTiers->all() as $tier) {
             $backends[] = $tier->backend;
@@ -216,10 +184,6 @@ final class LifecycleExecutor
             }
             $swept[spl_object_id($tempStorage)] = true;
             try {
-                if ($this->stopRequested || $this->runnerStopRequested) {
-                    return;
-                }
-                $this->assertAdmissionFresh();
                 $cleaned = $tempStorage->cleanupStaleTempFiles();
                 if ($cleaned > 0) {
                     $this->logger->info('Lifecycle temp-file cleanup completed.', $this->lifecycleContext([
@@ -254,10 +218,8 @@ final class LifecycleExecutor
         if ($observedBucket === null) {
             return 0;
         }
-        $this->assertAdmissionFresh();
         $startedAt = hrtime(true);
         $staleMultipartActions = $this->cleanupStaleMultipartUploads($observedBucket, $actionBudget);
-        $this->assertAdmissionFresh();
         $rules = $this->metadata->getBucketLifecycle($bucket);
         if ($rules === []) {
             return $staleMultipartActions;
@@ -735,7 +697,6 @@ final class LifecycleExecutor
         $bucketOwner = $observedBucket->ownerId;
 
         return $this->metadata->transaction(function () use ($observedBucket, $object, $targetStorageClass, $targetTier, $bucketOwner, $expectedLatest, $ruleId): bool {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $bucketOwner);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $current = $object->versionId !== null || ! $expectedLatest
@@ -767,7 +728,6 @@ final class LifecycleExecutor
                 return false;
             }
 
-            $this->assertAdmissionFresh();
             $this->metadata->enqueueTierTransitionJob(
                 bucket: $current->bucket,
                 key: $current->key,
@@ -780,7 +740,6 @@ final class LifecycleExecutor
                 lifecycleRuleId: $ruleId,
                 expectedIsLatest: $expectedLatest,
             );
-            $this->assertAdmissionFresh();
             $this->metadata->updateObjectPlacement(
                 bucket: $current->bucket,
                 key: $current->key,
@@ -805,7 +764,6 @@ final class LifecycleExecutor
         $bucketOwner = $observedBucket->ownerId;
 
         $objectToClean = $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $obj, $rule): ObjectInfo|false|null {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $obj->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
@@ -818,7 +776,6 @@ final class LifecycleExecutor
 
             $versioning = $this->metadata->getBucketVersioning($bucket);
             if ($versioning === 'Enabled') {
-                $this->assertAdmissionFresh();
                 $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId);
 
                 return null;
@@ -835,14 +792,12 @@ final class LifecycleExecutor
                     $this->objectLockChecker->checkProtection($bucket, $obj->key, 'null');
                     $this->enqueueStoredDataCleanup($replacedObject);
                 }
-                $this->assertAdmissionFresh();
                 $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId, suspended: true);
 
                 return $replacedObject;
             }
 
             $this->enqueueStoredDataCleanup($current);
-            $this->assertAdmissionFresh();
             $this->metadata->deleteObjectMetadata($bucket, $obj->key);
 
             return $current;
@@ -870,7 +825,6 @@ final class LifecycleExecutor
         $versionId = $object->versionId ?? 'null';
 
         $deleted = $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $object, $rule, $versionId): ObjectInfo|false|null {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $object->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
@@ -888,7 +842,6 @@ final class LifecycleExecutor
 
             $this->enqueueStoredDataCleanup($current);
 
-            $this->assertAdmissionFresh();
             return $this->metadata->deleteObjectVersion($bucket, $object->key, $versionId);
         });
 
@@ -931,7 +884,6 @@ final class LifecycleExecutor
         }
 
         return $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $marker, $rule): bool {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $marker->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
@@ -948,7 +900,6 @@ final class LifecycleExecutor
                 return false;
             }
 
-            $this->assertAdmissionFresh();
             return $this->metadata->deleteObjectVersion($bucket, $marker->key, $marker->versionId) !== null;
         });
     }
@@ -979,7 +930,6 @@ final class LifecycleExecutor
     {
         foreach ($this->storedDataLocations($object) as [$backend, $tier, $path]) {
             try {
-                $this->assertAdmissionFresh();
                 $this->assertNotStopping();
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
                     $this->metadata,
@@ -1009,7 +959,6 @@ final class LifecycleExecutor
     private function enqueueStoredDataCleanup(ObjectInfo $object): void
     {
         foreach ($this->storedDataLocations($object) as [, $tier, $path]) {
-            $this->assertAdmissionFresh();
             $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path);
         }
     }
@@ -1046,7 +995,6 @@ final class LifecycleExecutor
             'count' => $count,
         ] + $context));
 
-        $this->assertAdmissionFresh();
         $this->notifications?->dispatchEvent(new S3Event(
             name: 's3:Lifecycle:ActionApplied',
             bucket: $bucket,
@@ -1096,7 +1044,6 @@ final class LifecycleExecutor
      */
     private function checkpoint(BucketInfo $observedBucket, array $rule, string $action): ?array
     {
-        $this->assertAdmissionFresh();
         BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
 
         return $this->metadata->getLifecycleCheckpoint($observedBucket->name, $this->ruleId($rule), $action);
@@ -1107,10 +1054,8 @@ final class LifecycleExecutor
     {
         $this->renewLeaseIfNeeded();
         $this->metadata->transaction(function () use ($observedBucket, $rule, $action, $object): void {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
-            $this->assertAdmissionFresh();
             $this->metadata->putLifecycleCheckpoint(
                 $observedBucket->name,
                 $this->ruleId($rule),
@@ -1126,10 +1071,8 @@ final class LifecycleExecutor
     {
         $this->renewLeaseIfNeeded();
         $this->metadata->transaction(function () use ($observedBucket, $rule, $action, $key, $uploadId): void {
-            $this->assertAdmissionFresh();
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
-            $this->assertAdmissionFresh();
             $this->metadata->putLifecycleCheckpoint(
                 $observedBucket->name,
                 $this->ruleId($rule),
@@ -1147,12 +1090,9 @@ final class LifecycleExecutor
     private function clearCheckpointIfPresent(BucketInfo $observedBucket, array $rule, string $action, ?array $checkpoint): void
     {
         if ($checkpoint !== null) {
-            $this->assertAdmissionFresh();
             $this->metadata->transaction(function () use ($observedBucket, $rule, $action): void {
-                $this->assertAdmissionFresh();
                 OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
                 BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
-                $this->assertAdmissionFresh();
                 $this->metadata->deleteLifecycleCheckpoint($observedBucket->name, $this->ruleId($rule), $action);
             });
         }
@@ -1287,7 +1227,6 @@ final class LifecycleExecutor
 
     private function renewLeaseIfNeeded(): void
     {
-        $this->assertAdmissionFresh();
         $this->assertNotStopping();
 
         if (! $this->leaseHeld) {
@@ -1380,7 +1319,6 @@ final class LifecycleExecutor
         ?BucketInfo $observedBucket = null,
         ?array $observedRule = null,
     ): bool {
-        $this->assertAdmissionFresh();
         $this->assertNotStopping();
         $upload = $this->metadata->getMultipartUpload($uploadId);
         if ($upload === null) {
@@ -1397,9 +1335,7 @@ final class LifecycleExecutor
 
         try {
             $bucketOwner = $this->metadata->getBucketOwner($bucket);
-            $this->assertAdmissionFresh();
             $parts = $this->metadata->transaction(function () use ($bucket, $key, $uploadId, $upload, $uploadGeneration, $bucketOwner, $observedBucket, $observedRule, $tier): array|false {
-                $this->assertAdmissionFresh();
                 OwnerWriteLock::acquire(
                     $this->metadata,
                     $bucketOwner ?? '',
@@ -1412,7 +1348,6 @@ final class LifecycleExecutor
                     return false;
                 }
 
-                $this->assertAdmissionFresh();
                 return MultipartCleanup::stage(
                     $this->metadata,
                     $bucket,
@@ -1431,7 +1366,6 @@ final class LifecycleExecutor
             return false;
         }
 
-        $this->assertAdmissionFresh();
         $this->assertNotStopping();
         MultipartCleanup::clean(
             $this->metadata,

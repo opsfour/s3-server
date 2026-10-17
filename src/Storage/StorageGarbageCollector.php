@@ -17,7 +17,6 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -30,7 +29,6 @@ final readonly class StorageGarbageCollector
         private StorageTierRegistry $tiers,
         LoggerInterface $logger = new NullLogger(),
         private float $renewIntervalSeconds = 100.0,
-        private ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0 || $renewIntervalSeconds >= 150) {
@@ -38,17 +36,8 @@ final readonly class StorageGarbageCollector
         }
     }
 
-    /** Bind a candidate recovery worker to the same SQL facade, tier and watcher. */
-    public function assertBoundTo(MetadataStore $metadata, StorageTierRegistry $tiers, EfsHostEvidenceReader $evidence): void
-    {
-        if ($this->metadata !== $metadata || $this->tiers !== $tiers || $this->efsEvidence !== $evidence) {
-            throw new \RuntimeException('Storage garbage collector differs from the EFS candidate resources.');
-        }
-    }
-
     public function collect(int $limit = 100, ?Cancellation $cancellation = null): int
     {
-        $this->efsEvidence?->assertFresh();
         if (! $this->metadata instanceof FencedStorageGarbageStore || ! $this->metadata instanceof StorageGarbageLeaseStore) {
             throw new \LogicException('Storage garbage collection requires generation-fenced lease renewal.');
         }
@@ -78,27 +67,15 @@ final readonly class StorageGarbageCollector
 
         while ($processed < $limit) {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $items = $this->metadata->dequeueStorageGarbage(1);
             if ($items === []) {
                 break;
             }
 
             $item = $items[0];
-            // A claim made while the watcher tripped must remain leased for
-            // recovery; it must not proceed to any physical backend call.
-            $this->efsEvidence?->assertFresh();
             $processed++;
             if (! isset($item['lease_generation'])) {
                 throw new \LogicException('Storage garbage claim has no generation.');
-            }
-            if ($this->efsEvidence !== null && $item['operation'] === 'abort_multipart') {
-                // A legacy directory-wide abort can appear after startup
-                // admission on another node. Never execute it in the qualified
-                // local graph. Leave the claim unacknowledged and do not charge
-                // an attempt, so the same job remains available for operator
-                // migration or a later non-EFS collector after lease expiry.
-                continue;
             }
             $leaseUntil = $item['lease_expires_at'];
             $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($item, &$leaseUntil): bool {
@@ -175,16 +152,6 @@ final readonly class StorageGarbageCollector
                 $failed = $e;
             }
             try {
-                $this->efsEvidence?->assertFresh();
-            } catch (\RuntimeException $error) {
-                try {
-                    $heartbeat->stop();
-                } catch (\Throwable) {
-                    // The SQL claim remains leased for recovery either way.
-                }
-                throw $error;
-            }
-            try {
                 $heartbeat->stop();
             } catch (\Throwable $e) {
                 $this->logger->warning('Storage garbage claim was lost during physical cleanup.', [
@@ -196,7 +163,6 @@ final readonly class StorageGarbageCollector
             }
             $item['lease_expires_at'] = $leaseUntil;
             if ($failed !== null) {
-                $this->efsEvidence?->assertFresh();
                 $attempts = $item['attempts'] + 1;
                 $retryScheduled = $this->retryClaim(
                     $item,
@@ -218,7 +184,6 @@ final readonly class StorageGarbageCollector
                     ]);
                 }
             } elseif ($retainedPartIntent) {
-                $this->efsEvidence?->assertFresh();
                 if ($this->retryClaim(
                     $item,
                     'Uncommitted part path retained for late-write reconciliation.',
@@ -230,7 +195,6 @@ final readonly class StorageGarbageCollector
                     $completed++;
                 }
             } else {
-                $this->efsEvidence?->assertFresh();
                 if ($this->completeClaim($item)) {
                     $completed++;
                 }

@@ -9,8 +9,6 @@ use Amp\Cancellation;
 use Amp\Parallel\Worker\Task;
 use Amp\Sync\Channel;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
-use OpsFour\S3Server\Runtime\EfsWorkerEvidenceScope;
 use OpsFour\S3Server\Storage\LocalObjectWriteFence;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
@@ -28,7 +26,6 @@ final readonly class LocalObjectWriteTask implements Task
         private int $expectedSize,
         private string $expectedSha256,
         private ?LocalObjectWriteIo $io = null,
-        private ?EfsWorkerEvidenceScope $efsEvidenceScope = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): LocalObjectWriteTaskResult
@@ -48,10 +45,7 @@ final readonly class LocalObjectWriteTask implements Task
                 throw new \RuntimeException('Local object worker could not open staging file.');
             }
             $stream = new ReadableResourceStream($resource);
-            $evidence = $this->efsEvidenceScope !== null
-                ? EfsHostEvidenceReader::fromWorkerScope($this->efsEvidenceScope) : null;
-            $evidence?->assertFresh();
-            $result = (new LocalObjectWriteFence($this->root, $trackingIo, $evidence))
+            $result = (new LocalObjectWriteFence($this->root, $trackingIo))
                 ->write($this->intent, $this->key, $stream);
             if ($result->size !== $this->expectedSize
                 || $result->sha256Base64 === null

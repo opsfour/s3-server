@@ -7,7 +7,6 @@ namespace OpsFour\S3Server\Storage;
 use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 
 /**
  * Isolated filesystem primitive for a planned object path. Publication needs
@@ -15,7 +14,7 @@ use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
  * a committed collector claim. The caller must use the intent's CAS methods.
  * All other writers and cleaners must obey the same create-only/seal contract.
  * These blocking syscalls must run in a worker, never on the API event loop;
- * an adapter and an EFS two-host fault gate are required before runtime use.
+ * an adapter and a filesystem fault gate are required before runtime use.
  * The storage namespace must be writable only by trusted service processes:
  * PHP path APIs cannot atomically reject a concurrent directory-symlink swap.
  */
@@ -26,16 +25,7 @@ final readonly class LocalObjectWriteFence
     public function __construct(
         string $basePath,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
-        private ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
-        if ($efsEvidence !== null) {
-            if ($basePath !== $efsEvidence->storageRoot()) {
-                throw new \InvalidArgumentException('Guarded local object root differs from EFS evidence.');
-            }
-            $efsEvidence->assertFresh();
-            $this->root = rtrim($basePath, '/');
-            return;
-        }
         $resolved = realpath($basePath);
         if ($resolved === false || ! is_dir($resolved)) {
             throw new \InvalidArgumentException('Local object storage root must exist.');
@@ -50,7 +40,6 @@ final readonly class LocalObjectWriteFence
 
     public function write(ObjectWriteIntent $intent, string $key, ReadableStream $body): StorageWriteResult
     {
-        $this->efsEvidence?->assertFresh();
         $this->assertWriteIntentPath($intent, $key);
         if ($intent->state !== 'active') {
             throw new \InvalidArgumentException('Object write intent must be active.');
@@ -82,14 +71,12 @@ final readonly class LocalObjectWriteFence
             if (! $this->io->syncFile($file)) {
                 throw new \RuntimeException('Failed to synchronize local object data.');
             }
-            $this->efsEvidence?->assertFresh();
             $writtenInode = @fstat($file);
             if (! is_array($writtenInode)) {
                 throw new \RuntimeException('Failed to verify local object staging file.');
             }
             // Keep a second shared lock through close-to-open verification and
             // link, so the stale-temp sweeper cannot claim the old inode.
-            $this->efsEvidence?->assertFresh();
             $tempLease = @fopen($tempPath, 'rb');
             $leaseInode = $tempLease !== false ? @fstat($tempLease) : false;
             if ($tempLease === false || ! is_array($leaseInode)
@@ -105,7 +92,6 @@ final readonly class LocalObjectWriteFence
 
             // Reopen the synced inode before its create-only link. Reading the
             // original handle would miss a close-to-open visibility failure.
-            $this->efsEvidence?->assertFresh();
             $verified = @fopen($tempPath, 'rb');
             if ($verified === false) {
                 throw new \RuntimeException('Failed to verify local object staging file.');
@@ -119,7 +105,6 @@ final readonly class LocalObjectWriteFence
                 }
                 $physicalCalculator = new ChecksumCalculator();
                 while (! feof($verified)) {
-                    $this->efsEvidence?->assertFresh();
                     $written = @fread($verified, 65536);
                     if ($written === false || ($written === '' && ! feof($verified))) {
                         throw new \RuntimeException('Failed to verify local object staging file.');
@@ -135,7 +120,6 @@ final readonly class LocalObjectWriteFence
                 @fclose($verified);
             }
 
-            $this->efsEvidence?->assertFresh();
             clearstatcache(true, $tempPath);
             if (@filesize($tempPath) !== $size) {
                 throw new \RuntimeException('Local object staging file is incomplete.');
@@ -143,7 +127,6 @@ final readonly class LocalObjectWriteFence
 
             // A failed link can still have succeeded on NFS. Never overwrite or
             // infer a successful publication from an ambiguous response.
-            $this->efsEvidence?->assertFresh();
             if (! $this->io->link($tempPath, $intent->storagePath)) {
                 throw new \RuntimeException('Local create-only object publication is uncertain.');
             }
@@ -174,24 +157,13 @@ final readonly class LocalObjectWriteFence
             }
             // The final path is intentionally never removed here. A committed
             // collector claim must replace it with a permanent same-path seal.
-            if ($this->efsEvidence === null) {
-                @unlink($tempPath);
-            } else {
-                try {
-                    $this->efsEvidence->assertFresh();
-                    @unlink($tempPath);
-                } catch (\Throwable) {
-                    // Leave an orphaned temp path for a healthy node rather
-                    // than issue another hard-NFS call after host evidence loss.
-                }
-            }
+            @unlink($tempPath);
         }
     }
 
     /** Replace the exact path after a committed SQL claim; retain the seal. */
     public function seal(ObjectWriteIntent $claimed): void
     {
-        $this->efsEvidence?->assertFresh();
         StoragePath::assertPlannedObjectIntentPath(
             $this->root,
             $claimed->storagePath,
@@ -224,7 +196,6 @@ final readonly class LocalObjectWriteFence
 
             // NFS may report failure after a successful rename. Verify the
             // unique marker even then; retry is safe while SQL retains claim.
-            $this->efsEvidence?->assertFresh();
             $renamed = $this->io->rename($sealPath, $claimed->storagePath);
             $this->syncDirectoryChain($targetDirectory);
             if (! $this->hasExactMarker($claimed->storagePath, $marker)) {
@@ -236,17 +207,7 @@ final readonly class LocalObjectWriteFence
             if (is_resource($file)) {
                 @fclose($file);
             }
-            if ($this->efsEvidence === null) {
-                @unlink($sealPath);
-            } else {
-                try {
-                    $this->efsEvidence->assertFresh();
-                    @unlink($sealPath);
-                } catch (\Throwable) {
-                    // A healthy collector can reclaim the orphaned seal temp
-                    // after a watcher trip; do not issue another EFS syscall.
-                }
-            }
+            @unlink($sealPath);
         }
     }
 
@@ -276,14 +237,6 @@ final readonly class LocalObjectWriteFence
             clearstatcache(true, $current);
             if (is_link($current) || realpath($current) !== $current) {
                 throw new \RuntimeException('Local object directory escapes its storage root.');
-            }
-            if ($this->efsEvidence !== null) {
-                $entry = @lstat($current);
-                if (! is_array($entry) || ($entry['mode'] & 0o170000) !== 0o040000
-                    || ($entry['mode'] & 0o7777) !== 0o700
-                    || ! function_exists('posix_geteuid') || $entry['uid'] !== posix_geteuid()) {
-                    throw new \RuntimeException('Local object directory must be private and process-owned.');
-                }
             }
         }
     }

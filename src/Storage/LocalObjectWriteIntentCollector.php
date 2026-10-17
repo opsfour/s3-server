@@ -11,13 +11,12 @@ use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
-use OpsFour\S3Server\Runtime\EfsHostEvidenceReader;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
 /**
  * Collects only one configured local tier. SQL claims/CAS remain on the
- * calling fiber; blocking EFS seal calls run in a process worker.
+ * calling fiber; blocking seal calls run in a process worker.
  * Runtime scheduling and PUT/Copy admission are separate integration steps.
  */
 final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBackend
@@ -37,14 +36,13 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
         LoggerInterface $logger = new NullLogger(),
         ?WorkerPool $sealPool = null,
         private readonly float $claimLeaseSeconds = 300.0,
-        private readonly ?EfsHostEvidenceReader $efsEvidence = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0.0 || $claimLeaseSeconds > 86400.0) {
             throw new \InvalidArgumentException('Local object claim lease must be between 0 and 86400 seconds.');
         }
         // Validate the selected backend before allocating a process pool.
-        new LocalObjectWriteIntentReconciler($metadata, $tiers, $tierName, efsEvidence: $efsEvidence);
+        new LocalObjectWriteIntentReconciler($metadata, $tiers, $tierName);
         $this->ownsPool = $sealPool === null;
         $this->sealPool = $sealPool ?? new ContextWorkerPool(2);
         $this->reconciler = new LocalObjectWriteIntentReconciler(
@@ -52,7 +50,6 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
             $tiers,
             $tierName,
             sealPool: $this->sealPool,
-            efsEvidence: $efsEvidence,
         );
     }
 
@@ -76,13 +73,11 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
         // A NULL dispatch_id proves no physical task was ever submitted. Its
         // reservation can be retired without creating a seal at the path.
         $cancellation?->throwIfRequested();
-        $this->efsEvidence?->assertFresh();
         $retired = $this->metadata->retireExpiredUndispatchedObjectWriteIntents($this->tierName, $limit);
 
         $sealed = 0;
         for ($i = $retired; $i < $limit; $i++) {
             $cancellation?->throwIfRequested();
-            $this->efsEvidence?->assertFresh();
             $claimed = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
             if ($claimed === []) {
                 break;

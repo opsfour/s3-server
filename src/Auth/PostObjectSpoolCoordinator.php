@@ -51,22 +51,6 @@ final class PostObjectSpoolCoordinator
         return $this->tempDir;
     }
 
-    /** @internal Prove the inert EFS candidate uses its exact ingress directory. */
-    public function assertQualifiedBinding(string $tempDir): void
-    {
-        if ($this->tempDir !== $tempDir) {
-            throw new \RuntimeException('EFS ingress budget coordinator differs from qualified scratch.');
-        }
-    }
-
-    /** @internal An ingress pool cannot close while local request leases remain. */
-    public function assertIdle(): void
-    {
-        if ($this->activeReservations !== []) {
-            throw new \RuntimeException('EFS ingress still has active temporary reservations.');
-        }
-    }
-
     public function start(string $tempPath): PostObjectSpoolReservation
     {
         if (realpath(dirname($tempPath)) !== $this->tempDir || ! self::isManagedTempPath($tempPath)) {
