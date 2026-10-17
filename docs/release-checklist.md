@@ -64,21 +64,24 @@ gate required by the advertised deployment profile has passed.
 
 ### Current Local Evidence
 
-The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,328
-PHPUnit tests with 33,171 assertions and 232 expected opt-in or environment
-skips in 4:20 with 195 MB peak memory. PHPStan passed, and PHP CS Fixer
-reported zero fixes across 971 files.
+The latest confirmed local `composer quality` run on PHP 8.5.11 passed 4,345
+PHPUnit tests with 33,331 assertions and 232 expected opt-in or environment
+skips in 4:36 with 195 MB peak memory. PHPStan passed, and PHP CS Fixer
+reported zero fixes across 975 files.
 Strict Composer validation, the locked dependency audit, and `git diff --check`
-also passed on the same current candidate. The CI baseline at `6c98e72`
+also passed on the same current candidate. The CI baseline at `d221ac2`
 passed all four jobs in GitHub Actions run
-[38925435830](https://github.com/opsfour/s3-server/actions/runs/38925435830),
+[38975267946](https://github.com/opsfour/s3-server/actions/runs/38975267946),
 including quality, metadata backends, and the lowest and highest dependency
-matrices. That run covers the immutable schema-v2 worker scope and terminal
-worker evidence latch. The later inert parent feedback at `7f6664e` is covered
-by the current local quality run but has no recorded green GitHub Actions
-result yet. Atomic migration of all 14 guarded EFS tasks and seven pool-owning
-runtime components, plus qualification of the exact read-only bind and stale
-replay contract on the intended Linux hosts, remain open. External
+matrices. That run covers the immutable schema-v2 worker scope, terminal worker
+evidence latch, and inert parent feedback. The later schema-v2 worker storage
+adapter and physical EFS revalidation at `85e06aa` are covered by the current
+local quality run but have no recorded green GitHub Actions result yet. Atomic
+migration of all 14 guarded EFS tasks and seven pool-owning runtime components,
+join-capable process-exit evidence or fail-closed serving-process termination,
+and qualification of the exact read-only bind and stale replay contract on the
+intended Linux hosts remain open. Return from `kill()` alone is not accepted as
+worker-exit evidence. External
 PostgreSQL/MySQL execution without skips, the exact PHP 8.4 deployment profile,
 multi-host storage qualification, and the current-source long soak remain
 separate gates.

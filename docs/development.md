@@ -194,12 +194,27 @@ PHPStan level 8 covers both `src/` and `tests/`. CI also installs the lowest
 and highest allowed Composer dependency sets: Laravel 12 with Symfony 7.4 LTS,
 and Laravel 13 with Symfony 8.1 or newer.
 
+## Production EFS Development Boundary
+
+The schema-v2 worker adapter and host reader implement the shared
+storage-evidence abstraction. Physical EFS fence constructors accept only these
+two final trusted implementations. Keep evidence revalidation between
+potentially blocking EFS system calls and after final or failed calls; use the
+evidence-aware directory-sync path whenever a namespace mutation requires a
+durability barrier. Descriptor-only cleanup is permitted only when it performs
+no further path lookup or namespace mutation.
+
+The production path remains closed until all 14 guarded tasks and seven
+pool-owning runtime components migrate atomically. Worker termination also
+needs join-capable process-exit evidence or fail-closed serving-process
+termination; return from `kill()` alone is not sufficient evidence.
+
 ## Current Test Baseline
 
 The complete local package gate for the current `develop` source records:
 
 ```
-4328 tests, 33171 assertions, 232 expected opt-in/environment skips, 0 failures
+4345 tests, 33331 assertions, 232 expected opt-in/environment skips, 0 failures
 ```
 
 External database, remote-storage, multi-host, load-balancer, and long-soak

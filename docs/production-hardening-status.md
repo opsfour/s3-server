@@ -134,9 +134,19 @@ Status: **Partial** — independent HTTP/1 idle timeout remains open.
   registered pool. Failed kills remain visible and retryable, and late pool or
   admission registration fails closed. Native and serialized cancellation and
   unrelated domain task failures are rethrown without revocation.
+- [x] The current unreleased schema-v2 worker storage-evidence adapter shares
+  one storage-evidence abstraction with the host reader while physical fence
+  constructors accept only those two final trusted implementations. All 11 EFS
+  physical primitives revalidate evidence between potentially blocking EFS
+  system calls and after final or failed calls. Directory synchronization is
+  evidence-aware; descriptor-only cleanup remains a bounded exception when no
+  further path lookup or namespace mutation occurs.
 - [ ] All 14 guarded EFS tasks and seven pool-owning runtime components must
-  adopt the latch and parent feedback atomically before production wiring. No
-  task, runtime factory, or listener uses these inert primitives yet.
+  adopt the latch, storage revalidation, and parent feedback atomically before
+  production wiring. No task, runtime factory, or listener uses these inert
+  primitives yet. Pool shutdown must also gain join-capable process-exit
+  evidence or fail closed by terminating the serving process; return from
+  `kill()` alone does not prove that a worker has exited.
 - [x] Standalone, Laravel, and Symfony serve commands arm their SIGINT and
   SIGTERM watchers before opening the listener and remove them when startup
   fails, closing the unhandled-signal window at the listener boundary.

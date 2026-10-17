@@ -62,6 +62,13 @@ The project follows [Semantic Versioning](https://semver.org/).
   retryable, while cancellation and unrelated task failures preserve normal
   handling. The guarded tasks and pool-owning runtime components are not wired
   to it yet.
+- Add a schema-v2 production EFS worker storage-evidence adapter and a shared
+  storage-evidence abstraction. The 11 physical EFS primitives revalidate
+  evidence around potentially blocking filesystem calls, including
+  evidence-aware directory synchronization; physical fence constructors still
+  accept only the two final trusted reader implementations. Descriptor-only
+  cleanup is retained as a bounded exception. Task, runtime-factory, and
+  listener wiring remain open.
 
 ### Changed
 
