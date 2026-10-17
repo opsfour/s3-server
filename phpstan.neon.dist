@@ -3,7 +3,6 @@ parameters:
     treatPhpDocTypesAsCertain: false
     scanFiles:
         - phpstan-laravel-stubs.php
-        - scripts/lib/MultihostNodeBootstrap.php
     stubFiles:
         # Cancellation can change while a fiber is suspended by I/O.
         - phpstan-amp-cancellation.stub
@@ -11,4 +10,3 @@ parameters:
         - src
         - tests
         - scripts/cleanup-production-soak.php
-        - scripts/lib/MultihostNodeBootstrap.php
