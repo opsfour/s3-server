@@ -68,6 +68,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Store newly auto-configured SQLite metadata in `.opsfour/metadata.sqlite`
+  while continuing to use an existing regular legacy `metadata.sqlite` file,
+  leaving the valid `metadata.sqlite` bucket name available for object data.
+- Apply SQLite `synchronous=FULL` to every runtime connection, including when
+  reopening a database whose schema is already current.
 - Preserve an object's S3 `Last-Modified` timestamp when restore state,
   physical placement, transition metadata, or current-version bookkeeping
   changes across SQLite, PostgreSQL, and MySQL. PostgreSQL and MySQL version
