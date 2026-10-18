@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\S3Client;
 use OpsFour\S3Server\Metadata\SqliteMetadataPathResolver;
+use OpsFour\S3Server\Tests\Support\ProductionSoakDiagnostics;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -235,6 +236,8 @@ abstract class S3FunctionalTestCase extends TestCase
             $shutdownDiagnostics = self::shutdownDiagnostics($shutdownOutput);
         }
 
+        self::persistProductionSoakServerLogs();
+
         if (self::$serverStdoutPath !== '') {
             @unlink(self::$serverStdoutPath);
             self::$serverStdoutPath = '';
@@ -337,6 +340,90 @@ abstract class S3FunctionalTestCase extends TestCase
         } finally {
             fclose($socket);
         }
+    }
+
+    protected static function persistProductionSoakFailureDiagnostics(): void
+    {
+        $directory = self::productionSoakDiagnosticsDirectory();
+        if ($directory === null) {
+            return;
+        }
+
+        $processStatus = null;
+        if (self::$serverProcess !== null && is_resource(self::$serverProcess)) {
+            $status = proc_get_status(self::$serverProcess);
+            $processStatus = [
+                'running' => (bool) $status['running'],
+                'pid' => (int) $status['pid'],
+                'exit_code' => (int) $status['exitcode'],
+                'signaled' => (bool) $status['signaled'],
+                'term_signal' => (int) $status['termsig'],
+                'stopped' => (bool) $status['stopped'],
+                'stop_signal' => (int) $status['stopsig'],
+            ];
+        }
+
+        ProductionSoakDiagnostics::persistRuntime($directory, [
+            'captured_at' => gmdate('Y-m-d\TH:i:s\Z'),
+            'process' => $processStatus,
+            'rss_bytes' => self::serverRssBytes(),
+            'probes' => [
+                'live' => self::productionSoakDiagnosticProbe('/.live'),
+                'health' => self::productionSoakDiagnosticProbe('/.health'),
+            ],
+        ]);
+        self::persistProductionSoakServerLogs();
+    }
+
+    /** @return array{result: string, status: int|null} */
+    private static function productionSoakDiagnosticProbe(string $path): array
+    {
+        $socket = @stream_socket_client(
+            sprintf('tcp://%s:%d', self::$host, self::$port),
+            $errno,
+            $error,
+            0.5,
+        );
+        if (! is_resource($socket)) {
+            return ['result' => 'connect_failed', 'status' => null];
+        }
+
+        try {
+            stream_set_timeout($socket, 1);
+            $request = sprintf("GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", $path, self::$host, self::$port);
+            if (@fwrite($socket, $request) !== strlen($request)) {
+                return ['result' => 'write_failed', 'status' => null];
+            }
+            $statusLine = @fgets($socket, 128);
+            if (is_string($statusLine) && preg_match('/\AHTTP\/1\.[01] ([0-9]{3}) /', $statusLine, $matches) === 1) {
+                return ['result' => 'response', 'status' => (int) $matches[1]];
+            }
+
+            return [
+                'result' => stream_get_meta_data($socket)['timed_out'] ? 'response_timeout' : 'no_http_status',
+                'status' => null,
+            ];
+        } finally {
+            fclose($socket);
+        }
+    }
+
+    private static function persistProductionSoakServerLogs(): void
+    {
+        $directory = self::productionSoakDiagnosticsDirectory();
+        if ($directory === null) {
+            return;
+        }
+
+        ProductionSoakDiagnostics::persistLogTail(self::$serverStdoutPath, $directory, 'server.stdout.log');
+        ProductionSoakDiagnostics::persistLogTail(self::$serverStderrPath, $directory, 'server.stderr.log');
+    }
+
+    private static function productionSoakDiagnosticsDirectory(): ?string
+    {
+        $directory = getenv('S3_TEST_PRODUCTION_SOAK_DIAGNOSTICS_DIR');
+
+        return $directory === false || $directory === '' ? null : $directory;
     }
 
     private static function findFreePort(): int

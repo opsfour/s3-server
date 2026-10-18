@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\CommandPool;
 use Aws\ResultInterface;
+use OpsFour\S3Server\Tests\Support\ProductionSoakDiagnostics;
 
 /**
  * Focused reliability tests for streaming, restart persistence, and concurrent
@@ -455,6 +456,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
     private function runCommandPool(array $commands, int $concurrency, ?callable $fulfilled = null, bool $safeFailure = false): void
     {
         $errors = [];
+        $diagnosticErrors = [];
         $pool = new CommandPool(self::$s3, $commands, [
             'concurrency' => $concurrency,
             'fulfilled' => function (ResultInterface $result, int|string $index) use ($fulfilled): void {
@@ -462,14 +464,28 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                     $fulfilled($result, $index);
                 }
             },
-            'rejected' => static function ($reason) use (&$errors, $safeFailure): void {
-                $errors[] = $safeFailure
-                    ? ($reason instanceof \Throwable ? $reason::class : 'non-throwable rejection')
-                    : ($reason instanceof \Throwable ? $reason->getMessage() : (string) $reason);
+            'rejected' => static function ($reason, int|string $index) use (&$errors, &$diagnosticErrors, $safeFailure): void {
+                if ($safeFailure) {
+                    $diagnostic = ProductionSoakDiagnostics::rejection($index, $reason);
+                    $diagnosticErrors[] = $diagnostic;
+                    $errors[] = $diagnostic['exception_class'];
+
+                    return;
+                }
+
+                $errors[] = $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason;
             },
         ]);
 
         $pool->promise()->wait();
+
+        if ($safeFailure && $diagnosticErrors !== []) {
+            $diagnosticsDir = getenv('S3_TEST_PRODUCTION_SOAK_DIAGNOSTICS_DIR');
+            if ($diagnosticsDir !== false && $diagnosticsDir !== '') {
+                ProductionSoakDiagnostics::persistRejections($diagnosticsDir, $diagnosticErrors);
+            }
+            self::persistProductionSoakFailureDiagnostics();
+        }
 
         $this->assertSame([], $errors, $safeFailure ? 'Production soak command pool rejected a request.' : self::serverLogs());
     }
