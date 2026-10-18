@@ -40,9 +40,6 @@ services:
   soak:
     image: ${S3_SOAK_IMAGE:?run through scripts/run-production-soak}
     pull_policy: never
-    build:
-      context: .
-      dockerfile: Dockerfile
     working_dir: /app
     command: ["/bin/sh", "scripts/production-soak-container"]
     user: "${S3_SOAK_HOST_UID:-10001}:${S3_SOAK_HOST_GID:-10001}"

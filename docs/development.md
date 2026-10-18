@@ -240,9 +240,21 @@ scripts/run-local-proxy-gate
 ### Local Production Soak
 
 The release soak runs on Linux with one API process and a bind-mounted local
-filesystem. Install the locked Composer dependencies first, then choose a
-writable state directory on the exact local filesystem being qualified. SQLite
-is the default metadata backend:
+filesystem. Install the locked Composer dependencies first. Build the soak
+image once for the current Dockerfile, or load that image from a trusted cache;
+the runner never builds or pulls it. Its default tag contains the Dockerfile
+SHA-256:
+
+```bash
+dockerfile_sha=$(sha256sum docker/production-soak/Dockerfile | awk '{print $1}')
+docker build \
+  --file docker/production-soak/Dockerfile \
+  --tag "opsfour-s3-production-soak:$dockerfile_sha" \
+  docker/production-soak
+```
+
+Then choose a writable state directory on the exact local filesystem being
+qualified. SQLite is the default metadata backend:
 
 ```bash
 composer install

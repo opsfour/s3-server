@@ -70,37 +70,56 @@ else
 fi
 expected_image="opsfour-s3-production-soak:$dockerfile_hash"
 
+soak_service=$(sed -n '/^  soak:/,/^[^ ]/p' \
+    "$package_dir/docker/production-soak/compose.yml")
+if printf '%s\n' "$soak_service" | grep -Eq '^    build:'; then
+    printf 'Soak service still permits an implicit image build.\n' >&2
+    exit 1
+fi
+printf '%s\n' "$soak_service" | grep -Eq '^    pull_policy: never$'
+
 run_case()
 {
     case_name=$1
     image_present=$2
-    expected_builds=$3
+    expected_status=$3
     requested_image=${4:-}
     case_image=${5:-$expected_image}
     state_dir="$test_root/$case_name"
     log_file="$test_root/$case_name.log"
+    error_file="$test_root/$case_name.err"
 
-    PATH="$mock_bin:$PATH" \
+    if PATH="$mock_bin:$PATH" \
         MOCK_DOCKER_LOG="$log_file" \
         MOCK_IMAGE_PRESENT="$image_present" \
         S3_SOAK_DURATION_SECONDS=1 \
         S3_SOAK_IMAGE="$requested_image" \
         S3_SOAK_STATE_DIR="$state_dir" \
-        "$package_dir/scripts/run-production-soak" start >/dev/null
+        "$package_dir/scripts/run-production-soak" start >/dev/null 2>"$error_file"; then
+        actual_status=success
+    else
+        actual_status=failure
+    fi
+    [ "$actual_status" = "$expected_status" ]
 
     grep -Fqx "image=$case_image command=image inspect $case_image" "$log_file"
     actual_builds=$(awk '/ command=compose .* build soak$/ { count++ } END { print count + 0 }' "$log_file")
-    [ "$actual_builds" -eq "$expected_builds" ]
+    [ "$actual_builds" -eq 0 ]
     if grep -Eq ' command=.*(^| )pull( |$)' "$log_file"; then
         printf 'Runner attempted to pull an image.\n' >&2
         exit 1
     fi
-    grep -Fqx "S3_SOAK_IMAGE=$case_image" "$state_dir/runtime.env"
+    if [ "$expected_status" = success ]; then
+        grep -Fqx "S3_SOAK_IMAGE=$case_image" "$state_dir/runtime.env"
+    else
+        grep -Fq "Production-soak image $case_image is not available locally." "$error_file"
+        [ ! -e "$state_dir/runtime.env" ]
+    fi
 }
 
-run_case cached 1 0
-run_case missing 0 1
-run_case explicit 1 0 registry.example.test/opsfour/s3-soak:cached \
+run_case cached 1 success
+run_case missing 0 failure
+run_case explicit 1 success registry.example.test/opsfour/s3-soak:cached \
     registry.example.test/opsfour/s3-soak:cached
 
 digest_log="$test_root/digest.log"

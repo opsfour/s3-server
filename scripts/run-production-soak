@@ -120,6 +120,14 @@ configure_image()
     export S3_SOAK_IMAGE
 }
 
+require_local_image()
+{
+    if ! docker image inspect "$S3_SOAK_IMAGE" >/dev/null 2>&1; then
+        message="Production-soak image $S3_SOAK_IMAGE is not available locally."
+        fail "$message Build it once or load it from a trusted cache before starting the runner."
+    fi
+}
+
 configure_metadata_dsn()
 {
     case "$S3_SOAK_METADATA_DRIVER" in
@@ -222,6 +230,7 @@ start_soak()
     [ -f "$PACKAGE_DIR/vendor/autoload.php" ] || fail 'Run composer install before starting the production soak.'
     [ -z "$(git -C "$PACKAGE_DIR" status --porcelain --untracked-files=normal)" ] \
         || fail 'The production soak requires a clean package checkout.'
+    require_local_image
 
     if docker ps --all \
         --filter "label=com.docker.compose.project=$PROJECT_NAME" \
@@ -272,9 +281,6 @@ start_soak()
         "$S3_SOAK_HOST_UID" \
         "$S3_SOAK_HOST_GID" > "$RUNTIME_FILE"
 
-    if ! docker image inspect "$S3_SOAK_IMAGE" >/dev/null 2>&1; then
-        compose build soak
-    fi
     if [ "$S3_SOAK_METADATA_DRIVER" != sqlite ]; then
         compose up --detach --wait --wait-timeout 90 "$S3_SOAK_METADATA_DRIVER"
         compose run --rm --no-deps soak php bin/s3-server metadata:migrate
