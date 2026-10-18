@@ -139,7 +139,13 @@ final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
         self::assertSame('AES256', $get['SSECustomerAlgorithm']);
     }
 
-    /** @param array<string, string> $headers */
+    /**
+     * @param array{}|array{
+     *     SSECustomerAlgorithm: string,
+     *     SSECustomerKey: string,
+     *     SSECustomerKeyMD5: string,
+     * } $headers
+     */
     private static function assertSseCReadRejected(string $bucket, string $key, array $headers): void
     {
         foreach (['headObject', 'getObject'] as $operation) {
