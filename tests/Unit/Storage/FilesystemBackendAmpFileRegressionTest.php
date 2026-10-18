@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableStreamIteratorAggregate;
 use Amp\ByteStream\ReadableStream;
+use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\DeferredFuture;
 use Amp\File\Driver\BlockingFilesystemDriver;
 use Amp\File\File;
 use Amp\File\Filesystem;
@@ -233,6 +236,46 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         foreach ($results as $result) {
             self::assertSame(1024, $result->size);
             self::assertFileExists($result->path);
+        }
+    }
+
+    public function test_more_simultaneous_file_opens_than_workers_do_not_stall(): void
+    {
+        $backend = new FilesystemBackend($this->basePath);
+        $backend->createBucket('bucket');
+        $allBodiesStarted = new DeferredFuture();
+        $startedBodies = 0;
+
+        try {
+            $futures = [];
+            for ($i = 0; $i < 10; $i++) {
+                $body = new CoordinatedReadableStream(
+                    str_repeat(chr(65 + $i), 1024),
+                    static function () use (&$startedBodies, $allBodiesStarted): void {
+                        $startedBodies++;
+                        if ($startedBodies === 10) {
+                            $allBodiesStarted->complete();
+                        }
+                        $allBodiesStarted->getFuture()->await();
+                    },
+                );
+                $futures[] = async(static fn() => $backend->putObject(
+                    'bucket',
+                    "worker-limit/{$i}.bin",
+                    $body,
+                ));
+            }
+
+            $results = awaitFutures($futures, new TimeoutCancellation(10));
+
+            self::assertSame(10, $startedBodies);
+            self::assertCount(10, $results);
+            foreach ($results as $result) {
+                self::assertSame(1024, $result->size);
+                self::assertFileExists($result->path);
+            }
+        } finally {
+            $backend->shutdown();
         }
     }
 
@@ -588,5 +631,74 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         }
 
         rmdir($path);
+    }
+}
+
+/**
+ * Holds every concurrent PUT after openFile() until all ten bodies have started.
+ *
+ * @implements \IteratorAggregate<int, string>
+ */
+final class CoordinatedReadableStream implements \IteratorAggregate, ReadableStream
+{
+    use ReadableStreamIteratorAggregate;
+
+    private bool $read = false;
+
+    private bool $closed = false;
+
+    /** @var list<\Closure(): void> */
+    private array $onCloseCallbacks = [];
+
+    public function __construct(
+        private readonly string $payload,
+        private readonly \Closure $beforeFirstRead,
+    ) {}
+
+    public function read(?Cancellation $cancellation = null): ?string
+    {
+        if ($this->closed || $this->read) {
+            $this->close();
+
+            return null;
+        }
+
+        ($this->beforeFirstRead)();
+        $cancellation?->throwIfRequested();
+        $this->read = true;
+
+        return $this->payload;
+    }
+
+    public function isReadable(): bool
+    {
+        return ! $this->closed;
+    }
+
+    public function close(): void
+    {
+        if ($this->closed) {
+            return;
+        }
+        $this->closed = true;
+        foreach ($this->onCloseCallbacks as $callback) {
+            $callback();
+        }
+        $this->onCloseCallbacks = [];
+    }
+
+    public function isClosed(): bool
+    {
+        return $this->closed;
+    }
+
+    public function onClose(\Closure $onClose): void
+    {
+        if ($this->closed) {
+            $onClose();
+
+            return;
+        }
+        $this->onCloseCallbacks[] = $onClose;
     }
 }

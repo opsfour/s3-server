@@ -12,6 +12,7 @@ use Amp\File\FilesystemException;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\TaskFailureError;
 use Amp\Parallel\Worker\TaskFailureException;
+use Amp\Sync\LocalMutex;
 use OpsFour\S3Server\Parallel\LocalMultipartPublishTask;
 use OpsFour\S3Server\Parallel\LocalMultipartAssemblyTask;
 use OpsFour\S3Server\Parallel\LocalMultipartSealTask;
@@ -43,6 +44,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
     private readonly File\Filesystem $metadataFilesystem;
 
+    private readonly LocalMutex $dataFileOpenMutex;
+
     /** @var list<ContextWorkerPool> */
     private array $ownedWorkerPools = [];
 
@@ -73,6 +76,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $fileFilesystem = new File\Filesystem(new ParallelFilesystemDriver($dataPool));
         }
         $this->fileFilesystem = $fileFilesystem;
+        $this->dataFileOpenMutex = new LocalMutex();
 
         if ($metadataFilesystem === null) {
             $metadataPool = new ContextWorkerPool(8);
@@ -159,7 +163,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Write to temp file, computing checksums as data streams in
         $tempFile = null;
         try {
-            $tempFile = $this->fileFilesystem->openFile($tempPath, 'w');
+            $tempFile = $this->openDataFile($tempPath, 'w');
             $this->copyStreamToFile($body, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
@@ -224,7 +228,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             throw new NoSuchKeyException();
         }
 
-        $file = $this->fileFilesystem->openFile($storagePath, 'r');
+        $file = $this->openDataFile($storagePath, 'r');
 
         try {
             if ($offset !== null && $offset > 0) {
@@ -353,7 +357,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Write to temp first
         $tempFile = null;
         try {
-            $tempFile = $this->fileFilesystem->openFile($tempPath, 'w');
+            $tempFile = $this->openDataFile($tempPath, 'w');
             $this->copyStreamToFile($data, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
@@ -518,7 +522,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Concatenate all parts into the temp file
         $outFile = null;
         try {
-            $outFile = $this->fileFilesystem->openFile($tempPath, 'w');
+            $outFile = $this->openDataFile($tempPath, 'w');
             foreach ($parts as $part) {
                 $partNumber = $part['partNumber'];
                 $partPath = $part['storagePath'];
@@ -527,7 +531,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                     throw new InternalErrorException('Multipart part is unavailable in filesystem backend.');
                 }
 
-                $partFile = $this->fileFilesystem->openFile($partPath, 'r');
+                $partFile = $this->openDataFile($partPath, 'r');
                 $readStream = new FileReadableStream($partFile, self::IO_CHUNK_SIZE);
                 $partMd5Context = hash_init('md5');
 
@@ -656,9 +660,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         $srcFile = null;
         $dstFile = null;
         try {
-            $srcFile = $this->fileFilesystem->openFile($srcPath, 'r');
+            $srcFile = $this->openDataFile($srcPath, 'r');
             $readStream = new FileReadableStream($srcFile, self::IO_CHUNK_SIZE);
-            $dstFile = $this->fileFilesystem->openFile($tempPath, 'w');
+            $dstFile = $this->openDataFile($tempPath, 'w');
             $this->copyStreamToFile($readStream, $dstFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
@@ -759,6 +763,21 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
         if ($buffer !== '') {
             $target->write($buffer);
+        }
+    }
+
+    private function openDataFile(string $path, string $mode): File\File
+    {
+        // ParallelFilesystemDriver serializes worker checkout with a Future,
+        // but resumed callers can still observe its worker map before the
+        // previous caller records the checked-out worker. More callers than
+        // the pool size then wait forever for workers that open files already
+        // hold. Serialize only openFile(); file reads and writes stay parallel.
+        $lock = $this->dataFileOpenMutex->acquire();
+        try {
+            return $this->fileFilesystem->openFile($path, $mode);
+        } finally {
+            $lock->release();
         }
     }
 
