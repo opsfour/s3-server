@@ -13,11 +13,16 @@ RUN apt-get update \
         curl \
         mbstring \
         pcntl \
+        pdo_mysql \
         pgsql \
         pdo_pgsql \
         pdo_sqlite \
         simplexml \
         sockets \
+    && pecl install raphf-2.0.2 \
+    && docker-php-ext-enable raphf \
+    && pecl install pq-2.2.3 \
+    && docker-php-ext-enable pq \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 soak

@@ -32,6 +32,8 @@ abstract class S3FunctionalTestCase extends TestCase
 
     protected static string $storagePath = '';
 
+    private static bool $removeStoragePathAfterClass = true;
+
     protected static string $host = '127.0.0.1';
 
     protected static int $port = 0;
@@ -44,9 +46,15 @@ abstract class S3FunctionalTestCase extends TestCase
     {
         parent::setUpBeforeClass();
 
-        // Create a temporary storage directory.
-        self::$storagePath = sys_get_temp_dir() . '/s3-test-' . uniqid();
-        mkdir(self::$storagePath, 0o755, true);
+        self::$removeStoragePathAfterClass = true;
+        $configuredStoragePath = getenv('S3_TEST_STORAGE_PATH');
+        if ($configuredStoragePath === false || trim($configuredStoragePath) === '') {
+            self::$storagePath = sys_get_temp_dir() . '/s3-test-' . uniqid();
+            mkdir(self::$storagePath, 0o755, true);
+        } else {
+            self::$storagePath = self::validateConfiguredStoragePath(trim($configuredStoragePath));
+            self::$removeStoragePathAfterClass = false;
+        }
 
         // Find a free port.
         self::$port = self::findFreePort();
@@ -113,7 +121,7 @@ abstract class S3FunctionalTestCase extends TestCase
         self::stopServer();
 
         // Clean up the storage directory.
-        if (self::$storagePath !== '' && is_dir(self::$storagePath)) {
+        if (self::$removeStoragePathAfterClass && self::$storagePath !== '' && is_dir(self::$storagePath)) {
             self::recursiveDelete(self::$storagePath);
         }
 
@@ -504,6 +512,34 @@ abstract class S3FunctionalTestCase extends TestCase
         } elseif (file_exists($path)) {
             unlink($path);
         }
+    }
+
+    private static function validateConfiguredStoragePath(string $path): string
+    {
+        if (! str_starts_with($path, DIRECTORY_SEPARATOR)) {
+            throw new \InvalidArgumentException('S3_TEST_STORAGE_PATH must be an absolute path.');
+        }
+        if (is_link($path) || ! is_dir($path) || ! is_writable($path)) {
+            throw new \InvalidArgumentException('S3_TEST_STORAGE_PATH must be a writable, existing directory and not a symbolic link.');
+        }
+
+        $resolved = realpath($path);
+        if ($resolved === false || $resolved === DIRECTORY_SEPARATOR) {
+            throw new \InvalidArgumentException('S3_TEST_STORAGE_PATH must resolve to a dedicated directory below the filesystem root.');
+        }
+        if ($resolved !== rtrim($path, DIRECTORY_SEPARATOR)) {
+            throw new \InvalidArgumentException('S3_TEST_STORAGE_PATH must not traverse symbolic links or parent-directory segments.');
+        }
+
+        $entries = scandir($resolved);
+        if ($entries === false) {
+            throw new \RuntimeException('Unable to inspect S3_TEST_STORAGE_PATH.');
+        }
+        if (array_values(array_diff($entries, ['.', '..'])) !== []) {
+            throw new \InvalidArgumentException('S3_TEST_STORAGE_PATH must be empty before the test starts.');
+        }
+
+        return $resolved;
     }
 
     protected static function serverLogs(): string

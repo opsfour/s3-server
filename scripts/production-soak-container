@@ -2,22 +2,63 @@
 
 set -eu
 
+child_pid=''
+interrupted=false
+
+handle_signal()
+{
+    interrupted=true
+    if [ -n "$child_pid" ]; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+    fi
+}
+
+write_result()
+{
+    result_status=$1
+    exit_status=$2
+    finished_epoch=$(date -u '+%s')
+    elapsed=$((finished_epoch - S3_SOAK_STARTED_EPOCH))
+    temporary=/soak-state/result.tmp
+
+    printf 'status=%s\nexit=%s\nqualification=%s\ncommit=%s\nmetadata=%s\nrequested_duration_seconds=%s\nstarted=%s\nfinished=%s\nelapsed_seconds=%s\n' \
+        "$result_status" \
+        "$exit_status" \
+        "$S3_SOAK_QUALIFICATION" \
+        "$S3_SOAK_COMMIT" \
+        "$S3_METADATA_DRIVER" \
+        "$S3_TEST_PRODUCTION_SOAK_SECONDS" \
+        "$S3_SOAK_STARTED_AT" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$elapsed" > "$temporary"
+    mv "$temporary" /soak-state/result
+}
+
+trap handle_signal TERM INT
+
+hard_timeout=$((S3_TEST_PRODUCTION_SOAK_SECONDS + 900))
 status=0
-cleanup_status=0
+timeout --signal=TERM --kill-after=60s "${hard_timeout}s" \
+    php -d memory_limit=768M vendor/bin/phpunit \
+        tests/Functional/ReliabilityStressTest.php \
+        --filter test_opt_in_local_filesystem_production_soak_keeps_memory_temp_files_and_responses_stable \
+        --fail-on-skipped \
+        --do-not-cache-result &
+child_pid=$!
+wait "$child_pid" || status=$?
+child_pid=''
 
-php -d memory_limit=768M vendor/bin/phpunit \
-    tests/Functional/ReliabilityStressTest.php \
-    --filter test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable \
-    --do-not-cache-result || status=$?
-
-php scripts/cleanup-production-soak.php || cleanup_status=$?
-if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
-    status=$cleanup_status
+if [ "$interrupted" = true ]; then
+    write_result aborted 143
+    exit 143
+fi
+if [ "$status" -eq 124 ]; then
+    write_result timeout "$status"
+    exit "$status"
+fi
+if [ "$status" -ne 0 ]; then
+    write_result failed "$status"
+    exit "$status"
 fi
 
-printf 'exit=%d finished=%s commit=%s\n' \
-    "$status" \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    "$S3_SOAK_COMMIT" > /soak-state/result
-
-exit "$status"
+write_result passed 0

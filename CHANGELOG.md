@@ -37,6 +37,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Clarify the production target, shared support-status definitions, and the
   separation between universal release gates and optional deployment profiles.
+- Align the production soak with the supported single-process local-filesystem
+  profile, with selectable SQLite, PostgreSQL, or MySQL metadata and no remote
+  object-storage credentials.
 - Export `bin/s3-server` as the Composer package binary, report the installed
   package version from `--version`, and declare the DOM, libxml, and SimpleXML
   PHP extensions required by the public runtime.

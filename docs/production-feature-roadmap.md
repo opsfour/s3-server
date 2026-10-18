@@ -66,7 +66,8 @@ its own evidence and only then becomes an advertised production profile:
 - a specific remote object-storage provider through Flysystem;
 - a specific shared filesystem and mount configuration;
 - multiple hosts with shared metadata and qualified shared object storage;
-- longer load and soak profiles sized for the intended deployment; and
+- load and soak profiles beyond the bounded 12-hour single-host release gate;
+  and
 - strict at-rest claims that include request spools, multipart staging, swap,
   core dumps, logs, and backups.
 

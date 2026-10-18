@@ -288,7 +288,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $this->assertStringContainsString('ok', strtolower($health));
     }
 
-    public function test_opt_in_production_soak_keeps_memory_temp_files_and_responses_stable(): void
+    public function test_opt_in_local_filesystem_production_soak_keeps_memory_temp_files_and_responses_stable(): void
     {
         if (! self::envBool('S3_TEST_PRODUCTION_SOAK')) {
             self::markTestSkipped('Set S3_TEST_PRODUCTION_SOAK=1 to run the long production soak profile.');
@@ -376,7 +376,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                     'Container memory peak or server process-tree RSS exceeded the production soak hard limit.',
                 );
 
-                // Flysystem workers are started lazily by the first storage batch.
+                // Establish the baseline after the first complete storage batch.
                 if ($memoryBaseline === null) {
                     $memoryBaseline = $memoryPeak;
                 } else {
@@ -490,52 +490,8 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 if (file_put_contents($diagnosticsDir . '/phases.tsv', $line, FILE_APPEND | LOCK_EX) === false) {
                     self::fail('Could not persist production soak phase timing.');
                 }
-                if ($phase === 'get') {
-                    $this->saveProductionSoakReadMetrics($diagnosticsDir, $status === 'ok');
-                }
             }
         }
-    }
-
-    private function saveProductionSoakReadMetrics(string $diagnosticsDir, bool $phaseSucceeded): void
-    {
-        $context = stream_context_create(['http' => ['timeout' => 2]]);
-        $metrics = @file_get_contents(sprintf('http://%s:%d/.metrics', self::$host, self::$port), false, $context);
-        if ($metrics === false) {
-            file_put_contents($diagnosticsDir . '/read-metrics-error', "Metrics endpoint unavailable after GET phase.\n", LOCK_EX);
-            if ($phaseSucceeded) {
-                self::fail('Could not capture production soak read metrics.');
-            }
-
-            return;
-        }
-
-        $safeLines = array_filter(
-            explode("\n", $metrics),
-            static fn(string $line): bool => str_starts_with($line, 's3_server_flysystem_read_first_byte_seconds_')
-                || str_starts_with($line, 's3_server_flysystem_read_stage_seconds_'),
-        );
-        if ($safeLines === [] && getenv('S3_TEST_SERVER_STORAGE_DRIVER') === 'flysystem') {
-            file_put_contents($diagnosticsDir . '/read-metrics-error', "No Flysystem first-byte samples after GET phase.\n", LOCK_EX);
-            if ($phaseSucceeded) {
-                self::fail('Production soak read metrics contain no Flysystem first-byte samples.');
-            }
-
-            return;
-        }
-        $snapshot = implode("\n", $safeLines) . "\n";
-        $temporary = $diagnosticsDir . '/read-first-byte.prom.tmp';
-        $handle = @fopen($temporary, 'x');
-        if ($handle === false) {
-            self::fail('Could not create a production soak metrics snapshot.');
-        }
-        $written = fwrite($handle, $snapshot);
-        fclose($handle);
-        if ($written !== strlen($snapshot) || ! rename($temporary, $diagnosticsDir . '/read-first-byte.prom')) {
-            @unlink($temporary);
-            self::fail('Could not persist production soak first-byte metrics.');
-        }
-        @unlink($diagnosticsDir . '/read-metrics-error');
     }
 
     private static function createDeterministicFile(string $prefix, int $bytes, string $seed = 'A'): string

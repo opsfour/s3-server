@@ -236,3 +236,43 @@ proxy_http modules. Override nonstandard installations with
 ```bash
 scripts/run-local-proxy-gate
 ```
+
+### Local Production Soak
+
+The release soak runs on Linux with one API process and a bind-mounted local
+filesystem. Install the locked Composer dependencies first, then choose a
+writable state directory on the exact local filesystem being qualified. SQLite
+is the default metadata backend:
+
+```bash
+composer install
+export S3_SOAK_STATE_DIR=/var/tmp/opsfour-s3-soak
+scripts/run-production-soak start
+scripts/run-production-soak status
+scripts/run-production-soak cleanup
+```
+
+Select one of the external metadata profiles when that is the intended release
+environment:
+
+```bash
+S3_SOAK_METADATA_DRIVER=postgres \
+S3_SOAK_STATE_DIR=/var/tmp/opsfour-s3-soak-postgres \
+scripts/run-production-soak start
+
+S3_SOAK_METADATA_DRIVER=mysql \
+S3_SOAK_STATE_DIR=/var/tmp/opsfour-s3-soak-mysql \
+scripts/run-production-soak start
+```
+
+The default duration is 43,200 seconds. A failed, timed-out, OOM-killed, or
+manually stopped run is not release evidence. `stop` records an abort and keeps
+the local data and diagnostics. `cleanup` removes the containers, disposable
+database volumes, and test object data while retaining the result and logs in
+the state directory. Run the commands as a non-root user with Docker access and
+use a new, empty, canonical state directory outside the checkout for every run.
+A shorter configured duration is marked `qualification=smoke`; release evidence
+requires `qualification=release`, `status=passed`, at least 43,200 requested and
+elapsed seconds, `source=unchanged`, exit status zero, and `oom=false` from
+`status`. The soak has no remote object-storage dependency and does not qualify
+Flysystem, shared filesystems, multiple processes, or multiple hosts.

@@ -41,25 +41,63 @@ jobs:
       - run: composer test
       - name: Validate production soak runner
         env:
-          S3_INTEGRATION_BUCKET: ci-bucket
-          S3_INTEGRATION_REGION: us-east-1
-          S3_INTEGRATION_ACCESS_KEY: ci-access-key
-          S3_INTEGRATION_SECRET_KEY: ci-secret-key
-          S3_INTEGRATION_ENDPOINT: https://s3.example.com
-          S3_SOAK_BACKING_PREFIX: s3-server/release-soak-ci
           S3_SOAK_COMMIT: ci
+          S3_SOAK_DATA_DIR: /tmp/opsfour-s3-production-soak/data/ci
+          S3_SOAK_HOST_GID: "1001"
+          S3_SOAK_HOST_UID: "1001"
+          S3_SOAK_IMAGE: opsfour-s3-production-soak:ci
+          S3_SOAK_QUALIFICATION: smoke
+          S3_SOAK_STARTED_AT: "2026-01-01T00:00:00Z"
+          S3_SOAK_STARTED_EPOCH: "1767225600"
           S3_SOAK_STATE_DIR: /tmp/opsfour-s3-production-soak
         run: |
           shellcheck scripts/run-production-soak \
             scripts/production-soak-container \
-            scripts/production-soak-watchdog
+            tests/production-soak-image-cache-test.sh
           sh -n scripts/run-production-soak \
             scripts/production-soak-container \
-            scripts/production-soak-watchdog
-          docker compose \
-            --project-name opsfour-s3-production-soak \
-            --file docker/production-soak/compose.yml \
-            config --quiet
+            tests/production-soak-image-cache-test.sh
+          tests/production-soak-image-cache-test.sh
+          if S3_SOAK_STATE_DIR=/ scripts/run-production-soak status; then
+            echo "State-directory root was accepted" >&2
+            exit 1
+          fi
+          if S3_SOAK_STATE_DIR="${RUNNER_TEMP}/.." scripts/run-production-soak status; then
+            echo "State-directory traversal was accepted" >&2
+            exit 1
+          fi
+          if S3_SOAK_IMAGE='invalid image' scripts/run-production-soak start; then
+            echo "Unsafe production-soak image reference was accepted" >&2
+            exit 1
+          fi
+          mkdir "${RUNNER_TEMP}/soak-state-target"
+          ln -s "${RUNNER_TEMP}/soak-state-target" "${RUNNER_TEMP}/soak-state-link"
+          if S3_SOAK_STATE_DIR="${RUNNER_TEMP}/soak-state-link" scripts/run-production-soak status; then
+            echo "State-directory symlink was accepted" >&2
+            exit 1
+          fi
+          mkdir "${RUNNER_TEMP}/soak-state-nonempty"
+          touch "${RUNNER_TEMP}/soak-state-nonempty/marker"
+          if S3_SOAK_STATE_DIR="${RUNNER_TEMP}/soak-state-nonempty" scripts/run-production-soak start; then
+            echo "Non-empty state directory was accepted" >&2
+            exit 1
+          fi
+          for metadata in sqlite postgres mysql; do
+            profiles=()
+            dsn=""
+            if [ "${metadata}" = postgres ]; then
+              profiles=(--profile postgres)
+              dsn="host=postgres port=5432 dbname=s3server user=s3 password=s3audit"
+            elif [ "${metadata}" = mysql ]; then
+              profiles=(--profile mysql)
+              dsn="host=mysql;port=3306;dbname=s3server;user=s3;password=s3audit"
+            fi
+            S3_SOAK_METADATA_DRIVER="${metadata}" S3_SOAK_METADATA_DSN="${dsn}" \
+              docker compose \
+                --project-name opsfour-s3-production-soak \
+                --file docker/production-soak/compose.yml \
+                "${profiles[@]}" config --quiet
+          done
 
   dependency-compatibility:
     name: Dependencies (${{ matrix.name }})

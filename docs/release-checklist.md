@@ -59,8 +59,12 @@ The initial production profile adds these gates:
 - [ ] Exercise signed path-style and virtual-hosted requests directly and
   through a generic reverse proxy or load balancer. Preserve `Host` exactly,
   including the port, and validate trusted-proxy CIDRs.
-- [ ] Run bounded large-object, multipart, concurrent request, S3 Select
-  expansion, and soak profiles sized for the intended first deployment.
+- [ ] Run bounded large-object, multipart, concurrent request, and S3 Select
+  expansion profiles, then one uninterrupted 12-hour local-filesystem soak on
+  Linux with one API process and the metadata backend selected for the release
+  evidence. Do not multiply the 12-hour run across every metadata backend;
+  their integration, contention, recovery, and migration gates remain
+  separate.
 - [ ] Verify access-log, metrics, notification, lifecycle, quota, encryption,
   and cleanup behavior under failure.
 

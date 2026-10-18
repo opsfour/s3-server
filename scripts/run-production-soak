@@ -4,198 +4,419 @@ set -eu
 
 PACKAGE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 COMPOSE_FILE="$PACKAGE_DIR/docker/production-soak/compose.yml"
-STATE_DIR=${S3_SOAK_STATE_DIR:-/tmp/opsfour-s3-production-soak}
+SOAK_DOCKERFILE="$PACKAGE_DIR/docker/production-soak/Dockerfile"
+STATE_DIR=${S3_SOAK_STATE_DIR:-/var/tmp/opsfour-s3-production-soak}
 RUNTIME_FILE="$STATE_DIR/runtime.env"
 RESULT_FILE="$STATE_DIR/result"
 PROJECT_NAME=opsfour-s3-production-soak
-AWAKE_GUARD_LABEL=com.opsfour.s3-production-soak
-AWAKE_GUARD_PLIST="$STATE_DIR/awake-guard.plist"
 
-load_environment()
+fail()
 {
-    if [ ! -f "$PACKAGE_DIR/.env.integration" ]; then
-        printf 'Missing %s/.env.integration\n' "$PACKAGE_DIR" >&2
-        exit 1
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+validate_state_dir()
+{
+    case "$STATE_DIR" in
+        /*) ;;
+        *) fail 'S3_SOAK_STATE_DIR must be an absolute path.' ;;
+    esac
+    case "$STATE_DIR" in
+        *[!A-Za-z0-9_./-]*) fail 'S3_SOAK_STATE_DIR contains unsupported characters.' ;;
+    esac
+    case "$STATE_DIR/" in
+        *'/../'*|*'/./'*) fail 'S3_SOAK_STATE_DIR must not contain parent or current-directory segments.' ;;
+    esac
+    [ "$STATE_DIR" = "${STATE_DIR%/}" ] || fail 'S3_SOAK_STATE_DIR must not end with a slash.'
+    [ "$STATE_DIR" != / ] || fail 'S3_SOAK_STATE_DIR must not be the filesystem root.'
+    case "$STATE_DIR/" in
+        "$PACKAGE_DIR"/*) fail 'S3_SOAK_STATE_DIR must be outside the package checkout.' ;;
+    esac
+}
+
+validate_existing_state_dir()
+{
+    [ -d "$STATE_DIR" ] || fail 'S3_SOAK_STATE_DIR does not exist or is not a directory.'
+    [ ! -L "$STATE_DIR" ] || fail 'S3_SOAK_STATE_DIR must not be a symbolic link.'
+    resolved_state_dir=$(CDPATH='' cd -- "$STATE_DIR" && pwd -P)
+    [ "$resolved_state_dir" = "$STATE_DIR" ] \
+        || fail 'S3_SOAK_STATE_DIR must not traverse symbolic links.'
+}
+
+prepare_state_dir()
+{
+    state_parent=${STATE_DIR%/*}
+    [ -n "$state_parent" ] || state_parent=/
+    [ -d "$state_parent" ] || fail 'The parent of S3_SOAK_STATE_DIR must already exist.'
+    [ ! -L "$state_parent" ] || fail 'The parent of S3_SOAK_STATE_DIR must not be a symbolic link.'
+    resolved_state_parent=$(CDPATH='' cd -- "$state_parent" && pwd -P)
+    [ "$resolved_state_parent" = "$state_parent" ] \
+        || fail 'The parent of S3_SOAK_STATE_DIR must not traverse symbolic links.'
+
+    if [ -e "$STATE_DIR" ]; then
+        validate_existing_state_dir
+    else
+        mkdir -- "$STATE_DIR"
+        validate_existing_state_dir
     fi
+    if find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        fail 'S3_SOAK_STATE_DIR must be empty before a new run.'
+    fi
+}
 
-    set -a
-    # shellcheck disable=SC1091
-    . "$PACKAGE_DIR/.env.integration"
-    set +a
+validate_data_dir()
+{
+    case "$S3_SOAK_DATA_DIR" in
+        "$STATE_DIR"/data/*) ;;
+        *) fail 'Production soak data is outside its state directory.' ;;
+    esac
+    [ -d "$S3_SOAK_DATA_DIR" ] || fail 'Production soak data directory is missing.'
+    resolved_data_dir=$(CDPATH='' cd -- "$S3_SOAK_DATA_DIR" && pwd -P)
+    [ "$resolved_data_dir" = "$S3_SOAK_DATA_DIR" ] \
+        || fail 'Production soak data must not traverse symbolic links.'
+}
 
-    for name in \
-        S3_INTEGRATION_BUCKET \
-        S3_INTEGRATION_REGION \
-        S3_INTEGRATION_ACCESS_KEY \
-        S3_INTEGRATION_SECRET_KEY \
-        S3_INTEGRATION_ENDPOINT
-    do
-        eval "value=\${$name:-}"
-        if [ -z "$value" ]; then
-            printf 'Missing %s in .env.integration\n' "$name" >&2
-            exit 1
+validate_backend()
+{
+    case "$S3_SOAK_METADATA_DRIVER" in
+        sqlite|postgres|mysql) ;;
+        *) fail 'S3_SOAK_METADATA_DRIVER must be sqlite, postgres, or mysql.' ;;
+    esac
+}
+
+validate_image()
+{
+    [ "${#S3_SOAK_IMAGE}" -le 255 ] \
+        || fail 'S3_SOAK_IMAGE must not exceed 255 characters.'
+    case "$S3_SOAK_IMAGE" in
+        ''|*[!A-Za-z0-9._:/-]*)
+            fail 'S3_SOAK_IMAGE contains unsupported characters.'
+            ;;
+        [!A-Za-z0-9]*|*//*|*/|*:)
+            fail 'S3_SOAK_IMAGE is not a safe Docker image reference.'
+            ;;
+    esac
+}
+
+configure_image()
+{
+    if [ -z "${S3_SOAK_IMAGE:-}" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            dockerfile_hash=$(sha256sum "$SOAK_DOCKERFILE" | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+            dockerfile_hash=$(shasum -a 256 "$SOAK_DOCKERFILE" | awk '{print $1}')
+        else
+            fail 'sha256sum or shasum is required to derive the production-soak image tag.'
         fi
-    done
+        case "$dockerfile_hash" in
+            *[!0-9a-f]*|'') fail 'Could not derive the production-soak Dockerfile SHA-256.' ;;
+        esac
+        [ "${#dockerfile_hash}" -eq 64 ] \
+            || fail 'Could not derive the production-soak Dockerfile SHA-256.'
+        S3_SOAK_IMAGE="opsfour-s3-production-soak:$dockerfile_hash"
+    fi
+    validate_image
+    export S3_SOAK_IMAGE
+}
+
+configure_metadata_dsn()
+{
+    case "$S3_SOAK_METADATA_DRIVER" in
+        sqlite) S3_SOAK_METADATA_DSN='' ;;
+        postgres) S3_SOAK_METADATA_DSN='host=postgres port=5432 dbname=s3server user=s3 password=s3audit' ;;
+        mysql) S3_SOAK_METADATA_DSN='host=mysql;port=3306;dbname=s3server;user=s3;password=s3audit' ;;
+    esac
+    export S3_SOAK_METADATA_DSN
 }
 
 compose()
 {
-    docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
+    case "$S3_SOAK_METADATA_DRIVER" in
+        postgres|mysql)
+            docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" \
+                --profile "$S3_SOAK_METADATA_DRIVER" "$@"
+            ;;
+        *)
+            docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
+            ;;
+    esac
 }
 
 load_runtime()
 {
+    validate_state_dir
+    validate_existing_state_dir
     if [ ! -f "$RUNTIME_FILE" ]; then
-        printf 'No production soak runtime state exists.\n' >&2
-        exit 1
+        fail 'No production soak runtime state exists.'
     fi
 
     set -a
     # shellcheck disable=SC1090
     . "$RUNTIME_FILE"
     set +a
+    export S3_SOAK_STATE_DIR="$STATE_DIR"
+    configure_image
+    validate_backend
+    configure_metadata_dsn
 }
 
-start_awake_guard()
+preserve_diagnostics()
 {
-    if [ "$(uname -s)" != Darwin ] \
-        || [ ! -x /usr/bin/caffeinate ] \
-        || [ ! -x /bin/launchctl ]; then
-        return
+    container_id=$(compose ps --all --quiet soak 2>/dev/null || true)
+    if [ -n "$container_id" ]; then
+        docker inspect --format \
+            'container={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' \
+            "$container_id" > "$STATE_DIR/container-status" 2>/dev/null || true
+        compose logs --no-color soak > "$STATE_DIR/soak.log" 2>&1 || true
     fi
-
-    awake_seconds=$((S3_SOAK_DURATION_SECONDS + 1200))
-    awake_domain="gui/$(id -u)"
-    /bin/launchctl bootout "$awake_domain/$AWAKE_GUARD_LABEL" >/dev/null 2>&1 || true
-
-    {
-        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
-        printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
-        printf '%s\n' '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-        printf '%s\n' '<plist version="1.0"><dict>'
-        printf '  <key>Label</key><string>%s</string>\n' "$AWAKE_GUARD_LABEL"
-        printf '%s\n' '  <key>ProgramArguments</key><array>'
-        printf '%s\n' '    <string>/usr/bin/caffeinate</string>'
-        printf '%s\n' '    <string>-i</string>'
-        printf '%s\n' '    <string>-t</string>'
-        printf '    <string>%s</string>\n' "$awake_seconds"
-        printf '%s\n' '  </array>'
-        printf '%s\n' '  <key>RunAtLoad</key><true/>'
-        printf '%s\n' '  <key>KeepAlive</key><false/>'
-        printf '%s\n' '  <key>ProcessType</key><string>Background</string>'
-        printf '%s\n' '</dict></plist>'
-    } > "$AWAKE_GUARD_PLIST"
-
-    if /usr/bin/plutil -lint "$AWAKE_GUARD_PLIST" >/dev/null \
-        && /bin/launchctl bootstrap "$awake_domain" "$AWAKE_GUARD_PLIST"; then
-        printf 'macOS idle sleep blocked for up to %ss while the soak runs.\n' "$awake_seconds"
-    else
-        printf 'Warning: unable to start the macOS awake guard; host sleep invalidates the soak.\n' >&2
+    if [ "$S3_SOAK_METADATA_DRIVER" != sqlite ]; then
+        backend_container_id=$(compose ps --all --quiet "$S3_SOAK_METADATA_DRIVER" 2>/dev/null || true)
+        if [ -n "$backend_container_id" ]; then
+            docker inspect --format \
+                'container={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' \
+                "$backend_container_id" > "$STATE_DIR/$S3_SOAK_METADATA_DRIVER-container-status" 2>/dev/null || true
+            compose logs --no-color "$S3_SOAK_METADATA_DRIVER" \
+                > "$STATE_DIR/$S3_SOAK_METADATA_DRIVER.log" 2>&1 || true
+        fi
     fi
 }
 
-stop_awake_guard()
+write_aborted_result()
 {
-    if [ "$(uname -s)" = Darwin ] && [ -x /bin/launchctl ]; then
-        awake_domain="gui/$(id -u)"
-        /bin/launchctl bootout "$awake_domain/$AWAKE_GUARD_LABEL" >/dev/null 2>&1 || true
-    fi
-    rm -f "$AWAKE_GUARD_PLIST"
+    [ -f "$RESULT_FILE" ] && return
+
+    finished_epoch=$(date -u '+%s')
+    elapsed=$((finished_epoch - S3_SOAK_STARTED_EPOCH))
+    temporary="$RESULT_FILE.tmp"
+    printf 'status=aborted\nexit=143\nqualification=%s\ncommit=%s\nmetadata=%s\nrequested_duration_seconds=%s\nstarted=%s\nfinished=%s\nelapsed_seconds=%s\n' \
+        "$S3_SOAK_QUALIFICATION" \
+        "$S3_SOAK_COMMIT" \
+        "$S3_SOAK_METADATA_DRIVER" \
+        "$S3_SOAK_DURATION_SECONDS" \
+        "$S3_SOAK_STARTED_AT" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$elapsed" > "$temporary"
+    mv "$temporary" "$RESULT_FILE"
 }
 
 start_soak()
 {
-    mkdir -p "$STATE_DIR"
-    chmod 0777 "$STATE_DIR"
-    if docker ps \
+    [ "$(uname -s)" = Linux ] || fail 'The production soak release gate requires Linux.'
+    [ "$(id -u)" -ne 0 ] || fail 'Run the production soak as a non-root Linux user with Docker access.'
+    validate_state_dir
+
+    S3_SOAK_METADATA_DRIVER=${S3_SOAK_METADATA_DRIVER:-sqlite}
+    validate_backend
+    configure_image
+    S3_SOAK_DURATION_SECONDS=${S3_SOAK_DURATION_SECONDS:-43200}
+    case "$S3_SOAK_DURATION_SECONDS" in
+        ''|*[!0-9]*) fail 'S3_SOAK_DURATION_SECONDS must be a positive integer.' ;;
+    esac
+    [ "$S3_SOAK_DURATION_SECONDS" -gt 0 ] || fail 'S3_SOAK_DURATION_SECONDS must be greater than zero.'
+    if [ "$S3_SOAK_DURATION_SECONDS" -ge 43200 ]; then
+        S3_SOAK_QUALIFICATION=release
+    else
+        S3_SOAK_QUALIFICATION=smoke
+    fi
+    [ -f "$PACKAGE_DIR/vendor/autoload.php" ] || fail 'Run composer install before starting the production soak.'
+    [ -z "$(git -C "$PACKAGE_DIR" status --porcelain --untracked-files=normal)" ] \
+        || fail 'The production soak requires a clean package checkout.'
+
+    if docker ps --all \
         --filter "label=com.docker.compose.project=$PROJECT_NAME" \
         --quiet | grep -q .; then
-        printf 'A production soak stack is already running; stop it before starting another.\n' >&2
-        exit 1
+        fail 'A production soak stack already exists; inspect and clean it before starting another.'
+    fi
+    if docker volume ls \
+        --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+        --quiet | grep -q .; then
+        fail 'Production soak database volumes already exist; inspect and remove the stale stack before starting.'
+    fi
+    if docker network ls \
+        --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+        --quiet | grep -q .; then
+        fail 'A production soak network already exists; inspect and remove the stale stack before starting.'
+    fi
+    umask 077
+    prepare_state_dir
+    S3_SOAK_RUN_ID="$(git -C "$PACKAGE_DIR" rev-parse --short HEAD)-$(date -u '+%Y%m%dT%H%M%SZ')"
+    S3_SOAK_DATA_DIR="$STATE_DIR/data/$S3_SOAK_RUN_ID"
+    mkdir -p "$S3_SOAK_DATA_DIR/objects" "$S3_SOAK_DATA_DIR/metadata"
+    validate_data_dir
+    chmod 0700 "$STATE_DIR" "$S3_SOAK_DATA_DIR" \
+        "$S3_SOAK_DATA_DIR/objects" "$S3_SOAK_DATA_DIR/metadata"
+
+    S3_SOAK_COMMIT=$(git -C "$PACKAGE_DIR" rev-parse HEAD)
+    S3_SOAK_STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    S3_SOAK_STARTED_EPOCH=$(date -u '+%s')
+    S3_SOAK_HOST_UID=$(id -u)
+    S3_SOAK_HOST_GID=$(id -g)
+    configure_metadata_dsn
+    export S3_SOAK_COMMIT S3_SOAK_DATA_DIR S3_SOAK_DURATION_SECONDS
+    export S3_SOAK_HOST_GID S3_SOAK_HOST_UID S3_SOAK_IMAGE
+    export S3_SOAK_METADATA_DRIVER S3_SOAK_METADATA_DSN
+    export S3_SOAK_QUALIFICATION
+    export S3_SOAK_STARTED_AT S3_SOAK_STARTED_EPOCH S3_SOAK_STATE_DIR="$STATE_DIR"
+
+    printf 'S3_SOAK_RUN_ID=%s\nS3_SOAK_DURATION_SECONDS=%s\nS3_SOAK_QUALIFICATION=%s\nS3_SOAK_COMMIT=%s\nS3_SOAK_STARTED_AT=%s\nS3_SOAK_STARTED_EPOCH=%s\nS3_SOAK_METADATA_DRIVER=%s\nS3_SOAK_IMAGE=%s\nS3_SOAK_DATA_DIR=%s\nS3_SOAK_HOST_UID=%s\nS3_SOAK_HOST_GID=%s\n' \
+        "$S3_SOAK_RUN_ID" \
+        "$S3_SOAK_DURATION_SECONDS" \
+        "$S3_SOAK_QUALIFICATION" \
+        "$S3_SOAK_COMMIT" \
+        "$S3_SOAK_STARTED_AT" \
+        "$S3_SOAK_STARTED_EPOCH" \
+        "$S3_SOAK_METADATA_DRIVER" \
+        "$S3_SOAK_IMAGE" \
+        "$S3_SOAK_DATA_DIR" \
+        "$S3_SOAK_HOST_UID" \
+        "$S3_SOAK_HOST_GID" > "$RUNTIME_FILE"
+
+    if ! docker image inspect "$S3_SOAK_IMAGE" >/dev/null 2>&1; then
+        compose build soak
+    fi
+    if [ "$S3_SOAK_METADATA_DRIVER" != sqlite ]; then
+        compose up --detach --wait --wait-timeout 90 "$S3_SOAK_METADATA_DRIVER"
+        compose run --rm --no-deps soak php bin/s3-server metadata:migrate
+    fi
+    compose up --detach soak
+
+    sleep 1
+    container_id=$(compose ps --all --quiet soak)
+    [ -n "$container_id" ] || fail 'The production soak container was not created.'
+    running=$(docker inspect --format '{{.State.Running}}' "$container_id")
+    if [ "$running" != true ]; then
+        preserve_diagnostics
+        fail "The production soak container exited during startup; inspect $STATE_DIR."
     fi
 
-    load_environment
-    export S3_SOAK_DURATION_SECONDS="${S3_SOAK_DURATION_SECONDS:-43200}"
-    export S3_SOAK_BACKING_PREFIX="${S3_SOAK_BACKING_PREFIX:-s3-server/release-soak-$(git -C "$PACKAGE_DIR" rev-parse --short HEAD)-$(date -u '+%Y%m%dT%H%M%SZ')}"
-    export S3_SOAK_COMMIT
-    S3_SOAK_COMMIT=$(git -C "$PACKAGE_DIR" rev-parse --short HEAD)
-    export S3_SOAK_STATE_DIR="$STATE_DIR"
-
-    rm -f "$RESULT_FILE"
-    rm -f "$STATE_DIR/watchdog-result"
-    printf 'S3_SOAK_DURATION_SECONDS=%s\nS3_SOAK_BACKING_PREFIX=%s\nS3_SOAK_COMMIT=%s\nS3_SOAK_STATE_DIR=%s\n' \
-        "$S3_SOAK_DURATION_SECONDS" \
-        "$S3_SOAK_BACKING_PREFIX" \
-        "$S3_SOAK_COMMIT" \
-        "$S3_SOAK_STATE_DIR" > "$RUNTIME_FILE"
-
-    compose up --detach --build --wait --wait-timeout 90
-    start_awake_guard
-    printf 'Production soak started in Docker: duration %ss, prefix %s\n' \
-        "$S3_SOAK_DURATION_SECONDS" \
-        "$S3_SOAK_BACKING_PREFIX"
+    printf 'Production soak started: duration=%ss qualification=%s metadata=%s state=%s\n' \
+        "$S3_SOAK_DURATION_SECONDS" "$S3_SOAK_QUALIFICATION" \
+        "$S3_SOAK_METADATA_DRIVER" "$STATE_DIR"
 }
 
 show_status()
 {
-    load_environment
     load_runtime
+    preserve_diagnostics
+    source_ok=true
+    current_commit=$(git -C "$PACKAGE_DIR" rev-parse HEAD)
+    if [ "$current_commit" != "$S3_SOAK_COMMIT" ] \
+        || [ -n "$(git -C "$PACKAGE_DIR" status --porcelain --untracked-files=normal)" ]; then
+        source_ok=false
+        printf 'source=changed\n'
+    else
+        printf 'source=unchanged\n'
+    fi
 
-    container_id=$(compose ps --all --quiet soak)
+    container_id=$(compose ps --all --quiet soak 2>/dev/null || true)
     if [ -n "$container_id" ]; then
-        docker inspect --format 'container={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} memory=1g' "$container_id"
-    elif [ ! -f "$RESULT_FILE" ]; then
-        printf 'not running\n'
+        cat "$STATE_DIR/container-status"
+        running=$(docker inspect --format '{{.State.Running}}' "$container_id")
+        exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_id")
+        oom=$(docker inspect --format '{{.State.OOMKilled}}' "$container_id")
+    else
+        if [ -f "$STATE_DIR/container-status" ]; then
+            saved_container_status=$(cat "$STATE_DIR/container-status")
+            printf '%s\n' "$saved_container_status"
+            case " $saved_container_status " in
+                *' exit=0 '*) exit_code=0 ;;
+                *) exit_code=1 ;;
+            esac
+            case " $saved_container_status " in
+                *' oom=false '*) oom=false ;;
+                *) oom=true ;;
+            esac
+        else
+            printf 'container=missing\n'
+            exit_code=1
+            oom=false
+        fi
+        running=false
     fi
 
     if [ -f "$RESULT_FILE" ]; then
         cat "$RESULT_FILE"
     fi
-    compose logs --tail 20 soak
+    tail -n 20 "$STATE_DIR/soak.log" 2>/dev/null || true
+
+    backend_ok=true
+    if [ "$S3_SOAK_METADATA_DRIVER" != sqlite ]; then
+        backend_status_file="$STATE_DIR/$S3_SOAK_METADATA_DRIVER-container-status"
+        if [ -f "$backend_status_file" ]; then
+            saved_backend_status=$(cat "$backend_status_file")
+            printf 'metadata_%s_%s\n' "$S3_SOAK_METADATA_DRIVER" "$saved_backend_status"
+            case " $saved_backend_status " in
+                *' container=running '*' oom=false '*' health=healthy '*) ;;
+                *) backend_ok=false ;;
+            esac
+        else
+            printf 'metadata_%s_container=missing\n' "$S3_SOAK_METADATA_DRIVER"
+            backend_ok=false
+        fi
+    fi
+
+    result_ok=false
+    if grep -qx 'status=passed' "$RESULT_FILE" 2>/dev/null \
+        && grep -qx "commit=$S3_SOAK_COMMIT" "$RESULT_FILE" \
+        && grep -qx "qualification=$S3_SOAK_QUALIFICATION" "$RESULT_FILE" \
+        && grep -qx "requested_duration_seconds=$S3_SOAK_DURATION_SECONDS" "$RESULT_FILE"; then
+        result_elapsed=$(sed -n 's/^elapsed_seconds=//p' "$RESULT_FILE")
+        case "$result_elapsed" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$result_elapsed" -ge "$S3_SOAK_DURATION_SECONDS" ]; then
+                    result_ok=true
+                fi
+                ;;
+        esac
+    fi
+
+    if [ "$running" = true ] && [ "$source_ok" = true ] && [ "$backend_ok" = true ]; then
+        return 0
+    fi
+    if [ "$source_ok" = true ] && [ "$backend_ok" = true ] \
+        && [ "$oom" = false ] && [ "$exit_code" -eq 0 ] \
+        && [ "$result_ok" = true ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 stop_soak()
 {
-    load_environment
     load_runtime
+    preserve_diagnostics
+    compose stop --timeout 60
+    write_aborted_result
+    preserve_diagnostics
+    printf 'Production soak stopped; diagnostics and data remain in %s.\n' "$STATE_DIR"
+}
 
-    status=0
-    cleanup_status=0
-    down_status=0
-
-    compose stop --timeout 30 soak cleanup || status=$?
-    compose run --rm --no-deps soak php scripts/cleanup-production-soak.php || cleanup_status=$?
-    compose down --volumes --remove-orphans || down_status=$?
-    stop_awake_guard
-
-    if [ "$cleanup_status" -ne 0 ]; then
-        status=$cleanup_status
-    elif [ "$down_status" -ne 0 ]; then
-        status=$down_status
+cleanup_soak()
+{
+    load_runtime
+    preserve_diagnostics
+    container_id=$(compose ps --all --quiet soak 2>/dev/null || true)
+    if [ -n "$container_id" ] \
+        && [ "$(docker inspect --format '{{.State.Running}}' "$container_id")" = true ]; then
+        fail 'The production soak is still running; stop it before cleanup.'
     fi
-
-    if [ "$status" -eq 0 ]; then
-        printf 'Production soak stopped and remote prefix cleaned.\n'
-    else
-        printf 'Production soak stopped with cleanup errors; inspect the remote prefix in %s.\n' \
-            "$RUNTIME_FILE" >&2
-    fi
-
-    return "$status"
+    compose down --volumes --remove-orphans
+    validate_data_dir
+    rm -rf -- "$S3_SOAK_DATA_DIR"
+    printf 'Production soak containers, database volumes, and disposable data removed; evidence remains in %s.\n' \
+        "$STATE_DIR"
 }
 
 case "${1:-}" in
-    start)
-        start_soak
-        ;;
-    status)
-        show_status
-        ;;
-    stop)
-        stop_soak
-        ;;
+    start) start_soak ;;
+    status) show_status ;;
+    stop) stop_soak ;;
+    cleanup) cleanup_soak ;;
     *)
-        printf 'Usage: %s start|status|stop\n' "$0" >&2
+        printf 'Usage: %s start|status|stop|cleanup\n' "$0" >&2
         exit 2
         ;;
 esac
