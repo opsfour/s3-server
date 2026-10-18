@@ -97,9 +97,10 @@ The `S3AttributeMiddleware` sets the resolved operation as a request attribute, 
 Request-path I/O uses PHP Fibers:
 
 - **HTTP** — Amp HTTP Server (event-loop driven)
-- **File I/O** — `amphp/file` with separate bounded pools for open data
-  handles and stateless `mkdir`/rename/stat/delete operations; active uploads
-  therefore cannot starve atomic finalization, and both pools shut down explicitly
+- **File I/O** — `amphp/file` uses separate bounded data and metadata pools;
+  blocking file and directory synchronization, create-only links, and durable
+  deletes run in a dedicated lazy durability worker pool. All owned pools shut
+  down explicitly.
 - **PostgreSQL** — `amphp/postgres` (non-blocking protocol, connection pool)
 - **MySQL** — `amphp/mysql` (non-blocking protocol, connection pool)
 - **SQLite** — PDO (blocking, optionally offloaded to `amphp/parallel` worker pool)
@@ -121,14 +122,17 @@ Storage Path Structure (filesystem backend):
 │   └── ab/cd/<unique-path>
 ├── .parts/<upload-id>/       # Multipart upload parts
 ├── .assemblies/              # Planned multipart completion paths
-└── .tmp/                     # Temporary files for atomic rename
+└── .tmp/                     # Temporary files for durable publication
 ```
 
-The backend writes a temporary file and renames it to a unique final path
-before the handler commits the metadata reference. Readers follow committed
-metadata, so they do not see a partial file. Failed commits require cleanup of
-the unreferenced path. Atomic rename alone does not establish sudden-power-loss
-durability; see [Storage Backends](storage-backends.md#requirements).
+The backend writes and synchronizes a temporary file, creates a unique final
+path with a create-only hard link, synchronizes the target directory, and then
+durably removes the temporary name before the handler commits the metadata
+reference. Readers follow committed metadata, so they do not see a partial
+file. Failed commits require cleanup of the unreferenced path. Qualification
+for sudden power loss still requires the exact filesystem and mount to pass
+the crash-recovery gate; see
+[Storage Backends](storage-backends.md#requirements).
 
 ## Encryption Architecture
 

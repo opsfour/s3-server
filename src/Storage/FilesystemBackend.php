@@ -991,7 +991,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                     } catch (CancelledException $e) {
                         throw $e;
                     } catch (\Throwable) {
-                        // Leave failed cleanup for a later sweep.
+                        // Do not count uncertain cleanup as successful.
                     }
                 }
             } finally {
