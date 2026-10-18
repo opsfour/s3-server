@@ -138,6 +138,12 @@ upgrade. If database-backed credentials are configured, run the separate
 `credentials:migrate` bootstrap before serving; it can use a different PDO
 DSN and DDL-capable role. See the [deployment order](deployment.md#rollout-and-rollback).
 
+MySQL migrations create counter-maintenance triggers. Grant the migration role
+`TRIGGER` in addition to its table DDL rights. When binary logging is enabled,
+MySQL also requires either an administrative migration role or the DBA-managed
+`log_bin_trust_function_creators=ON` server setting before the migration runs.
+The DML-only serving role does not need trigger-creation rights.
+
 | Version | Changes |
 |---------|---------|
 | 1 | Core tables: buckets, objects, multipart uploads, parts, ACLs, tags, policies, CORS, encryption, lifecycle, lock, retention, legal holds, notifications, website, PAB, logging |

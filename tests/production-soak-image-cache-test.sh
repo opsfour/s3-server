@@ -78,6 +78,11 @@ if printf '%s\n' "$soak_service" | grep -Eq '^    build:'; then
 fi
 printf '%s\n' "$soak_service" | grep -Eq '^    pull_policy: never$'
 
+mysql_service=$(sed -n '/^  mysql:/,/^[^ ]/p' \
+    "$package_dir/docker/production-soak/compose.yml")
+printf '%s\n' "$mysql_service" \
+    | grep -Fq -- '--log-bin-trust-function-creators=ON'
+
 run_case()
 {
     case_name=$1

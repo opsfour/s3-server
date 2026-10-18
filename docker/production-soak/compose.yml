@@ -20,7 +20,10 @@ services:
   mysql:
     profiles: ["mysql"]
     image: mysql@sha256:4890b3247d48a6dc1f3ac1e979330af4e543d06f194322f3879b27e6c7052585
-    command: ["--innodb-buffer-pool-size=128M", "--performance-schema=OFF"]
+    command:
+      - "--innodb-buffer-pool-size=128M"
+      - "--performance-schema=OFF"
+      - "--log-bin-trust-function-creators=ON"
     environment:
       MYSQL_DATABASE: s3server
       MYSQL_USER: s3
