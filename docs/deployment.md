@@ -407,6 +407,11 @@ key formats are not supported. Access-log records follow the AWS field order,
 with `-` for unavailable values. Operation names and generated log keys remain
 package-specific; these records are not yet fully AWS-compatible.
 
+Access-log delivery is Best Effort. Records wait in a bounded in-memory buffer
+before a background flush, so an abrupt process termination can lose buffered
+records. Do not use bucket access logging as the only security or compliance
+audit trail.
+
 ```php
 $s3->putBucketLogging([
     'Bucket' => 'my-bucket',
