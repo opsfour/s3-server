@@ -217,3 +217,22 @@ storage, proxy, load, and topology profiles add gates only when the release
 advertises them. Do not copy test counts or timings into maintained docs;
 record commit-specific evidence with the release artifacts. See the
 [release checklist](release-checklist.md).
+
+Run the framework entry-point and SSE-C server journeys directly:
+
+```bash
+vendor/bin/phpunit --fail-on-skipped \
+  tests/Functional/EntrypointServeProfileTest.php \
+  tests/Functional/LifecycleRunnerFunctionalTest.php \
+  tests/Functional/SseCustomerEncryptionFunctionalTest.php
+```
+
+The local single-process reverse-proxy gate uses Apache `mod_proxy_http` with
+filesystem storage and SQLite. It requires `httpd` or `apache2`, `curl`,
+`pdo_sqlite`, and the Apache prefork, unixd, authz_core, headers, proxy, and
+proxy_http modules. Override nonstandard installations with
+`S3_TEST_HTTPD_BIN` and `S3_TEST_HTTPD_MODULE_DIR`.
+
+```bash
+scripts/run-local-proxy-gate
+```

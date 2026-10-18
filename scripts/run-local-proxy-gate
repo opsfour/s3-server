@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+httpd_bin="${S3_TEST_HTTPD_BIN:-}"
+if [[ -z "$httpd_bin" ]]; then
+    for candidate in httpd apache2; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            httpd_bin="$(command -v "$candidate")"
+            break
+        fi
+    done
+fi
+if [[ -z "$httpd_bin" || ! -x "$httpd_bin" ]]; then
+    echo "A local Apache httpd with mod_proxy_http and mod_headers is required." >&2
+    echo "Set S3_TEST_HTTPD_BIN and S3_TEST_HTTPD_MODULE_DIR when they are outside PATH." >&2
+    exit 2
+fi
+if [[ ! -f vendor/autoload.php ]]; then
+    echo "Run composer install before scripts/run-local-proxy-gate." >&2
+    exit 2
+fi
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required by the local proxy gate readiness check." >&2
+    exit 2
+fi
+if ! php -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);'; then
+    echo "The PHP pdo_sqlite extension is required by the local proxy gate." >&2
+    exit 2
+fi
+
+module_dir="${S3_TEST_HTTPD_MODULE_DIR:-}"
+if [[ -z "$module_dir" ]] && command -v apxs >/dev/null 2>&1; then
+    module_dir="$(apxs -q LIBEXECDIR 2>/dev/null || true)"
+fi
+if [[ -z "$module_dir" ]]; then
+    for candidate in /usr/libexec/apache2 /usr/lib/apache2/modules /usr/lib64/httpd/modules; do
+        if [[ -d "$candidate" ]]; then
+            module_dir="$candidate"
+            break
+        fi
+    done
+fi
+if ! static_modules="$("$httpd_bin" -l 2>/dev/null)"; then
+    echo "Could not inspect the modules compiled into ${httpd_bin}." >&2
+    exit 2
+fi
+
+has_static_source() {
+    local expected="$1"
+    local compiled
+    while IFS= read -r compiled; do
+        compiled="${compiled#"${compiled%%[![:space:]]*}"}"
+        compiled="${compiled%"${compiled##*[![:space:]]}"}"
+        if [[ "$compiled" == "$expected" ]]; then
+            return 0
+        fi
+    done <<< "$static_modules"
+
+    return 1
+}
+
+has_static_mpm() {
+    local source
+    for source in prefork.c worker.c event.c mod_mpm_prefork.c mod_mpm_worker.c mod_mpm_event.c; do
+        if has_static_source "$source"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+dynamic_load() {
+    local symbol="$1"
+    local module="$2"
+    if [[ -z "$module_dir" || ! -f "${module_dir}/${module}" ]]; then
+        echo "Apache module ${module} was not found; set S3_TEST_HTTPD_MODULE_DIR." >&2
+        return 1
+    fi
+    printf "LoadModule %s \"\${S3_TEST_HTTPD_MODULE_DIR}/%s\"\n" "$symbol" "$module"
+}
+
+if has_static_mpm; then
+    load_mpm="# An MPM is statically compiled into Apache."
+else
+    load_mpm="$(dynamic_load mpm_prefork_module mod_mpm_prefork.so)"
+fi
+if has_static_source mod_unixd.c; then
+    load_unixd="# mod_unixd is statically compiled into Apache."
+else
+    load_unixd="$(dynamic_load unixd_module mod_unixd.so)"
+fi
+if has_static_source mod_authz_core.c; then
+    load_authz_core="# mod_authz_core is statically compiled into Apache."
+else
+    load_authz_core="$(dynamic_load authz_core_module mod_authz_core.so)"
+fi
+if has_static_source mod_headers.c; then
+    load_headers="# mod_headers is statically compiled into Apache."
+else
+    load_headers="$(dynamic_load headers_module mod_headers.so)"
+fi
+if has_static_source mod_proxy.c; then
+    load_proxy="# mod_proxy is statically compiled into Apache."
+else
+    load_proxy="$(dynamic_load proxy_module mod_proxy.so)"
+fi
+if has_static_source mod_proxy_http.c; then
+    load_proxy_http="# mod_proxy_http is statically compiled into Apache."
+else
+    load_proxy_http="$(dynamic_load proxy_http_module mod_proxy_http.so)"
+fi
+
+gate_root="$(mktemp -d "${TMPDIR:-/tmp}/opsfour-s3-proxy-gate.XXXXXX")"
+storage_path="${gate_root}/storage"
+mkdir -p "$storage_path"
+gate_pids=()
+
+cleanup() {
+    local pid
+    for pid in "${gate_pids[@]:-}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${gate_pids[@]:-}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$gate_root"
+}
+trap cleanup EXIT INT TERM
+
+free_port() {
+    # shellcheck disable=SC2016 # Dollar-prefixed variables belong to the PHP snippet.
+    php -r '$s = stream_socket_server("tcp://127.0.0.1:0", $e, $m); if ($s === false) { exit(1); } $n = stream_socket_get_name($s, false); fclose($s); echo substr(strrchr($n, ":"), 1);'
+}
+
+S3_TEST_ORIGIN_PORT="$(free_port)"
+S3_TEST_PROXY_PORT="$(free_port)"
+S3_TEST_REWRITE_PROXY_PORT="$(free_port)"
+S3_TEST_MISSING_XFF_PROXY_PORT="$(free_port)"
+S3_TEST_AMBIGUOUS_XFP_PROXY_PORT="$(free_port)"
+S3_TEST_HTTPD_ROOT="$gate_root"
+S3_TEST_HTTPD_MODULE_DIR="$module_dir"
+S3_TEST_HTTPD_USER="$(id -un)"
+S3_TEST_HTTPD_GROUP="$(id -gn)"
+export S3_TEST_ORIGIN_PORT S3_TEST_PROXY_PORT S3_TEST_REWRITE_PROXY_PORT
+export S3_TEST_MISSING_XFF_PROXY_PORT S3_TEST_AMBIGUOUS_XFP_PROXY_PORT
+export S3_TEST_HTTPD_ROOT S3_TEST_HTTPD_MODULE_DIR S3_TEST_HTTPD_USER S3_TEST_HTTPD_GROUP
+
+runtime_httpd_config="${gate_root}/httpd.conf"
+# shellcheck disable=SC2016 # Dollar-prefixed fields belong to the Awk program.
+awk \
+    -v load_mpm="$load_mpm" \
+    -v load_unixd="$load_unixd" \
+    -v load_authz_core="$load_authz_core" \
+    -v load_headers="$load_headers" \
+    -v load_proxy="$load_proxy" \
+    -v load_proxy_http="$load_proxy_http" \
+    '$0 == "@LOAD_MPM@" { print load_mpm; next }
+     $0 == "@LOAD_UNIXD@" { print load_unixd; next }
+     $0 == "@LOAD_AUTHZ_CORE@" { print load_authz_core; next }
+     $0 == "@LOAD_HEADERS@" { print load_headers; next }
+     $0 == "@LOAD_PROXY@" { print load_proxy; next }
+     $0 == "@LOAD_PROXY_HTTP@" { print load_proxy_http; next }
+     { print }' \
+    tests/Support/local-proxy-httpd.conf > "$runtime_httpd_config"
+
+php bin/s3-server serve \
+    --host=127.0.0.1 \
+    --port="$S3_TEST_ORIGIN_PORT" \
+    --storage-driver=filesystem \
+    --storage-path="$storage_path" \
+    --metadata-driver=sqlite \
+    --trusted-proxy-cidrs=127.0.0.1/32 \
+    --base-domain=s3.localhost \
+    --access-key=testAccessKey \
+    --secret-key=testSecretKey \
+    --notification-worker=false \
+    >"${gate_root}/server.stdout" 2>"${gate_root}/server.stderr" &
+gate_pids+=("$!")
+
+"$httpd_bin" -f "$runtime_httpd_config" -DFOREGROUND \
+    >"${gate_root}/httpd.stdout" 2>"${gate_root}/httpd.stderr" &
+gate_pids+=("$!")
+
+deadline=$((SECONDS + 15))
+while ! curl --fail --silent --max-time 1 "http://127.0.0.1:${S3_TEST_MISSING_XFF_PROXY_PORT}/.health" >/dev/null; do
+    if ! kill -0 "${gate_pids[0]}" 2>/dev/null || ! kill -0 "${gate_pids[1]}" 2>/dev/null || (( SECONDS >= deadline )); then
+        echo "The local API process or Apache proxy did not become ready." >&2
+        sed -n '1,120p' "${gate_root}/server.stdout" >&2 || true
+        sed -n '1,120p' "${gate_root}/server.stderr" >&2 || true
+        sed -n '1,120p' "${gate_root}/httpd.stderr" >&2 || true
+        sed -n '1,120p' "${gate_root}/httpd-error.log" >&2 || true
+        exit 1
+    fi
+    sleep 0.1
+done
+
+while ! php tests/Functional/local-proxy-gate.php readiness >/dev/null; do
+    if ! kill -0 "${gate_pids[0]}" 2>/dev/null || ! kill -0 "${gate_pids[1]}" 2>/dev/null || (( SECONDS >= deadline )); then
+        echo "The local API write path did not become ready." >&2
+        sed -n '1,120p' "${gate_root}/server.stdout" >&2 || true
+        sed -n '1,120p' "${gate_root}/server.stderr" >&2 || true
+        sed -n '1,120p' "${gate_root}/httpd.stderr" >&2 || true
+        sed -n '1,120p' "${gate_root}/httpd-error.log" >&2 || true
+        exit 1
+    fi
+    sleep 0.1
+done
+
+if ! php tests/Functional/local-proxy-gate.php; then
+    echo "The local proxy assertions failed." >&2
+    sed -n '1,120p' "${gate_root}/server.stdout" >&2 || true
+    sed -n '1,120p' "${gate_root}/server.stderr" >&2 || true
+    sed -n '1,120p' "${gate_root}/httpd-error.log" >&2 || true
+    exit 1
+fi
