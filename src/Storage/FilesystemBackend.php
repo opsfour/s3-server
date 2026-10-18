@@ -425,7 +425,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         array $parts,
     ): StorageWriteResult {
 
-        return $this->assembleAtPath($uploadId, $parts, StoragePath::forObject($this->basePath, $bucket, $key));
+        return $this->assembleAtPath(
+            $uploadId,
+            $parts,
+            StoragePath::forObject($this->basePath, $bucket, $key),
+            false,
+        );
     }
 
     public function assembleMultipartUploadAtPath(
@@ -438,7 +443,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         $this->assertCompletionPath($path);
         StoragePath::assertObjectWritePath($this->basePath, $path, $bucket, $key);
 
-        return $this->assembleAtPath($uploadId, $parts, $path);
+        return $this->assembleAtPath($uploadId, $parts, $path, true);
     }
 
     /**
@@ -482,7 +487,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     }
 
     /** @param array<int, array{partNumber: int, etag: string, storagePath: string}> $parts */
-    private function assembleAtPath(string $uploadId, array $parts, string $finalPath): StorageWriteResult
+    private function assembleAtPath(string $uploadId, array $parts, string $finalPath, bool $fenced): StorageWriteResult
     {
         StoragePath::assertSafeUploadIdSegment($uploadId);
         $partPrefix = rtrim($this->basePath, '/') . '/.parts/' . $uploadId . '/';
@@ -572,14 +577,24 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Move assembled file to final path
         $targetDir = dirname($finalPath);
 
+        $durablePublicationStarted = false;
         try {
             $this->ensureDirectory($targetDir);
-            $this->publishFencedMultipartPath($tempPath, $finalPath);
+            if ($fenced) {
+                $this->publishFencedMultipartPath($tempPath, $finalPath);
+            } else {
+                $durablePublicationStarted = true;
+                $this->publishDurably($tempPath, $finalPath);
+            }
         } catch (CancelledException $e) {
-            $this->safeDelete($tempPath);
+            if (! $durablePublicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw $e;
         } catch (\Throwable $e) {
-            $this->safeDelete($tempPath);
+            if (! $durablePublicationStarted) {
+                $this->safeDelete($tempPath);
+            }
             throw new InternalErrorException('Failed to finalize assembled object in filesystem backend.', $e);
         }
 
@@ -971,10 +986,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                 $stat = fstat($handle);
                 if ($stat !== false && ($stat['mtime'] ?? 0) < $cutoff) {
                     try {
-                        $this->metadataFilesystem->deleteFile($filePath);
+                        $this->runDurabilityTask(LocalDurableFilesystemTask::delete($this->basePath, $filePath));
                         $cleaned++;
-                    } catch (FilesystemException) {
-                        // A concurrent operation may have removed the file.
+                    } catch (CancelledException $e) {
+                        throw $e;
+                    } catch (\Throwable) {
+                        // Leave failed cleanup for a later sweep.
                     }
                 }
             } finally {

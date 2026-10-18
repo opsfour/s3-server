@@ -117,6 +117,28 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         }
     }
 
+    public function test_legacy_multipart_assembly_publishes_to_the_bucket_namespace(): void
+    {
+        $backend = new FilesystemBackend($this->basePath);
+        $backend->createBucket('bucket');
+        $uploadId = bin2hex(random_bytes(16));
+        $part = $backend->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer('part bytes'));
+
+        try {
+            $result = $backend->assembleMultipartUpload('bucket', 'key', $uploadId, [[
+                'partNumber' => 1,
+                'etag' => $part->md5Hex,
+                'storagePath' => $part->path,
+            ]]);
+
+            self::assertStringStartsWith($this->basePath . '/bucket/', $result->path);
+            self::assertSame('part bytes', buffer($backend->getObjectByPath($result->path)));
+            self::assertSame([], glob($this->basePath . '/.tmp/*') ?: []);
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
     public function test_cancelled_object_write_cleans_staging_file_and_propagates_same_cancellation(): void
     {
         $backend = new FilesystemBackend($this->basePath);
