@@ -8,7 +8,7 @@ canonical storage support matrix:
 
 | Backend | Status | Current use |
 |---------|--------|-------------|
-| Persistent local filesystem on Linux | Implemented and Supported | Current one-host, one-process release target; qualification is pending the release gates and the durability blocker below |
+| Persistent local filesystem on Linux | Implemented and Supported | Current one-host, one-process release target; qualification is pending the release gates, including crash recovery on the exact filesystem and mount |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -76,13 +76,15 @@ S3_STORAGE_PATH=/var/data/s3
 ```
 
 Objects use unique paths sharded by the SHA-256 hash of their key under the
-storage root. Atomic writes use temp files and rename to prevent partial reads.
+storage root. Writes use synchronized temp files and create-only hard links so
+readers cannot observe partial data or replace an already published path.
 
 ### Requirements
 
 - The storage path must be writable by the server process
 - Sufficient disk space for your expected data volume
-- Use a filesystem that supports `O_TMPFILE` or atomic rename (ext4, XFS, ZFS)
+- Use a local filesystem that supports hard links plus file and directory
+  `fsync` (for example ext4, XFS, or ZFS)
 
 On Linux, the startup write-fence gate inspects the canonical storage path's
 mount and admits only known local filesystem types. NFS/EFS,
@@ -102,12 +104,14 @@ writers; if shutdown cannot prove that, it remains held until process exit.
 It enforces the one-process topology and is not evidence of crash or
 power-loss durability.
 
-The backend closes temporary files and renames them into place, but it does
-not currently `fsync` the file and containing directory. This is a
-qualification blocker for acknowledged-write durability across sudden host
-power loss. The local-filesystem profile must not be marked Qualified for that
-durability contract until the implementation performs the required syncs and
-the exact filesystem and mount pass the crash-recovery gate.
+Before reporting a local publication as successful, the backend synchronizes
+the staged file, creates the final path without replacement, synchronizes the
+target directory, removes the temporary name, and synchronizes the temporary
+directory. Exact-path deletion similarly synchronizes the nearest existing
+parent directory before reporting success. These guarantees cover the current
+one-process local-filesystem implementation. The exact Linux filesystem,
+mount, storage device, and host still need the release crash-recovery gate;
+unit and process-termination tests do not simulate a sudden loss of power.
 
 ## Flysystem
 

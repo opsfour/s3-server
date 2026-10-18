@@ -48,9 +48,9 @@ The initial production profile adds these gates:
   storage backup, map every referenced local tier explicitly, run
   `storage:audit`, and require exit status 0 before accepting writes. Run the
   separate recovery and garbage gates for transient or cleanup references.
-- [ ] Confirm the filesystem and mount support atomic rename. Do not claim
-  sudden-power-loss durability until file and directory synchronization is
-  implemented and qualified.
+- [ ] Confirm the filesystem and mount support create-only hard links plus file
+  and directory `fsync`. Run the abrupt-power-loss/reboot recovery gate on the
+  exact filesystem and mount before claiming sudden-power-loss durability.
 - [ ] Run the SQLite profile.
 - [ ] Run PostgreSQL and MySQL integration, contention, recovery, and migration
   profiles against real disposable servers with required tests unable to skip.
