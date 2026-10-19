@@ -70,6 +70,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
 
         MetadataSchemaGuard::assertCurrentVersion('postgres', $actual);
         $this->assertSupportedBucketEncryptionInventory();
+        MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
         MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
     }
@@ -97,6 +98,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
         }
         if ($currentVersion === PostgresSchema::VERSION) {
             $this->assertSupportedBucketEncryptionInventory();
+            MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
             $this->assertWriteIntentCapacityConsistent();
             MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
             return;
@@ -116,10 +118,7 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
         }
         $this->assertSupportedBucketEncryptionInventory();
 
-        $capacity = $this->pool->query('SELECT retained_count, (SELECT COUNT(*) FROM s3_multipart_write_intents) AS actual_count FROM s3_multipart_completion_capacity WHERE id = 1')->fetchRow();
-        if ($capacity === null || (int) $capacity['retained_count'] !== (int) $capacity['actual_count']) {
-            throw new \RuntimeException('Multipart completion recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
-        }
+        MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
         MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
 

@@ -29,6 +29,7 @@ final class MetadataSchemaGuard
             if ($pool->query(StoredBucketEncryptionConfiguration::invalidRowQuery($driver))->fetchRow() !== null) {
                 throw new \RuntimeException('Stored bucket encryption configuration is unsupported; repair metadata before serving.');
             }
+            self::assertMultipartCompletionCapacityConsistent($pool);
             if ($pool instanceof PostgresConnectionPool) {
                 self::assertPostgresWriteIntentTriggers($pool);
             }
@@ -53,6 +54,18 @@ final class MetadataSchemaGuard
         }
     }
 
+    public static function assertMultipartCompletionCapacityConsistent(PostgresConnectionPool|MysqlConnectionPool $pool): void
+    {
+        try {
+            $capacity = $pool->query('SELECT retained_count, (SELECT COUNT(*) FROM s3_multipart_write_intents) AS actual_count FROM s3_multipart_completion_capacity WHERE id = 1')->fetchRow();
+        } catch (\Throwable $error) {
+            throw new \RuntimeException('Multipart completion recovery capacity counter cannot be verified.', 0, $error);
+        }
+        if ($capacity === null || (int) $capacity['retained_count'] !== (int) $capacity['actual_count']) {
+            throw new \RuntimeException('Multipart completion recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
+        }
+    }
+
     public static function assertCurrentVersion(string $driver, int $actual): void
     {
         $expected = match ($driver) {
@@ -67,7 +80,7 @@ final class MetadataSchemaGuard
 
     public static function assertPostgresWriteIntentTriggers(PostgresConnectionPool $pool): void
     {
-        $expected = self::writeIntentTriggerInventory();
+        $expected = self::recoveryCapacityTriggerInventory();
         $rows = $pool->query(<<<'SQL'
             SELECT trigger.tgname AS name, table_class.relname AS table_name,
                    trigger.tgenabled AS enabled, trigger.tgtype AS trigger_type,
@@ -77,9 +90,14 @@ final class MetadataSchemaGuard
             JOIN pg_namespace AS table_schema ON table_schema.oid = table_class.relnamespace
             JOIN pg_proc AS function_proc ON function_proc.oid = trigger.tgfoid
             JOIN pg_namespace AS function_schema ON function_schema.oid = function_proc.pronamespace
-            WHERE trigger.tgrelid IN (to_regclass('s3_object_write_intents'), to_regclass('s3_storage_garbage'))
+            WHERE trigger.tgrelid IN (
+                to_regclass('s3_object_write_intents'),
+                to_regclass('s3_storage_garbage'),
+                to_regclass('s3_multipart_write_intents')
+            )
               AND function_schema.oid = table_schema.oid
-              AND trigger.tgname LIKE 's3_write_intent_capacity_%'
+              AND (trigger.tgname LIKE 's3_write_intent_capacity_%'
+                   OR trigger.tgname LIKE 's3_multipart_completion_capacity_%')
             SQL);
         while (($row = $rows->fetchRow()) !== null) {
             if (! is_string($row['name'] ?? null)) {
@@ -110,13 +128,14 @@ final class MetadataSchemaGuard
     /** Check the MySQL trigger inventory only with the DDL-capable migration role. */
     public static function assertMysqlWriteIntentTriggersForMigration(MysqlConnectionPool $pool): void
     {
-        $expected = self::writeIntentTriggerInventory();
+        $expected = self::recoveryCapacityTriggerInventory();
         $rows = $pool->query(<<<'SQL'
             SELECT TRIGGER_NAME AS name, EVENT_OBJECT_TABLE AS table_name,
                    EVENT_MANIPULATION AS event_name, ACTION_TIMING AS timing
             FROM information_schema.TRIGGERS
             WHERE TRIGGER_SCHEMA = DATABASE()
-              AND TRIGGER_NAME LIKE 's3_write_intent_capacity_%'
+              AND (TRIGGER_NAME LIKE 's3_write_intent_capacity_%'
+                   OR TRIGGER_NAME LIKE 's3_multipart_completion_capacity_%')
             SQL);
         while (($row = $rows->fetchRow()) !== null) {
             if (! is_string($row['name'] ?? null)) {
@@ -137,7 +156,7 @@ final class MetadataSchemaGuard
     }
 
     /** @return array<string, array{string, 'INSERT'|'DELETE'|'UPDATE', string}> */
-    private static function writeIntentTriggerInventory(): array
+    private static function recoveryCapacityTriggerInventory(): array
     {
         return [
             's3_write_intent_capacity_object_insert' => ['s3_object_write_intents', 'INSERT', 's3_write_intent_capacity_object_fn'],
@@ -145,6 +164,8 @@ final class MetadataSchemaGuard
             's3_write_intent_capacity_part_insert' => ['s3_storage_garbage', 'INSERT', 's3_write_intent_capacity_part_fn'],
             's3_write_intent_capacity_part_delete' => ['s3_storage_garbage', 'DELETE', 's3_write_intent_capacity_part_fn'],
             's3_write_intent_capacity_part_update' => ['s3_storage_garbage', 'UPDATE', 's3_write_intent_capacity_part_fn'],
+            's3_multipart_completion_capacity_insert' => ['s3_multipart_write_intents', 'INSERT', 's3_multipart_completion_capacity_insert_fn'],
+            's3_multipart_completion_capacity_delete' => ['s3_multipart_write_intents', 'DELETE', 's3_multipart_completion_capacity_delete_fn'],
         ];
     }
 }

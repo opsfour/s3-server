@@ -121,6 +121,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
 
         MetadataSchemaGuard::assertCurrentVersion('mysql', $actual);
         $this->assertSupportedBucketEncryptionInventory();
+        MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
     }
 
@@ -149,7 +150,9 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
         }
         if ($currentVersion === MysqlSchema::VERSION) {
             $this->assertSupportedBucketEncryptionInventory();
+            MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
             $this->assertWriteIntentCapacityConsistent();
+            MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
             return;
         }
 
@@ -175,10 +178,7 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
         }
         $this->assertSupportedBucketEncryptionInventory();
 
-        $capacity = $this->pool->query('SELECT retained_count, (SELECT COUNT(*) FROM s3_multipart_write_intents) AS actual_count FROM s3_multipart_completion_capacity WHERE id = 1')->fetchRow();
-        if ($capacity === null || (int) $capacity['retained_count'] !== (int) $capacity['actual_count']) {
-            throw new \RuntimeException('Multipart completion recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
-        }
+        MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
         MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
 
