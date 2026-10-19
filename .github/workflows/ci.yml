@@ -53,11 +53,14 @@ jobs:
         run: |
           shellcheck scripts/run-production-soak \
             scripts/production-soak-container \
-            tests/production-soak-image-cache-test.sh
+            tests/production-soak-image-cache-test.sh \
+            tests/production-soak-status-test.sh
           sh -n scripts/run-production-soak \
             scripts/production-soak-container \
-            tests/production-soak-image-cache-test.sh
+            tests/production-soak-image-cache-test.sh \
+            tests/production-soak-status-test.sh
           tests/production-soak-image-cache-test.sh
+          tests/production-soak-status-test.sh
           if S3_SOAK_STATE_DIR=/ scripts/run-production-soak status; then
             echo "State-directory root was accepted" >&2
             exit 1

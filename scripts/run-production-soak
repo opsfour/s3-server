@@ -353,7 +353,15 @@ show_status()
             saved_backend_status=$(cat "$backend_status_file")
             printf 'metadata_%s_%s\n' "$S3_SOAK_METADATA_DRIVER" "$saved_backend_status"
             case " $saved_backend_status " in
-                *' container=running '*' oom=false '*' health=healthy '*) ;;
+                *' container=running '*) ;;
+                *) backend_ok=false ;;
+            esac
+            case " $saved_backend_status " in
+                *' oom=false '*) ;;
+                *) backend_ok=false ;;
+            esac
+            case " $saved_backend_status " in
+                *' health=healthy '*) ;;
                 *) backend_ok=false ;;
             esac
         else
