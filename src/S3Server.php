@@ -18,6 +18,7 @@ use Amp\Socket\BindContext;
 use Amp\Socket\Certificate;
 use Amp\Socket\ServerTlsContext;
 use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
@@ -147,6 +148,8 @@ final class S3Server
     private ?LocalFencedBackgroundObjectWriter $localBackgroundTestWriter = null;
 
     private ?DeferredCancellation $backgroundCancellation = null;
+
+    private ?PostObjectSpoolCoordinator $postObjectSpoolCoordinator = null;
 
     /** @var list<Future<void>> */
     private array $backgroundFutures = [];
@@ -621,25 +624,38 @@ final class S3Server
             // 9. Start background cleanup fiber for rate limit + notification queue.
             $this->backgroundCancellation = $preparedBackgroundCancellation;
             $backgroundCancellation = $this->backgroundCancellation->getCancellation();
-            if ($this->metadata !== null) {
+            $spoolCoordinator = $this->postObjectSpoolCoordinator;
+            if ($this->metadata !== null || $spoolCoordinator !== null) {
                 $metadata = $this->metadata;
                 $this->cleanupRunning = true;
-                $this->backgroundFutures[] = \Amp\async(function () use ($backgroundCancellation, $metadata): void {
+                $this->backgroundFutures[] = \Amp\async(function () use ($backgroundCancellation, $metadata, $spoolCoordinator): void {
                     try {
                         while ($this->cleanupRunning) {
                             // Every 5 minutes (reduced from 60s to minimize DB contention).
                             \Amp\delay(300, cancellation: $backgroundCancellation);
                             $backgroundCancellation->throwIfRequested();
 
-                            try {
-                                $metadata->rateLimitCleanup(3600);
-                                $metadata->cleanupOldNotifications(86400);
-                                $this->flushAccessLogsIfAdmitted();
-                            } catch (\Throwable $e) {
-                                $this->logger->warning('Background cleanup failed.', [
-                                    'component' => 'background_cleanup',
-                                    'exception' => $e::class,
-                                ]);
+                            if ($spoolCoordinator !== null) {
+                                try {
+                                    $spoolCoordinator->recoverAbandoned();
+                                } catch (\Throwable $e) {
+                                    $this->logger->warning('Background cleanup failed.', [
+                                        'component' => 'post_object_spool_recovery',
+                                        'exception' => $e::class,
+                                    ]);
+                                }
+                            }
+                            if ($metadata !== null) {
+                                try {
+                                    $metadata->rateLimitCleanup(3600);
+                                    $metadata->cleanupOldNotifications(86400);
+                                    $this->flushAccessLogsIfAdmitted();
+                                } catch (\Throwable $e) {
+                                    $this->logger->warning('Background cleanup failed.', [
+                                        'component' => 'metadata_cleanup',
+                                        'exception' => $e::class,
+                                    ]);
+                                }
                             }
                         }
                     } catch (\Amp\CancelledException) {
@@ -1302,7 +1318,14 @@ final class S3Server
         $spoolPool = new ContextWorkerPool($spoolWorkers);
         $this->registerWorkerPool($spoolPool, 'request_body_spool', $spoolWorkers);
 
-        return new RequestBodySpool($spoolPool, budgetBytes: $this->config->postSpoolBudgetBytes);
+        $coordinator = $this->postObjectSpoolCoordinator ??= new PostObjectSpoolCoordinator();
+        $coordinator->recoverAbandoned();
+
+        return new RequestBodySpool(
+            $spoolPool,
+            budgetBytes: $this->config->postSpoolBudgetBytes,
+            coordinator: $coordinator,
+        );
     }
 
     /**

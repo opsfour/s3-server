@@ -10,6 +10,37 @@ use PHPUnit\Framework\TestCase;
 
 final class PostObjectSpoolCoordinatorTest extends TestCase
 {
+    public function test_explicit_recovery_removes_an_abandoned_reservation(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-recovery-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $tempPath = $tempDir . '/s3-post-abandoned.tmp';
+        self::assertSame(4, file_put_contents($tempPath, 'data'));
+        $coordinator = new PostObjectSpoolCoordinator($tempDir);
+        $reservation = $coordinator->start($tempPath);
+        $coordinator->reserve($reservation, 4, 4);
+        $leasePath = $reservation->leasePath;
+        $statePath = dirname($leasePath) . '/state-' . substr(basename($leasePath), 6);
+        $totalPath = dirname($leasePath) . '/total';
+
+        try {
+            $reservation->close();
+            $coordinator->recoverAbandoned();
+
+            self::assertFileDoesNotExist($tempPath);
+            self::assertFileDoesNotExist($leasePath);
+            self::assertFileDoesNotExist($statePath);
+            self::assertSame('0', file_get_contents($totalPath));
+        } finally {
+            @unlink($tempPath);
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_crashed_reservation_is_recovered_when_processes_use_aliases_of_one_temp_directory(): void
     {
         $root = sys_get_temp_dir() . '/s3-post-alias-' . bin2hex(random_bytes(8));

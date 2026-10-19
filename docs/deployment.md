@@ -268,15 +268,16 @@ Browser POST uploads use `sys_get_temp_dir()`. The default
 `S3_POST_SPOOL_BUDGET=10737418240` caps concurrent browser POST and request-body
 checksum spool bytes for the server and its helper processes in that local
 directory, and returns S3 `SlowDown` (503) when full. Locked lease files recover
-a crashed process's reservations on the next browser POST. A
+a crashed process's reservations at server startup and every five minutes;
+every later spool reservation also recovers them immediately as a fallback. A
 request carrying both Content-MD5 and literal SigV4 SHA-256 can occupy two
 spools; a full 5-GiB body slightly exceeds the default 10-GiB budget after
-ciphertext-frame overhead and is rejected with 503. Raise the configured
-budget or lower the accepted body size for that case. Set a filesystem quota
-or use an isolated temporary volume with headroom for storage staging and
-crash files before recovery. Do not remove `.opsfour-s3-post-budget` while the
-server is running. Sharing this temporary directory between API processes
-belongs to a later profile and needs its own acceptance evidence. The stale-file
+ciphertext-frame overhead and is rejected with 503. Raise the configured budget
+or lower the accepted body size for that case. Set a filesystem quota or use an
+isolated temporary volume with headroom for storage staging and crash files
+before recovery. Do not remove `.opsfour-s3-post-budget` while the server is
+running. Sharing this temporary directory between API processes belongs to a
+later profile and needs its own acceptance evidence. Separately, the prefix
 sweep reclaims abandoned browser POST files older than 24 hours on a later
 upload.
 
@@ -286,13 +287,14 @@ each ephemeral key remains in the API process and a crashed spool cannot be
 resumed. Use a private service-account directory where possible; a shared
 writable directory must have the sticky bit so another local user cannot
 replace an active file. A sticky directory alone does not rule out hard links
-on every filesystem. A server with no later uploads needs operator cleanup of
-abandoned ciphertext files; the checksum spool also uses a bounded 24-hour
-stale sweep. An active checksum spool holds a file lock, so a concurrent sweep
-preserves it even when its modification time is old. A crashed process releases
-its lock and its stale file is removed on a later sweep. For the
-strict at-rest guarantee, also disable or encrypt swap and prevent core dumps
-that could contain plaintext request buffers or SSE-C keys.
+on every filesystem. Startup and five-minute recovery remove abandoned
+ciphertext files recorded by the shared budget coordinator. Active checksum
+spools retain their lease and file locks, so concurrent recovery preserves
+them. A crash releases both locks, allowing coordinator recovery to remove the
+registered file. Separately, the bounded 24-hour prefix sweep removes unleased
+remnants during a later upload. For the strict at-rest guarantee, also disable
+or encrypt swap and prevent core dumps that could contain plaintext request
+buffers or SSE-C keys.
 Apply the same host-memory and diagnostic rules to every TLS terminator or
 load balancer that decrypts S3 traffic. Its access and error logs must not
 retain presigned request queries or SSE-C headers; verify this for the actual

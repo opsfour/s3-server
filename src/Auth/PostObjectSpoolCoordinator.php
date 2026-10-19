@@ -51,6 +51,14 @@ final class PostObjectSpoolCoordinator
         return $this->tempDir;
     }
 
+    public function recoverAbandoned(): void
+    {
+        $this->withLock(function (): void {
+            $this->reapAbandonedLeases();
+            $this->writeTotal($this->sumLeases());
+        });
+    }
+
     public function start(string $tempPath): PostObjectSpoolReservation
     {
         if (realpath(dirname($tempPath)) !== $this->tempDir || ! self::isManagedTempPath($tempPath)) {

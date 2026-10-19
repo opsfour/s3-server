@@ -20,16 +20,18 @@ encryption services are configured in YAML rather than environment variables.
 | `S3_STRICT_BUCKET_NAMING` | `true` | Reject AWS-reserved bucket name prefixes and suffixes |
 
 The browser POST spool budget uses locked lease files under
-`sys_get_temp_dir()/.opsfour-s3-post-budget` to count active forms across API
-and helper processes. A later reservation recovers leases and files abandoned
-by a crashed process. The coordinator rejects a different budget while another
-process has an active form; the value can change after all reservations are
-released. Provision a separate temporary volume or filesystem quota with
-headroom for other temporary writers and crash files before recovery. Do not
-remove the reservation directory while the server is running. The stale-file
-sweep also reclaims abandoned browser POST files older than 24 hours during
-later uploads. Sharing the directory between API processes belongs to a later
-deployment profile and is not qualified by this accounting mechanism alone.
+`sys_get_temp_dir()/.opsfour-s3-post-budget` to count active spools across API
+and helper processes. Startup recovers leases and files abandoned by a crashed
+process, and the server repeats recovery every five minutes. Every later spool
+reservation also recovers abandoned leases immediately as a fallback. The
+coordinator rejects a different budget while another process has an active
+spool; the value can change after all reservations are released. Provision a
+separate temporary volume or filesystem quota with headroom for other temporary
+writers and crash files between recovery runs. Do not remove the reservation
+directory while the server is running. Separately, the prefix sweep reclaims
+abandoned browser POST files older than 24 hours during later uploads. Sharing
+the directory between API processes belongs to a later deployment profile and
+is not qualified by this accounting mechanism alone.
 
 ## TLS
 
