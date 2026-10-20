@@ -102,6 +102,13 @@ source checksums independently of its user-metadata directive and returns them
 with `ChecksumType` set to `FULL_OBJECT`; checksum-free source objects return
 no checksum fields.
 
+GET and HEAD return `x-amz-object-lock-mode` and
+`x-amz-object-lock-retain-until-date` when the caller may perform
+`s3:GetObjectRetention`. They return `x-amz-object-lock-legal-hold` when the
+caller may perform `s3:GetObjectLegalHold`. These checks use the selected
+object version. Missing either additional permission hides only its headers;
+it does not reject an otherwise authorized object read.
+
 `PostObject` authenticates supported V2/V4 policy fields before spooling the
 file. Object options must be policy-covered form fields; raw HTTP object-option
 headers are rejected before the file is spooled. Multipart boundaries are limited to the 70 characters specified by

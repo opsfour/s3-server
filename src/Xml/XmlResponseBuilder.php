@@ -1109,7 +1109,10 @@ final class XmlResponseBuilder
     {
         $writer->startElement('Contents');
         $writer->writeElement('Key', self::safeXmlValue($object->key, $urlEncode));
-        $writer->writeElement('LastModified', $object->lastModified->format('Y-m-d\TH:i:s.000\Z'));
+        $writer->writeElement(
+            'LastModified',
+            $object->lastModified->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s.000\Z'),
+        );
         $writer->writeElement('ETag', $object->etag);
         $writer->writeElement('Size', (string) $object->size);
         $writer->writeElement('StorageClass', $object->storageClass);

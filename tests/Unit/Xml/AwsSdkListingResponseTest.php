@@ -33,7 +33,7 @@ final class AwsSdkListingResponseTest extends TestCase
                 'dir/*/file(1)',
                 1,
                 '"etag"',
-                lastModified: new \DateTimeImmutable('2026-01-01T00:00:00Z'),
+                lastModified: new \DateTimeImmutable('2026-01-01T04:00:00+04:00'),
             )],
             'commonPrefixes' => ['dir/*/nested/'],
         ]);
@@ -67,6 +67,7 @@ final class AwsSdkListingResponseTest extends TestCase
         self::assertSame('dir/*/next', $result['NextMarker']);
         self::assertSame('/', $result['Delimiter']);
         self::assertSame('dir/*/file(1)', $result['Contents'][0]['Key']);
+        self::assertSame('2026-01-01T00:00:00+00:00', $result['Contents'][0]['LastModified']->format(\DateTimeInterface::ATOM));
         self::assertSame('dir/*/nested/', $result['CommonPrefixes'][0]['Prefix']);
     }
 }

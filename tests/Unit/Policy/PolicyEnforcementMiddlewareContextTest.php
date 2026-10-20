@@ -1306,6 +1306,35 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         $this->assertSame('Allow', $request->getAttribute('s3.policyResult'));
     }
 
+    public function test_anonymous_tagged_put_uses_explicit_bucket_policy_actions(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => ['s3:PutObject', 's3:PutObjectTagging'],
+            'Resource' => 'arn:aws:s3:::bucket/public/*',
+        ]]));
+
+        foreach ([
+            'untagged' => [],
+            'tagged' => ['x-amz-tagging' => 'project=alpha'],
+        ] as $label => $headers) {
+            $request = $this->request('PUT', '/bucket/public/' . $label . '.txt', $headers);
+            $request->setAttribute('s3.bucket', 'bucket');
+            $request->setAttribute('s3.key', 'public/' . $label . '.txt');
+            $request->setAttribute('s3.operation', S3Operation::PutObject);
+            $request->setAttribute('ownerId', '');
+
+            $response = (new PolicyEnforcementMiddleware($this->metadata))->handleRequest(
+                $request,
+                new PolicyTerminalHandler(),
+            );
+
+            self::assertSame(200, $response->getStatus(), $label);
+            self::assertSame('Allow', $request->getAttribute('s3.policyResult'), $label);
+        }
+    }
+
     public function test_scoped_credential_prefix_is_enforced_before_owner_bypass(): void
     {
         $request = $this->request('GET', '/bucket/private/readme.txt');

@@ -111,7 +111,7 @@ final readonly class AdditionalActionAuthorizer
         if ($ownerId !== '' && $ownerId === $bucketOwner) {
             return;
         }
-        if ($identityAllowed && $resourceResult === 'Allow' && $bucketPolicy !== null) {
+        if (($ownerId === '' || $identityAllowed) && $resourceResult === 'Allow' && $bucketPolicy !== null) {
             $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
             if ($publicAccessBlock === null
                 || ! $publicAccessBlock['restrictPublicBuckets']

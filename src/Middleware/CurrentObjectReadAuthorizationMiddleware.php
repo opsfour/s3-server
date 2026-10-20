@@ -19,6 +19,7 @@ use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerReadLock;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\ObjectLock\ObjectLockResponseHeaders;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\GenerationGuardedReadableStream;
 
@@ -150,6 +151,10 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         }
         \assert($response instanceof Response);
 
+        foreach ($validation['objectLockHeaders'] as $header => $value) {
+            $response->setHeader($header, $value);
+        }
+
         if ($operation === S3Operation::GetObject) {
             if ($validation['bucket'] === null) {
                 self::closeResponse($response);
@@ -172,8 +177,8 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
     }
 
     /**
-     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response})|null $retry
-     * @return array{bucket: ?BucketInfo, response: ?Response}
+     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response, objectLockHeaders: array<non-empty-string, string>})|null $retry
+     * @return array{bucket: ?BucketInfo, response: ?Response, objectLockHeaders: array<non-empty-string, string>}
      */
     private function validate(
         Request $request,
@@ -205,7 +210,16 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
                 return $this->retryOrDeny($retry, $authorized, $current);
             }
 
-            return ['bucket' => $observedBucket, 'response' => null];
+            $objectLockHeaders = $current !== null
+                && in_array($operation, [S3Operation::GetObject, S3Operation::HeadObject], true)
+                ? (new ObjectLockResponseHeaders($this->metadata))->forObject($request, $current)
+                : [];
+
+            return [
+                'bucket' => $observedBucket,
+                'response' => null,
+                'objectLockHeaders' => $objectLockHeaders,
+            ];
         };
         if (! $request->hasAttribute('s3.policyResult') || $withinWriteTransaction) {
             return $validate();
@@ -225,7 +239,7 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
         });
     }
 
-    /** @return array{bucket: ?BucketInfo, response: Response} */
+    /** @return array{bucket: ?BucketInfo, response: Response, objectLockHeaders: array<non-empty-string, string>} */
     private function retryReadWithinAuthorizationLock(
         Request $request,
         RequestHandler $requestHandler,
@@ -255,7 +269,16 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
             $observedBucket = $this->assertBucketUnchanged($request, $bucket, $authorizedBucketGeneration, $authorizedBucketOwner);
             $this->assertObjectUnchanged($refreshed, $operation, $bucket, $key, $versionId);
 
-            return ['bucket' => $observedBucket, 'response' => $retryResponse];
+            $objectLockHeaders = $refreshed !== null
+                && in_array($operation, [S3Operation::GetObject, S3Operation::HeadObject], true)
+                ? (new ObjectLockResponseHeaders($this->metadata))->forObject($request, $refreshed)
+                : [];
+
+            return [
+                'bucket' => $observedBucket,
+                'response' => $retryResponse,
+                'objectLockHeaders' => $objectLockHeaders,
+            ];
         } catch (\Throwable $error) {
             if ($retryResponse !== null) {
                 self::closeResponse($retryResponse);
@@ -267,8 +290,8 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
     }
 
     /**
-     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response})|null $retry
-     * @return array{bucket: ?BucketInfo, response: Response}
+     * @param (\Closure(): array{bucket: ?BucketInfo, response: Response, objectLockHeaders: array<non-empty-string, string>})|null $retry
+     * @return array{bucket: ?BucketInfo, response: Response, objectLockHeaders: array<non-empty-string, string>}
      */
     private function retryOrDeny(?\Closure $retry, ?ObjectInfo $authorized, ?ObjectInfo $current): array
     {

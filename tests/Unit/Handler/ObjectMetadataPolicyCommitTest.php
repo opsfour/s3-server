@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Handler;
 
+use Amp\ByteStream\ReadableBuffer;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
@@ -14,6 +15,7 @@ use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Handler\Object\PutObjectAclHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectAclHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectTaggingHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
@@ -31,6 +33,77 @@ use PHPUnit\Framework\TestCase;
 
 final class ObjectMetadataPolicyCommitTest extends TestCase
 {
+    public function test_get_and_head_return_authorized_object_lock_headers(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $versionId = $this->putLockedVersion($metadata, 'GOVERNANCE', 'ON');
+
+            foreach (['GET', 'HEAD'] as $method) {
+                $request = $this->request($method, 'http://127.0.0.1/bucket/key', $method === 'GET' ? S3Operation::GetObject : S3Operation::HeadObject, 'owner');
+                $response = $this->objectRead($metadata, $request);
+
+                self::assertSame($versionId, $response->getHeader('x-amz-version-id'));
+                self::assertSame('GOVERNANCE', $response->getHeader('x-amz-object-lock-mode'));
+                self::assertSame('2099-01-01T00:00:00Z', $response->getHeader('x-amz-object-lock-retain-until-date'));
+                self::assertSame('ON', $response->getHeader('x-amz-object-lock-legal-hold'));
+            }
+        });
+    }
+
+    public function test_head_returns_object_lock_headers_for_the_selected_version(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $selectedVersion = $this->putLockedVersion($metadata, 'GOVERNANCE', 'ON');
+            $currentVersion = $metadata->putObjectVersioned('bucket', 'key', 'owner', 3, '"new"', 'text/plain', 'new-path');
+            $metadata->putObjectRetention('bucket', 'key', 'COMPLIANCE', '2098-01-01T00:00:00Z', $currentVersion);
+            $metadata->putObjectLegalHold('bucket', 'key', 'OFF', $currentVersion);
+
+            $request = $this->request(
+                'HEAD',
+                'http://127.0.0.1/bucket/key?versionId=' . rawurlencode($selectedVersion),
+                S3Operation::HeadObject,
+                'owner',
+            );
+            $response = $this->objectRead($metadata, $request);
+
+            self::assertSame($selectedVersion, $response->getHeader('x-amz-version-id'));
+            self::assertSame('GOVERNANCE', $response->getHeader('x-amz-object-lock-mode'));
+            self::assertSame('2099-01-01T00:00:00Z', $response->getHeader('x-amz-object-lock-retain-until-date'));
+            self::assertSame('ON', $response->getHeader('x-amz-object-lock-legal-hold'));
+        });
+    }
+
+    public function test_missing_legal_hold_permission_hides_only_that_head_header(): void
+    {
+        $this->withMetadata(function (SqliteMetadataStore $metadata): void {
+            $this->putLockedVersion($metadata, 'GOVERNANCE', 'ON');
+            $resource = 'arn:aws:s3:::bucket/key';
+            $metadata->putAccountPolicy('visitor', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Action' => ['s3:GetObject', 's3:GetObjectRetention'],
+                    'Resource' => $resource,
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $metadata->putBucketPolicy('bucket', json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Principal' => ['AWS' => 'visitor'],
+                    'Action' => ['s3:GetObject', 's3:GetObjectRetention'],
+                    'Resource' => $resource,
+                ]],
+            ], JSON_THROW_ON_ERROR));
+
+            $request = $this->request('HEAD', 'http://127.0.0.1/bucket/key', S3Operation::HeadObject, 'visitor');
+            $response = $this->objectRead($metadata, $request);
+
+            self::assertSame(200, $response->getStatus());
+            self::assertSame('GOVERNANCE', $response->getHeader('x-amz-object-lock-mode'));
+            self::assertSame('2099-01-01T00:00:00Z', $response->getHeader('x-amz-object-lock-retain-until-date'));
+            self::assertNull($response->getHeader('x-amz-object-lock-legal-hold'));
+        });
+    }
+
     public function test_explicit_delete_marker_keeps_its_cross_account_object_owner(): void
     {
         $this->withMetadata(function (SqliteMetadataStore $metadata): void {
@@ -649,6 +722,45 @@ final class ObjectMetadataPolicyCommitTest extends TestCase
         $request->setAttribute('ownerId', $owner);
 
         return $request;
+    }
+
+    private function objectRead(SqliteMetadataStore $metadata, Request $request): Response
+    {
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturn(new ReadableBuffer('old'));
+        $operation = $request->getAttribute('s3.operation');
+        $handler = $operation === S3Operation::GetObject
+            ? new GetObjectHandler($metadata, $storage)
+            : new HeadObjectHandler($metadata);
+
+        return (new PolicyEnforcementMiddleware($metadata))->handleRequest($request, $this->terminal(
+            static fn(): Response => (new AclEnforcementMiddleware($metadata))->handleRequest(
+                $request,
+                new class ($metadata, $handler) implements RequestHandler {
+                    public function __construct(
+                        private readonly SqliteMetadataStore $metadata,
+                        private readonly RequestHandler $handler,
+                    ) {}
+
+                    public function handleRequest(Request $request): Response
+                    {
+                        return (new CurrentObjectReadAuthorizationMiddleware($this->metadata))
+                            ->handleRequest($request, $this->handler);
+                    }
+                },
+            ),
+        ));
+    }
+
+    private function putLockedVersion(SqliteMetadataStore $metadata, string $mode, string $legalHold): string
+    {
+        $metadata->setBucketVersioning('bucket', 'Enabled');
+        $metadata->putObjectLockConfig('bucket', ['objectLockEnabled' => 'Enabled']);
+        $versionId = $metadata->putObjectVersioned('bucket', 'key', 'owner', 3, '"old"', 'text/plain', 'old-path');
+        $metadata->putObjectRetention('bucket', 'key', $mode, '2099-01-01T00:00:00Z', $versionId);
+        $metadata->putObjectLegalHold('bucket', 'key', $legalHold, $versionId);
+
+        return $versionId;
     }
 
     /** @param \Closure(): Response $callback */

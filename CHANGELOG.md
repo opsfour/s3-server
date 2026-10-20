@@ -82,6 +82,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Return version-specific Object Lock retention and legal-hold headers from
+  GET and HEAD when the caller has the corresponding metadata permission.
+- Allow anonymous object options when their additional actions are explicitly
+  granted by bucket policy while preserving two-sided cross-account checks.
+- Normalize object and version listing timestamps to UTC before emitting the
+  literal S3 `Z` suffix.
 - Default CopyObject destinations to the S3 `STANDARD` storage class when the
   request does not specify `x-amz-storage-class`, including self-copy checks.
 - Reject reentrant CreateBucket requests whose location differs from the

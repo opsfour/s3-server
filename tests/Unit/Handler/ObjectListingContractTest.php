@@ -126,7 +126,7 @@ final class ObjectListingContractTest extends TestCase
             ownerId: 'owner',
             versionId: 'delete-version',
             isDeleteMarker: true,
-            lastModified: new \DateTimeImmutable('2026-03-02T00:00:00Z'),
+            lastModified: new \DateTimeImmutable('2026-03-02T04:00:00+04:00'),
         );
         $version = new ObjectInfo(
             'bucket',
@@ -135,7 +135,7 @@ final class ObjectListingContractTest extends TestCase
             '"etag"',
             ownerId: 'owner',
             versionId: 'object-version',
-            lastModified: new \DateTimeImmutable('2026-03-01T00:00:00Z'),
+            lastModified: new \DateTimeImmutable('2026-02-28T19:00:00-05:00'),
         );
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
@@ -156,6 +156,8 @@ final class ObjectListingContractTest extends TestCase
         self::assertLessThan(strpos($body, '<Version>'), strpos($body, '<DeleteMarker>'));
         self::assertSame(1, substr_count($body, '<Version>'));
         self::assertSame(1, substr_count($body, '<DeleteMarker>'));
+        self::assertStringContainsString('<LastModified>2026-03-02T00:00:00.000Z</LastModified>', $body);
+        self::assertStringContainsString('<LastModified>2026-03-01T00:00:00.000Z</LastModified>', $body);
     }
 
     private function metadataWithResult(ListObjectsResult $result): MetadataStore
