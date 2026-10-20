@@ -18,7 +18,8 @@ final class LifecycleRuleValidator
     public static function assertValid(array $rule): void
     {
         $id = $rule['id'] ?? null;
-        if (! is_string($id) || $id === '' || strlen($id) > 255) {
+        $idLength = is_string($id) ? preg_match_all('/./us', $id) : false;
+        if ($idLength === false || $idLength === 0 || $idLength > 255) {
             throw new \UnexpectedValueException('Stored lifecycle rule ID is invalid.');
         }
 

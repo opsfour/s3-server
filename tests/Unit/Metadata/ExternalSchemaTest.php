@@ -41,7 +41,11 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(45, MysqlSchema::VERSION);
+        self::assertSame(46, MysqlSchema::VERSION);
+        self::assertContains(
+            'ALTER TABLE s3_tier_transition_jobs MODIFY COLUMN lifecycle_rule_id VARBINARY(1020) NULL',
+            MysqlSchema::getMigrationStatements(45),
+        );
         self::assertContains(
             'ALTER TABLE s3_cors_rules MODIFY COLUMN rule_id VARBINARY(1020) NULL',
             MysqlSchema::getMigrationStatements(44),
@@ -63,6 +67,7 @@ final class ExternalSchemaTest extends TestCase
         self::assertStringContainsString('idx_s3_storage_gc_recursive_unsafe', $recursiveCleanupMigration);
         $mysqlCreate = implode("\n", MysqlSchema::getCreateStatements());
         self::assertStringContainsString('rule_id VARBINARY(1020) NULL', $mysqlCreate);
+        self::assertStringContainsString('lifecycle_rule_id VARBINARY(1020) NULL', $mysqlCreate);
         self::assertStringContainsString('recursive_cleanup_unsafe TINYINT(1)', $mysqlCreate);
         self::assertStringContainsString(') VIRTUAL', $mysqlCreate);
         self::assertStringContainsString('idx_s3_storage_gc_recursive_unsafe (recursive_cleanup_unsafe, storage_tier)', $mysqlCreate);

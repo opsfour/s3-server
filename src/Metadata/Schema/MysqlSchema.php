@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 45;
+    public const int VERSION = 46;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -163,7 +163,7 @@ final class MysqlSchema
                 target_storage_class VARCHAR(64) NOT NULL,
                 source_storage_path TEXT NOT NULL,
                 origin VARCHAR(16) NOT NULL DEFAULT 'legacy',
-                lifecycle_rule_id VARBINARY(255) NULL,
+                lifecycle_rule_id VARBINARY(1020) NULL,
                 expected_is_latest TINYINT NULL,
                 target_storage_path TEXT,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
@@ -1014,6 +1014,9 @@ final class MysqlSchema
         }
         if ($fromVersion < 45) {
             $statements[] = 'ALTER TABLE s3_cors_rules MODIFY COLUMN rule_id VARBINARY(1020) NULL';
+        }
+        if ($fromVersion < 46) {
+            $statements[] = 'ALTER TABLE s3_tier_transition_jobs MODIFY COLUMN lifecycle_rule_id VARBINARY(1020) NULL';
         }
 
         return $statements;

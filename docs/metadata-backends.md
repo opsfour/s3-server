@@ -193,9 +193,10 @@ The DML-only serving role does not need trigger-creation rights.
 | 39 (SQLite) / 41 (PostgreSQL) / 44 (MySQL) | Preserve optional CORS rule IDs and distinguish an omitted `MaxAgeSeconds` from explicit zero. Legacy zero rows retain their previous omitted meaning. MySQL also widens website document/redirect fields and logging prefixes to `MEDIUMTEXT` for parity with the one-MiB control-plane request limit. |
 | 42 (PostgreSQL) | Add a C-collated account-quota owner index so cursor pagination keeps UTF-8 byte order under non-C database collations. |
 | 45 (MySQL) | Widen stored CORS rule IDs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
+| 46 (MySQL) | Widen lifecycle rule IDs stored with tier-transition jobs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
 
 SQLite currently uses schema version `39`; PostgreSQL uses `42`, and MySQL
-uses `45`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+uses `46`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error
@@ -204,8 +205,9 @@ indexes, and columns with defaults, but do not delete application data.
 MySQL v31 changes three indexed identifier columns and may wait for metadata
 locks or rebuild their indexes on a populated database. The v32 dispatch-token
 column also needs a migration-time and lock check on a representative copy.
-MySQL v45 widens the CORS rule ID column and can likewise wait for metadata
-locks or rebuild the table; measure it on a representative copy.
+MySQL v45 and v46 widen CORS and lifecycle tier-job rule ID columns and can
+likewise wait for metadata locks or rebuild their tables; measure them on a
+representative copy.
 The completion, object and part counter migrations count retained rows and
 create DML triggers. Stop all old API nodes and workers before their backfill;
 MySQL DDL auto-commits and does not provide a hot rolling cutover. The

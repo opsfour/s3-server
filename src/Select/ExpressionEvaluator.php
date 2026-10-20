@@ -152,7 +152,11 @@ final class ExpressionEvaluator
                     fn(string $p) => implode('.', array_map(fn(string $q) => preg_quote($q, '/'), explode('_', $p))),
                     explode('%', (string) $rightVal),
                 ));
-                $matchResult = preg_match('/^' . $pattern . '$/s', (string) $leftVal) === 1;
+                $match = preg_match('/^' . $pattern . '$/su', (string) $leftVal);
+                if ($match === false) {
+                    throw new SelectSqlException('S3 Select LIKE operands must be valid UTF-8.');
+                }
+                $matchResult = $match === 1;
                 return $negate ? !$matchResult : $matchResult;
             }
         }

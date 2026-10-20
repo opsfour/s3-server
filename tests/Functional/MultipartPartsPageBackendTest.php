@@ -35,7 +35,12 @@ final class MultipartPartsPageBackendTest extends TestCase
                 $store->putPart($uploadId, $partNumber, 'etag-' . $partNumber, 1, 'part-' . $partNumber);
             }
 
-            self::assertSame([1, 3], array_column($store->listPartsPage($uploadId, 0, 2), 'part_number'));
+            $firstPage = $store->listPartsPage($uploadId, 0, 2);
+            self::assertSame([1, 3], array_column($firstPage, 'part_number'));
+            self::assertMatchesRegularExpression(
+                '/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/D',
+                $firstPage[0]['created_at'],
+            );
             self::assertSame([3], array_column($store->listPartsPage($uploadId, 2, 1), 'part_number'));
             self::assertSame([10, 10000], array_column($store->listPartsPage($uploadId, 3, 1001), 'part_number'));
             self::assertSame([], $store->listPartsPage($uploadId, 10000, 1));

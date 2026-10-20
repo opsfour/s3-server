@@ -148,6 +148,26 @@ final class SqlAdmissionTest extends TestCase
         self::assertTrue(ExpressionEvaluator::evaluate($case['where'], ['name' => 'ÄRGER'], $case['alias']));
     }
 
+    public function test_like_wildcards_use_utf8_character_semantics(): void
+    {
+        $like = SqlParser::parse("SELECT * FROM s3object s WHERE s.name LIKE '_'");
+        $notLike = SqlParser::parse("SELECT * FROM s3object s WHERE s.name NOT LIKE '_'");
+
+        foreach (['A', 'Ä', '😀'] as $character) {
+            self::assertTrue(ExpressionEvaluator::evaluate($like['where'], ['name' => $character], $like['alias']));
+            self::assertFalse(ExpressionEvaluator::evaluate($notLike['where'], ['name' => $character], $notLike['alias']));
+        }
+    }
+
+    public function test_not_like_rejects_invalid_utf8_instead_of_matching_it(): void
+    {
+        $parsed = SqlParser::parse("SELECT * FROM s3object s WHERE s.name NOT LIKE '_'");
+
+        $this->expectException(SelectSqlException::class);
+        $this->expectExceptionMessage('LIKE operands must be valid UTF-8');
+        ExpressionEvaluator::evaluate($parsed['where'], ['name' => "\xC3\x28"], $parsed['alias']);
+    }
+
     public function test_empty_aggregates_preserve_sql_null(): void
     {
         self::assertSame(

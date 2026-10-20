@@ -4252,10 +4252,20 @@ final class PostgresMetadataStore implements MetadataStore, SharedAuthorizationL
     private function formatTimestamp(mixed $value): string
     {
         if ($value instanceof \DateTimeInterface) {
-            return $value->format('Y-m-d\TH:i:s\Z');
+            $timestamp = \DateTimeImmutable::createFromInterface($value);
+        } elseif (is_string($value) && $value !== '') {
+            try {
+                $timestamp = new \DateTimeImmutable($value);
+            } catch (\Exception $error) {
+                throw new \UnexpectedValueException('PostgreSQL returned an invalid timestamp.', 0, $error);
+            }
+        } else {
+            throw new \UnexpectedValueException('PostgreSQL returned an invalid timestamp.');
         }
 
-        return (string) $value;
+        return $timestamp
+            ->setTimezone(new \DateTimeZone('UTC'))
+            ->format('Y-m-d\TH:i:s\Z');
     }
 
     /** Preserve sub-second precision for keyset pagination comparisons. */
