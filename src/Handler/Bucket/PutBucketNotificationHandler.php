@@ -87,6 +87,9 @@ final class PutBucketNotificationHandler implements RequestHandler
                 || isset($parts['user']) || isset($parts['pass'])) {
                 throw new InvalidArgumentException('Notification destination must be an absolute HTTP(S) URL without user information.');
             }
+            if (isset($parts['port']) && $parts['port'] < 1) {
+                throw new InvalidArgumentException('Notification destination port must be between 1 and 65535.');
+            }
             $scheme = strtolower($parts['scheme']);
             if (! in_array($scheme, ['http', 'https'], true)) {
                 throw new NotImplementedException('Only HTTP(S) notification destinations are supported.');

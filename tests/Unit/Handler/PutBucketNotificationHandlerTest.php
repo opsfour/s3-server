@@ -221,10 +221,10 @@ final class PutBucketNotificationHandlerTest extends TestCase
             self::assertSame(200, $handler->handleRequest($request('https://notifications.invalid/existing'))->getStatus());
             $existing = $metadata->getBucketNotification('bucket');
 
-            foreach (['https://notifications.invalid/has space', 'https://notifications.invalid/line&#10;break'] as $destination) {
+            foreach (['https://notifications.invalid/has space', 'https://notifications.invalid/line&#10;break', 'https://notifications.invalid:0/hook'] as $destination) {
                 try {
                     $handler->handleRequest($request($destination));
-                    self::fail('A destination containing whitespace or control characters was accepted.');
+                    self::fail('An invalid notification destination was accepted.');
                 } catch (InvalidArgumentException $exception) {
                     self::assertSame(400, $exception->getHttpStatus());
                 }

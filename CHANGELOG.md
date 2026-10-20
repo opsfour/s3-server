@@ -82,6 +82,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Reject notification webhook URLs with invalid port zero before they enter
+  the delivery queue.
 - Refuse embedded server startup when rate limiting is enabled without the
   metadata store required to enforce it.
 - Discard access-log entries whose target bucket already has an incompatible

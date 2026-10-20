@@ -414,6 +414,10 @@ final class NotificationProcessor
             throw new UnsafeNotificationDestination('Notification destination must not contain user information.');
         }
 
+        if (isset($parts['port']) && $parts['port'] < 1) {
+            throw new UnsafeNotificationDestination('Notification destination port is invalid.');
+        }
+
         if ($this->requireHttps && $scheme !== 'https') {
             throw new UnsafeNotificationDestination('Notification destination must use HTTPS.');
         }
