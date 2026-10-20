@@ -34,7 +34,7 @@ final class ObjectTagValidator
                 $normalized[] = ['key' => $tag['key'], 'value' => $tag['value']];
             }
 
-            return self::validate($normalized, $maximum);
+            return self::validateTags($normalized, $maximum, true);
         } catch (InvalidArgumentException $error) {
             throw new InternalErrorException('Stored tag metadata is invalid.', $error);
         }
@@ -46,6 +46,15 @@ final class ObjectTagValidator
      */
     public static function validate(array $tags, int $maximum): array
     {
+        return self::validateTags($tags, $maximum, false);
+    }
+
+    /**
+     * @param list<array{key: string, value: string}> $tags
+     * @return list<array{key: string, value: string}>
+     */
+    private static function validateTags(array $tags, int $maximum, bool $allowReservedPrefix): array
+    {
         if (count($tags) > $maximum) {
             throw new InvalidArgumentException("Tag count cannot be greater than {$maximum}.");
         }
@@ -55,7 +64,7 @@ final class ObjectTagValidator
             if (preg_match('//u', $tag['key']) !== 1 || preg_match('//u', $tag['value']) !== 1) {
                 throw new InvalidArgumentException('Tag keys and values must be valid UTF-8.');
             }
-            if (strncasecmp($tag['key'], 'aws:', 4) === 0) {
+            if (! $allowReservedPrefix && strncasecmp($tag['key'], 'aws:', 4) === 0) {
                 throw new InvalidArgumentException('Tag keys must not use the reserved aws: prefix.');
             }
             if (! self::hasAllowedCharacters($tag['key'], false) || ! self::hasAllowedCharacters($tag['value'], true)) {

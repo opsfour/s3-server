@@ -11,6 +11,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
@@ -23,16 +24,39 @@ use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
 use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectTaggingHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectTaggingHandler;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
+use OpsFour\S3Server\ObjectLock\ObjectLockResponseHeaders;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\StorageBackend;
 use PHPUnit\Framework\TestCase;
 
 final class ObjectMetadataPolicyCommitTest extends TestCase
 {
+    public function test_unlocked_object_does_not_trigger_additional_object_lock_authorization(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::once())->method('getObjectRetention')
+            ->with('bucket', 'key', 'version')->willReturn(null);
+        $metadata->expects(self::once())->method('getObjectLegalHold')
+            ->with('bucket', 'key', 'version')->willReturn(null);
+        $metadata->expects(self::never())->method('getBucketPolicy');
+        $metadata->expects(self::never())->method('getAccountPolicy');
+        $metadata->expects(self::never())->method('getAcl');
+        $request = $this->request('GET', 'http://127.0.0.1/bucket/key', S3Operation::GetObject, 'owner');
+        $request->setAttribute('s3.policyResult', 'OwnerBypass');
+
+        $headers = (new ObjectLockResponseHeaders($metadata))->forObject(
+            $request,
+            new ObjectInfo('bucket', 'key', 3, '"etag"', ownerId: 'owner', versionId: 'version'),
+        );
+
+        self::assertSame([], $headers);
+    }
+
     public function test_get_and_head_return_authorized_object_lock_headers(): void
     {
         $this->withMetadata(function (SqliteMetadataStore $metadata): void {

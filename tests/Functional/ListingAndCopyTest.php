@@ -627,10 +627,15 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             'CopySource' => self::$bucket . '/storage-class-source.txt',
         ]);
 
-        self::assertSame('STANDARD', self::$s3->headObject([
+        $listed = self::$s3->listObjectsV2([
+            'Bucket' => self::$bucket,
+            'Prefix' => 'storage-class-copy.txt',
+        ]);
+        self::assertSame('STANDARD', $listed['Contents'][0]['StorageClass'] ?? null);
+        self::assertArrayNotHasKey('StorageClass', self::$s3->headObject([
             'Bucket' => self::$bucket,
             'Key' => 'storage-class-copy.txt',
-        ])['StorageClass']);
+        ]));
     }
 
     public function test_self_copy_uses_the_effective_default_storage_class_for_change_detection(): void
@@ -661,10 +666,10 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             'MetadataDirective' => 'COPY',
         ]);
         self::assertSame(200, $defaulted['@metadata']['statusCode']);
-        self::assertSame('STANDARD', self::$s3->headObject([
+        self::assertArrayNotHasKey('StorageClass', self::$s3->headObject([
             'Bucket' => self::$bucket,
             'Key' => 'self-copy.txt',
-        ])['StorageClass']);
+        ]));
 
         foreach ([[], ['StorageClass' => 'STANDARD']] as $unchangedOptions) {
             try {

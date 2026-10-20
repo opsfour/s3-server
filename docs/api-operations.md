@@ -339,7 +339,8 @@ Keys and values accept Unicode letters, numbers, spaces, and `+ - = . _ : / @`,
 matching the [S3 tag character set](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging.html).
 XML controls, Unicode noncharacters, and other symbols are rejected before
 existing tags are changed. Client-defined tag keys using the case-insensitive
-reserved `aws:` prefix are also rejected.
+reserved `aws:` prefix are also rejected. Existing stored tags with this prefix
+remain readable and copyable so upgrades do not make legacy objects unusable.
 
 ## Public Access Block
 

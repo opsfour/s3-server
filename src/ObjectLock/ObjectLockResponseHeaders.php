@@ -28,27 +28,23 @@ final readonly class ObjectLockResponseHeaders
         }
 
         $headers = [];
-        if ($this->isAllowed($request, S3Operation::GetObjectRetention)) {
-            $retention = $this->metadata->getObjectRetention(
-                $object->bucket,
-                $object->key,
-                $object->versionId,
-            );
-            if ($retention !== null) {
-                $headers['x-amz-object-lock-mode'] = $retention['mode'];
-                $headers['x-amz-object-lock-retain-until-date'] = $retention['retainUntilDate'];
-            }
+        $retention = $this->metadata->getObjectRetention(
+            $object->bucket,
+            $object->key,
+            $object->versionId,
+        );
+        if ($retention !== null && $this->isAllowed($request, S3Operation::GetObjectRetention)) {
+            $headers['x-amz-object-lock-mode'] = $retention['mode'];
+            $headers['x-amz-object-lock-retain-until-date'] = $retention['retainUntilDate'];
         }
 
-        if ($this->isAllowed($request, S3Operation::GetObjectLegalHold)) {
-            $status = $this->metadata->getObjectLegalHold(
-                $object->bucket,
-                $object->key,
-                $object->versionId,
-            );
-            if ($status !== null) {
-                $headers['x-amz-object-lock-legal-hold'] = $status;
-            }
+        $status = $this->metadata->getObjectLegalHold(
+            $object->bucket,
+            $object->key,
+            $object->versionId,
+        );
+        if ($status !== null && $this->isAllowed($request, S3Operation::GetObjectLegalHold)) {
+            $headers['x-amz-object-lock-legal-hold'] = $status;
         }
 
         return $headers;

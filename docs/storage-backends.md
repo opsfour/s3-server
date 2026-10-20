@@ -44,7 +44,12 @@ and preserves orderly worker shutdown.
 
 The optional `RecoverableObjectWriteBackend` can plan a physical object path from bucket, key, bucket generation, and a unique attempt ID before writing bytes. Built-in in-memory, filesystem, direct/worker Flysystem, and observed wrappers implement it. `putObjectAtPath()` validates the planned object's bucket and key hash; it also preserves the existing multipart completion paths while binding their bucket and key hash. Ordinary `putObject()` still uses its existing path and call behavior. No ordinary PUT handler or metadata intent uses this new capability yet, so it alone does not provide crash recovery or a remote write fence.
 
-Filesystem reads and exact-path deletes resolve existing paths against the configured storage root before I/O, rejecting traversal and symlinks that lead outside it. Keep the storage root private to the API process; path resolution and file opening are separate operations and do not protect against an attacker who can mutate directories concurrently.
+Filesystem reads reject traversal and every symlink component in a stored path,
+including links whose target remains inside the configured storage root.
+Exact-path deletes apply the same root confinement in the durable filesystem
+task. Keep the storage root private to the API process; path validation and
+file opening are separate operations and do not protect against an attacker
+who can mutate directories concurrently.
 
 Direct and worker-backed Flysystem reject absolute, traversal, and other paths
 that Flysystem would normalize before a stored-path read or exact-path delete.

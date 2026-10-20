@@ -38,6 +38,16 @@ final class ObjectTagValidatorTest extends TestCase
         self::assertSame($tags, ObjectTagValidator::validateStored($tags, 10));
     }
 
+    public function test_validate_stored_preserves_legacy_aws_reserved_tag_keys(): void
+    {
+        $tags = [
+            ['key' => 'aws:managed', 'value' => 'legacy'],
+            ['key' => 'AWS:Imported', 'value' => 'legacy'],
+        ];
+
+        self::assertSame($tags, ObjectTagValidator::validateStored($tags, 10));
+    }
+
     public function test_parse_header_rejects_malformed_percent_encoding(): void
     {
         $this->expectException(InvalidArgumentException::class);

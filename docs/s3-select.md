@@ -224,10 +224,8 @@ default `S3_SELECT_WORKERS=1` isolates SQL parsing, filtering, projection, and
 EventStream encoding from the API process. The API process still buffers the
 source object before submitting it to the worker.
 Reduce `S3_MAX_SELECT_OBJECT_SIZE` for the available memory, and limit Select
-callers at the proxy or policy layer. The release gate must use adversarial
-small-row and output-expansion profiles with the chosen storage adapter, PHP
-limit, and worker count. A streaming row and EventStream pipeline is needed
-before increasing the 64-MiB input ceiling.
+callers at the proxy or policy layer. A streaming row and EventStream pipeline
+is needed before increasing the 64-MiB input ceiling.
 
 ## Worker failures
 

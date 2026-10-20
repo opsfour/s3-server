@@ -95,7 +95,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Match CreateBucket's regional conflict behavior and reset the bucket ACL on
   the legacy successful us-east-1 same-owner recreation path.
 - Reject client-defined bucket and object tag keys that use the case-insensitive
-  reserved `aws:` prefix.
+  reserved `aws:` prefix while preserving reads and copies of legacy stored
+  tags that already use it.
 - Reject notification webhook URLs with invalid port zero before they enter
   the delivery queue.
 - Refuse embedded server startup when rate limiting is enabled without the
