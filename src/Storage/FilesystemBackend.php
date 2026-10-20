@@ -1048,24 +1048,33 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     private function assertStoredPathConfined(string $path): bool
     {
         clearstatcache(true, $this->basePath);
-        clearstatcache(true, $path);
         $root = realpath($this->basePath);
         if ($root === false) {
             throw new InternalErrorException('Filesystem storage root is unavailable.');
         }
 
-        $resolved = realpath($path);
-        if ($resolved === false) {
-            if ($this->metadataFilesystem->exists($path)) {
-                throw new \InvalidArgumentException('Stored object path cannot be resolved safely.');
+        $relative = substr($path, strlen($this->basePath) + 1);
+        $segments = explode('/', $relative);
+        $current = rtrim($root, '/');
+        $last = array_key_last($segments);
+        foreach ($segments as $index => $segment) {
+            $current .= '/' . $segment;
+            clearstatcache(true, $current);
+            $stat = @lstat($current);
+            if ($stat === false) {
+                if ($this->metadataFilesystem->exists($path)) {
+                    throw new \InvalidArgumentException('Stored object path cannot be resolved safely.');
+                }
+
+                return false;
             }
 
-            return false;
-        }
-
-        $prefix = rtrim($root, '/') . '/';
-        if (! str_starts_with($resolved, $prefix)) {
-            throw new \InvalidArgumentException('Stored object path escapes the storage root.');
+            $type = $stat['mode'] & 0170000;
+            if ($type === 0120000
+                || ($index === $last && $type !== 0100000)
+                || ($index !== $last && $type !== 0040000)) {
+                throw new \InvalidArgumentException('Stored object path cannot be resolved safely.');
+            }
         }
 
         return true;

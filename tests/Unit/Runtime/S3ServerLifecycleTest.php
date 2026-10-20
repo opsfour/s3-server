@@ -79,6 +79,7 @@ final class S3ServerLifecycleTest extends TestCase
             storagePath: sys_get_temp_dir(),
             tlsCertPath: sys_get_temp_dir() . '/missing-s3-cert-' . bin2hex(random_bytes(8)),
             tlsKeyPath: sys_get_temp_dir() . '/missing-s3-key-' . bin2hex(random_bytes(8)),
+            perClientRateLimit: 0,
         ));
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
@@ -107,6 +108,7 @@ final class S3ServerLifecycleTest extends TestCase
             host: '127.0.0.1',
             port: $port,
             storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
         ));
         $callerPool = $this->createMock(WorkerPool::class);
         $callerPool->expects(self::once())->method('shutdown');
@@ -479,7 +481,12 @@ final class S3ServerLifecycleTest extends TestCase
         $port = (int) substr($address, strrpos($address, ':') + 1);
         fclose($reservation);
 
-        $server = new S3Server(new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: sys_get_temp_dir()));
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+        ));
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
             'us-east-1',

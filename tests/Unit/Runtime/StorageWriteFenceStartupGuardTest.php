@@ -402,7 +402,10 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
     public function test_api_start_also_checks_primary_storage_outside_assigned_tier_registry(): void
     {
         $storage = new FlysystemBackend($this->createMock(FilesystemOperator::class));
-        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()), storage: $storage);
+        $server = new S3Server(new S3ServerConfig(
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+        ), storage: $storage);
         $server->setStorageTierRegistry(StorageTierRegistry::single($this->filesystemPlaceholder()));
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
@@ -492,6 +495,7 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
             port: $port,
             storagePath: sys_get_temp_dir(),
             allowUnfencedStorageForTests: true,
+            perClientRateLimit: 0,
         ), storage: new InMemoryBackend());
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),

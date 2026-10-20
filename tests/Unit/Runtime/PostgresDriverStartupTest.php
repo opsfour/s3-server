@@ -30,6 +30,7 @@ final class PostgresDriverStartupTest extends TestCase
         $server = new S3Server(new S3ServerConfig(
             storagePath: sys_get_temp_dir(),
             metadataDriver: 'postgres',
+            perClientRateLimit: 0,
         ));
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('access-key', 'secret-key', 'owner')),

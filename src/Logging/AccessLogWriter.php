@@ -152,7 +152,9 @@ final class AccessLogWriter
         if ($sourceOwner === '') {
             return;
         }
-        if ($loggingConfig === null || $targetAtRecord === null) {
+        if ($loggingConfig === null || $targetAtRecord === null
+            || $targetAtRecord->ownerId !== $sourceOwner
+            || $targetAtRecord->region !== $sourceInfo->region) {
             return;
         }
         $targetGeneration = $targetAtRecord->generation;

@@ -65,6 +65,30 @@ final class FilesystemPathConfinementTest extends TestCase
         }
     }
 
+    public function test_stored_path_cannot_read_or_copy_through_a_symlink_within_the_storage_root(): void
+    {
+        $backend = $this->backend();
+        mkdir($this->root . '/bucket/target');
+        file_put_contents($this->root . '/bucket/target/object', 'other-object-bytes');
+        symlink('target/object', $this->root . '/bucket/object-link');
+        symlink('target', $this->root . '/bucket/parent-link');
+
+        foreach ([$this->root . '/bucket/object-link', $this->root . '/bucket/parent-link/object'] as $path) {
+            foreach (['get', 'copy'] as $operation) {
+                try {
+                    if ($operation === 'get') {
+                        $backend->getObjectByPath($path)->close();
+                    } else {
+                        $backend->copyObject($path, 'bucket', 'copy');
+                    }
+                    self::fail("An internal symlink must be rejected before {$operation} reads its target.");
+                } catch (\InvalidArgumentException) {
+                    self::assertSame('other-object-bytes', file_get_contents($this->root . '/bucket/target/object'));
+                }
+            }
+        }
+    }
+
     public function test_stored_path_cannot_delete_outside_the_storage_root(): void
     {
         $backend = $this->backend();

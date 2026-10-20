@@ -213,6 +213,7 @@ final class S3ServerStartupOwnershipTest extends TestCase
             port: $port,
             storagePath: sys_get_temp_dir(),
             allowUnfencedStorageForTests: true,
+            perClientRateLimit: 0,
         ), storage: new InMemoryBackend(), logger: $logger);
         $server->addMiddleware(new AuthMiddleware(
             new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),

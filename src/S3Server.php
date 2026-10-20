@@ -235,6 +235,12 @@ final class S3Server
             throw new \LogicException('Refusing to start without authentication middleware.');
         }
 
+        if ($this->config->perClientRateLimit > 0 && $this->metadata === null) {
+            throw new \RuntimeException(
+                'Refusing to start with rate limiting enabled but no metadata store; set perClientRateLimit to 0 to disable rate limiting.',
+            );
+        }
+
         if (! extension_loaded('openssl')) {
             throw new \RuntimeException('S3 API nodes require ext-openssl for encrypted request spools.');
         }

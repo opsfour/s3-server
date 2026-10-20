@@ -82,6 +82,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Refuse embedded server startup when rate limiting is enabled without the
+  metadata store required to enforce it.
+- Discard access-log entries whose target bucket already has an incompatible
+  owner or region instead of retaining entries that can never be delivered.
+- Reject symlinks in committed local object paths before GET or CopyObject can
+  read bytes from another file inside the storage root.
 - Normalize GetObject and HeadObject HTTP dates to UTC before emitting the
   literal `GMT` suffix, including 304, delete-marker, and restore headers.
 - Preserve terminal lifecycle tier-transition failures instead of enqueueing a

@@ -42,6 +42,23 @@ final class S3ServerAuthenticationTest extends TestCase
         self::assertInstanceOf(AuthenticationMiddleware::class, $middleware);
     }
 
+    public function test_enabled_rate_limit_requires_metadata_store_before_startup(): void
+    {
+        $server = new S3Server(new S3ServerConfig(
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 2,
+        ));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('access-key', 'secret-key', 'owner')),
+            'us-east-1',
+        ));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('set perClientRateLimit to 0 to disable rate limiting');
+
+        $server->start();
+    }
+
     public function test_readiness_binding_uses_the_exact_provider_from_built_in_authentication(): void
     {
         $provider = new ProbeCredentialProvider();
