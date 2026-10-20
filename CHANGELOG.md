@@ -82,6 +82,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Default CopyObject destinations to the S3 `STANDARD` storage class when the
+  request does not specify `x-amz-storage-class`, including self-copy checks.
+- Reject reentrant CreateBucket requests whose location differs from the
+  existing bucket instead of reporting a false success.
+- Enforce `x-amz-mp-object-size` before multipart assembly and keep the upload
+  available when the declared size is invalid or does not match.
 - Normalize PostgreSQL multipart timestamps to valid UTC S3 response values.
 - Count lifecycle rule ID limits in Unicode characters and widen MySQL tier-job
   rule IDs to preserve accepted 255-character values.

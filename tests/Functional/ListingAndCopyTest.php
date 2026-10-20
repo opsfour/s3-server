@@ -612,7 +612,28 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_self_copy_allows_storage_class_change_and_rejects_no_op_with_invalid_request(): void
+    public function test_copy_object_defaults_destination_storage_class_to_standard(): void
+    {
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'storage-class-source.txt',
+            'Body' => 'copy-storage-class',
+            'StorageClass' => 'STANDARD_IA',
+        ]);
+
+        self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'storage-class-copy.txt',
+            'CopySource' => self::$bucket . '/storage-class-source.txt',
+        ]);
+
+        self::assertSame('STANDARD', self::$s3->headObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'storage-class-copy.txt',
+        ])['StorageClass']);
+    }
+
+    public function test_self_copy_uses_the_effective_default_storage_class_for_change_detection(): void
     {
         self::$s3->putObject([
             'Bucket' => self::$bucket,
@@ -633,7 +654,19 @@ final class ListingAndCopyTest extends S3FunctionalTestCase
             'Key' => 'self-copy.txt',
         ])['StorageClass']);
 
-        foreach ([[], ['StorageClass' => 'STANDARD_IA']] as $unchangedOptions) {
+        $defaulted = self::$s3->copyObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'self-copy.txt',
+            'CopySource' => self::$bucket . '/self-copy.txt',
+            'MetadataDirective' => 'COPY',
+        ]);
+        self::assertSame(200, $defaulted['@metadata']['statusCode']);
+        self::assertSame('STANDARD', self::$s3->headObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'self-copy.txt',
+        ])['StorageClass']);
+
+        foreach ([[], ['StorageClass' => 'STANDARD']] as $unchangedOptions) {
             try {
                 $command = self::$s3->getCommand('CopyObject', [
                     'Bucket' => self::$bucket,

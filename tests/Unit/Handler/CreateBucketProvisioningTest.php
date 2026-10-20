@@ -115,6 +115,47 @@ final class CreateBucketProvisioningTest extends TestCase
         }
     }
 
+    public function test_existing_bucket_with_different_region_is_not_reported_as_created(): void
+    {
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('createBucket');
+        $handler = $this->handler($storage);
+        $this->metadata->createBucket('owner', 'bucket', 'us-west-2');
+
+        try {
+            $handler->handleRequest($this->request(body: $this->locationConstraint('eu-west-1')));
+            self::fail('A conflicting bucket region must not be reported as created.');
+        } catch (BucketAlreadyOwnedByYouException $exception) {
+            self::assertStringContainsString('different region', $exception->getMessage());
+        }
+
+        self::assertSame('us-west-2', $this->metadata->getBucket('bucket')?->region);
+    }
+
+    public function test_reentrant_create_with_different_region_is_not_reported_as_created(): void
+    {
+        $storage = $this->createMock(StorageBackend::class);
+        $handler = $this->handler($storage);
+        $calls = 0;
+        $storage->method('createBucket')->willReturnCallback(function () use (&$calls, $handler): void {
+            if (++$calls === 1) {
+                self::assertSame(200, $handler->handleRequest(
+                    $this->request(body: $this->locationConstraint('eu-west-1')),
+                )->getStatus());
+            }
+        });
+
+        try {
+            $handler->handleRequest($this->request(body: $this->locationConstraint('us-west-2')));
+            self::fail('A concurrent bucket created in another region must reject the stale request.');
+        } catch (BucketAlreadyOwnedByYouException $exception) {
+            self::assertStringContainsString('different region', $exception->getMessage());
+        }
+
+        self::assertSame(2, $calls);
+        self::assertSame('eu-west-1', $this->metadata->getBucket('bucket')?->region);
+    }
+
     public function test_reentrant_create_with_matching_protection_options_remains_idempotent(): void
     {
         $storage = $this->createMock(StorageBackend::class);
@@ -268,13 +309,19 @@ final class CreateBucketProvisioningTest extends TestCase
     }
 
     /** @param array<non-empty-string, string> $headers */
-    private function request(array $headers = []): Request
+    private function request(array $headers = [], string $body = ''): Request
     {
-        $request = new Request(new CreateBucketProvisioningTestClient(), 'PUT', Http::new('http://127.0.0.1/bucket'), $headers);
+        $request = new Request(new CreateBucketProvisioningTestClient(), 'PUT', Http::new('http://127.0.0.1/bucket'), $headers, $body);
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('ownerId', 'owner');
 
         return $request;
+    }
+
+    private function locationConstraint(string $region): string
+    {
+        return '<CreateBucketConfiguration><LocationConstraint>' . $region
+            . '</LocationConstraint></CreateBucketConfiguration>';
     }
 
     private function headRequest(): Request

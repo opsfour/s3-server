@@ -54,7 +54,9 @@ CopyObject can copy the current object onto the same key when the request uses
 `MetadataDirective=REPLACE`, changes the storage class, or changes effective
 encryption attributes. Encryption changes include applying SSE-S3 through a
 request or a newly configured bucket default and rotating an SSE-C customer
-key. A self-copy that requests none of these changes returns `InvalidRequest`.
+key. Without `x-amz-storage-class`, the destination uses `STANDARD`; this may
+therefore be a storage-class change during a self-copy. A self-copy that leaves
+all of these attributes unchanged returns `InvalidRequest`.
 A single CopyObject request is limited to 5 GiB; larger sources require
 multipart copy and return `EntityTooLarge` before storage I/O.
 When the source size and current destination state are known, CopyObject also
@@ -172,7 +174,9 @@ Each uploaded or copied part is limited to 5 GiB. An oversized part returns
 `EntityTooLarge` (HTTP 400); it cannot be committed to the upload.
 CompleteMultipartUpload also rejects a selected part set above S3's 50-TB
 object limit (50,000 GiB, about 48.8 TiB) before creating a durable write
-attempt or invoking assembly.
+attempt or invoking assembly. When `x-amz-mp-object-size` is supplied, it must
+be a non-negative decimal value within that limit and must equal the selected
+parts' total size; a mismatch returns `InvalidRequest` before assembly.
 UploadPart accepts one CRC32, CRC32C, SHA1, or SHA256 checksum. It validates
 the digest against the complete logical part, returns the matching checksum
 response header, persists it with the part, and includes it in ListParts.

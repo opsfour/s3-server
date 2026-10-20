@@ -20,8 +20,10 @@ use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Exception\InvalidPartException;
 use OpsFour\S3Server\Exception\InvalidPartOrderException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
+use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
@@ -79,6 +81,9 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 );
             }
         }
+        $declaredObjectSize = self::declaredObjectSize(
+            RequestHeaderValues::singleton($request, 'x-amz-mp-object-size'),
+        );
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -232,6 +237,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         if ($uploadEncryptionMode !== null && $expectedSize > $this->maxEncryptedObjectSize) {
             throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                 'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+            );
+        }
+        if ($declaredObjectSize !== null && $declaredObjectSize !== $expectedSize) {
+            throw new InvalidRequestException(
+                'The specified multipart object size does not match the selected parts.',
             );
         }
 
@@ -800,6 +810,29 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         }
 
         return null;
+    }
+
+    private static function declaredObjectSize(?string $value): ?int
+    {
+        if ($value === null) {
+            return null;
+        }
+        if ($value === '' || ! ctype_digit($value)) {
+            throw new \OpsFour\S3Server\Exception\InvalidArgumentException(
+                'x-amz-mp-object-size must be a non-negative decimal integer.',
+            );
+        }
+
+        $digits = ltrim($value, '0');
+        $max = (string) MultipartPartSize::MAX_OBJECT_BYTES;
+        if (strlen($digits) > strlen($max)
+            || (strlen($digits) === strlen($max) && strcmp($digits, $max) > 0)) {
+            throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
+                'Expected multipart object size exceeds the 50,000 GiB maximum.',
+            );
+        }
+
+        return (int) $value;
     }
 
     /**

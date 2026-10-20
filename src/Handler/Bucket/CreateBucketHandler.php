@@ -79,14 +79,14 @@ final class CreateBucketHandler implements RequestHandler
         // 3. Reject known name conflicts and quota violations before touching
         // storage. The checks run again at commit because another request can
         // create the bucket while the backend operation is in progress.
-        $this->metadata->transaction(function () use ($ownerId, $bucket, $objectLockHeader, $objectOwnershipHeader): void {
+        $this->metadata->transaction(function () use ($ownerId, $bucket, $region, $objectLockHeader, $objectOwnershipHeader): void {
             $this->metadata->lockOwnerForUpdate($ownerId);
             $existingOwner = $this->metadata->getBucketOwner($bucket);
             if ($existingOwner !== null && $existingOwner !== $ownerId) {
                 throw new BucketAlreadyExistsException();
             }
             if ($existingOwner === $ownerId) {
-                $this->assertExistingBucketSettings($bucket, $objectLockHeader, $objectOwnershipHeader);
+                $this->assertExistingBucketSettings($bucket, $region, $objectLockHeader, $objectOwnershipHeader);
             }
             if ($existingOwner === null) {
                 $this->quotas?->assertCanCreateBucket($ownerId);
@@ -106,7 +106,7 @@ final class CreateBucketHandler implements RequestHandler
             $existingOwner = $this->metadata->getBucketOwner($bucket);
             if ($existingOwner !== null) {
                 if ($existingOwner === $ownerId) {
-                    $this->assertExistingBucketSettings($bucket, $objectLockHeader, $objectOwnershipHeader);
+                    $this->assertExistingBucketSettings($bucket, $region, $objectLockHeader, $objectOwnershipHeader);
                     return;
                 }
                 throw new BucketAlreadyExistsException();
@@ -131,8 +131,16 @@ final class CreateBucketHandler implements RequestHandler
         );
     }
 
-    private function assertExistingBucketSettings(string $bucket, ?string $objectLockHeader, ?string $objectOwnershipHeader): void
-    {
+    private function assertExistingBucketSettings(
+        string $bucket,
+        string $region,
+        ?string $objectLockHeader,
+        ?string $objectOwnershipHeader,
+    ): void {
+        if ($this->metadata->getBucket($bucket)?->region !== $region) {
+            throw new BucketAlreadyOwnedByYouException('The existing bucket has a different region.');
+        }
+
         if ($objectLockHeader !== null
             && ($this->metadata->getObjectLockConfig($bucket) !== null) !== ($objectLockHeader === 'true')) {
             throw new BucketAlreadyOwnedByYouException('The existing bucket has different Object Lock settings.');

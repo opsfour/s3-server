@@ -2540,6 +2540,55 @@ final class MultipartCompletionRetryTest extends TestCase
         )->getStatus());
     }
 
+    public function test_multipart_completion_enforces_expected_object_size_before_assembly(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage))->handleRequest(
+            $this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'),
+        );
+        $etag = (string) $part->getHeader('ETag');
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->expects(self::never())->method('planMultipartCompletionPaths');
+        $storage->expects(self::never())->method('assembleMultipartUploadAtPath');
+        $handler = new CompleteMultipartUploadHandler($this->metadata, $storage);
+        foreach ([
+            'mismatch' => [['x-amz-mp-object-size' => '8'], InvalidRequestException::class],
+            'malformed' => [['x-amz-mp-object-size' => '7junk'], InvalidArgumentException::class],
+            'duplicate' => [['x-amz-mp-object-size' => ['7', '7']], InvalidArgumentException::class],
+            'above object limit' => [[
+                'x-amz-mp-object-size' => (string) (MultipartPartSize::MAX_OBJECT_BYTES + 1),
+            ], EntityTooLargeException::class],
+        ] as $case => [$headers, $expectedException]) {
+            try {
+                $handler->handleRequest($this->request(
+                    'POST',
+                    '/bucket/retry.bin?uploadId=' . $uploadId,
+                    $body,
+                    $headers,
+                ));
+                self::fail("{$case} x-amz-mp-object-size must reject multipart completion.");
+            } catch (\Throwable $error) {
+                self::assertInstanceOf($expectedException, $error, $case);
+                self::assertNotNull($this->metadata->getMultipartUpload($uploadId), $case);
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'), $case);
+            }
+        }
+
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request(
+                'POST',
+                '/bucket/retry.bin?uploadId=' . $uploadId,
+                $body,
+                ['x-amz-mp-object-size' => '0007'],
+            ))
+            ->getStatus());
+    }
+
     public function test_multipart_completion_preserves_expires_from_initiation(): void
     {
         $expires = 'Wed, 21 Oct 2037 07:28:00 GMT';

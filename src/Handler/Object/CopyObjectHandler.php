@@ -324,6 +324,7 @@ final class CopyObjectHandler implements RequestHandler
         if ($requestedStorageClass !== null) {
             $requestedStorageClass = \OpsFour\S3Server\Http\StorageClassValidator::requested($requestedStorageClass);
         }
+        $effectiveStorageClass = $requestedStorageClass ?? 'STANDARD';
         $aclGrants = AclGrantResolver::fromHeaders($request, $objectOwnerId, 'object', $dstBucketInfo->ownerId)
             ?? AclGrantResolver::privateAcl($objectOwnerId);
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($dstBucket);
@@ -489,7 +490,7 @@ final class CopyObjectHandler implements RequestHandler
         // default encryption are valid reasons to rewrite the object.
         if ($srcBucket === $dstBucket && $srcKey === $dstKey
             && $metadataDirective === 'COPY' && $srcVersionId === null
-            && ($requestedStorageClass === null || $requestedStorageClass === $srcObjectInfo->storageClass)
+            && $effectiveStorageClass === $srcObjectInfo->storageClass
             && ! $changesEncryption) {
             throw new InvalidRequestException(
                 'This copy request is illegal because it is trying to copy an object to itself '
@@ -740,7 +741,7 @@ final class CopyObjectHandler implements RequestHandler
             $userMetadata['__' . $k] = $v;
         }
 
-        $storageClass = $requestedStorageClass ?? $srcObjectInfo->storageClass;
+        $storageClass = $effectiveStorageClass;
 
         // Checksums are object integrity metadata, so a copy preserves each
         // checksum that was verified against the copied source payload above.
