@@ -112,6 +112,12 @@ write-lock rows serialize quota-sensitive writes across processes. MariaDB and
 distributed MySQL variants are outside the current production target and
 remain experimental compatibility profiles.
 
+Pools created through `MysqlMetadataStore::fromDsn()` configure every physical
+connection with `time_zone='+00:00'` before use so MySQL `TIMESTAMP` values map
+to S3 UTC timestamps. Code that injects its own `MysqlConnectionPool` must wrap
+the pool connector in `UtcMysqlConnector`; checking one borrowed connection is
+insufficient because the pool can open more connections later.
+
 The `transaction()` convenience method can be called from normal synchronous
 CLI code or from an Amp Fiber. Direct `beginTransaction()`, `commit()`, and
 `rollback()` calls require an Amp Fiber so the connection remains bound to the

@@ -40,6 +40,7 @@ use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
+use OpsFour\S3Server\Metadata\UtcMysqlConnector;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Metadata\OwnerReadLock;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
@@ -652,6 +653,17 @@ final class MetadataBackendIntegrationTest extends TestCase
         }
 
         $dsn = trim($dsn);
+        if ($driver === 'mysql') {
+            $connector = new UtcMysqlConnector();
+            foreach ([1, 2] as $_) {
+                $connection = $connector->connect(MysqlConfig::fromString($dsn));
+                try {
+                    self::assertSame('+00:00', $connection->query('SELECT @@session.time_zone AS time_zone')->fetchRow()['time_zone'] ?? null);
+                } finally {
+                    $connection->close();
+                }
+            }
+        }
         $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
         $pool = self::externalPool($driver, $dsn);
         $suffix = bin2hex(random_bytes(8));

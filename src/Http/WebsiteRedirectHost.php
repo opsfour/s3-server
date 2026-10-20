@@ -9,6 +9,10 @@ final class WebsiteRedirectHost
 {
     public static function isValid(string $host): bool
     {
-        return preg_match('/\A[a-zA-Z0-9.-]+(?::[0-9]{1,5})?\z/D', $host) === 1;
+        if (preg_match('/\A[a-zA-Z0-9.-]+(?::([0-9]{1,5}))?\z/D', $host, $matches) !== 1) {
+            return false;
+        }
+
+        return ! isset($matches[1]) || ((int) $matches[1] >= 1 && (int) $matches[1] <= 65_535);
     }
 }

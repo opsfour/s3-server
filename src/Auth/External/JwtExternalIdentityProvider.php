@@ -229,11 +229,11 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
             throw new ExternalIdentityAuthenticationException('JWT has expired.');
         }
 
-        if (isset($claims['nbf']) && (!is_int($claims['nbf']) || $claims['nbf'] > $now + $this->clockSkewSeconds)) {
+        if (array_key_exists('nbf', $claims) && (!is_int($claims['nbf']) || $claims['nbf'] > $now + $this->clockSkewSeconds)) {
             throw new ExternalIdentityAuthenticationException('JWT is not valid yet.');
         }
 
-        if (isset($claims['iat']) && (!is_int($claims['iat']) || $claims['iat'] > $now + $this->clockSkewSeconds)) {
+        if (array_key_exists('iat', $claims) && (!is_int($claims['iat']) || $claims['iat'] > $now + $this->clockSkewSeconds)) {
             throw new ExternalIdentityAuthenticationException('JWT issued-at timestamp is in the future.');
         }
 

@@ -87,6 +87,11 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
 
     private ?string $creationDsnFingerprint = null;
 
+    /**
+     * Constructor-injected pools must configure every physical connection with
+     * UtcMysqlConnector so MySQL TIMESTAMP values retain their S3 UTC meaning.
+     * Prefer fromDsn(), which applies that connector automatically.
+     */
     public function __construct(
         private readonly MysqlConnectionPool $pool,
     ) {
@@ -95,7 +100,10 @@ final class MysqlMetadataStore implements MetadataStore, SharedAuthorizationLock
 
     public static function fromDsn(string $dsn): self
     {
-        $pool = new MysqlConnectionPool(MysqlConfig::fromString($dsn));
+        $pool = new MysqlConnectionPool(
+            MysqlConfig::fromString($dsn),
+            connector: new UtcMysqlConnector(),
+        );
 
         $store = new self($pool);
         $store->creationDsnFingerprint = hash('sha256', $dsn);

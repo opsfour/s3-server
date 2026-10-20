@@ -82,6 +82,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Initialize every package-managed MySQL metadata connection in UTC so server
+  session time zones cannot shift S3 timestamps.
+- Reject invalid ports in stored website redirect hosts instead of emitting
+  unusable `Location` responses.
+- Reject explicitly present non-integer OIDC `nbf` and `iat` claims while
+  keeping those optional claims optional.
 - Return version-specific Object Lock retention and legal-hold headers from
   GET and HEAD when the caller has the corresponding metadata permission.
 - Allow anonymous object options when their additional actions are explicitly

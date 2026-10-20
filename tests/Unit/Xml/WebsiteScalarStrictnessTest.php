@@ -84,8 +84,22 @@ final class WebsiteScalarStrictnessTest extends TestCase
     public static function invalidRedirectHosts(): iterable
     {
         yield 'redirect-all alphabetic port' => ['<RedirectAllRequestsTo><HostName>example.com:http</HostName></RedirectAllRequestsTo>'];
+        yield 'redirect-all zero port' => ['<RedirectAllRequestsTo><HostName>example.com:0</HostName></RedirectAllRequestsTo>'];
+        yield 'redirect-all zero-padded zero port' => ['<RedirectAllRequestsTo><HostName>example.com:00000</HostName></RedirectAllRequestsTo>'];
+        yield 'redirect-all port above maximum' => ['<RedirectAllRequestsTo><HostName>example.com:65536</HostName></RedirectAllRequestsTo>'];
         yield 'redirect-all six digit port' => ['<RedirectAllRequestsTo><HostName>example.com:123456</HostName></RedirectAllRequestsTo>'];
+        yield 'routing port above maximum' => [self::routingRule('<KeyPrefixEquals>docs/</KeyPrefixEquals>', '<HostName>example.com:99999</HostName>')];
         yield 'routing IPv6 literal' => [self::routingRule('<KeyPrefixEquals>docs/</KeyPrefixEquals>', '<HostName>[::1]</HostName>')];
+    }
+
+    public function test_website_accepts_maximum_redirect_port(): void
+    {
+        $configuration = XmlRequestParser::parseWebsiteConfiguration(
+            '<WebsiteConfiguration><RedirectAllRequestsTo><HostName>example.com:65535</HostName>'
+            . '<Protocol>https</Protocol></RedirectAllRequestsTo></WebsiteConfiguration>',
+        );
+
+        self::assertSame('example.com:65535', $configuration['redirectAllHost']);
     }
 
     private static function routingRule(string $condition, string $redirect): string

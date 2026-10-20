@@ -572,6 +572,41 @@ final class ExternalCredentialIssuerTest extends TestCase
         $provider->authenticate($token);
     }
 
+    public function test_jwt_external_identity_provider_allows_missing_optional_time_claims_and_rejects_null_values(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $header = ['alg' => 'RS256', 'kid' => 'key-1'];
+        $claims = [
+            'sub' => 'user-123',
+            'iss' => 'https://issuer.example.test',
+            'aud' => 's3-admin',
+            'exp' => time() + 300,
+        ];
+        $provider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+        );
+
+        self::assertSame('user-123', $provider->authenticate($this->signJwt($privateKey, $header, $claims))->ownerId);
+
+        foreach ([
+            'nbf' => 'JWT is not valid yet.',
+            'iat' => 'JWT issued-at timestamp is in the future.',
+        ] as $claim => $expectedMessage) {
+            $invalidClaims = $claims;
+            $invalidClaims[$claim] = null;
+
+            try {
+                $provider->authenticate($this->signJwt($privateKey, $header, $invalidClaims));
+                self::fail(sprintf('A null %s claim was accepted.', $claim));
+            } catch (ExternalIdentityAuthenticationException $exception) {
+                self::assertSame($expectedMessage, $exception->getMessage());
+            }
+        }
+    }
+
     public function test_jwt_external_identity_provider_rejects_tampered_signature(): void
     {
         [$privateKey, $jwk] = $this->createRsaKeyPair();

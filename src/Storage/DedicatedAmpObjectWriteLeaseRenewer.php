@@ -17,6 +17,7 @@ use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
+use OpsFour\S3Server\Metadata\UtcMysqlConnector;
 
 /**
  * A separate, bounded Amp connection pool for local write lease renewals.
@@ -53,7 +54,7 @@ final readonly class DedicatedAmpObjectWriteLeaseRenewer implements LocalObjectW
         $pool = new MysqlConnectionPool(
             MysqlConfig::fromString($dsn),
             maxConnections: $maxConnections,
-            connector: new RetrySqlConnector(new SocketMysqlConnector(new RetrySocketConnector(new DnsSocketConnector()))),
+            connector: new RetrySqlConnector(new UtcMysqlConnector(new SocketMysqlConnector(new RetrySocketConnector(new DnsSocketConnector())))),
         );
 
         return new self(new MysqlMetadataStore($pool), $pool);
