@@ -1211,7 +1211,7 @@ final class AccessLogWriterTest extends TestCase
         $writer->log('source', 'private-key', 'GetObject', 200, 42);
         $writer->flush();
 
-        self::assertSame(1, $writer->getBufferCount());
+        self::assertSame(0, $writer->getBufferCount());
         self::assertSame([], $metadata->listObjects('log-target')->objects);
     }
 }

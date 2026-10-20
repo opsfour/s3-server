@@ -235,6 +235,9 @@ not qualify the topology. An enabled limit fails closed with S3 `SlowDown`
 (503) when its database check fails; `/.health` reports degraded after its next
 rate-limit probe (within 30 seconds), while `/.live` remains available. With
 `S3_RATE_LIMIT=0`, no rate-limit database check runs.
+An embedded `S3Server` with no metadata store refuses to start while the limit
+is positive; set `perClientRateLimit` to `0` only for an intentionally
+unlimited metadata-free embedding.
 
 Management requests under `/.admin/*` and `/.metrics` also fail closed when
 their rate-limit check fails. Downstream handler, backend, and rate-limit

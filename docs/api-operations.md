@@ -24,6 +24,9 @@ capabilities for this endpoint; otherwise it returns HTTP 501. See
 [Metadata Backends](metadata-backends.md#generation-bound-multipart-listings).
 CreateBucket ignores `x-amz-expected-bucket-owner`; supported bucket and object
 operations reject a mismatched expected owner before processing the request.
+Recreating a same-owner bucket returns `BucketAlreadyOwnedByYou` outside
+`us-east-1`. The legacy successful `us-east-1` path resets the bucket ACL to
+the private owner ACL.
 
 ## Object CRUD
 
@@ -101,6 +104,8 @@ neither a checksum value nor a checksum type. CopyObject preserves verified
 source checksums independently of its user-metadata directive and returns them
 with `ChecksumType` set to `FULL_OBJECT`; checksum-free source objects return
 no checksum fields.
+GET and HEAD omit `x-amz-storage-class` for STANDARD objects and include it for
+other supported storage classes.
 
 GET and HEAD return `x-amz-object-lock-mode` and
 `x-amz-object-lock-retain-until-date` when the caller may perform
@@ -307,6 +312,7 @@ new delete marker. `BucketOwnerPreferred` is not implemented.
 | DeleteBucketCors | `DELETE` | `/{bucket}?cors` | Remove CORS rules |
 
 CORS preflight (OPTIONS) is handled automatically by the CorsMiddleware.
+PutBucketCors accepts configuration documents up to 64 KiB.
 `CORSRule.ID` is preserved across PUT/GET and is limited to 255 Unicode
 characters. `MaxAgeSeconds` accepts the complete
 non-negative signed 32-bit range, including an explicit `0`. Origins and
@@ -328,7 +334,8 @@ Every `Tag` requires both `Key` and `Value`; an empty `<Value/>` is valid.
 Keys and values accept Unicode letters, numbers, spaces, and `+ - = . _ : / @`,
 matching the [S3 tag character set](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging.html).
 XML controls, Unicode noncharacters, and other symbols are rejected before
-existing tags are changed.
+existing tags are changed. Client-defined tag keys using the case-insensitive
+reserved `aws:` prefix are also rejected.
 
 ## Public Access Block
 
@@ -386,7 +393,8 @@ specific error response.
 | PutBucketNotification | `PUT` | `/{bucket}?notification` | Replace notification config (maximum 256 entries; 257 or more returns `400 InvalidArgument`) |
 
 Webhook destination URLs are limited to 512 bytes. Invalid replacements leave
-the existing notification configuration unchanged. See
+the existing notification configuration unchanged. Explicit ports must be in
+the range 1 through 65535. See
 [Notifications](notifications.md) for webhook delivery.
 
 ## Logging
@@ -398,6 +406,9 @@ the existing notification configuration unchanged. See
 
 `TargetPrefix` is limited to 988 bytes so the generated timestamp and random
 suffix always fit within S3's 1,024-byte object-key limit.
+Targets with Object Lock are rejected. If Object Lock is enabled after logging
+was configured, queued entries for that target are discarded as permanently
+undeliverable.
 
 ## Website Hosting
 
@@ -406,6 +417,10 @@ suffix always fit within S3's 1,024-byte object-key limit.
 | GetBucketWebsite | `GET` | `/{bucket}?website` | Get website config |
 | PutBucketWebsite | `PUT` | `/{bucket}?website` | Set website config |
 | DeleteBucketWebsite | `DELETE` | `/{bucket}?website` | Remove website config |
+
+Website endpoints use the configured error document for supported 4XX
+responses, including 403 for an existing object that is not publicly readable,
+while preserving the original status code.
 
 ## S3 Select
 

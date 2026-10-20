@@ -136,6 +136,17 @@ final class WebsiteHostingMiddleware implements Middleware
                 }
             }
 
+            $errorResponse = $this->websiteErrorDocumentResponse(
+                $request,
+                $bucketInfo,
+                $bucket,
+                $websiteConfig['errorDocument'] ?? null,
+                403,
+            );
+            if ($errorResponse !== null) {
+                return $errorResponse;
+            }
+
             return self::htmlError(403, 'AccessDenied', 'The requested website object is not publicly readable.');
         }
 
@@ -203,49 +214,72 @@ final class WebsiteHostingMiddleware implements Middleware
             }
         }
 
-        // Try error document.
-        if (isset($websiteConfig['errorDocument'])) {
-            $errorDocument = $websiteConfig['errorDocument'];
-            $errorObjectInfo = $this->metadata->getObjectMetadata($bucket, $errorDocument);
-            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            $errorPubliclyReadable = $this->isPubliclyReadable($request, $bucket, $errorDocument, $errorObjectInfo);
-            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            if (! $errorPubliclyReadable) {
-                return self::htmlError(403, 'AccessDenied', 'The website error document is not publicly readable.');
-            }
-
-            if ($errorObjectInfo !== null && !$errorObjectInfo->isDeleteMarker) {
-                $sseAlgo = $errorObjectInfo->userMetadata['__sse-algorithm'] ?? null;
-                if ($sseAlgo === 'SSE-C' || $sseAlgo === 'AES256') {
-                    return self::htmlError(403, 'AccessDenied', 'Encrypted error documents cannot be served via website hosting.');
-                }
-
-                $storagePath = $errorObjectInfo->systemMetadata['storagePath'] ?? null;
-                if ($storagePath !== null) {
-                    try {
-                        [$storage, $storagePath] = $this->readLocation($errorObjectInfo, $storagePath);
-                    } catch (\InvalidArgumentException) {
-                        return self::htmlError(500, 'InternalError', 'Error document storage tier is not configured.');
-                    }
-
-                    if ($storage === null) {
-                        return self::htmlError(403, 'InvalidObjectState', 'The archived error document must be restored before it can be served.');
-                    }
-
-                    $body = $request->getMethod() === 'HEAD'
-                        ? ''
-                        : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo->size);
-
-                    return new Response(
-                        status: 404,
-                        headers: self::websiteObjectHeaders($errorObjectInfo),
-                        body: $body,
-                    );
-                }
-            }
+        $errorResponse = $this->websiteErrorDocumentResponse(
+            $request,
+            $bucketInfo,
+            $bucket,
+            $websiteConfig['errorDocument'] ?? null,
+            404,
+        );
+        if ($errorResponse !== null) {
+            return $errorResponse;
         }
 
         return self::htmlError(404, 'NoSuchKey', 'The specified key does not exist.');
+    }
+
+    private function websiteErrorDocumentResponse(
+        Request $request,
+        BucketInfo $bucketInfo,
+        string $bucket,
+        ?string $errorDocument,
+        int $status,
+    ): ?Response {
+        if ($errorDocument === null) {
+            return null;
+        }
+
+        $errorObjectInfo = $this->metadata->getObjectMetadata($bucket, $errorDocument);
+        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        $errorPubliclyReadable = $this->isPubliclyReadable($request, $bucket, $errorDocument, $errorObjectInfo);
+        BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+        if (! $errorPubliclyReadable) {
+            return self::htmlError(403, 'AccessDenied', 'The website error document is not publicly readable.');
+        }
+
+        if ($errorObjectInfo === null || $errorObjectInfo->isDeleteMarker) {
+            return null;
+        }
+
+        $sseAlgo = $errorObjectInfo->userMetadata['__sse-algorithm'] ?? null;
+        if ($sseAlgo === 'SSE-C' || $sseAlgo === 'AES256') {
+            return self::htmlError(403, 'AccessDenied', 'Encrypted error documents cannot be served via website hosting.');
+        }
+
+        $storagePath = $errorObjectInfo->systemMetadata['storagePath'] ?? null;
+        if ($storagePath === null) {
+            return null;
+        }
+
+        try {
+            [$storage, $storagePath] = $this->readLocation($errorObjectInfo, $storagePath);
+        } catch (\InvalidArgumentException) {
+            return self::htmlError(500, 'InternalError', 'Error document storage tier is not configured.');
+        }
+
+        if ($storage === null) {
+            return self::htmlError(403, 'InvalidObjectState', 'The archived error document must be restored before it can be served.');
+        }
+
+        $body = $request->getMethod() === 'HEAD'
+            ? ''
+            : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo->size);
+
+        return new Response(
+            status: $status,
+            headers: self::websiteObjectHeaders($errorObjectInfo),
+            body: $body,
+        );
     }
 
     private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): GenerationGuardedReadableStream

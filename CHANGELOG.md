@@ -82,6 +82,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Serve configured website error documents for access-denied objects while
+  preserving the original 403 status.
+- Discard access-log entries after their target enables Object Lock instead of
+  retaining a permanently undeliverable retry group.
 - Omit `x-amz-storage-class` from GET and HEAD responses for STANDARD objects,
   matching S3's response contract.
 - Enforce the 64-KiB PutBucketCors document limit.

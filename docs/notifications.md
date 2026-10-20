@@ -310,7 +310,8 @@ Destinations resolving to private IPs are immediately dead-lettered.
 Plaintext HTTP destinations are rejected at configuration time by default;
 legacy stored HTTP destinations are dead-lettered by the worker. Legacy
 destinations containing whitespace or control characters are likewise
-dead-lettered without invoking the transport. Keep
+dead-lettered without invoking the transport. Port zero is rejected for new
+configurations and blocked immediately for legacy entries. Keep
 `S3_NOTIFICATION_REQUIRE_HTTPS=true` in production; setting it to `false`
 changes only the transport requirement and does not disable destination or
 redirect SSRF validation.

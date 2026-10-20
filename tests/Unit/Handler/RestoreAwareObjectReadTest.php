@@ -507,6 +507,26 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertStringContainsString('AccessDenied', \Amp\ByteStream\buffer($encrypted->getBody()));
     }
 
+    public function test_website_error_document_is_served_for_access_denied_object(): void
+    {
+        $private = $this->hot->putObject('bucket', 'private.html', new ReadableBuffer('private'));
+        $this->putMetadata('private.html', $private->path, $private->size, $private->md5Hex);
+        $error = $this->hot->putObject('bucket', 'error.html', new ReadableBuffer('access denied'));
+        $this->putMetadata('error.html', $error->path, $error->size, $error->md5Hex);
+        $this->grantPublicRead('error.html');
+        $this->metadata->putBucketWebsite('bucket', 'index.html', 'error.html');
+
+        $response = (new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test'))
+            ->handleRequest(
+                $this->websiteRequest('GET', '/private.html', 'bucket.s3-website.test'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+
+        self::assertSame(403, $response->getStatus());
+        self::assertSame('access denied', \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame((string) strlen('access denied'), $response->getHeader('Content-Length'));
+    }
+
     public function test_website_object_and_error_document_preserve_cache_metadata(): void
     {
         foreach (['index.html', 'error.html'] as $key) {

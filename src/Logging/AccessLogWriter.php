@@ -334,7 +334,10 @@ final class AccessLogWriter
                     throw new \RuntimeException('Access log target is no longer owned by the source bucket owner in the same region.');
                 }
                 if ($this->metadata->getObjectLockConfig($targetBucket) !== null) {
-                    throw new \RuntimeException('Access log target has Object Lock enabled.');
+                    // Object Lock cannot be disabled and logging targets with
+                    // Object Lock are rejected at configuration time. Retrying
+                    // these entries would only occupy the bounded buffer.
+                    continue;
                 }
 
                 // Remote storage writes may take seconds. Stage the uniquely
