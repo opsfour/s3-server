@@ -86,6 +86,21 @@ final class ObjectTagValidatorTest extends TestCase
         ], 10));
     }
 
+    public function test_validate_rejects_aws_reserved_tag_keys_across_body_and_header_writes(): void
+    {
+        foreach ([
+            static fn() => ObjectTagValidator::validate([['key' => 'aws:managed', 'value' => 'value']], 10),
+            static fn() => ObjectTagValidator::parseHeader('AWS%3AManaged=value'),
+        ] as $validate) {
+            try {
+                $validate();
+                self::fail('A client tag using the reserved aws: prefix was accepted.');
+            } catch (InvalidArgumentException $error) {
+                self::assertStringContainsString('reserved aws: prefix', $error->getMessage());
+            }
+        }
+    }
+
     #[DataProvider('invalidTagCharacters')]
     public function test_validate_rejects_characters_outside_the_s3_and_xml_character_sets(string $value): void
     {

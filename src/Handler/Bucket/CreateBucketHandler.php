@@ -107,6 +107,12 @@ final class CreateBucketHandler implements RequestHandler
             if ($existingOwner !== null) {
                 if ($existingOwner === $ownerId) {
                     $this->assertExistingBucketSettings($bucket, $region, $objectLockHeader, $objectOwnershipHeader);
+                    $this->metadata->putAcl(
+                        'bucket',
+                        $bucket,
+                        $ownerId,
+                        AclGrantResolver::privateAcl($ownerId),
+                    );
                     return;
                 }
                 throw new BucketAlreadyExistsException();
@@ -137,8 +143,15 @@ final class CreateBucketHandler implements RequestHandler
         ?string $objectLockHeader,
         ?string $objectOwnershipHeader,
     ): void {
-        if ($this->metadata->getBucket($bucket)?->region !== $region) {
+        $existingRegion = $this->metadata->getBucket($bucket)?->region;
+        if ($existingRegion !== $region) {
             throw new BucketAlreadyOwnedByYouException('The existing bucket has a different region.');
+        }
+
+        // Only us-east-1 retains S3's legacy idempotent CreateBucket response.
+        // Every other region reports an existing same-owner bucket as a conflict.
+        if ($existingRegion !== 'us-east-1') {
+            throw new BucketAlreadyOwnedByYouException();
         }
 
         if ($objectLockHeader !== null

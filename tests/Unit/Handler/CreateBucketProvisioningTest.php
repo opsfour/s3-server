@@ -10,6 +10,7 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
 use OpsFour\S3Server\Exception\BucketAlreadyOwnedByYouException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
@@ -130,6 +131,39 @@ final class CreateBucketProvisioningTest extends TestCase
         }
 
         self::assertSame('us-west-2', $this->metadata->getBucket('bucket')?->region);
+    }
+
+    public function test_existing_bucket_outside_us_east_1_returns_same_owner_conflict(): void
+    {
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('createBucket');
+        $handler = $this->handler($storage);
+        $this->metadata->createBucket('owner', 'bucket', 'us-west-2');
+
+        $this->expectException(BucketAlreadyOwnedByYouException::class);
+        $handler->handleRequest($this->request(body: $this->locationConstraint('us-west-2')));
+    }
+
+    public function test_us_east_1_recreation_resets_acl_only_after_storage_provisioning(): void
+    {
+        $publicAcl = [
+            ...AclGrantResolver::privateAcl('owner'),
+            [
+                'granteeType' => 'Group',
+                'granteeId' => AclGrantResolver::ALL_USERS_URI,
+                'permission' => 'READ',
+            ],
+        ];
+        $this->metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $this->metadata->putAcl('bucket', 'bucket', 'owner', $publicAcl);
+
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('createBucket')->willReturnCallback(function () use ($publicAcl): void {
+            self::assertSame($publicAcl, $this->metadata->getAcl('bucket', 'bucket'));
+        });
+
+        self::assertSame(200, $this->handler($storage)->handleRequest($this->request())->getStatus());
+        self::assertSame(AclGrantResolver::privateAcl('owner'), $this->metadata->getAcl('bucket', 'bucket'));
     }
 
     public function test_reentrant_create_with_different_region_is_not_reported_as_created(): void

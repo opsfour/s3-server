@@ -55,6 +55,9 @@ final class ObjectTagValidator
             if (preg_match('//u', $tag['key']) !== 1 || preg_match('//u', $tag['value']) !== 1) {
                 throw new InvalidArgumentException('Tag keys and values must be valid UTF-8.');
             }
+            if (strncasecmp($tag['key'], 'aws:', 4) === 0) {
+                throw new InvalidArgumentException('Tag keys must not use the reserved aws: prefix.');
+            }
             if (! self::hasAllowedCharacters($tag['key'], false) || ! self::hasAllowedCharacters($tag['value'], true)) {
                 throw new InvalidArgumentException(
                     'Tag keys and values may contain only Unicode letters, numbers, spaces, and + - = . _ : / @.',
