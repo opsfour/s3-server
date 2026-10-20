@@ -171,10 +171,9 @@ final class CanonicalRequest
                 return (string) preg_replace('/\s+/', ' ', $value);
             }, $values);
 
-            // The AWS SDK serializes this read-only attribute selection as
-            // multiple header values but signs their sorted canonical form.
-            // Its handler consumes the complete set, independent of order.
-            if ($name === 'x-amz-object-attributes') {
+            // The AWS SDK signs these list-valued headers in sorted order.
+            // Their handlers consume the complete set, independent of order.
+            if ($name === 'x-amz-object-attributes' || str_starts_with($name, 'x-amz-grant-')) {
                 sort($trimmed, SORT_STRING);
             }
 

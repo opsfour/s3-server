@@ -722,7 +722,7 @@ final class LifecycleExecutor
                 return false;
             }
             if (
-                in_array($current->transitionStatus, ['pending', 'processing'], true)
+                in_array($current->transitionStatus, ['pending', 'processing', 'failed'], true)
                 && $current->transitionTargetTier === $targetTier
             ) {
                 return false;

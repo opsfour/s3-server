@@ -12,6 +12,9 @@ use Amp\Http\Server\Response;
 use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
+use Aws\Credentials\Credentials as AwsCredentials;
+use Aws\Signature\S3SignatureV4;
+use GuzzleHttp\Psr7\Request as PsrRequest;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\CanonicalRequest;
 use OpsFour\S3Server\Auth\AuthMiddleware;
@@ -337,6 +340,26 @@ final class SessionCredentialVerifierTest extends TestCase
         )->ownerId);
     }
 
+    public function test_header_sigv4_accepts_sdk_signed_repeated_acl_grant_headers(): void
+    {
+        $credential = $this->temporaryCredential();
+        $signed = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+            new PsrRequest('PUT', 'http://127.0.0.1/bucket?acl', [
+                'x-amz-grant-read' => ['id="z-reader"', 'id="a-reader"'],
+            ]),
+            new AwsCredentials($credential->accessKeyId, $credential->secretAccessKey, $credential->sessionToken),
+        );
+        self::assertSame(['id="z-reader"', 'id="a-reader"'], $signed->getHeader('x-amz-grant-read'));
+
+        $request = $this->requestFromPsr($signed);
+
+        self::assertSame('tenant:acme', (new SignatureV4Verifier())->verify(
+            $request,
+            new InMemoryCredentialProvider($credential),
+            'us-east-1',
+        )->ownerId);
+    }
+
     public function test_presigned_url_accepts_valid_session_token(): void
     {
         $credential = $this->temporaryCredential();
@@ -550,6 +573,28 @@ final class SessionCredentialVerifierTest extends TestCase
         )->ownerId);
     }
 
+    public function test_presigned_url_accepts_sdk_signed_repeated_acl_grant_headers(): void
+    {
+        $credential = $this->temporaryCredential();
+        $signed = (new S3SignatureV4('s3', 'us-east-1'))->presign(
+            new PsrRequest('PUT', 'http://127.0.0.1/bucket?acl', [
+                'x-amz-grant-read' => ['id="z-reader"', 'id="a-reader"'],
+            ]),
+            new AwsCredentials($credential->accessKeyId, $credential->secretAccessKey, $credential->sessionToken),
+            '+5 minutes',
+        );
+        self::assertSame(['id="z-reader"', 'id="a-reader"'], $signed->getHeader('x-amz-grant-read'));
+        self::assertSame(2, substr_count($signed->getUri()->getQuery(), 'x-amz-grant-read='));
+
+        $request = $this->requestFromPsr($signed);
+
+        self::assertSame('tenant:acme', (new PresignedUrlValidator())->validate(
+            $request,
+            new InMemoryCredentialProvider($credential),
+            'us-east-1',
+        )->ownerId);
+    }
+
     private function temporaryCredential(?\DateTimeImmutable $expiresAt = null): Credential
     {
         return new Credential(
@@ -725,6 +770,24 @@ final class SessionCredentialVerifierTest extends TestCase
             hash('sha256', ''),
             hash('sha256', $payload),
         ]), $signingKey);
+    }
+
+    private function requestFromPsr(\Psr\Http\Message\RequestInterface $request): Request
+    {
+        $method = $request->getMethod();
+        if ($method === '') {
+            throw new \LogicException('A signed SDK request must have a method.');
+        }
+
+        $headers = [];
+        foreach ($request->getHeaders() as $name => $values) {
+            if ($name === '') {
+                throw new \LogicException('A signed SDK request must not have an empty header name.');
+            }
+            $headers[$name] = array_values($values);
+        }
+
+        return $this->request($method, $request->getRequestTarget(), $headers);
     }
 
     /**

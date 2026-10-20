@@ -82,6 +82,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Normalize GetObject and HeadObject HTTP dates to UTC before emitting the
+  literal `GMT` suffix, including 304, delete-marker, and restore headers.
+- Preserve terminal lifecycle tier-transition failures instead of enqueueing a
+  fresh job for the same target during every sweep.
+- Match AWS SDK SigV4 canonicalization for repeated `x-amz-grant-*` values in
+  signed-header and narrowly scoped presigned requests.
 - Initialize every package-managed MySQL metadata connection in UTC so server
   session time zones cannot shift S3 timestamps.
 - Reject invalid ports in stored website redirect hosts instead of emitting

@@ -4,12 +4,32 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Http;
 
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\S3ResponseHeaders;
 use PHPUnit\Framework\TestCase;
 
 final class S3ResponseHeadersOverrideTest extends TestCase
 {
+    public function test_object_and_restore_http_dates_are_normalized_to_utc(): void
+    {
+        $headers = S3ResponseHeaders::build(new ObjectInfo(
+            'bucket',
+            'key',
+            1,
+            '"etag"',
+            restoreStatus: 'restored',
+            restoreExpiresAt: new \DateTimeImmutable('2026-10-21T11:28:00+04:00'),
+            lastModified: new \DateTimeImmutable('2026-10-20T12:34:56+04:00'),
+        ), 1);
+
+        self::assertSame('Tue, 20 Oct 2026 08:34:56 GMT', $headers['Last-Modified']);
+        self::assertSame(
+            'ongoing-request="false", expiry-date="Wed, 21 Oct 2026 07:28:00 GMT"',
+            $headers['x-amz-restore'],
+        );
+    }
+
     public function test_only_six_supported_headers_can_be_overridden(): void
     {
         $headers = S3ResponseHeaders::withAuthenticatedOverrides(

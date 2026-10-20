@@ -34,13 +34,21 @@ final class ConditionalHttpDateTest extends TestCase
             Http::new('http://127.0.0.1/bucket/key'),
             ['If-None-Match' => '"etag"'],
         );
-        $object = new ObjectInfo('bucket', 'key', 1, '"etag"', versionId: $versionId);
+        $object = new ObjectInfo(
+            'bucket',
+            'key',
+            1,
+            '"etag"',
+            versionId: $versionId,
+            lastModified: new \DateTimeImmutable('2026-10-20T12:34:56+04:00'),
+        );
 
         try {
             ConditionalHeaderEvaluator::evaluate($request, $object, $emitNullVersion);
             self::fail('Matching If-None-Match must return NotModified.');
         } catch (NotModifiedException $exception) {
             self::assertSame($expected, $exception->getExtraHeaders()['x-amz-version-id'] ?? null);
+            self::assertSame('Tue, 20 Oct 2026 08:34:56 GMT', $exception->getExtraHeaders()['Last-Modified']);
         }
     }
 

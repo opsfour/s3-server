@@ -1359,6 +1359,39 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertSame('available', $newObject->transitionStatus);
     }
 
+    public function test_failed_transition_is_not_requeued_for_the_same_target_but_allows_a_different_target(): void
+    {
+        $this->createBucket('bucket');
+        $write = $this->putObject('bucket', 'archive.txt', 'archive me');
+        $this->metadata->updateObjectPlacement(
+            bucket: 'bucket',
+            key: 'archive.txt',
+            versionId: null,
+            storageClass: 'STANDARD',
+            storageTier: 'STANDARD',
+            storagePath: $write->path,
+            transitionStatus: 'failed',
+            transitionTargetTier: 'GLACIER',
+            transitionError: 'Tier transition processing failed.',
+        );
+
+        $bucket = $this->metadata->getBucket('bucket');
+        $object = $this->metadata->getObjectMetadata('bucket', 'archive.txt');
+        self::assertNotNull($bucket);
+        self::assertNotNull($object);
+        $method = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('enqueueTransitionIfNeeded');
+
+        self::assertFalse($method->invoke($this->executor(), $bucket, $object, 'GLACIER', true, 'archive'));
+        self::assertSame([], $this->tierTransitionJobs());
+        self::assertSame('failed', $this->metadata->getObjectMetadata('bucket', 'archive.txt')?->transitionStatus);
+
+        self::assertTrue($method->invoke($this->executor(), $bucket, $object, 'DEEP_ARCHIVE', true, 'archive'));
+        $jobs = $this->tierTransitionJobs();
+        self::assertCount(1, $jobs);
+        self::assertSame('DEEP_ARCHIVE', $jobs[0]['target_tier']);
+        self::assertSame('pending', $this->metadata->getObjectMetadata('bucket', 'archive.txt')?->transitionStatus);
+    }
+
     public function test_noncurrent_transition_rule_enqueues_versioned_job(): void
     {
         $this->createBucket('bucket');

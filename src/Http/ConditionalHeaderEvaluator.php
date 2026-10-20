@@ -72,7 +72,7 @@ final class ConditionalHeaderEvaluator
     {
         $headers = [
             'ETag' => $objectInfo->etag,
-            'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),
+            'Last-Modified' => S3ResponseHeaders::httpDate($objectInfo->lastModified),
         ];
         if ($objectInfo->versionId !== null) {
             $headers['x-amz-version-id'] = $objectInfo->versionId;

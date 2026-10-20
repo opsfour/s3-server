@@ -44,15 +44,20 @@ final class PresignedUrlValidator
     public function validate(Request $request, CredentialProvider $credentialProvider, string $region): AuthResult
     {
         $query = QueryStringParser::parse($request->getUri()->getQuery());
-        // The AWS SDK moves the read-only x-amz-object-attributes header list
-        // into repeated query pairs when presigning. The handler still reads
-        // the signed header as a set, so their query order has no effect.
-        $orderInsensitiveNames = $request->hasHeader('x-amz-object-attributes')
-            && in_array(
-                'x-amz-object-attributes',
-                explode(';', $query['X-Amz-SignedHeaders'] ?? ''),
-                true,
-            ) ? ['x-amz-object-attributes'] : [];
+        // The AWS SDK copies list-valued x-amz headers into repeated query
+        // pairs when presigning. Their handlers read the signed header as a
+        // set, so query order is irrelevant only when that header is both
+        // present and signed.
+        $signedHeaderNames = explode(';', $query['X-Amz-SignedHeaders'] ?? '');
+        $orderInsensitiveNames = [];
+        foreach (array_keys($query) as $queryName) {
+            $headerName = strtolower($queryName);
+            if (($headerName === 'x-amz-object-attributes' || str_starts_with($headerName, 'x-amz-grant-'))
+                && $request->hasHeader($headerName)
+                && in_array($headerName, $signedHeaderNames, true)) {
+                $orderInsensitiveNames[] = $queryName;
+            }
+        }
         if (QueryStringParser::hasConflictingValues($request->getUri()->getQuery(), $orderInsensitiveNames)) {
             throw new AccessDeniedException('Conflicting duplicate query parameter.');
         }

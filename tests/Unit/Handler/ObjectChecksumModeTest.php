@@ -11,6 +11,7 @@ use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
@@ -159,6 +160,35 @@ final class ObjectChecksumModeTest extends TestCase
         $this->expectException(NoSuchVersionException::class);
         ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
             ->handleRequest($request);
+    }
+
+    /** @param 'GET'|'HEAD' $method */
+    #[DataProvider('methods')]
+    public function test_explicit_delete_marker_last_modified_is_normalized_to_utc(string $method): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadataByVersion')->with('bucket', 'key', 'marker')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            0,
+            '"marker"',
+            versionId: 'marker',
+            isDeleteMarker: true,
+            lastModified: new \DateTimeImmutable('2026-10-20T12:34:56+04:00'),
+        ));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+        $request = $this->request($method);
+        $request->setUri(Http::new('http://127.0.0.1/bucket/key?versionId=marker'));
+
+        try {
+            ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
+                ->handleRequest($request);
+            self::fail('An explicit delete marker must return MethodNotAllowed.');
+        } catch (MethodNotAllowedException $error) {
+            self::assertSame('Tue, 20 Oct 2026 08:34:56 GMT', $error->getExtraHeaders()['Last-Modified']);
+        }
     }
 
     /** @return array{MetadataStore, StorageBackend} */

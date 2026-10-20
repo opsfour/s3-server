@@ -37,12 +37,19 @@ final class S3ResponseHeaders
         return true;
     }
 
+    public static function httpDate(\DateTimeImmutable $timestamp): string
+    {
+        return $timestamp
+            ->setTimezone(new \DateTimeZone('UTC'))
+            ->format('D, d M Y H:i:s \\G\\M\\T');
+    }
+
     /** @return array<non-empty-string, string> */
     public static function build(ObjectInfo $objectInfo, int $contentLength, bool $includeNullVersionId = false, bool $includeChecksums = false): array
     {
         $headers = [
             'ETag' => $objectInfo->etag,
-            'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),
+            'Last-Modified' => self::httpDate($objectInfo->lastModified),
             'Content-Length' => (string) $contentLength,
             'Content-Type' => $objectInfo->contentType,
             'Accept-Ranges' => 'bytes',
@@ -161,7 +168,7 @@ final class S3ResponseHeaders
         if ($objectInfo->restoreStatus === 'restored' && $objectInfo->restoreExpiresAt !== null) {
             return sprintf(
                 'ongoing-request="false", expiry-date="%s"',
-                $objectInfo->restoreExpiresAt->format('D, d M Y H:i:s \\G\\M\\T'),
+                self::httpDate($objectInfo->restoreExpiresAt),
             );
         }
 
