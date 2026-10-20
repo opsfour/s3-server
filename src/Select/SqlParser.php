@@ -183,6 +183,7 @@ final class SqlParser
         if ($this->pos < count($this->tokens) && $this->peek()['type'] === 'KEYWORD' && $this->peek()['value'] === 'WHERE') {
             $this->consume('KEYWORD');
             $where = $this->parseExpression();
+            self::assertWhereQualifiers($where['tokens'], $alias);
         }
 
         if ($this->pos !== count($this->tokens)) {
@@ -315,6 +316,22 @@ final class SqlParser
         WhereSyntaxValidator::validate($tokens);
 
         return ['tokens' => $tokens];
+    }
+
+    /** @param list<array{type: string, value: string}> $tokens */
+    private static function assertWhereQualifiers(array $tokens, string $alias): void
+    {
+        foreach ($tokens as $index => $token) {
+            if ($token['type'] !== 'IDENT' || ($tokens[$index + 1]['value'] ?? null) !== '.') {
+                continue;
+            }
+            if ($index > 0 && $tokens[$index - 1]['value'] === '.') {
+                continue;
+            }
+            if (strcasecmp($token['value'], $alias) !== 0) {
+                throw new SelectSqlException('S3 Select WHERE fields must use the declared table alias.');
+            }
+        }
     }
 
     private static function assertWhereDepth(int $depth): void

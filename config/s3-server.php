@@ -55,8 +55,8 @@ return [
     // Maximum object size for SSE encryption (bytes, default 256 MiB).
     'max_encrypted_object_size' => EnvironmentNumber::integer('S3_MAX_ENCRYPTED_OBJECT_SIZE', 268_435_456),
 
-    // Maximum object size for S3 Select queries (bytes, default 256 MiB).
-    'max_select_object_size' => EnvironmentNumber::integer('S3_MAX_SELECT_OBJECT_SIZE', 268_435_456),
+    // Maximum object size for buffered S3 Select queries (bytes, default 64 MiB).
+    'max_select_object_size' => EnvironmentNumber::integer('S3_MAX_SELECT_OBJECT_SIZE', 67_108_864),
 
     // Seconds before warning that graceful shutdown is still draining.
     'shutdown_drain_timeout' => EnvironmentNumber::integer('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
@@ -101,8 +101,8 @@ return [
         // Number of worker processes for encryption/decryption.
         'encryption_workers' => EnvironmentNumber::integer('S3_ENCRYPTION_WORKERS', 0),
 
-        // Number of worker processes for S3 Select.
-        'select_workers' => EnvironmentNumber::integer('S3_SELECT_WORKERS', EnvironmentNumber::integer('S3_ENCRYPTION_WORKERS', 0)),
+        // Number of worker processes for S3 Select. One isolates buffered query processing by default.
+        'select_workers' => EnvironmentNumber::integer('S3_SELECT_WORKERS', 1),
 
         // Stateless workers for request-body checksum spooling.
         'request_body_spool_workers' => EnvironmentNumber::integer('S3_REQUEST_BODY_SPOOL_WORKERS', 8),

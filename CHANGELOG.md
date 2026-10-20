@@ -43,6 +43,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Export `bin/s3-server` as the Composer package binary, report the installed
   package version from `--version`, and declare the DOM, libxml, and SimpleXML
   PHP extensions required by the public runtime.
+- Require `ext-mbstring` for the documented UTF-8 S3 Select string functions.
+- Set the buffered S3 Select input default and hard ceiling to 64 MiB; larger
+  configured values remain accepted but cannot raise the safe runtime limit.
+- Run buffered S3 Select query processing in one dedicated worker by default;
+  setting `S3_SELECT_WORKERS=0` keeps the explicit inline mode available.
+- Document the existing `proc_open` runtime requirement for local helper
+  workers.
 - Normalize the user-facing product name to the lowercase `opsfour` spelling.
 - Cross-account signed access now requires an explicit identity-policy Allow
   plus resource-side consent from a bucket policy or applicable ACL.
@@ -74,6 +81,16 @@ The project follows [Semantic Versioning](https://semver.org/).
   CVE-2026-108082 and the whitespace-separator regression in its first fixes.
 
 ### Fixed
+
+- Preserve JSON `null` in S3 Select projections, reject wrong table aliases in
+  `WHERE`, return SQL `NULL` for empty non-count aggregates, apply UTF-8 string
+  semantics consistently, and fail closed for unsupported `CAST` targets.
+- Return controlled S3 Select capacity errors when parser row limits are
+  reached and reject objects above the effective input ceiling before reading
+  their bytes.
+- Reduce buffered S3 Select memory peaks by appending storage chunks directly
+  and releasing input rows while filtering instead of retaining duplicate row
+  index arrays.
 
 - Store newly auto-configured SQLite metadata in `.opsfour/metadata.sqlite`
   while continuing to use an existing regular legacy `metadata.sqlite` file,

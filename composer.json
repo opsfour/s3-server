@@ -15,6 +15,7 @@
         "php": "^8.4",
         "ext-dom": "*",
         "ext-libxml": "*",
+        "ext-mbstring": "*",
         "ext-openssl": "*",
         "ext-simplexml": "*",
         "amphp/amp": "^3.1.2",

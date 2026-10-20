@@ -317,15 +317,24 @@ final class ExpressionEvaluator
                 if (count($args) < 2) {
                     return null;
                 }
-                $str = (string) self::resolveValue($args[0], $row, $alias);
-                $pos = (int) self::resolveValue($args[1], $row, $alias);
+                $stringValue = self::resolveValue($args[0], $row, $alias);
+                $positionValue = self::resolveValue($args[1], $row, $alias);
+                if ($stringValue === null || $positionValue === null) {
+                    return null;
+                }
+                $str = (string) $stringValue;
+                $pos = (int) $positionValue;
                 // Convert 1-based SQL position to 0-based PHP index.
                 $phpPos = $pos - 1;
                 if (isset($args[2])) {
-                    $len = (int) self::resolveValue($args[2], $row, $alias);
-                    return substr($str, $phpPos, $len);
+                    $lengthValue = self::resolveValue($args[2], $row, $alias);
+                    if ($lengthValue === null) {
+                        return null;
+                    }
+                    $len = (int) $lengthValue;
+                    return mb_substr($str, $phpPos, $len, 'UTF-8');
                 }
-                return substr($str, $phpPos);
+                return mb_substr($str, $phpPos, null, 'UTF-8');
             }
 
             // CAST(expr AS type).
@@ -343,10 +352,13 @@ final class ExpressionEvaluator
 
             // Single-argument scalar functions.
             $innerVal = self::resolveValue($innerTokens, $row, $alias);
+            if ($innerVal === null) {
+                return null;
+            }
 
             return match ($func) {
-                'LOWER' => strtolower((string) $innerVal),
-                'UPPER' => strtoupper((string) $innerVal),
+                'LOWER' => mb_strtolower((string) $innerVal, 'UTF-8'),
+                'UPPER' => mb_strtoupper((string) $innerVal, 'UTF-8'),
                 'TRIM' => trim((string) $innerVal),
                 'CHAR_LENGTH' => mb_strlen((string) $innerVal, 'UTF-8'),
                 default => $innerVal,
@@ -422,13 +434,15 @@ final class ExpressionEvaluator
         $typeTokens = array_slice($innerTokens, $asIndex + 1);
         $value = self::resolveValue($exprTokens, $row, $alias);
         $typeName = strtoupper(trim(implode('', array_column($typeTokens, 'value'))));
+        if ($value === null) {
+            return null;
+        }
 
         return match ($typeName) {
             'INT', 'INTEGER' => (int) $value,
             'FLOAT', 'DOUBLE', 'DECIMAL' => (float) $value,
             'VARCHAR', 'STRING', 'CHAR' => (string) $value,
-            'BOOL', 'BOOLEAN' => (bool) $value,
-            default => $value,
+            default => throw new SelectSqlException("Unsupported S3 Select CAST target type: {$typeName}."),
         };
     }
 
@@ -499,7 +513,7 @@ final class ExpressionEvaluator
      *
      * @param list<array<string, mixed>> $allRows
      */
-    private static function computeSingleAggregate(string $func, string $arg, array $allRows, string $alias): int|float|string
+    private static function computeSingleAggregate(string $func, string $arg, array $allRows, string $alias): int|float|string|null
     {
         // COUNT(*) counts all rows.
         if ($func === 'COUNT' && $arg === '*') {
@@ -525,7 +539,7 @@ final class ExpressionEvaluator
         if ($values === []) {
             return match ($func) {
                 'COUNT' => 0,
-                default => '',
+                default => null,
             };
         }
 

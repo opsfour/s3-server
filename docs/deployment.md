@@ -243,12 +243,16 @@ S3_ENCRYPTION_THRESHOLD=65536   # Objects > 64 KiB offloaded to workers
 
 ### S3 Select Workers
 
-Configure S3 Select independently when query concurrency differs from
-encryption throughput. When omitted, it inherits `S3_ENCRYPTION_WORKERS`.
+S3 Select uses one dedicated worker by default so buffered query processing
+does not run in the API process. Set it independently from encryption workers.
 
 ```bash
-S3_SELECT_WORKERS=4
+S3_SELECT_WORKERS=1
 ```
+
+The buffered Select admission guard currently allows one Select request per API
+process. Additional Select workers do not increase Select concurrency in this
+profile.
 
 ### Rate Limiting
 

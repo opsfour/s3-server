@@ -66,7 +66,7 @@ final class SelectObjectContentHandler implements RequestHandler
     public function __construct(
         private readonly MetadataStore $metadata,
         StorageBackend $storage,
-        private readonly int $maxSelectObjectSize = 268_435_456,
+        private readonly int $maxSelectObjectSize = SelectMemoryGuard::MAX_INPUT_BYTES,
         private readonly ?WorkerPool $workerPool = null,
         private readonly ?MetricsCollector $metrics = null,
         ?StorageTierRegistry $storageTiers = null,
@@ -120,9 +120,10 @@ final class SelectObjectContentHandler implements RequestHandler
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         // Size guard: S3 Select buffers the entire object.
-        if ($objectInfo->size > $this->maxSelectObjectSize) {
+        $effectiveMaxSelectObjectSize = min($this->maxSelectObjectSize, SelectMemoryGuard::MAX_INPUT_BYTES);
+        if ($objectInfo->size > $effectiveMaxSelectObjectSize) {
             throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
-                'S3 Select is limited to objects under ' . $this->maxSelectObjectSize . ' bytes.',
+                'S3 Select is limited to objects no larger than ' . $effectiveMaxSelectObjectSize . ' bytes.',
             );
         }
 
@@ -226,7 +227,7 @@ final class SelectObjectContentHandler implements RequestHandler
     private function bufferSelectObject(ByteStream\ReadableStream $source, Cancellation $cancellation, SelectMemoryGuard $memoryGuard, int $expectedSize): string
     {
         $limit = min($this->maxSelectObjectSize, SelectMemoryGuard::MAX_INPUT_BYTES);
-        $chunks = [];
+        $buffer = '';
         $length = 0;
         $readCancellation = null;
         try {
@@ -239,15 +240,14 @@ final class SelectObjectContentHandler implements RequestHandler
                     throw new SelectMemoryLimitException('S3 Select input exceeds the buffered memory budget.');
                 }
                 $memoryGuard->check($length + $chunkLength);
-                $chunks[] = $chunk;
+                $buffer .= $chunk;
                 $length += $chunkLength;
             }
 
             $memoryGuard->check($length);
-            $result = implode($chunks);
             $memoryGuard->check();
 
-            return $result;
+            return $buffer;
         } catch (CancelledException $error) {
             $readCancellation = $error;
             throw $error;
@@ -426,12 +426,16 @@ final class SelectObjectContentHandler implements RequestHandler
         $memoryGuard->check();
 
         // Apply WHERE filter.
-        $filtered = array_filter(
-            $rows,
-            fn(array $row)
-            => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
-        );
-        $filtered = array_values($filtered);
+        $filtered = [];
+        foreach ($rows as $index => $row) {
+            if (ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias'])) {
+                $filtered[] = $row;
+            }
+            unset($rows[$index]);
+            if (($index & 255) === 0) {
+                $memoryGuard->check();
+            }
+        }
         $memoryGuard->check();
 
         // Free unfiltered rows.
@@ -510,9 +514,11 @@ final class SelectObjectContentHandler implements RequestHandler
                 if (str_contains($expr, '.')) {
                     $parts = explode('.', $expr, 2);
                     $fieldName = $parts[1] ?? $parts[0];
-                    $projected[$key] = JsonProcessor::resolvePath($row, $fieldName) ?? ($row[$fieldName] ?? '');
+                    $projected[$key] = JsonProcessor::hasPath($row, $fieldName)
+                        ? JsonProcessor::resolvePath($row, $fieldName)
+                        : '';
                 } else {
-                    $projected[$key] = $row[$expr] ?? '';
+                    $projected[$key] = array_key_exists($expr, $row) ? $row[$expr] : '';
                 }
             }
             $result[] = $projected;

@@ -455,7 +455,7 @@ opsfour_s3_server:
 
   parallel:
     encryption_workers: 0
-    select_workers: 0
+    select_workers: 1
     encryption_threshold: 65536
 ```
 

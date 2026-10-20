@@ -63,7 +63,7 @@ final class CsvProcessor
             $firstDataLine = false;
 
             if (count($rows) >= self::MAX_ROWS) {
-                throw new \RuntimeException(
+                throw new SelectMemoryLimitException(
                     'S3 Select: CSV input exceeds maximum row count (' . self::MAX_ROWS . ').',
                 );
             }

@@ -127,7 +127,7 @@ final readonly class S3ServerConfig
      * @param  string  $masterKeyProvider  Master key provider type: 'config', 'redis', or 'vault'.
      * @param  bool  $enforceMinPartSize  Enforce 5 MiB minimum part size on CompleteMultipartUpload (default true, matches AWS S3).
      * @param  int  $maxEncryptedObjectSize  Maximum size in bytes for objects encrypted with SSE (default 256 MiB).
-     * @param  int  $maxSelectObjectSize  Maximum size in bytes for S3 Select queries (default 256 MiB).
+     * @param  int  $maxSelectObjectSize  Maximum size in bytes for buffered S3 Select queries (default 64 MiB).
      * @param  int  $shutdownDrainTimeout  Seconds before warning about in-flight shutdown work (default 30).
      * @param  bool  $notificationRequireHttps  Reject non-HTTPS webhook destinations.
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
@@ -139,7 +139,7 @@ final readonly class S3ServerConfig
      * @param  int  $lifecycleMaxActionsPerRun  Maximum destructive lifecycle actions per sweep.
      * @param  int  $lifecycleLockTtlSeconds  Seconds before a lifecycle lease is considered stale.
      * @param  int  $multipartMaxAgeSeconds  Global maximum age for incomplete multipart uploads (0 disables cleanup).
-     * @param  int|null  $selectWorkerPoolSize  Number of amphp/parallel workers for S3 Select (null inherits encryptionWorkerPoolSize for compatibility).
+     * @param  int|null  $selectWorkerPoolSize  Number of amphp/parallel workers for S3 Select (null defaults to one isolated worker).
      * @param  bool  $notificationWorkerEnabled  Process queued webhook deliveries on this server instance.
      * @param  bool  $allowUnfencedStorageForTests  Unsafe opt-in for storage fault tests; never enable in production.
      * @param  string|null  $localObjectWriteTestScratchPath  Private node-local scratch for the isolated PUT/Copy fence test profile.
@@ -166,7 +166,7 @@ final readonly class S3ServerConfig
         string $masterKeyProvider = 'config',
         bool $enforceMinPartSize = true,
         int $maxEncryptedObjectSize = 268_435_456,
-        int $maxSelectObjectSize = 268_435_456,
+        int $maxSelectObjectSize = 67_108_864,
         int $shutdownDrainTimeout = 30,
         bool $notificationRequireHttps = true,
         int $sqliteWorkerPoolSize = 0,
@@ -384,7 +384,7 @@ final readonly class S3ServerConfig
         $this->notificationWorkerEnabled = $notificationWorkerEnabled;
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
-        $this->selectWorkerPoolSize = $selectWorkerPoolSize ?? $encryptionWorkerPoolSize;
+        $this->selectWorkerPoolSize = $selectWorkerPoolSize ?? 1;
         $this->requestBodySpoolWorkerPoolSize = $requestBodySpoolWorkerPoolSize;
         $this->encryptionParallelThreshold = $encryptionParallelThreshold;
         $this->quota = $quota ?? new QuotaConfig();

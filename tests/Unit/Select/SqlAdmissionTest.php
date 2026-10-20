@@ -87,6 +87,7 @@ final class SqlAdmissionTest extends TestCase
         yield 'missing BETWEEN bound' => ['x BETWEEN 1 AND'];
         yield 'unsupported function' => ['COALESCE(x, y) = 1'];
         yield 'malformed function argument' => ['LOWER(x, y) = 1'];
+        yield 'wrong field qualifier' => ['wrong.age = 1'];
     }
 
     public function test_small_boolean_where_still_evaluates_correctly(): void
@@ -136,6 +137,39 @@ final class SqlAdmissionTest extends TestCase
 
         $notInNullList = SqlParser::parse('SELECT * FROM s3object WHERE y NOT IN (1, NULL)');
         self::assertFalse(ExpressionEvaluator::evaluate($notInNullList['where'], ['y' => '2']));
+    }
+
+    public function test_utf8_scalar_functions_use_character_semantics(): void
+    {
+        $substring = SqlParser::parse("SELECT * FROM s3object s WHERE SUBSTRING(s.name, 2, 1) = 'ö'");
+        self::assertTrue(ExpressionEvaluator::evaluate($substring['where'], ['name' => 'Jörg'], $substring['alias']));
+
+        $case = SqlParser::parse("SELECT * FROM s3object s WHERE LOWER(s.name) = 'ärger'");
+        self::assertTrue(ExpressionEvaluator::evaluate($case['where'], ['name' => 'ÄRGER'], $case['alias']));
+    }
+
+    public function test_empty_aggregates_preserve_sql_null(): void
+    {
+        self::assertSame(
+            [['total' => null, 'count' => 0]],
+            ExpressionEvaluator::computeAggregates(
+                [
+                    ['expr' => 'SUM(s.amount)', 'alias' => 'total'],
+                    ['expr' => 'COUNT(s.amount)', 'alias' => 'count'],
+                ],
+                [],
+                's',
+            ),
+        );
+    }
+
+    public function test_scalar_functions_preserve_null_and_unknown_casts_fail_closed(): void
+    {
+        $nullFunction = SqlParser::parse("SELECT * FROM s3object s WHERE LOWER(s.missing) = ''");
+        self::assertFalse(ExpressionEvaluator::evaluate($nullFunction['where'], [], $nullFunction['alias']));
+
+        $this->expectException(SelectSqlException::class);
+        SqlParser::parse('SELECT * FROM s3object s WHERE CAST(s.value AS BOOL) = TRUE');
     }
 
     #[DataProvider('validWhere')]

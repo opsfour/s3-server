@@ -47,7 +47,9 @@ profile completes its own qualification gates. See the
 
 - PHP 8.4+
 - Composer 2.x
+- `proc_open` enabled for the package's local helper worker processes
 - ext-dom, ext-libxml, and ext-simplexml for S3 XML requests and responses
+- ext-mbstring for UTF-8 S3 Select string functions
 - ext-openssl (required for all request-body temporary spools)
 - ext-pdo_sqlite for the default SQLite metadata backend
 - pecl-pq and its pecl-raphf dependency for PostgreSQL API nodes; the server

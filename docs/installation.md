@@ -4,12 +4,15 @@
 
 - **PHP 8.4+** with the following extensions:
   - `ext-dom`, `ext-libxml`, and `ext-simplexml` (required for S3 XML requests and responses)
+  - `ext-mbstring` (required for UTF-8 S3 Select string functions)
   - `ext-openssl` (always required for encrypted request-body temporary spools)
   - `ext-pdo_sqlite` (default metadata backend)
   - `ext-pdo_pgsql` (optional, for PostgreSQL metadata)
   - `ext-pdo_mysql` (optional, for MySQL metadata)
   - `ext-pcntl` (recommended, for signal handling)
   - `ext-posix` (required on Unix when writing credentials with the file provider)
+- PHP's `proc_open` function must be enabled for the package's local helper
+  worker processes.
 - **PostgreSQL API nodes:** `pecl-pq` and its `pecl-raphf` dependency are
   required; `ext-pdo_pgsql` alone does not satisfy the server startup check.
 - **Composer 2.x**

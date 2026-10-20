@@ -87,7 +87,7 @@ final class JsonProcessor
             }
             SelectRecordSizeException::assertLength($lineLength);
             if (count($rows) >= self::MAX_ROWS) {
-                throw new \RuntimeException(
+                throw new SelectMemoryLimitException(
                     'S3 Select: JSON input exceeds maximum row count (' . self::MAX_ROWS . ').',
                 );
             }
@@ -119,7 +119,7 @@ final class JsonProcessor
             throw new \JsonException('S3 Select JSON document must contain an object or array of objects.');
         }
         if (count($decoded) > self::MAX_ROWS) {
-            throw new \RuntimeException(
+            throw new SelectMemoryLimitException(
                 'S3 Select: JSON document exceeds maximum row count (' . self::MAX_ROWS . ').',
             );
         }
@@ -201,5 +201,24 @@ final class JsonProcessor
         }
 
         return $current;
+    }
+
+    /** @param array<string, mixed> $row */
+    public static function hasPath(array $row, string $path): bool
+    {
+        $parts = explode('.', $path);
+        $current = $row;
+
+        foreach ($parts as $part) {
+            if (is_array($current) && array_key_exists($part, $current)) {
+                $current = $current[$part];
+            } elseif ($current instanceof \stdClass && property_exists($current, $part)) {
+                $current = $current->{$part};
+            } else {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

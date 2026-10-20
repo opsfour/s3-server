@@ -51,7 +51,7 @@ final class S3ServerRuntimeFactoryTest extends TestCase
 
         self::assertInstanceOf(S3Server::class, $runtime->server);
         self::assertNull($runtime->encryption);
-        self::assertNull($runtime->selectWorkerPool);
+        self::assertInstanceOf(\Amp\Parallel\Worker\WorkerPool::class, $runtime->selectWorkerPool);
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::PutObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::RestoreObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::SelectObjectContent));

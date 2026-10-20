@@ -132,6 +132,26 @@ final class SelectProcessingTaskTest extends TestCase
         $this->assertSame(strlen($json), $result['bytesScanned']);
     }
 
+    public function test_json_projection_preserves_null_and_distinguishes_missing_fields(): void
+    {
+        $task = new SelectProcessingTask(
+            "{\"present\":null,\"nested\":{\"value\":null}}\n",
+            'SELECT s.present, s.nested.value, s.missing FROM s3object s',
+            ['format' => 'JSON', 'jsonType' => 'LINES'],
+            ['format' => 'JSON'],
+        );
+
+        $result = $task->run($this->createMock(\Amp\Sync\Channel::class), new \Amp\NullCancellation());
+        $records = '';
+        foreach (new DecodingEventStreamIterator(Utils::streamFor($result['eventStream'])) as $event) {
+            if ($event['headers'][':event-type'] === 'Records') {
+                $records .= (string) $event['payload'];
+            }
+        }
+
+        self::assertSame("{\"s.present\":null,\"s.nested.value\":null,\"s.missing\":\"\"}\n", $records);
+    }
+
     public function test_output_matches_inline_processing(): void
     {
         $csv = "name,age\nAlice,30\nBob,25\n";

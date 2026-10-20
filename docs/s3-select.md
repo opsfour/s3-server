@@ -13,7 +13,8 @@ Encrypted objects, compressed input, and Parquet input are not supported by the
 current S3 Select implementation. The endpoint requires authentication even
 when an object has a public read grant. Requests must provide a SQL expression
 and explicit CSV or JSON input and output serialization. Unsupported options
-such as `ScanRange` and `RequestProgress` are rejected.
+such as `ScanRange`, `RequestProgress`, and selecting an explicit `versionId`
+are rejected.
 
 ## Basic Usage
 
@@ -39,7 +40,7 @@ $result = $s3->selectObjectContent([
     ],
 ]);
 
-// Read the streamed results
+// Read the returned Records events
 foreach ($result['Payload'] as $event) {
     if (isset($event['Records'])) {
         echo $event['Records']['Payload'];
@@ -90,7 +91,7 @@ implemented. Use direct field names in the selected columns.
 
 | Function | Example |
 |----------|---------|
-| `CAST` | `CAST(s.age AS INT)` |
+| `CAST` | `CAST(s.age AS INT)`; targets: `INT`/`INTEGER`, `FLOAT`/`DOUBLE`/`DECIMAL`, `VARCHAR`/`STRING`/`CHAR` |
 | `SUBSTRING` | `SUBSTRING(s.name, 1, 3)` |
 | `CHAR_LENGTH` | `CHAR_LENGTH(s.name)` |
 | `UPPER` / `LOWER` | `UPPER(s.name)` |
@@ -186,10 +187,12 @@ SELECT s.name, s.address.city FROM s3object s WHERE s.age > 25
 ## Size Limits
 
 ```bash
-S3_MAX_SELECT_OBJECT_SIZE=268435456   # 256 MiB default
+S3_MAX_SELECT_OBJECT_SIZE=67108864   # 64 MiB default and hard maximum
 ```
 
-Objects larger than this limit return an error. For large datasets, consider splitting files or using multipart uploads.
+Objects larger than the configured limit return an error. The current buffered
+implementation enforces a 64-MiB hard maximum even if a larger configured value
+is supplied. For large datasets, split the input into smaller objects.
 An input or result record whose serialized content exceeds 1 MiB (1,048,576
 bytes, excluding the CSV or JSON record delimiter) returns `OverMaxRecordSize`
 (400). CSV and JSON Lines input are checked before copying a record. JSON
@@ -198,7 +201,7 @@ member is then measured after decoding. AWS describes its
 limit as "1 MB" and `maxCharsPerRecord`; exact Unicode and decimal-MB boundary
 parity has not been verified.
 
-Select still buffers the complete object, parsed rows, filtered rows, projected
+Select buffers the complete object, parsed rows, filtered rows, projected
 rows, formatted result, and EventStream response. Its EventStream encoder splits
 the Records payload into 64-KiB frames, but this does not limit total process
 memory; clients must concatenate Records payloads before parsing CSV or JSON
@@ -215,14 +218,16 @@ with a smaller input. Previously, 500,000 short CSV rows occupying only 2 MB
 of input exhausted a 256-MiB PHP process; this now returns 503 in both inline
 and worker modes, and the server continues to serve queries.
 
-These checks are an interim guard around a buffered design, not a proof of a
-fixed worst-case process footprint for every parser or storage adapter. Use
-`S3_SELECT_WORKERS` above zero to isolate Select work from the API process,
-reduce `S3_MAX_SELECT_OBJECT_SIZE` for the available memory, and limit Select
-callers at the proxy or policy layer. The full release gate still needs
-adversarial small-row and output-expansion profiles with the chosen storage
-adapter, PHP limit, and worker count. A streaming row and EventStream pipeline
-is needed before restoring the advertised 256-MiB input ceiling safely.
+These checks bound the supported buffered design, but are not a proof of a
+fixed worst-case process footprint for every parser or storage adapter. The
+default `S3_SELECT_WORKERS=1` isolates SQL parsing, filtering, projection, and
+EventStream encoding from the API process. The API process still buffers the
+source object before submitting it to the worker.
+Reduce `S3_MAX_SELECT_OBJECT_SIZE` for the available memory, and limit Select
+callers at the proxy or policy layer. The release gate must use adversarial
+small-row and output-expansion profiles with the chosen storage adapter, PHP
+limit, and worker count. A streaming row and EventStream pipeline is needed
+before increasing the 64-MiB input ceiling.
 
 ## Worker failures
 

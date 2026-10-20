@@ -167,7 +167,7 @@ final class WhereSyntaxValidator
         } elseif ($name === 'CAST') {
             $this->expect('AS');
             if ($this->current()['type'] !== 'IDENT'
-                || ! in_array(strtoupper($this->current()['value']), ['INT', 'INTEGER', 'FLOAT', 'DOUBLE', 'DECIMAL', 'VARCHAR', 'STRING', 'CHAR', 'BOOL', 'BOOLEAN'], true)) {
+                || ! in_array(strtoupper($this->current()['value']), ['INT', 'INTEGER', 'FLOAT', 'DOUBLE', 'DECIMAL', 'VARCHAR', 'STRING', 'CHAR'], true)) {
                 throw new SelectSqlException('Unsupported S3 Select CAST type.');
             }
             ++$this->position;

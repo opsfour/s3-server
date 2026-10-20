@@ -74,12 +74,16 @@ final class SelectProcessingTask implements Task
         $memoryGuard->check();
 
         // Apply WHERE filter.
-        $filtered = array_filter(
-            $rows,
-            fn(array $row)
-            => ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias']),
-        );
-        $filtered = array_values($filtered);
+        $filtered = [];
+        foreach ($rows as $index => $row) {
+            if (ExpressionEvaluator::evaluate($parsed['where'], $row, $parsed['alias'])) {
+                $filtered[] = $row;
+            }
+            unset($rows[$index]);
+            if (($index & 255) === 0) {
+                $memoryGuard->check();
+            }
+        }
         $memoryGuard->check();
         unset($rows);
 
@@ -153,9 +157,11 @@ final class SelectProcessingTask implements Task
                 if (str_contains($expr, '.')) {
                     $parts = explode('.', $expr, 2);
                     $fieldName = $parts[1] ?? $parts[0];
-                    $projected[$key] = JsonProcessor::resolvePath($row, $fieldName) ?? ($row[$fieldName] ?? '');
+                    $projected[$key] = JsonProcessor::hasPath($row, $fieldName)
+                        ? JsonProcessor::resolvePath($row, $fieldName)
+                        : '';
                 } else {
-                    $projected[$key] = $row[$expr] ?? '';
+                    $projected[$key] = array_key_exists($expr, $row) ? $row[$expr] : '';
                 }
             }
             $result[] = $projected;

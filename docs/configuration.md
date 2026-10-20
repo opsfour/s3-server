@@ -302,7 +302,7 @@ rule is saved; otherwise the S3 API rejects the replacement.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_MAX_SELECT_OBJECT_SIZE` | `268435456` | Configured object cap for S3 Select (256 MiB). The buffered-memory guard currently imposes a lower effective input ceiling of 64 MiB or less, depending on PHP memory headroom. Short rows and expanded output may be rejected at smaller sizes; see [S3 Select](s3-select.md). |
+| `S3_MAX_SELECT_OBJECT_SIZE` | `67108864` | Configured object cap for buffered S3 Select (64 MiB default and hard maximum). Smaller inputs may still be rejected when PHP lacks headroom or rows expand substantially; values above 64 MiB do not raise the hard limit. See [S3 Select](s3-select.md). |
 
 ## Website Hosting
 
@@ -323,7 +323,7 @@ permission model used by Amazon S3 and Linode website hosting.
 |----------|---------|-------------|
 | `S3_SQLITE_WORKERS` | `0` | Number of Amp parallel workers for SQLite (0 = blocking mode) |
 | `S3_ENCRYPTION_WORKERS` | `0` | Number of Amp parallel workers for encryption (0 = inline) |
-| `S3_SELECT_WORKERS` | `S3_ENCRYPTION_WORKERS` | Number of Amp parallel workers for S3 Select (0 = inline) |
+| `S3_SELECT_WORKERS` | `1` | Number of Amp parallel workers for S3 Select. One worker isolates buffered query processing from the API process; `0` opts into inline processing. Buffered Select admission currently permits one request per API process, so values above 1 provide spare workers rather than parallel Select throughput. |
 | `S3_ENCRYPTION_THRESHOLD` | `65536` | Object size threshold for offloading encryption to workers (bytes) |
 
 Setting `S3_SQLITE_WORKERS` > 0 wraps SQLite in a `ParallelSqliteMetadataStore` that dispatches queries to a worker pool, preventing SQLite's single-writer lock from blocking the event loop.

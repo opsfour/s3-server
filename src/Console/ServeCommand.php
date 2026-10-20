@@ -89,7 +89,7 @@ final class ServeCommand extends Command
             ->addOption('rate-limit', null, InputOption::VALUE_REQUIRED, 'Requests per second per client (0 = unlimited)', getenv('S3_RATE_LIMIT') === false ? '1000' : getenv('S3_RATE_LIMIT'))
             ->addOption('master-key-provider', null, InputOption::VALUE_REQUIRED, 'Master key provider: config|redis|vault', getenv('S3_MASTER_KEY_PROVIDER') ?: 'config')
             ->addOption('max-encrypted-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum encrypted object size in bytes', self::envOption('S3_MAX_ENCRYPTED_OBJECT_SIZE', '268435456'))
-            ->addOption('max-select-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum S3 Select object size in bytes', self::envOption('S3_MAX_SELECT_OBJECT_SIZE', '268435456'))
+            ->addOption('max-select-object-size', null, InputOption::VALUE_REQUIRED, 'Maximum S3 Select object size in bytes', self::envOption('S3_MAX_SELECT_OBJECT_SIZE', '67108864'))
             ->addOption('metrics-bearer-token', null, InputOption::VALUE_REQUIRED, 'Bearer token required by the metrics endpoint', getenv('S3_METRICS_BEARER_TOKEN') === false ? null : getenv('S3_METRICS_BEARER_TOKEN'))
             ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: memory|database|file', getenv('S3_CREDENTIALS_DRIVER') ?: 'memory')
             ->addOption('access-key', null, InputOption::VALUE_REQUIRED, 'Access key ID (memory driver)', getenv('S3_ACCESS_KEY') ?: null)

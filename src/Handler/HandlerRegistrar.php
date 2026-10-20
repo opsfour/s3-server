@@ -504,7 +504,7 @@ final class HandlerRegistrar
             new DeleteBucketWebsiteHandler($metadata),
         );
 
-        // Production-ready: Public Access Block, Policy Status, Logging, SelectObjectContent, GetObjectAttributes.
+        // Public Access Block, Policy Status, Logging, SelectObjectContent, and GetObjectAttributes.
         $registry->register(
             S3Operation::GetPublicAccessBlock,
             new GetPublicAccessBlockHandler($metadata),
