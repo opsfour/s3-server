@@ -672,6 +672,24 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame('uploaded', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key])['Body']);
     }
 
+    public function test_legacy_redirect_field_is_returned_after_object_write(): void
+    {
+        $key = 'legacy-redirect-' . bin2hex(random_bytes(4)) . '.txt';
+        $response = $this->postV4(
+            key: $key,
+            filename: 'upload.txt',
+            body: 'uploaded',
+            extraFields: ['redirect' => 'https://example.test/upload'],
+        );
+
+        $this->assertSame(303, $response->getStatusCode());
+        $this->assertStringStartsWith(
+            'https://example.test/upload?bucket=' . self::$bucket . '&key=' . $key,
+            $response->getHeaderLine('Location'),
+        );
+        $this->assertSame('uploaded', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key])['Body']);
+    }
+
     public function test_uninterpretable_redirect_falls_back_to_requested_success_status(): void
     {
         $key = 'fallback-redirect-' . bin2hex(random_bytes(4)) . '.txt';

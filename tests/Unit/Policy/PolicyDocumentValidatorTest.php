@@ -98,6 +98,15 @@ final class PolicyDocumentValidatorTest extends TestCase
     public static function invalidPolicies(): iterable
     {
         yield 'missing statement' => [[]];
+        yield 'unsupported policy version' => [[
+            'Version' => '2026-10-20',
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => '*',
+            ]],
+        ]];
         yield 'empty statements' => [['Statement' => []]];
         yield 'non-object statement' => [['Statement' => ['invalid']]];
         yield 'invalid effect' => [['Statement' => [[

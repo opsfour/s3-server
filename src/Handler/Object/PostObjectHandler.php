@@ -56,7 +56,7 @@ final class PostObjectHandler implements RequestHandler
             }
         }
 
-        $successRedirect = $form->value('success_action_redirect');
+        $successRedirect = $form->value('success_action_redirect') ?? $form->value('redirect');
         if ($successRedirect !== null && $successRedirect !== '') {
             $parts = preg_match('/[\x00-\x1F\x7F]/', $successRedirect) === 1
                 ? false

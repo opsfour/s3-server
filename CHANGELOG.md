@@ -82,6 +82,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Honor the deprecated browser POST `redirect` field as a fallback for
+  `success_action_redirect`.
+- Reject bucket policies with unsupported policy-language versions.
 - Serve configured website error documents for access-denied objects while
   preserving the original 403 status.
 - Discard access-log entries after their target enables Object Lock instead of

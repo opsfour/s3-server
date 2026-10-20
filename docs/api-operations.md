@@ -128,7 +128,8 @@ supply one of these checksums. The policy-covered `tagging` form field uses the
 S3 `<Tagging><TagSet>...` XML document format. It is validated before the file
 is spooled, while POST-policy conditions continue to match the original XML
 field value; the query-encoded `x-amz-tagging` header format is not accepted in
-this form field.
+this form field. The deprecated `redirect` form field remains accepted as a
+fallback when `success_action_redirect` is absent.
 
 ## Listing
 
@@ -302,6 +303,9 @@ new delete marker. `BucketOwnerPreferred` is not implemented.
 | PutBucketPolicy | `PUT` | `/{bucket}?policy` | Set bucket policy |
 | DeleteBucketPolicy | `DELETE` | `/{bucket}?policy` | Remove bucket policy |
 | GetBucketPolicyStatus | `GET` | `/{bucket}?policyStatus` | Report whether policy grants public access |
+
+Bucket policies may omit `Version`; when present it must be `2008-10-17` or
+`2012-10-17`.
 
 ## CORS
 

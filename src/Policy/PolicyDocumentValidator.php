@@ -50,7 +50,7 @@ final class PolicyDocumentValidator
 
         self::rejectUnknownFields($policy, self::TOP_LEVEL_FIELDS, 'policy');
         self::optionalString($policy, 'Id', 'Policy Id');
-        self::optionalString($policy, 'Version', 'Policy Version');
+        self::validateVersion($policy);
 
         if (!array_key_exists('Statement', $policy) || !is_array($policy['Statement'])) {
             throw new MalformedPolicyException('Policy must contain a Statement object or list.');
@@ -218,6 +218,21 @@ final class PolicyDocumentValidator
         if (array_key_exists($field, $document)
             && (!is_string($document[$field]) || $document[$field] === '')) {
             throw new MalformedPolicyException("{$label} must be a non-empty string.");
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $document
+     */
+    private static function validateVersion(array $document): void
+    {
+        if (! array_key_exists('Version', $document)) {
+            return;
+        }
+
+        if (! is_string($document['Version'])
+            || ! in_array($document['Version'], ['2008-10-17', '2012-10-17'], true)) {
+            throw new MalformedPolicyException('Policy Version must be 2008-10-17 or 2012-10-17.');
         }
     }
 }
