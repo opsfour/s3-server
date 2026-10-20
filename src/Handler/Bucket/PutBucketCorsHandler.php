@@ -35,7 +35,7 @@ final class PutBucketCorsHandler implements RequestHandler
         }
 
         // Parse the XML body.
-        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request);
+        $body = \OpsFour\S3Server\Http\RequestBody::buffer($request, 65_536);
         $rules = XmlRequestParser::parseCorsConfiguration($body);
 
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(

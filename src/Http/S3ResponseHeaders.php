@@ -53,8 +53,11 @@ final class S3ResponseHeaders
             'Content-Length' => (string) $contentLength,
             'Content-Type' => $objectInfo->contentType,
             'Accept-Ranges' => 'bytes',
-            'x-amz-storage-class' => $objectInfo->storageClass,
         ];
+
+        if ($objectInfo->storageClass !== 'STANDARD') {
+            $headers['x-amz-storage-class'] = $objectInfo->storageClass;
+        }
 
         // Optional system metadata headers.
         if (isset($objectInfo->systemMetadata['content-encoding']) && $objectInfo->systemMetadata['content-encoding'] !== '') {

@@ -82,6 +82,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Omit `x-amz-storage-class` from GET and HEAD responses for STANDARD objects,
+  matching S3's response contract.
+- Enforce the 64-KiB PutBucketCors document limit.
 - Match CreateBucket's regional conflict behavior and reset the bucket ACL on
   the legacy successful us-east-1 same-owner recreation path.
 - Reject client-defined bucket and object tag keys that use the case-insensitive

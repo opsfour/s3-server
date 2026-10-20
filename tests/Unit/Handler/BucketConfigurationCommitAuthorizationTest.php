@@ -11,6 +11,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketCorsHandler;
 use OpsFour\S3Server\Handler\Bucket\PutBucketVersioningHandler;
 use OpsFour\S3Server\Handler\Bucket\PutObjectLockConfigHandler;
@@ -80,6 +81,14 @@ final class BucketConfigurationCommitAuthorizationTest extends TestCase
         } catch (AccessDeniedException) {
             self::assertSame([], $this->metadata->getBucketCors('bucket'));
         }
+    }
+
+    public function test_cors_configuration_larger_than_64_kib_is_rejected(): void
+    {
+        $request = $this->request('owner', static function (): void {}, xml: str_repeat(' ', 65_537));
+
+        $this->expectException(EntityTooLargeException::class);
+        (new PutBucketCorsHandler($this->metadata))->handleRequest($request);
     }
 
     /** @return iterable<string, array{S3Operation, string, string, class-string<RequestHandler>}> */

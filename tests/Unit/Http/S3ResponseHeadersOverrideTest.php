@@ -11,6 +11,21 @@ use PHPUnit\Framework\TestCase;
 
 final class S3ResponseHeadersOverrideTest extends TestCase
 {
+    public function test_storage_class_header_is_omitted_for_standard_objects(): void
+    {
+        $standard = S3ResponseHeaders::build(new ObjectInfo('bucket', 'key', 1, '"etag"'), 1);
+        $archive = S3ResponseHeaders::build(new ObjectInfo(
+            'bucket',
+            'key',
+            1,
+            '"etag"',
+            storageClass: 'GLACIER',
+        ), 1);
+
+        self::assertArrayNotHasKey('x-amz-storage-class', $standard);
+        self::assertSame('GLACIER', $archive['x-amz-storage-class']);
+    }
+
     public function test_object_and_restore_http_dates_are_normalized_to_utc(): void
     {
         $headers = S3ResponseHeaders::build(new ObjectInfo(
