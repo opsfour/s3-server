@@ -17,8 +17,9 @@ use OpsFour\S3Server\Parallel\LocalObjectWriteTaskResult;
 
 /**
  * Isolated writer for a separately committed SQL intent. The scratch directory
- * must be node-local and private; SSE callers must supply ciphertext. Amp file
- * workers stage bytes, then a process worker performs filesystem writes.
+ * must be private and on the storage filesystem; SSE callers must supply
+ * ciphertext. Amp file workers stage bytes, then a process worker performs
+ * filesystem writes.
  * A canceled dispatched task may still publish later: the caller must retain
  * its SQL intent until the collector seals the exact path.
  * Scratch requires ext-posix, private process ownership and trusted parent
@@ -57,8 +58,9 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         if ($scratch === false || ! is_dir($scratch) || ! is_writable($scratch)) {
             throw new \InvalidArgumentException('Local object scratch directory must exist and be writable.');
         }
-        if ($scratch === $root || str_starts_with($scratch, rtrim($root, '/') . '/')) {
-            throw new \InvalidArgumentException('Local object scratch must be outside the storage root.');
+        $internalScratch = rtrim($root, '/') . '/.tmp/object-writes';
+        if ($scratch === $root || (str_starts_with($scratch, rtrim($root, '/') . '/') && $scratch !== $internalScratch)) {
+            throw new \InvalidArgumentException('Local object scratch inside the storage root must use its reserved internal path.');
         }
         $scratchPermissions = @fileperms($scratch);
         if ($scratchPermissions === false || ($scratchPermissions & 0077) !== 0) {
@@ -68,6 +70,11 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         if (! function_exists('posix_geteuid') || $scratchOwner === false || $scratchOwner !== posix_geteuid()) {
             throw new \InvalidArgumentException('Local object scratch directory must belong to the API process user.');
         }
+        $rootStat = @stat($root);
+        $scratchStat = @stat($scratch);
+        if ($rootStat === false || $scratchStat === false || $rootStat['dev'] !== $scratchStat['dev']) {
+            throw new \InvalidArgumentException('Local object scratch must be on the storage filesystem.');
+        }
         if ($storageTier === '') {
             throw new \InvalidArgumentException('Local object storage tier cannot be empty.');
         }
@@ -76,7 +83,10 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         }
 
         $this->root = rtrim($root, '/');
-        $this->workerAdmission = $workerAdmission ?? new LocalObjectWriteLeaseAdmission(2);
+        $this->workerAdmission = $workerAdmission ?? new LocalObjectWriteLeaseAdmission(
+            2,
+            waitForCapacity: true,
+        );
         $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
         $this->writePool = new ContextWorkerPool(2);
     }
@@ -144,7 +154,7 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             // Reserve one of the two physical worker slots before staging.
             // There is no unbounded pool queue retaining scratch files or
             // waiting for a filesystem syscall held by another upload.
-            $permit = $this->workerAdmission->acquire();
+            $permit = $this->workerAdmission->acquire($cancellation);
             $writeWorker = $this->checkoutWriteWorker($cancellation);
             $stage = $this->stager->stage($reserved->attemptId, $body, $cancellation);
             $cancellation?->throwIfRequested();

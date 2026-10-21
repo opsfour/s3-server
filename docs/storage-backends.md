@@ -42,7 +42,22 @@ but a cleanup failure must not replace the active cancellation. This lets the
 server distinguish a disconnected or stopped request from a backend failure
 and preserves orderly worker shutdown.
 
-The optional `RecoverableObjectWriteBackend` can plan a physical object path from bucket, key, bucket generation, and a unique attempt ID before writing bytes. Built-in in-memory, filesystem, direct/worker Flysystem, and observed wrappers implement it. `putObjectAtPath()` validates the planned object's bucket and key hash; it also preserves the existing multipart completion paths while binding their bucket and key hash. Ordinary `putObject()` still uses its existing path and call behavior. No ordinary PUT handler or metadata intent uses this new capability yet, so it alone does not provide crash recovery or a remote write fence.
+The optional `RecoverableObjectWriteBackend` can plan a physical object path
+from bucket, key, bucket generation, and a unique attempt ID before writing
+bytes. Built-in in-memory, filesystem, direct/worker Flysystem, and observed
+wrappers implement it. `putObjectAtPath()` validates the planned object's
+bucket and key hash; it also preserves the existing multipart completion paths
+while binding their bucket and key hash.
+
+For the supported persistent local filesystem profile, ordinary object PUTs,
+copies, and background object writes reserve a durable metadata intent before
+staging bytes in the private `.tmp/object-writes` directory on the same
+filesystem. Publication uses a create-only path, and the intent collector
+recovers or removes paths whose request did not finish committing metadata on
+its next pass or after restart.
+This write fence applies to the documented one-host, one-process profile. The
+same capability on a Flysystem adapter or shared filesystem does not establish
+a remote or multi-host write fence.
 
 Filesystem reads reject traversal and every symlink component in a stored path,
 including links whose target remains inside the configured storage root.

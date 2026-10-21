@@ -19,7 +19,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 {
     public function test_suspended_null_version_uses_response_headers_without_undeclared_xml_field(): void
     {
-        $lastModified = new \DateTimeImmutable('2026-01-02T03:04:05Z');
+        $lastModified = new \DateTimeImmutable('2026-01-02T07:04:05+04:00');
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
@@ -73,9 +73,35 @@ final class GetObjectAttributesResponseTest extends TestCase
         self::assertSame(1, substr_count($body, '<ObjectSize>'));
     }
 
+    public function test_sse_s3_object_reports_encryption_header(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            3,
+            '"etag"',
+            userMetadata: ['__sse-algorithm' => 'AES256'],
+        ));
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key?attributes'),
+            ['x-amz-object-attributes' => 'ETag'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        $response = (new GetObjectAttributesHandler($metadata))->handleRequest($request);
+
+        self::assertSame('AES256', $response->getHeader('x-amz-server-side-encryption'));
+    }
+
     public function test_explicit_delete_marker_returns_method_not_allowed_with_marker_headers(): void
     {
-        $lastModified = new \DateTimeImmutable('2026-02-03T04:05:06Z');
+        $lastModified = new \DateTimeImmutable('2026-02-03T08:05:06+04:00');
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadataByVersion')->willReturn(new ObjectInfo(

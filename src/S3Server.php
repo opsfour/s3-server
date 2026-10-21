@@ -33,6 +33,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
@@ -101,6 +102,15 @@ final class S3Server
 
     private bool $stopInProgress = false;
 
+    /**
+     * Amp's HTTP stop future is retained after a drain timeout so a later stop retry can finish cleanup safely.
+     *
+     * @var Future<void>|null
+     */
+    private ?Future $httpStopFuture = null;
+
+    private bool $httpDrainTimedOut = false;
+
     /** @var array<int, true> Successfully closed storage instances retained by this server. */
     private array $closedStorageBackends = [];
 
@@ -141,11 +151,11 @@ final class S3Server
 
     private ?LocalObjectWriteIntentCollector $localObjectIntentCollector = null;
 
-    private ?LocalFencedObjectWriter $localObjectTestWriter = null;
+    private ?LocalFencedObjectWriter $localObjectWriter = null;
 
-    private ?LocalObjectWriteLeaseGuardFactory $localObjectTestLeaseFactory = null;
+    private ?LocalObjectWriteLeaseGuardFactory $localObjectLeaseFactory = null;
 
-    private ?LocalFencedBackgroundObjectWriter $localBackgroundTestWriter = null;
+    private ?LocalFencedBackgroundObjectWriter $localBackgroundWriter = null;
 
     private ?DeferredCancellation $backgroundCancellation = null;
 
@@ -199,8 +209,8 @@ final class S3Server
                 $this->logger,
                 maxEncryptedObjectSize: $config->maxEncryptedObjectSize,
                 quotas: QuotaManager::fromGlobalConfig($metadata, $config->quota),
-                localFencedWriter: $this->localObjectTestWriter,
-                localLeaseFactory: $this->localObjectTestLeaseFactory,
+                localFencedWriter: $this->localObjectWriter,
+                localLeaseFactory: $this->localObjectLeaseFactory,
             )
             : null;
     }
@@ -324,43 +334,48 @@ final class S3Server
                 }
             }
 
-            if ($this->localObjectTestWriter !== null) {
+            if ($this->localObjectWriter !== null) {
                 if ($this->localObjectIntentCollector === null) {
-                    throw new \RuntimeException('Local object write test profile requires its intent collector.');
+                    throw new \RuntimeException('Local object write fencing requires its intent collector.');
                 }
                 if ($this->metadata === null) {
-                    throw new \RuntimeException('Local object write test profile requires metadata.');
+                    throw new \RuntimeException('Local object write fencing requires metadata.');
                 }
-                MetadataDriverStartupGuard::assertRawFencedSqlStore(
-                    $this->metadata,
-                    $this->config->metadataDriver,
-                    $this->config->metadataDsn,
-                );
-                $this->localObjectIntentCollector->assertBoundTo($this->metadata, $this->localObjectTestWriter);
-                if ($configuredTiers === null || count($configuredTiers->all()) !== 1
-                    || $configuredTiers->defaultTier()->name !== $this->localObjectTestWriter->storageTierName()
+                if (! $this->metadata instanceof ObjectWriteIntentStore) {
+                    throw new \RuntimeException('Local object write fencing requires durable object-write metadata intents.');
+                }
+                if (in_array($this->config->metadataDriver, ['postgres', 'mysql'], true)) {
+                    MetadataDriverStartupGuard::assertRawFencedSqlStore(
+                        $this->metadata,
+                        $this->config->metadataDriver,
+                        $this->config->metadataDsn,
+                    );
+                }
+                $this->localObjectIntentCollector->assertBoundTo($this->metadata, $this->localObjectWriter);
+                if ($configuredTiers === null
+                    || $configuredTiers->defaultTier()->name !== $this->localObjectWriter->storageTierName()
                     || $this->storage !== $configuredTiers->defaultBackend()) {
-                    throw new \RuntimeException('Local object write test profile requires exactly its fenced filesystem tier.');
+                    throw new \RuntimeException('Local object write fencing must match the default filesystem tier.');
                 }
                 $fencedBackend = $configuredTiers->defaultBackend();
                 while ($fencedBackend instanceof ObservedStorageBackend) {
                     $fencedBackend = $fencedBackend->innerBackend();
                 }
                 if (! $fencedBackend instanceof FilesystemBackend
-                    || realpath($fencedBackend->getBasePath()) !== $this->localObjectTestWriter->storageRoot()) {
-                    throw new \RuntimeException('Local object write test profile filesystem root differs from its writer.');
+                    || realpath($fencedBackend->getBasePath()) !== $this->localObjectWriter->storageRoot()) {
+                    throw new \RuntimeException('Local object write fencing filesystem root differs from its writer.');
                 }
                 foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
                     if ($registration['storage'] !== $this->storage
-                        || count($registration['tiers']->all()) !== 1
-                        || $registration['tiers']->defaultBackend() !== $this->storage) {
-                        throw new \RuntimeException('Local object write test profile handlers must use the same fenced filesystem tier.');
+                        || $registration['tiers']->defaultBackend() !== $this->storage
+                        || $registration['tiers']->defaultTier()->name !== $this->localObjectWriter->storageTierName()) {
+                        throw new \RuntimeException('Local object write fencing handlers must use the same fenced filesystem tier.');
                     }
                 }
                 if (! $this->metadata instanceof LocalMultipartFenceAdmissionStore
                     || ! $this->metadata instanceof FencedMultipartPartWriteIntentStore
                     || ! $this->metadata instanceof LocalMultipartCompletionIntentStore) {
-                    throw new \RuntimeException('Local object write test profile requires multipart legacy-intent admission.');
+                    throw new \RuntimeException('Local object write fencing requires multipart legacy-intent admission.');
                 }
                 $this->metadata->assertNoLegacyLocalMultipartIntents($configuredTiers->defaultTier()->name);
             }
@@ -784,13 +799,13 @@ final class S3Server
                 $this->config->maxEncryptedObjectSize,
                 QuotaManager::fromGlobalConfig($this->metadata, $this->config->quota),
                 $this->notifications,
-                $this->localObjectTestWriter,
-                $this->localObjectTestLeaseFactory,
+                $this->localObjectWriter,
+                $this->localObjectLeaseFactory,
             );
         }
     }
 
-    /** Attach one tier-scoped collector for the isolated local write test profile. */
+    /** Attach one tier-scoped collector for the local object write fencing. */
     public function setLocalObjectWriteIntentCollector(LocalObjectWriteIntentCollector $collector): void
     {
         $this->assertConfigurationMutable('Local object intent collector');
@@ -800,21 +815,18 @@ final class S3Server
         $this->localObjectIntentCollector = $collector;
     }
 
-    /** Attach the isolated local write test profile to internal access-log delivery. */
-    public function setLocalObjectWriteTestWriter(
+    /** Attach the local object write fencing to internal access-log delivery. */
+    public function setLocalObjectWriter(
         LocalFencedObjectWriter $writer,
         LocalObjectWriteLeaseGuardFactory $leaseFactory,
     ): void {
-        $this->assertConfigurationMutable('Local object write test writer');
-        if (! $this->config->allowUnfencedStorageForTests || $this->config->localObjectWriteTestScratchPath === null) {
-            throw new \LogicException('Local object write test writer requires the explicit unsafe test profile.');
+        $this->assertConfigurationMutable('Local object write writer');
+        if ($this->localObjectWriter !== null || $this->metadata === null || $this->storage === null) {
+            throw new \LogicException('Local object write writer is already attached or server dependencies are incomplete.');
         }
-        if ($this->localObjectTestWriter !== null || $this->metadata === null || $this->storage === null) {
-            throw new \LogicException('Local object write test writer is already attached or server dependencies are incomplete.');
-        }
-        $this->localObjectTestWriter = $writer;
-        $this->localObjectTestLeaseFactory = $leaseFactory;
-        $this->localBackgroundTestWriter = new LocalFencedBackgroundObjectWriter($writer, $leaseFactory);
+        $this->localObjectWriter = $writer;
+        $this->localObjectLeaseFactory = $leaseFactory;
+        $this->localBackgroundWriter = new LocalFencedBackgroundObjectWriter($writer, $leaseFactory);
         $this->setEncryptionService($this->encryption);
     }
 
@@ -833,8 +845,8 @@ final class S3Server
                 $this->config->maxEncryptedObjectSize,
                 QuotaManager::fromGlobalConfig($this->metadata, $this->config->quota),
                 $this->notifications,
-                $this->localObjectTestWriter,
-                $this->localObjectTestLeaseFactory,
+                $this->localObjectWriter,
+                $this->localObjectLeaseFactory,
             );
         }
     }
@@ -854,8 +866,9 @@ final class S3Server
     /**
      * Gracefully stop the server, waiting for in-flight requests to drain.
      *
-     * Warns after `shutdownDrainTimeout` seconds, but keeps dependencies alive
-     * until in-flight requests and background work have stopped.
+     * A drain timeout fails the stop attempt while retaining every dependency
+     * that an in-flight request may still use. Calling stop() again completes
+     * cleanup once the retained HTTP stop future has finished.
      */
     public function stop(): void
     {
@@ -893,28 +906,36 @@ final class S3Server
         // Stop accepting new connections and drain in-flight requests before
         // shutting down worker pools or metadata services they may still use.
         if ($this->server !== null) {
-            $stopFuture = \Amp\async(function (): void {
-                $this->server?->stop();
-            });
+            if ($this->httpStopFuture === null) {
+                $server = $this->server;
+                $this->httpStopFuture = \Amp\async(static function () use ($server): void {
+                    $server->stop();
+                });
+                $this->httpStopFuture->ignore();
+            }
+
+            if ($this->httpDrainTimedOut && ! $this->httpStopFuture->isComplete()) {
+                $this->abortIncompleteShutdown();
+            }
 
             try {
-                $stopFuture->await(new \Amp\TimeoutCancellation($timeout));
+                $this->httpStopFuture->await(new \Amp\TimeoutCancellation($timeout));
             } catch (\Amp\CancelledException) {
-                $this->logShutdown('warning', 'Shutdown drain timeout exceeded ({timeout}s); waiting for Amp to close active streams.', [
+                $this->httpDrainTimedOut = true;
+                $this->logShutdown('warning', 'Shutdown drain timeout exceeded ({timeout}s); active-request dependencies remain owned.', [
                     'timeout' => $timeout,
                 ]);
-                // Amp has already closed all listening sockets. Do not tear down
-                // dependencies while request fibers are still active.
-                try {
-                    $stopFuture->await();
-                } catch (\Throwable $e) {
-                    $this->logShutdown('warning', 'HTTP server shutdown failed.', ['exception' => $e::class]);
-                    $this->abortIncompleteShutdown();
-                }
+                // Amp has closed all listening sockets, but an active request
+                // can still be using storage or metadata. Return control to the
+                // supervisor without tearing those dependencies down. A later
+                // stop() retry observes the retained future and can finish.
+                $this->abortIncompleteShutdown();
             } catch (\Throwable $e) {
                 $this->logShutdown('warning', 'HTTP server shutdown failed.', ['exception' => $e::class]);
                 $this->abortIncompleteShutdown();
             }
+            $this->httpStopFuture = null;
+            $this->httpDrainTimedOut = false;
             $this->server = null;
         }
 
@@ -1097,12 +1118,8 @@ final class S3Server
             try {
                 $future->await($cancellation);
             } catch (\Amp\CancelledException) {
-                $this->logShutdown('warning', 'Background task did not stop within {timeout}s; waiting before dependency shutdown.', ['timeout' => $timeout]);
-                try {
-                    $future->await();
-                } catch (\Throwable $e) {
-                    $this->logShutdown('warning', 'Background task shutdown failed.', ['exception' => $e::class]);
-                }
+                $this->logShutdown('warning', 'Background task did not stop within {timeout}s; dependencies remain owned.', ['timeout' => $timeout]);
+                $this->abortIncompleteShutdown();
             } catch (\Throwable $e) {
                 $this->logShutdown('warning', 'Background task shutdown failed.', ['exception' => $e::class]);
             }
@@ -1284,6 +1301,8 @@ final class S3Server
                 $this->metadata,
                 $this->storageTiers ?? StorageTierRegistry::single($this->storage),
                 $this->config->websiteHostPattern,
+                $this->encryption,
+                $this->config->maxEncryptedObjectSize,
             );
         }
 
@@ -1379,14 +1398,14 @@ final class S3Server
                 $this->metadata,
                 $tiers,
                 $this->logger,
-                localFencedWriter: $this->localBackgroundTestWriter,
+                localFencedWriter: $this->localBackgroundWriter,
             );
             $restoreExecutor = new RestoreExecutor(
                 $this->metadata,
                 $tiers,
                 $this->logger,
                 $this->notifications,
-                localFencedWriter: $this->localBackgroundTestWriter,
+                localFencedWriter: $this->localBackgroundWriter,
             );
             $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
             $storageGc = new StorageGarbageCollector($this->metadata, $tiers, $this->logger);

@@ -46,19 +46,23 @@ final class MetadataDriverStartupGuard
         }
     }
 
-    /** The fenced local writer cannot use SQLite, an opaque store or a cache decorator. */
-    public static function assertRawFencedSqlStore(?MetadataStore $metadata, string $driver, string $dsn): void
+    /** Resolve the concrete Amp SQL store through the package's transparent decorators. */
+    public static function fencedSqlStore(?MetadataStore $metadata, string $driver, string $dsn): PostgresMetadataStore|MysqlMetadataStore
     {
-        if ($metadata instanceof ObservedMetadataStore) {
-            $metadata = $metadata->innerStore();
-        }
-
-        if (trim($dsn) === '' || ! (
+        $metadata = self::unwrap($metadata);
+        if (trim($dsn) !== '' && (
             ($driver === 'postgres' && $metadata instanceof PostgresMetadataStore && $metadata->matchesCreationDsn($dsn))
             || ($driver === 'mysql' && $metadata instanceof MysqlMetadataStore && $metadata->matchesCreationDsn($dsn))
         )) {
-            throw new \RuntimeException('Local object write fencing requires raw PostgreSQL/MySQL metadata created from the configured DSN.');
+            return $metadata;
         }
+
+        throw new \RuntimeException('Local object write fencing requires raw PostgreSQL/MySQL metadata created from the configured DSN.');
+    }
+
+    public static function assertRawFencedSqlStore(?MetadataStore $metadata, string $driver, string $dsn): void
+    {
+        self::fencedSqlStore($metadata, $driver, $dsn);
     }
 
     public static function hasVolatileSqliteMetadata(?MetadataStore $metadata): bool

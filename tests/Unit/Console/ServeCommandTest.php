@@ -91,6 +91,37 @@ final class ServeCommandTest extends TestCase
         self::assertSame('metrics-secret', $config->metricsBearerToken);
     }
 
+    public function test_sqlite_workers_default_to_four_and_zero_remains_an_explicit_opt_out(): void
+    {
+        $previous = getenv('S3_SQLITE_WORKERS');
+        putenv('S3_SQLITE_WORKERS');
+
+        try {
+            $command = new ServeCommand();
+            $default = $this->input($command, ['--storage-temp-dir' => $this->tempDir]);
+            $disabled = $this->input($command, [
+                '--storage-temp-dir' => $this->tempDir,
+                '--sqlite-workers' => '0',
+            ]);
+
+            self::assertSame(4, $this->invoke($command, 'configFromInput', [$default, null])->sqliteWorkerPoolSize);
+            self::assertSame(0, $this->invoke($command, 'configFromInput', [$disabled, null])->sqliteWorkerPoolSize);
+        } finally {
+            putenv($previous === false ? 'S3_SQLITE_WORKERS' : "S3_SQLITE_WORKERS={$previous}");
+        }
+    }
+
+    public function test_in_memory_sqlite_keeps_the_synchronous_compatibility_mode(): void
+    {
+        $command = new ServeCommand();
+        $input = $this->input($command, [
+            '--storage-temp-dir' => $this->tempDir,
+            '--metadata-path' => ':memory:',
+        ]);
+
+        self::assertSame(0, $this->invoke($command, 'configFromInput', [$input, null])->sqliteWorkerPoolSize);
+    }
+
     public function test_ambiguous_default_sqlite_files_fail_before_server_start(): void
     {
         self::assertTrue(mkdir($this->tempDir . '/.opsfour'));

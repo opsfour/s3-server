@@ -76,11 +76,15 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
             'postgres',
             'host=127.0.0.1 user=test db=test',
         );
+        MetadataDriverStartupGuard::assertRawFencedSqlStore(
+            new CachedMetadataStoreDecorator($postgres),
+            'postgres',
+            'host=127.0.0.1 user=test db=test',
+        );
 
         foreach ([
             [$postgres, 'mysql', 'host=127.0.0.1 user=test db=test'],
             [$postgres, 'postgres', ''],
-            [new CachedMetadataStoreDecorator($postgres), 'postgres', 'host=127.0.0.1 user=test db=test'],
             [new SqliteMetadataStore(':memory:'), 'sqlite', ''],
         ] as [$metadata, $driver, $dsn]) {
             try {

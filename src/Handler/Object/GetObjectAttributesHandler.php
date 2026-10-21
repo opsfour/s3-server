@@ -14,6 +14,7 @@ use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
@@ -79,7 +80,7 @@ final class GetObjectAttributesHandler implements RequestHandler
                 'Allow' => 'DELETE',
                 'x-amz-delete-marker' => 'true',
                 'x-amz-version-id' => $objectInfo->versionId ?? 'null',
-                'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \\G\\M\\T'),
+                'Last-Modified' => S3ResponseHeaders::httpDate($objectInfo->lastModified),
             ]);
         }
 
@@ -143,7 +144,7 @@ final class GetObjectAttributesHandler implements RequestHandler
 
         $headers = [
             'Content-Type' => 'application/xml',
-            'Last-Modified' => $objectInfo->lastModified->format('D, d M Y H:i:s \G\M\T'),
+            'Last-Modified' => S3ResponseHeaders::httpDate($objectInfo->lastModified),
         ];
         if ($objectInfo->versionId !== null) {
             $headers['x-amz-version-id'] = $objectInfo->versionId;
@@ -154,6 +155,8 @@ final class GetObjectAttributesHandler implements RequestHandler
             $headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
             $headers['x-amz-server-side-encryption-customer-key-MD5']
                 = $objectInfo->userMetadata['__sse-customer-key-md5'];
+        } elseif ($sseAlgorithm === 'AES256') {
+            $headers['x-amz-server-side-encryption'] = 'AES256';
         }
 
         // The versioning lookup above can yield after the earlier generation

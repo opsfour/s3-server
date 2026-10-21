@@ -9,11 +9,19 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
+use OpsFour\S3Server\Encryption\BufferedSsePayload;
+use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Exception\EntityTooLargeException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Http\WebsiteRedirectHost;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Runtime\BufferedWorkLimiter;
+use OpsFour\S3Server\Runtime\CancellationPreservingCleanup;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Security\RequestNetworkContext;
@@ -36,6 +44,8 @@ final class WebsiteHostingMiddleware implements Middleware
         private readonly MetadataStore $metadata,
         private readonly StorageTierRegistry $storageTiers,
         private readonly ?string $websiteHostPattern = null,
+        private readonly ?EncryptionServiceInterface $encryption = null,
+        private readonly int $maxEncryptedObjectSize = 268_435_456,
     ) {}
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
@@ -46,18 +56,42 @@ final class WebsiteHostingMiddleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
+        // Website hosts bypass normal API route parsing. Resolve the bucket
+        // before CORS so both preflight and object responses use its rules.
+        $request->setAttribute('s3.bucket', $bucket);
+        $request->setAttribute('s3.website', true);
+
+        if ($request->getMethod() === 'OPTIONS') {
+            return (new CorsMiddleware($this->metadata))->handleRequest($request, $requestHandler);
+        }
+
         // Only handle GET/HEAD for website hosting.
         if (!in_array($request->getMethod(), ['GET', 'HEAD'], true)) {
             return $requestHandler->handleRequest($request);
         }
 
+        return (new CorsMiddleware($this->metadata))->handleRequest(
+            $request,
+            new class (fn(Request $innerRequest): Response => $this->serveWebsiteRequest($innerRequest, $bucket)) implements RequestHandler {
+                /** @param \Closure(Request): Response $handler */
+                public function __construct(private readonly \Closure $handler) {}
+
+                public function handleRequest(Request $request): Response
+                {
+                    return ($this->handler)($request);
+                }
+            },
+        );
+    }
+
+    private function serveWebsiteRequest(Request $request, string $bucket): Response
+    {
+
         // Website paths contain only an object key; the bucket is in Host.
         // Set attributes here because website requests bypass API route parsing.
         $path = rawurldecode(ltrim($request->getUri()->getPath(), '/'));
-        $request->setAttribute('s3.bucket', $bucket);
         $request->setAttribute('s3.key', $path);
         $request->setAttribute('s3.operation', $request->getMethod() === 'HEAD' ? S3Operation::HeadObject : S3Operation::GetObject);
-        $request->setAttribute('s3.website', true);
         $bucketInfo = $this->metadata->getBucket($bucket);
         $request->setAttribute('s3.cachedBucketOwner', $bucketInfo?->ownerId);
         $request->setAttribute('s3.cachedBucketGeneration', $bucketInfo?->generation);
@@ -158,11 +192,9 @@ final class WebsiteHostingMiddleware implements Middleware
                 return self::htmlError(500, 'InternalError', 'Object storage path missing.');
             }
 
-            // Encrypted objects cannot be served via website hosting.
-            // SSE-C requires a customer key (not available), SSE-S3 stores ciphertext on disk.
             $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
-            if ($sseAlgo === 'SSE-C' || $sseAlgo === 'AES256') {
-                return self::htmlError(403, 'AccessDenied', 'Encrypted objects cannot be served via website hosting.');
+            if ($sseAlgo === EncryptionRequestResolver::SSE_C) {
+                return self::htmlError(403, 'AccessDenied', 'SSE-C objects cannot be served via website hosting.');
             }
 
             try {
@@ -175,9 +207,7 @@ final class WebsiteHostingMiddleware implements Middleware
                 return self::htmlError(403, 'InvalidObjectState', 'The archived object must be restored before it can be served.');
             }
 
-            $body = $request->getMethod() === 'HEAD'
-                ? ''
-                : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $objectInfo->size);
+            $body = $this->websiteBody($request, $bucketInfo, $storage, $storagePath, $objectInfo);
 
             return new Response(
                 status: 200,
@@ -252,8 +282,8 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         $sseAlgo = $errorObjectInfo->userMetadata['__sse-algorithm'] ?? null;
-        if ($sseAlgo === 'SSE-C' || $sseAlgo === 'AES256') {
-            return self::htmlError(403, 'AccessDenied', 'Encrypted error documents cannot be served via website hosting.');
+        if ($sseAlgo === EncryptionRequestResolver::SSE_C) {
+            return self::htmlError(403, 'AccessDenied', 'SSE-C error documents cannot be served via website hosting.');
         }
 
         $storagePath = $errorObjectInfo->systemMetadata['storagePath'] ?? null;
@@ -271,15 +301,78 @@ final class WebsiteHostingMiddleware implements Middleware
             return self::htmlError(403, 'InvalidObjectState', 'The archived error document must be restored before it can be served.');
         }
 
-        $body = $request->getMethod() === 'HEAD'
-            ? ''
-            : $this->openWebsiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo->size);
+        $body = $this->websiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo);
 
         return new Response(
             status: $status,
             headers: self::websiteObjectHeaders($errorObjectInfo),
             body: $body,
         );
+    }
+
+    private function websiteBody(
+        Request $request,
+        BucketInfo $bucketInfo,
+        StorageBackend $storage,
+        string $path,
+        ObjectInfo $object,
+    ): string|GenerationGuardedReadableStream {
+        if ($request->getMethod() === 'HEAD') {
+            return '';
+        }
+
+        if (($object->userMetadata['__sse-algorithm'] ?? null) === EncryptionRequestResolver::SSE_S3) {
+            return $this->decryptWebsiteBody($request, $bucketInfo, $storage, $path, $object);
+        }
+
+        return $this->openWebsiteBody($request, $bucketInfo, $storage, $path, $object->size);
+    }
+
+    private function decryptWebsiteBody(
+        Request $request,
+        BucketInfo $bucketInfo,
+        StorageBackend $storage,
+        string $path,
+        ObjectInfo $object,
+    ): string {
+        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        \assert($this->encryption !== null);
+        if ($object->size > $this->maxEncryptedObjectSize) {
+            throw new EntityTooLargeException(
+                'Encrypted object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+            );
+        }
+
+        $bufferedWorkLock = BufferedWorkLimiter::acquire();
+        $decryptionCancellation = null;
+        try {
+            [$ciphertext] = BufferedSsePayload::readExpected(
+                $storage->getObjectByPath($path),
+                $object->size,
+                $this->maxEncryptedObjectSize,
+            );
+
+            $plaintext = $this->encryption->decryptSseS3(
+                $ciphertext,
+                $object->userMetadata['__sse-key'],
+                $object->userMetadata['__sse-iv'],
+                $object->userMetadata['__sse-tag'],
+            );
+            if (strlen($plaintext) !== $object->size) {
+                throw new InternalErrorException('Decrypted object size does not match metadata.');
+            }
+            BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+
+            return $plaintext;
+        } catch (\Amp\CancelledException $error) {
+            $decryptionCancellation = $error;
+            throw $error;
+        } finally {
+            CancellationPreservingCleanup::inFinally(
+                $decryptionCancellation,
+                $bufferedWorkLock->release(...),
+            );
+        }
     }
 
     private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): GenerationGuardedReadableStream
@@ -290,7 +383,12 @@ final class WebsiteHostingMiddleware implements Middleware
             // changed while the backend was opening the old physical path.
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             return new GenerationGuardedReadableStream(
-                new LimitedReadableStream($source, $size),
+                new LimitedReadableStream(
+                    $source,
+                    $size,
+                    requireExactLength: true,
+                    rejectExcess: true,
+                ),
                 function () use ($bucketInfo, $request): void {
                     BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                 },
@@ -360,6 +458,12 @@ final class WebsiteHostingMiddleware implements Middleware
             if ($policyResult === 'Allow') {
                 return ! ($publicAccessBlock['restrictPublicBuckets'] ?? false);
             }
+        }
+
+        // Object ACLs are disabled in BucketOwnerEnforced mode, including
+        // grants left behind by an earlier ObjectWriter configuration.
+        if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
+            return false;
         }
 
         $grants = $this->metadata->getAcl(

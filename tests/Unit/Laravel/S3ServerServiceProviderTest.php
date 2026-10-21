@@ -78,6 +78,7 @@ final class S3ServerServiceProviderTest extends TestCase
         $app = $this->application([
             'storage' => ['path' => $this->basePath],
             'metadata' => ['path' => null, 'cache_ttl' => 0.0],
+            'parallel' => ['sqlite_workers' => 0],
         ]);
 
         $metadata = $app->make(MetadataStore::class);
@@ -279,6 +280,24 @@ final class S3ServerServiceProviderTest extends TestCase
         }
     }
 
+    public function test_package_config_defaults_sqlite_to_four_workers_and_preserves_zero_opt_out(): void
+    {
+        $previous = getenv('S3_SQLITE_WORKERS');
+        new Application($this->basePath);
+
+        try {
+            putenv('S3_SQLITE_WORKERS');
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            self::assertSame(4, $config['parallel']['sqlite_workers']);
+
+            putenv('S3_SQLITE_WORKERS=0');
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            self::assertSame(0, $config['parallel']['sqlite_workers']);
+        } finally {
+            putenv($previous === false ? 'S3_SQLITE_WORKERS' : "S3_SQLITE_WORKERS={$previous}");
+        }
+    }
+
     public function test_provider_resolves_config_and_core_singletons(): void
     {
         $app = $this->application([
@@ -311,6 +330,7 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
         self::assertFalse($config->notificationWorkerEnabled);
+        self::assertSame(0, $config->sqliteWorkerPoolSize);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
 

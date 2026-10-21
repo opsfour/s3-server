@@ -109,13 +109,14 @@ The server handles `SIGTERM` and `SIGINT` signals:
 
 1. Cancels and drains background processors.
 2. Stops accepting new connections and drains in-flight requests.
-3. Logs a warning after `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds but keeps runtime dependencies alive until work has stopped.
-4. Shuts down storage and worker pools.
-5. Exits cleanly.
+3. Waits up to `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds for active HTTP requests.
+4. Shuts down storage and worker pools after the requests and background work stop.
+5. Fails the shutdown attempt without releasing dependencies if the deadline is exceeded.
 
 Set the process supervisor's hard stop deadline above
-`S3_SHUTDOWN_DRAIN_TIMEOUT`; the supervisor remains responsible for terminating
-a callback or backend operation that never returns.
+`S3_SHUTDOWN_DRAIN_TIMEOUT`. A timed-out stop returns a failure to the serve
+command, retains dependencies that active work may still use, and lets the
+supervisor terminate a callback or backend operation that never returns.
 
 ```bash
 S3_SHUTDOWN_DRAIN_TIMEOUT=30   # seconds
@@ -226,11 +227,14 @@ described in [configuration.md](configuration.md#timeouts).
 
 ### SQLite Worker Pool
 
-For SQLite deployments under load, prevent write-lock contention:
+File-backed SQLite uses four metadata workers by default to keep lock waits out
+of the API event loop:
 
 ```bash
 S3_SQLITE_WORKERS=4
 ```
+
+Set `S3_SQLITE_WORKERS=0` only when blocking SQLite access is intentional.
 
 ### Encryption Workers
 

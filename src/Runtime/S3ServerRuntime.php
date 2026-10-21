@@ -50,13 +50,13 @@ final class S3ServerRuntime
         $this->localStorageRootLocks?->retainUntilProcessExit();
     }
 
-    /** Transfer the isolated test profile's worker resources to runtime shutdown. */
-    public function attachLocalObjectWriteTestResources(
+    /** Transfer local object publication resources to runtime shutdown. */
+    public function attachLocalObjectWriteResources(
         LocalFencedObjectWriter $writer,
-        DedicatedAmpObjectWriteLeaseRenewer $renewer,
+        ?DedicatedAmpObjectWriteLeaseRenewer $renewer,
     ): void {
         if ($this->stopped || $this->stopInProgress || $this->localObjectWriter !== null || $this->localObjectRenewer !== null) {
-            throw new \LogicException('Local object write test resources were already attached or runtime stopped.');
+            throw new \LogicException('Local object write resources were already attached or runtime stopped.');
         }
         $this->localObjectWriter = $writer;
         $this->localObjectRenewer = $renewer;

@@ -231,6 +231,16 @@ class S3ServerCommand extends Command
             ]);
         }
 
-        return app(CredentialProvider::class);
+        $driver = (string) config('s3-server.credentials.driver', 'memory');
+        if (! in_array($driver, ['database', 'chain'], true)) {
+            return app(CredentialProvider::class);
+        }
+
+        return CredentialProviderFactory::createForServing(
+            $driver,
+            config('s3-server.credentials', []),
+            (int) config('s3-server.parallel.credential_workers', 4),
+            (float) config('s3-server.credentials.operation_timeout_seconds', 15.0),
+        );
     }
 }

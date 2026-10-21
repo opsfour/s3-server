@@ -213,6 +213,7 @@ opsfour_s3_server:
     username: 's3'
     password: 'secret'
     cache_ttl: 1.0
+    operation_timeout_seconds: 15.0
 
   quotas:
     max_buckets_per_owner: 0
@@ -227,7 +228,8 @@ opsfour_s3_server:
     lock_ttl_seconds: 300
 
   parallel:
-    sqlite_workers: 0
+    sqlite_workers: 4
+    credential_workers: 4
     encryption_workers: 0
     request_body_spool_workers: 8
     encryption_threshold: 65536

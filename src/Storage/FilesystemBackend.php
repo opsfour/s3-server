@@ -1031,10 +1031,20 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     private function storedPathForAccess(string $path): string
     {
         $prefix = $this->basePath . '/';
-        if (! str_starts_with($path, $prefix)) {
-            throw new \InvalidArgumentException('Stored object path is outside the storage namespace.');
+        if (str_starts_with($path, $prefix)) {
+            $relative = substr($path, strlen($prefix));
+        } else {
+            // The durable local writer resolves the root before passing it to
+            // a worker. Preserve compatibility when the configured namespace
+            // reaches the same directory through an absolute symlink alias
+            // (for example /var and /private/var on macOS).
+            $resolvedRoot = realpath($this->basePath);
+            $resolvedPrefix = $resolvedRoot === false ? null : rtrim($resolvedRoot, '/') . '/';
+            if ($resolvedPrefix === null || ! str_starts_with($path, $resolvedPrefix)) {
+                throw new \InvalidArgumentException('Stored object path is outside the storage namespace.');
+            }
+            $relative = substr($path, strlen($resolvedPrefix));
         }
-        $relative = substr($path, strlen($prefix));
         // Older configurations ending in "/" persisted one extra separator
         // directly after the root. No other separator normalization is safe.
         if (str_starts_with($relative, '/')) {

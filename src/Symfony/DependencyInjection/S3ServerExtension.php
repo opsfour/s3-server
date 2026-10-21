@@ -37,6 +37,9 @@ final class S3ServerExtension extends Extension
     {
         $configuration = new Configuration();
         $config = $this->processConfiguration($configuration, $configs);
+        if ($config['metadata']['driver'] === 'sqlite' && $config['metadata']['path'] === ':memory:') {
+            $config['parallel']['sqlite_workers'] = 0;
+        }
 
         $metadataConfig = $config['metadata'];
         $metadataConfig['worker_pool_size'] = $config['parallel']['sqlite_workers'];
@@ -95,6 +98,17 @@ final class S3ServerExtension extends Extension
             ])
             ->setPublic(true));
 
+        $servingCredentialProviderId = 'opsfour_s3_server.credentials.serving';
+        $container->setDefinition($servingCredentialProviderId, (new Definition(CredentialProvider::class))
+            ->setFactory([CredentialProviderFactory::class, 'createForServing'])
+            ->setArguments([
+                $config['credentials']['driver'],
+                $config['credentials'],
+                $config['parallel']['credential_workers'],
+                $config['credentials']['operation_timeout_seconds'],
+            ])
+            ->setPublic(false));
+
         $container->setDefinition(S3ServerRuntimeFactory::class, (new Definition(S3ServerRuntimeFactory::class))
             ->setPublic(true));
 
@@ -103,7 +117,7 @@ final class S3ServerExtension extends Extension
                 new ServiceClosureArgument(new Reference(S3ServerConfig::class)),
                 new ServiceClosureArgument(new Reference(MetadataStore::class)),
                 new ServiceClosureArgument(new Reference(StorageBackend::class)),
-                new ServiceClosureArgument(new Reference(CredentialProvider::class)),
+                new ServiceClosureArgument(new Reference($servingCredentialProviderId)),
                 new Reference(MetricsCollector::class),
                 new ServiceClosureArgument(new Reference(StorageTierRegistry::class)),
                 new Reference(S3ServerRuntimeFactory::class),

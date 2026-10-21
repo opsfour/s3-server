@@ -61,6 +61,18 @@ final class S3ServerBundleTest extends TestCase
         self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle())->getContainerExtension());
     }
 
+    public function test_file_backed_sqlite_defaults_to_four_workers(): void
+    {
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'metadata' => ['driver' => 'sqlite', 'path' => '/tmp/opsfour-config-default.sqlite'],
+        ]], $container);
+
+        $metadataConfig = $container->getParameter('opsfour_s3_server.metadata_config');
+        self::assertIsArray($metadataConfig);
+        self::assertSame(4, $metadataConfig['worker_pool_size']);
+    }
+
     public function test_default_sqlite_metadata_uses_the_internal_storage_namespace(): void
     {
         $storagePath = sys_get_temp_dir() . '/s3-symfony-metadata-' . bin2hex(random_bytes(6));
@@ -68,6 +80,7 @@ final class S3ServerBundleTest extends TestCase
         (new S3ServerExtension())->load([[
             'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
             'metadata' => ['driver' => 'sqlite', 'cache_ttl' => 0.0],
+            'parallel' => ['sqlite_workers' => 0],
         ]], $container);
 
         $metadataConfig = $container->getParameter('opsfour_s3_server.metadata_config');
@@ -95,6 +108,7 @@ final class S3ServerBundleTest extends TestCase
         (new S3ServerExtension())->load([[
             'storage' => ['driver' => 'filesystem', 'path' => $storagePath],
             'metadata' => ['driver' => 'sqlite', 'cache_ttl' => 0.0],
+            'parallel' => ['sqlite_workers' => 0],
         ]], $container);
         $container->compile();
 

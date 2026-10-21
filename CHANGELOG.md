@@ -35,6 +35,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Run file-backed SQLite metadata operations in four worker processes by
+  default for standalone, Laravel, and Symfony serving; `0` remains an opt-out
+  and `:memory:` remains synchronous.
 - Clarify the production target, shared support-status definitions, and the
   separation between universal release gates and optional deployment profiles.
 - Align the production soak with the supported single-process local-filesystem
@@ -82,6 +85,17 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Use durable write intents for normal local-filesystem object writes and
+  recover physical paths left behind by a process exit before metadata commit.
+- Apply website CORS rules, honor BucketOwnerEnforced ACL semantics, decrypt
+  SSE-S3 website objects, and reject stored-size mismatches while streaming.
+- Keep database credential PDO operations out of the HTTP event loop and bound
+  each serving operation with a configurable timeout.
+- Make the configured shutdown drain timeout finite: a stalled HTTP request or
+  background task now fails shutdown while retaining its dependencies for a
+  safe retry or supervisor termination instead of waiting forever.
+- Return SSE-S3 encryption metadata from GetObjectAttributes and normalize its
+  `Last-Modified` response headers to UTC.
 - Honor the deprecated browser POST `redirect` field as a fallback for
   `success_action_redirect`.
 - Reject bucket policies with unsupported policy-language versions.

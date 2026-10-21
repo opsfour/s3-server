@@ -127,10 +127,7 @@ final class HandlerRegistrar
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
     ): void {
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
-            throw new \InvalidArgumentException('Local object write test profile needs both writer and lease factory.');
-        }
-        if ($localFencedWriter !== null && ($config->localObjectWriteTestScratchPath === null || ! $config->allowUnfencedStorageForTests)) {
-            throw new \InvalidArgumentException('Local object write fencing is available only in its explicit test profile.');
+            throw new \InvalidArgumentException('Local object writes need both writer and lease factory.');
         }
 
         self::registerHandlers(
@@ -166,7 +163,7 @@ final class HandlerRegistrar
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
-        $requireLocalFencedMultipart = $localFencedWriter !== null;
+        $requireLocalFencedMultipart = $localPartWriter !== null;
         $registry->registerStorage($storage, $storageTiers);
 
         // Bucket operations.

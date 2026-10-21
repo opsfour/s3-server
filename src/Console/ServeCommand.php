@@ -74,9 +74,9 @@ final class ServeCommand extends Command
             ->addOption('post-spool-budget', null, InputOption::VALUE_REQUIRED, 'Concurrent browser POST temporary bytes shared by processes using one local temp directory', getenv('S3_POST_SPOOL_BUDGET') === false ? '10737418240' : getenv('S3_POST_SPOOL_BUDGET'))
             ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', self::envOption('S3_READ_TIMEOUT', '300'))
             ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', self::envOption('S3_WRITE_TIMEOUT', '300'))
-            ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Seconds before warning that graceful shutdown is still draining', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
+            ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to drain in-flight requests during graceful shutdown', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
             ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', self::envOption('S3_REQUEST_BODY_SPOOL_WORKERS', '8'))
-            ->addOption('sqlite-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for SQLite metadata operations', getenv('S3_SQLITE_WORKERS') ?: '0')
+            ->addOption('sqlite-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for SQLite metadata operations', self::envOption('S3_SQLITE_WORKERS', '4'))
             ->addOption('encryption-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for encryption', getenv('S3_ENCRYPTION_WORKERS') ?: '0')
             ->addOption('select-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for S3 Select', getenv('S3_SELECT_WORKERS') === false ? null : getenv('S3_SELECT_WORKERS'))
             ->addOption('encryption-threshold', null, InputOption::VALUE_REQUIRED, 'Encryption worker offload threshold in bytes', self::envOption('S3_ENCRYPTION_THRESHOLD', '65536'))
@@ -100,6 +100,8 @@ final class ServeCommand extends Command
             ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Username for credentials database', getenv('S3_CREDENTIALS_USERNAME') ?: null)
             ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Password for credentials database', getenv('S3_CREDENTIALS_PASSWORD') === false ? null : getenv('S3_CREDENTIALS_PASSWORD'))
             ->addOption('credentials-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Positive credential cache TTL in seconds (0 = disabled)', getenv('S3_CREDENTIALS_CACHE_TTL') === false ? '1' : getenv('S3_CREDENTIALS_CACHE_TTL'))
+            ->addOption('credentials-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for database credential operations', self::envOption('S3_CREDENTIALS_WORKERS', '4'))
+            ->addOption('credentials-operation-timeout', null, InputOption::VALUE_REQUIRED, 'Database credential operation timeout in seconds', self::envOption('S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS', '15'))
             ->addOption('credentials-file', null, InputOption::VALUE_REQUIRED, 'Path to credentials JSON file (file driver)', getenv('S3_CREDENTIALS_PATH') ?: null)
             ->addOption('quota-max-buckets-per-owner', null, InputOption::VALUE_REQUIRED, 'Maximum buckets per owner (0 = unlimited)', getenv('S3_QUOTA_MAX_BUCKETS_PER_OWNER') ?: '0')
             ->addOption('quota-max-objects-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum objects per bucket (0 = unlimited)', getenv('S3_QUOTA_MAX_OBJECTS_PER_BUCKET') ?: '0')
@@ -267,7 +269,7 @@ final class ServeCommand extends Command
             shutdownDrainTimeout: $this->integerOption($input, 'shutdown-drain-timeout'),
             notificationRequireHttps: $this->booleanOption($input, 'notification-require-https'),
             notificationWorkerEnabled: $this->booleanOption($input, 'notification-worker'),
-            sqliteWorkerPoolSize: $this->integerOption($input, 'sqlite-workers'),
+            sqliteWorkerPoolSize: $this->sqliteWorkerPoolSize($input),
             encryptionWorkerPoolSize: $this->integerOption($input, 'encryption-workers'),
             selectWorkerPoolSize: $input->getOption('select-workers') === null
                 ? null
@@ -378,7 +380,7 @@ final class ServeCommand extends Command
     ): \OpsFour\S3Server\Metadata\MetadataStore {
         $metadataConfig = [
             'dsn' => $metadataDsn,
-            'worker_pool_size' => $this->integerOption($input, 'sqlite-workers'),
+            'worker_pool_size' => $this->sqliteWorkerPoolSize($input),
         ];
         if ($metadataDriver === 'sqlite') {
             $path = SqliteMetadataPathResolver::resolve(
@@ -399,6 +401,16 @@ final class ServeCommand extends Command
         }
 
         return new ObservedMetadataStore($metadata, $metrics, $metadataDriver);
+    }
+
+    private function sqliteWorkerPoolSize(InputInterface $input): int
+    {
+        if ((string) $input->getOption('metadata-driver') === 'sqlite'
+            && $this->nullableString($input->getOption('metadata-path')) === ':memory:') {
+            return 0;
+        }
+
+        return $this->integerOption($input, 'sqlite-workers');
     }
 
     private function booleanOption(InputInterface $input, string $name): bool
@@ -476,7 +488,12 @@ final class ServeCommand extends Command
         };
 
         try {
-            return CredentialProviderFactory::create($driver, $config);
+            return CredentialProviderFactory::createForServing(
+                $driver,
+                $config,
+                $this->integerOption($input, 'credentials-workers'),
+                $this->floatOption($input, 'credentials-operation-timeout'),
+            );
         } catch (\InvalidArgumentException $e) {
             $output->writeln('<error>Error: ' . ServeFailureMessage::format($e, 'bootstrap') . '</error>');
 

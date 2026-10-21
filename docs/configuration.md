@@ -119,13 +119,17 @@ S3_METADATA_DSN="host=localhost;port=3306;dbname=s3server;user=s3;password=secre
 | `S3_CREDENTIALS_DSN` | - | PDO DSN (database driver), for example `pgsql:host=db;port=5432;dbname=s3server` |
 | `S3_CREDENTIALS_USERNAME` | - | Database username (database driver) |
 | `S3_CREDENTIALS_PASSWORD` | - | Database password (database driver) |
+| `S3_CREDENTIALS_CACHE_TTL` | `1.0` | Positive lookup cache in seconds; `0` observes revocations on the next request |
+| `S3_CREDENTIALS_WORKERS` | `4` | Worker processes that isolate PDO credential operations from the HTTP event loop; `0` opts into synchronous PDO |
+| `S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS` | `15` | Maximum runtime of one credential database operation in a serving process |
+| `S3_CREDENTIALS_PATH` | - | JSON file path (file driver) |
 
 When a database credential provider is configured, `/.health` performs a
 read-only availability probe against that same provider. Credential database
 outages therefore remove the server from readiness while `/.live` remains
-available for process supervision.
-| `S3_CREDENTIALS_CACHE_TTL` | `1.0` | Positive lookup cache in seconds; `0` observes revocations on the next request |
-| `S3_CREDENTIALS_PATH` | - | JSON file path (file driver) |
+available for process supervision. Serving integrations use the bounded worker
+pool and operation timeout above; credential management commands continue to
+run synchronously.
 
 See [Authentication](authentication.md) for multi-user setup.
 
@@ -271,7 +275,7 @@ destinations remain blocked by the notification SSRF policy.
 | `S3_CONNECTION_IDLE_TIMEOUT` | `60` | HTTP/2 idle connection timeout (seconds) |
 | `S3_READ_TIMEOUT` | `300` | Request stream inactivity timeout (seconds) |
 | `S3_WRITE_TIMEOUT` | `300` | Response stream inactivity timeout (seconds) |
-| `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Seconds before warning that graceful shutdown is still draining |
+| `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Maximum seconds to drain in-flight HTTP requests before shutdown fails safely with their dependencies still owned |
 
 Amp's HTTP/1 driver currently uses one inactivity timeout for keep-alive,
 request reads, and response writes. The package sets that value to the larger
@@ -324,12 +328,15 @@ permission model used by Amazon S3 and Linode website hosting.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_SQLITE_WORKERS` | `0` | Number of Amp parallel workers for SQLite (0 = blocking mode) |
+| `S3_SQLITE_WORKERS` | `4` | Number of Amp parallel workers for file-backed SQLite (`0` = blocking mode) |
 | `S3_ENCRYPTION_WORKERS` | `0` | Number of Amp parallel workers for encryption (0 = inline) |
 | `S3_SELECT_WORKERS` | `1` | Number of Amp parallel workers for S3 Select. One worker isolates buffered query processing from the API process; `0` opts into inline processing. Buffered Select admission currently permits one request per API process, so values above 1 provide spare workers rather than parallel Select throughput. |
 | `S3_ENCRYPTION_THRESHOLD` | `65536` | Object size threshold for offloading encryption to workers (bytes) |
 
-Setting `S3_SQLITE_WORKERS` > 0 wraps SQLite in a `ParallelSqliteMetadataStore` that dispatches queries to a worker pool, preventing SQLite's single-writer lock from blocking the event loop.
+File-backed SQLite is wrapped in a `ParallelSqliteMetadataStore` by default,
+preventing its lock waits from blocking the event loop. Set
+`S3_SQLITE_WORKERS=0` for the explicit blocking mode. The `:memory:` path stays
+synchronous because its database cannot be shared between worker processes.
 
 ## Example .env
 
@@ -353,6 +360,8 @@ S3_CREDENTIALS_DSN="pgsql:host=db.internal;port=5432;dbname=s3server"
 S3_CREDENTIALS_USERNAME=s3
 S3_CREDENTIALS_PASSWORD=secret
 S3_CREDENTIALS_CACHE_TTL=1
+S3_CREDENTIALS_WORKERS=4
+S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS=15
 
 # Admin APIs
 S3_ADMIN_API_TOKEN=change-me

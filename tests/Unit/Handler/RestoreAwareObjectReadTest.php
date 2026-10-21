@@ -350,13 +350,11 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame('abc', \Amp\ByteStream\buffer($response->getBody()));
     }
 
-    public function test_website_object_and_error_document_do_not_stream_beyond_recorded_size(): void
+    public function test_website_rejects_storage_content_larger_than_recorded_size(): void
     {
         $index = $this->hot->putObject('bucket', 'index.html', new ReadableBuffer('abcEXTRA'));
-        $error = $this->hot->putObject('bucket', 'error.html', new ReadableBuffer('errEXTRA'));
         $this->putMetadata('index.html', $index->path, 3, $index->md5Hex);
-        $this->putMetadata('error.html', $error->path, 3, $error->md5Hex);
-        $this->metadata->putBucketWebsite('bucket', 'index.html', 'error.html');
+        $this->metadata->putBucketWebsite('bucket', 'index.html');
         $this->allowPublicReadByPolicy();
         $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
 
@@ -366,15 +364,9 @@ final class RestoreAwareObjectReadTest extends TestCase
         );
         self::assertSame(200, $indexResponse->getStatus());
         self::assertSame('3', $indexResponse->getHeader('content-length'));
-        self::assertSame('abc', \Amp\ByteStream\buffer($indexResponse->getBody()));
 
-        $errorResponse = $middleware->handleRequest(
-            $this->websiteRequest('GET', '/missing', 'bucket.s3-website.test'),
-            new RestoreWebsiteTerminalHandler(),
-        );
-        self::assertSame(404, $errorResponse->getStatus());
-        self::assertSame('3', $errorResponse->getHeader('content-length'));
-        self::assertSame('err', \Amp\ByteStream\buffer($errorResponse->getBody()));
+        $this->expectException(InternalErrorException::class);
+        \Amp\ByteStream\buffer($indexResponse->getBody());
     }
 
     public function test_website_path_decodes_key_once_and_keeps_bucket_named_first_segment(): void
@@ -473,7 +465,7 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame('', \Amp\ByteStream\buffer($head->getBody()));
     }
 
-    public function test_website_error_document_is_served_but_encrypted_error_document_is_rejected(): void
+    public function test_website_serves_sse_s3_error_document_and_rejects_sse_c(): void
     {
         $write = $this->hot->putObject('bucket', 'error.html', new ReadableBuffer('not found'));
         $this->putMetadata('error.html', $write->path, $write->size, $write->md5Hex);
@@ -488,6 +480,37 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame(404, $response->getStatus());
         self::assertSame('not found', \Amp\ByteStream\buffer($response->getBody()));
 
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $encryptedPayload = $encryption->encryptSseS3('encrypted error');
+        $encryptedWrite = $this->hot->putObject('bucket', 'error.html', new ReadableBuffer($encryptedPayload['ciphertext']));
+        $this->metadata->putObjectMetadata(
+            bucket: 'bucket',
+            key: 'error.html',
+            ownerId: 'owner',
+            size: strlen('encrypted error'),
+            etag: '"' . md5('encrypted error') . '"',
+            contentType: 'text/html',
+            storagePath: $encryptedWrite->path,
+            userMetadata: [
+                '__sse-algorithm' => 'AES256',
+                '__sse-key' => $encryptedPayload['encryptedDataKey'],
+                '__sse-iv' => $encryptedPayload['iv'],
+                '__sse-tag' => $encryptedPayload['tag'],
+            ],
+        );
+        $encrypted = (new WebsiteHostingMiddleware(
+            $this->metadata,
+            $this->tiers,
+            '*.s3-website.test',
+            $encryption,
+        ))->handleRequest(
+            $this->websiteRequest('GET', '/missing', 'bucket.s3-website.test'),
+            new RestoreWebsiteTerminalHandler(),
+        );
+
+        self::assertSame(404, $encrypted->getStatus());
+        self::assertSame('encrypted error', \Amp\ByteStream\buffer($encrypted->getBody()));
+
         $this->metadata->putObjectMetadata(
             bucket: 'bucket',
             key: 'error.html',
@@ -496,15 +519,60 @@ final class RestoreAwareObjectReadTest extends TestCase
             etag: '"' . $write->md5Hex . '"',
             contentType: 'text/html',
             storagePath: $write->path,
-            userMetadata: ['__sse-algorithm' => 'AES256'],
+            userMetadata: ['__sse-algorithm' => 'SSE-C'],
         );
-        $encrypted = $middleware->handleRequest(
+        $customerEncrypted = $middleware->handleRequest(
             $this->websiteRequest('GET', '/missing', 'bucket.s3-website.test'),
             new RestoreWebsiteTerminalHandler(),
         );
+        self::assertSame(403, $customerEncrypted->getStatus());
+        self::assertStringContainsString('AccessDenied', \Amp\ByteStream\buffer($customerEncrypted->getBody()));
+    }
 
-        self::assertSame(403, $encrypted->getStatus());
-        self::assertStringContainsString('AccessDenied', \Amp\ByteStream\buffer($encrypted->getBody()));
+    public function test_website_applies_bucket_cors_to_get_and_preflight(): void
+    {
+        $write = $this->hot->putObject('bucket', 'index.html', new ReadableBuffer('published'));
+        $this->putMetadata('index.html', $write->path, $write->size, $write->md5Hex);
+        $this->metadata->putBucketWebsite('bucket', 'index.html');
+        $this->allowPublicReadByPolicy();
+        $this->metadata->putBucketCors('bucket', [[
+            'allowedOrigins' => ['https://client.example'],
+            'allowedMethods' => ['GET'],
+            'allowedHeaders' => [],
+            'exposeHeaders' => ['ETag'],
+            'maxAgeSeconds' => 60,
+        ]]);
+        $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
+
+        $get = $this->websiteRequest('GET', '/', 'bucket.s3-website.test');
+        $get->setHeader('Origin', 'https://client.example');
+        $getResponse = $middleware->handleRequest($get, new RestoreWebsiteTerminalHandler());
+        self::assertSame(200, $getResponse->getStatus());
+        self::assertSame('https://client.example', $getResponse->getHeader('Access-Control-Allow-Origin'));
+
+        $options = $this->websiteRequest('OPTIONS', '/', 'bucket.s3-website.test');
+        $options->setHeader('Origin', 'https://client.example');
+        $options->setHeader('Access-Control-Request-Method', 'GET');
+        $optionsResponse = $middleware->handleRequest($options, new RestoreWebsiteTerminalHandler());
+        self::assertSame(200, $optionsResponse->getStatus());
+        self::assertSame('https://client.example', $optionsResponse->getHeader('Access-Control-Allow-Origin'));
+    }
+
+    public function test_bucket_owner_enforced_website_ignores_legacy_public_object_acl(): void
+    {
+        $write = $this->hot->putObject('bucket', 'index.html', new ReadableBuffer('published'));
+        $this->putMetadata('index.html', $write->path, $write->size, $write->md5Hex);
+        $this->metadata->putBucketWebsite('bucket', 'index.html');
+        $this->grantPublicRead('index.html');
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerEnforced');
+
+        $response = (new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test'))
+            ->handleRequest(
+                $this->websiteRequest('GET', '/', 'bucket.s3-website.test'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+
+        self::assertSame(403, $response->getStatus());
     }
 
     public function test_website_error_document_is_served_for_access_denied_object(): void

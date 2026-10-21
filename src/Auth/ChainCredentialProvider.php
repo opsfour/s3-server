@@ -9,6 +9,7 @@ use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
+use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
 
 /**
  * Composite credential provider that tries multiple providers in order.
@@ -16,7 +17,7 @@ use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
  * The first provider is considered the "primary" and receives writes.
  * Reads try each provider until a match is found.
  */
-final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialHealthProbe, CredentialProvider, AtomicCredentialStatusUpdater
+final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialHealthProbe, CredentialProvider, AtomicCredentialStatusUpdater, CredentialWorkerPoolOwner
 {
     /** @var list<CredentialProvider> */
     private readonly array $providers;
@@ -42,6 +43,15 @@ final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCr
         return $provider instanceof AtomicCredentialCreator
             && $provider instanceof AtomicCredentialDeleter
             && (!$provider instanceof self || $provider->supportsAtomicCredentialLifecycle());
+    }
+
+    public function transferCredentialWorkerPools(\Closure $receiver): void
+    {
+        foreach ($this->providers as $provider) {
+            if ($provider instanceof CredentialWorkerPoolOwner) {
+                $provider->transferCredentialWorkerPools($receiver);
+            }
+        }
     }
 
     public function getCredential(string $accessKeyId): ?Credential

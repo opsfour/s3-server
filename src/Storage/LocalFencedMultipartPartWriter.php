@@ -113,7 +113,7 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         try {
             $cancellation?->throwIfRequested();
             $this->assertActive();
-            $permit = $this->admission->acquire();
+            $permit = $this->admission->acquire($cancellation);
             $worker = $this->checkoutWorker($cancellation);
             $physicalLimit = MultipartPartSize::MAX_BYTES
                 + ($partFormat === EncryptedMultipartPartCodec::FORMAT ? EncryptedMultipartPartCodec::MAX_OVERHEAD : 0);

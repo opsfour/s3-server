@@ -128,7 +128,7 @@ final readonly class S3ServerConfig
      * @param  bool  $enforceMinPartSize  Enforce 5 MiB minimum part size on CompleteMultipartUpload (default true, matches AWS S3).
      * @param  int  $maxEncryptedObjectSize  Maximum size in bytes for objects encrypted with SSE (default 256 MiB).
      * @param  int  $maxSelectObjectSize  Maximum size in bytes for buffered S3 Select queries (default 64 MiB).
-     * @param  int  $shutdownDrainTimeout  Seconds before warning about in-flight shutdown work (default 30).
+     * @param  int  $shutdownDrainTimeout  Maximum seconds to drain in-flight shutdown work (default 30).
      * @param  bool  $notificationRequireHttps  Reject non-HTTPS webhook destinations.
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
      * @param  int  $encryptionWorkerPoolSize  Number of amphp/parallel workers for encryption (0 = disable).

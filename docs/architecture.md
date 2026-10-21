@@ -103,7 +103,10 @@ Request-path I/O uses PHP Fibers:
   down explicitly.
 - **PostgreSQL** — `amphp/postgres` (non-blocking protocol, connection pool)
 - **MySQL** — `amphp/mysql` (non-blocking protocol, connection pool)
-- **SQLite** — PDO (blocking, optionally offloaded to `amphp/parallel` worker pool)
+- **SQLite** — PDO, offloaded to an `amphp/parallel` worker pool by default for
+  file-backed serving; `0` workers and `:memory:` use the blocking mode
+- **Database credentials** — PDO, isolated in a bounded worker pool with a
+  per-operation deadline for serving; management commands remain synchronous
 - **Flysystem** — synchronous adapters; experimental worker mode offloads every
   adapter call to a bounded `amphp/parallel` process pool
 - **DNS** — `amphp/dns` (async resolution for webhook SSRF checks)
@@ -123,15 +126,18 @@ Storage Path Structure (filesystem backend):
 ├── .parts/<upload-id>/       # Multipart upload parts
 ├── .assemblies/              # Planned multipart completion paths
 └── .tmp/                     # Temporary files for durable publication
+    └── object-writes/        # Private same-filesystem staging for object writes
 ```
 
 The backend writes and synchronizes a temporary file, creates a unique final
 path with a create-only hard link, synchronizes the target directory, and then
 durably removes the temporary name before the handler commits the metadata
 reference. Readers follow committed metadata, so they do not see a partial
-file. Failed commits require cleanup of the unreferenced path. Qualification
-for sudden power loss still requires the exact filesystem and mount to pass
-the crash-recovery gate; see
+file. Normal local object writes reserve a durable metadata intent before the
+physical path can be published. If a process exits between publication and the
+metadata commit, the intent collector removes or seals the exact path on the
+next run. Qualification for sudden power loss still requires the exact
+filesystem and mount to pass the crash-recovery gate; see
 [Storage Backends](storage-backends.md#requirements).
 
 ## Encryption Architecture

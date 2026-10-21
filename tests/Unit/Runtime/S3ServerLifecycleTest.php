@@ -699,6 +699,63 @@ final class S3ServerLifecycleTest extends TestCase
         }
     }
 
+    public function test_http_drain_timeout_returns_without_releasing_dependencies_and_retry_finishes_cleanup(): void
+    {
+        $port = $this->unusedPort();
+        $requestStarted = new DeferredFuture();
+        $releaseRequest = new DeferredFuture();
+        $handler = new class ($requestStarted, $releaseRequest) implements RequestHandler {
+            /**
+             * @param  DeferredFuture<void>  $started
+             * @param  DeferredFuture<void>  $release
+             */
+            public function __construct(private readonly DeferredFuture $started, private readonly DeferredFuture $release) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                $this->started->complete();
+                $this->release->getFuture()->await();
+
+                return new Response(200, body: 'finished');
+            }
+        };
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+            shutdownDrainTimeout: 1,
+        ));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->setAdminCredentialApiHandler($handler);
+        $server->start();
+
+        $client = HttpClientBuilder::buildDefault();
+        $requestFuture = \Amp\async(static fn() => $client->request(new ClientRequest("http://127.0.0.1:{$port}/.admin/credentials", 'POST')));
+        $requestStarted->getFuture()->await(new \Amp\TimeoutCancellation(2));
+        $startedAt = microtime(true);
+
+        try {
+            $server->stop();
+            self::fail('A request beyond the shutdown drain deadline must fail the stop attempt.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('S3 server shutdown incomplete; dependencies remain owned.', $error->getMessage());
+            self::assertLessThan(1.8, microtime(true) - $startedAt);
+            self::assertNotNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+            self::assertFalse($this->canConnect($port));
+        } finally {
+            $releaseRequest->complete();
+        }
+
+        $response = $requestFuture->await(new \Amp\TimeoutCancellation(2));
+        self::assertSame('finished', \Amp\ByteStream\buffer($response->getBody()));
+        $server->stop();
+        self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+    }
+
     private function unusedPort(): int
     {
         $reservation = stream_socket_server('tcp://127.0.0.1:0');

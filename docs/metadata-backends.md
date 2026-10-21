@@ -33,13 +33,17 @@ SQLite is configured with these PRAGMAs for production performance:
 
 ### SQLite Worker Pool
 
-SQLite's single-writer limitation can block the Amp event loop. For high-throughput scenarios, enable the worker pool:
+File-backed SQLite uses four `amphp/parallel` workers by default so lock waits
+do not block the Amp event loop:
 
 ```bash
 S3_SQLITE_WORKERS=4
 ```
 
-This wraps SQLite operations in `amphp/parallel` workers, preventing lock contention from blocking HTTP request handling. Each worker maintains its own PDO connection and prepared statement cache.
+Each worker maintains its own PDO connection and prepared statement cache. Set
+`S3_SQLITE_WORKERS=0` to opt into the blocking mode. The `:memory:` SQLite path
+always uses the synchronous store because separate worker processes cannot
+share an in-memory database.
 
 ### When to Use SQLite
 

@@ -39,6 +39,7 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         private readonly ReadableStream $inner,
         int $limit,
         private readonly bool $requireExactLength = false,
+        private readonly bool $rejectExcess = false,
     ) {
         if ($limit < 0) {
             throw new \InvalidArgumentException('Limit must be non-negative, got ' . $limit);
@@ -53,6 +54,15 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
             return null;
         }
         if ($this->remaining <= 0) {
+            if ($this->rejectExcess) {
+                $chunk = $this->readInner($cancellation, 1);
+                $this->close();
+                if ($chunk !== null) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object size does not match metadata.');
+                }
+
+                return null;
+            }
             $this->close();
 
             return null;
@@ -61,13 +71,7 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         // Built-in file and Flysystem streams accept a per-read limit. Ask for
         // only the remaining bytes, although a PHP stream adapter may still
         // prefetch a larger chunk internally before returning them.
-        if ($this->inner instanceof FileReadableStream) {
-            $chunk = $this->inner->read($cancellation, min($this->remaining, 1_048_576));
-        } elseif ($this->inner instanceof ReadableResourceStream) {
-            $chunk = $this->inner->read($cancellation, min($this->remaining, ReadableResourceStream::DEFAULT_CHUNK_SIZE));
-        } else {
-            $chunk = $this->inner->read($cancellation);
-        }
+        $chunk = $this->readInner($cancellation, $this->remaining);
 
         if ($chunk === null) {
             $this->close();
@@ -87,6 +91,10 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         if ($chunkLen > $this->remaining) {
+            if ($this->rejectExcess) {
+                $this->close();
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object size does not match metadata.');
+            }
             $chunk = substr($chunk, 0, $this->remaining);
             $this->remaining = 0;
             $this->close();
@@ -95,7 +103,7 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $this->remaining -= $chunkLen;
-        if ($this->remaining === 0) {
+        if ($this->remaining === 0 && ! $this->rejectExcess) {
             $this->close();
         }
 
@@ -104,11 +112,26 @@ final class LimitedReadableStream implements \IteratorAggregate, ReadableStream
 
     public function isReadable(): bool
     {
-        if ($this->closed || $this->remaining <= 0) {
+        if ($this->closed || ($this->remaining <= 0 && ! $this->rejectExcess)) {
             return false;
         }
 
         return $this->inner->isReadable();
+    }
+
+    private function readInner(?Cancellation $cancellation, int $limit): ?string
+    {
+        if ($this->inner instanceof FileReadableStream) {
+            return $this->inner->read($cancellation, min($limit, 1_048_576));
+        }
+        if ($this->inner instanceof ReadableResourceStream) {
+            return $this->inner->read(
+                $cancellation,
+                max(1, min($limit, ReadableResourceStream::DEFAULT_CHUNK_SIZE)),
+            );
+        }
+
+        return $this->inner->read($cancellation);
     }
 
     public function close(): void

@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
-use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
@@ -12,8 +11,8 @@ use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\UploadPartCopyHandler;
 use OpsFour\S3Server\Handler\Multipart\UploadPartHandler;
-use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -21,7 +20,6 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntime;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
-use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -29,10 +27,10 @@ use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
+use OpsFour\S3Server\Storage\LocalScratchStager;
 use OpsFour\S3Server\Storage\LocalObjectTestPublishPauseIo;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
-use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -97,7 +95,7 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             putenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK=true');
             $runtime = $this->createRuntime($this->runtimeConfig(), MysqlMetadataStore::fromDsn(self::MYSQL_DSN));
             try {
-                $writer = (new \ReflectionProperty($runtime->server, 'localObjectTestWriter'))->getValue($runtime->server);
+                $writer = (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server);
                 self::assertInstanceOf(LocalFencedObjectWriter::class, $writer);
                 self::assertNull((new \ReflectionProperty(LocalFencedObjectWriter::class, 'workerIo'))->getValue($writer));
             } finally {
@@ -110,14 +108,19 @@ final class LocalObjectWriteRuntimeTest extends TestCase
                 MysqlMetadataStore::fromDsn(self::MYSQL_DSN),
             );
             try {
-                self::assertNull((new \ReflectionProperty($normal->server, 'localObjectTestWriter'))->getValue($normal->server));
+                self::assertInstanceOf(
+                    LocalFencedObjectWriter::class,
+                    (new \ReflectionProperty($normal->server, 'localObjectWriter'))->getValue($normal->server),
+                );
+                $normalWriter = (new \ReflectionProperty($normal->server, 'localObjectWriter'))->getValue($normal->server);
+                self::assertNull((new \ReflectionProperty(LocalFencedObjectWriter::class, 'workerIo'))->getValue($normalWriter));
             } finally {
                 $normal->stop();
             }
 
             $runtime = $this->createRuntime($this->runtimeConfig(), MysqlMetadataStore::fromDsn(self::MYSQL_DSN));
             try {
-                $writer = (new \ReflectionProperty($runtime->server, 'localObjectTestWriter'))->getValue($runtime->server);
+                $writer = (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server);
                 self::assertInstanceOf(LocalFencedObjectWriter::class, $writer);
                 self::assertInstanceOf(
                     LocalObjectTestPublishPauseIo::class,
@@ -155,9 +158,9 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             ] as [$operation, $class, $flag]) {
                 $handler = $runtime->server->getHandlerRegistry()->get($operation);
                 self::assertInstanceOf($class, $handler);
-                self::assertTrue((new \ReflectionProperty($class, $flag))->getValue($handler));
+                self::assertFalse((new \ReflectionProperty($class, $flag))->getValue($handler));
             }
-            $backgroundWriter = (new \ReflectionProperty($runtime->server, 'localBackgroundTestWriter'))->getValue($runtime->server);
+            $backgroundWriter = (new \ReflectionProperty($runtime->server, 'localBackgroundWriter'))->getValue($runtime->server);
             self::assertInstanceOf(LocalFencedBackgroundObjectWriter::class, $backgroundWriter);
             self::assertSame($writer, (new \ReflectionProperty(LocalFencedBackgroundObjectWriter::class, 'writer'))->getValue($backgroundWriter));
             self::assertSame($factory, (new \ReflectionProperty(LocalFencedBackgroundObjectWriter::class, 'leases'))->getValue($backgroundWriter));
@@ -182,30 +185,57 @@ final class LocalObjectWriteRuntimeTest extends TestCase
         $runtime->stop();
     }
 
-    public function test_sqlite_and_wrapped_metadata_are_rejected_before_resource_creation(): void
+    public function test_normal_sqlite_runtime_wires_local_object_fence_without_test_profile(): void
     {
-        $sqlite = new SqliteMetadataStore(':memory:');
+        $database = $this->base . '/metadata.sqlite';
+        $sqlite = new SqliteMetadataStore($database);
         $sqlite->initialize();
-        try {
-            $this->createRuntime(
-                $this->runtimeConfig()->with(['metadataDriver' => 'sqlite', 'metadataDsn' => '']),
-                $sqlite,
-            );
-            self::fail('SQLite must not enter the local write test profile.');
-        } catch (\RuntimeException $error) {
-            self::assertStringContainsString('raw PostgreSQL/MySQL', $error->getMessage());
-        }
+        $runtime = $this->createRuntime(new S3ServerConfig(
+            storagePath: $this->objects,
+            metadataDriver: 'sqlite',
+            metadataDsn: $database,
+        ), $sqlite);
 
-        $wrapped = new \OpsFour\S3Server\Observability\ObservedMetadataStore(
-            MysqlMetadataStore::fromDsn(self::MYSQL_DSN),
-            new MetricsCollector(),
-            'mysql',
-        );
         try {
-            $this->createRuntime($this->runtimeConfig(), $wrapped);
-            self::fail('A wrapped metadata store must not enter the raw SQL lease profile.');
-        } catch (\RuntimeException $error) {
-            self::assertStringContainsString('raw PostgreSQL/MySQL', $error->getMessage());
+            $writer = (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server);
+            self::assertInstanceOf(LocalFencedObjectWriter::class, $writer);
+            self::assertNull((new \ReflectionProperty(LocalFencedObjectWriter::class, 'workerIo'))->getValue($writer));
+            $stager = (new \ReflectionProperty(LocalFencedObjectWriter::class, 'stager'))->getValue($writer);
+            self::assertInstanceOf(LocalScratchStager::class, $stager);
+            self::assertSame(
+                realpath($this->objects . '/.tmp/object-writes'),
+                (new \ReflectionProperty($stager, 'scratch'))->getValue($stager),
+            );
+            self::assertNull((new \ReflectionProperty(S3ServerRuntime::class, 'localObjectRenewer'))->getValue($runtime));
+
+            $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
+            self::assertInstanceOf(PutObjectHandler::class, $put);
+            self::assertSame(
+                $writer,
+                (new \ReflectionProperty(PutObjectHandler::class, 'localFencedWriter'))->getValue($put),
+            );
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_known_metadata_decorator_is_unwrapped_for_sql_lease_resources(): void
+    {
+        $wrapped = new CachedMetadataStoreDecorator(
+            new \OpsFour\S3Server\Observability\ObservedMetadataStore(
+                MysqlMetadataStore::fromDsn(self::MYSQL_DSN),
+                new MetricsCollector(),
+                'mysql',
+            ),
+        );
+        $runtime = $this->createRuntime($this->runtimeConfig(), $wrapped);
+        try {
+            self::assertInstanceOf(
+                LocalFencedObjectWriter::class,
+                (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server),
+            );
+        } finally {
+            $runtime->stop();
         }
     }
 
@@ -236,7 +266,7 @@ final class LocalObjectWriteRuntimeTest extends TestCase
         $runtime = $this->createRuntime($this->runtimeConfig(), MysqlMetadataStore::fromDsn(self::MYSQL_DSN));
         try {
             $metadata = (new \ReflectionProperty($runtime->server, 'metadata'))->getValue($runtime->server);
-            $writer = (new \ReflectionProperty($runtime->server, 'localObjectTestWriter'))->getValue($runtime->server);
+            $writer = (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server);
             $collector = (new \ReflectionProperty($runtime->server, 'localObjectIntentCollector'))->getValue($runtime->server);
             self::assertInstanceOf(MetadataStore::class, $metadata);
             self::assertInstanceOf(ObjectWriteIntentStore::class, $metadata);
@@ -275,46 +305,6 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             }
         } finally {
             $runtime->stop();
-        }
-    }
-
-    /** @return iterable<string, array{bool}> */
-    public static function unqualifiedDirectMetadata(): iterable
-    {
-        yield 'sqlite' => [false];
-        yield 'cached sqlite' => [true];
-    }
-
-    #[DataProvider('unqualifiedDirectMetadata')]
-    public function test_direct_server_refuses_local_fence_with_sqlite_before_http_bind(bool $wrapped): void
-    {
-        $raw = new SqliteMetadataStore(':memory:');
-        $raw->initialize();
-        $metadata = $wrapped ? new CachedMetadataStoreDecorator($raw) : $raw;
-        $storage = new FilesystemBackend($this->objects);
-        $writer = new LocalFencedObjectWriter($this->objects, $this->scratch, 'STANDARD');
-        $collector = new LocalObjectWriteIntentCollector($metadata, StorageTierRegistry::single($storage), 'STANDARD');
-        $server = new S3Server(new S3ServerConfig(
-            storagePath: $this->objects,
-            allowUnfencedStorageForTests: true,
-            localObjectWriteTestScratchPath: $this->scratch,
-        ), $metadata, $storage);
-        $server->setLocalObjectWriteIntentCollector($collector);
-        $server->setLocalObjectWriteTestWriter($writer, $this->createMock(LocalObjectWriteLeaseGuardFactory::class));
-        $server->addMiddleware(new AuthMiddleware(
-            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
-            'us-east-1',
-        ));
-
-        try {
-            $server->start();
-            self::fail('A direct SQLite server admitted the local write fence.');
-        } catch (\RuntimeException $error) {
-            self::assertStringContainsString('raw PostgreSQL/MySQL metadata', $error->getMessage());
-            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
-        } finally {
-            $server->stop();
-            $writer->shutdown();
         }
     }
 

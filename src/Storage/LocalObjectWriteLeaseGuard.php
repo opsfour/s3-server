@@ -19,7 +19,7 @@ use function Amp\delay;
  * Lease state machine for fenced local object writes. Call
  * reserve before worker checkout or staging, arm after staging and directly
  * before submit, then stopForCommit after a definite worker success. Runtime
- * callers must supply the concrete Amp SQL adapters to reserve().
+ * callers must supply non-blocking metadata adapters to reserve().
  * The cooperative operation seam is private and used by isolated fault tests.
  */
 final class LocalObjectWriteLeaseGuard
@@ -61,8 +61,8 @@ final class LocalObjectWriteLeaseGuard
 
     public static function reserve(
         ObjectWriteIntent $planned,
-        AmpLocalObjectWriteLeaseSql $sql,
-        DedicatedAmpObjectWriteLeaseRenewer $renewer,
+        LocalObjectWriteLeaseSql $sql,
+        LocalObjectWriteLeaseRenewer $renewer,
         LocalObjectWriteLeaseAdmission $admission,
         float $leaseSeconds = 300.0,
         float $operationTimeoutSeconds = 15.0,

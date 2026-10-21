@@ -9,6 +9,7 @@ use OpsFour\S3Server\Admin\AdminQuotaApiHandler;
 use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
@@ -19,6 +20,7 @@ use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -35,6 +37,8 @@ use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseAdmission;
 use OpsFour\S3Server\Storage\LocalObjectTestPublishPauseIo;
+use OpsFour\S3Server\Storage\MetadataLocalObjectWriteLeaseAdapter;
+use OpsFour\S3Server\Storage\MetadataLocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\AmpLocalObjectWriteLeaseSql;
 use OpsFour\S3Server\Storage\AmpLocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\DedicatedAmpObjectWriteLeaseRenewer;
@@ -84,6 +88,20 @@ final readonly class S3ServerRuntimeFactory
         try {
             PostgresApiDriverGuard::assertAvailable($config);
 
+            if ($credentialProvider instanceof CredentialWorkerPoolOwner) {
+                $poolNumber = 0;
+                $credentialProvider->transferCredentialWorkerPools(
+                    function (\Amp\Parallel\Worker\WorkerPool $pool, int $workers) use ($server, &$poolNumber): void {
+                        ++$poolNumber;
+                        $server->addWorkerPool(
+                            $pool,
+                            $poolNumber === 1 ? 'database_credentials' : "database_credentials_{$poolNumber}",
+                            $workers,
+                        );
+                    },
+                );
+            }
+
             $server->addMiddleware(new AuthMiddleware(
                 credentialProvider: $credentialProvider,
                 region: $config->region,
@@ -129,20 +147,35 @@ final readonly class S3ServerRuntimeFactory
             $localFencedWriter = null;
             $localLeaseFactory = null;
             if ($config->localObjectWriteTestScratchPath !== null) {
-                [$localFencedWriter, $localLeaseFactory, $renewer] = $this->localObjectWriteTestWiring(
+                [$localFencedWriter, $localLeaseFactory, $renewer] = $this->localObjectWriteWiring(
                     $config,
                     $rawMetadata,
+                    $metadata,
                     $storageTiers,
+                    $this->testScratchPath($config),
+                    true,
                 );
-                $runtime->attachLocalObjectWriteTestResources($localFencedWriter, $renewer);
+                $logger->warning('Isolated local write fence fault profile active; its pause hook must never be enabled in production.');
+            } elseif ($this->localFilesystemBackend($storageTiers) !== null) {
+                [$localFencedWriter, $localLeaseFactory, $renewer] = $this->localObjectWriteWiring(
+                    $config,
+                    $rawMetadata,
+                    $metadata,
+                    $storageTiers,
+                    $this->productionScratchPath($storageTiers),
+                    false,
+                );
+            }
+
+            if ($localFencedWriter !== null && $localLeaseFactory !== null) {
+                $runtime->attachLocalObjectWriteResources($localFencedWriter, $renewer);
                 $server->setLocalObjectWriteIntentCollector(new LocalObjectWriteIntentCollector(
                     $metadata,
                     $storageTiers,
                     $storageTiers->defaultTier()->name,
                     $logger,
                 ));
-                $server->setLocalObjectWriteTestWriter($localFencedWriter, $localLeaseFactory);
-                $logger->warning('Isolated local write fence test profile active; shared-filesystem fault qualification remains open.');
+                $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory);
             }
 
             foreach ($notificationListeners as $listenerConfig) {
@@ -229,76 +262,125 @@ final readonly class S3ServerRuntimeFactory
     }
 
     /**
-     * @return array{LocalFencedObjectWriter, LocalObjectWriteLeaseGuardFactory, DedicatedAmpObjectWriteLeaseRenewer}
+     * @return array{LocalFencedObjectWriter, LocalObjectWriteLeaseGuardFactory, DedicatedAmpObjectWriteLeaseRenewer|null}
      */
-    private function localObjectWriteTestWiring(
+    private function localObjectWriteWiring(
         S3ServerConfig $config,
         MetadataStore $rawMetadata,
+        MetadataStore $metadata,
         StorageTierRegistry $tiers,
+        string $scratch,
+        bool $faultProfile,
     ): array {
-        $scratchPath = $config->localObjectWriteTestScratchPath;
-        if ($scratchPath === null || ! $config->allowUnfencedStorageForTests) {
-            throw new \LogicException('Local object write test profile was not explicitly enabled.');
-        }
-        if (($config->metadataDriver === 'postgres' && ! $rawMetadata instanceof PostgresMetadataStore)
-            || ($config->metadataDriver === 'mysql' && ! $rawMetadata instanceof MysqlMetadataStore)
-            || ! in_array($config->metadataDriver, ['postgres', 'mysql'], true)
-            || trim($config->metadataDsn) === '') {
-            throw new \RuntimeException('Local object write test profile requires a raw PostgreSQL/MySQL metadata store and matching non-empty driver DSN.');
-        }
-        MetadataDriverStartupGuard::assertRawFencedSqlStore(
-            $rawMetadata,
-            $config->metadataDriver,
-            $config->metadataDsn,
-        );
-
-        $backend = $tiers->defaultBackend();
-        while ($backend instanceof ObservedStorageBackend) {
-            $backend = $backend->innerBackend();
-        }
-        if (! $backend instanceof FilesystemBackend || realpath($backend->getBasePath()) === false) {
-            throw new \RuntimeException('Local object write test profile requires an existing filesystem default tier.');
+        $backend = $this->localFilesystemBackend($tiers)
+            ?? throw new \RuntimeException('Local object write fencing requires an existing filesystem default tier.');
+        if (! $metadata instanceof ObjectWriteIntentStore) {
+            throw new \RuntimeException('Local object write fencing requires durable object-write metadata intents.');
         }
 
-        // This scoped test profile accepts only a private directory beneath
-        // the process temp root on its same device. It does not certify a
-        // network filesystem or prove that the temp root is node-local.
-        $scratch = realpath($scratchPath);
-        $tempRoot = realpath(sys_get_temp_dir());
-        $scratchStat = $scratch !== false ? @stat($scratch) : false;
-        $tempStat = $tempRoot !== false ? @stat($tempRoot) : false;
-        if ($scratch === false || $tempRoot === false || $scratchStat === false || $tempStat === false
-            || ! str_starts_with($scratch, rtrim($tempRoot, '/') . '/')
-            || $scratchStat['dev'] !== $tempStat['dev']) {
-            throw new \RuntimeException('Local object write test scratch must be an existing directory on the process temporary volume.');
-        }
-
-        $renewer = $config->metadataDriver === 'postgres'
-            ? DedicatedAmpObjectWriteLeaseRenewer::forPostgres($config->metadataDsn)
-            : DedicatedAmpObjectWriteLeaseRenewer::forMysql($config->metadataDsn);
+        $renewer = null;
+        $writer = null;
         try {
             $writer = new LocalFencedObjectWriter(
                 $backend->getBasePath(),
                 $scratch,
                 $tiers->defaultTier()->name,
-                workerIo: getenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK') === '1'
+                workerIo: $faultProfile && getenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK') === '1'
                     ? new LocalObjectTestPublishPauseIo($scratch)
                     : null,
             );
 
+            if (in_array($config->metadataDriver, ['postgres', 'mysql'], true)) {
+                $rawSqlStore = MetadataDriverStartupGuard::fencedSqlStore(
+                    $rawMetadata,
+                    $config->metadataDriver,
+                    $config->metadataDsn,
+                );
+                $renewer = $config->metadataDriver === 'postgres'
+                    ? DedicatedAmpObjectWriteLeaseRenewer::forPostgres($config->metadataDsn)
+                    : DedicatedAmpObjectWriteLeaseRenewer::forMysql($config->metadataDsn);
+
+                return [
+                    $writer,
+                    new AmpLocalObjectWriteLeaseGuardFactory(
+                        new AmpLocalObjectWriteLeaseSql($rawSqlStore),
+                        $renewer,
+                        new LocalObjectWriteLeaseAdmission(2, waitForCapacity: true),
+                    ),
+                    $renewer,
+                ];
+            }
+
+            if ($config->metadataDriver !== 'sqlite') {
+                throw new \RuntimeException('Unsupported metadata driver for local object write fencing.');
+            }
+            $adapter = new MetadataLocalObjectWriteLeaseAdapter($metadata);
+
             return [
                 $writer,
-                new AmpLocalObjectWriteLeaseGuardFactory(
-                    new AmpLocalObjectWriteLeaseSql($rawMetadata),
-                    $renewer,
-                    new LocalObjectWriteLeaseAdmission(),
+                new MetadataLocalObjectWriteLeaseGuardFactory(
+                    $adapter,
+                    // SQLite's deferred write transactions can repeatedly
+                    // lose snapshot promotion when two intent admissions run
+                    // together. Serialize this short lease transaction while
+                    // retaining the bounded request queue in the admission.
+                    new LocalObjectWriteLeaseAdmission(1, waitForCapacity: true),
                 ),
-                $renewer,
+                null,
             ];
         } catch (\Throwable $error) {
-            $renewer->close();
+            $writer?->shutdown();
+            $renewer?->close();
             throw $error;
         }
+    }
+
+    private function localFilesystemBackend(StorageTierRegistry $tiers): ?FilesystemBackend
+    {
+        $backend = $tiers->defaultBackend();
+        while ($backend instanceof ObservedStorageBackend) {
+            $backend = $backend->innerBackend();
+        }
+
+        return $backend instanceof FilesystemBackend && realpath($backend->getBasePath()) !== false
+            ? $backend
+            : null;
+    }
+
+    private function productionScratchPath(StorageTierRegistry $tiers): string
+    {
+        $backend = $this->localFilesystemBackend($tiers)
+            ?? throw new \LogicException('Local filesystem scratch requested for another backend.');
+        $root = realpath($backend->getBasePath());
+        if ($root === false) {
+            throw new \RuntimeException('Local filesystem root does not exist.');
+        }
+        $temp = $root . '/.tmp';
+        $scratch = $temp . '/object-writes';
+        if ((is_link($temp) || is_link($scratch))
+            || (! is_dir($scratch) && ! @mkdir($scratch, 0700, true) && ! is_dir($scratch))) {
+            throw new \RuntimeException('Cannot create the private local object write scratch directory.');
+        }
+        if (realpath($scratch) !== $scratch) {
+            throw new \RuntimeException('Local object write scratch must not traverse symbolic links.');
+        }
+
+        return $scratch;
+    }
+
+    private function testScratchPath(S3ServerConfig $config): string
+    {
+        $scratchPath = $config->localObjectWriteTestScratchPath;
+        if ($scratchPath === null || ! $config->allowUnfencedStorageForTests) {
+            throw new \LogicException('Local object write fault profile was not explicitly enabled.');
+        }
+        $scratch = realpath($scratchPath);
+        $tempRoot = realpath(sys_get_temp_dir());
+        if ($scratch === false || $tempRoot === false || ! str_starts_with($scratch, rtrim($tempRoot, '/') . '/')) {
+            throw new \RuntimeException('Local object write fault scratch must be an existing directory below the process temporary directory.');
+        }
+
+        return $scratch;
     }
 
     private function encryptionFromEnvironment(

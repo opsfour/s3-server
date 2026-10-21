@@ -68,7 +68,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 shutdownDrainTimeout: $config['shutdown_drain_timeout'] ?? 30,
                 notificationRequireHttps: $config['notifications']['require_https'] ?? true,
                 notificationWorkerEnabled: $config['notifications']['worker_enabled'] ?? true,
-                sqliteWorkerPoolSize: $config['parallel']['sqlite_workers'] ?? 0,
+                sqliteWorkerPoolSize: self::sqliteWorkerPoolSize($config),
                 encryptionWorkerPoolSize: $config['parallel']['encryption_workers'] ?? 0,
                 selectWorkerPoolSize: $config['parallel']['select_workers'] ?? null,
                 requestBodySpoolWorkerPoolSize: $config['parallel']['request_body_spool_workers'] ?? 8,
@@ -117,8 +117,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 $metadataConfig['path'] = SqliteMetadataPathResolver::resolve($storagePath);
             }
 
-            $parallelConfig = $config['parallel'] ?? [];
-            $metadataConfig['worker_pool_size'] = $parallelConfig['sqlite_workers'] ?? 0;
+            $metadataConfig['worker_pool_size'] = self::sqliteWorkerPoolSize($config);
 
             $store = MetadataStoreFactory::create(
                 $metadataConfig['driver'] ?? 'sqlite',
@@ -165,6 +164,17 @@ class S3ServerServiceProvider extends ServiceProvider
                 S3QuotaCommand::class,
             ]);
         }
+    }
+
+    /** @param array<string, mixed> $config */
+    private static function sqliteWorkerPoolSize(array $config): int
+    {
+        if (($config['metadata']['driver'] ?? 'sqlite') === 'sqlite'
+            && ($config['metadata']['path'] ?? null) === ':memory:') {
+            return 0;
+        }
+
+        return $config['parallel']['sqlite_workers'] ?? 4;
     }
 
     /**

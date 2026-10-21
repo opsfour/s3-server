@@ -58,7 +58,7 @@ return [
     // Maximum object size for buffered S3 Select queries (bytes, default 64 MiB).
     'max_select_object_size' => EnvironmentNumber::integer('S3_MAX_SELECT_OBJECT_SIZE', 67_108_864),
 
-    // Seconds before warning that graceful shutdown is still draining.
+    // Maximum seconds to drain active work before shutdown fails safely.
     'shutdown_drain_timeout' => EnvironmentNumber::integer('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
 
     // Connection idle timeout in seconds (0 = no timeout).
@@ -96,7 +96,10 @@ return [
     */
     'parallel' => [
         // Number of worker processes for SQLite metadata operations.
-        'sqlite_workers' => EnvironmentNumber::integer('S3_SQLITE_WORKERS', 0),
+        'sqlite_workers' => EnvironmentNumber::integer('S3_SQLITE_WORKERS', 4),
+
+        // Number of workers isolating PDO credential operations from HTTP.
+        'credential_workers' => EnvironmentNumber::integer('S3_CREDENTIALS_WORKERS', 4),
 
         // Number of worker processes for encryption/decryption.
         'encryption_workers' => EnvironmentNumber::integer('S3_ENCRYPTION_WORKERS', 0),
@@ -229,6 +232,8 @@ return [
         // Positive credential lookups are refreshed after this many seconds.
         // Set to 0 to disable caching and observe revocations on every request.
         'cache_ttl' => EnvironmentNumber::finiteFloat('S3_CREDENTIALS_CACHE_TTL', 1.0),
+        // Maximum runtime of one credential database operation in a serving process.
+        'operation_timeout_seconds' => EnvironmentNumber::finiteFloat('S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS', 15.0),
         // For 'file' driver:
         'path' => env('S3_CREDENTIALS_PATH'),
     ],
