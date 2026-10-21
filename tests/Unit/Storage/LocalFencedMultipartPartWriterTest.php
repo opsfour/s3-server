@@ -11,6 +11,7 @@ use Amp\Parallel\Worker\Execution;
 use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\WorkerPool;
 use Amp\Sync\Channel;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -24,6 +25,9 @@ use OpsFour\S3Server\Tests\Support\LocalMultipartLinkAckFaultIo;
 use OpsFour\S3Server\Tests\Support\LocalMultipartSyncCorruptIo;
 use OpsFour\S3Server\Tests\Support\LocalObjectWriteFaultIo;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\async;
+use function Amp\delay;
 
 final class LocalFencedMultipartPartWriterTest extends TestCase
 {
@@ -635,6 +639,67 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
             $writer->shutdown();
             self::assertFileDoesNotExist($stages[0]);
         } finally {
+            $this->removeDirectory($directory);
+        }
+    }
+
+    public function test_worker_timeout_returns_uncertain_and_retains_stage_until_late_completion(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-part-timeout-' . bin2hex(random_bytes(8));
+        $root = $directory . '/storage';
+        $scratch = $directory . '/scratch';
+        self::assertTrue(mkdir($root, 0700, true));
+        self::assertTrue(mkdir($scratch, 0700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $bucket = $metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $uploadId = bin2hex(random_bytes(16));
+        $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
+        $entered = $directory . '/link-entered';
+        $release = $directory . '/link-release';
+        $io = new LocalObjectWriteFaultIo();
+        $io->linkEnteredPath = $entered;
+        $io->releaseLinkPath = $release;
+        $writer = new LocalFencedMultipartPartWriter(
+            $root,
+            $scratch,
+            'STANDARD',
+            $metadata,
+            workerIo: $io,
+            workerTimeoutSeconds: 0.05,
+        );
+
+        try {
+            $pending = async(fn(): LocalMultipartPartWriteOutcome => $writer->publish(
+                'bucket',
+                $bucket->generation,
+                $uploadId,
+                1,
+                new ReadableBuffer('late part'),
+            ));
+            $deadline = microtime(true) + 5.0;
+            while (! file_exists($entered) && microtime(true) < $deadline) {
+                delay(0.01);
+            }
+            self::assertFileExists($entered);
+            $outcome = $pending->await();
+            self::assertSame(LocalMultipartPartWriteOutcome::UNCERTAIN, $outcome->state);
+            self::assertInstanceOf(SlowDownException::class, $outcome->error);
+            self::assertNotNull($outcome->dispatchId);
+            self::assertCount(1, glob($scratch . '/s3fw-part-*') ?: []);
+
+            self::assertSame(1, file_put_contents($release, '1'));
+            $deadline = microtime(true) + 5.0;
+            while (glob($scratch . '/s3fw-part-*') !== [] && microtime(true) < $deadline) {
+                delay(0.01);
+            }
+            self::assertSame([], glob($scratch . '/s3fw-part-*'));
+            self::assertFileExists($outcome->path);
+        } finally {
+            file_put_contents($release, '1');
+            $writer->shutdown();
             $this->removeDirectory($directory);
         }
     }

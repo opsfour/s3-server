@@ -244,6 +244,40 @@ final class ExternalWriteIntentCapacityTest extends TestCase
         }
     }
 
+    public function test_mysql_serving_and_readiness_reject_a_later_missing_capacity_trigger(): void
+    {
+        [$dsn, $pool] = self::database('mysql', 'S3_TEST_MYSQL_METADATA_DSN');
+        self::assertInstanceOf(MysqlConnectionPool::class, $pool);
+        $store = MetadataStoreFactory::create('mysql', ['dsn' => $dsn]);
+        self::assertInstanceOf(MysqlMetadataStore::class, $store);
+        $pool->query('DROP TRIGGER s3_write_intent_capacity_part_update');
+
+        try {
+            foreach ([
+                static fn() => MetadataStoreFactory::create('mysql', ['dsn' => $dsn], migrate: false),
+                static fn() => $store->assertMetadataWritable(),
+            ] as $check) {
+                try {
+                    $check();
+                    self::fail('MySQL serving accepted a missing capacity trigger.');
+                } catch (\RuntimeException $error) {
+                    self::assertStringContainsString('recovery triggers are missing', $error->getMessage());
+                }
+            }
+        } finally {
+            $restored = false;
+            foreach (MysqlSchema::getCreateStatements() as $sql) {
+                if (str_starts_with(ltrim($sql), 'CREATE TRIGGER s3_write_intent_capacity_part_update ')) {
+                    $pool->query($sql);
+                    $restored = true;
+                    break;
+                }
+            }
+            $pool->close();
+            self::assertTrue($restored, 'The MySQL capacity trigger fixture must restore its database state.');
+        }
+    }
+
     #[DataProvider('databases')]
     public function test_both_admission_paths_serialize_last_global_slot(string $driver, string $dsnEnv): void
     {

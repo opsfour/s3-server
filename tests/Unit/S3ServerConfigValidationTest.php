@@ -18,6 +18,7 @@ final class S3ServerConfigValidationTest extends TestCase
         self::assertSame(4, $config->sqliteWorkerPoolSize);
         self::assertFalse($config->isVirtualHostedStyle());
         self::assertFalse($config->allowUnfencedStorageForTests);
+        self::assertSame(300.0, $config->localWriteWorkerTimeoutSeconds);
     }
 
     public function test_unsafe_storage_override_survives_config_clone(): void
@@ -83,6 +84,20 @@ final class S3ServerConfigValidationTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
 
         new S3ServerConfig(storagePath: '/tmp/s3', lifecycleIntervalSeconds: $interval);
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidLocalWriteWorkerTimeouts')]
+    public function test_invalid_local_write_worker_timeouts_are_rejected(float $timeout): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        new S3ServerConfig(storagePath: '/tmp/s3', localWriteWorkerTimeoutSeconds: $timeout);
+    }
+
+    /** @return array<string, array{float}> */
+    public static function invalidLocalWriteWorkerTimeouts(): array
+    {
+        return ['zero' => [0.0], 'negative' => [-1.0], 'infinity' => [INF], 'NaN' => [NAN]];
     }
 
     /** @return array<string, array{float}> */

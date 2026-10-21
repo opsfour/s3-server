@@ -41,7 +41,13 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(46, MysqlSchema::VERSION);
+        self::assertSame(47, MysqlSchema::VERSION);
+        $triggerInventoryMigration = implode("\n", MysqlSchema::getMigrationStatements(46));
+        self::assertStringContainsString(
+            'CREATE FUNCTION s3_recovery_capacity_trigger_count() RETURNS INTEGER',
+            $triggerInventoryMigration,
+        );
+        self::assertStringContainsString('FROM information_schema.TRIGGERS', $triggerInventoryMigration);
         self::assertContains(
             'ALTER TABLE s3_tier_transition_jobs MODIFY COLUMN lifecycle_rule_id VARBINARY(1020) NULL',
             MysqlSchema::getMigrationStatements(45),
@@ -66,6 +72,10 @@ final class ExternalSchemaTest extends TestCase
         self::assertStringContainsString(') VIRTUAL', $recursiveCleanupMigration);
         self::assertStringContainsString('idx_s3_storage_gc_recursive_unsafe', $recursiveCleanupMigration);
         $mysqlCreate = implode("\n", MysqlSchema::getCreateStatements());
+        self::assertStringContainsString(
+            'CREATE FUNCTION IF NOT EXISTS s3_recovery_capacity_trigger_count() RETURNS INTEGER',
+            $mysqlCreate,
+        );
         self::assertStringContainsString('rule_id VARBINARY(1020) NULL', $mysqlCreate);
         self::assertStringContainsString('lifecycle_rule_id VARBINARY(1020) NULL', $mysqlCreate);
         self::assertStringContainsString('recursive_cleanup_unsafe TINYINT(1)', $mysqlCreate);

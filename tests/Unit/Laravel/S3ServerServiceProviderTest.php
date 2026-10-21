@@ -309,6 +309,7 @@ final class S3ServerServiceProviderTest extends TestCase
             'body_size_limit' => 456_789,
             'trusted_proxy_cidrs' => '127.0.0.1/32, ::1/128',
             'post_spool_budget' => 987_654,
+            'local_write_worker_timeout_seconds' => 12.5,
             'enforce_min_part_size' => false,
             'allow_unfenced_storage_for_tests' => true,
             'notifications' => ['worker_enabled' => false],
@@ -327,6 +328,7 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame(456_789, $config->requestBodySizeLimit);
         self::assertSame(['127.0.0.1/32', '::1/128'], $config->trustedProxyCidrs);
         self::assertSame(987_654, $config->postSpoolBudgetBytes);
+        self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
         self::assertFalse($config->notificationWorkerEnabled);

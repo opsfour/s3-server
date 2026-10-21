@@ -76,6 +76,12 @@ final class AuthMiddleware implements AuthenticationMiddleware
         return $this->credentialProvider;
     }
 
+    /** @internal Called by S3Server before it exposes the middleware stack. */
+    public function bindServerSpoolCoordinator(PostObjectSpoolCoordinator $coordinator): void
+    {
+        $this->postObjectFormParser->bindServerSpoolCoordinator($coordinator);
+    }
+
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
         // POST Object (HTML form upload) uses its own authentication via form fields.

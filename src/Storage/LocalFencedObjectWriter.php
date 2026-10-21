@@ -7,10 +7,13 @@ namespace OpsFour\S3Server\Storage;
 use Amp\ByteStream\ReadableStream;
 use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\Sync\Lock;
+use Amp\TimeoutCancellation;
 use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Parallel\LocalObjectWriteTask;
 use OpsFour\S3Server\Parallel\LocalObjectWriteTaskResult;
@@ -49,6 +52,7 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         private readonly ?LocalObjectWriteIo $workerIo = null,
         ?WorkerPool $budgetPool = null,
         ?LocalObjectWriteLeaseAdmission $workerAdmission = null,
+        private readonly float $workerTimeoutSeconds = 300.0,
     ) {
         $root = realpath($storageRoot);
         if ($root === false || ! is_dir($root)) {
@@ -80,6 +84,9 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         }
         if ($workerAdmission !== null && $workerAdmission->capacity() > 2) {
             throw new \InvalidArgumentException('Local object worker admission cannot exceed the two-worker pool.');
+        }
+        if (! is_finite($workerTimeoutSeconds) || $workerTimeoutSeconds <= 0.0) {
+            throw new \InvalidArgumentException('Local object worker timeout must be finite and greater than zero.');
         }
 
         $this->root = rtrim($root, '/');
@@ -231,8 +238,14 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         })->ignore();
         unset($writeWorker);
 
+        $deadline = new TimeoutCancellation(
+            $this->workerTimeoutSeconds,
+            'Local object write worker exceeded its configured deadline.',
+        );
         try {
-            $worker = $future->await($cancellation);
+            $worker = $future->await($cancellation === null
+                ? $deadline
+                : new CompositeCancellation($cancellation, $deadline));
             if (! $worker instanceof LocalObjectWriteTaskResult) {
                 throw new \RuntimeException('Local object worker returned an invalid result.');
             }
@@ -255,6 +268,9 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             }
             return LocalObjectWriteOutcome::completed($reserved, null, $error);
         } catch (CancelledException $error) {
+            if ($deadline->isRequested() && ! ($cancellation?->isRequested() ?? false)) {
+                $error = new SlowDownException('Local object write worker exceeded its configured deadline.');
+            }
             return LocalObjectWriteOutcome::uncertain($reserved, $error);
         } catch (\Throwable $error) {
             return LocalObjectWriteOutcome::uncertain($reserved, $error);

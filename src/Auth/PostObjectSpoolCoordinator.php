@@ -60,6 +60,12 @@ final class PostObjectSpoolCoordinator
         return $this->tempDir;
     }
 
+    /** @internal Shared with the browser-upload sweeper bound to this coordinator. */
+    public function workerPool(): ?WorkerPool
+    {
+        return $this->pool;
+    }
+
     public function recoverAbandoned(): void
     {
         if ($this->pool !== null) {

@@ -44,6 +44,7 @@ final class MetadataDmlRoleTest extends TestCase
             $admin->exec("DROP USER IF EXISTS '{$role}'@'%'");
             $admin->exec("CREATE USER '{$role}'@'%' IDENTIFIED BY 's3audit'");
             $admin->exec("GRANT SELECT, INSERT, UPDATE, DELETE ON s3audit_metadata_dml.* TO '{$role}'@'%'");
+            $admin->exec("GRANT EXECUTE ON FUNCTION s3audit_metadata_dml.s3_recovery_capacity_trigger_count TO '{$role}'@'%'");
         }
 
         $bucket = 'dml-' . bin2hex(random_bytes(6));

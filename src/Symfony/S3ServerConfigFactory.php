@@ -39,6 +39,7 @@ final class S3ServerConfigFactory
             connectionIdleTimeout: $server['connection_idle_timeout'],
             requestBodySizeLimit: $server['body_size_limit'],
             postSpoolBudgetBytes: $server['post_spool_budget'] ?? 10_737_418_240,
+            localWriteWorkerTimeoutSeconds: $server['local_write_worker_timeout_seconds'] ?? 300.0,
             readTimeout: $server['read_timeout'],
             writeTimeout: $server['write_timeout'],
             perClientRateLimit: $server['rate_limit'],

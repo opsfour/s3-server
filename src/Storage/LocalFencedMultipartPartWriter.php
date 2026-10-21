@@ -7,10 +7,13 @@ namespace OpsFour\S3Server\Storage;
 use Amp\ByteStream\ReadableStream;
 use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\WorkerPool;
 use Amp\Sync\Lock;
+use Amp\TimeoutCancellation;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Checksum\ChecksumResult;
@@ -77,6 +80,7 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         ?WorkerPool $budgetPool = null,
         private readonly ?LocalObjectWriteIo $workerIo = null,
         ?WorkerPool $writePool = null,
+        private readonly float $workerTimeoutSeconds = 300.0,
     ) {
         $root = realpath($storageRoot);
         if ($root === false || ! is_dir($root)) {
@@ -97,6 +101,9 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             || ! function_exists('posix_geteuid') || $scratchOwner === false || $scratchOwner !== posix_geteuid()
             || $rootStat === false || $scratchStat === false || $rootStat['dev'] !== $scratchStat['dev']) {
             throw new \InvalidArgumentException('Multipart scratch must be private, process-owned, and on the storage filesystem.');
+        }
+        if (! is_finite($workerTimeoutSeconds) || $workerTimeoutSeconds <= 0.0) {
+            throw new \InvalidArgumentException('Multipart worker timeout must be finite and greater than zero.');
         }
         $this->root = rtrim($root, '/');
         $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
@@ -237,8 +244,14 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         $completed->ignore();
         unset($worker);
 
+        $deadline = new TimeoutCancellation(
+            $this->workerTimeoutSeconds,
+            'Multipart write worker exceeded its configured deadline.',
+        );
         try {
-            $result = $completed->await($cancellation);
+            $result = $completed->await($cancellation === null
+                ? $deadline
+                : new CompositeCancellation($cancellation, $deadline));
             if (! $result instanceof LocalMultipartPartWriteTaskResult) {
                 throw new \RuntimeException('Multipart worker returned an invalid result.');
             }
@@ -265,6 +278,9 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 $error,
             );
         } catch (CancelledException $error) {
+            if ($deadline->isRequested() && ! ($cancellation?->isRequested() ?? false)) {
+                $error = new SlowDownException('Multipart write worker exceeded its configured deadline.');
+            }
             return new LocalMultipartPartWriteOutcome($path, LocalMultipartPartWriteOutcome::UNCERTAIN, $dispatchId, null, $error);
         } catch (\Throwable $error) {
             return new LocalMultipartPartWriteOutcome($path, LocalMultipartPartWriteOutcome::UNCERTAIN, $dispatchId, null, $error);

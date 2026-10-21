@@ -668,6 +668,11 @@ For production deployments:
   and otherwise fail even though the role has table `INSERT`. Recheck table
   and sequence grants after each migration, including when the credential
   store uses a separate database or schema.
+- For MySQL, keep the migration definer account and its `TRIGGER` privileges
+  available. Grant the DML-only role `EXECUTE` only on the narrow
+  `s3_recovery_capacity_trigger_count` definer function so it can verify
+  capacity triggers at startup and during readiness; it does not need
+  `TRIGGER` itself.
 - Deny public network access to the database.
 - Enable database TLS if traffic crosses hosts or networks you do not fully
   control.

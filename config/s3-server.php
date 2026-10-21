@@ -37,6 +37,9 @@ return [
     // Concurrent browser POST temporary bytes shared by API processes using one local temp directory (default 10 GiB).
     'post_spool_budget' => EnvironmentNumber::integer('S3_POST_SPOOL_BUDGET', 10_737_418_240),
 
+    // Maximum seconds to await a dispatched local object or multipart write worker.
+    'local_write_worker_timeout_seconds' => EnvironmentNumber::finiteFloat('S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS', 300.0),
+
     // Base domain for virtual-hosted-style bucket addressing.
     'base_domain' => env('S3_BASE_DOMAIN'),
 

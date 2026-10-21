@@ -279,6 +279,7 @@ final class S3ServerBundleTest extends TestCase
                 'max_connections' => 123,
                 'body_size_limit' => 456789,
                 'post_spool_budget' => 987654,
+                'local_write_worker_timeout_seconds' => 12.5,
                 'enforce_min_part_size' => false,
                 'allow_unfenced_storage_for_tests' => true,
             ],
@@ -306,6 +307,7 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456789, $config->requestBodySizeLimit);
         self::assertSame(987654, $config->postSpoolBudgetBytes);
+        self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
         self::assertFalse($config->notificationWorkerEnabled);
@@ -332,6 +334,7 @@ final class S3ServerBundleTest extends TestCase
     {
         yield 'encrypted object size' => ['max_encrypted_object_size'];
         yield 'select object size' => ['max_select_object_size'];
+        yield 'local write worker timeout' => ['local_write_worker_timeout_seconds'];
     }
 
     public function test_metadata_cache_ttl_wraps_metadata_store_by_default(): void

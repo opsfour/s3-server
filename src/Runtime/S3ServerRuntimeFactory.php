@@ -297,12 +297,14 @@ final readonly class S3ServerRuntimeFactory
                 workerIo: $faultProfile && getenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK') === '1'
                     ? new LocalObjectTestPublishPauseIo($scratch)
                     : null,
+                workerTimeoutSeconds: $config->localWriteWorkerTimeoutSeconds,
             );
             $partWriter = new LocalFencedMultipartPartWriter(
                 $backend->getBasePath(),
                 $scratch,
                 $tiers->defaultTier()->name,
                 $metadata,
+                workerTimeoutSeconds: $config->localWriteWorkerTimeoutSeconds,
             );
 
             if (in_array($config->metadataDriver, ['postgres', 'mysql'], true)) {

@@ -30,6 +30,27 @@ final class AclGrantResolverTest extends TestCase
         );
     }
 
+    #[DataProvider('objectOnlyCannedAcls')]
+    public function test_object_only_canned_acl_is_rejected_for_bucket(string $cannedAcl): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported canned ACL');
+
+        AclGrantResolver::fromHeaders(
+            $this->request(['x-amz-acl' => $cannedAcl]),
+            'owner',
+            'bucket',
+        );
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function objectOnlyCannedAcls(): iterable
+    {
+        yield 'bucket owner read' => ['bucket-owner-read'];
+        yield 'bucket owner full control' => ['bucket-owner-full-control'];
+        yield 'EC2 bundle read' => ['aws-exec-read'];
+    }
+
     public function test_canned_acl_and_explicit_grants_are_mutually_exclusive(): void
     {
         $this->expectException(InvalidArgumentException::class);

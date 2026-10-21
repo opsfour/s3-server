@@ -72,6 +72,7 @@ final class ServeCommand extends Command
             ->addOption('connection-idle-timeout', null, InputOption::VALUE_REQUIRED, 'HTTP/2 idle connection timeout in seconds; HTTP/1 uses the stream timeout', self::envOption('S3_CONNECTION_IDLE_TIMEOUT', '60'))
             ->addOption('body-size-limit', null, InputOption::VALUE_REQUIRED, 'Maximum request body size in bytes', self::envOption('S3_BODY_SIZE_LIMIT', '5368709120'))
             ->addOption('post-spool-budget', null, InputOption::VALUE_REQUIRED, 'Concurrent browser POST temporary bytes shared by processes using one local temp directory', getenv('S3_POST_SPOOL_BUDGET') === false ? '10737418240' : getenv('S3_POST_SPOOL_BUDGET'))
+            ->addOption('local-write-worker-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to await a dispatched local object write worker', self::envOption('S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS', '300'))
             ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', self::envOption('S3_READ_TIMEOUT', '300'))
             ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', self::envOption('S3_WRITE_TIMEOUT', '300'))
             ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to drain in-flight requests during graceful shutdown', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
@@ -256,6 +257,7 @@ final class ServeCommand extends Command
             connectionIdleTimeout: $this->integerOption($input, 'connection-idle-timeout'),
             requestBodySizeLimit: $this->integerOption($input, 'body-size-limit'),
             postSpoolBudgetBytes: $this->integerOption($input, 'post-spool-budget'),
+            localWriteWorkerTimeoutSeconds: $this->floatOption($input, 'local-write-worker-timeout'),
             readTimeout: $this->integerOption($input, 'read-timeout'),
             writeTimeout: $this->integerOption($input, 'write-timeout'),
             perClientRateLimit: $this->integerOption($input, 'rate-limit'),

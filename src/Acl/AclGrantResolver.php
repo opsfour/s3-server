@@ -204,7 +204,7 @@ final class AclGrantResolver
 
         if ($resourceType === 'bucket') {
             return match ($cannedAcl) {
-                'private', 'bucket-owner-read', 'bucket-owner-full-control' => [$ownerGrant],
+                'private' => [$ownerGrant],
                 'public-read' => [$ownerGrant, $publicRead],
                 'public-read-write' => [
                     $ownerGrant,
@@ -214,10 +214,6 @@ final class AclGrantResolver
                 'authenticated-read' => [
                     $ownerGrant,
                     ['granteeType' => 'Group', 'granteeId' => self::AUTHENTICATED_USERS_URI, 'permission' => 'READ'],
-                ],
-                'aws-exec-read' => [
-                    $ownerGrant,
-                    ['granteeType' => 'CanonicalUser', 'granteeId' => self::AWS_EXEC_PRINCIPAL, 'permission' => 'READ'],
                 ],
                 'log-delivery-write' => [
                     $ownerGrant,

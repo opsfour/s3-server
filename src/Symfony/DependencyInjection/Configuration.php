@@ -28,6 +28,7 @@ final class Configuration implements ConfigurationInterface
                         ->integerNode('connection_idle_timeout')->defaultValue(60)->min(0)->end()
                         ->integerNode('body_size_limit')->defaultValue(5_368_709_120)->min(0)->end()
                         ->integerNode('post_spool_budget')->defaultValue(10_737_418_240)->min(1)->end()
+                        ->floatNode('local_write_worker_timeout_seconds')->defaultValue(300.0)->min(0.001)->end()
                         ->integerNode('read_timeout')->defaultValue(300)->min(0)->end()
                         ->integerNode('write_timeout')->defaultValue(300)->min(0)->end()
                         ->integerNode('rate_limit')->defaultValue(1000)->min(0)->end()

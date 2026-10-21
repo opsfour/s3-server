@@ -69,7 +69,7 @@ The project follows [Semantic Versioning](https://semver.org/).
   retry contract applies to HTTP(S) webhooks.
 - New objects remain unencrypted unless SSE is requested or bucket default
   encryption is configured.
-- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 46.
+- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 47.
 - Raise the completed multipart object limit to S3's 50-TB limit (50,000 GiB)
   while retaining the 5-GiB per-part limit. A full GetObject above 5 TiB now
   returns HTTP 405; ranged GetObject requests and HeadObject remain available.
@@ -99,12 +99,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Keep database credential PDO operations out of the HTTP event loop and bound
   each serving operation with a configurable timeout.
 - Run host-wide browser POST and request-checksum spool accounting in the
-  owned request-body worker pool so filesystem locks cannot pause HTTP fibers.
+  owned request-body worker pool so filesystem locks cannot pause HTTP fibers,
+  including default programmatic `AuthMiddleware` integrations.
+- Bound dispatched local PutObject and multipart-part workers with a
+  configurable deadline while retaining durable intents for late completion.
+- Make MySQL DML-only serving nodes verify the capacity-trigger inventory at
+  startup and during readiness through a narrow definer-security function.
 - Make the configured shutdown drain timeout finite: a stalled HTTP request,
   background task, or in-process listener now fails shutdown while
   retaining its dependencies for a safe retry or supervisor termination.
 - Return SSE-S3 encryption metadata from GetObjectAttributes and normalize its
   `Last-Modified` response headers to UTC.
+- Reject object-only canned ACLs on PutBucketAcl.
 - Honor the deprecated browser POST `redirect` field as a fallback for
   `success_action_redirect`.
 - Reject bucket policies with unsupported policy-language versions.

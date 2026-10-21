@@ -169,13 +169,7 @@ final class MetadataSchemaAdmissionTest extends TestCase
 
         try {
             try {
-                if ($driver === 'postgres') {
-                    MetadataStoreFactory::create('postgres', ['dsn' => $dsn], migrate: false);
-                } else {
-                    // MySQL serving roles intentionally have no TRIGGER privilege.
-                    // The DDL-capable migrator verifies the complete inventory.
-                    MetadataStoreFactory::create('mysql', ['dsn' => $dsn], migrate: true);
-                }
+                MetadataStoreFactory::create($driver, ['dsn' => $dsn], migrate: false);
                 self::fail("Schema admission accepted a missing multipart completion {$operation} trigger.");
             } catch (\RuntimeException $error) {
                 self::assertStringContainsString('recovery triggers are missing', $error->getMessage());

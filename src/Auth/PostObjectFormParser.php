@@ -28,9 +28,11 @@ final class PostObjectFormParser
 
     private const int FIELD_SIZE_LIMIT = 65_536;
 
-    private readonly PostObjectTempFileSweeper $tempFileSweeper;
+    private PostObjectTempFileSweeper $tempFileSweeper;
 
-    private readonly PostObjectSpoolCoordinator $spoolCoordinator;
+    private PostObjectSpoolCoordinator $spoolCoordinator;
+
+    private readonly bool $serverCoordinatorBindable;
 
     public function __construct(
         private readonly CredentialProvider $credentialProvider,
@@ -48,8 +50,27 @@ final class PostObjectFormParser
         if ($tempDir !== null && ($tempFileSweeper !== null || $spoolCoordinator !== null)) {
             throw new \InvalidArgumentException('Explicit browser POST temp directory cannot be mixed with injected spool components.');
         }
-        $this->tempFileSweeper = $tempFileSweeper ?? new PostObjectTempFileSweeper(tempDir: $tempDir);
         $this->spoolCoordinator = $spoolCoordinator ?? new PostObjectSpoolCoordinator($tempDir);
+        $this->tempFileSweeper = $tempFileSweeper ?? new PostObjectTempFileSweeper(
+            $this->spoolCoordinator->workerPool(),
+            $this->spoolCoordinator->tempDir(),
+        );
+        $this->serverCoordinatorBindable = $spoolCoordinator === null
+            && $tempFileSweeper === null
+            && $tempDir === null;
+    }
+
+    /** @internal Bind default parser dependencies to the S3Server-owned worker pool before serving. */
+    public function bindServerSpoolCoordinator(PostObjectSpoolCoordinator $coordinator): void
+    {
+        if (! $this->serverCoordinatorBindable) {
+            return;
+        }
+        $this->spoolCoordinator = $coordinator;
+        $this->tempFileSweeper = new PostObjectTempFileSweeper(
+            $coordinator->workerPool(),
+            $coordinator->tempDir(),
+        );
     }
 
     public function parse(Request $request): PostObjectForm

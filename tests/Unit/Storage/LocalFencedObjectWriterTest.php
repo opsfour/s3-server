@@ -10,6 +10,7 @@ use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Parallel\Worker\ContextWorkerPool;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -495,7 +496,7 @@ final class LocalFencedObjectWriterTest extends TestCase
         }
     }
 
-    public function test_armed_worker_cancelled_after_submit_remains_uncertain_and_late_link_cannot_replace_seal(): void
+    public function test_armed_worker_timeout_remains_uncertain_and_late_link_cannot_replace_seal(): void
     {
         $entered = $this->base . '/armed-link-entered';
         $release = $this->base . '/armed-link-release';
@@ -504,10 +505,15 @@ final class LocalFencedObjectWriterTest extends TestCase
         $io = new LocalObjectWriteFaultIo();
         $io->linkEnteredDirectory = $entered;
         $io->linkReleaseDirectory = $release;
-        $writer = $this->writer(io: $io);
+        $writer = new LocalFencedObjectWriter(
+            $this->root,
+            $this->scratch,
+            'STANDARD',
+            workerIo: $io,
+            workerTimeoutSeconds: 0.05,
+        );
         $intent = $this->intent();
         $guard = $this->leaseGuard($intent, new LocalObjectWriteLeaseAdmission(1));
-        $cancel = new DeferredCancellation();
 
         try {
             $pending = async(fn(): LocalObjectWriteOutcome => $writer->publishWithLease(
@@ -515,15 +521,15 @@ final class LocalFencedObjectWriterTest extends TestCase
                 'key',
                 new ReadableBuffer('late payload'),
                 $guard,
-                $cancel->getCancellation(),
             ));
             $deadline = microtime(true) + 15.0;
             while (! file_exists($entered . '/' . basename($intent->storagePath)) && microtime(true) < $deadline) {
                 delay(0.01);
             }
             self::assertFileExists($entered . '/' . basename($intent->storagePath));
-            $cancel->cancel();
-            self::assertSame(LocalObjectWriteOutcome::UNCERTAIN, $pending->await()->state);
+            $outcome = $pending->await();
+            self::assertSame(LocalObjectWriteOutcome::UNCERTAIN, $outcome->state);
+            self::assertInstanceOf(SlowDownException::class, $outcome->error);
             $guard->close();
 
             (new LocalObjectWriteFence($this->root))->seal($this->claimed($intent));

@@ -150,8 +150,13 @@ upgrade. If database-backed credentials are configured, run the separate
 `credentials:migrate` bootstrap before serving; it can use a different PDO
 DSN and DDL-capable role. See the [deployment order](deployment.md#rollout-and-rollback).
 
-MySQL migrations create counter-maintenance triggers. Grant the migration role
-`TRIGGER` in addition to its table DDL rights. When binary logging is enabled,
+MySQL migrations create counter-maintenance triggers and a narrow
+`SQL SECURITY DEFINER` inventory function used by DML-only API nodes. Grant the
+migration role `TRIGGER`, `CREATE ROUTINE`, and `ALTER ROUTINE` in addition to
+its table DDL rights. Keep its definer account and privileges available for both
+the triggers and function. Grant the serving role only `EXECUTE` on
+`s3_recovery_capacity_trigger_count`; it returns one count and exposes no
+trigger body or other schema metadata. When binary logging is enabled,
 MySQL also requires either an administrative migration role or the DBA-managed
 `log_bin_trust_function_creators=ON` server setting before the migration runs.
 The DML-only serving role does not need trigger-creation rights.
@@ -206,9 +211,10 @@ The DML-only serving role does not need trigger-creation rights.
 | 42 (PostgreSQL) | Add a C-collated account-quota owner index so cursor pagination keeps UTF-8 byte order under non-C database collations. |
 | 45 (MySQL) | Widen stored CORS rule IDs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
 | 46 (MySQL) | Widen lifecycle rule IDs stored with tier-transition jobs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
+| 47 (MySQL) | Expose the expected capacity-trigger count through a narrow definer-security function so DML-only serving nodes fail closed after trigger removal. |
 
 SQLite currently uses schema version `39`; PostgreSQL uses `42`, and MySQL
-uses `46`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+uses `47`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error
@@ -236,12 +242,13 @@ The noncurrent-time migration deliberately does not derive missing values from
 `created_at`: existing noncurrent rows start their retention clock at the
 migration statement time. Validate migration duration, locks, and backfill
 results against a representative copy before rollout.
-The PostgreSQL serving guard also checks that all five object/part capacity
-triggers remain active. MySQL checks them with the DDL-capable migration role
-before publishing the schema version. Its DML-only serving role cannot read
-`information_schema.TRIGGERS` without the `TRIGGER` privilege, so a later
-trigger removal is an open operational detection gap; recheck the trigger
-inventory with the migration role after database restores or privilege changes.
+The PostgreSQL serving guard checks that all capacity triggers remain active.
+MySQL checks them directly with the DDL-capable migration role before publishing
+the schema version, then exposes only the number of exactly matching trigger
+tuples through the definer-security function. DML-only nodes call that function
+at startup and during readiness without receiving the `TRIGGER` privilege. A
+missing trigger, function, durable definer, or narrow `EXECUTE` grant fails
+closed.
 
 Custom metadata stores that implement `MultipartWriteIntentStore` must also
 implement `renewMultipartWriteIntent()`. It atomically extends an active

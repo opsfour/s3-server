@@ -50,6 +50,8 @@ final readonly class S3ServerConfig
 
     public int $postSpoolBudgetBytes;
 
+    public float $localWriteWorkerTimeoutSeconds;
+
     public int $readTimeout;
 
     public int $writeTimeout;
@@ -117,6 +119,7 @@ final readonly class S3ServerConfig
      * @param  int  $connectionIdleTimeout  HTTP/2 idle timeout in seconds; Amp HTTP/1 uses the stream inactivity timeout.
      * @param  int  $requestBodySizeLimit  Maximum request body size in bytes (default 5 GiB).
      * @param  int  $postSpoolBudgetBytes  Concurrent browser POST temporary bytes per node sharing a local temp directory (default 10 GiB).
+     * @param  float  $localWriteWorkerTimeoutSeconds  Maximum seconds to await a dispatched local object or multipart write worker.
      * @param  int  $readTimeout  Read timeout in seconds.
      * @param  int  $writeTimeout  Write timeout in seconds.
      * @param  int  $perClientRateLimit  Per-client rate limit (0 = unlimited).
@@ -186,6 +189,7 @@ final readonly class S3ServerConfig
         array $trustedProxyCidrs = [],
         bool $allowUnfencedStorageForTests = false,
         ?string $localObjectWriteTestScratchPath = null,
+        float $localWriteWorkerTimeoutSeconds = 300.0,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
@@ -353,6 +357,10 @@ final readonly class S3ServerConfig
             throw new \InvalidArgumentException('multipartMaxAgeSeconds must be >= 0.');
         }
 
+        if (! is_finite($localWriteWorkerTimeoutSeconds) || $localWriteWorkerTimeoutSeconds <= 0.0) {
+            throw new \InvalidArgumentException('localWriteWorkerTimeoutSeconds must be finite and > 0.');
+        }
+
         $this->host = $host;
         $this->port = $port;
         $this->region = $region;
@@ -368,6 +376,7 @@ final readonly class S3ServerConfig
         $this->connectionIdleTimeout = $connectionIdleTimeout;
         $this->requestBodySizeLimit = $requestBodySizeLimit;
         $this->postSpoolBudgetBytes = $postSpoolBudgetBytes;
+        $this->localWriteWorkerTimeoutSeconds = $localWriteWorkerTimeoutSeconds;
         $this->readTimeout = $readTimeout;
         $this->writeTimeout = $writeTimeout;
         $this->perClientRateLimit = $perClientRateLimit;
@@ -436,6 +445,7 @@ final readonly class S3ServerConfig
             'connectionIdleTimeout' => $this->connectionIdleTimeout,
             'requestBodySizeLimit' => $this->requestBodySizeLimit,
             'postSpoolBudgetBytes' => $this->postSpoolBudgetBytes,
+            'localWriteWorkerTimeoutSeconds' => $this->localWriteWorkerTimeoutSeconds,
             'readTimeout' => $this->readTimeout,
             'writeTimeout' => $this->writeTimeout,
             'perClientRateLimit' => $this->perClientRateLimit,

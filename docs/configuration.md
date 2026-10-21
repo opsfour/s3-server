@@ -80,6 +80,7 @@ test-only profiles until the exact deployment is qualified. See the canonical
 | `S3_BACKING_REQUEST_TIMEOUT_SECONDS` | `0` | Optional total backing S3 request timeout; `0` leaves long transfers uncapped. If set, it must be at least the connect timeout. |
 | `S3_STORAGE_PATH` | - | Root directory for object data (required for `filesystem`) |
 | `S3_REQUEST_BODY_SPOOL_WORKERS` | `8` | Process workers for checksum validation, request-body replay, and host-wide temporary-budget accounting |
+| `S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS` | `300` | Maximum seconds to await a dispatched local PutObject or multipart-part filesystem worker; a timeout returns an uncertain write while the durable intent remains available for recovery |
 | `S3_ENFORCE_MIN_PART_SIZE` | `true` | Require every non-final multipart part to be at least 5 MiB |
 
 See [Storage Backends](storage-backends.md) for driver-specific configuration.

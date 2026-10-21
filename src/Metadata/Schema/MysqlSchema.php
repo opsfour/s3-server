@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 46;
+    public const int VERSION = 47;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -574,6 +574,7 @@ final class MysqlSchema
 
             ...self::completionCapacityStatements(),
             ...self::writeIntentCapacityStatements(),
+            ...self::recoveryCapacityTriggerInventoryFunctionStatements(false),
         ];
     }
 
@@ -1018,6 +1019,9 @@ final class MysqlSchema
         if ($fromVersion < 46) {
             $statements[] = 'ALTER TABLE s3_tier_transition_jobs MODIFY COLUMN lifecycle_rule_id VARBINARY(1020) NULL';
         }
+        if ($fromVersion < 47) {
+            array_push($statements, ...self::recoveryCapacityTriggerInventoryFunctionStatements(true));
+        }
 
         return $statements;
     }
@@ -1146,5 +1150,47 @@ final class MysqlSchema
             END
             SQL,
         ];
+    }
+
+    /** @return list<string> */
+    private static function recoveryCapacityTriggerInventoryFunctionStatements(bool $replace): array
+    {
+        $create = <<<'SQL'
+            CREATE FUNCTION %ss3_recovery_capacity_trigger_count() RETURNS INTEGER
+            NOT DETERMINISTIC READS SQL DATA SQL SECURITY DEFINER
+            RETURN (
+                SELECT COUNT(*)
+                FROM information_schema.TRIGGERS
+                WHERE TRIGGER_SCHEMA = DATABASE()
+                  AND (
+                      (TRIGGER_NAME = 's3_write_intent_capacity_object_insert'
+                       AND EVENT_OBJECT_TABLE = 's3_object_write_intents'
+                       AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_write_intent_capacity_object_delete'
+                          AND EVENT_OBJECT_TABLE = 's3_object_write_intents'
+                          AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_write_intent_capacity_part_insert'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_write_intent_capacity_part_delete'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_write_intent_capacity_part_update'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'UPDATE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_multipart_completion_capacity_insert'
+                          AND EVENT_OBJECT_TABLE = 's3_multipart_write_intents'
+                          AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_multipart_completion_capacity_delete'
+                          AND EVENT_OBJECT_TABLE = 's3_multipart_write_intents'
+                          AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                  )
+            )
+            SQL;
+        $create = sprintf($create, $replace ? '' : 'IF NOT EXISTS ');
+
+        return $replace
+            ? ['DROP FUNCTION IF EXISTS s3_recovery_capacity_trigger_count', $create]
+            : [$create];
     }
 }

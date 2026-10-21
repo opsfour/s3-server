@@ -5,12 +5,46 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use Amp\Parallel\Worker\ContextWorkerPool;
+use OpsFour\S3Server\Auth\PostObjectFormParser;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Auth\PostObjectTempFileSweeper;
+use OpsFour\S3Server\Contracts\CredentialProvider;
 use PHPUnit\Framework\TestCase;
 
 final class PostObjectTempFileSweeperTest extends TestCase
 {
+    public function test_parser_default_sweeper_uses_injected_coordinator_directory(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-injected-sweep-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $stalePost = $tempDir . '/s3-post-abandoned.tmp';
+        self::assertSame(9, file_put_contents($stalePost, 'abandoned'));
+        self::assertTrue(touch($stalePost, time() - 90_000));
+        $pool = new ContextWorkerPool(1);
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, $pool);
+        $parser = new PostObjectFormParser(
+            $this->createStub(CredentialProvider::class),
+            'us-east-1',
+            1_048_576,
+            spoolCoordinator: $coordinator,
+        );
+
+        try {
+            $sweeper = (new \ReflectionProperty($parser, 'tempFileSweeper'))->getValue($parser);
+            self::assertInstanceOf(PostObjectTempFileSweeper::class, $sweeper);
+            $sweeper->sweepIfDue();
+            self::assertFileDoesNotExist($stalePost);
+        } finally {
+            $pool->shutdown();
+            @unlink($stalePost);
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_alias_sweeper_preserves_an_old_file_reserved_by_canonical_directory(): void
     {
         $root = sys_get_temp_dir() . '/s3-post-sweep-alias-' . bin2hex(random_bytes(8));

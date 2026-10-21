@@ -10,9 +10,11 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Contracts\CredentialProvider;
@@ -40,6 +42,32 @@ final class S3ServerAuthenticationTest extends TestCase
         );
 
         self::assertInstanceOf(AuthenticationMiddleware::class, $middleware);
+    }
+
+    public function test_default_auth_spooling_binds_to_server_pool_without_replacing_explicit_components(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-auth-spool-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $pool = $this->createStub(WorkerPool::class);
+        $owned = new PostObjectSpoolCoordinator($tempDir, $pool);
+        $explicit = new PostObjectSpoolCoordinator($tempDir, $this->createStub(WorkerPool::class));
+        $defaultAuth = new AuthMiddleware(new InMemoryCredentialProvider(), 'us-east-1');
+        $explicitAuth = new AuthMiddleware(
+            new InMemoryCredentialProvider(),
+            'us-east-1',
+            postSpoolCoordinator: $explicit,
+        );
+
+        try {
+            $defaultAuth->bindServerSpoolCoordinator($owned);
+            $explicitAuth->bindServerSpoolCoordinator($owned);
+
+            self::assertSame($owned, $this->authSpoolCoordinator($defaultAuth));
+            self::assertSame($explicit, $this->authSpoolCoordinator($explicitAuth));
+        } finally {
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
     }
 
     public function test_enabled_rate_limit_requires_metadata_store_before_startup(): void
@@ -89,20 +117,16 @@ final class S3ServerAuthenticationTest extends TestCase
             notificationWorkerEnabled: false,
         ));
         $server->addMiddleware(new AuthMiddleware($provider, 'us-east-1'));
+        $provider->failure = new \RuntimeException('credential database unavailable');
 
         try {
             $server->start();
             $client = (new HttpClientBuilder())->retry(0)->build();
             $endpoint = "http://127.0.0.1:{$port}";
 
-            self::assertSame(200, $client->request(new ClientRequest($endpoint . '/.health'))->getStatus());
-            self::assertSame(1, $provider->checks);
-
-            $provider->failure = new \RuntimeException('credential database unavailable');
-
             self::assertSame(503, $client->request(new ClientRequest($endpoint . '/.health'))->getStatus());
             self::assertSame(200, $client->request(new ClientRequest($endpoint . '/.live'))->getStatus());
-            self::assertSame(2, $provider->checks, 'Liveness must not invoke the credential dependency probe.');
+            self::assertSame(1, $provider->checks, 'Liveness must not invoke the credential dependency probe.');
         } finally {
             $server->stop();
         }
@@ -123,6 +147,18 @@ final class S3ServerAuthenticationTest extends TestCase
 
         $property = new \ReflectionProperty($server, 'authenticationCredentialProvider');
         self::assertSame($provider, $property->getValue($server));
+    }
+
+    private function authSpoolCoordinator(AuthMiddleware $middleware): PostObjectSpoolCoordinator
+    {
+        $parserProperty = new \ReflectionProperty($middleware, 'postObjectFormParser');
+        $parser = $parserProperty->getValue($middleware);
+        self::assertIsObject($parser);
+        $coordinatorProperty = new \ReflectionProperty($parser, 'spoolCoordinator');
+        $coordinator = $coordinatorProperty->getValue($parser);
+        self::assertInstanceOf(PostObjectSpoolCoordinator::class, $coordinator);
+
+        return $coordinator;
     }
 }
 

@@ -63,6 +63,7 @@ final class ServeCommandTest extends TestCase
             '--master-key-provider' => 'vault',
             '--max-encrypted-object-size' => '123456',
             '--max-select-object-size' => '654321',
+            '--local-write-worker-timeout' => '12.5',
             '--sqlite-workers' => '3',
             '--encryption-workers' => '4',
             '--select-workers' => '6',
@@ -83,6 +84,7 @@ final class ServeCommandTest extends TestCase
         self::assertSame('vault', $config->masterKeyProvider);
         self::assertSame(123456, $config->maxEncryptedObjectSize);
         self::assertSame(654321, $config->maxSelectObjectSize);
+        self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertSame(3, $config->sqliteWorkerPoolSize);
         self::assertSame(4, $config->encryptionWorkerPoolSize);
         self::assertSame(6, $config->selectWorkerPoolSize);

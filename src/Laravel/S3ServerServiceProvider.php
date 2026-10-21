@@ -54,6 +54,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 connectionIdleTimeout: $config['connection_idle_timeout'] ?? 60,
                 requestBodySizeLimit: $config['body_size_limit'] ?? 5_368_709_120,
                 postSpoolBudgetBytes: $config['post_spool_budget'] ?? 10_737_418_240,
+                localWriteWorkerTimeoutSeconds: $config['local_write_worker_timeout_seconds'] ?? 300.0,
                 readTimeout: $config['read_timeout'] ?? 300,
                 writeTimeout: $config['write_timeout'] ?? 300,
                 perClientRateLimit: $config['rate_limit'] ?? 1000,

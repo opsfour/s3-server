@@ -32,6 +32,8 @@ final class MetadataSchemaGuard
             self::assertMultipartCompletionCapacityConsistent($pool);
             if ($pool instanceof PostgresConnectionPool) {
                 self::assertPostgresWriteIntentTriggers($pool);
+            } else {
+                self::assertMysqlWriteIntentTriggers($pool);
             }
             foreach ([
                 'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
@@ -128,7 +130,6 @@ final class MetadataSchemaGuard
     /** Check the MySQL trigger inventory only with the DDL-capable migration role. */
     public static function assertMysqlWriteIntentTriggersForMigration(MysqlConnectionPool $pool): void
     {
-        $expected = self::recoveryCapacityTriggerInventory();
         $rows = $pool->query(<<<'SQL'
             SELECT TRIGGER_NAME AS name, EVENT_OBJECT_TABLE AS table_name,
                    EVENT_MANIPULATION AS event_name, ACTION_TIMING AS timing
@@ -137,6 +138,32 @@ final class MetadataSchemaGuard
               AND (TRIGGER_NAME LIKE 's3_write_intent_capacity_%'
                    OR TRIGGER_NAME LIKE 's3_multipart_completion_capacity_%')
             SQL);
+        self::assertMysqlWriteIntentTriggerRows($rows);
+    }
+
+    /** Check through a narrow DEFINER function without granting TRIGGER to the serving role. */
+    public static function assertMysqlWriteIntentTriggers(MysqlConnectionPool $pool): void
+    {
+        try {
+            $row = $pool->query(
+                'SELECT s3_recovery_capacity_trigger_count() AS trigger_count',
+            )->fetchRow();
+        } catch (\Throwable $error) {
+            throw new \RuntimeException(
+                'Write intent recovery trigger inventory cannot be verified; repair metadata before serving.',
+                0,
+                $error,
+            );
+        }
+        if ($row === null
+            || filter_var($row['trigger_count'] ?? null, FILTER_VALIDATE_INT) !== count(self::recoveryCapacityTriggerInventory())) {
+            throw new \RuntimeException('Write intent recovery triggers are missing; repair metadata before serving.');
+        }
+    }
+
+    private static function assertMysqlWriteIntentTriggerRows(\Amp\Mysql\MysqlResult $rows): void
+    {
+        $expected = self::recoveryCapacityTriggerInventory();
         while (($row = $rows->fetchRow()) !== null) {
             if (! is_string($row['name'] ?? null)) {
                 throw new \RuntimeException('Write intent recovery trigger inventory cannot be verified.');

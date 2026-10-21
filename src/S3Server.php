@@ -1337,7 +1337,11 @@ final class S3Server
         $middlewares[] = new CorsMiddleware($this->metadata);
 
         // Insert user-supplied middleware (e.g., AuthMiddleware).
+        $postObjectSpoolCoordinator = $this->preparePostObjectSpoolCoordinator();
         foreach ($this->extraMiddleware as $extra) {
+            if ($extra instanceof AuthMiddleware) {
+                $extra->bindServerSpoolCoordinator($postObjectSpoolCoordinator);
+            }
             $middlewares[] = $extra;
         }
 

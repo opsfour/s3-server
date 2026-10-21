@@ -121,6 +121,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
     public function assertMetadataWritable(): void
     {
         $this->conn()->execute('UPDATE s3_buckets SET region = region WHERE 0');
+        MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
     }
 
     public function assertCurrentSchema(): void
@@ -136,6 +137,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         $this->assertSupportedBucketEncryptionInventory();
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
+        MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
     }
 
     public function initialize(): void
@@ -166,6 +168,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
             $this->assertWriteIntentCapacityConsistent();
             MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
+            MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
             return;
         }
 
@@ -194,6 +197,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
         MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
+        MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
 
         $this->pool->execute(
             'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
