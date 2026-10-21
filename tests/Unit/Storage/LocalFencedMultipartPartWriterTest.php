@@ -31,10 +31,10 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
     {
         $directory = sys_get_temp_dir() . '/s3-part-worker-' . bin2hex(random_bytes(8));
         $root = $directory . '/storage';
-        $scratch = $directory . '/scratch';
+        $scratch = $root . '/.tmp/object-writes';
         self::assertTrue(mkdir($directory, 0700));
         self::assertTrue(mkdir($root, 0700));
-        self::assertTrue(mkdir($scratch, 0700));
+        self::assertTrue(mkdir($scratch, 0700, true));
         $root = realpath($root);
         self::assertIsString($root);
         $metadata = new SqliteMetadataStore(':memory:');

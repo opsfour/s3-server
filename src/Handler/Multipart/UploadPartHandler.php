@@ -129,12 +129,16 @@ final class UploadPartHandler implements RequestHandler
         $partIntentStore = MultipartPartWriteCapabilities::metadata($this->metadata);
         $plannedPartStorage = MultipartPartWriteCapabilities::storage($uploadStorage);
         $localFencedPart = MultipartPartWriteCapabilities::localFilesystem($uploadStorage);
-        if (($this->requireLocalFencedParts && ($this->localPartWriter === null || ! $localFencedPart))
+        $activeLocalPartWriter = $this->localPartWriter !== null
+            && $this->localPartWriter->isBoundTo($this->metadata, $uploadStorage, $storageTier)
+                ? $this->localPartWriter
+                : null;
+        if (($this->requireLocalFencedParts && ($activeLocalPartWriter === null || ! $localFencedPart))
             || ($localFencedPart && (! $partIntentStore instanceof FencedMultipartPartWriteIntentStore || $plannedPartStorage === null))) {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Local multipart parts require a fenced filesystem and metadata store.');
         }
-        if ($this->localPartWriter !== null) {
-            $this->localPartWriter->assertBoundTo($this->metadata, $uploadStorage, $storageTier);
+        if ($localFencedPart && $this->localPartWriter !== null && $activeLocalPartWriter === null) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Local multipart part writer is not bound to this upload tier.');
         }
         $plannedPartPath = null;
         $dispatchId = null;
@@ -170,9 +174,9 @@ final class UploadPartHandler implements RequestHandler
                     $uploadId,
                     $partNumber,
                 );
-                if ($this->localPartWriter !== null) {
+                if ($activeLocalPartWriter !== null) {
                     $validatedPhysical = null;
-                    $outcome = $this->localPartWriter->publish(
+                    $outcome = $activeLocalPartWriter->publish(
                         $bucket,
                         $bucketInfo->generation,
                         $uploadId,
@@ -255,9 +259,9 @@ final class UploadPartHandler implements RequestHandler
             $body = MultipartPartSize::boundedBody($request->getBody());
             $writeCancellation = null;
             try {
-                if ($this->localPartWriter !== null) {
+                if ($activeLocalPartWriter !== null) {
                     $validated = null;
-                    $outcome = $this->localPartWriter->publish(
+                    $outcome = $activeLocalPartWriter->publish(
                         $bucket,
                         $bucketInfo->generation,
                         $uploadId,

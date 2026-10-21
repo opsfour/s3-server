@@ -30,9 +30,11 @@ final readonly class LocalMultipartPartWriteFence
         int $expectedSize,
         string $expectedSha256,
     ): StorageWriteResult {
+        $internalScratchPrefix = rtrim($this->root, '/') . '/.tmp/object-writes/';
         if ($target !== StoragePath::forPlannedPart($this->root, $bucket, $generation, $uploadId, $partNumber, $attemptId)
             || $expectedSize < 0 || strlen($expectedSha256) !== 32
-            || ! str_starts_with($source, '/') || str_starts_with($source, rtrim($this->root, '/') . '/')
+            || ! str_starts_with($source, '/')
+            || (str_starts_with($source, rtrim($this->root, '/') . '/') && ! str_starts_with($source, $internalScratchPrefix))
             || preg_match('~/s3fw-part-' . $attemptId . '[a-f0-9]{32}$~D', $source) !== 1) {
             throw new \InvalidArgumentException('Multipart worker request does not match its planned path and stage.');
         }

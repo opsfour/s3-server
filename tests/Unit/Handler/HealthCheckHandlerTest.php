@@ -97,7 +97,7 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame([], $logger->records);
     }
 
-    public function test_filesystem_probe_remains_active_without_evidence(): void
+    public function test_filesystem_probe_does_not_use_the_metadata_driver(): void
     {
         $probeCount = 0;
         $storage = $this->filesystemProbeBackend($probeCount);
@@ -105,7 +105,7 @@ final class HealthCheckHandlerTest extends TestCase
             ->handleRequest($this->request());
 
         self::assertSame(503, $response->getStatus());
-        self::assertSame(1, $probeCount);
+        self::assertSame(0, $probeCount);
     }
 
     public function test_local_filesystem_readiness_detects_read_only_root_and_recovers(): void
@@ -131,6 +131,35 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame('{"status":"degraded"}', $response->getBody()->read());
         self::assertSame('metadata', $logger->records[0]['context']['component']);
         self::assertStringNotContainsString('private-test-token', json_encode($logger->records, JSON_THROW_ON_ERROR));
+    }
+
+    public function test_readiness_requires_sqlite_dml_without_changing_metadata(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-health-dml-' . bin2hex(random_bytes(8)) . '.sqlite';
+        try {
+            $writable = new SqliteMetadataStore($path);
+            $writable->initialize();
+            $writable->createBucket('owner', 'existing', 'us-east-1');
+            $handler = new HealthCheckHandler(metadata: $writable);
+
+            self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+            self::assertSame(['existing'], array_map(
+                static fn(\OpsFour\S3Server\Dto\BucketInfo $bucket): string => $bucket->name,
+                $writable->listAllBuckets(),
+            ));
+
+            $readOnly = new SqliteMetadataStore($path, readOnly: true);
+            self::assertSame(503, (new HealthCheckHandler(metadata: $readOnly))
+                ->handleRequest($this->request())->getStatus());
+            self::assertSame(['existing'], array_map(
+                static fn(\OpsFour\S3Server\Dto\BucketInfo $bucket): string => $bucket->name,
+                $writable->listAllBuckets(),
+            ));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
     }
 
     public function test_metadata_probe_propagates_the_original_cancellation(): void
@@ -172,7 +201,11 @@ final class HealthCheckHandlerTest extends TestCase
     {
         $logger = new HealthCheckArrayLogger();
         $probe = new HealthCheckCredentialProbe();
-        $handler = new HealthCheckHandler(logger: $logger, credentialHealthProbe: $probe);
+        $handler = new HealthCheckHandler(
+            logger: $logger,
+            credentialHealthProbe: $probe,
+            readinessCheckIntervalSeconds: 0,
+        );
 
         self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
 
@@ -210,7 +243,7 @@ final class HealthCheckHandlerTest extends TestCase
     public function test_readiness_degrades_when_configured_rate_limit_query_fails(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::exactly(2))->method('getBucket')->willReturn(null);
+        $metadata->expects(self::once())->method('getBucket')->willReturn(null);
         $metadata->expects(self::once())->method('rateLimitCheck')
             ->with('__rate_limit_health__', 1.0, 1.0)
             ->willThrowException(new \RuntimeException('s3_rate_limit_buckets missing: secret'));
@@ -262,7 +295,12 @@ final class HealthCheckHandlerTest extends TestCase
 
             return true;
         });
-        $handler = new HealthCheckHandler(metadata: $metadata, rateLimitEnabled: true, rateLimitCheckIntervalSeconds: 0);
+        $handler = new HealthCheckHandler(
+            metadata: $metadata,
+            rateLimitEnabled: true,
+            rateLimitCheckIntervalSeconds: 0,
+            readinessCheckIntervalSeconds: 0,
+        );
 
         self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
         self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
@@ -309,6 +347,7 @@ final class HealthCheckHandlerTest extends TestCase
             logger: $logger,
             storageTiers: StorageTierRegistry::single(new InMemoryBackend()),
             tierReferenceCheckIntervalSeconds: 0,
+            readinessCheckIntervalSeconds: 0,
         );
 
         self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
@@ -358,6 +397,7 @@ final class HealthCheckHandlerTest extends TestCase
                 metadata: $metadata,
                 storageTiers: StorageTierRegistry::single(new InMemoryBackend()),
                 tierReferenceCheckIntervalSeconds: 0,
+                readinessCheckIntervalSeconds: 0,
             );
 
             self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
@@ -403,9 +443,13 @@ final class HealthCheckHandlerTest extends TestCase
             $storage = $observed
                 ? new ObservedStorageBackend($backend, new MetricsCollector(), 'filesystem')
                 : $backend;
-            $handler = new HealthCheckHandler(storageTiers: StorageTierRegistry::single($storage));
+            $handler = new HealthCheckHandler(
+                storageTiers: StorageTierRegistry::single($storage),
+                readinessCheckIntervalSeconds: 0,
+            );
 
             self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+            self::assertSame([], array_values(array_diff(scandir($root) ?: [], ['.', '..'])));
             self::assertTrue(chmod($root, 0500));
             self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
             self::assertTrue(chmod($root, 0700));

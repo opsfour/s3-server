@@ -4,17 +4,25 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler;
 
+use Amp\Future;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use Amp\TimeoutCancellation;
+use Amp\TimeoutException;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
+use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MetadataWriteReadinessProbe;
+use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+
+use function Amp\async;
 
 /**
  * Health check endpoint for load balancers and Kubernetes probes.
@@ -24,6 +32,15 @@ use Psr\Log\NullLogger;
  */
 final class HealthCheckHandler implements RequestHandler
 {
+    private float $lastReadinessCheckAt = -INF;
+
+    private bool $readinessHealthy = true;
+
+    /** @var Future<void>|null */
+    private ?Future $readinessCheck = null;
+
+    private bool $readinessTimeoutLogged = false;
+
     private float $lastTierReferenceCheckAt = -INF;
 
     private float $lastRateLimitCheckAt = -INF;
@@ -42,20 +59,72 @@ final class HealthCheckHandler implements RequestHandler
         private readonly bool $rateLimitEnabled = false,
         private readonly int $rateLimitCheckIntervalSeconds = 30,
         private readonly ?CredentialHealthProbe $credentialHealthProbe = null,
+        private readonly int $readinessCheckIntervalSeconds = 30,
+        private readonly float $readinessCheckTimeoutSeconds = 5.0,
     ) {
+        if ($readinessCheckIntervalSeconds < 0) {
+            throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
+        }
+        if (! is_finite($readinessCheckTimeoutSeconds) || $readinessCheckTimeoutSeconds <= 0.0) {
+            throw new \InvalidArgumentException('Readiness check timeout must be a finite number greater than zero.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
     }
 
     public function handleRequest(Request $request): Response
     {
+        $now = hrtime(true) / 1e9;
+        if ($now - $this->lastReadinessCheckAt < $this->readinessCheckIntervalSeconds) {
+            return $this->readinessResponse();
+        }
+
+        if ($this->readinessCheck === null || $this->readinessCheck->isComplete()) {
+            $this->readinessTimeoutLogged = false;
+            $this->readinessCheck = async(function (): void {
+                $this->runReadinessCheck();
+                $this->lastReadinessCheckAt = hrtime(true) / 1e9;
+            });
+        }
+
+        try {
+            $this->readinessCheck->await(new TimeoutCancellation($this->readinessCheckTimeoutSeconds));
+        } catch (\Amp\CancelledException $e) {
+            if (! $e->getPrevious() instanceof TimeoutException) {
+                throw $e;
+            }
+
+            $this->readinessHealthy = false;
+            $this->lastReadinessCheckAt = hrtime(true) / 1e9;
+            if (! $this->readinessTimeoutLogged) {
+                $this->readinessTimeoutLogged = true;
+                $this->logDegraded('readiness', new \RuntimeException('Dependency readiness check timed out.'));
+            }
+        }
+
+        return $this->readinessResponse();
+    }
+
+    private function runReadinessCheck(): void
+    {
         if ($this->metadata !== null) {
             try {
-                // Lightweight probe: fetch a non-existent bucket.
+                // The read proves query availability. Built-in stores also run
+                // a no-row DML statement so readiness detects read-only roles
+                // and databases without changing metadata.
                 $this->metadata->getBucket('__health_check__');
+                $writeProbe = $this->metadata;
+                while ($writeProbe instanceof ObservedMetadataStore || $writeProbe instanceof CachedMetadataStoreDecorator) {
+                    $writeProbe = $writeProbe->innerStore();
+                }
+                if ($writeProbe instanceof MetadataWriteReadinessProbe) {
+                    $writeProbe->assertMetadataWritable();
+                }
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                return $this->degraded('metadata', $e);
+                $this->recordDegraded('metadata', $e);
+
+                return;
             }
         }
 
@@ -65,7 +134,9 @@ final class HealthCheckHandler implements RequestHandler
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                return $this->degraded('credentials', $e);
+                $this->recordDegraded('credentials', $e);
+
+                return;
             }
         }
 
@@ -85,7 +156,9 @@ final class HealthCheckHandler implements RequestHandler
             $this->lastRateLimitCheckAt = hrtime(true) / 1e9;
         }
         if ($this->rateLimitEnabled && ! $this->rateLimitHealthy) {
-            return $this->degradedResponse();
+            $this->readinessHealthy = false;
+
+            return;
         }
 
         if ($this->metadata !== null && $this->storageTiers !== null) {
@@ -103,55 +176,53 @@ final class HealthCheckHandler implements RequestHandler
                 } catch (\Amp\CancelledException $e) {
                     throw $e;
                 } catch (\Throwable $e) {
-                    return $this->degraded('metadata', $e);
+                    $this->recordDegraded('metadata', $e);
+
+                    return;
                 }
             }
             if ($this->missingReferencedTier !== null) {
-                return $this->degraded(
+                $this->recordDegraded(
                     'storage:' . $this->missingReferencedTier,
                     new \RuntimeException('Persisted storage tier is not configured on this API node.'),
                 );
+
+                return;
             }
         }
 
         foreach ($this->storageTiers?->all() ?? [] as $tier) {
             try {
-                // The result is irrelevant: a successful lookup proves that
-                // the backend can execute a read operation.
-                $tier->backend->bucketExists('__health_check__');
                 $backend = $tier->backend;
                 while ($backend instanceof ObservedStorageBackend) {
                     $backend = $backend->innerBackend();
                 }
                 if ($backend instanceof FilesystemBackend) {
-                    // Ordinary local roots can become read-only after startup.
-                    $root = $backend->getBasePath();
-                    clearstatcache(true, $root);
-                    $permissions = @fileperms($root);
-                    if (! @is_dir($root) || $permissions === false
-                        || ($permissions & 0222) === 0 || ! @is_writable($root)) {
-                        throw new \RuntimeException('Local storage root is not writable.');
-                    }
+                    // Keep the complete local probe in its isolated worker;
+                    // a preceding filesystem stat could otherwise strand a
+                    // production metadata worker before the timeout applies.
+                    $backend->assertWritable();
+                } else {
+                    // The result is irrelevant: a successful lookup proves
+                    // that the backend can execute a read operation.
+                    $tier->backend->bucketExists('__health_check__');
                 }
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                return $this->degraded('storage:' . $tier->name, $e);
+                $this->recordDegraded('storage:' . $tier->name, $e);
+
+                return;
             }
         }
 
-        return new Response(
-            status: 200,
-            headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-            body: '{"status":"ok"}',
-        );
+        $this->readinessHealthy = true;
     }
 
-    private function degraded(string $component, \Throwable $error): Response
+    private function recordDegraded(string $component, \Throwable $error): void
     {
+        $this->readinessHealthy = false;
         $this->logDegraded($component, $error);
-
-        return $this->degradedResponse();
     }
 
     private function logDegraded(string $component, \Throwable $error): void
@@ -162,12 +233,12 @@ final class HealthCheckHandler implements RequestHandler
         ]);
     }
 
-    private function degradedResponse(): Response
+    private function readinessResponse(): Response
     {
         return new Response(
-            status: 503,
+            status: $this->readinessHealthy ? 200 : 503,
             headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-            body: '{"status":"degraded"}',
+            body: $this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}',
         );
     }
 }

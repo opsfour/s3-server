@@ -84,7 +84,14 @@ curl -f http://localhost:9000/.health
 The readiness handler rechecks persisted storage-tier references at most once
 every 30 seconds. If metadata references a tier absent from this process,
 `/.health` returns 503 after the next check. Configure the proxy to stop routing
-to an unready process; `/.live` remains a process-liveness probe.
+to an unready process; `/.live` remains a process-liveness probe. At most once
+every 30 seconds, readiness also executes a no-row DML statement on a built-in
+metadata backend and creates, synchronizes, then removes a private sentinel in
+each local filesystem tier. Concurrent requests share the same in-flight probe.
+With the standard asynchronous metadata and credential providers, the HTTP
+response waits at most five seconds. A timed-out local filesystem probe is
+terminated in its isolated worker. Explicit synchronous provider modes must
+return promptly themselves. These probes change no S3 metadata or object data.
 
 For Kubernetes:
 

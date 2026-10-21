@@ -105,6 +105,68 @@ final readonly class LocalDurableFilePublisher
         }
     }
 
+    /** Exercise local create, write, sync and cleanup without storing user data. */
+    public function assertWritable(): void
+    {
+        clearstatcache(true, $this->root);
+        $permissions = @fileperms($this->root);
+        if (! @is_dir($this->root) || $permissions === false
+            || ($permissions & 0222) === 0 || ! @is_writable($this->root)) {
+            throw new \RuntimeException('Local storage root is not writable.');
+        }
+
+        $removedStaleFile = false;
+        foreach (glob($this->root . '/.opsfour-readiness-*', GLOB_NOSORT) ?: [] as $stalePath) {
+            if (! is_file($stalePath) || is_link($stalePath)) {
+                continue;
+            }
+            $removed = $this->io->unlink($stalePath);
+            if (! $removed) {
+                $removed = ! file_exists($stalePath) || (@unlink($stalePath) && ! file_exists($stalePath));
+            }
+            if (! $removed) {
+                throw new \RuntimeException('Failed to remove stale local storage readiness file.');
+            }
+            $removedStaleFile = true;
+        }
+        if ($removedStaleFile && ! $this->io->syncDirectory($this->root)) {
+            throw new \RuntimeException('Failed to synchronize stale readiness cleanup.');
+        }
+
+        $path = $this->root . '/.opsfour-readiness-' . bin2hex(random_bytes(16));
+        $file = @fopen($path, 'x+b');
+        if ($file === false) {
+            throw new \RuntimeException('Failed to create local storage readiness file.');
+        }
+
+        $failure = null;
+        try {
+            $payload = "opsfour-readiness\n";
+            if (! @chmod($path, 0600)
+                || @fwrite($file, $payload) !== strlen($payload)
+                || ! @fflush($file)
+                || ! $this->io->syncFile($file)) {
+                throw new \RuntimeException('Failed to write local storage readiness file.');
+            }
+        } catch (\Throwable $error) {
+            $failure = $error;
+        } finally {
+            $closed = @fclose($file);
+            $removed = $this->io->unlink($path);
+            if (! $removed) {
+                $removed = ! file_exists($path) || (@unlink($path) && ! file_exists($path));
+            }
+        }
+
+        $directorySynchronized = $this->io->syncDirectory($this->root);
+        if ($failure !== null) {
+            throw $failure;
+        }
+        if (! $closed || ! $removed || ! $directorySynchronized) {
+            throw new \RuntimeException('Failed to clean local storage readiness file.');
+        }
+    }
+
     /** Delete a file and durably record its absence. */
     public function delete(string $path): void
     {

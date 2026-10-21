@@ -210,7 +210,15 @@ final readonly class StorageGarbageCollector
         if ($uploadId === null || preg_match('/^([1-9][0-9]{0,4})-[a-f0-9]{32}-([a-f0-9]{32})$/D', basename($path), $matches) !== 1) {
             throw new \RuntimeException('Local multipart part path is not a planned attempt.');
         }
-        StoragePath::assertPlannedPartPath($backend->getBasePath(), $path, $uploadId, (int) $matches[1]);
+        try {
+            StoragePath::assertPlannedPartPath($backend->getBasePath(), $path, $uploadId, (int) $matches[1]);
+        } catch (\InvalidArgumentException $error) {
+            $resolvedRoot = realpath($backend->getBasePath());
+            if ($resolvedRoot === false || rtrim($resolvedRoot, '/') === rtrim($backend->getBasePath(), '/')) {
+                throw $error;
+            }
+            StoragePath::assertPlannedPartPath(rtrim($resolvedRoot, '/'), $path, $uploadId, (int) $matches[1]);
+        }
         $backend->sealFencedMultipartPath($path, $matches[2]);
     }
 

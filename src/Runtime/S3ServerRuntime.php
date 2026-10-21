@@ -9,6 +9,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\Storage\DedicatedAmpObjectWriteLeaseRenewer;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -27,6 +28,8 @@ final class S3ServerRuntime
     private bool $encryptionClosed = false;
 
     private ?LocalFencedObjectWriter $localObjectWriter = null;
+
+    private ?LocalFencedMultipartPartWriter $localMultipartPartWriter = null;
 
     private ?DedicatedAmpObjectWriteLeaseRenewer $localObjectRenewer = null;
 
@@ -54,11 +57,14 @@ final class S3ServerRuntime
     public function attachLocalObjectWriteResources(
         LocalFencedObjectWriter $writer,
         ?DedicatedAmpObjectWriteLeaseRenewer $renewer,
+        LocalFencedMultipartPartWriter $multipartPartWriter,
     ): void {
-        if ($this->stopped || $this->stopInProgress || $this->localObjectWriter !== null || $this->localObjectRenewer !== null) {
+        if ($this->stopped || $this->stopInProgress || $this->localObjectWriter !== null
+            || $this->localMultipartPartWriter !== null || $this->localObjectRenewer !== null) {
             throw new \LogicException('Local object write resources were already attached or runtime stopped.');
         }
         $this->localObjectWriter = $writer;
+        $this->localMultipartPartWriter = $multipartPartWriter;
         $this->localObjectRenewer = $renewer;
     }
 
@@ -89,6 +95,13 @@ final class S3ServerRuntime
             $this->abortIncompleteShutdown();
         }
 
+        try {
+            $this->localMultipartPartWriter?->shutdown();
+            $this->localMultipartPartWriter = null;
+        } catch (\Throwable $e) {
+            $this->logShutdownWarning('Local multipart part worker shutdown failed.', ['exception' => $e::class]);
+            $this->abortIncompleteShutdown();
+        }
         try {
             $this->localObjectWriter?->shutdown();
             $this->localObjectWriter = null;

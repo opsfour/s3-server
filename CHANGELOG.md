@@ -85,8 +85,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Make readiness verify metadata DML and a synchronized local-storage write
+  with cleanup, so read-only metadata or unwritable local storage returns 503
+  before traffic is admitted.
 - Use durable write intents for normal local-filesystem object writes and
   recover physical paths left behind by a process exit before metadata commit.
+- Stage local multipart parts before arming their durable intent and use the
+  attempt-bound local assembly path for normal multipart completion.
 - Apply website CORS rules, honor BucketOwnerEnforced ACL semantics, decrypt
   SSE-S3 website objects, and reject stored-size mismatches while streaming.
 - Keep database credential PDO operations out of the HTTP event loop and bound

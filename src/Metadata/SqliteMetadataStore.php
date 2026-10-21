@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private ?\PDO $pdo = null;
 
@@ -53,6 +53,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
     public function databaseFilePath(): ?string
     {
         return $this->isInMemory() ? null : $this->databasePath;
+    }
+
+    public function assertMetadataWritable(): void
+    {
+        $this->connection()->exec('UPDATE s3_buckets SET region = region WHERE 0');
     }
 
     // ===============================================================

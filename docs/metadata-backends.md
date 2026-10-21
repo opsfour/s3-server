@@ -94,7 +94,9 @@ S3_METADATA_DSN="host=pgbouncer.internal port=6432 dbname=s3server user=s3 passw
 - Teams that already operate PostgreSQL or need database-level availability
 - Workloads that should avoid SQLite's single-writer constraint
 - Shared rate-limit state for a later separately qualified multi-process profile
-- A failed rate-limit database check returns S3 `SlowDown` (503) when the limit is enabled; readiness probes that write path every 30 seconds
+- A failed rate-limit database check returns S3 `SlowDown` (503) when the limit
+  is enabled; readiness independently verifies DML permission without changing
+  metadata at most once every 30 seconds
 - Notification queue coordination for later qualified multi-process or
   multi-host profiles
 

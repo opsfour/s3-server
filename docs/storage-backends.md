@@ -55,6 +55,18 @@ staging bytes in the private `.tmp/object-writes` directory on the same
 filesystem. Publication uses a create-only path, and the intent collector
 recovers or removes paths whose request did not finish committing metadata on
 its next pass or after restart.
+
+Multipart part uploads and part copies use the same private staging area. They
+reserve and arm their part intent only after the complete part and its
+checksums have been staged, immediately before create-only publication.
+Completion uses an attempt-bound assembly path, and AbortMultipartUpload
+stages exact committed part paths for durable cleanup.
+
+Finish or abort active multipart uploads before changing from one local default
+storage tier to another. Uploads pinned to a remote tier remain usable while a
+local tier is the default; an upload pinned to a different local tier is
+rejected instead of weakening the local write fence.
+
 This write fence applies to the documented one-host, one-process profile. The
 same capability on a Flysystem adapter or shared filesystem does not establish
 a remote or multi-host write fence.

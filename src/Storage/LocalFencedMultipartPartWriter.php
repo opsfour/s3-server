@@ -20,9 +20,7 @@ use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Parallel\LocalMultipartPartWriteTask;
 use OpsFour\S3Server\Parallel\LocalMultipartPartWriteTaskResult;
 
-/**
- * @internal Isolated one-shot publisher. Handlers may bind it explicitly.
- */
+/** One-shot local part publisher backed by durable metadata intents. */
 final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBackend
 {
     private readonly string $root;
@@ -41,15 +39,33 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
     /** Bind a handler's exact metadata store, immutable tier and backend root. */
     public function assertBoundTo(MetadataStore $metadata, StorageBackend $backend, string $storageTier): void
     {
+        if (! $this->isBoundTo($metadata, $backend, $storageTier)) {
+            throw new \InvalidArgumentException('Multipart writer is not bound to this exact metadata store, tier and filesystem.');
+        }
+    }
+
+    public function storageTierName(): string
+    {
+        return $this->storageTier;
+    }
+
+    /** Check the physical root as well as the persisted tier identity. */
+    public function isBoundTo(MetadataStore $metadata, StorageBackend $backend, string $storageTier): bool
+    {
         $inner = $backend;
         while ($inner instanceof ObservedStorageBackend) {
             $inner = $inner->innerBackend();
         }
-        if ($metadata !== $this->intents || $storageTier !== $this->storageTier
-            || ! $inner instanceof FilesystemBackend
-            || $inner->getBasePath() !== $this->root) {
-            throw new \InvalidArgumentException('Multipart writer is not bound to this exact metadata store, tier and filesystem.');
+        if (! $inner instanceof FilesystemBackend) {
+            return false;
         }
+
+        $backendRoot = realpath($inner->getBasePath());
+
+        return $metadata === $this->intents
+            && $storageTier === $this->storageTier
+            && $backendRoot !== false
+            && rtrim($backendRoot, '/') === $this->root;
     }
 
     public function __construct(
@@ -67,14 +83,25 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             throw new \InvalidArgumentException('Multipart writer root does not exist.');
         }
         $scratch = realpath($scratchDirectory);
-        if ($scratch === false || $scratch === $root || str_starts_with($scratch, rtrim($root, '/') . '/')
+        $internalScratch = rtrim($root, '/') . '/.tmp/object-writes';
+        if ($scratch === false || $scratch === $root
+            || (str_starts_with($scratch, rtrim($root, '/') . '/') && $scratch !== $internalScratch)
             || $storageTier === '') {
-            throw new \InvalidArgumentException('Multipart scratch and tier must be separate from the storage root.');
+            throw new \InvalidArgumentException('Multipart scratch inside the storage root must use its reserved internal path.');
+        }
+        $scratchPermissions = @fileperms($scratch);
+        $scratchOwner = @fileowner($scratch);
+        $rootStat = @stat($root);
+        $scratchStat = @stat($scratch);
+        if ($scratchPermissions === false || ($scratchPermissions & 0077) !== 0
+            || ! function_exists('posix_geteuid') || $scratchOwner === false || $scratchOwner !== posix_geteuid()
+            || $rootStat === false || $scratchStat === false || $rootStat['dev'] !== $scratchStat['dev']) {
+            throw new \InvalidArgumentException('Multipart scratch must be private, process-owned, and on the storage filesystem.');
         }
         $this->root = rtrim($root, '/');
         $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
         $this->writePool = $writePool ?? new ContextWorkerPool(2);
-        $this->admission = new LocalObjectWriteLeaseAdmission(2);
+        $this->admission = new LocalObjectWriteLeaseAdmission(2, waitForCapacity: true);
     }
 
     /**

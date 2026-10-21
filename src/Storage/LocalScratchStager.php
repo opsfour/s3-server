@@ -17,7 +17,8 @@ use OpsFour\S3Server\Parallel\LocalStageBudgetReserveTask;
 
 /**
  * Stages exactly the supplied bytes on private scratch. The caller must bind
- * this directory to node-local storage outside the physical storage root.
+ * this directory to trusted storage on the same local filesystem as its
+ * publisher.
  * Retain a successful stage until its physical worker is terminal; SSE
  * callers must supply ciphertext before calling stage().
  */

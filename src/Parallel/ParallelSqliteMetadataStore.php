@@ -12,6 +12,7 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ListObjectsResult;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\MetadataWriteReadinessProbe;
 use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\GenerationBoundBucketMultipartCleanupStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
@@ -48,7 +49,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * calling Fiber to a dedicated worker via WeakMap<Fiber, Worker>.
  * A TransactionGuard ensures abandoned fibers trigger a rollback.
  */
-final class ParallelSqliteMetadataStore implements MetadataStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
 {
     private readonly WorkerPool $pool;
 
@@ -144,6 +145,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore, ObjectRetentio
     public function initialize(): void
     {
         $this->submit('initialize');
+    }
+
+    public function assertMetadataWritable(): void
+    {
+        $this->submit('assertMetadataWritable');
     }
 
     public function assertSupportedBucketEncryptionInventory(): void

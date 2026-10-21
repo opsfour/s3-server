@@ -45,6 +45,49 @@ final class LocalDurableFilePublisherTest extends TestCase
         self::assertFalse($io->renameCalled, 'Durable publication must remain create-only.');
     }
 
+    public function test_write_readiness_probe_is_durable_and_leaves_no_file(): void
+    {
+        $io = new RecordingDurableFileIo();
+
+        (new LocalDurableFilePublisher($this->root, $io))->assertWritable();
+
+        self::assertSame(['sync-file', 'unlink', 'sync-directory:' . $this->root], $io->events);
+        self::assertSame([], array_values(array_diff(scandir($this->root) ?: [], ['.', '..'])));
+    }
+
+    public function test_write_readiness_probe_cleans_up_after_a_write_failure(): void
+    {
+        $io = new RecordingDurableFileIo();
+        $io->failure = 'sync-file';
+
+        try {
+            (new LocalDurableFilePublisher($this->root, $io))->assertWritable();
+            self::fail('An unsynchronized readiness write must fail.');
+        } catch (\RuntimeException) {
+        }
+
+        self::assertSame(['sync-file', 'unlink', 'sync-directory:' . $this->root], $io->events);
+        self::assertSame([], array_values(array_diff(scandir($this->root) ?: [], ['.', '..'])));
+    }
+
+    public function test_write_readiness_probe_removes_a_stale_sentinel_before_retry(): void
+    {
+        $stale = $this->root . '/.opsfour-readiness-' . str_repeat('a', 32);
+        self::assertSame(5, file_put_contents($stale, 'stale'));
+        $io = new RecordingDurableFileIo();
+
+        (new LocalDurableFilePublisher($this->root, $io))->assertWritable();
+
+        self::assertSame([
+            'unlink',
+            'sync-directory:' . $this->root,
+            'sync-file',
+            'unlink',
+            'sync-directory:' . $this->root,
+        ], $io->events);
+        self::assertSame([], array_values(array_diff(scandir($this->root) ?: [], ['.', '..'])));
+    }
+
     /** @return iterable<string, array{string, list<string>, bool, bool}> */
     public static function publicationFailures(): iterable
     {

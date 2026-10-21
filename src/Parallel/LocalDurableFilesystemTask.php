@@ -18,6 +18,8 @@ final readonly class LocalDurableFilesystemTask implements Task
 
     private const string ENSURE_DIRECTORY = 'ensure-directory';
 
+    private const string ASSERT_WRITABLE = 'assert-writable';
+
     private function __construct(
         private string $operation,
         private string $root,
@@ -59,6 +61,11 @@ final readonly class LocalDurableFilesystemTask implements Task
         return new self(self::ENSURE_DIRECTORY, $root, $path, '');
     }
 
+    public static function assertWritable(string $root): self
+    {
+        return new self(self::ASSERT_WRITABLE, $root, $root, '');
+    }
+
     public function run(Channel $channel, Cancellation $cancellation): null
     {
         $cancellation->throwIfRequested();
@@ -71,6 +78,7 @@ final readonly class LocalDurableFilesystemTask implements Task
             self::PUBLISH => $publisher->publish($this->path, $this->targetPath),
             self::DELETE => $publisher->delete($this->path),
             self::ENSURE_DIRECTORY => $publisher->ensureDirectory($this->path),
+            self::ASSERT_WRITABLE => $publisher->assertWritable(),
             default => throw new \LogicException('Unknown local durability operation.'),
         };
 

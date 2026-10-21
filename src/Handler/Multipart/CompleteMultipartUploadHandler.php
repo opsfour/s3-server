@@ -62,6 +62,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         private readonly float $intentLeaseSeconds = 43_200.0,
         private readonly float $intentRenewalSeconds = 300.0,
         private readonly bool $requireLocalFencedCompletion = false,
+        private readonly ?string $localFencedCompletionTier = null,
     ) {
         if (! is_finite($this->intentLeaseSeconds) || ! is_finite($this->intentRenewalSeconds)
             || $this->intentLeaseSeconds <= 0.0 || $this->intentRenewalSeconds <= 0.0
@@ -124,9 +125,15 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
         $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
         $uploadStorage = $uploadTier->backend;
-        if ($this->requireLocalFencedCompletion
-            && (! self::isLocalFilesystem($uploadStorage)
-                || ! $this->metadata instanceof LocalMultipartCompletionIntentStore)) {
+        $isLocalFilesystem = self::isLocalFilesystem($uploadStorage);
+        $boundLocalTierSelected = $this->requireLocalFencedCompletion
+            && ($this->localFencedCompletionTier === null
+                || $this->localFencedCompletionTier === $uploadTier->name);
+        $useLocalFencedCompletion = $boundLocalTierSelected && $isLocalFilesystem;
+        if ($this->requireLocalFencedCompletion && $boundLocalTierSelected !== $isLocalFilesystem) {
+            throw new InternalErrorException('Local multipart completion fence is not bound to this upload tier.');
+        }
+        if ($useLocalFencedCompletion && ! $this->metadata instanceof LocalMultipartCompletionIntentStore) {
             throw new InternalErrorException('Local multipart completion requires a qualified filesystem backend and fenced metadata store.');
         }
         $storageTier = $uploadTier->name;
@@ -306,7 +313,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         // race with a renewal of the same intent.
         $localDispatchId = null;
         $currentLease = $intent->leaseUntil;
-        if (self::isLocalFilesystem($uploadStorage)) {
+        if ($useLocalFencedCompletion) {
             if (! $this->metadata instanceof LocalMultipartCompletionIntentStore) {
                 $this->abandonAttempt($intent);
                 throw new InternalErrorException('Local multipart completion requires a fenced metadata store.');
@@ -377,7 +384,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $request,
                 );
             } else {
-                $local = $this->requireLocalFencedCompletion ? self::localFilesystemBackend($uploadStorage) : null;
+                $local = $useLocalFencedCompletion ? self::localFilesystemBackend($uploadStorage) : null;
                 if ($local !== null) {
                     if ($localDispatchId === null) {
                         throw new InternalErrorException('Local multipart assembly has no armed dispatch.');

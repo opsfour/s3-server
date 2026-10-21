@@ -125,6 +125,7 @@ final class HandlerRegistrar
         ?StorageTierRegistry $storageTiers = null,
         ?LocalFencedObjectWriter $localFencedWriter = null,
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
+        ?LocalFencedMultipartPartWriter $localPartWriter = null,
     ): void {
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
             throw new \InvalidArgumentException('Local object writes need both writer and lease factory.');
@@ -143,6 +144,7 @@ final class HandlerRegistrar
             $storageTiers,
             $localFencedWriter,
             $localLeaseFactory,
+            $localPartWriter,
         );
     }
 
@@ -163,7 +165,8 @@ final class HandlerRegistrar
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
-        $requireLocalFencedMultipart = $localPartWriter !== null;
+        $requireLocalFencedCompletion = $localPartWriter !== null;
+        $localFencedCompletionTier = $localPartWriter?->storageTierName();
         $registry->registerStorage($storage, $storageTiers);
 
         // Bucket operations.
@@ -279,12 +282,12 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::UploadPart,
-            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, requireLocalFencedParts: $requireLocalFencedMultipart, localPartWriter: $localPartWriter),
+            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, localPartWriter: $localPartWriter),
         );
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, requireLocalFencedParts: $requireLocalFencedMultipart, localPartWriter: $localPartWriter),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, localPartWriter: $localPartWriter),
         );
 
         $registry->register(
@@ -298,7 +301,8 @@ final class HandlerRegistrar
                 $config->maxEncryptedObjectSize,
                 $quotas,
                 $storageTiers,
-                requireLocalFencedCompletion: $requireLocalFencedMultipart,
+                requireLocalFencedCompletion: $requireLocalFencedCompletion,
+                localFencedCompletionTier: $localFencedCompletionTier,
             ),
         );
 

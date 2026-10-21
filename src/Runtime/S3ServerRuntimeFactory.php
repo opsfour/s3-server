@@ -18,6 +18,7 @@ use OpsFour\S3Server\Encryption\RedisMasterKeyProvider;
 use OpsFour\S3Server\Encryption\VaultMasterKeyProvider;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
+use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
@@ -32,6 +33,7 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
@@ -146,8 +148,9 @@ final readonly class S3ServerRuntimeFactory
 
             $localFencedWriter = null;
             $localLeaseFactory = null;
+            $localPartWriter = null;
             if ($config->localObjectWriteTestScratchPath !== null) {
-                [$localFencedWriter, $localLeaseFactory, $renewer] = $this->localObjectWriteWiring(
+                [$localFencedWriter, $localLeaseFactory, $renewer, $localPartWriter] = $this->localObjectWriteWiring(
                     $config,
                     $rawMetadata,
                     $metadata,
@@ -157,7 +160,7 @@ final readonly class S3ServerRuntimeFactory
                 );
                 $logger->warning('Isolated local write fence fault profile active; its pause hook must never be enabled in production.');
             } elseif ($this->localFilesystemBackend($storageTiers) !== null) {
-                [$localFencedWriter, $localLeaseFactory, $renewer] = $this->localObjectWriteWiring(
+                [$localFencedWriter, $localLeaseFactory, $renewer, $localPartWriter] = $this->localObjectWriteWiring(
                     $config,
                     $rawMetadata,
                     $metadata,
@@ -167,8 +170,8 @@ final readonly class S3ServerRuntimeFactory
                 );
             }
 
-            if ($localFencedWriter !== null && $localLeaseFactory !== null) {
-                $runtime->attachLocalObjectWriteResources($localFencedWriter, $renewer);
+            if ($localFencedWriter !== null && $localLeaseFactory !== null && $localPartWriter !== null) {
+                $runtime->attachLocalObjectWriteResources($localFencedWriter, $renewer, $localPartWriter);
                 $server->setLocalObjectWriteIntentCollector(new LocalObjectWriteIntentCollector(
                     $metadata,
                     $storageTiers,
@@ -206,6 +209,7 @@ final readonly class S3ServerRuntimeFactory
                 storageTiers: $storageTiers,
                 localFencedWriter: $localFencedWriter,
                 localLeaseFactory: $localLeaseFactory,
+                localPartWriter: $localPartWriter,
             );
 
             return $runtime;
@@ -262,7 +266,7 @@ final readonly class S3ServerRuntimeFactory
     }
 
     /**
-     * @return array{LocalFencedObjectWriter, LocalObjectWriteLeaseGuardFactory, DedicatedAmpObjectWriteLeaseRenewer|null}
+     * @return array{LocalFencedObjectWriter, LocalObjectWriteLeaseGuardFactory, DedicatedAmpObjectWriteLeaseRenewer|null, LocalFencedMultipartPartWriter}
      */
     private function localObjectWriteWiring(
         S3ServerConfig $config,
@@ -274,12 +278,14 @@ final readonly class S3ServerRuntimeFactory
     ): array {
         $backend = $this->localFilesystemBackend($tiers)
             ?? throw new \RuntimeException('Local object write fencing requires an existing filesystem default tier.');
-        if (! $metadata instanceof ObjectWriteIntentStore) {
-            throw new \RuntimeException('Local object write fencing requires durable object-write metadata intents.');
+        if (! $metadata instanceof ObjectWriteIntentStore
+            || ! $metadata instanceof FencedMultipartPartWriteIntentStore) {
+            throw new \RuntimeException('Local filesystem writes require durable object and multipart-part metadata intents.');
         }
 
         $renewer = null;
         $writer = null;
+        $partWriter = null;
         try {
             $writer = new LocalFencedObjectWriter(
                 $backend->getBasePath(),
@@ -288,6 +294,12 @@ final readonly class S3ServerRuntimeFactory
                 workerIo: $faultProfile && getenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK') === '1'
                     ? new LocalObjectTestPublishPauseIo($scratch)
                     : null,
+            );
+            $partWriter = new LocalFencedMultipartPartWriter(
+                $backend->getBasePath(),
+                $scratch,
+                $tiers->defaultTier()->name,
+                $metadata,
             );
 
             if (in_array($config->metadataDriver, ['postgres', 'mysql'], true)) {
@@ -308,6 +320,7 @@ final readonly class S3ServerRuntimeFactory
                         new LocalObjectWriteLeaseAdmission(2, waitForCapacity: true),
                     ),
                     $renewer,
+                    $partWriter,
                 ];
             }
 
@@ -327,8 +340,10 @@ final readonly class S3ServerRuntimeFactory
                     new LocalObjectWriteLeaseAdmission(1, waitForCapacity: true),
                 ),
                 null,
+                $partWriter,
             ];
         } catch (\Throwable $error) {
+            $partWriter?->shutdown();
             $writer?->shutdown();
             $renewer?->close();
             throw $error;

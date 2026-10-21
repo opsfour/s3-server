@@ -24,6 +24,9 @@ use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\StorageTier;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -285,6 +288,78 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertSame(0, (int) $count->fetchColumn());
         } finally {
             $storage->shutdown();
+            $this->removeDirectory($root);
+        }
+    }
+
+    public function test_fenced_completion_is_limited_to_its_bound_local_tier(): void
+    {
+        $root = sys_get_temp_dir() . '/s3-local-complete-tier-' . bin2hex(random_bytes(8));
+        $activeRoot = $root . '/active';
+        $legacyRoot = $root . '/legacy';
+        self::assertTrue(mkdir($activeRoot, 0700, true));
+        self::assertTrue(mkdir($legacyRoot, 0700));
+        $active = new FilesystemBackend($activeRoot);
+        $legacy = new FilesystemBackend($legacyRoot);
+        $remote = new InMemoryBackend();
+        try {
+            $metadata = new SqliteMetadataStore($root . '/metadata.sqlite');
+            $metadata->initialize();
+            $metadata->createBucket('owner', 'bucket', 'us-east-1');
+            $active->createBucket('bucket');
+            $legacy->createBucket('bucket');
+            $remote->createBucket('bucket');
+            $tiers = new StorageTierRegistry([
+                new StorageTier('REMOTE', $remote),
+                new StorageTier('LEGACY', $legacy),
+                new StorageTier('ACTIVE', $active, defaultWriteTier: true),
+            ]);
+            $handler = new CompleteMultipartUploadHandler(
+                $metadata,
+                $active,
+                storageTiers: $tiers,
+                requireLocalFencedCompletion: true,
+                localFencedCompletionTier: 'ACTIVE',
+            );
+
+            $remoteUpload = bin2hex(random_bytes(16));
+            $metadata->createMultipartUploadWithTier(
+                $remoteUpload,
+                'bucket',
+                'key',
+                'owner',
+                'REMOTE',
+                userMetadata: self::currentPolicyContext(),
+            );
+            $remotePart = $remote->putPart('bucket', 'key', $remoteUpload, 1, new ReadableBuffer('remote part'));
+            $remoteEtag = md5('remote part');
+            $metadata->putPart($remoteUpload, 1, $remoteEtag, strlen('remote part'), $remotePart->path);
+            self::assertSame(200, $handler->handleRequest(self::completionRequest($remoteUpload, $remoteEtag))->getStatus());
+
+            $legacyUpload = bin2hex(random_bytes(16));
+            $metadata->createMultipartUploadWithTier(
+                $legacyUpload,
+                'bucket',
+                'key',
+                'owner',
+                'LEGACY',
+                userMetadata: self::currentPolicyContext(),
+            );
+            $legacyPart = $legacy->putPart('bucket', 'key', $legacyUpload, 1, new ReadableBuffer('legacy part'));
+            $legacyEtag = md5('legacy part');
+            $metadata->putPart($legacyUpload, 1, $legacyEtag, strlen('legacy part'), $legacyPart->path);
+
+            try {
+                $handler->handleRequest(self::completionRequest($legacyUpload, $legacyEtag));
+                self::fail('A different local tier used the active tier completion fence.');
+            } catch (InternalErrorException $error) {
+                self::assertSame('Local multipart completion fence is not bound to this upload tier.', $error->getMessage());
+            }
+            self::assertNotNull($metadata->getMultipartUpload($legacyUpload));
+            self::assertCount(1, $metadata->getParts($legacyUpload));
+        } finally {
+            $active->shutdown();
+            $legacy->shutdown();
             $this->removeDirectory($root);
         }
     }

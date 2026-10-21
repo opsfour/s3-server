@@ -126,7 +126,7 @@ Storage Path Structure (filesystem backend):
 ├── .parts/<upload-id>/       # Multipart upload parts
 ├── .assemblies/              # Planned multipart completion paths
 └── .tmp/                     # Temporary files for durable publication
-    └── object-writes/        # Private same-filesystem staging for object writes
+    └── object-writes/        # Private staging for object and multipart-part writes
 ```
 
 The backend writes and synchronizes a temporary file, creates a unique final

@@ -24,6 +24,7 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
@@ -152,13 +153,19 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             self::assertSame($writer, (new \ReflectionProperty(CopyObjectHandler::class, 'localFencedWriter'))->getValue($copy));
             self::assertSame($factory, (new \ReflectionProperty(CopyObjectHandler::class, 'localLeaseFactory'))->getValue($copy));
             foreach ([
-                [S3Operation::UploadPart, UploadPartHandler::class, 'requireLocalFencedParts'],
-                [S3Operation::UploadPartCopy, UploadPartCopyHandler::class, 'requireLocalFencedParts'],
-                [S3Operation::CompleteMultipartUpload, CompleteMultipartUploadHandler::class, 'requireLocalFencedCompletion'],
-            ] as [$operation, $class, $flag]) {
+                [S3Operation::UploadPart, UploadPartHandler::class, 'requireLocalFencedParts', false],
+                [S3Operation::UploadPartCopy, UploadPartCopyHandler::class, 'requireLocalFencedParts', false],
+                [S3Operation::CompleteMultipartUpload, CompleteMultipartUploadHandler::class, 'requireLocalFencedCompletion', true],
+            ] as [$operation, $class, $flag, $required]) {
                 $handler = $runtime->server->getHandlerRegistry()->get($operation);
                 self::assertInstanceOf($class, $handler);
-                self::assertFalse((new \ReflectionProperty($class, $flag))->getValue($handler));
+                self::assertSame($required, (new \ReflectionProperty($class, $flag))->getValue($handler));
+                if ($operation !== S3Operation::CompleteMultipartUpload) {
+                    self::assertInstanceOf(
+                        LocalFencedMultipartPartWriter::class,
+                        (new \ReflectionProperty($class, 'localPartWriter'))->getValue($handler),
+                    );
+                }
             }
             $backgroundWriter = (new \ReflectionProperty($runtime->server, 'localBackgroundWriter'))->getValue($runtime->server);
             self::assertInstanceOf(LocalFencedBackgroundObjectWriter::class, $backgroundWriter);
@@ -207,6 +214,8 @@ final class LocalObjectWriteRuntimeTest extends TestCase
                 (new \ReflectionProperty($stager, 'scratch'))->getValue($stager),
             );
             self::assertNull((new \ReflectionProperty(S3ServerRuntime::class, 'localObjectRenewer'))->getValue($runtime));
+            $partWriter = (new \ReflectionProperty(S3ServerRuntime::class, 'localMultipartPartWriter'))->getValue($runtime);
+            self::assertInstanceOf(LocalFencedMultipartPartWriter::class, $partWriter);
 
             $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
             self::assertInstanceOf(PutObjectHandler::class, $put);
@@ -217,6 +226,7 @@ final class LocalObjectWriteRuntimeTest extends TestCase
         } finally {
             $runtime->stop();
         }
+        self::assertTrue((new \ReflectionProperty(LocalFencedMultipartPartWriter::class, 'shuttingDown'))->getValue($partWriter));
     }
 
     public function test_known_metadata_decorator_is_unwrapped_for_sql_lease_resources(): void

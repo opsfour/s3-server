@@ -13,6 +13,8 @@ use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\TaskFailureError;
 use Amp\Parallel\Worker\TaskFailureException;
 use Amp\Sync\LocalMutex;
+use Amp\TimeoutCancellation;
+use Amp\TimeoutException;
 use OpsFour\S3Server\Parallel\LocalMultipartPublishTask;
 use OpsFour\S3Server\Parallel\LocalMultipartAssemblyTask;
 use OpsFour\S3Server\Parallel\LocalMultipartSealTask;
@@ -53,6 +55,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
     private ?ContextWorkerPool $durabilityPool = null;
 
+    private ?ContextWorkerPool $readinessPool = null;
+
     /** IPC uncertainty retains a slot until backend shutdown. */
     private int $multipartFenceAdmissions = 0;
 
@@ -88,6 +92,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
     public function shutdown(): void
     {
+        $this->readinessPool?->shutdown();
+        $this->readinessPool = null;
         foreach ($this->ownedWorkerPools as $pool) {
             $pool->shutdown();
         }
@@ -740,6 +746,26 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         return $this->basePath;
     }
 
+    /** Probe physical write and cleanup in an isolated, disposable worker. */
+    public function assertWritable(): void
+    {
+        $pool = $this->readinessPool();
+        try {
+            $pool->submit(LocalDurableFilesystemTask::assertWritable($this->basePath))
+                ->getFuture()
+                ->await(new TimeoutCancellation(4.0));
+        } catch (CancelledException $error) {
+            if (! $error->getPrevious() instanceof TimeoutException) {
+                throw $error;
+            }
+            if ($this->readinessPool === $pool) {
+                $pool->kill();
+                $this->readinessPool = null;
+            }
+            throw new \RuntimeException('Local storage readiness check timed out.', 0, $error);
+        }
+    }
+
     // ---------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------
@@ -826,6 +852,11 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         }
 
         return $this->durabilityPool;
+    }
+
+    private function readinessPool(): ContextWorkerPool
+    {
+        return $this->readinessPool ??= new ContextWorkerPool(1);
     }
 
     /**
