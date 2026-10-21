@@ -137,9 +137,26 @@ final class BoundedMultipartFormParserTest extends TestCase
         try {
             $parser->parse($this->request(new ReadableIterableStream(str_split($body, 509)), 'guard-boundary'));
             self::fail('A form without a valid closing delimiter must be rejected.');
-        } catch (HttpErrorException $error) {
-            self::assertSame(400, $error->getStatus());
+        } catch (InvalidArgumentException $error) {
+            self::assertSame(400, $error->getHttpStatus());
             self::assertStringContainsString('Request body ended unexpectedly', $error->getMessage());
+        }
+    }
+
+    public function test_text_field_over_64_kib_is_rejected_as_an_s3_client_error(): void
+    {
+        $body = "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"key\"\r\n\r\n"
+            . str_repeat('a', 65_537)
+            . "\r\n--guard-boundary--\r\n";
+        $parser = new PostObjectFormParser($this->createMock(CredentialProvider::class), 'us-east-1', 1_048_576);
+
+        try {
+            $parser->parse($this->request(new ReadableBuffer($body), 'guard-boundary'));
+            self::fail('An oversized text field must be rejected.');
+        } catch (InvalidArgumentException $error) {
+            self::assertSame(400, $error->getHttpStatus());
+            self::assertSame('POST Object form fields may not exceed 64 KiB.', $error->getMessage());
         }
     }
 
@@ -362,8 +379,8 @@ final class BoundedMultipartFormParserTest extends TestCase
         try {
             $parser->parse($this->request(new ReadableIterableStream(str_split($body, 509)), 'guard-boundary'));
             self::fail('The bounded parser must reject an invalid first boundary.');
-        } catch (HttpErrorException $error) {
-            self::assertSame(400, $error->getStatus());
+        } catch (InvalidArgumentException $error) {
+            self::assertSame(400, $error->getHttpStatus());
             self::assertStringContainsString('Invalid boundary', $error->getMessage());
         }
     }

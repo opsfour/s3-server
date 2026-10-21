@@ -9,14 +9,14 @@ namespace OpsFour\S3Server\Exception;
  */
 final class ObjectLockedException extends S3Exception
 {
-    public function __construct(string $message = 'Object is protected by Object Lock and cannot be overwritten or deleted.')
+    public function __construct(string $message = 'Access Denied')
     {
         parent::__construct($message);
     }
 
     public function getErrorCode(): string
     {
-        return 'ObjectLocked';
+        return 'AccessDenied';
     }
 
     public function getHttpStatus(): int

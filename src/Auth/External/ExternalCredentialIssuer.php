@@ -33,8 +33,20 @@ final readonly class ExternalCredentialIssuer
             throw new \InvalidArgumentException('Credential TTL must be between 3600 and 43200 seconds.');
         }
 
-        $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
-            ->modify("+{$ttlSeconds} seconds");
+        $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+        $expiresAt = $now->modify("+{$ttlSeconds} seconds");
+        if (array_key_exists('exp', $identity->claims)) {
+            $identityExpiration = $identity->claims['exp'];
+            if (! is_int($identityExpiration)) {
+                throw new \InvalidArgumentException('External identity expiration must be an integer Unix timestamp.');
+            }
+            if ($identityExpiration <= $now->getTimestamp()) {
+                throw new \InvalidArgumentException('External identity has no remaining credential lifetime.');
+            }
+            if ($identityExpiration < $expiresAt->getTimestamp()) {
+                $expiresAt = $now->setTimestamp($identityExpiration);
+            }
+        }
         $sessionToken = $this->credentials->generateSessionToken();
 
         $credential = $this->credentials->createCredential(

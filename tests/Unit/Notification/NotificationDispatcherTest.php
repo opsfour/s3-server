@@ -440,10 +440,10 @@ final class NotificationDispatcherTest extends TestCase
     {
         $logger = new NotificationArrayLogger();
         $dispatcher = new NotificationDispatcher($this->metadata, $logger);
-        $completed = false;
-        $dispatcher->listen('s3:ObjectCreated:*', static function () use (&$completed): void {
+        $state = (object) ['completed' => false];
+        $dispatcher->listen('s3:ObjectCreated:*', static function () use ($state): void {
             \Amp\delay(0.03);
-            $completed = true;
+            $state->completed = true;
         });
 
         $dispatcher->dispatchEvent(new S3Event(
@@ -459,14 +459,14 @@ final class NotificationDispatcherTest extends TestCase
             self::assertSame('Notification listener shutdown timed out.', $error->getMessage());
         }
 
-        self::assertFalse($completed);
+        self::assertFalse($state->completed);
         self::assertNotNull($logger->findContext('listener_shutdown_timeout', [
             'component' => 'notification',
         ]));
 
         \Amp\delay(0.04);
         $dispatcher->shutdown(1);
-        self::assertTrue($completed);
+        self::assertTrue($state->completed);
     }
 
     public function test_throwing_timeout_logger_cannot_hide_incomplete_listener_shutdown(): void

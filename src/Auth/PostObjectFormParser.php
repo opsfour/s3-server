@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth;
 
+use Amp\ByteStream\BufferException;
+use Amp\Http\HttpStatus;
 use Amp\Http\Server\FormParser\StreamedField;
+use Amp\Http\Server\HttpErrorException;
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\AccessDeniedException;
@@ -278,6 +281,15 @@ final class PostObjectFormParser
                     }
                 },
             );
+
+            if ($e instanceof HttpErrorException && $e->getStatus() === HttpStatus::BAD_REQUEST) {
+                throw new InvalidArgumentException(
+                    $e->getReason() ?: 'POST Object multipart form is malformed.',
+                );
+            }
+            if ($e instanceof BufferException) {
+                throw new InvalidArgumentException('POST Object form fields may not exceed 64 KiB.');
+            }
 
             throw $e;
         }

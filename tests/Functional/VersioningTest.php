@@ -747,10 +747,10 @@ final class VersioningTest extends S3FunctionalTestCase
                 'Key' => $key,
                 'VersionId' => $versionId,
             ]);
-            $this->fail('Expected ObjectLocked exception');
+            $this->fail('Expected AccessDenied response');
         } catch (S3Exception $e) {
             $this->assertSame(403, $e->getStatusCode());
-            $this->assertSame('ObjectLocked', $e->getAwsErrorCode());
+            $this->assertSame('AccessDenied', $e->getAwsErrorCode());
         }
 
         // Delete with bypass should succeed.
@@ -814,10 +814,10 @@ final class VersioningTest extends S3FunctionalTestCase
                 'Key' => $key,
                 'VersionId' => $versionId,
             ]);
-            $this->fail('Expected ObjectLocked exception');
+            $this->fail('Expected AccessDenied response');
         } catch (S3Exception $e) {
             $this->assertSame(403, $e->getStatusCode());
-            $this->assertSame('ObjectLocked', $e->getAwsErrorCode());
+            $this->assertSame('AccessDenied', $e->getAwsErrorCode());
         }
 
         // Remove legal hold.

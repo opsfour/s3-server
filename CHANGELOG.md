@@ -85,6 +85,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Cap OIDC-issued credential lifetimes at the source JWT expiration time.
+- Return HTTP 400 for malformed browser POST multipart bodies and invalid text
+  fields instead of surfacing internal server errors.
+- Return S3 `AccessDenied` when Object Lock blocks a single-object delete.
+- Make PostgreSQL readiness detect capacity triggers removed or disabled after
+  server startup.
 - Make readiness verify metadata DML and a synchronized local-storage write
   with cleanup, so read-only metadata or unwritable local storage returns 503
   before traffic is admitted, and prevent a probe that completes after its

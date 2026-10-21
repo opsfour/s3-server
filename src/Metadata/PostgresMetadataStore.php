@@ -62,6 +62,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     public function assertMetadataWritable(): void
     {
         $this->conn()->execute('UPDATE s3_buckets SET region = region WHERE FALSE');
+        MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
     }
 
     public function assertCurrentSchema(): void

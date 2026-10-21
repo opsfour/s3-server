@@ -232,10 +232,12 @@ same-claim tokens from both issuers, cross-issuer signatures, revocation, and
 access to each assigned bucket before serving traffic.
 
 Credentials always expire and include `sessionToken` and `expiresAt`. Omitting
-`ttlSeconds` gives a one-hour lifetime; explicit values must be from 3,600 to
-43,200 seconds (one to twelve hours). SDK clients must pass all three credential
-fields and refresh before expiry. Header-based SigV4, presigned URLs, and POST
-object uploads reject missing, invalid, or expired session tokens. Credentials
+`ttlSeconds` requests a one-hour lifetime; explicit values must be from 3,600 to
+43,200 seconds (one to twelve hours). The issuing JWT's `exp` is an additional
+hard limit, so the effective credential lifetime can be shorter. SDK clients
+must pass all three credential fields and refresh before expiry. Header-based
+SigV4, presigned URLs, and POST object uploads reject missing, invalid, or
+expired session tokens. Credentials
 already issued without an expiry must be revoked separately if they should no
 longer be usable.
 

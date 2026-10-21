@@ -198,17 +198,23 @@ final class ExternalWriteIntentCapacityTest extends TestCase
         }
     }
 
-    public function test_postgres_serving_rejects_a_missing_capacity_trigger(): void
+    public function test_postgres_serving_and_readiness_reject_a_later_missing_capacity_trigger(): void
     {
         [$dsn, $pool] = self::database('postgres', 'S3_TEST_POSTGRES_METADATA_DSN');
-        MetadataStoreFactory::create('postgres', ['dsn' => $dsn]);
+        $store = MetadataStoreFactory::create('postgres', ['dsn' => $dsn]);
+        self::assertInstanceOf(PostgresMetadataStore::class, $store);
         $pool->query('DROP TRIGGER s3_write_intent_capacity_part_update ON s3_storage_garbage');
         try {
-            try {
-                MetadataStoreFactory::create('postgres', ['dsn' => $dsn], migrate: false);
-                self::fail('PostgreSQL serving accepted a missing capacity trigger.');
-            } catch (\RuntimeException $error) {
-                self::assertStringContainsString('recovery triggers are missing', $error->getMessage());
+            foreach ([
+                static fn() => MetadataStoreFactory::create('postgres', ['dsn' => $dsn], migrate: false),
+                static fn() => $store->assertMetadataWritable(),
+            ] as $check) {
+                try {
+                    $check();
+                    self::fail('PostgreSQL serving accepted a missing capacity trigger.');
+                } catch (\RuntimeException $error) {
+                    self::assertStringContainsString('recovery triggers are missing', $error->getMessage());
+                }
             }
         } finally {
             $pool->query('CREATE TRIGGER s3_write_intent_capacity_part_update BEFORE UPDATE OF operation

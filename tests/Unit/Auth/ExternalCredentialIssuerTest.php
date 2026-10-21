@@ -291,6 +291,73 @@ final class ExternalCredentialIssuerTest extends TestCase
         }
     }
 
+    public function test_issue_never_outlives_external_identity_expiration(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $provider = new InMemoryCredentialProvider();
+        $issuer = new ExternalCredentialIssuer(new CredentialManager($provider));
+        $identityExpiration = time() + 120;
+        $identityProvider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(ownerPrefix: 'tenant:'),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+        );
+        $identity = $identityProvider->authenticate($this->signJwt(
+            $privateKey,
+            ['alg' => 'RS256', 'kid' => 'key-1'],
+            [
+                'sub' => 'acme',
+                'iss' => 'https://issuer.example.test',
+                'aud' => 's3-admin',
+                'exp' => $identityExpiration,
+            ],
+        ));
+
+        $issued = $issuer->issue($identity, ttlSeconds: 43_200);
+
+        self::assertNotNull($issued->expiresAt);
+        self::assertSame($identityExpiration, $issued->expiresAt->getTimestamp());
+        self::assertSame($identityExpiration, $issued->credential->expiresAt?->getTimestamp());
+        self::assertSame(
+            $identityExpiration,
+            $provider->getCredential($issued->credential->accessKeyId)?->expiresAt?->getTimestamp(),
+        );
+    }
+
+    public function test_issue_rejects_external_identity_without_remaining_lifetime(): void
+    {
+        [$privateKey, $jwk] = $this->createRsaKeyPair();
+        $provider = new InMemoryCredentialProvider();
+        $issuer = new ExternalCredentialIssuer(new CredentialManager($provider));
+        $identityProvider = new JwtExternalIdentityProvider(
+            mapper: new OidcClaimMapper(ownerPrefix: 'tenant:'),
+            keys: ['key-1' => $jwk],
+            allowedIssuers: ['https://issuer.example.test'],
+            allowedAudiences: ['s3-admin'],
+            clockSkewSeconds: 60,
+        );
+        $identity = $identityProvider->authenticate($this->signJwt(
+            $privateKey,
+            ['alg' => 'RS256', 'kid' => 'key-1'],
+            [
+                'sub' => 'acme',
+                'iss' => 'https://issuer.example.test',
+                'aud' => 's3-admin',
+                'exp' => time() - 1,
+            ],
+        ));
+
+        try {
+            $issuer->issue($identity);
+            self::fail('An expired external identity must not issue a credential.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertSame('External identity has no remaining credential lifetime.', $error->getMessage());
+        }
+
+        self::assertSame([], $provider->listCredentials());
+    }
+
     public function test_revoke_deletes_issued_credential_without_restart(): void
     {
         $provider = new InMemoryCredentialProvider();

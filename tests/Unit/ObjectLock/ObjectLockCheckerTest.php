@@ -85,8 +85,10 @@ final class ObjectLockCheckerTest extends TestCase
             try {
                 $this->checker->checkProtection('bucket', 'key', $versionId, true);
                 self::fail("Governance bypass removed {$versionId} protection.");
-            } catch (ObjectLockedException) {
-                self::addToAssertionCount(1);
+            } catch (ObjectLockedException $exception) {
+                self::assertSame(403, $exception->getHttpStatus());
+                self::assertSame('AccessDenied', $exception->getErrorCode());
+                self::assertSame('Access Denied', $exception->getMessage());
             }
         }
     }
