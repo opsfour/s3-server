@@ -39,6 +39,10 @@ final class HealthCheckHandler implements RequestHandler
     /** @var Future<void>|null */
     private ?Future $readinessCheck = null;
 
+    private ?int $readinessCheckGeneration = null;
+
+    private int $readinessGeneration = 0;
+
     private bool $readinessTimeoutLogged = false;
 
     private float $lastTierReferenceCheckAt = -INF;
@@ -80,19 +84,30 @@ final class HealthCheckHandler implements RequestHandler
 
         if ($this->readinessCheck === null || $this->readinessCheck->isComplete()) {
             $this->readinessTimeoutLogged = false;
-            $this->readinessCheck = async(function (): void {
-                $this->runReadinessCheck();
-                $this->lastReadinessCheckAt = hrtime(true) / 1e9;
+            $generation = ++$this->readinessGeneration;
+            $this->readinessCheck = async(function () use ($generation): void {
+                $this->runReadinessCheck($generation);
+                if ($this->readinessGeneration === $generation) {
+                    $this->lastReadinessCheckAt = hrtime(true) / 1e9;
+                }
             });
+            $this->readinessCheckGeneration = $generation;
         }
 
+        $readinessCheck = $this->readinessCheck;
+        $generation = $this->readinessCheckGeneration
+            ?? throw new \LogicException('Readiness check generation is missing.');
         try {
-            $this->readinessCheck->await(new TimeoutCancellation($this->readinessCheckTimeoutSeconds));
+            $readinessCheck->await(new TimeoutCancellation($this->readinessCheckTimeoutSeconds));
         } catch (\Amp\CancelledException $e) {
             if (! $e->getPrevious() instanceof TimeoutException) {
                 throw $e;
             }
 
+            if ($this->readinessGeneration === $generation) {
+                ++$this->readinessGeneration;
+                $readinessCheck->ignore();
+            }
             $this->readinessHealthy = false;
             $this->lastReadinessCheckAt = hrtime(true) / 1e9;
             if (! $this->readinessTimeoutLogged) {
@@ -104,7 +119,7 @@ final class HealthCheckHandler implements RequestHandler
         return $this->readinessResponse();
     }
 
-    private function runReadinessCheck(): void
+    private function runReadinessCheck(int $generation): void
     {
         if ($this->metadata !== null) {
             try {
@@ -122,7 +137,7 @@ final class HealthCheckHandler implements RequestHandler
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                $this->recordDegraded('metadata', $e);
+                $this->recordDegraded($generation, 'metadata', $e);
 
                 return;
             }
@@ -134,7 +149,7 @@ final class HealthCheckHandler implements RequestHandler
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                $this->recordDegraded('credentials', $e);
+                $this->recordDegraded($generation, 'credentials', $e);
 
                 return;
             }
@@ -142,21 +157,29 @@ final class HealthCheckHandler implements RequestHandler
 
         if ($this->metadata !== null && $this->rateLimitEnabled
             && hrtime(true) / 1e9 - $this->lastRateLimitCheckAt >= max(0, $this->rateLimitCheckIntervalSeconds)) {
+            $rateLimitError = null;
             try {
                 // A dedicated key tests the write path without consuming a client's quota.
                 // A normal "limit exhausted" result still proves the database call worked.
                 $this->metadata->rateLimitCheck('__rate_limit_health__', 1.0, 1.0);
-                $this->rateLimitHealthy = true;
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                $this->rateLimitHealthy = false;
-                $this->logDegraded('rate_limit', $e);
+                $rateLimitError = $e;
+            }
+            if ($this->readinessGeneration !== $generation) {
+                return;
+            }
+            $this->rateLimitHealthy = $rateLimitError === null;
+            if ($rateLimitError !== null) {
+                $this->logDegraded('rate_limit', $rateLimitError);
             }
             $this->lastRateLimitCheckAt = hrtime(true) / 1e9;
         }
         if ($this->rateLimitEnabled && ! $this->rateLimitHealthy) {
-            $this->readinessHealthy = false;
+            if ($this->readinessGeneration === $generation) {
+                $this->readinessHealthy = false;
+            }
 
             return;
         }
@@ -171,18 +194,22 @@ final class HealthCheckHandler implements RequestHandler
                             break;
                         }
                     }
+                    if ($this->readinessGeneration !== $generation) {
+                        return;
+                    }
                     $this->missingReferencedTier = $missingReferencedTier;
                     $this->lastTierReferenceCheckAt = hrtime(true) / 1e9;
                 } catch (\Amp\CancelledException $e) {
                     throw $e;
                 } catch (\Throwable $e) {
-                    $this->recordDegraded('metadata', $e);
+                    $this->recordDegraded($generation, 'metadata', $e);
 
                     return;
                 }
             }
             if ($this->missingReferencedTier !== null) {
                 $this->recordDegraded(
+                    $generation,
                     'storage:' . $this->missingReferencedTier,
                     new \RuntimeException('Persisted storage tier is not configured on this API node.'),
                 );
@@ -210,17 +237,22 @@ final class HealthCheckHandler implements RequestHandler
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
-                $this->recordDegraded('storage:' . $tier->name, $e);
+                $this->recordDegraded($generation, 'storage:' . $tier->name, $e);
 
                 return;
             }
         }
 
-        $this->readinessHealthy = true;
+        if ($this->readinessGeneration === $generation) {
+            $this->readinessHealthy = true;
+        }
     }
 
-    private function recordDegraded(string $component, \Throwable $error): void
+    private function recordDegraded(int $generation, string $component, \Throwable $error): void
     {
+        if ($this->readinessGeneration !== $generation) {
+            return;
+        }
         $this->readinessHealthy = false;
         $this->logDegraded($component, $error);
     }

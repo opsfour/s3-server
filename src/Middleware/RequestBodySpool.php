@@ -70,7 +70,7 @@ final class RequestBodySpool
         if ($permissions === false || (($permissions & 0o022) !== 0 && ($permissions & 0o1000) === 0)) {
             throw new InternalErrorException('Request-body temporary directory must be private or sticky.');
         }
-        $this->coordinator = $coordinator ?? new PostObjectSpoolCoordinator($this->tempDir);
+        $this->coordinator = $coordinator ?? new PostObjectSpoolCoordinator($this->tempDir, $this->pool);
     }
 
     /** @internal Closing the worker pool requires every request spool to drain. */

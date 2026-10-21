@@ -50,14 +50,14 @@ final class CorsMiddleware implements Middleware
         $bucket = $request->hasAttribute('s3.bucket') ? $request->getAttribute('s3.bucket') : null;
 
         // Try to match CORS rules for this bucket.
-        $corsHeaders = $this->matchCorsRules($bucket, $origin, $request);
+        $corsMatch = $this->matchCorsRules($bucket, $origin, $request);
 
         // OPTIONS preflight request.
         if ($request->getMethod() === 'OPTIONS') {
-            if ($corsHeaders !== null) {
+            if ($corsMatch !== null && $this->isCurrentGeneration($bucket, $corsMatch)) {
                 return new Response(
                     status: 200,
-                    headers: $corsHeaders,
+                    headers: $corsMatch['headers'],
                     body: '',
                 );
             }
@@ -73,13 +73,13 @@ final class CorsMiddleware implements Middleware
         // Regular request with Origin — process then add CORS headers.
         $response = $requestHandler->handleRequest($request);
 
-        if ($corsHeaders === null) {
+        if ($corsMatch === null || ! $this->isCurrentGeneration($bucket, $corsMatch)) {
             self::mergeVary($response, 'Origin');
 
             return $response;
         }
 
-        foreach ($corsHeaders as $name => $value) {
+        foreach ($corsMatch['headers'] as $name => $value) {
             if ($name === 'Vary') {
                 self::mergeVary($response, $value);
             } else {
@@ -93,7 +93,7 @@ final class CorsMiddleware implements Middleware
     /**
      * Match request against bucket CORS rules.
      *
-     * @return array<non-empty-string, string>|null Matched CORS headers, or null if no match.
+     * @return array{headers: array<non-empty-string, string>, ownerId: string, generation: string}|null
      */
     private function matchCorsRules(?string $bucket, string $origin, Request $request): ?array
     {
@@ -172,10 +172,42 @@ final class CorsMiddleware implements Middleware
             }
 
             // First matching rule wins.
-            return self::buildCorsHeaders($origin, $rule, $method === 'OPTIONS' ? $requestedHeaderNames : null);
+            return [
+                'headers' => self::buildCorsHeaders($origin, $rule, $method === 'OPTIONS' ? $requestedHeaderNames : null),
+                'ownerId' => $observedBucket->ownerId,
+                'generation' => $observedBucket->generation,
+            ];
         }
 
         return null;
+    }
+
+    /** @param array{ownerId: string, generation: string} $match */
+    private function isCurrentGeneration(?string $bucket, array $match): bool
+    {
+        if ($this->metadata === null || $bucket === null || $bucket === '') {
+            return false;
+        }
+
+        try {
+            $metadata = $this->metadata;
+            while ($metadata instanceof ObservedMetadataStore || $metadata instanceof CachedMetadataStoreDecorator) {
+                $metadata = $metadata->innerStore();
+            }
+            $current = $metadata->getBucket($bucket);
+
+            return $current !== null
+                && $current->ownerId === $match['ownerId']
+                && $current->generation === $match['generation'];
+        } catch (\Amp\CancelledException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->logger?->warning('CORS bucket generation check failed.', [
+                'exception' => $e::class,
+            ]);
+
+            return false;
+        }
     }
 
     /**

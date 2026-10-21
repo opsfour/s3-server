@@ -79,7 +79,7 @@ test-only profiles until the exact deployment is qualified. See the canonical
 | `S3_BACKING_READ_TIMEOUT_SECONDS` | `15` | Per-source-read idle timeout for worker-backed S3 GETs; the worker resets it after each chunk. A timeout before API headers returns 503; after headers it truncates the response and releases the read worker. |
 | `S3_BACKING_REQUEST_TIMEOUT_SECONDS` | `0` | Optional total backing S3 request timeout; `0` leaves long transfers uncapped. If set, it must be at least the connect timeout. |
 | `S3_STORAGE_PATH` | - | Root directory for object data (required for `filesystem`) |
-| `S3_REQUEST_BODY_SPOOL_WORKERS` | `8` | Stateless process workers for checksum validation and request-body replay |
+| `S3_REQUEST_BODY_SPOOL_WORKERS` | `8` | Process workers for checksum validation, request-body replay, and host-wide temporary-budget accounting |
 | `S3_ENFORCE_MIN_PART_SIZE` | `true` | Require every non-final multipart part to be at least 5 MiB |
 
 See [Storage Backends](storage-backends.md) for driver-specific configuration.
@@ -275,7 +275,7 @@ destinations remain blocked by the notification SSRF policy.
 | `S3_CONNECTION_IDLE_TIMEOUT` | `60` | HTTP/2 idle connection timeout (seconds) |
 | `S3_READ_TIMEOUT` | `300` | Request stream inactivity timeout (seconds) |
 | `S3_WRITE_TIMEOUT` | `300` | Response stream inactivity timeout (seconds) |
-| `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Maximum seconds to drain in-flight HTTP requests before shutdown fails safely with their dependencies still owned |
+| `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Maximum seconds for each bounded HTTP, background, or in-process listener drain before shutdown fails safely with its dependencies still owned |
 
 Amp's HTTP/1 driver currently uses one inactivity timeout for keep-alive,
 request reads, and response writes. The package sets that value to the larger

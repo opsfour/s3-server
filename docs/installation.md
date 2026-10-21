@@ -169,7 +169,14 @@ $credentials = new InMemoryCredentialProvider(
     ownerId: 'owner-1',
     displayName: 'Admin',
 );
-$server->addMiddleware(new AuthMiddleware($credentials, 'us-east-1'));
+$server->addMiddleware(new AuthMiddleware(
+    credentialProvider: $credentials,
+    region: $config->region,
+    requestBodySizeLimit: $config->requestBodySizeLimit,
+    metadata: $metadata,
+    postSpoolBudgetBytes: $config->postSpoolBudgetBytes,
+    postSpoolCoordinator: $server->preparePostObjectSpoolCoordinator(),
+));
 
 // 5. Register S3 handlers
 $notifications = new NotificationDispatcher($metadata);

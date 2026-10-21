@@ -4,12 +4,148 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
+use Amp\Future;
+use Amp\Parallel\Worker\ContextWorkerPool;
+use Amp\Parallel\Worker\Execution;
+use Amp\Parallel\Worker\Task;
+use Amp\Parallel\Worker\WorkerPool;
+use Amp\Sync\Channel;
+use Amp\TimeoutCancellation;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Exception\SlowDownException;
 use PHPUnit\Framework\TestCase;
 
+use function Amp\async;
+use function Amp\delay;
+
 final class PostObjectSpoolCoordinatorTest extends TestCase
 {
+    public function test_malformed_positive_start_signal_is_rejected_before_joining_worker(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-handshake-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $tempPath = $tempDir . '/s3-post-active.tmp';
+        self::assertSame(1, file_put_contents($tempPath, 'x'));
+        $channel = $this->createMock(Channel::class);
+        $channel->expects(self::once())->method('receive')->willReturn(['ok' => true, 'value' => 123]);
+        $channel->expects(self::once())->method('send')->with(false);
+        $execution = new Execution(
+            $this->createMock(Task::class),
+            $channel,
+            Future::complete([
+                'ok' => false,
+                'type' => \RuntimeException::class,
+                'message' => 'invalid worker announcement',
+            ]),
+        );
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::once())->method('submit')->willReturn($execution);
+
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('invalid worker announcement');
+            (new PostObjectSpoolCoordinator($tempDir, $pool))->start($tempPath);
+        } finally {
+            @unlink($tempPath);
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
+    public function test_incomplete_accounting_and_stale_parent_bytes_repair_from_lease_state(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-repair-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $firstPath = $tempDir . '/s3-post-first.tmp';
+        $secondPath = $tempDir . '/s3-post-second.tmp';
+        self::assertSame(4, file_put_contents($firstPath, 'data'));
+        self::assertSame(4, file_put_contents($secondPath, 'more'));
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, runInline: true);
+        $first = $coordinator->start($firstPath);
+        $second = null;
+
+        try {
+            $coordinator->reserve($first, 4, 8);
+            $accountingDir = dirname($first->leasePath);
+            self::assertSame(1, file_put_contents($accountingDir . '/total', '8'));
+            self::assertSame(1, file_put_contents($accountingDir . '/accounting-dirty', '1'));
+
+            $second = $coordinator->start($secondPath);
+            $coordinator->reserve($second, 4, 8);
+            self::assertSame(4, $second->bytes());
+
+            // Model a worker that committed its lease but whose response did
+            // not reach the API process. Release must trust durable state.
+            $first->setBytes(0);
+            @unlink($firstPath);
+            $coordinator->release($first, true);
+            @unlink($secondPath);
+            $coordinator->release($second, true);
+            self::assertSame('0', file_get_contents($accountingDir . '/total'));
+        } finally {
+            @unlink($firstPath);
+            @unlink($secondPath);
+            $coordinator->release($first, true);
+            if ($second !== null) {
+                $coordinator->release($second, true);
+            }
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
+    public function test_waiting_for_the_host_budget_lock_does_not_block_the_event_loop(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-async-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $tempPath = $tempDir . '/s3-post-active.tmp';
+        self::assertSame(1, file_put_contents($tempPath, 'x'));
+        $pool = new ContextWorkerPool(1);
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, $pool);
+        $lock = fopen($tempDir . '/.opsfour-s3-post-budget/lock', 'c+');
+        self::assertIsResource($lock);
+        self::assertTrue(flock($lock, LOCK_EX));
+        $eventLoopAdvanced = false;
+        $reservation = null;
+
+        try {
+            $pending = async(static fn() => $coordinator->start($tempPath));
+            async(static function () use (&$eventLoopAdvanced): void {
+                delay(0.01);
+                $eventLoopAdvanced = true;
+            })->ignore();
+
+            delay(0.03);
+            self::assertTrue($eventLoopAdvanced);
+            self::assertFalse($pending->isComplete());
+
+            flock($lock, LOCK_UN);
+            $reservation = $pending->await(new TimeoutCancellation(1));
+            self::assertTrue($reservation->isOpen());
+        } finally {
+            if (is_resource($lock)) {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
+            @unlink($tempPath);
+            if ($reservation !== null) {
+                $coordinator->release($reservation, true);
+            }
+            $pool->shutdown();
+            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_explicit_recovery_removes_an_abandoned_reservation(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-post-recovery-' . bin2hex(random_bytes(8));

@@ -329,7 +329,6 @@ final class NotificationDispatcher
     public function shutdown(float $timeoutSeconds = 30): void
     {
         $cancellation = new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds));
-        $timedOut = false;
         // A listener may dispatch another event before it returns. Keep
         // draining the live set instead of iterating a snapshot that misses
         // those newly queued callbacks.
@@ -339,27 +338,18 @@ final class NotificationDispatcher
                 return;
             }
             try {
-                $future->await($timedOut ? null : $cancellation);
+                $future->await($cancellation);
             } catch (\Amp\CancelledException) {
-                $timedOut = true;
                 $this->logger->warning('Notification listeners did not drain before shutdown timeout.', [
                     'component' => 'notification',
                     'event' => 'listener_shutdown_timeout',
                     'queued_listener_tasks' => $this->queuedListenerTasks,
                 ]);
 
-                // Listener callbacks cannot be cancelled safely. Keep runtime
-                // dependencies alive until they return; the process supervisor
-                // remains responsible for enforcing a hard shutdown deadline.
-                try {
-                    $future->await();
-                } catch (\Throwable $e) {
-                    $this->logger->error('Notification listener failed during shutdown.', [
-                        'component' => 'notification',
-                        'event' => 'listener_shutdown_failed',
-                        'exception' => $e::class,
-                    ]);
-                }
+                // Listener callbacks cannot be cancelled safely. Report an
+                // incomplete shutdown so the runtime keeps their dependencies
+                // owned and a later stop attempt can finish the drain.
+                throw new \RuntimeException('Notification listener shutdown timed out.');
             } catch (\Throwable $e) {
                 $this->logger->error('Notification listener failed during shutdown.', [
                     'component' => 'notification',

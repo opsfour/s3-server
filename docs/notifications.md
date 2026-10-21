@@ -217,9 +217,11 @@ execution slot. Its constructor keeps the existing concurrency argument and
 accepts a bounded listener-task queue; when that bound is full, the event is
 dropped and only sanitized metadata is logged. Call `shutdown()` during an
 orderly process stop to drain callbacks, including callbacks scheduled by a
-listener. Listener and logger failures do not interrupt that drain. This does
-not make the in-process bridge durable: a hard process exit can still lose
-queued callbacks.
+listener. Listener and logger failures do not interrupt that drain. If a
+callback exceeds the shutdown timeout, the drain fails while its dependencies
+remain owned so a later stop attempt or the process supervisor can finish it.
+This does not make the in-process bridge durable: a hard process exit can still
+lose queued callbacks.
 
 ### Symfony Listeners
 

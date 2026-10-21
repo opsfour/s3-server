@@ -169,7 +169,7 @@ final readonly class S3ServerConfig
         int $maxSelectObjectSize = 67_108_864,
         int $shutdownDrainTimeout = 30,
         bool $notificationRequireHttps = true,
-        int $sqliteWorkerPoolSize = 0,
+        int $sqliteWorkerPoolSize = 4,
         int $encryptionWorkerPoolSize = 0,
         int $requestBodySpoolWorkerPoolSize = 8,
         int $encryptionParallelThreshold = 65_536,

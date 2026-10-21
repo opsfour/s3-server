@@ -72,7 +72,11 @@ final class RequestBodySpoolTest extends TestCase
             new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete(null)),
             new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::error($cancellation)),
         );
-        $middleware = new $middlewareClass(new RequestBodySpool($pool, $tempDir));
+        $middleware = new $middlewareClass(new RequestBodySpool(
+            $pool,
+            $tempDir,
+            coordinator: new PostObjectSpoolCoordinator($tempDir, runInline: true),
+        ));
         $handler = new class implements RequestHandler {
             public function handleRequest(Request $request): Response
             {
@@ -157,7 +161,11 @@ final class RequestBodySpoolTest extends TestCase
                 Future::error($cancellation),
             ),
         );
-        $spool = new RequestBodySpool($pool, $tempDir);
+        $spool = new RequestBodySpool(
+            $pool,
+            $tempDir,
+            coordinator: new PostObjectSpoolCoordinator($tempDir, runInline: true),
+        );
         self::assertSame($path, $spool->create('s3-md5-'));
 
         try {

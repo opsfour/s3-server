@@ -316,6 +316,8 @@ Bucket policies may omit `Version`; when present it must be `2008-10-17` or
 | DeleteBucketCors | `DELETE` | `/{bucket}?cors` | Remove CORS rules |
 
 CORS preflight (OPTIONS) is handled automatically by the CorsMiddleware.
+Preflight grants and response headers are emitted only while the bucket
+generation that supplied the matching rule remains current.
 PutBucketCors accepts configuration documents up to 64 KiB.
 `CORSRule.ID` is preserved across PUT/GET and is limited to 255 Unicode
 characters. `MaxAgeSeconds` accepts the complete

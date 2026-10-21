@@ -4,7 +4,12 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth;
 
+use Amp\Cancellation;
+use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Parallel\PostObjectSpoolTask;
+
+use function Amp\Parallel\Worker\workerPool;
 
 /**
  * Coordinates browser POST temporary bytes between API processes on one host.
@@ -22,7 +27,10 @@ final class PostObjectSpoolCoordinator
     /** @var array<string, PostObjectSpoolReservation> */
     private array $activeReservations = [];
 
-    public function __construct(?string $tempDir = null)
+    private readonly ?WorkerPool $pool;
+
+    /** @internal $runInline is reserved for PostObjectSpoolTask. */
+    public function __construct(?string $tempDir = null, ?WorkerPool $pool = null, bool $runInline = false)
     {
         $resolvedTempDir = realpath($tempDir ?? sys_get_temp_dir());
         if ($resolvedTempDir === false) {
@@ -44,6 +52,7 @@ final class PostObjectSpoolCoordinator
             || (function_exists('posix_geteuid') && ($owner === false || $owner !== posix_geteuid()))) {
             throw new \RuntimeException('Browser POST reservation directory must be private.');
         }
+        $this->pool = $runInline ? null : ($pool ?? workerPool());
     }
 
     public function tempDir(): string
@@ -53,50 +62,139 @@ final class PostObjectSpoolCoordinator
 
     public function recoverAbandoned(): void
     {
+        if ($this->pool !== null) {
+            $this->taskValue($this->pool->submit(new PostObjectSpoolTask('recover', $this->tempDir))->await());
+
+            return;
+        }
+
+        $this->recoverAbandonedInline();
+    }
+
+    /** @internal Executed only inside PostObjectSpoolTask. */
+    public function recoverAbandonedInline(): void
+    {
         $this->withLock(function (): void {
+            $this->repairAccountingIfDirty();
+            $this->markAccountingDirty();
             $this->reapAbandonedLeases();
             $this->writeTotal($this->sumLeases());
+            $this->clearAccountingDirty();
         });
     }
 
     public function start(string $tempPath): PostObjectSpoolReservation
     {
-        if (realpath(dirname($tempPath)) !== $this->tempDir || ! self::isManagedTempPath($tempPath)) {
-            throw new \InvalidArgumentException('Request temporary path is outside its spool directory.');
+        $tempPath = $this->validatedTempPath($tempPath);
+        if ($this->pool === null) {
+            $reservation = $this->startInline($tempPath);
+            if (! $reservation instanceof PostObjectSpoolReservation) {
+                throw new \LogicException('Inline browser POST reservation returned an invalid result.');
+            }
+
+            return $reservation;
         }
-        $tempPath = $this->tempDir . DIRECTORY_SEPARATOR . basename($tempPath);
 
-        return $this->withLock(function () use ($tempPath): PostObjectSpoolReservation {
-            // Crash leftovers must not accumulate indefinitely when traffic
-            // stays below the byte limit (including zero-byte uploads).
-            if ($this->reapAbandonedLeases()) {
-                $this->writeTotal($this->sumLeases());
-            } else {
-                $this->readTotal();
-            }
-            $path = $this->leaseDir . DIRECTORY_SEPARATOR . 'lease-' . bin2hex(random_bytes(16));
-            $this->writeLease($path, $tempPath, 0);
-            $handle = @fopen($path, 'x+');
-            if ($handle === false) {
-                @unlink($this->statePath($path));
-                throw new \RuntimeException('Cannot create browser POST reservation.');
-            }
+        $execution = $this->pool->submit(new PostObjectSpoolTask('start', $this->tempDir, $tempPath));
+        $channel = $execution->getChannel();
+        $signal = $channel->receive();
+        if (! is_array($signal) || ($signal['ok'] ?? false) !== true || ! is_string($signal['value'] ?? null)) {
+            // A worker that already announced a lease is waiting for this
+            // acknowledgement while it still owns the global accounting lock.
+            // Always reject malformed announcements before joining the task.
             try {
-                if (! flock($handle, LOCK_SH | LOCK_NB)) {
-                    throw new \RuntimeException('Cannot lock browser POST reservation.');
-                }
-
-                $reservation = new PostObjectSpoolReservation($path, $tempPath, $handle);
-                $this->activeReservations[$path] = $reservation;
-
-                return $reservation;
-            } catch (\Throwable $error) {
-                fclose($handle);
-                @unlink($path);
-                @unlink($this->statePath($path));
-                throw $error;
+                $channel->send(false);
+            } catch (\Throwable) {
+                // A negative worker result may already have closed the channel.
             }
-        });
+            $this->taskValue($execution->await());
+            throw new \RuntimeException('Browser POST reservation worker returned an invalid lease.');
+        }
+        $leasePath = $signal['value'];
+
+        $handle = @fopen($leasePath, 'r+');
+        $locked = $handle !== false && flock($handle, LOCK_SH | LOCK_NB);
+        try {
+            $channel->send($locked);
+            $completedPath = $this->taskValue($execution->await());
+            if (! $locked || ! is_string($completedPath) || $completedPath !== $leasePath) {
+                throw new \RuntimeException('Cannot lock browser POST reservation.');
+            }
+        } catch (\Throwable $error) {
+            if (is_resource($handle)) {
+                fclose($handle);
+            }
+            throw $error;
+        }
+
+        $reservation = new PostObjectSpoolReservation($leasePath, $tempPath, $handle);
+        $this->activeReservations[$leasePath] = $reservation;
+
+        return $reservation;
+    }
+
+    /**
+     * @internal Executed only inside PostObjectSpoolTask.
+     * @param \Amp\Sync\Channel<bool, array{ok: bool, value?: string, type?: class-string<\Throwable>, message?: string}>|null $channel
+     */
+    public function startInline(
+        string $tempPath,
+        ?\Amp\Sync\Channel $channel = null,
+        ?Cancellation $cancellation = null,
+    ): PostObjectSpoolReservation|string {
+        $tempPath = $this->validatedTempPath($tempPath);
+        $announced = false;
+
+        try {
+            return $this->withLock(function () use ($tempPath, $channel, $cancellation, &$announced): PostObjectSpoolReservation|string {
+                $this->repairAccountingIfDirty();
+                // Crash leftovers must not accumulate indefinitely when traffic
+                // stays below the byte limit (including zero-byte uploads).
+                $this->reapAndRecount();
+                $path = $this->leaseDir . DIRECTORY_SEPARATOR . 'lease-' . bin2hex(random_bytes(16));
+                $this->writeLease($path, $tempPath, 0);
+                $handle = @fopen($path, 'x+');
+                if ($handle === false) {
+                    @unlink($this->statePath($path));
+                    throw new \RuntimeException('Cannot create browser POST reservation.');
+                }
+                try {
+                    if (! flock($handle, LOCK_SH | LOCK_NB)) {
+                        throw new \RuntimeException('Cannot lock browser POST reservation.');
+                    }
+
+                    if ($channel !== null) {
+                        $announced = true;
+                        $channel->send(['ok' => true, 'value' => $path]);
+                        if ($channel->receive($cancellation) !== true) {
+                            throw new \RuntimeException('Cannot transfer browser POST reservation.');
+                        }
+                        fclose($handle);
+
+                        return $path;
+                    }
+
+                    $reservation = new PostObjectSpoolReservation($path, $tempPath, $handle);
+                    $this->activeReservations[$path] = $reservation;
+
+                    return $reservation;
+                } catch (\Throwable $error) {
+                    fclose($handle);
+                    @unlink($path);
+                    @unlink($this->statePath($path));
+                    throw $error;
+                }
+            });
+        } catch (\Throwable $error) {
+            if ($channel !== null && ! $announced) {
+                $channel->send([
+                    'ok' => false,
+                    'type' => $error::class,
+                    'message' => $error->getMessage(),
+                ]);
+            }
+            throw $error;
+        }
     }
 
     public function reserve(PostObjectSpoolReservation $reservation, int $bytes, int $budgetBytes): void
@@ -108,27 +206,72 @@ final class PostObjectSpoolCoordinator
             return;
         }
 
-        $this->withLock(function () use ($reservation, $bytes, $budgetBytes): void {
-            $this->assertSharedBudget($reservation->leasePath, $budgetBytes);
+        if ($this->pool !== null) {
+            $next = $this->taskValue($this->pool->submit(new PostObjectSpoolTask(
+                'reserve',
+                $this->tempDir,
+                $reservation->tempPath,
+                $reservation->leasePath,
+                $reservation->bytes(),
+                $bytes,
+                $budgetBytes,
+            ))->await());
+            if (! is_int($next)) {
+                throw new \RuntimeException('Browser POST reservation worker returned an invalid size.');
+            }
+            $reservation->setBytes($next);
+
+            return;
+        }
+
+        $reservation->setBytes($this->reserveInline(
+            $reservation->leasePath,
+            $reservation->tempPath,
+            $reservation->bytes(),
+            $bytes,
+            $budgetBytes,
+        ));
+    }
+
+    /** @internal Executed only inside PostObjectSpoolTask. */
+    public function reserveInline(
+        string $leasePath,
+        string $tempPath,
+        int $_reservedBytes,
+        int $bytes,
+        int $budgetBytes,
+    ): int {
+        $tempPath = $this->validatedTempPath($tempPath);
+        $leasePath = $this->validatedLeasePath($leasePath);
+
+        return $this->withLock(function () use ($leasePath, $tempPath, $bytes, $budgetBytes): int {
+            $this->repairAccountingIfDirty();
+            $this->assertSharedBudget($leasePath, $budgetBytes);
+            $lease = $this->readLease($leasePath);
+            if ($lease['tempPath'] !== $tempPath) {
+                throw new \RuntimeException('Browser POST reservation does not match its temporary file.');
+            }
             $total = $this->readTotal();
             if ($bytes > $budgetBytes - $total) {
-                $this->reapAbandonedLeases();
-                $total = $this->sumLeases();
-                $this->writeTotal($total);
+                $total = $this->reapAndRecount();
             }
             if ($bytes > $budgetBytes - $total) {
                 throw new SlowDownException('Browser upload temporary storage budget is full.');
             }
 
-            $next = $reservation->bytes() + $bytes;
-            $this->writeTotal($total + $bytes);
+            $next = $lease['bytes'] + $bytes;
+            $this->markAccountingDirty();
             try {
-                $this->writeLease($reservation->leasePath, $reservation->tempPath, $next);
+                $this->writeLease($leasePath, $tempPath, $next);
+                $this->writeTotal($total + $bytes);
+                $this->clearAccountingDirty();
             } catch (\Throwable $error) {
-                $this->writeTotal($total);
+                // The marker intentionally remains. The next operation
+                // reconstructs the total from the atomically replaced leases.
                 throw $error;
             }
-            $reservation->setBytes($next);
+
+            return $next;
         });
     }
 
@@ -143,7 +286,7 @@ final class PostObjectSpoolCoordinator
             throw new \RuntimeException('Cannot read browser POST shared budget.');
         }
         if ($stored !== false) {
-            $this->reapAbandonedLeases();
+            $this->reapAndRecount();
             foreach ($this->leasePaths() as $leasePath) {
                 if ($leasePath !== $ownLeasePath) {
                     throw new \RuntimeException('Processes sharing a browser POST temporary directory must use the same budget.');
@@ -165,14 +308,17 @@ final class PostObjectSpoolCoordinator
         }
         try {
             if ($tempDeleted) {
-                $this->withLock(function () use ($reservation): void {
-                    $total = $this->readTotal();
-                    if (@unlink($reservation->leasePath) || ! file_exists($reservation->leasePath)) {
-                        @unlink(self::statePath($reservation->leasePath));
-                        @unlink(self::statePath($reservation->leasePath) . '.tmp');
-                        $this->writeTotal(max(0, $total - $reservation->bytes()));
-                    }
-                });
+                if ($this->pool !== null) {
+                    $this->taskValue($this->pool->submit(new PostObjectSpoolTask(
+                        'release',
+                        $this->tempDir,
+                        $reservation->tempPath,
+                        $reservation->leasePath,
+                        $reservation->bytes(),
+                    ))->await());
+                } else {
+                    $this->releaseInline($reservation->leasePath, $reservation->bytes());
+                }
             }
         } catch (\Throwable) {
             // A remaining lease is recovered after this process releases its lock.
@@ -180,6 +326,111 @@ final class PostObjectSpoolCoordinator
             $reservation->close();
             unset($this->activeReservations[$reservation->leasePath]);
         }
+    }
+
+    /** @internal Executed only inside PostObjectSpoolTask. */
+    public function releaseInline(string $leasePath, int $_reservedBytes): void
+    {
+        $leasePath = $this->validatedLeasePath($leasePath);
+        $this->withLock(function () use ($leasePath): void {
+            $this->repairAccountingIfDirty();
+            $lease = $this->readLease($leasePath);
+            $total = $this->readTotal();
+            $this->markAccountingDirty();
+            if (@unlink($leasePath) || ! file_exists($leasePath)) {
+                @unlink(self::statePath($leasePath));
+                @unlink(self::statePath($leasePath) . '.tmp');
+                $this->writeTotal(max(0, $total - $lease['bytes']));
+                $this->clearAccountingDirty();
+            }
+        });
+    }
+
+    private function repairAccountingIfDirty(): void
+    {
+        if (! file_exists($this->accountingDirtyPath())) {
+            return;
+        }
+
+        $this->writeTotal($this->sumLeases());
+        $this->clearAccountingDirty();
+    }
+
+    private function reapAndRecount(): int
+    {
+        $this->markAccountingDirty();
+        try {
+            $this->reapAbandonedLeases();
+            $total = $this->sumLeases();
+            $this->writeTotal($total);
+            $this->clearAccountingDirty();
+
+            return $total;
+        } catch (\Throwable $error) {
+            // The marker intentionally remains so the next lock owner repairs
+            // from the per-lease state before trusting the cached total.
+            throw $error;
+        }
+    }
+
+    private function markAccountingDirty(): void
+    {
+        $path = $this->accountingDirtyPath();
+        $temporaryPath = $path . '.tmp';
+        if (file_put_contents($temporaryPath, '1') !== 1 || ! @rename($temporaryPath, $path)) {
+            throw new \RuntimeException('Cannot mark browser POST accounting as incomplete.');
+        }
+    }
+
+    private function clearAccountingDirty(): void
+    {
+        $path = $this->accountingDirtyPath();
+        if (! @unlink($path) && file_exists($path)) {
+            throw new \RuntimeException('Cannot complete browser POST accounting update.');
+        }
+        @unlink($path . '.tmp');
+    }
+
+    private function accountingDirtyPath(): string
+    {
+        return $this->leaseDir . DIRECTORY_SEPARATOR . 'accounting-dirty';
+    }
+
+    private function validatedTempPath(string $tempPath): string
+    {
+        if (realpath(dirname($tempPath)) !== $this->tempDir || ! self::isManagedTempPath($tempPath)) {
+            throw new \InvalidArgumentException('Request temporary path is outside its spool directory.');
+        }
+
+        return $this->tempDir . DIRECTORY_SEPARATOR . basename($tempPath);
+    }
+
+    private function validatedLeasePath(string $leasePath): string
+    {
+        if (dirname($leasePath) !== $this->leaseDir
+            || ! str_starts_with(basename($leasePath), 'lease-')
+            || str_contains(substr(basename($leasePath), 6), DIRECTORY_SEPARATOR)) {
+            throw new \InvalidArgumentException('Browser POST reservation lease is invalid.');
+        }
+
+        return $this->leaseDir . DIRECTORY_SEPARATOR . basename($leasePath);
+    }
+
+    /**
+     * @param array{ok: bool, value?: int|string|null, type?: class-string<\Throwable>, message?: string} $result
+     */
+    private function taskValue(array $result): int|string|null
+    {
+        if ($result['ok']) {
+            return $result['value'] ?? null;
+        }
+
+        $message = $result['message'] ?? 'Browser POST reservation worker failed.';
+        throw match ($result['type'] ?? '') {
+            SlowDownException::class => new SlowDownException($message),
+            \InvalidArgumentException::class => new \InvalidArgumentException($message),
+            default => new \RuntimeException($message),
+        };
     }
 
     private function sumLeases(): int

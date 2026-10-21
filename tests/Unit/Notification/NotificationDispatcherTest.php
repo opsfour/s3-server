@@ -436,7 +436,7 @@ final class NotificationDispatcherTest extends TestCase
         self::assertTrue($nestedCompleted);
     }
 
-    public function test_shutdown_keeps_waiting_after_timeout_warning(): void
+    public function test_shutdown_timeout_is_finite_and_can_be_retried_after_listener_finishes(): void
     {
         $logger = new NotificationArrayLogger();
         $dispatcher = new NotificationDispatcher($this->metadata, $logger);
@@ -452,15 +452,24 @@ final class NotificationDispatcherTest extends TestCase
             key: 'slow-drain.txt',
             ownerId: 'owner',
         ), enqueueWebhooks: false);
-        $dispatcher->shutdown(0.005);
+        try {
+            $dispatcher->shutdown(0.005);
+            self::fail('A timed-out listener drain must report an incomplete shutdown.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Notification listener shutdown timed out.', $error->getMessage());
+        }
 
-        self::assertTrue($completed);
+        self::assertFalse($completed);
         self::assertNotNull($logger->findContext('listener_shutdown_timeout', [
             'component' => 'notification',
         ]));
+
+        \Amp\delay(0.04);
+        $dispatcher->shutdown(1);
+        self::assertTrue($completed);
     }
 
-    public function test_throwing_timeout_logger_cannot_interrupt_listener_drain(): void
+    public function test_throwing_timeout_logger_cannot_hide_incomplete_listener_shutdown(): void
     {
         $logger = new class extends AbstractLogger {
             /** @param array<string, mixed> $context */
@@ -482,9 +491,14 @@ final class NotificationDispatcherTest extends TestCase
             ownerId: 'owner',
         ), enqueueWebhooks: false);
 
-        $dispatcher->shutdown(0.005);
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Notification listener shutdown timed out.');
 
-        self::assertTrue($completed);
+        try {
+            $dispatcher->shutdown(0.005);
+        } finally {
+            self::assertFalse($completed);
+        }
     }
 
     public function test_webhook_enqueue_rolls_back_with_caller_transaction(): void

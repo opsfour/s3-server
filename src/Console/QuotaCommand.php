@@ -93,6 +93,7 @@ final class QuotaCommand extends Command
 
                 $config['path'] = SqliteMetadataPathResolver::resolve((string) $storagePath);
             }
+            $config['worker_pool_size'] = 0;
         }
 
         try {

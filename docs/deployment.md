@@ -120,10 +120,12 @@ The server handles `SIGTERM` and `SIGINT` signals:
 4. Shuts down storage and worker pools after the requests and background work stop.
 5. Fails the shutdown attempt without releasing dependencies if the deadline is exceeded.
 
-Set the process supervisor's hard stop deadline above
-`S3_SHUTDOWN_DRAIN_TIMEOUT`. A timed-out stop returns a failure to the serve
-command, retains dependencies that active work may still use, and lets the
-supervisor terminate a callback or backend operation that never returns.
+`S3_SHUTDOWN_DRAIN_TIMEOUT` applies separately to each sequential bounded
+shutdown phase; it is not a total process-stop deadline. Set the process
+supervisor's hard stop deadline above the combined budget of the enabled HTTP,
+background, and listener phases. A timed-out stop returns a failure to the
+serve command, retains dependencies that active work may still use, and lets
+the supervisor terminate a callback or backend operation that never returns.
 
 ```bash
 S3_SHUTDOWN_DRAIN_TIMEOUT=30   # seconds

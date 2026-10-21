@@ -223,6 +223,34 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame(3, $probe->checks);
     }
 
+    public function test_timed_out_readiness_probe_cannot_accumulate_or_overwrite_a_fresh_result(): void
+    {
+        $probe = new class implements CredentialHealthProbe {
+            public int $calls = 0;
+
+            public function assertCredentialStoreAvailable(): void
+            {
+                if (++$this->calls === 1) {
+                    \Amp\delay(0.05);
+                    throw new \RuntimeException('late stale failure');
+                }
+            }
+        };
+        $handler = new HealthCheckHandler(
+            credentialHealthProbe: $probe,
+            readinessCheckIntervalSeconds: 0,
+            readinessCheckTimeoutSeconds: 0.005,
+        );
+
+        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame(1, $probe->calls, 'The running timed-out probe must remain the only in-flight probe.');
+        \Amp\delay(0.06);
+
+        self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame(2, $probe->calls);
+    }
+
     public function test_credential_probe_propagates_the_original_cancellation(): void
     {
         $cancellation = new CancelledException();

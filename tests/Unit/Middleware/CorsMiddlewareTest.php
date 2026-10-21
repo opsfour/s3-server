@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use League\Uri\Http;
+use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -216,6 +217,36 @@ final class CorsMiddlewareTest extends TestCase
 
         self::assertSame(403, $response->getStatus());
         self::assertNull($response->getHeader('Access-Control-Allow-Origin'));
+    }
+
+    public function test_matched_rules_are_not_applied_after_bucket_recreation(): void
+    {
+        $oldBucket = new BucketInfo('bucket-a', 'owner', generation: str_repeat('a', 32));
+        $newBucket = new BucketInfo('bucket-a', 'owner', generation: str_repeat('b', 32));
+
+        foreach (['PUT', 'OPTIONS'] as $method) {
+            $metadata = $this->createMock(MetadataStore::class);
+            $metadata->expects(self::exactly(3))
+                ->method('getBucket')
+                ->with('bucket-a')
+                ->willReturnOnConsecutiveCalls($oldBucket, $oldBucket, $newBucket);
+            $metadata->expects(self::once())
+                ->method('getBucketCors')
+                ->with('bucket-a')
+                ->willReturn([$this->rule([])]);
+            $headers = ['Origin' => 'https://client.example'];
+            if ($method === 'OPTIONS') {
+                $headers['Access-Control-Request-Method'] = 'PUT';
+            }
+
+            $response = (new CorsMiddleware($metadata))->handleRequest(
+                $this->request($method, $headers),
+                $this->terminal(),
+            );
+
+            self::assertSame($method === 'OPTIONS' ? 403 : 204, $response->getStatus());
+            self::assertNull($response->getHeader('Access-Control-Allow-Origin'));
+        }
     }
 
     public function test_observability_wrapper_cannot_hide_stale_cors_cache_from_generation_check(): void

@@ -36,12 +36,15 @@ final class MetadataStoreFactory
         }
 
         $workerPoolSize = filter_var(
-            $config['worker_pool_size'] ?? 0,
+            $config['worker_pool_size'] ?? ($driver === 'sqlite' && $sqlitePath !== ':memory:' ? 4 : 0),
             FILTER_VALIDATE_INT,
             ['options' => ['min_range' => 0]],
         );
         if ($workerPoolSize === false) {
             throw new \InvalidArgumentException('Metadata worker_pool_size must be a decimal integer >= 0.');
+        }
+        if ($driver === 'sqlite' && $sqlitePath === ':memory:') {
+            $workerPoolSize = 0;
         }
 
         if (! $migrate) {

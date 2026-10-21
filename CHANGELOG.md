@@ -36,8 +36,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Run file-backed SQLite metadata operations in four worker processes by
-  default for standalone, Laravel, and Symfony serving; `0` remains an opt-out
-  and `:memory:` remains synchronous.
+  default for programmatic, standalone, Laravel, and Symfony serving; `0`
+  remains an opt-out and `:memory:` remains synchronous.
 - Clarify the production target, shared support-status definitions, and the
   separation between universal release gates and optional deployment profiles.
 - Align the production soak with the supported single-process local-filesystem
@@ -87,18 +87,22 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Make readiness verify metadata DML and a synchronized local-storage write
   with cleanup, so read-only metadata or unwritable local storage returns 503
-  before traffic is admitted.
+  before traffic is admitted, and prevent a probe that completes after its
+  timeout from restoring readiness.
 - Use durable write intents for normal local-filesystem object writes and
   recover physical paths left behind by a process exit before metadata commit.
 - Stage local multipart parts before arming their durable intent and use the
   attempt-bound local assembly path for normal multipart completion.
-- Apply website CORS rules, honor BucketOwnerEnforced ACL semantics, decrypt
-  SSE-S3 website objects, and reject stored-size mismatches while streaming.
+- Apply website CORS rules only while their bucket generation remains current,
+  honor BucketOwnerEnforced ACL semantics, decrypt SSE-S3 website objects, and
+  reject stored-size mismatches while streaming.
 - Keep database credential PDO operations out of the HTTP event loop and bound
   each serving operation with a configurable timeout.
-- Make the configured shutdown drain timeout finite: a stalled HTTP request or
-  background task now fails shutdown while retaining its dependencies for a
-  safe retry or supervisor termination instead of waiting forever.
+- Run host-wide browser POST and request-checksum spool accounting in the
+  owned request-body worker pool so filesystem locks cannot pause HTTP fibers.
+- Make the configured shutdown drain timeout finite: a stalled HTTP request,
+  background task, or in-process listener now fails shutdown while
+  retaining its dependencies for a safe retry or supervisor termination.
 - Return SSE-S3 encryption metadata from GetObjectAttributes and normalize its
   `Last-Modified` response headers to UTC.
 - Honor the deprecated browser POST `redirect` field as a fallback for

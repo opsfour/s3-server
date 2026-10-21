@@ -113,22 +113,23 @@ final class SimpleEventDispatcher implements EventDispatcher
     public function shutdown(float $timeoutSeconds = 30): void
     {
         $cancellation = new \Amp\TimeoutCancellation(max(0.001, $timeoutSeconds));
-        $timedOut = false;
         while (true) {
             $future = reset($this->listenerFutures);
             if ($future === false) {
                 return;
             }
             try {
-                $future->await($timedOut ? null : $cancellation);
+                $future->await($cancellation);
             } catch (\Amp\CancelledException) {
-                $timedOut = true;
                 $this->logger->warning('Event listeners did not drain before shutdown timeout.', [
                     'component' => 'event_dispatcher',
                     'event' => 'listener_shutdown_timeout',
                     'queued_listener_tasks' => $this->queuedListenerTasks,
                 ]);
-                $future->await();
+
+                // Keep the accepted callbacks and their dependencies owned so
+                // a later shutdown attempt can finish the drain safely.
+                throw new \RuntimeException('Event listener shutdown timed out.');
             } catch (\Throwable $error) {
                 $this->logger->error('Event listener failed during shutdown.', [
                     'component' => 'event_dispatcher',

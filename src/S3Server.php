@@ -161,6 +161,8 @@ final class S3Server
 
     private ?PostObjectSpoolCoordinator $postObjectSpoolCoordinator = null;
 
+    private ?WorkerPool $requestBodySpoolPool = null;
+
     /** @var list<Future<void>> */
     private array $backgroundFutures = [];
 
@@ -1209,6 +1211,29 @@ final class S3Server
     }
 
     /**
+     * Return the server-owned coordinator shared by authentication and checksum spooling.
+     *
+     * Programmatic integrations should inject this coordinator into AuthMiddleware so
+     * all request-body work uses the server's bounded, lifecycle-managed worker pool.
+     */
+    public function preparePostObjectSpoolCoordinator(): PostObjectSpoolCoordinator
+    {
+        if ($this->postObjectSpoolCoordinator !== null) {
+            return $this->postObjectSpoolCoordinator;
+        }
+        if (! $this->starting) {
+            $this->assertConfigurationMutable('Browser POST spool coordinator');
+        }
+
+        $workers = $this->config->requestBodySpoolWorkerPoolSize;
+        $this->requestBodySpoolPool = new ContextWorkerPool($workers);
+        $this->registerWorkerPool($this->requestBodySpoolPool, 'request_body_spool', $workers);
+        $this->postObjectSpoolCoordinator = new PostObjectSpoolCoordinator(pool: $this->requestBodySpoolPool);
+
+        return $this->postObjectSpoolCoordinator;
+    }
+
+    /**
      * Transfer shutdown ownership of a worker pool to this server.
      *
      * A later stop retry force-kills the pool if its graceful shutdown fails.
@@ -1339,15 +1364,11 @@ final class S3Server
 
     private function requestBodySpoolForStack(): RequestBodySpool
     {
-        $spoolWorkers = $this->config->requestBodySpoolWorkerPoolSize;
-        $spoolPool = new ContextWorkerPool($spoolWorkers);
-        $this->registerWorkerPool($spoolPool, 'request_body_spool', $spoolWorkers);
-
-        $coordinator = $this->postObjectSpoolCoordinator ??= new PostObjectSpoolCoordinator();
+        $coordinator = $this->preparePostObjectSpoolCoordinator();
         $coordinator->recoverAbandoned();
 
         return new RequestBodySpool(
-            $spoolPool,
+            $this->requestBodySpoolPool ?? throw new \LogicException('Request-body spool pool was not prepared.'),
             budgetBytes: $this->config->postSpoolBudgetBytes,
             coordinator: $coordinator,
         );

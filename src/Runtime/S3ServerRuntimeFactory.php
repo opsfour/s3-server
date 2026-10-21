@@ -104,11 +104,14 @@ final readonly class S3ServerRuntimeFactory
                 );
             }
 
+            $postObjectSpoolCoordinator = $server->preparePostObjectSpoolCoordinator();
+
             $server->addMiddleware(new AuthMiddleware(
                 credentialProvider: $credentialProvider,
                 region: $config->region,
                 requestBodySizeLimit: $config->requestBodySizeLimit,
                 postSpoolBudgetBytes: $config->postSpoolBudgetBytes,
+                postSpoolCoordinator: $postObjectSpoolCoordinator,
                 metadata: $metadata,
             ));
 

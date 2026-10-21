@@ -87,6 +87,29 @@ final class SimpleEventDispatcherTest extends TestCase
         self::assertSame(2, $nestedCalls);
     }
 
+    public function test_shutdown_timeout_is_finite_and_can_be_retried(): void
+    {
+        $completed = new DeferredFuture();
+        $dispatcher = new SimpleEventDispatcher();
+        $dispatcher->listen('event', static function () use ($completed): void {
+            \Amp\delay(0.03);
+            $completed->complete();
+        });
+        $dispatcher->dispatch('event');
+
+        try {
+            $dispatcher->shutdown(0.005);
+            self::fail('A timed-out event-listener drain must report an incomplete shutdown.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Event listener shutdown timed out.', $error->getMessage());
+        }
+        self::assertFalse($completed->isComplete());
+
+        \Amp\delay(0.04);
+        $dispatcher->shutdown(1);
+        self::assertTrue($completed->isComplete());
+    }
+
     public function test_existing_constructor_and_interface_shape_remain_usable(): void
     {
         self::assertInstanceOf(\OpsFour\S3Server\Contracts\EventDispatcher::class, new SimpleEventDispatcher());

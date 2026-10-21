@@ -15,6 +15,7 @@ final class S3ServerConfigValidationTest extends TestCase
         $config = new S3ServerConfig(storagePath: '/');
 
         self::assertSame('/', $config->storagePath);
+        self::assertSame(4, $config->sqliteWorkerPoolSize);
         self::assertFalse($config->isVirtualHostedStyle());
         self::assertFalse($config->allowUnfencedStorageForTests);
     }

@@ -44,6 +44,7 @@ final class MetadataMigrateCommand extends Command
                 }
                 $config['path'] = SqliteMetadataPathResolver::resolve($storagePath);
             }
+            $config['worker_pool_size'] = 0;
         } elseif (in_array($driver, ['postgres', 'mysql'], true)) {
             $dsn = $input->getOption('metadata-dsn');
             if (! is_string($dsn) || $dsn === '') {
