@@ -32,6 +32,12 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 {
     private ?\PDO $pdo = null;
 
+    /** Whether the current transaction acquired SQLite's writer lock eagerly. */
+    private bool $immediateTransaction = false;
+
+    /** Whether a deferred transaction has already prepared a metadata mutation. */
+    private bool $deferredTransactionMutated = false;
+
     /** @var array<string, \PDOStatement> Cached prepared statements keyed by SQL. */
     private array $stmtCache = [];
 
@@ -1974,7 +1980,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2032,7 +2038,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2159,7 +2165,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2546,7 +2552,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2613,7 +2619,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2676,7 +2682,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2788,7 +2794,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $ownTx = ! $pdo->inTransaction();
 
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -2942,7 +2948,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -3042,7 +3048,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -3197,7 +3203,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -3345,7 +3351,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -3880,7 +3886,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         $ownTx = ! $pdo->inTransaction();
         if ($ownTx) {
-            $pdo->beginTransaction();
+            $this->beginImmediateTransaction($pdo);
         }
 
         try {
@@ -4090,13 +4096,13 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         }
         $ownerId = $upload['owner_id'];
         $this->transaction(function () use ($bucket, $bucketGeneration, $storageTier, $uploadId, $storagePath, $ownerId, $localReservation): void {
+            $this->lockOwnerForUpdate($ownerId);
             $global = $this->prepare("SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'part'");
             $global->execute();
             $retained = $global->fetchColumn();
             if ($retained === false || (int) $retained >= MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS) {
                 throw new SlowDownException('Multipart part recovery capacity is exhausted.');
             }
-            $this->lockOwnerForUpdate($ownerId);
             $statement = $this->prepare("SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent' AND owner_id = ?");
             $statement->execute([$ownerId]);
             $count = (int) $statement->fetchColumn();
@@ -4433,6 +4439,8 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             throw new \LogicException('Nested beginTransaction() is unsupported; use transaction() to join the current transaction.');
         }
         $connection->beginTransaction();
+        $this->immediateTransaction = false;
+        $this->deferredTransactionMutated = false;
     }
 
     public function commit(): void
@@ -4441,7 +4449,12 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         if (! $connection->inTransaction()) {
             throw new \LogicException('commit() requires an active transaction.');
         }
-        $connection->commit();
+        try {
+            $connection->commit();
+        } finally {
+            $this->immediateTransaction = false;
+            $this->deferredTransactionMutated = false;
+        }
     }
 
     public function rollback(): void
@@ -4455,6 +4468,9 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         } catch (\Throwable $error) {
             $this->discardConnection();
             throw $error;
+        } finally {
+            $this->immediateTransaction = false;
+            $this->deferredTransactionMutated = false;
         }
 
         // After rollback, prepared statements may reference invalidated transaction
@@ -4464,10 +4480,23 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
     public function lockOwnerForUpdate(string $ownerId): void
     {
-        if (! $this->connection()->inTransaction()) {
+        $connection = $this->connection();
+        if (! $connection->inTransaction()) {
             throw new \LogicException('lockOwnerForUpdate() requires an active transaction.');
         }
-        // SQLite write transactions already serialize metadata mutations.
+        if ($this->immediateTransaction) {
+            return;
+        }
+        if ($this->deferredTransactionMutated) {
+            throw new \LogicException('lockOwnerForUpdate() must be acquired before transactional metadata mutations.');
+        }
+
+        // Replace the deferred transaction before its first mutation so
+        // competing workers wait at BEGIN instead of failing while promoting
+        // a WAL snapshot. Callers re-read guarded state after taking the lock.
+        $connection->rollBack();
+        $this->stmtCache = [];
+        $this->beginImmediateTransaction($connection);
     }
 
     public function prepareOwnerReadLock(string $ownerId): void
@@ -4491,13 +4520,20 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         if ($ownTx) {
             $pdo->beginTransaction();
+            $this->immediateTransaction = false;
+            $this->deferredTransactionMutated = false;
         }
 
         try {
             $result = $callback();
 
             if ($ownTx) {
-                $pdo->commit();
+                try {
+                    $pdo->commit();
+                } finally {
+                    $this->immediateTransaction = false;
+                    $this->deferredTransactionMutated = false;
+                }
             }
 
             return $result;
@@ -4511,6 +4547,8 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                     // Preserve the callback or ambiguous commit failure.
                     $this->discardConnection();
                 } finally {
+                    $this->immediateTransaction = false;
+                    $this->deferredTransactionMutated = false;
                     $this->stmtCache = [];
                 }
             }
@@ -4526,7 +4564,16 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
     private function discardConnection(): void
     {
         $this->stmtCache = [];
+        $this->immediateTransaction = false;
+        $this->deferredTransactionMutated = false;
         $this->pdo = null;
+    }
+
+    private function beginImmediateTransaction(\PDO $pdo): void
+    {
+        $pdo->exec('BEGIN IMMEDIATE');
+        $this->immediateTransaction = true;
+        $this->deferredTransactionMutated = false;
     }
 
     /**
@@ -4563,7 +4610,6 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 'PRAGMA mmap_size=268435456',
             ]
             : [
-                'PRAGMA journal_mode=WAL',
                 'PRAGMA synchronous=FULL',
                 'PRAGMA busy_timeout=5000',
                 'PRAGMA foreign_keys=ON',
@@ -4594,6 +4640,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
      */
     private function prepare(string $sql): \PDOStatement
     {
+        if ($this->connection()->inTransaction()
+            && ! $this->immediateTransaction
+            && preg_match('/^\s*(?:SELECT|WITH|PRAGMA)\b/i', $sql) !== 1) {
+            $this->deferredTransactionMutated = true;
+        }
         if (preg_match('/^\s*(?:SELECT|WITH)\b/i', $sql) === 1) {
             return $this->connection()->prepare($sql);
         }

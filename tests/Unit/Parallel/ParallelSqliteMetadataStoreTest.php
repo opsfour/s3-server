@@ -143,6 +143,24 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
         self::assertSame('owner1', $this->store->getBucketOwner('after-rejected-lock'));
     }
 
+    public function test_owner_write_lock_reaches_pinned_worker_before_metadata_mutation(): void
+    {
+        try {
+            $this->store->transaction(function (): void {
+                $this->store->createBucket('owner1', 'before-late-lock', 'us-east-1');
+                $this->store->lockOwnerForUpdate('owner1');
+            });
+            self::fail('A late owner write lock must be rejected by the pinned SQLite worker.');
+        } catch (\LogicException $error) {
+            self::assertSame(
+                'lockOwnerForUpdate() must be acquired before transactional metadata mutations.',
+                $error->getMessage(),
+            );
+        }
+
+        self::assertNull($this->store->getBucket('before-late-lock'));
+    }
+
     public function test_queue_claims_reject_pinned_outer_transaction(): void
     {
         $this->store->transaction(function (): void {

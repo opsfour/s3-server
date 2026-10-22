@@ -69,6 +69,44 @@ final class SqliteMetadataStoreDurabilityTest extends TestCase
         self::assertSame(1, (int) $queryOnly->fetchColumn());
     }
 
+    public function test_owner_write_lock_acquires_sqlite_writer_before_metadata_reads(): void
+    {
+        $this->path = sys_get_temp_dir() . '/s3-write-lock-' . bin2hex(random_bytes(4)) . '.sqlite';
+        $store = new SqliteMetadataStore($this->path);
+        $store->initialize();
+        $contender = $this->contendingConnection();
+
+        $store->beginTransaction();
+        $store->lockOwnerForUpdate('owner');
+
+        try {
+            $contender->exec($this->bucketInsertSql('blocked-bucket'));
+            self::fail('A competing SQLite writer bypassed the acquired owner write lock.');
+        } catch (\PDOException $error) {
+            self::assertStringContainsString('database is locked', $error->getMessage());
+        } finally {
+            $store->rollback();
+        }
+
+        self::assertSame(1, $contender->exec($this->bucketInsertSql('released-bucket')));
+    }
+
+    public function test_owner_read_lock_keeps_a_deferred_read_transaction(): void
+    {
+        $this->path = sys_get_temp_dir() . '/s3-read-lock-' . bin2hex(random_bytes(4)) . '.sqlite';
+        $store = new SqliteMetadataStore($this->path);
+        $store->initialize();
+        $contender = $this->contendingConnection();
+
+        $store->beginTransaction();
+        $store->lockOwnerForRead('owner');
+        try {
+            self::assertSame(1, $contender->exec($this->bucketInsertSql('concurrent-bucket')));
+        } finally {
+            $store->rollback();
+        }
+    }
+
     private function connection(SqliteMetadataStore $store): \PDO
     {
         $property = new \ReflectionProperty($store, 'pdo');
@@ -84,6 +122,25 @@ final class SqliteMetadataStoreDurabilityTest extends TestCase
         self::assertInstanceOf(\PDOStatement::class, $statement);
 
         return (int) $statement->fetchColumn();
+    }
+
+    private function contendingConnection(): \PDO
+    {
+        $connection = new \PDO('sqlite:' . $this->path, options: [
+            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+        ]);
+        $connection->exec('PRAGMA busy_timeout=0');
+
+        return $connection;
+    }
+
+    private function bucketInsertSql(string $bucket): string
+    {
+        return sprintf(
+            "INSERT INTO s3_buckets (name, owner_id, region, generation) VALUES ('%s', 'owner', 'us-east-1', '%s')",
+            $bucket,
+            bin2hex(random_bytes(16)),
+        );
     }
 
     private static function assertConnectionPerformancePragmas(\PDO $connection): void

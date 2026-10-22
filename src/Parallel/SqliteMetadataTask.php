@@ -38,7 +38,6 @@ final class SqliteMetadataTask implements Task
     {
         if (self::$store === null || self::$currentDbPath !== $this->databasePath) {
             self::$store = new SqliteMetadataStore($this->databasePath);
-            self::$store->initialize();
             self::$currentDbPath = $this->databasePath;
         }
 

@@ -1395,7 +1395,7 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         if ($fiber === null || ! isset($this->fiberWorkerMap[$fiber])) {
             throw new \LogicException('lockOwnerForUpdate() requires an active transaction in the current Fiber.');
         }
-        // The pinned SQLite worker transaction already serializes metadata writes.
+        $this->submit('lockOwnerForUpdate', [$ownerId]);
     }
 
     public function transaction(callable $callback): mixed
