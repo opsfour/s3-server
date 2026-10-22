@@ -98,9 +98,10 @@ final class ExternalIamHttpFunctionalTest extends S3FunctionalTestCase
         $client = $this->httpClient();
         $bucket = 'external-iam-' . bin2hex(random_bytes(8));
         self::$s3->createBucket(['Bucket' => $bucket]);
+        $expectedExpiresAt = time() + 300;
         $issued = $client->post('/.admin/credentials', [
             'headers' => ['Authorization' => 'Bearer external-test-admin-token'],
-            'json' => ['token' => $this->signedToken('s3-admin', ['key'], 'default-owner')],
+            'json' => ['token' => $this->signedToken('s3-admin', ['key'], 'default-owner', $expectedExpiresAt)],
         ]);
         self::assertSame(201, $issued->getStatusCode());
         $payload = json_decode((string) $issued->getBody(), true, 512, JSON_THROW_ON_ERROR);
@@ -109,7 +110,7 @@ final class ExternalIamHttpFunctionalTest extends S3FunctionalTestCase
         self::assertNotSame('', $payload['sessionToken']);
         self::assertIsString($payload['expiresAt']);
         $expiresAt = new \DateTimeImmutable($payload['expiresAt']);
-        self::assertEqualsWithDelta(time() + 3600, $expiresAt->getTimestamp(), 5);
+        self::assertEqualsWithDelta($expectedExpiresAt, $expiresAt->getTimestamp(), 5);
 
         $s3 = new S3Client([
             'version' => 'latest',
@@ -210,14 +211,18 @@ final class ExternalIamHttpFunctionalTest extends S3FunctionalTestCase
     }
 
     /** @param ?list<string> $prefixes */
-    private function signedToken(string $audience, ?array $prefixes = null, string $subject = 'external-user'): string
-    {
+    private function signedToken(
+        string $audience,
+        ?array $prefixes = null,
+        string $subject = 'external-user',
+        ?int $expiresAt = null,
+    ): string {
         $header = self::base64Url(json_encode(['alg' => 'RS256', 'kid' => 'default'], JSON_THROW_ON_ERROR));
         $claims = [
             'sub' => $subject,
             'iss' => 'https://identity.example.test/realm',
             'aud' => $audience,
-            'exp' => time() + 300,
+            'exp' => $expiresAt ?? time() + 300,
         ];
         if ($prefixes !== null) {
             $claims['s3_prefixes'] = $prefixes;

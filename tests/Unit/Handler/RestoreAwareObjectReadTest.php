@@ -610,7 +610,10 @@ final class RestoreAwareObjectReadTest extends TestCase
                 contentEncoding: 'gzip',
                 contentDisposition: 'inline',
                 cacheControl: 'public, max-age=300',
-                userMetadata: ['__expires' => 'Wed, 21 Oct 2026 07:28:00 GMT'],
+                userMetadata: [
+                    '__expires' => 'Wed, 21 Oct 2026 07:28:00 GMT',
+                    '__content-language' => 'de',
+                ],
             );
         }
         $this->metadata->putBucketWebsite('bucket', 'index.html', 'error.html');
@@ -627,6 +630,7 @@ final class RestoreAwareObjectReadTest extends TestCase
             self::assertSame('inline', $response->getHeader('Content-Disposition'));
             self::assertSame('public, max-age=300', $response->getHeader('Cache-Control'));
             self::assertSame('Wed, 21 Oct 2026 07:28:00 GMT', $response->getHeader('Expires'));
+            self::assertSame('de', $response->getHeader('Content-Language'));
             self::assertNotNull($response->getHeader('ETag'));
             self::assertNotNull($response->getHeader('Last-Modified'));
         }

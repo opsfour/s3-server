@@ -13,6 +13,8 @@ use OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration;
 /** Read-only schema admission check for serving nodes. */
 final class MetadataSchemaGuard
 {
+    private const int POSTGRES_MANAGED_SEQUENCE_COUNT = 17;
+
     public static function assertCurrent(string $driver, string $dsn): void
     {
         if (! in_array($driver, ['postgres', 'mysql'], true)) {
@@ -32,6 +34,7 @@ final class MetadataSchemaGuard
             self::assertMultipartCompletionCapacityConsistent($pool);
             if ($pool instanceof PostgresConnectionPool) {
                 self::assertPostgresWriteIntentTriggers($pool);
+                self::assertPostgresSequenceUsage($pool);
             } else {
                 self::assertMysqlWriteIntentTriggers($pool);
             }
@@ -124,6 +127,55 @@ final class MetadataSchemaGuard
         }
         if ($expected !== []) {
             throw new \RuntimeException('Write intent recovery triggers are missing or disabled; repair metadata before serving.');
+        }
+    }
+
+    public static function assertPostgresSequenceUsage(PostgresConnectionPool $pool): void
+    {
+        try {
+            $row = $pool->query(<<<'SQL'
+                SELECT COUNT(*) AS sequence_count,
+                       COUNT(*) FILTER (
+                           WHERE has_sequence_privilege(current_user, sequence_class.oid, 'USAGE') IS NOT TRUE
+                       ) AS missing_usage_count
+                FROM pg_class AS sequence_class
+                JOIN pg_depend AS dependency
+                  ON dependency.classid = 'pg_class'::regclass
+                 AND dependency.objid = sequence_class.oid
+                 AND dependency.refclassid = 'pg_class'::regclass
+                 AND dependency.deptype IN ('a', 'i')
+                JOIN pg_class AS table_class ON table_class.oid = dependency.refobjid
+                JOIN pg_namespace AS table_schema ON table_schema.oid = table_class.relnamespace
+                WHERE sequence_class.relkind = 'S'
+                  AND table_class.relname IN (
+                      's3_tier_transition_jobs',
+                      's3_restore_jobs',
+                      's3_objects',
+                      's3_parts',
+                      's3_acls',
+                      's3_tagging',
+                      's3_policies',
+                      's3_cors_rules',
+                      's3_encryption_configs',
+                      's3_lifecycle_rules',
+                      's3_lock_configs',
+                      's3_object_retention',
+                      's3_object_legal_holds',
+                      's3_notification_configs',
+                      's3_website_configs',
+                      's3_notification_queue',
+                      's3_storage_garbage'
+                  )
+                  AND table_schema.nspname = current_schema()
+                SQL)->fetchRow();
+        } catch (\Throwable) {
+            throw new \RuntimeException('PostgreSQL metadata sequence privileges cannot be verified.');
+        }
+
+        $sequenceCount = filter_var($row['sequence_count'] ?? null, FILTER_VALIDATE_INT);
+        $missingUsageCount = filter_var($row['missing_usage_count'] ?? null, FILTER_VALIDATE_INT);
+        if ($sequenceCount !== self::POSTGRES_MANAGED_SEQUENCE_COUNT || $missingUsageCount !== 0) {
+            throw new \RuntimeException('PostgreSQL metadata sequence USAGE privileges are incomplete.');
         }
     }
 

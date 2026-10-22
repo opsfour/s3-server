@@ -125,6 +125,28 @@ final class ObjectHeadersAndSpecialKeysTest extends S3FunctionalTestCase
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
     }
 
+    public function test_put_object_with_content_language_round_trips_through_get_and_head(): void
+    {
+        $key = 'content-language-test.txt';
+        self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+            'Body' => 'test',
+            'ContentLanguage' => 'de, en',
+        ]);
+
+        try {
+            $get = self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            $head = self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+
+            $this->assertSame('de, en', $get['ContentLanguage'] ?? $get['@metadata']['headers']['content-language'] ?? '');
+            $this->assertSame('de, en', $head['ContentLanguage'] ?? $head['@metadata']['headers']['content-language'] ?? '');
+            $this->assertArrayNotHasKey('__content-language', $get['Metadata'] ?? []);
+        } finally {
+            self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+        }
+    }
+
     public function test_put_object_default_content_type(): void
     {
         $key = 'default-ct-test.dat';

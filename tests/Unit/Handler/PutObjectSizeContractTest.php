@@ -73,6 +73,7 @@ final class PutObjectSizeContractTest extends TestCase
         $storage = new InMemoryBackend();
         $response = (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request('body', [
             'content-encoding' => ['gzip', 'br'],
+            'content-language' => ['de', 'en'],
             'cache-control' => ['no-cache', 'no-store'],
         ]));
 
@@ -80,6 +81,7 @@ final class PutObjectSizeContractTest extends TestCase
 
         self::assertSame(200, $response->getStatus());
         self::assertSame('gzip, br', $object?->systemMetadata['content-encoding'] ?? null);
+        self::assertSame('de, en', $object?->userMetadata['__content-language'] ?? null);
         self::assertSame('no-cache, no-store', $object?->systemMetadata['cache-control'] ?? null);
     }
 

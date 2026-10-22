@@ -140,6 +140,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
 
         // Preserve standard HTTP metadata for CompleteMultipartUpload.
         $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
+        $contentLanguage = RequestHeaderValues::combined($request, 'content-language');
         $contentDisposition = $request->getHeader('content-disposition');
         $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
         $expires = $request->getHeader('expires');
@@ -147,6 +148,9 @@ final class CreateMultipartUploadHandler implements RequestHandler
 
         if ($contentEncoding !== null) {
             $userMetadata['__mpu-content-encoding'] = $contentEncoding;
+        }
+        if ($contentLanguage !== null) {
+            $userMetadata['__mpu-content-language'] = $contentLanguage;
         }
         if ($contentDisposition !== null) {
             $userMetadata['__mpu-content-disposition'] = $contentDisposition;

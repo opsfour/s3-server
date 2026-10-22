@@ -617,6 +617,10 @@ final class WebsiteHostingMiddleware implements Middleware
         if ($expires !== null && $expires !== '') {
             $headers['Expires'] = $expires;
         }
+        $contentLanguage = $object->userMetadata['__content-language'] ?? null;
+        if ($contentLanguage !== null && $contentLanguage !== '') {
+            $headers['Content-Language'] = $contentLanguage;
+        }
 
         return $headers;
     }

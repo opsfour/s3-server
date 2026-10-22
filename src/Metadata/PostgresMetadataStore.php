@@ -63,6 +63,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     {
         $this->conn()->execute('UPDATE s3_buckets SET region = region WHERE FALSE');
         MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
+        MetadataSchemaGuard::assertPostgresSequenceUsage($this->pool);
     }
 
     public function assertCurrentSchema(): void
@@ -79,6 +80,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
         MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
+        MetadataSchemaGuard::assertPostgresSequenceUsage($this->pool);
     }
 
     public function initialize(): void

@@ -26,6 +26,24 @@ final class S3ResponseHeadersOverrideTest extends TestCase
         self::assertSame('GLACIER', $archive['x-amz-storage-class']);
     }
 
+    public function test_content_language_is_returned_without_leaking_internal_metadata(): void
+    {
+        $headers = S3ResponseHeaders::build(new ObjectInfo(
+            'bucket',
+            'key',
+            1,
+            '"etag"',
+            userMetadata: [
+                '__content-language' => 'de, en',
+                'visible' => 'value',
+            ],
+        ), 1);
+
+        self::assertSame('de, en', $headers['Content-Language']);
+        self::assertSame('value', $headers['x-amz-meta-visible']);
+        self::assertArrayNotHasKey('x-amz-meta-__content-language', $headers);
+    }
+
     public function test_object_and_restore_http_dates_are_normalized_to_utc(): void
     {
         $headers = S3ResponseHeaders::build(new ObjectInfo(

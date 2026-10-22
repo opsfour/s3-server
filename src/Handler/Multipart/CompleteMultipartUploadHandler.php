@@ -439,9 +439,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
         // Recover metadata fields stored during CreateMultipartUpload.
         $contentEncoding = $userMetadata['__mpu-content-encoding'] ?? null;
+        $contentLanguage = $userMetadata['__mpu-content-language'] ?? null;
         $contentDisposition = $userMetadata['__mpu-content-disposition'] ?? null;
         $cacheControl = $userMetadata['__mpu-cache-control'] ?? null;
         $storageClass = $userMetadata['__mpu-storage-class'] ?? 'STANDARD';
+        if ($contentLanguage !== null) {
+            $userMetadata['__content-language'] = $contentLanguage;
+        }
         $objectLockHeaders = [
             'mode' => $userMetadata['__object-lock-mode'] ?? null,
             'retainUntilDate' => $userMetadata['__object-lock-retain-until-date'] ?? null,
@@ -477,6 +481,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         // Remove internal __mpu-* keys from persisted user metadata.
         unset(
             $userMetadata['__mpu-content-encoding'],
+            $userMetadata['__mpu-content-language'],
             $userMetadata['__mpu-content-disposition'],
             $userMetadata['__mpu-cache-control'],
             $userMetadata['__mpu-storage-class'],

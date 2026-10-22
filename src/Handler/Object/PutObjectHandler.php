@@ -136,6 +136,7 @@ final class PutObjectHandler implements RequestHandler
         // 3. Extract metadata from request headers.
         $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
         $contentEncoding = RequestHeaderValues::combined($request, 'content-encoding');
+        $contentLanguage = RequestHeaderValues::combined($request, 'content-language');
         $contentDisposition = $request->getHeader('content-disposition');
         $cacheControl = RequestHeaderValues::combined($request, 'cache-control');
         $expires = $request->getHeader('expires');
@@ -149,6 +150,9 @@ final class PutObjectHandler implements RequestHandler
         // Store Expires in system metadata if provided.
         if ($expires !== null && $expires !== '') {
             $userMetadata['__expires'] = $expires;
+        }
+        if ($contentLanguage !== null) {
+            $userMetadata['__content-language'] = $contentLanguage;
         }
 
         $localLease = null;

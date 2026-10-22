@@ -470,8 +470,12 @@ final class CopyObjectHandler implements RequestHandler
             ? UserMetadataExtractor::extract($request)
             : null;
         $replacementExpires = $request->getHeader('expires');
+        $replacementContentLanguage = RequestHeaderValues::combined($request, 'content-language');
         if ($replacementUserMetadata !== null && $replacementExpires !== null && $replacementExpires !== '') {
             $replacementUserMetadata['__expires'] = $replacementExpires;
+        }
+        if ($replacementUserMetadata !== null && $replacementContentLanguage !== null) {
+            $replacementUserMetadata['__content-language'] = $replacementContentLanguage;
         }
 
         $changesEncryption = $sourceEncryptionMode !== $destinationEncryptionMode;
@@ -730,7 +734,7 @@ final class CopyObjectHandler implements RequestHandler
             $cacheControl = $srcObjectInfo->systemMetadata['cache-control'] ?? null;
             $userMetadata = [];
             foreach ($srcObjectInfo->userMetadata as $k => $v) {
-                if (! str_starts_with($k, '__') || $k === '__expires') {
+                if (! str_starts_with($k, '__') || in_array($k, ['__expires', '__content-language'], true)) {
                     $userMetadata[$k] = $v;
                 }
             }

@@ -117,10 +117,11 @@ final class CopyObjectValidationOrderTest extends TestCase
         }
     }
 
-    public function test_copy_directive_preserves_source_expires_metadata(): void
+    public function test_copy_directive_preserves_source_standard_metadata(): void
     {
         [$metadata, $storage] = $this->sourceWithStorage([
             '__expires' => 'Wed, 21 Oct 2026 07:28:00 GMT',
+            '__content-language' => 'de',
         ]);
 
         (new CopyObjectHandler($metadata, $storage))->handleRequest($this->request());
@@ -129,9 +130,13 @@ final class CopyObjectValidationOrderTest extends TestCase
             'Wed, 21 Oct 2026 07:28:00 GMT',
             $metadata->getObjectMetadata('target', 'copied')?->userMetadata['__expires'] ?? null,
         );
+        self::assertSame(
+            'de',
+            $metadata->getObjectMetadata('target', 'copied')?->userMetadata['__content-language'] ?? null,
+        );
     }
 
-    public function test_replace_directive_stores_request_expires_metadata(): void
+    public function test_replace_directive_stores_request_standard_metadata(): void
     {
         [$metadata, $storage] = $this->sourceWithStorage([
             '__expires' => 'Wed, 21 Oct 2026 07:28:00 GMT',
@@ -140,11 +145,16 @@ final class CopyObjectValidationOrderTest extends TestCase
         (new CopyObjectHandler($metadata, $storage))->handleRequest($this->request([
             'x-amz-metadata-directive' => 'REPLACE',
             'expires' => 'Thu, 22 Oct 2026 08:29:00 GMT',
+            'content-language' => 'fr',
         ]));
 
         self::assertSame(
             'Thu, 22 Oct 2026 08:29:00 GMT',
             $metadata->getObjectMetadata('target', 'copied')?->userMetadata['__expires'] ?? null,
+        );
+        self::assertSame(
+            'fr',
+            $metadata->getObjectMetadata('target', 'copied')?->userMetadata['__content-language'] ?? null,
         );
     }
 

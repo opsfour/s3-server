@@ -150,20 +150,18 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
         $this->assertGroupGrant($grants[1], self::AUTH_USERS_URI, 'READ');
     }
 
-    public function test_bucket_unknown_canned_defaults_to_private(): void
+    public function test_bucket_owner_full_control_canned_acl_is_rejected(): void
     {
-        $command = self::$s3->getCommand('PutBucketAcl', [
-            'Bucket' => self::$bucket,
-            'ACL' => 'bucket-owner-full-control',
-        ]);
-        self::$s3->execute($command);
-
-        $result = self::$s3->getBucketAcl(['Bucket' => self::$bucket]);
-        $grants = $result['Grants'];
-
-        $this->assertOwnerIdInResult($result);
-        $this->assertCount(1, $grants);
-        $this->assertOwnerFullControl($grants[0]);
+        try {
+            self::$s3->putBucketAcl([
+                'Bucket' => self::$bucket,
+                'ACL' => 'bucket-owner-full-control',
+            ]);
+            $this->fail('Expected InvalidArgument exception');
+        } catch (S3Exception $e) {
+            $this->assertSame(400, $e->getStatusCode());
+            $this->assertSame('InvalidArgument', $e->getAwsErrorCode());
+        }
     }
 
     // -----------------------------------------------------------------

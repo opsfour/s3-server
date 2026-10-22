@@ -72,6 +72,10 @@ final class S3ResponseHeaders
             $headers['Cache-Control'] = $objectInfo->systemMetadata['cache-control'];
         }
 
+        if (isset($objectInfo->userMetadata['__content-language']) && $objectInfo->userMetadata['__content-language'] !== '') {
+            $headers['Content-Language'] = $objectInfo->userMetadata['__content-language'];
+        }
+
         // Expires header (stored as __expires in user metadata).
         if (isset($objectInfo->userMetadata['__expires']) && $objectInfo->userMetadata['__expires'] !== '') {
             $headers['Expires'] = $objectInfo->userMetadata['__expires'];

@@ -62,18 +62,26 @@ final class MetadataDmlRoleTest extends TestCase
                 // DML-only is an actual database grant, not a test convention.
             }
 
-            $store = MetadataStoreFactory::create($driver, ['dsn' => $runtimeDsn], migrate: false);
-            $store->createBucket('dml-owner', $bucket, 'us-east-1');
-            self::assertSame('dml-owner', $store->getBucket($bucket)?->ownerId);
             if ($driver === 'postgres') {
-                try {
-                    $store->putObjectMetadata($bucket, 'key', 'dml-owner', 5, 'etag', 'text/plain', 'path');
-                    self::fail('PostgreSQL BIGSERIAL insert unexpectedly worked without sequence USAGE.');
-                } catch (\Throwable $error) {
-                    self::assertStringContainsString('permission denied for sequence', $error->getMessage());
+                $readinessStore = \OpsFour\S3Server\Metadata\PostgresMetadataStore::fromDsn($runtimeDsn);
+                foreach ([
+                    static fn() => MetadataStoreFactory::create($driver, ['dsn' => $runtimeDsn], migrate: false),
+                    static fn() => $readinessStore->assertMetadataWritable(),
+                ] as $admissionCheck) {
+                    try {
+                        $admissionCheck();
+                        self::fail('PostgreSQL serving accepted missing sequence USAGE privileges.');
+                    } catch (\RuntimeException $error) {
+                        self::assertStringContainsString('sequence USAGE privileges are incomplete', $error->getMessage());
+                        self::assertStringNotContainsString('_id_seq', $error->getMessage());
+                    }
                 }
                 $admin->exec("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO {$role}");
             }
+
+            $store = MetadataStoreFactory::create($driver, ['dsn' => $runtimeDsn], migrate: false);
+            $store->createBucket('dml-owner', $bucket, 'us-east-1');
+            self::assertSame('dml-owner', $store->getBucket($bucket)?->ownerId);
             $store->putObjectMetadata($bucket, 'key', 'dml-owner', 5, 'etag', 'text/plain', 'path');
             self::assertSame('etag', $store->getObjectMetadata($bucket, 'key')?->etag);
             $store->deleteObjectMetadata($bucket, 'key');

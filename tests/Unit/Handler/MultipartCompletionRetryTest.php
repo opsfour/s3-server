@@ -2589,14 +2589,18 @@ final class MultipartCompletionRetryTest extends TestCase
             ->getStatus());
     }
 
-    public function test_multipart_completion_preserves_expires_from_initiation(): void
+    public function test_multipart_completion_preserves_standard_metadata_from_initiation(): void
     {
         $expires = 'Wed, 21 Oct 2037 07:28:00 GMT';
+        $contentLanguage = 'de, en';
         $created = (new CreateMultipartUploadHandler($this->metadata))
             ->handleRequest($this->request(
                 'POST',
                 '/bucket/retry.bin?uploads',
-                headers: ['expires' => $expires],
+                headers: [
+                    'expires' => $expires,
+                    'content-language' => $contentLanguage,
+                ],
             ));
         $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
         $part = (new UploadPartHandler($this->metadata, $this->storage))->handleRequest(
@@ -2613,9 +2617,12 @@ final class MultipartCompletionRetryTest extends TestCase
         $object = $this->metadata->getObjectMetadata('bucket', 'retry.bin');
         self::assertNotNull($object);
         self::assertSame($expires, $object->userMetadata['__expires'] ?? null);
+        self::assertSame($contentLanguage, $object->userMetadata['__content-language'] ?? null);
+        self::assertArrayNotHasKey('__mpu-content-language', $object->userMetadata);
         $get = (new GetObjectHandler($this->metadata, $this->storage))
             ->handleRequest($this->request('GET', '/bucket/retry.bin'));
         self::assertSame($expires, $get->getHeader('Expires'));
+        self::assertSame($contentLanguage, $get->getHeader('Content-Language'));
     }
 
     public function test_upload_part_copy_rejects_explicit_delete_marker_version(): void
