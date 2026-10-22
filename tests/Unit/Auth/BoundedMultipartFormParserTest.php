@@ -18,11 +18,36 @@ use OpsFour\S3Server\Auth\PostObjectTempFileSweeper;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
+use OpsFour\S3Server\Exception\KeyTooLongException;
 use OpsFour\S3Server\Exception\S3Exception;
 use PHPUnit\Framework\TestCase;
 
 final class BoundedMultipartFormParserTest extends TestCase
 {
+    /** @param class-string<\Throwable> $exception */
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidObjectKeys')]
+    public function test_object_key_is_validated_before_authentication_and_spooling(string $key, string $exception): void
+    {
+        $body = "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"key\"\r\n\r\n"
+            . $key
+            . "\r\n--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"file\"; filename=\"object.txt\"\r\n\r\n"
+            . "payload\r\n--guard-boundary--\r\n";
+        $parser = new PostObjectFormParser($this->createMock(CredentialProvider::class), 'us-east-1', 1_048_576);
+
+        $this->expectException($exception);
+        $parser->parse($this->request(new ReadableBuffer($body), 'guard-boundary'));
+    }
+
+    /** @return iterable<string, array{string, class-string<\Throwable>}> */
+    public static function invalidObjectKeys(): iterable
+    {
+        yield 'invalid UTF-8' => ["object-\xFF", InvalidArgumentException::class];
+        yield 'XML control' => ["object-\x0B", InvalidArgumentException::class];
+        yield 'above byte limit' => [str_repeat('a', 1025), KeyTooLongException::class];
+    }
+
     /** @param list<string> $names */
     #[\PHPUnit\Framework\Attributes\DataProvider('duplicateChecksumFormFieldNames')]
     public function test_checksum_form_field_names_are_unique_case_insensitively(array $names): void

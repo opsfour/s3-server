@@ -8,6 +8,7 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Http\ObjectKeyValidator;
 use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
@@ -39,6 +40,7 @@ final class S3AttributeMiddleware implements Middleware
             $request->setAttribute('s3.bucket', $bucket ?? '');
             $request->setAttribute('s3.key', $key ?? '');
             $request->setAttribute('s3.operation', null);
+            self::validateKey($key);
 
             return $requestHandler->handleRequest($request);
         }
@@ -59,13 +61,19 @@ final class S3AttributeMiddleware implements Middleware
         $request->setAttribute('s3.key', $key ?? '');
         $request->setAttribute('s3.operation', $operation);
 
-        // Validate key length (S3 limit: 1024 bytes).
-        // Set attributes BEFORE throwing so error handler can read them.
-        if ($key !== null && strlen($key) > 1024) {
-            throw new \OpsFour\S3Server\Exception\KeyTooLongException();
-        }
+        // Set attributes before validation so the error handler retains request context.
+        self::validateKey($key);
 
         return $requestHandler->handleRequest($request);
+    }
+
+    private static function validateKey(?string $key): void
+    {
+        if ($key === null || $key === '') {
+            return;
+        }
+
+        ObjectKeyValidator::assertValid($key);
     }
 
     private static function determineScope(?string $bucket, ?string $key): string

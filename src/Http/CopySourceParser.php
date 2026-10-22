@@ -32,6 +32,7 @@ final class CopySourceParser
         if ($bucket === '' || $key === '') {
             throw new InvalidArgumentException('Invalid x-amz-copy-source: bucket and key must not be empty.');
         }
+        ObjectKeyValidator::assertValid($key);
 
         return [$bucket, $key, $versionId];
     }

@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -15,6 +16,7 @@ use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
+use OpsFour\S3Server\Xml\XmlText;
 
 final class ListMultipartUploadsHandler implements RequestHandler
 {
@@ -25,17 +27,21 @@ final class ListMultipartUploadsHandler implements RequestHandler
     public function handleRequest(Request $request): Response
     {
         $bucket = $request->getAttribute('s3.bucket');
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        $uploadIdMarker = $queryParams['upload-id-marker'] ?? null;
+        if ($uploadIdMarker !== null && ! XmlText::isValid($uploadIdMarker)) {
+            throw new InvalidArgumentException('upload-id-marker contains characters that are invalid in XML.');
+        }
+
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
 
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
         $prefix = $queryParams['prefix'] ?? null;
         $delimiter = $queryParams['delimiter'] ?? null;
         $maxUploads = ListingQuery::limit($queryParams, 'max-uploads');
         $keyMarker = $queryParams['key-marker'] ?? null;
-        $uploadIdMarker = $queryParams['upload-id-marker'] ?? null;
         $encodingType = ListingQuery::encodingType($queryParams);
 
         if (! $this->metadata instanceof GenerationBoundMultipartListingStore) {

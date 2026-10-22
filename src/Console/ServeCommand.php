@@ -242,6 +242,14 @@ final class ServeCommand extends Command
 
     private function configFromInput(InputInterface $input, ?string $storagePath): S3ServerConfig
     {
+        if ((string) $input->getOption('storage-driver') !== 'filesystem'
+            && (string) $input->getOption('metadata-driver') === 'sqlite'
+            && $this->nullableString($input->getOption('metadata-path')) === null) {
+            throw new \InvalidArgumentException(
+                '--metadata-path is required when SQLite is used with non-filesystem storage.',
+            );
+        }
+
         return new S3ServerConfig(
             host: (string) $input->getOption('host'),
             port: $this->integerOption($input, 'port'),

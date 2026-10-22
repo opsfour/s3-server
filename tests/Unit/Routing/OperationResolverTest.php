@@ -37,6 +37,43 @@ final class OperationResolverTest extends TestCase
         $this->assertSame(S3Operation::ListBuckets, $op);
     }
 
+    public function test_service_scope_accepts_list_buckets_modifiers_and_unknown_parameters(): void
+    {
+        $op = OperationResolver::resolve('GET', 'service', [
+            'max-buckets' => '10',
+            'continuation-token' => 'next',
+            'prefix' => 'logs-',
+            'bucket-region' => 'us-east-1',
+            'future-parameter' => 'value',
+        ], []);
+
+        self::assertSame(S3Operation::ListBuckets, $op);
+    }
+
+    /** @param array<string, string> $query */
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidServiceScopeSelectors')]
+    public function test_service_scope_rejects_known_bucket_and_object_selectors(array $query): void
+    {
+        $this->expectException(MethodNotAllowedException::class);
+        OperationResolver::resolve('GET', 'service', $query, []);
+    }
+
+    /** @return iterable<string, array{array<string, string>}> */
+    public static function invalidServiceScopeSelectors(): iterable
+    {
+        yield 'bucket ACL' => [['acl' => '']];
+        yield 'multipart upload listing' => [['uploads' => '']];
+        yield 'object retention' => [['retention' => '']];
+        yield 'bucket object listing modifier' => [['max-keys' => '10']];
+        yield 'object part listing modifier' => [['max-parts' => '10']];
+    }
+
+    public function test_service_scope_rejects_unsupported_directory_bucket_listing(): void
+    {
+        $this->expectException(NotImplementedException::class);
+        OperationResolver::resolve('GET', 'service', ['max-directory-buckets' => '10'], []);
+    }
+
     public function test_bucket_scope_put(): void
     {
         $op = OperationResolver::resolve('PUT', 'bucket', [], []);

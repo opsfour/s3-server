@@ -46,6 +46,60 @@ final class QueryRoutingConsistencyTest extends TestCase
         self::assertSame(S3Operation::GetObject, $request->getAttribute('s3.operation'));
     }
 
+    public function test_attribute_middleware_rejects_invalid_utf8_in_decoded_object_key(): void
+    {
+        $request = $this->request('GET', 'http://127.0.0.1/bucket-a/object%FF');
+
+        try {
+            (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+            self::fail('Expected an invalid UTF-8 object key to be rejected.');
+        } catch (InvalidArgumentException $exception) {
+            self::assertSame('InvalidArgument', $exception->getErrorCode());
+        }
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidXmlObjectKeys')]
+    public function test_attribute_middleware_rejects_invalid_xml_text_in_decoded_object_key(string $encodedKey): void
+    {
+        $request = $this->request('GET', 'http://127.0.0.1/bucket-a/' . $encodedKey);
+
+        try {
+            (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+            self::fail('Expected an invalid XML object key to be rejected.');
+        } catch (InvalidArgumentException $exception) {
+            self::assertSame('InvalidArgument', $exception->getErrorCode());
+        }
+    }
+
+    /** @return iterable<string, array{non-empty-string}> */
+    public static function invalidXmlObjectKeys(): iterable
+    {
+        yield 'NUL' => ['object%00key'];
+        yield 'XML control' => ['object%0Bkey'];
+    }
+
+    public function test_options_rejects_invalid_xml_text_before_cors_middleware(): void
+    {
+        $request = $this->request('OPTIONS', 'http://127.0.0.1/bucket-a/object%0Bkey');
+
+        try {
+            (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+            self::fail('Expected an invalid XML object key in a CORS preflight to be rejected.');
+        } catch (InvalidArgumentException $exception) {
+            self::assertSame('InvalidArgument', $exception->getErrorCode());
+        }
+    }
+
+    public function test_attribute_middleware_accepts_valid_unicode_object_key(): void
+    {
+        $request = $this->request('GET', 'http://127.0.0.1/bucket-a/%E2%98%83/%E6%96%87%E4%BB%B6');
+
+        (new S3AttributeMiddleware())->handleRequest($request, $this->terminal());
+
+        self::assertSame("\u{2603}/\u{6587}\u{4EF6}", $request->getAttribute('s3.key'));
+        self::assertSame(S3Operation::GetObject, $request->getAttribute('s3.operation'));
+    }
+
     public function test_decoded_control_character_cannot_alias_another_bucket(): void
     {
         $request = $this->request(

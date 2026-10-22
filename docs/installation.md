@@ -62,7 +62,7 @@ it through shell history or process listings.
 | `--region` | `us-east-1` | AWS region identifier |
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
 | `--metadata-dsn` | (auto) | Database DSN for postgres/mysql |
-| `--metadata-path` | (auto) | Standalone SQLite database path |
+| `--metadata-path` | (auto for filesystem storage) | Standalone SQLite database path; required with non-filesystem storage (`:memory:` is an explicit test-only choice) |
 | `--credentials-driver` | `memory` | `memory`, `database`, `file` |
 | `--access-key` | - | Access key (memory driver) |
 | `--secret-key` | - | Secret key override for isolated local use; prefer a protected environment or secret store |

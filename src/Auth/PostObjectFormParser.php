@@ -16,6 +16,7 @@ use OpsFour\S3Server\Exception\InvalidAccessKeyIdException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\RequestHeaderValues;
+use OpsFour\S3Server\Http\ObjectKeyValidator;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
 use OpsFour\S3Server\Xml\XmlRequestParser;
@@ -144,6 +145,7 @@ final class PostObjectFormParser
                         throw new InvalidArgumentException('Bucket POST must contain a field named "key".');
                     }
                     $key = str_replace('${filename}', $filename, $keyField);
+                    ObjectKeyValidator::assertValid($key);
                     self::setValue($fields, 'key', $key);
 
                     // The file field must be last, so all signature fields are

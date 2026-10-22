@@ -94,6 +94,18 @@ final class ObjectListingContractTest extends TestCase
         );
     }
 
+    public function test_list_versions_rejects_xml_invalid_version_marker_before_metadata_access(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getBucket');
+        $metadata->expects(self::never())->method('listObjectVersions');
+
+        $this->expectException(InvalidArgumentException::class);
+        (new ListObjectVersionsHandler($metadata))->handleRequest(
+            $this->request('?versions&key-marker=key&version-id-marker=%01'),
+        );
+    }
+
     public function test_list_versions_accepts_paired_key_and_version_markers(): void
     {
         $metadata = $this->createMock(MetadataStore::class);

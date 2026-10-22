@@ -795,6 +795,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $sseAlgo = $encMeta['sse-algorithm'] ?? null;
         if ($sseAlgo === 'SSE-C') {
             $responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+            $responseHeaders['x-amz-server-side-encryption-customer-key-MD5'] = $encMeta['sse-customer-key-md5'];
         } elseif ($sseAlgo === 'AES256') {
             $responseHeaders['x-amz-server-side-encryption'] = 'AES256';
         }

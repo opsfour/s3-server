@@ -10,6 +10,8 @@ use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
 use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Laravel\S3CredentialsCommand;
 use OpsFour\S3Server\Laravel\S3QuotaCommand;
 use OpsFour\S3Server\Laravel\S3ServerCommand;
@@ -493,6 +495,52 @@ final class S3ServerServiceProviderTest extends TestCase
 
         self::assertSame(Command::FAILURE, $exit);
         self::assertStringContainsString('Port must be between 1 and 65535', $tester->getDisplay());
+    }
+
+    public function test_serve_command_uses_container_encryption_service(): void
+    {
+        $app = $this->application();
+        $service = $this->createStub(EncryptionServiceInterface::class);
+        $app->instance(EncryptionServiceInterface::class, $service);
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+        $resolve = new \ReflectionMethod($command, 'encryptionFromContainer');
+
+        self::assertSame(
+            $service,
+            $resolve->invoke($command, $app->make(S3ServerConfig::class), $app->make(\OpsFour\S3Server\Observability\MetricsCollector::class)),
+        );
+    }
+
+    public function test_serve_command_builds_opt_in_laravel_event_bridge(): void
+    {
+        $app = $this->application([
+            'notifications' => [
+                'laravel_event_dispatcher' => [
+                    'enabled' => true,
+                    'pattern' => 's3:ObjectCreated:*',
+                    'event_name' => null,
+                ],
+            ],
+        ]);
+        $events = new Dispatcher($app);
+        $app->instance('events', $events);
+        $received = null;
+        $events->listen(S3Event::class, static function (S3Event $event) use (&$received): void {
+            $received = $event;
+        });
+        $command = $app->make(S3ServerCommand::class);
+        $command->setLaravel($app);
+        $resolve = new \ReflectionMethod($command, 'notificationListenersFromConfig');
+
+        $listeners = $resolve->invoke($command);
+        self::assertIsArray($listeners);
+        self::assertCount(1, $listeners);
+        self::assertSame('s3:ObjectCreated:*', $listeners[0]['pattern']);
+        self::assertIsCallable($listeners[0]['listener']);
+        $event = new S3Event('s3:ObjectCreated:Put', 'bucket', 'key');
+        ($listeners[0]['listener'])($event);
+        self::assertSame($event, $received);
     }
 
     public function test_serve_command_rejects_non_decimal_port_without_truncating_it(): void

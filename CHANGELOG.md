@@ -85,6 +85,17 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Wire opt-in Laravel event dispatch and container-provided encryption services
+  into the Artisan server runtime.
+- Require an explicit standalone SQLite metadata path when object storage is
+  not the local filesystem, preventing unrelated instances from sharing a
+  temporary-directory database.
+- Reject URL-decoded object keys that are invalid UTF-8 or cannot be represented
+  as XML 1.0 text before handler or storage access.
+- Reject known bucket and object selectors at service scope, and reject XML-invalid
+  version and multipart upload markers before listing metadata is accessed.
+- Return the SSE-C customer-key MD5 header after successful multipart
+  completion.
 - Preserve `Content-Language` across object PUT, multipart completion, and
   metadata COPY/REPLACE operations, and return it from API and website reads.
 - Cap OIDC-issued credential lifetimes at the source JWT expiration time.

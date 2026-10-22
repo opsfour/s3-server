@@ -25,6 +25,11 @@ use OpsFour\S3Server\Exception\NotImplementedException;
  */
 final class OperationResolver
 {
+    /** @var list<string> */
+    private const array UNSUPPORTED_SERVICE_QUERY_SELECTORS = [
+        'max-directory-buckets',
+    ];
+
     /** @var array<string, list<string>> */
     private const array BUCKET_SUBRESOURCE_METHODS = [
         'ownershipControls' => ['GET', 'PUT', 'DELETE'],
@@ -99,18 +104,20 @@ final class OperationResolver
     /** @var array<string, list<S3Operation>> */
     private const array BUCKET_LISTING_MODIFIER_OPERATIONS = [
         'list-type' => [S3Operation::ListObjectsV2],
-        'continuation-token' => [S3Operation::ListObjectsV2],
+        'continuation-token' => [S3Operation::ListBuckets, S3Operation::ListObjectsV2],
         'delimiter' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
         'encoding-type' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
         'fetch-owner' => [S3Operation::ListObjectsV2],
         'key-marker' => [S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
         'marker' => [S3Operation::ListObjects],
+        'max-buckets' => [S3Operation::ListBuckets],
         'max-keys' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions],
         'max-uploads' => [S3Operation::ListMultipartUploads],
-        'prefix' => [S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
+        'prefix' => [S3Operation::ListBuckets, S3Operation::ListObjects, S3Operation::ListObjectsV2, S3Operation::ListObjectVersions, S3Operation::ListMultipartUploads],
         'start-after' => [S3Operation::ListObjectsV2],
         'upload-id-marker' => [S3Operation::ListMultipartUploads],
         'version-id-marker' => [S3Operation::ListObjectVersions],
+        'bucket-region' => [S3Operation::ListBuckets],
     ];
 
     /** @var array<string, list<string>> */
@@ -193,7 +200,7 @@ final class OperationResolver
     public static function resolve(string $method, string $scope, array $queryParams, array $headers): S3Operation
     {
         return match ($scope) {
-            'service' => self::resolveService($method),
+            'service' => self::resolveService($method, $queryParams),
             'bucket' => self::resolveBucket($method, $queryParams),
             'object' => self::resolveObject($method, $queryParams, $headers),
             default => throw new MethodNotAllowedException("Unknown scope: {$scope}"),
@@ -202,16 +209,41 @@ final class OperationResolver
 
     /**
      * Service-level: only GET / is valid (ListBuckets).
+     *
+     * @param array<string, mixed> $queryParams
      */
-    private static function resolveService(string $method): S3Operation
+    private static function resolveService(string $method, array $queryParams): S3Operation
     {
-        return match ($method) {
+        self::assertSubresourceScopeIsValid(
+            $queryParams,
+            self::BUCKET_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_BUCKET_SUBRESOURCES,
+            [],
+        );
+        self::assertSubresourceScopeIsValid(
+            $queryParams,
+            self::OBJECT_SUBRESOURCE_METHODS,
+            self::UNSUPPORTED_OBJECT_SUBRESOURCES,
+            [],
+        );
+        self::assertSubresourceRoutingIsValid(
+            $method,
+            $queryParams,
+            [],
+            self::UNSUPPORTED_SERVICE_QUERY_SELECTORS,
+        );
+
+        $operation = match ($method) {
             'GET' => S3Operation::ListBuckets,
             default => throw new MethodNotAllowedException(
                 "Unsupported method '{$method}' for service scope.",
                 ['GET'],
             ),
         };
+        self::assertQueryModifiersForOperation($queryParams, $operation, self::BUCKET_LISTING_MODIFIER_OPERATIONS);
+        self::assertQueryModifiersForOperation($queryParams, $operation, self::OBJECT_QUERY_MODIFIER_OPERATIONS);
+
+        return $operation;
     }
 
     /**

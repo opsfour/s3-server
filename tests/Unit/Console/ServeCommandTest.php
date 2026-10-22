@@ -124,6 +124,19 @@ final class ServeCommandTest extends TestCase
         self::assertSame(0, $this->invoke($command, 'configFromInput', [$input, null])->sqliteWorkerPoolSize);
     }
 
+    public function test_non_filesystem_storage_requires_an_explicit_sqlite_metadata_path(): void
+    {
+        $command = new ServeCommand();
+        $input = $this->input($command, [
+            '--storage-driver' => 'memory',
+            '--storage-temp-dir' => $this->tempDir,
+        ]);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('--metadata-path is required when SQLite is used with non-filesystem storage.');
+        $this->invoke($command, 'configFromInput', [$input, null]);
+    }
+
     public function test_ambiguous_default_sqlite_files_fail_before_server_start(): void
     {
         self::assertTrue(mkdir($this->tempDir . '/.opsfour'));

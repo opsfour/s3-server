@@ -153,10 +153,11 @@ final class AclComprehensiveTest extends S3FunctionalTestCase
     public function test_bucket_owner_full_control_canned_acl_is_rejected(): void
     {
         try {
-            self::$s3->putBucketAcl([
+            $command = self::$s3->getCommand('PutBucketAcl', [
                 'Bucket' => self::$bucket,
                 'ACL' => 'bucket-owner-full-control',
             ]);
+            self::$s3->execute($command);
             $this->fail('Expected InvalidArgument exception');
         } catch (S3Exception $e) {
             $this->assertSame(400, $e->getStatusCode());

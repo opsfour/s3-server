@@ -81,6 +81,12 @@ return [
         'require_https' => EnvironmentBoolean::boolean('S3_NOTIFICATION_REQUIRE_HTTPS', true),
         // Let this server process drain queued webhook deliveries.
         'worker_enabled' => EnvironmentBoolean::boolean('S3_NOTIFICATION_WORKER', true),
+        // Optionally dispatch internal S3 events through Laravel's event dispatcher.
+        'laravel_event_dispatcher' => [
+            'enabled' => false,
+            'pattern' => 's3:*',
+            'event_name' => null,
+        ],
     ],
 
     'metrics_bearer_token' => env('S3_METRICS_BEARER_TOKEN'),

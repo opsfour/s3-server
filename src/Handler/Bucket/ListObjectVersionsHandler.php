@@ -13,6 +13,7 @@ use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
+use OpsFour\S3Server\Xml\XmlText;
 
 /**
  * Handles ListObjectVersions (GET /{bucket}?versions).
@@ -32,6 +33,12 @@ final class ListObjectVersionsHandler implements RequestHandler
         $bucket = $request->getAttribute('s3.bucket');
         $ownerId = $request->getAttribute('ownerId');
 
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        $versionIdMarker = $queryParams['version-id-marker'] ?? null;
+        if ($versionIdMarker !== null && ! XmlText::isValid($versionIdMarker)) {
+            throw new InvalidArgumentException('version-id-marker contains characters that are invalid in XML.');
+        }
+
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
 
@@ -39,13 +46,9 @@ final class ListObjectVersionsHandler implements RequestHandler
             throw new NoSuchBucketException();
         }
 
-        // Parse query parameters.
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-
         $prefix = $queryParams['prefix'] ?? null;
         $delimiter = $queryParams['delimiter'] ?? null;
         $keyMarker = $queryParams['key-marker'] ?? null;
-        $versionIdMarker = $queryParams['version-id-marker'] ?? null;
         $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
         $encodingType = ListingQuery::encodingType($queryParams);
         if ($versionIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {

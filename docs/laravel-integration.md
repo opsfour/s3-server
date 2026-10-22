@@ -105,6 +105,38 @@ $metadata = app(MetadataStore::class);
 $storage  = app(StorageBackend::class);
 ```
 
+### Laravel Events
+
+Internal S3 events can be forwarded to Laravel's event dispatcher without
+changing webhook delivery. Enable the opt-in bridge in `config/s3-server.php`:
+
+```php
+'notifications' => [
+    'laravel_event_dispatcher' => [
+        'enabled' => true,
+        'pattern' => 's3:ObjectCreated:*',
+        'event_name' => null,
+    ],
+],
+```
+
+With `event_name` set to `null`, Laravel receives the
+`OpsFour\S3Server\Event\S3Event` object. Set a nonempty event name to dispatch
+that fixed Laravel event name with the S3 event as its payload.
+
+### Custom Encryption Services
+
+The Artisan server uses an `EncryptionServiceInterface` binding when one is
+present. If only `MasterKeyProvider` is bound, it builds the standard inline or
+parallel encryption service from that provider. Without either binding, the
+existing environment-based provider configuration remains active.
+
+```php
+use OpsFour\S3Server\Encryption\MasterKeyProvider;
+
+$this->app->singleton(MasterKeyProvider::class, AppMasterKeyProvider::class);
+```
+
 ## Using with Laravel's Filesystem
 
 You can point Laravel's S3 filesystem driver at your local S3 server for development:

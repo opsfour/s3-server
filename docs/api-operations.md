@@ -40,6 +40,10 @@ the private owner ACL.
 | PostObject | `POST` | `/{bucket}` | Browser-style form upload |
 | CopyObject | `PUT` | `/{bucket}/{key}` | Copy object (with `x-amz-copy-source` header) |
 
+Nonempty object keys are limited to 1024 bytes after URL decoding and must be
+valid UTF-8 XML 1.0 text. Invalid keys return `InvalidArgument` before handler
+or storage access.
+
 GetObject requests without a `Range` header return HTTP 405 for objects larger
 than 5 TiB. Use byte-range requests to download those objects. HeadObject
 continues to return their metadata without an object body.

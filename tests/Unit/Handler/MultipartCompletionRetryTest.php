@@ -2451,6 +2451,10 @@ final class MultipartCompletionRetryTest extends TestCase
             $sseHeaders,
         ));
         self::assertSame(200, $completed->getStatus());
+        self::assertSame(
+            $sseHeaders['x-amz-server-side-encryption-customer-key-MD5'],
+            $completed->getHeader('x-amz-server-side-encryption-customer-key-MD5'),
+        );
         self::assertNull($this->metadata->getMultipartUpload($uploadId));
 
         $get = (new GetObjectHandler($this->metadata, $this->storage, $this->encryption))

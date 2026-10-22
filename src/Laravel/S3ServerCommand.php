@@ -11,12 +11,17 @@ use Illuminate\Console\Command;
 use Monolog\Logger;
 use Monolog\Processor\PsrLogMessageProcessor;
 use OpsFour\S3Server\Contracts\CredentialProvider;
+use OpsFour\S3Server\Encryption\EncryptionService;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Encryption\MasterKeyProvider;
+use OpsFour\S3Server\Event\Adapter\LaravelEventListener;
 use OpsFour\S3Server\Factory\CredentialProviderFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Parallel\ParallelEncryptionService;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\BootstrapResourceCleanup;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
@@ -115,6 +120,8 @@ class S3ServerCommand extends Command
                 (string) config('s3-server.metadata.driver', 'sqlite'),
             );
             $credentialProvider = $this->resolveCredentials();
+            $notificationListeners = $this->notificationListenersFromConfig();
+            $encryption = $this->encryptionFromContainer($config, $metrics);
 
             $runtime = (new S3ServerRuntimeFactory())->create(
                 config: $config,
@@ -126,6 +133,8 @@ class S3ServerCommand extends Command
                 storageTiers: $storageTierRegistry,
                 externalIamConfig: config('s3-server.external_iam', []),
                 adminToken: $this->adminTokenFromConfig(),
+                encryption: $encryption,
+                notificationListeners: $notificationListeners,
             );
             $ownedStorageTierRegistry = null;
         } catch (\InvalidArgumentException $e) {
@@ -188,6 +197,78 @@ class S3ServerCommand extends Command
             ?? config('s3-server.external_iam.admin_token');
 
         return is_string($adminToken) ? $adminToken : null;
+    }
+
+    /** @return list<array{pattern: string, listener: callable}> */
+    private function notificationListenersFromConfig(): array
+    {
+        $bridge = config('s3-server.notifications.laravel_event_dispatcher', []);
+        if (! is_array($bridge)) {
+            throw new \InvalidArgumentException('Laravel event dispatcher configuration must be an array.');
+        }
+
+        $enabled = $bridge['enabled'] ?? false;
+        if (! is_bool($enabled)) {
+            throw new \InvalidArgumentException('Laravel event dispatcher enabled must be a boolean.');
+        }
+        if (! $enabled) {
+            return [];
+        }
+
+        $pattern = $bridge['pattern'] ?? 's3:*';
+        if (! is_string($pattern) || trim($pattern) === '') {
+            throw new \InvalidArgumentException('Laravel event dispatcher pattern must be a non-empty string.');
+        }
+
+        $eventName = $bridge['event_name'] ?? null;
+        if ($eventName !== null && (! is_string($eventName) || trim($eventName) === '')) {
+            throw new \InvalidArgumentException('Laravel event dispatcher event_name must be null or a non-empty string.');
+        }
+
+        $events = $this->getLaravel()->make('events');
+        if (! is_object($events)) {
+            throw new \InvalidArgumentException('Laravel events service must resolve to an object.');
+        }
+
+        return [[
+            'pattern' => $pattern,
+            'listener' => new LaravelEventListener($events, $eventName),
+        ]];
+    }
+
+    private function encryptionFromContainer(
+        S3ServerConfig $config,
+        MetricsCollector $metrics,
+    ): ?EncryptionServiceInterface {
+        $container = $this->getLaravel();
+        if ($container->bound(EncryptionServiceInterface::class)) {
+            $service = $container->make(EncryptionServiceInterface::class);
+            if (! $service instanceof EncryptionServiceInterface) {
+                throw new \InvalidArgumentException('Laravel encryption service binding is invalid.');
+            }
+
+            return $service;
+        }
+
+        if (! $container->bound(MasterKeyProvider::class)) {
+            return null;
+        }
+
+        $provider = $container->make(MasterKeyProvider::class);
+        if (! $provider instanceof MasterKeyProvider) {
+            throw new \InvalidArgumentException('Laravel master key provider binding is invalid.');
+        }
+
+        if ($config->encryptionWorkerPoolSize > 0) {
+            return new ParallelEncryptionService(
+                $provider,
+                $config->encryptionWorkerPoolSize,
+                $config->encryptionParallelThreshold,
+                $metrics,
+            );
+        }
+
+        return new EncryptionService($provider);
     }
 
     /**

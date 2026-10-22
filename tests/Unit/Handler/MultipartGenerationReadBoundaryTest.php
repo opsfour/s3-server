@@ -8,6 +8,7 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Exception\NotImplementedException;
@@ -121,6 +122,24 @@ final class MultipartGenerationReadBoundaryTest extends TestCase
         );
 
         self::assertSame(200, $response->getStatus());
+    }
+
+    public function test_upload_listing_rejects_xml_invalid_upload_marker_before_metadata_access(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            GenerationBoundMultipartListingStore::class,
+        ]);
+        if (! $metadata instanceof MetadataStore) {
+            throw new \LogicException('Intersection mock does not implement MetadataStore.');
+        }
+        $metadata->expects(self::never())->method('getBucket');
+        $metadata->expects(self::never())->method('listMultipartUploadsForBucket');
+
+        $this->expectException(InvalidArgumentException::class);
+        (new ListMultipartUploadsHandler($metadata))->handleRequest(
+            $this->request('GET', 'owner', query: '?uploads&upload-id-marker=%01'),
+        );
     }
 
     public function test_list_parts_rechecks_generation_after_ownership_lookup(): void
