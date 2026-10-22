@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Routing;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Http\ObjectKeyValidator;
 use OpsFour\S3Server\Http\QueryStringParser;
 
 /**
@@ -72,6 +73,10 @@ final class S3Router implements RequestHandler
         $request->setAttribute('s3.bucket', $bucket ?? '');
         $request->setAttribute('s3.key', $key ?? '');
         $request->setAttribute('s3.operation', $operation);
+
+        if ($key !== null && $key !== '') {
+            ObjectKeyValidator::assertValid($key);
+        }
 
         // 6. Dispatch to the registered handler.
         $handler = $this->handlerRegistry->get($operation);

@@ -161,6 +161,20 @@ final class QueryRoutingConsistencyTest extends TestCase
         self::assertSame(S3Operation::ListObjectsV2, $request->getAttribute('s3.operation'));
     }
 
+    public function test_legacy_router_rejects_an_invalid_object_key_before_dispatch(): void
+    {
+        $request = $this->request(
+            'GET',
+            'http://127.0.0.1/bucket-a/object%0Bkey',
+            [],
+        );
+        $registry = new HandlerRegistry();
+        $registry->register(S3Operation::GetObject, $this->terminal());
+
+        $this->expectException(InvalidArgumentException::class);
+        (new S3Router($registry))->handleRequest($request);
+    }
+
     public function test_attribute_middleware_rejects_wrong_method_for_object_subresource(): void
     {
         $request = $this->request(

@@ -35,6 +35,38 @@ final class WebsiteScalarStrictnessTest extends TestCase
         XmlRequestParser::parseWebsiteConfiguration('<WebsiteConfiguration>' . $children . '</WebsiteConfiguration>');
     }
 
+    #[DataProvider('oversizedKeyFields')]
+    public function test_website_key_fields_are_limited_to_s3_object_key_size(string $children): void
+    {
+        $this->expectException(MalformedXmlException::class);
+
+        XmlRequestParser::parseWebsiteConfiguration('<WebsiteConfiguration>' . $children . '</WebsiteConfiguration>');
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function oversizedKeyFields(): iterable
+    {
+        $oversized = str_repeat('a', 1_025);
+
+        yield 'index suffix' => ['<IndexDocument><Suffix>' . $oversized . '</Suffix></IndexDocument>'];
+        yield 'error document key' => [
+            '<IndexDocument><Suffix>index.html</Suffix></IndexDocument>'
+            . '<ErrorDocument><Key>' . $oversized . '</Key></ErrorDocument>',
+        ];
+        yield 'routing condition prefix' => [self::routingRule(
+            '<KeyPrefixEquals>' . $oversized . '</KeyPrefixEquals>',
+            '<ReplaceKeyWith>new.html</ReplaceKeyWith>',
+        )];
+        yield 'routing replacement prefix' => [self::routingRule(
+            '<KeyPrefixEquals>docs/</KeyPrefixEquals>',
+            '<ReplaceKeyPrefixWith>' . $oversized . '</ReplaceKeyPrefixWith>',
+        )];
+        yield 'routing replacement key' => [self::routingRule(
+            '<KeyPrefixEquals>docs/</KeyPrefixEquals>',
+            '<ReplaceKeyWith>' . $oversized . '</ReplaceKeyWith>',
+        )];
+    }
+
     public function test_prefixed_website_scalar_values_remain_valid(): void
     {
         $namespace = 'http://s3.amazonaws.com/doc/2006-03-01/';

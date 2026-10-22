@@ -9,10 +9,10 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\BucketContinuationToken;
+use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
-use OpsFour\S3Server\Xml\XmlText;
 
 /**
  * Handles ListBuckets (GET /).
@@ -35,13 +35,9 @@ final class ListBucketsHandler implements RequestHandler
             || array_key_exists('continuation-token', $query)
             || array_key_exists('prefix', $query)
             || array_key_exists('bucket-region', $query);
-        $prefix = $query['prefix'] ?? null;
+        $prefix = ListingQuery::xmlText($query, 'prefix');
         $region = $query['bucket-region'] ?? null;
         $nextToken = null;
-
-        if ($prefix !== null && ! XmlText::isValid($prefix)) {
-            throw new InvalidArgumentException('prefix must contain only characters representable in XML 1.0.');
-        }
 
         if ($paginated) {
             $maxBuckets = self::maxBuckets($query['max-buckets'] ?? null);

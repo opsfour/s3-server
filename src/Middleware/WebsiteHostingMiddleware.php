@@ -16,7 +16,10 @@ use OpsFour\S3Server\Encryption\BufferedSsePayload;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\KeyTooLongException;
+use OpsFour\S3Server\Http\ObjectKeyValidator;
 use OpsFour\S3Server\Http\WebsiteRedirectHost;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -90,6 +93,9 @@ final class WebsiteHostingMiddleware implements Middleware
         // Website paths contain only an object key; the bucket is in Host.
         // Set attributes here because website requests bypass API route parsing.
         $path = rawurldecode(ltrim($request->getUri()->getPath(), '/'));
+        if ($path !== '') {
+            ObjectKeyValidator::assertValid($path);
+        }
         $request->setAttribute('s3.key', $path);
         $request->setAttribute('s3.operation', $request->getMethod() === 'HEAD' ? S3Operation::HeadObject : S3Operation::GetObject);
         $bucketInfo = $this->metadata->getBucket($bucket);
@@ -111,6 +117,7 @@ final class WebsiteHostingMiddleware implements Middleware
         if ($key === '' || str_ends_with($key, '/')) {
             $key .= $websiteConfig['indexDocument'];
         }
+        ObjectKeyValidator::assertValid($key);
         $request->setAttribute('s3.key', $key);
 
         // Redirect-only buckets do not need an object at the requested key.
@@ -415,6 +422,12 @@ final class WebsiteHostingMiddleware implements Middleware
             $redirectKey = $redirect['replaceKeyWith'];
         }
 
+        try {
+            ObjectKeyValidator::assertValid($redirectKey);
+        } catch (InvalidArgumentException|KeyTooLongException) {
+            return self::htmlError(500, 'InvalidWebsiteConfiguration', 'The website redirect key is invalid.');
+        }
+
         $protocol = $redirect['protocol']
             ?? (RequestNetworkContext::secureTransport($request) ? 'https' : 'http');
         if (! in_array($protocol, ['http', 'https'], true)) {
@@ -428,7 +441,6 @@ final class WebsiteHostingMiddleware implements Middleware
         if (! in_array($statusCode, [301, 302, 303, 307, 308], true)) {
             $statusCode = 301;
         }
-        $redirectKey = str_replace(["\r", "\n"], '', $redirectKey);
         $redirectPath = implode('/', array_map('rawurlencode', explode('/', ltrim($redirectKey, '/'))));
 
         return new Response(

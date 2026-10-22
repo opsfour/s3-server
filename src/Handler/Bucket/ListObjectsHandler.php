@@ -30,18 +30,17 @@ final class ListObjectsHandler implements RequestHandler
         $bucket = $request->getAttribute('s3.bucket');
         $ownerId = $request->getAttribute('ownerId');
 
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        $prefix = ListingQuery::xmlText($queryParams, 'prefix');
+        $delimiter = ListingQuery::xmlText($queryParams, 'delimiter');
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
+        $marker = ListingQuery::xmlText($queryParams, 'marker');
+        $encodingType = ListingQuery::encodingType($queryParams);
+
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
-
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-
-        $prefix = $queryParams['prefix'] ?? null;
-        $delimiter = $queryParams['delimiter'] ?? null;
-        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
-        $marker = $queryParams['marker'] ?? null;
-        $encodingType = ListingQuery::encodingType($queryParams);
 
         // V1 uses marker as startAfter.
         $result = $this->metadata->listObjects(

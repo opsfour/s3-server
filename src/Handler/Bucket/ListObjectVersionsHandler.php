@@ -13,7 +13,6 @@ use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
-use OpsFour\S3Server\Xml\XmlText;
 
 /**
  * Handles ListObjectVersions (GET /{bucket}?versions).
@@ -34,9 +33,14 @@ final class ListObjectVersionsHandler implements RequestHandler
         $ownerId = $request->getAttribute('ownerId');
 
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $versionIdMarker = $queryParams['version-id-marker'] ?? null;
-        if ($versionIdMarker !== null && ! XmlText::isValid($versionIdMarker)) {
-            throw new InvalidArgumentException('version-id-marker contains characters that are invalid in XML.');
+        $prefix = ListingQuery::xmlText($queryParams, 'prefix');
+        $delimiter = ListingQuery::xmlText($queryParams, 'delimiter');
+        $keyMarker = ListingQuery::xmlText($queryParams, 'key-marker');
+        $versionIdMarker = ListingQuery::xmlText($queryParams, 'version-id-marker');
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
+        $encodingType = ListingQuery::encodingType($queryParams);
+        if ($versionIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {
+            throw new InvalidArgumentException('version-id-marker requires key-marker.');
         }
 
         // Verify bucket exists and owner matches.
@@ -44,15 +48,6 @@ final class ListObjectVersionsHandler implements RequestHandler
 
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
-        }
-
-        $prefix = $queryParams['prefix'] ?? null;
-        $delimiter = $queryParams['delimiter'] ?? null;
-        $keyMarker = $queryParams['key-marker'] ?? null;
-        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
-        $encodingType = ListingQuery::encodingType($queryParams);
-        if ($versionIdMarker !== null && ($keyMarker === null || $keyMarker === '')) {
-            throw new InvalidArgumentException('version-id-marker requires key-marker.');
         }
 
         // Delegate to metadata store.

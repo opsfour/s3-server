@@ -16,6 +16,7 @@ final class XmlRequestParser
 {
     private const int MAX_ACL_GRANTS = 100;
     private const int MAX_LIFECYCLE_RULES = 1_000;
+    private const int MAX_OBJECT_KEY_BYTES = 1_024;
     /** Keep restore expiry representable across every built-in metadata backend. */
     public const int MAX_RESTORE_DAYS = 365_000;
 
@@ -1143,6 +1144,7 @@ final class XmlRequestParser
             if ($suffix === '' || str_contains($suffix, '/')) {
                 throw new MalformedXmlException('IndexDocument Suffix must be non-empty and contain no slash.');
             }
+            self::assertWebsiteKeyField($suffix, 'IndexDocument Suffix');
             $result['indexDocument'] = $suffix;
         }
 
@@ -1152,6 +1154,7 @@ final class XmlRequestParser
             if ($errorKey === '') {
                 throw new MalformedXmlException('ErrorDocument Key must be non-empty.');
             }
+            self::assertWebsiteKeyField($errorKey, 'ErrorDocument Key');
             $result['errorDocument'] = $errorKey;
         }
 
@@ -1178,7 +1181,9 @@ final class XmlRequestParser
                     $conditionChildren = self::assertAllowedChildren($conditionElement, ['KeyPrefixEquals', 'HttpErrorCodeReturnedEquals'], 'RoutingRule Condition');
                     $condition = [];
                     if (isset($conditionChildren['KeyPrefixEquals'])) {
-                        $condition['keyPrefixEquals'] = self::scalarText($conditionChildren['KeyPrefixEquals'][0], 'KeyPrefixEquals');
+                        $keyPrefix = self::scalarText($conditionChildren['KeyPrefixEquals'][0], 'KeyPrefixEquals');
+                        self::assertWebsiteKeyField($keyPrefix, 'KeyPrefixEquals');
+                        $condition['keyPrefixEquals'] = $keyPrefix;
                     }
                     if (isset($conditionChildren['HttpErrorCodeReturnedEquals'])) {
                         $rawErrorCode = self::scalarText($conditionChildren['HttpErrorCodeReturnedEquals'][0], 'HttpErrorCodeReturnedEquals');
@@ -1202,10 +1207,14 @@ final class XmlRequestParser
                     throw new MalformedXmlException('ReplaceKeyPrefixWith and ReplaceKeyWith cannot be combined.');
                 }
                 if (isset($redirectChildren['ReplaceKeyPrefixWith'])) {
-                    $redirect['replaceKeyPrefixWith'] = self::scalarText($redirectChildren['ReplaceKeyPrefixWith'][0], 'ReplaceKeyPrefixWith');
+                    $replacementPrefix = self::scalarText($redirectChildren['ReplaceKeyPrefixWith'][0], 'ReplaceKeyPrefixWith');
+                    self::assertWebsiteKeyField($replacementPrefix, 'ReplaceKeyPrefixWith');
+                    $redirect['replaceKeyPrefixWith'] = $replacementPrefix;
                 }
                 if (isset($redirectChildren['ReplaceKeyWith'])) {
-                    $redirect['replaceKeyWith'] = self::scalarText($redirectChildren['ReplaceKeyWith'][0], 'ReplaceKeyWith');
+                    $replacementKey = self::scalarText($redirectChildren['ReplaceKeyWith'][0], 'ReplaceKeyWith');
+                    self::assertWebsiteKeyField($replacementKey, 'ReplaceKeyWith');
+                    $redirect['replaceKeyWith'] = $replacementKey;
                 }
                 if (isset($redirectChildren['Protocol'])) {
                     $protocol = self::scalarText($redirectChildren['Protocol'][0], 'RoutingRule Protocol');
@@ -1236,6 +1245,15 @@ final class XmlRequestParser
         }
 
         return $result;
+    }
+
+    private static function assertWebsiteKeyField(string $value, string $field): void
+    {
+        if (strlen($value) > self::MAX_OBJECT_KEY_BYTES || ! XmlText::isValid($value)) {
+            throw new MalformedXmlException(
+                "{$field} must be valid XML 1.0 text of at most 1024 bytes.",
+            );
+        }
     }
 
     /**

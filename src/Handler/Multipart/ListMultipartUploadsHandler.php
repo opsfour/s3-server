@@ -8,7 +8,6 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\BucketOwnership;
-use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -16,7 +15,6 @@ use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
-use OpsFour\S3Server\Xml\XmlText;
 
 final class ListMultipartUploadsHandler implements RequestHandler
 {
@@ -28,21 +26,17 @@ final class ListMultipartUploadsHandler implements RequestHandler
     {
         $bucket = $request->getAttribute('s3.bucket');
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        $uploadIdMarker = $queryParams['upload-id-marker'] ?? null;
-        if ($uploadIdMarker !== null && ! XmlText::isValid($uploadIdMarker)) {
-            throw new InvalidArgumentException('upload-id-marker contains characters that are invalid in XML.');
-        }
+        $prefix = ListingQuery::xmlText($queryParams, 'prefix');
+        $delimiter = ListingQuery::xmlText($queryParams, 'delimiter');
+        $keyMarker = ListingQuery::xmlText($queryParams, 'key-marker');
+        $uploadIdMarker = ListingQuery::xmlText($queryParams, 'upload-id-marker');
+        $maxUploads = ListingQuery::limit($queryParams, 'max-uploads');
+        $encodingType = ListingQuery::encodingType($queryParams);
 
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
-
-        $prefix = $queryParams['prefix'] ?? null;
-        $delimiter = $queryParams['delimiter'] ?? null;
-        $maxUploads = ListingQuery::limit($queryParams, 'max-uploads');
-        $keyMarker = $queryParams['key-marker'] ?? null;
-        $encodingType = ListingQuery::encodingType($queryParams);
 
         if (! $this->metadata instanceof GenerationBoundMultipartListingStore) {
             throw new NotImplementedException('Generation-bound multipart listing is unavailable for this metadata backend.');

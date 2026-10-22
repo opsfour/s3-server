@@ -16,6 +16,7 @@ use League\Uri\Http;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InvalidObjectStateException;
+use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
@@ -387,6 +388,17 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame('public file', \Amp\ByteStream\buffer($response->getBody()));
     }
 
+    public function test_website_rejects_xml_invalid_decoded_key(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+
+        (new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test'))
+            ->handleRequest(
+                $this->websiteRequest('GET', '/object%0Bkey', 'bucket.s3-website.test'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+    }
+
     public function test_website_endpoint_only_activates_for_matching_host_and_safe_methods(): void
     {
         $this->metadata->putBucketWebsite('bucket', 'index.html');
@@ -697,6 +709,28 @@ final class RestoreAwareObjectReadTest extends TestCase
 
         self::assertSame(301, $response->getStatus());
         self::assertSame('http://bucket.s3-website.test/new/page.html', $response->getHeader('Location'));
+    }
+
+    public function test_website_rejects_a_redirect_key_that_exceeds_the_limit_after_prefix_replacement(): void
+    {
+        $this->metadata->putBucketWebsite(
+            'bucket',
+            'index.html',
+            routingRules: [[
+                'condition' => ['keyPrefixEquals' => 'old/'],
+                'redirect' => ['replaceKeyPrefixWith' => str_repeat('a', 1_020)],
+            ]],
+        );
+
+        $response = (new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test'))
+            ->handleRequest(
+                $this->websiteRequest('GET', '/old/page.html', 'bucket.s3-website.test'),
+                new RestoreWebsiteTerminalHandler(),
+            );
+
+        self::assertSame(500, $response->getStatus());
+        self::assertNull($response->getHeader('Location'));
+        self::assertStringContainsString('InvalidWebsiteConfiguration', \Amp\ByteStream\buffer($response->getBody()));
     }
 
     public function test_website_unconditional_and_access_denied_rules_redirect_without_public_access(): void
@@ -1055,6 +1089,35 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertSame($hotWrite->path, $object->restoredStoragePath);
         self::assertSame('STANDARD', $object->restoredStorageTier);
         self::assertGreaterThan($oldExpiry, $object->restoreExpiresAt);
+        self::assertSame([], $this->metadata->dequeueRestoreJobs(1));
+    }
+
+    public function test_restore_object_does_not_shorten_an_existing_restored_copy(): void
+    {
+        $coldWrite = $this->cold->putObject('bucket', 'archive.bin', new ReadableBuffer('cold-data'));
+        $hotWrite = $this->hot->putObject('bucket', 'archive.bin', new ReadableBuffer('hot-data'));
+        $this->putMetadata('archive.bin', $coldWrite->path, $coldWrite->size, $coldWrite->md5Hex);
+        $this->metadata->updateObjectPlacement('bucket', 'archive.bin', null, 'GLACIER', 'GLACIER', $coldWrite->path);
+        $existingExpiry = (new \DateTimeImmutable('+7 days', new \DateTimeZone('UTC')))->setTime(12, 0);
+        $this->metadata->updateObjectRestoreStateWithTier(
+            'bucket',
+            'archive.bin',
+            null,
+            'restored',
+            $hotWrite->path,
+            $existingExpiry,
+            'STANDARD',
+        );
+
+        $response = (new RestoreObjectHandler($this->metadata, $this->tiers))->handleRequest(
+            $this->request('POST', '/bucket/archive.bin?restore', '<RestoreRequest><Days>1</Days></RestoreRequest>'),
+        );
+        $object = $this->metadata->getObjectMetadata('bucket', 'archive.bin');
+
+        self::assertSame(200, $response->getStatus());
+        self::assertNotNull($object);
+        self::assertSame($existingExpiry->format(\DateTimeInterface::ATOM), $object->restoreExpiresAt?->format(\DateTimeInterface::ATOM));
+        self::assertSame($hotWrite->path, $object->restoredStoragePath);
         self::assertSame([], $this->metadata->dequeueRestoreJobs(1));
     }
 

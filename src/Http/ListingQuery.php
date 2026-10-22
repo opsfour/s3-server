@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Http;
 
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Xml\XmlText;
 
 final class ListingQuery
 {
@@ -43,6 +44,17 @@ final class ListingQuery
             'false' => false,
             default => throw new InvalidArgumentException("{$name} must be true or false."),
         };
+    }
+
+    /** @param array<string, string> $query */
+    public static function xmlText(array $query, string $name): ?string
+    {
+        $value = $query[$name] ?? null;
+        if ($value !== null && ! XmlText::isValid($value)) {
+            throw new InvalidArgumentException("{$name} contains characters that are invalid in XML 1.0.");
+        }
+
+        return $value;
     }
 
     private static function nonNegativeInteger(string $value, string $name): int

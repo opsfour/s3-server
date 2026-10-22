@@ -30,22 +30,20 @@ final class ListObjectsV2Handler implements RequestHandler
         $bucket = $request->getAttribute('s3.bucket');
         $ownerId = $request->getAttribute('ownerId');
 
+        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
+        $prefix = ListingQuery::xmlText($queryParams, 'prefix');
+        $delimiter = ListingQuery::xmlText($queryParams, 'delimiter');
+        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
+        $continuationToken = ListingQuery::xmlText($queryParams, 'continuation-token');
+        $startAfter = ListingQuery::xmlText($queryParams, 'start-after');
+        $fetchOwner = ListingQuery::boolean($queryParams, 'fetch-owner');
+        $encodingType = ListingQuery::encodingType($queryParams);
+
         // Verify bucket exists and owner matches.
         $bucketInfo = $this->metadata->getBucket($bucket);
         if ($bucketInfo === null) {
             throw new NoSuchBucketException();
         }
-
-        // Parse query parameters.
-        $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-
-        $prefix = $queryParams['prefix'] ?? null;
-        $delimiter = $queryParams['delimiter'] ?? null;
-        $maxKeys = ListingQuery::limit($queryParams, 'max-keys');
-        $continuationToken = $queryParams['continuation-token'] ?? null;
-        $startAfter = $queryParams['start-after'] ?? null;
-        $fetchOwner = ListingQuery::boolean($queryParams, 'fetch-owner');
-        $encodingType = ListingQuery::encodingType($queryParams);
 
         // Delegate to metadata store.
         $result = $this->metadata->listObjects(

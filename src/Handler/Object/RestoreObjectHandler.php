@@ -87,8 +87,11 @@ final class RestoreObjectHandler implements RequestHandler
                     throw new InvalidObjectStateException('Restored object copy has incomplete physical metadata.');
                 }
                 $restoredTier = RestoredCopyTierResolver::resolve($current, $this->storageTiers);
-                $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+                $requestedExpiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
                     ->modify('+' . $restore['days'] . ' days');
+                $expiresAt = $current->restoreExpiresAt > $requestedExpiresAt
+                    ? $current->restoreExpiresAt
+                    : $requestedExpiresAt;
                 $this->metadata->updateObjectRestoreStateWithTier(
                     bucket: $current->bucket,
                     key: $current->key,

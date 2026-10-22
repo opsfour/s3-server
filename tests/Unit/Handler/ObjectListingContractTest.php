@@ -29,6 +29,28 @@ final class ObjectListingContractTest extends TestCase
         (new ListObjectsV2Handler($metadata))->handleRequest($this->request('?list-type=2&fetch-owner=banana'));
     }
 
+    public function test_list_v1_rejects_xml_invalid_prefix_before_metadata_access(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getBucket');
+        $metadata->expects(self::never())->method('listObjects');
+
+        $this->expectException(InvalidArgumentException::class);
+        (new ListObjectsHandler($metadata))->handleRequest($this->request('?prefix=object%0B'));
+    }
+
+    public function test_list_v2_rejects_xml_invalid_start_after_before_metadata_access(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getBucket');
+        $metadata->expects(self::never())->method('listObjects');
+
+        $this->expectException(InvalidArgumentException::class);
+        (new ListObjectsV2Handler($metadata))->handleRequest(
+            $this->request('?list-type=2&start-after=object%0B'),
+        );
+    }
+
     public function test_list_v1_omits_next_marker_without_delimiter(): void
     {
         $metadata = $this->metadataWithResult(new ListObjectsResult(
