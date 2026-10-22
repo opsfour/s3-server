@@ -101,6 +101,20 @@ final class S3ServerBundleTest extends TestCase
         ];
     }
 
+    public function test_non_filesystem_storage_requires_an_explicit_sqlite_metadata_path(): void
+    {
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => ['driver' => 'memory'],
+            'metadata' => ['driver' => 'sqlite'],
+        ]], $container);
+        $container->compile();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('explicit SQLite metadata path');
+        $this->service($container, MetadataStore::class);
+    }
+
     public function test_compiled_container_discovers_legacy_sqlite_after_runtime_mount(): void
     {
         $storagePath = sys_get_temp_dir() . '/s3-symfony-runtime-metadata-' . bin2hex(random_bytes(6));

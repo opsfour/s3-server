@@ -112,8 +112,13 @@ class S3ServerServiceProvider extends ServiceProvider
             $config = $app['config']['s3-server'];
             $metadataConfig = $config['metadata'] ?? [];
 
-            // For SQLite, derive a package-internal path from storage unless explicitly configured.
             if (($metadataConfig['driver'] ?? 'sqlite') === 'sqlite' && empty($metadataConfig['path'])) {
+                if (($config['storage']['driver'] ?? 'filesystem') !== 'filesystem') {
+                    throw new \InvalidArgumentException(
+                        'An explicit SQLite metadata path is required with non-filesystem storage.',
+                    );
+                }
+
                 $storagePath = $config['storage']['path'] ?? storage_path('s3');
                 $metadataConfig['path'] = SqliteMetadataPathResolver::resolve($storagePath);
             }

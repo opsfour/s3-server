@@ -78,7 +78,7 @@ final class S3ServerServiceProviderTest extends TestCase
     public function test_default_sqlite_metadata_uses_the_internal_storage_namespace(): void
     {
         $app = $this->application([
-            'storage' => ['path' => $this->basePath],
+            'storage' => ['driver' => 'filesystem', 'path' => $this->basePath],
             'metadata' => ['path' => null, 'cache_ttl' => 0.0],
             'parallel' => ['sqlite_workers' => 0],
         ]);
@@ -95,6 +95,18 @@ final class S3ServerServiceProviderTest extends TestCase
         @rmdir($this->basePath . '/.opsfour');
     }
 
+    public function test_non_filesystem_storage_requires_an_explicit_sqlite_metadata_path(): void
+    {
+        $app = $this->application([
+            'storage' => ['driver' => 'memory'],
+            'metadata' => ['driver' => 'sqlite', 'path' => null],
+        ]);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('explicit SQLite metadata path');
+        $app->make(MetadataStore::class);
+    }
+
     public function test_ambiguous_default_sqlite_files_require_an_explicit_metadata_path(): void
     {
         self::assertTrue(mkdir($this->basePath . '/.opsfour'));
@@ -103,7 +115,7 @@ final class S3ServerServiceProviderTest extends TestCase
 
         try {
             $app = $this->application([
-                'storage' => ['path' => $this->basePath],
+                'storage' => ['driver' => 'filesystem', 'path' => $this->basePath],
                 'metadata' => ['path' => null],
             ]);
 

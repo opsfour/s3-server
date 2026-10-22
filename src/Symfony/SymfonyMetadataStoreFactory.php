@@ -15,10 +15,20 @@ final class SymfonyMetadataStoreFactory
     /**
      * @param array<string, mixed> $config
      */
-    public static function create(array $config, string $storagePath, MetricsCollector $metrics): MetadataStore
-    {
+    public static function create(
+        array $config,
+        string $storageDriver,
+        string $storagePath,
+        MetricsCollector $metrics,
+    ): MetadataStore {
         $driver = (string) ($config['driver'] ?? 'sqlite');
         if ($driver === 'sqlite' && ($config['path'] ?? null) === null) {
+            if ($storageDriver !== 'filesystem') {
+                throw new \InvalidArgumentException(
+                    'An explicit SQLite metadata path is required with non-filesystem storage.',
+                );
+            }
+
             $config['path'] = SqliteMetadataPathResolver::resolve($storagePath);
         }
 

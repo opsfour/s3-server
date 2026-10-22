@@ -183,6 +183,9 @@ SQLite, PostgreSQL, and MySQL are supported for the current single-host,
 single-process target. Use SQLite when a local database and its single-writer
 model fit the workload. Use PostgreSQL or MySQL when the deployment already
 operates that database or needs to avoid SQLite's single-writer constraint.
+With Flysystem or memory object storage, SQLite requires an explicit persistent
+`metadata.path`; automatic path derivation is available only with filesystem
+object storage.
 
 ```yaml
 opsfour_s3_server:

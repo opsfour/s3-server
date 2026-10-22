@@ -94,6 +94,10 @@ The service provider registers these singletons:
 | `MetadataStore` | SQLite/Postgres/MySQL | Based on `S3_METADATA_DRIVER` |
 | `CredentialProvider` | Memory/Database/File | Based on `S3_CREDENTIALS_DRIVER` |
 
+When SQLite is combined with Flysystem or memory object storage, set
+`S3_METADATA_PATH` to an explicit persistent local path. Automatic SQLite path
+derivation is limited to filesystem object storage.
+
 ### Resolving in Your Code
 
 ```php

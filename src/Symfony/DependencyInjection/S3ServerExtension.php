@@ -73,6 +73,7 @@ final class S3ServerExtension extends Extension
             ->setFactory([SymfonyMetadataStoreFactory::class, 'create'])
             ->setArguments([
                 $metadataConfig,
+                (string) $config['storage']['driver'],
                 (string) $config['storage']['path'],
                 new Reference(MetricsCollector::class),
             ])
