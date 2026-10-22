@@ -35,6 +35,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Repeated restores keep an existing later hot-copy expiry instead of
+  shortening its availability to the newly requested duration.
+- Bound website object-key fields and generated routing-rule redirect keys to
+  the S3 1,024-byte object-key limit.
 - Run file-backed SQLite metadata operations in four worker processes by
   default for programmatic, standalone, Laravel, and Symfony serving; `0`
   remains an opt-out and `:memory:` remains synchronous.
@@ -85,13 +89,19 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Acquire SQLite writer locks before transactional metadata reads and initialize
+  schemas only through the explicit startup task, preventing parallel API and
+  lifecycle mutations from failing with `database is locked`.
 - Wire opt-in Laravel event dispatch and container-provided encryption services
   into the Artisan server runtime.
-- Require an explicit standalone SQLite metadata path when object storage is
-  not the local filesystem, preventing unrelated instances from sharing a
-  temporary-directory database.
+- Require an explicit SQLite metadata path in standalone, Laravel, and Symfony
+  runtimes when object storage is not the local filesystem, preventing metadata
+  from silently using an unrelated local directory.
 - Reject URL-decoded object keys that are invalid UTF-8 or cannot be represented
-  as XML 1.0 text before handler or storage access.
+  as XML 1.0 text before handler or storage access, including website and
+  legacy-router requests.
+- Reject listing query values that cannot be represented in XML 1.0 before
+  metadata access.
 - Reject known bucket and object selectors at service scope, and reject XML-invalid
   version and multipart upload markers before listing metadata is accessed.
 - Return the SSE-C customer-key MD5 header after successful multipart

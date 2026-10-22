@@ -42,7 +42,11 @@ the private owner ACL.
 
 Nonempty object keys are limited to 1024 bytes after URL decoding and must be
 valid UTF-8 XML 1.0 text. Invalid keys return `InvalidArgument` before handler
-or storage access.
+or storage access. This validation also applies to website requests and the
+legacy programmatic router.
+
+Listing parameters reflected in XML responses, including prefixes, delimiters,
+and pagination markers, must also be valid UTF-8 XML 1.0 text.
 
 GetObject requests without a `Range` header return HTTP 405 for objects larger
 than 5 TiB. Use byte-range requests to download those objects. HeadObject
@@ -433,6 +437,10 @@ Website endpoints use the configured error document for supported 4XX
 responses, including 403 for an existing object that is not publicly readable,
 while preserving the original status code.
 
+Website index, error-document, condition-prefix, and redirect-key fields use
+the S3 object-key limit of 1,024 bytes. A routing rule whose prefix replacement
+produces a longer redirect key is rejected when the website request is served.
+
 ## S3 Select
 
 | Operation | Method | Path | Description |
@@ -445,7 +453,7 @@ See [S3 Select](s3-select.md) for SQL syntax.
 
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
-| GetObjectAttributes | `GET` | `/{bucket}/{key}?attributes` | Get checksum and part info |
+| GetObjectAttributes | `GET` | `/{bucket}/{key}?attributes` | Get checksums and the multipart `PartsCount` summary |
 | HealthCheck | `GET` | `/.health` | Server health probe, not counted as an S3 API operation |
 
 `GetObjectAttributes` requires both `s3:GetObject` and
@@ -455,6 +463,10 @@ can grant the base read action, but the attributes action requires object
 ownership or an explicit policy allow. Explicit Deny on either action rejects
 the request. See the [AWS GetObjectAttributes permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectAttributes.html)
 and [object ACL action mapping](https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html).
+
+The supported `ObjectParts` response contains `PartsCount` derived from the
+multipart ETag. Per-part entries and GetObjectAttributes part pagination are
+outside the current operation subset.
 
 For a missing current object, `GetObject`, `HeadObject`, and
 `GetObjectAttributes` return `403 AccessDenied` unless the caller has effective
