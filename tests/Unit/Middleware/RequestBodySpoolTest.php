@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Middleware;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableIterableStream;
+use Amp\ByteStream\ReadableStream;
 use Amp\CancelledException;
 use Amp\Future;
 use Amp\Http\Server\Driver\Client;
@@ -184,6 +186,43 @@ final class RequestBodySpoolTest extends TestCase
             'x-amz-content-sha256' => $emptySha256,
         ], true];
         yield 'special SHA-256 remains skipped' => ['ignored', ['x-amz-content-sha256' => 'UNSIGNED-PAYLOAD'], true];
+    }
+
+    public function test_bodyless_digest_validation_accepts_empty_stream_chunks_before_eof(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('submit');
+        $spool = new RequestBodySpool($pool, $tempDir);
+        $checksum = new ChecksumValidationMiddleware($spool);
+        $terminal = new class implements RequestHandler {
+            public function handleRequest(Request $request): Response
+            {
+                return new Response(204);
+            }
+        };
+        $inner = new class ($checksum, $terminal) implements RequestHandler {
+            public function __construct(
+                private readonly ChecksumValidationMiddleware $checksum,
+                private readonly RequestHandler $terminal,
+            ) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                return $this->checksum->handleRequest($request, $this->terminal);
+            }
+        };
+        $request = $this->bodylessRequest(new ReadableIterableStream(['', '']), [
+            'content-md5' => base64_encode(md5('', binary: true)),
+            'x-amz-content-sha256' => hash('sha256', ''),
+        ]);
+
+        try {
+            self::assertSame(204, (new ContentMd5Middleware($spool))->handleRequest($request, $inner)->getStatus());
+        } finally {
+            self::removeTempDir($tempDir);
+        }
     }
 
     public function test_create_worker_cancellation_is_not_retried_or_converted(): void
@@ -791,14 +830,14 @@ final class RequestBodySpoolTest extends TestCase
     }
 
     /** @param array<string, string> $headers */
-    private function bodylessRequest(string $body, array $headers): Request
+    private function bodylessRequest(string|ReadableStream $body, array $headers): Request
     {
         $request = new Request(
             $this->createMock(Client::class),
             'PUT',
             Http::new('http://127.0.0.1/bucket/key'),
             [],
-            new ReadableBuffer($body),
+            is_string($body) ? new ReadableBuffer($body) : $body,
         );
         foreach ($headers as $name => $value) {
             if ($name === '') {

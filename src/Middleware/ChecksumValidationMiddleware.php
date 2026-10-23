@@ -44,7 +44,7 @@ final class ChecksumValidationMiddleware implements Middleware
                     "The SHA-256 checksum you specified did not match what we received. Expected: {$expected}, Computed: {$computed}",
                 );
             }
-            if ($request->getBody()->read() !== null) {
+            if (RequestBody::hasPayloadBytes($request)) {
                 throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
             }
 

@@ -61,7 +61,7 @@ final class ContentMd5Middleware implements Middleware
                     . base64_encode($computed),
                 );
             }
-            if ($request->getBody()->read() !== null) {
+            if (RequestBody::hasPayloadBytes($request)) {
                 throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
             }
 

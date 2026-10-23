@@ -34,6 +34,17 @@ final class RequestBody
             && in_array($operation, self::BODYLESS_WRITE_OPERATIONS, true);
     }
 
+    public static function hasPayloadBytes(Request $request): bool
+    {
+        while (($chunk = $request->getBody()->read()) !== null) {
+            if ($chunk !== '') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static function buffer(Request $request, int $limit = self::XML_LIMIT): string
     {
         try {
