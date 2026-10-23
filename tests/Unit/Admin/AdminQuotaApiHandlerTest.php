@@ -290,6 +290,29 @@ final class AdminQuotaApiHandlerTest extends TestCase
         }
     }
 
+    public function test_list_rejects_non_text_and_oversized_cursors_before_metadata_access(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('listAccountQuotasPage');
+        $handler = new AdminQuotaApiHandler($metadata, 'admin-secret');
+
+        foreach (["owner-\xFF", "owner-\0hidden", str_repeat('a', 256)] as $ownerId) {
+            $cursor = rtrim(strtr(base64_encode($ownerId), '+/', '-_'), '=');
+            $response = $handler->handleRequest($this->request(
+                'GET',
+                '/.admin/quotas?cursor=' . $cursor,
+                '',
+                $this->authHeaders(),
+            ));
+
+            self::assertSame(400, $response->getStatus());
+            self::assertSame([
+                'error' => 'invalid_request',
+                'message' => 'Invalid quota cursor.',
+            ], $this->json($response));
+        }
+    }
+
     public function test_corrupt_owner_row_is_redacted_and_does_not_break_cursor_pagination(): void
     {
         $quota = new QuotaConfig(maxBucketsPerOwner: 1);
@@ -300,7 +323,7 @@ final class AdminQuotaApiHandlerTest extends TestCase
         $pdo = new \PDO('sqlite:' . $this->path);
         $statement = $pdo->prepare('UPDATE s3_account_quotas SET owner_id = ? WHERE owner_id = ?');
         self::assertNotFalse($statement);
-        self::assertTrue($statement->execute(["b-\xFF", 'b-placeholder']));
+        self::assertTrue($statement->execute(["b-\u{0085}", 'b-placeholder']));
 
         $handler = $this->handler();
         $first = $this->json($handler->handleRequest($this->request(
@@ -323,7 +346,7 @@ final class AdminQuotaApiHandlerTest extends TestCase
         self::assertSame([], $second['quotas']);
         self::assertSame([[
             'issue' => 'invalid_owner_id',
-            'ownerIdSha256' => hash('sha256', "b-\xFF"),
+            'ownerIdSha256' => hash('sha256', "b-\u{0085}"),
             'message' => 'A quota row has an invalid owner ID and requires metadata repair.',
         ]], $second['repairHints']);
         self::assertIsString($second['nextCursor']);

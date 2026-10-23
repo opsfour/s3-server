@@ -22,7 +22,9 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
 
     private const int MAX_PAGE_LIMIT = 1000;
 
-    private const int MAX_CURSOR_BYTES = 32768;
+    private const int MAX_CURSOR_BYTES = 340;
+
+    private const int MAX_CURSOR_VALUE_BYTES = 255;
 
     private const array QUOTA_FIELDS = [
         'maxBucketsPerOwner', 'maxBuckets',
@@ -287,7 +289,13 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
             throw new \InvalidArgumentException('Invalid quota cursor.');
         }
         $after = base64_decode(strtr($cursor, '-_', '+/'), true);
-        if ($after === false || $after === '' || self::encodeCursor($after) !== $cursor) {
+        if ($after === false
+            || $after === ''
+            || strlen($after) > self::MAX_CURSOR_VALUE_BYTES
+            || preg_match('//u', $after) !== 1
+            || str_contains($after, "\0")
+            || self::encodeCursor($after) !== $cursor
+        ) {
             throw new \InvalidArgumentException('Invalid quota cursor.');
         }
 

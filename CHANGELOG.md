@@ -35,6 +35,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Reject non-UTF-8, NUL-containing, and oversized quota pagination cursors
+  before querying a metadata backend.
 - Repeated restores keep an existing later hot-copy expiry instead of
   shortening its availability to the newly requested duration.
 - Bound website object-key fields and generated routing-rule redirect keys to
