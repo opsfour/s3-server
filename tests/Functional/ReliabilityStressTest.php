@@ -40,6 +40,35 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $key = 'large-streamed-object.bin';
         $transferClient = self::makeClient(self::envInt('S3_TEST_TRANSFER_TIMEOUT_SECONDS', 180));
 
+        // Amp starts the isolated local-write and file-read workers lazily.
+        // Exercise the same file-based transfer paths before measuring so the
+        // assertion reflects payload-dependent growth instead of worker boot.
+        $warmupSource = self::createDeterministicFile('large-warmup-source-', 64 * 1024);
+        $warmupDownload = tempnam(sys_get_temp_dir(), 'large-warmup-download-');
+        if ($warmupDownload === false) {
+            @unlink($warmupSource);
+            self::fail('Could not create the large-transfer warmup download file.');
+        }
+        $warmupKey = 'large-streamed-object-warmup.bin';
+        try {
+            $transferClient->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $warmupKey,
+                'SourceFile' => $warmupSource,
+                'ContentType' => 'application/octet-stream',
+                'ContentSHA256' => 'UNSIGNED-PAYLOAD',
+            ]);
+            $transferClient->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $warmupKey,
+                'SaveAs' => $warmupDownload,
+            ]);
+        } finally {
+            $transferClient->deleteObject(['Bucket' => self::$bucket, 'Key' => $warmupKey]);
+            @unlink($warmupSource);
+            @unlink($warmupDownload);
+        }
+
         $rssBefore = self::serverRssBytes();
 
         $transferClient->putObject([
