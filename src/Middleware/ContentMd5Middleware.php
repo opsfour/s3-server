@@ -11,6 +11,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Http\RequestHeaderValues;
+use OpsFour\S3Server\Http\RequestBody;
 use OpsFour\S3Server\Routing\S3Operation;
 
 /** Validates request-body digests before dispatch without buffering in memory. */
@@ -51,6 +52,22 @@ final class ContentMd5Middleware implements Middleware
         if ($contentMd5 !== null) {
             $digests['Content-MD5'] = self::decodeDigest($contentMd5, 'md5', 16, 'Content-MD5');
         }
+
+        if (RequestBody::isBodylessOperation($request) && isset($digests['Content-MD5'])) {
+            $computed = md5('', binary: true);
+            if (! hash_equals($digests['Content-MD5']['expected'], $computed)) {
+                throw new BadDigestException(
+                    "The Content-MD5 you specified did not match what we received. Expected: {$contentMd5}, Computed: "
+                    . base64_encode($computed),
+                );
+            }
+            if ($request->getBody()->read() !== null) {
+                throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
+            }
+
+            return $requestHandler->handleRequest($request);
+        }
+
         $operation = $request->hasAttribute('s3.operation') ? $request->getAttribute('s3.operation') : null;
         $objectLockChecksumRequired = $request->hasAttribute(ObjectLockChecksumMiddleware::REQUIRED_ATTRIBUTE)
             && $request->getAttribute(ObjectLockChecksumMiddleware::REQUIRED_ATTRIBUTE) === true;

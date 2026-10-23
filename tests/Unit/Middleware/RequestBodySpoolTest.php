@@ -19,11 +19,13 @@ use Amp\Sync\Channel;
 use Amp\TimeoutCancellation;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
+use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\RequestBodySpool;
+use OpsFour\S3Server\Routing\S3Operation;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -102,6 +104,86 @@ final class RequestBodySpoolTest extends TestCase
     {
         yield 'Content-MD5' => [ContentMd5Middleware::class];
         yield 'SigV4 SHA-256' => [ChecksumValidationMiddleware::class];
+    }
+
+    /** @param array<string, string> $headers */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bodylessDigestCases')]
+    public function test_bodyless_digest_validation_never_spools(
+        string $body,
+        array $headers,
+        bool $accepted,
+    ): void {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('submit');
+        $spool = new RequestBodySpool($pool, $tempDir);
+        $checksum = new ChecksumValidationMiddleware($spool);
+        $handlerCalled = false;
+        $terminal = new class (static function () use (&$handlerCalled): void {
+            $handlerCalled = true;
+        }) implements RequestHandler {
+            public function __construct(private readonly \Closure $onCall) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ($this->onCall)();
+
+                return new Response(204);
+            }
+        };
+        $inner = new class ($checksum, $terminal) implements RequestHandler {
+            public function __construct(
+                private readonly ChecksumValidationMiddleware $checksum,
+                private readonly RequestHandler $terminal,
+            ) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                return $this->checksum->handleRequest($request, $this->terminal);
+            }
+        };
+
+        try {
+            try {
+                $response = (new ContentMd5Middleware($spool))->handleRequest(
+                    $this->bodylessRequest($body, $headers),
+                    $inner,
+                );
+                if (! $accepted) {
+                    self::fail('Invalid bodyless digest input must be rejected.');
+                }
+                self::assertSame(204, $response->getStatus());
+                self::assertTrue($handlerCalled);
+            } catch (BadDigestException) {
+                if ($accepted) {
+                    self::fail('Valid bodyless digest input must be accepted.');
+                }
+                self::assertFalse($handlerCalled);
+            }
+        } finally {
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    /** @return iterable<string, array{string, array<string, string>, bool}> */
+    public static function bodylessDigestCases(): iterable
+    {
+        $emptyMd5 = base64_encode(md5('', binary: true));
+        $emptySha256 = hash('sha256', '');
+
+        yield 'malformed SHA-256' => ['', ['x-amz-content-sha256' => 'not-a-digest'], false];
+        yield 'wrong SHA-256' => ['', ['x-amz-content-sha256' => hash('sha256', 'payload')], false];
+        yield 'correct empty SHA-256' => ['', ['x-amz-content-sha256' => $emptySha256], true];
+        yield 'body with empty SHA-256' => ['payload', ['x-amz-content-sha256' => $emptySha256], false];
+        yield 'malformed Content-MD5' => ['', ['content-md5' => 'not-base64'], false];
+        yield 'wrong Content-MD5' => ['', ['content-md5' => base64_encode(md5('payload', binary: true))], false];
+        yield 'body with empty Content-MD5' => ['payload', ['content-md5' => $emptyMd5], false];
+        yield 'both real empty digests' => ['', [
+            'content-md5' => $emptyMd5,
+            'x-amz-content-sha256' => $emptySha256,
+        ], true];
+        yield 'special SHA-256 remains skipped' => ['ignored', ['x-amz-content-sha256' => 'UNSIGNED-PAYLOAD'], true];
     }
 
     public function test_create_worker_cancellation_is_not_retried_or_converted(): void
@@ -704,6 +786,27 @@ final class RequestBodySpoolTest extends TestCase
         );
         $request->setHeader('Content-MD5', base64_encode(md5($body, true)));
         $request->setHeader('x-amz-content-sha256', hash('sha256', $body));
+
+        return $request;
+    }
+
+    /** @param array<string, string> $headers */
+    private function bodylessRequest(string $body, array $headers): Request
+    {
+        $request = new Request(
+            $this->createMock(Client::class),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/key'),
+            [],
+            new ReadableBuffer($body),
+        );
+        foreach ($headers as $name => $value) {
+            if ($name === '') {
+                throw new \LogicException('Test request header name must not be empty.');
+            }
+            $request->setHeader($name, $value);
+        }
+        $request->setAttribute('s3.operation', S3Operation::CopyObject);
 
         return $request;
     }

@@ -35,6 +35,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Validate literal SigV4 and Content-MD5 hashes for bodyless S3 operations
+  against an empty payload without consuming checksum spool capacity.
 - Return bounded JSON validation errors for malformed quota-list query
   encoding instead of routing those failures through S3 XML error handling.
 - Reject non-UTF-8, NUL-containing, and oversized quota pagination cursors

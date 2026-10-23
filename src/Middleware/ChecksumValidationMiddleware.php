@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\BadDigestException;
+use OpsFour\S3Server\Http\RequestBody;
 
 /**
  * Validates literal SigV4 payload hashes without buffering object data in RAM.
@@ -34,6 +35,20 @@ final class ChecksumValidationMiddleware implements Middleware
 
         if (preg_match('/^[a-f0-9]{64}$/i', $expected) !== 1) {
             throw new BadDigestException('x-amz-content-sha256 must be a 64-character hexadecimal SHA-256 digest.');
+        }
+
+        if (RequestBody::isBodylessOperation($request)) {
+            $computed = hash('sha256', '');
+            if (! hash_equals(strtolower($expected), $computed)) {
+                throw new BadDigestException(
+                    "The SHA-256 checksum you specified did not match what we received. Expected: {$expected}, Computed: {$computed}",
+                );
+            }
+            if ($request->getBody()->read() !== null) {
+                throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
+            }
+
+            return $requestHandler->handleRequest($request);
         }
 
         $tempPath = $this->spool->create('s3-sha256-');
