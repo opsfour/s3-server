@@ -35,6 +35,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Return bounded JSON validation errors for malformed quota-list query
+  encoding instead of routing those failures through S3 XML error handling.
 - Reject non-UTF-8, NUL-containing, and oversized quota pagination cursors
   before querying a metadata backend.
 - Repeated restores keep an existing later hot-copy expiry instead of

@@ -8,8 +8,9 @@ use Amp\ByteStream\BufferException;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
-use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Exception\InvalidArgumentException as S3InvalidArgumentException;
 use OpsFour\S3Server\Http\QueryStringParser;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Quota\AccountQuotaWriter;
 use OpsFour\S3Server\Quota\OwnerIdValidator;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -67,10 +68,14 @@ final readonly class AdminQuotaApiHandler implements RequestHandler
         }
         if ($ownerId === null) {
             $rawQuery = $request->getUri()->getQuery();
-            if (QueryStringParser::hasConflictingValues($rawQuery)) {
-                return $this->json(['error' => 'invalid_request', 'message' => 'Conflicting query parameters.'], 400);
+            try {
+                if (QueryStringParser::hasConflictingValues($rawQuery)) {
+                    return $this->json(['error' => 'invalid_request', 'message' => 'Conflicting query parameters.'], 400);
+                }
+                $params = QueryStringParser::parse($rawQuery);
+            } catch (S3InvalidArgumentException $e) {
+                return $this->json(['error' => 'invalid_request', 'message' => $e->getMessage()], 400);
             }
-            $params = QueryStringParser::parse($rawQuery);
             foreach (array_keys($params) as $name) {
                 if ($name !== 'limit' && $name !== 'cursor') {
                     return $this->json(['error' => 'invalid_request', 'message' => 'Unknown query parameter.'], 400);

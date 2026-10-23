@@ -290,6 +290,27 @@ final class AdminQuotaApiHandlerTest extends TestCase
         }
     }
 
+    public function test_list_returns_json_for_malformed_query_encoding(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('listAccountQuotasPage');
+        $handler = new AdminQuotaApiHandler($metadata, 'admin-secret');
+
+        foreach (['cursor=%', 'cursor=%FF'] as $query) {
+            $response = $handler->handleRequest($this->request(
+                'GET',
+                '/.admin/quotas?' . $query,
+                '',
+                $this->authHeaders(),
+            ));
+
+            self::assertSame(400, $response->getStatus(), $query);
+            self::assertSame('application/json', $response->getHeader('content-type'));
+            self::assertSame('no-store', $response->getHeader('cache-control'));
+            self::assertSame('invalid_request', $this->json($response)['error']);
+        }
+    }
+
     public function test_list_rejects_non_text_and_oversized_cursors_before_metadata_access(): void
     {
         $metadata = $this->createMock(MetadataStore::class);
