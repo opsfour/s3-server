@@ -19,6 +19,7 @@ use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
@@ -414,7 +415,9 @@ final class AccessLogWriterTest extends TestCase
         $storagePath = 's3://storage-private-test-token/log-object';
         $storage = $this->createMock(StorageBackend::class);
         $storage->method('putObject')->willReturnCallback(static fn(string $bucket, string $key, ReadableStream $body): StorageWriteResult => self::writeResultForBody($storagePath, $body));
-        $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('delete-private-test-token'));
+        $storage->expects(self::once())
+            ->method('deleteObjectByPath')
+            ->willThrowException(new \RuntimeException('delete-private-test-token'));
 
         $writer = new AccessLogWriter($metadata, $storage, $logger);
         $writer->log('source', 'key', 'GetObject', 200, 0);
@@ -589,7 +592,8 @@ final class AccessLogWriterTest extends TestCase
 
     public function test_metadata_failure_deletes_or_queues_written_log_object_and_retains_buffer(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, RecoveryStorageGarbageStore::class]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
         $storage = $this->createMock(StorageBackend::class);
 
         $metadata->method('getBucketLogging')->willReturn([
@@ -603,7 +607,7 @@ final class AccessLogWriterTest extends TestCase
         $storage->method('putObject')->willReturnCallback(static fn(string $bucket, string $key, ReadableStream $body): StorageWriteResult => self::writeResultForBody('/remote/log-object', $body));
         $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('storage unavailable'));
         $metadata->expects(self::once())
-            ->method('enqueueStorageGarbage')
+            ->method('enqueueRecoveryStorageGarbage')
             ->with('log-target', 'HOT', '/remote/log-object');
 
         $writer = new AccessLogWriter($metadata, $storage, storageTier: 'HOT');

@@ -10,6 +10,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartCompletionCapacityReader;
 use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
+use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 
@@ -47,7 +48,7 @@ final class MetricsHandler implements RequestHandler
         }
 
         if ($this->metadata !== null) {
-            if ($this->metadata instanceof ObservedMetadataStore) {
+            if ($this->metadataIsObserved()) {
                 $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
             } else {
                 $startedAt = hrtime(true);
@@ -74,6 +75,7 @@ final class MetricsHandler implements RequestHandler
             }
             $this->refreshMultipartCompletionCapacity();
             $this->refreshWriteIntentCapacity();
+            $this->refreshStorageCleanupCapacity();
         }
 
         return $this->response();
@@ -96,7 +98,7 @@ final class MetricsHandler implements RequestHandler
         if (! $this->metadata instanceof MultipartCompletionCapacityReader) {
             return;
         }
-        if ($this->metadata instanceof ObservedMetadataStore) {
+        if ($this->metadataIsObserved()) {
             $count = $this->metadata->getMultipartCompletionIntentCount();
         } else {
             $startedAt = hrtime(true);
@@ -131,7 +133,7 @@ final class MetricsHandler implements RequestHandler
 
             return;
         }
-        if ($this->metadata instanceof ObservedMetadataStore) {
+        if ($this->metadataIsObserved()) {
             $counts = $this->metadata->getWriteIntentCapacityCounts();
         } else {
             $startedAt = hrtime(true);
@@ -168,5 +170,33 @@ final class MetricsHandler implements RequestHandler
         $parts = explode('\\', $this->metadata::class);
 
         return $parts[array_key_last($parts)] ?? $this->metadata::class;
+    }
+
+    private function refreshStorageCleanupCapacity(): void
+    {
+        if (! $this->metadata instanceof StorageCleanupCapacityReader) {
+            $this->metrics->setStorageCleanupCount(null);
+
+            return;
+        }
+        if ($this->metadataIsObserved()) {
+            $count = $this->metadata->getStorageCleanupCount();
+        } else {
+            $startedAt = hrtime(true);
+            try {
+                $count = $this->metadata->getStorageCleanupCount();
+                $this->metrics->recordBackendOperation('metadata', $this->metadataDriver(), 'getStorageCleanupCount', hrtime(true) - $startedAt);
+            } catch (\Throwable $error) {
+                $this->metrics->recordBackendOperation('metadata', $this->metadataDriver(), 'getStorageCleanupCount', hrtime(true) - $startedAt, false, exception: $error::class);
+                throw $error;
+            }
+        }
+        $this->metrics->setStorageCleanupCount($count);
+    }
+
+    private function metadataIsObserved(): bool
+    {
+        return $this->metadata !== null
+            && ObservedMetadataStore::isObservedBy($this->metadata, $this->metrics);
     }
 }

@@ -243,6 +243,9 @@ jobs:
       - name: Metadata backend parity and concurrency
         run: vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
 
+      - name: Storage cleanup capacity concurrency
+        run: vendor/bin/phpunit --fail-on-skipped tests/Functional/ExternalStorageCleanupCapacityTest.php
+
       - name: Stored identity policy inventory on external backends
         run: |
           S3_POLICY_AUDIT_DSN='mysql:host=127.0.0.1;port=3306;dbname=s3server' \

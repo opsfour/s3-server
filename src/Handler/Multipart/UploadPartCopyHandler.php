@@ -713,6 +713,7 @@ final class UploadPartCopyHandler implements RequestHandler
             $bucket,
             $storageTier,
             $path,
+            'upload_part_copy_uncommitted_path',
         );
         if ($confirmedUploadId === null || ! $this->metadata instanceof MultipartPartWriteIntentStore) {
             return;

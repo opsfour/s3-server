@@ -585,6 +585,7 @@ final class TierTransitionExecutor
                 $this->stringJobValue($job, 'bucket'),
                 $this->stringJobValue($job, 'targetTier'),
                 $path,
+                'tier_transition_target_cleanup',
             );
         } catch (\Throwable $cleanupError) {
             $this->logger->critical('Tier transition target cleanup could not be persisted.', [

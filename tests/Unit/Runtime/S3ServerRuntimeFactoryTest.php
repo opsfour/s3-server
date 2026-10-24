@@ -8,8 +8,11 @@ use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3Server;
@@ -84,6 +87,83 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertCount(1, $events);
         self::assertSame('s3:ObjectCreated:Put', $events[0]->name);
         self::assertSame('key.txt', $events[0]->key);
+    }
+
+    public function test_create_binds_cleanup_rejections_to_the_serving_metrics_collector(): void
+    {
+        $databasePath = tempnam(sys_get_temp_dir(), 's3-runtime-observed-');
+        self::assertIsString($databasePath);
+        $store = new SqliteMetadataStore($databasePath);
+        $store->initialize();
+        $upstreamMetrics = new MetricsCollector();
+        $servingMetrics = new MetricsCollector();
+        $observed = new ObservedMetadataStore($store, $upstreamMetrics, 'sqlite');
+        $runtime = $this->createRuntimeWithMetadata($observed, $servingMetrics);
+
+        try {
+            $runtimeMetadata = $this->runtimeMetadata($runtime->server);
+            self::assertInstanceOf(ObservedMetadataStore::class, $runtimeMetadata);
+            self::assertNotSame($observed, $runtimeMetadata);
+
+            $pdo = new \PDO('sqlite:' . $databasePath);
+            $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+            $pdo->exec('UPDATE s3_storage_cleanup_capacity SET retained_count = 900000 WHERE id = 1');
+
+            try {
+                $runtimeMetadata->enqueueStorageGarbage('bucket', 'STANDARD', 'full');
+                self::fail('Cleanup capacity rejection was not propagated.');
+            } catch (StorageCleanupCapacityException) {
+            }
+
+            foreach ([$upstreamMetrics, $servingMetrics] as $metrics) {
+                self::assertStringContainsString(
+                    's3_server_storage_cleanup_admission_rejections_total{admission="normal"} 1',
+                    $metrics->renderPrometheus(),
+                );
+            }
+        } finally {
+            $runtime->stop();
+            @unlink($databasePath);
+        }
+    }
+
+    public function test_create_does_not_bind_the_same_metrics_collector_twice(): void
+    {
+        $databasePath = tempnam(sys_get_temp_dir(), 's3-runtime-observed-');
+        self::assertIsString($databasePath);
+        $store = new SqliteMetadataStore($databasePath);
+        $store->initialize();
+        $metrics = new MetricsCollector();
+        $observed = new ObservedMetadataStore($store, $metrics, 'sqlite');
+        $runtime = $this->createRuntimeWithMetadata($observed, $metrics);
+
+        try {
+            $runtimeMetadata = $this->runtimeMetadata($runtime->server);
+            self::assertSame($observed, $runtimeMetadata);
+
+            $pdo = new \PDO('sqlite:' . $databasePath);
+            $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+            $pdo->exec('UPDATE s3_storage_cleanup_capacity SET retained_count = 900000 WHERE id = 1');
+
+            try {
+                $runtimeMetadata->enqueueStorageGarbage('bucket', 'STANDARD', 'full');
+                self::fail('Cleanup capacity rejection was not propagated.');
+            } catch (StorageCleanupCapacityException) {
+            }
+
+            $rendered = $metrics->renderPrometheus();
+            self::assertStringContainsString(
+                's3_server_storage_cleanup_admission_rejections_total{admission="normal"} 1',
+                $rendered,
+            );
+            self::assertStringNotContainsString(
+                's3_server_storage_cleanup_admission_rejections_total{admission="normal"} 2',
+                $rendered,
+            );
+        } finally {
+            $runtime->stop();
+            @unlink($databasePath);
+        }
     }
 
     public function test_runtime_stop_shuts_down_encryption_service_when_supported(): void
@@ -226,6 +306,29 @@ final class S3ServerRuntimeFactoryTest extends TestCase
             encryption: $encryption,
             notificationListeners: $notificationListeners,
         );
+    }
+
+    private function createRuntimeWithMetadata(MetadataStore $metadata, MetricsCollector $metrics): \OpsFour\S3Server\Runtime\S3ServerRuntime
+    {
+        return (new S3ServerRuntimeFactory())->create(
+            config: new S3ServerConfig(storagePath: $this->storagePath),
+            metadata: $metadata,
+            storage: new InMemoryBackend(),
+            credentialProvider: new InMemoryCredentialProvider(
+                new Credential('test-key', 'test-secret', 'test-owner'),
+            ),
+            logger: new NullLogger(),
+            metrics: $metrics,
+        );
+    }
+
+    private function runtimeMetadata(S3Server $server): MetadataStore
+    {
+        $property = new \ReflectionProperty(S3Server::class, 'metadata');
+        $metadata = $property->getValue($server);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+
+        return $metadata;
     }
 
     private function runEventLoopTick(): void

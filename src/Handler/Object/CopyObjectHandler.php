@@ -1285,6 +1285,7 @@ final class CopyObjectHandler implements RequestHandler
                     $bucket,
                     $this->storageTiers->defaultTier()->name,
                     $original->path,
+                    'copy_object_staging_replacement',
                 );
             }
         } catch (\Throwable $e) {
@@ -1341,6 +1342,7 @@ final class CopyObjectHandler implements RequestHandler
             $bucket,
             $this->storageTiers->defaultTier()->name,
             $path,
+            'copy_object_uncommitted_path',
         );
     }
 

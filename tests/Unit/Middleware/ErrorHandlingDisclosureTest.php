@@ -14,6 +14,7 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -101,6 +102,17 @@ final class ErrorHandlingDisclosureTest extends TestCase
 
         self::assertSame(503, $response->getStatus());
         self::assertSame('1', $response->getHeader('Retry-After'));
+    }
+
+    public function test_storage_cleanup_capacity_uses_the_s3_slow_down_contract(): void
+    {
+        $response = $this->dispatch(new StorageCleanupCapacityException());
+        $body = ByteStream\buffer($response->getBody());
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('1', $response->getHeader('Retry-After'));
+        self::assertStringContainsString('<Code>SlowDown</Code>', $body);
+        self::assertStringContainsString('Storage cleanup capacity is exhausted.', $body);
     }
 
     public function test_error_handling_remains_available_without_request_id_middleware(): void

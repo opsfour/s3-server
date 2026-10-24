@@ -443,6 +443,7 @@ final class RestoreExecutor
                 (string) ($job['bucket'] ?? ''),
                 $targetTierName,
                 $path,
+                'restore_target_cleanup',
             );
         } catch (\Throwable $cleanupError) {
             $this->logger->critical('Restore target cleanup could not be persisted.', [

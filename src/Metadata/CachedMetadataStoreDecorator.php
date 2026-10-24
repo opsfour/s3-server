@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -1042,6 +1042,13 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
             : null;
     }
 
+    public function getStorageCleanupCount(): ?int
+    {
+        return $this->inner instanceof StorageCleanupCapacityReader
+            ? $this->inner->getStorageCleanupCount()
+            : null;
+    }
+
     public function updateNotificationStatus(
         int $id,
         string $status,
@@ -1061,6 +1068,14 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
     public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
         $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath);
+    }
+
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        if (! $this->inner instanceof RecoveryStorageGarbageStore) {
+            throw new \RuntimeException('Protected storage cleanup recovery admission is unavailable.');
+        }
+        $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath);
     }
 
     public function createMultipartPartWriteIntent(

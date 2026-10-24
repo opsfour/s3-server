@@ -769,6 +769,7 @@ final class PutObjectHandler implements RequestHandler
             $bucket,
             $this->storageTiers->defaultTier()->name,
             $path,
+            'put_object_uncommitted_path',
         );
     }
 

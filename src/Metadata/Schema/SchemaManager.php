@@ -929,6 +929,62 @@ final class SchemaManager
         $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (39, 'Preserve CORS rule IDs and explicit zero maximum age')");
     }
 
+    private function applyVersion40(): void
+    {
+        if (! $this->columnExists('s3_storage_garbage', 'recovery_admission')) {
+            $this->pdo->exec('ALTER TABLE s3_storage_garbage ADD COLUMN recovery_admission INTEGER NOT NULL DEFAULT 0 CHECK (recovery_admission IN (0, 1))');
+        }
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                retained_count INTEGER NOT NULL CHECK (retained_count >= 0)
+            )
+            SQL);
+        $this->pdo->exec("INSERT INTO s3_storage_cleanup_capacity (id, retained_count)
+            SELECT 1, (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation != 'part_write_intent')
+            WHERE NOT EXISTS (SELECT 1 FROM s3_storage_cleanup_capacity WHERE id = 1)");
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_storage_cleanup_capacity_insert BEFORE INSERT ON s3_storage_garbage
+            WHEN NEW.operation != 'part_write_intent'
+            BEGIN
+                UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count + 1
+                WHERE id = 1 AND retained_count < CASE WHEN NEW.recovery_admission = 1 THEN 1000000 ELSE 900000 END;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Storage cleanup capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_storage_cleanup_capacity_delete BEFORE DELETE ON s3_storage_garbage
+            WHEN OLD.operation != 'part_write_intent'
+            BEGIN
+                UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count - 1
+                WHERE id = 1 AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Storage cleanup capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER IF NOT EXISTS s3_storage_cleanup_capacity_update BEFORE UPDATE OF operation, recovery_admission ON s3_storage_garbage
+            BEGIN
+                SELECT CASE WHEN OLD.recovery_admission != NEW.recovery_admission
+                    THEN RAISE(ABORT, 'Storage cleanup recovery admission is immutable.') END;
+                UPDATE s3_storage_cleanup_capacity
+                SET retained_count = retained_count + CASE
+                    WHEN OLD.operation = 'part_write_intent' AND NEW.operation != 'part_write_intent' THEN 1
+                    ELSE -1 END
+                WHERE id = 1
+                  AND ((OLD.operation = 'part_write_intent' AND NEW.operation != 'part_write_intent'
+                        AND retained_count < CASE WHEN NEW.recovery_admission = 1 THEN 1000000 ELSE 900000 END)
+                    OR (OLD.operation != 'part_write_intent' AND NEW.operation = 'part_write_intent'
+                        AND retained_count > 0));
+                SELECT CASE WHEN ((OLD.operation = 'part_write_intent' AND NEW.operation != 'part_write_intent')
+                    OR (OLD.operation != 'part_write_intent' AND NEW.operation = 'part_write_intent')) AND changes() != 1
+                    THEN RAISE(ABORT, 'Storage cleanup capacity is exhausted or inconsistent.') END;
+            END
+            SQL);
+        $this->assertStorageCleanupCapacityConsistent();
+        $this->assertStorageCleanupTriggers();
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (40, 'Bound durable storage cleanup admission')");
+    }
+
     public function assertWriteIntentCapacityConsistent(): void
     {
         foreach ([
@@ -945,6 +1001,35 @@ final class SchemaManager
             if ($row === false || $row['count_type'] !== 'integer' || (int) $row['retained_count'] !== (int) $row['actual_count']) {
                 throw new \RuntimeException('Write intent recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
             }
+        }
+    }
+
+    public function assertStorageCleanupCapacityConsistent(): void
+    {
+        try {
+            $capacity = $this->pdo->query("SELECT retained_count, typeof(retained_count) AS count_type,
+                (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation != 'part_write_intent') AS actual_count
+                FROM s3_storage_cleanup_capacity WHERE id = 1");
+            $row = $capacity === false ? false : $capacity->fetch(\PDO::FETCH_ASSOC);
+        } catch (\PDOException $error) {
+            throw new \RuntimeException('Storage cleanup capacity counter cannot be verified.', 0, $error);
+        }
+        if ($row === false || $row['count_type'] !== 'integer' || (int) $row['retained_count'] !== (int) $row['actual_count']) {
+            throw new \RuntimeException('Storage cleanup capacity counter is inconsistent; stop writers and repair metadata before serving.');
+        }
+    }
+
+    public function assertStorageCleanupTriggers(): void
+    {
+        $statement = $this->pdo->query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 's3_storage_cleanup_capacity_%'");
+        $names = $statement === false ? [] : $statement->fetchAll(\PDO::FETCH_COLUMN);
+        sort($names);
+        if ($names !== [
+            's3_storage_cleanup_capacity_delete',
+            's3_storage_cleanup_capacity_insert',
+            's3_storage_cleanup_capacity_update',
+        ]) {
+            throw new \RuntimeException('Storage cleanup capacity triggers are missing; repair metadata before serving.');
         }
     }
 
@@ -998,6 +1083,9 @@ final class SchemaManager
             's3_account_quotas',
             's3_notification_queue',
             's3_storage_garbage',
+            's3_storage_cleanup_capacity',
+            's3_write_intent_capacity',
+            's3_multipart_completion_capacity',
             's3_rate_limit_buckets',
             's3_bucket_logging',
             's3_public_access_blocks',

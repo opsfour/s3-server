@@ -8,6 +8,13 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Bound durable storage cleanup with an exact cross-backend counter, a
+  900,000-row normal boundary, a protected failed-delete band through
+  1,000,000 rows, O(1) metrics, fail-closed startup checks, and a read-only
+  stopped-local-profile `storage:inventory` reconciliation command. The
+  inventory uses a size-bounded disk-backed exact reference index,
+  deterministic cursor-paged candidate output, explicit default-tier
+  resolution, and rejects ambiguous local tier roots.
 - Add an offline `storage:audit` command for bounded, non-repairing reference
   existence and size checks across explicitly mapped local filesystem tiers.
 - Add exclusive `.opsfour/runtime.lock` ownership for local storage roots so a

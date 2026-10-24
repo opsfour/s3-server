@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 47;
+    public const int VERSION = 48;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -501,7 +501,8 @@ final class MysqlSchema
                 bucket VARCHAR(255) NOT NULL,
                 storage_tier VARCHAR(64) NOT NULL,
                 storage_path VARCHAR(1024) NOT NULL,
-                operation VARCHAR(32) NOT NULL DEFAULT 'delete_path',
+                operation VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'delete_path',
+                recovery_admission TINYINT(1) NOT NULL DEFAULT 0 CHECK (recovery_admission IN (0, 1)),
                 key_name VARBINARY(1024) NULL,
                 upload_id VARCHAR(255) NULL,
                 owner_id VARBINARY(255) NULL,
@@ -518,7 +519,14 @@ final class MysqlSchema
                         OR BINARY operation = BINARY 'part_write_intent'
                     ) THEN 1 ELSE 0 END
                 ) VIRTUAL,
-                KEY idx_s3_storage_gc_status (status, next_attempt_at),
+                CONSTRAINT chk_s3_storage_garbage_operation CHECK (
+                    BINARY operation IN (
+                        BINARY 'delete_path',
+                        BINARY 'abort_multipart',
+                        BINARY 'part_write_intent'
+                    )
+                ),
+                KEY idx_s3_storage_gc_due (next_attempt_at, id),
                 KEY idx_s3_storage_gc_operation_owner (operation, owner_id),
                 KEY idx_s3_storage_gc_recursive_unsafe (recursive_cleanup_unsafe, storage_tier)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -574,6 +582,7 @@ final class MysqlSchema
 
             ...self::completionCapacityStatements(),
             ...self::writeIntentCapacityStatements(),
+            ...self::storageCleanupCapacityStatements(),
             ...self::recoveryCapacityTriggerInventoryFunctionStatements(false),
         ];
     }
@@ -1022,6 +1031,33 @@ final class MysqlSchema
         if ($fromVersion < 47) {
             array_push($statements, ...self::recoveryCapacityTriggerInventoryFunctionStatements(true));
         }
+        if ($fromVersion < 48) {
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN recovery_admission TINYINT(1) NOT NULL DEFAULT 0 CHECK (recovery_admission IN (0, 1))';
+            $statements[] = <<<'SQL'
+                UPDATE s3_storage_garbage SET operation = CASE
+                    WHEN operation = 'delete_path' THEN 'delete_path'
+                    WHEN operation = 'abort_multipart' THEN 'abort_multipart'
+                    WHEN operation = 'part_write_intent' THEN 'part_write_intent'
+                    ELSE operation
+                END
+                SQL;
+            $statements[] = "ALTER TABLE s3_storage_garbage MODIFY COLUMN operation VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'delete_path'";
+            $statements[] = <<<'SQL'
+                ALTER TABLE s3_storage_garbage
+                ADD CONSTRAINT chk_s3_storage_garbage_operation CHECK (
+                    BINARY operation IN (
+                        BINARY 'delete_path',
+                        BINARY 'abort_multipart',
+                        BINARY 'part_write_intent'
+                    )
+                )
+                SQL;
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD INDEX idx_s3_storage_gc_due (next_attempt_at, id)';
+            $statements[] = 'ALTER TABLE s3_storage_garbage DROP INDEX idx_s3_storage_gc_status';
+            array_push($statements, ...self::writeIntentCapacityStatements());
+            array_push($statements, ...self::storageCleanupCapacityStatements());
+            array_push($statements, ...self::recoveryCapacityTriggerInventoryFunctionStatements(true));
+        }
 
         return $statements;
     }
@@ -1078,7 +1114,7 @@ final class MysqlSchema
              SELECT 'object', (SELECT COUNT(*) FROM s3_object_write_intents)
              WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object')",
             "INSERT INTO s3_write_intent_capacity (kind, retained_count)
-             SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent')
+             SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation = BINARY 'part_write_intent')
              WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')",
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_insert',
             <<<'SQL'
@@ -1106,7 +1142,7 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TRIGGER s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage
             FOR EACH ROW BEGIN
-                IF NEW.operation = 'part_write_intent' THEN
+                IF BINARY NEW.operation = BINARY 'part_write_intent' THEN
                     UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
                     WHERE kind = 'part' AND retained_count < 1000000;
                     IF ROW_COUNT() <> 1 THEN
@@ -1119,7 +1155,7 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TRIGGER s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage
             FOR EACH ROW BEGIN
-                IF OLD.operation = 'part_write_intent' THEN
+                IF BINARY OLD.operation = BINARY 'part_write_intent' THEN
                     UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
                     WHERE kind = 'part' AND retained_count > 0;
                     IF ROW_COUNT() <> 1 THEN
@@ -1132,19 +1168,86 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TRIGGER s3_write_intent_capacity_part_update BEFORE UPDATE ON s3_storage_garbage
             FOR EACH ROW BEGIN
-                IF OLD.operation <> NEW.operation THEN
-                    IF NEW.operation = 'part_write_intent' THEN
+                IF BINARY OLD.operation <> BINARY NEW.operation THEN
+                    IF BINARY NEW.operation = BINARY 'part_write_intent' THEN
                         UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
                         WHERE kind = 'part' AND retained_count < 1000000;
                         IF ROW_COUNT() <> 1 THEN
                             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is exhausted or unavailable.';
                         END IF;
-                    ELSEIF OLD.operation = 'part_write_intent' THEN
+                    ELSEIF BINARY OLD.operation = BINARY 'part_write_intent' THEN
                         UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
                         WHERE kind = 'part' AND retained_count > 0;
                         IF ROW_COUNT() <> 1 THEN
                             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Multipart part recovery capacity is inconsistent.';
                         END IF;
+                    END IF;
+                END IF;
+            END
+            SQL,
+        ];
+    }
+
+    /** @return list<string> */
+    private static function storageCleanupCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity (
+                id TINYINT NOT NULL PRIMARY KEY,
+                retained_count BIGINT NOT NULL,
+                CONSTRAINT chk_s3_storage_cleanup_capacity CHECK (id = 1 AND retained_count >= 0)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+            "INSERT INTO s3_storage_cleanup_capacity (id, retained_count)
+             SELECT 1, (SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation <> BINARY 'part_write_intent')
+             WHERE NOT EXISTS (SELECT 1 FROM s3_storage_cleanup_capacity WHERE id = 1)",
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_insert',
+            <<<'SQL'
+            CREATE TRIGGER s3_storage_cleanup_capacity_insert BEFORE INSERT ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF BINARY NEW.operation <> BINARY 'part_write_intent' THEN
+                    UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count + 1
+                    WHERE id = 1 AND retained_count < IF(NEW.recovery_admission = 1, 1000000, 900000);
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Storage cleanup capacity is exhausted.';
+                    END IF;
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_delete',
+            <<<'SQL'
+            CREATE TRIGGER s3_storage_cleanup_capacity_delete BEFORE DELETE ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF BINARY OLD.operation <> BINARY 'part_write_intent' THEN
+                    UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count - 1
+                    WHERE id = 1 AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Storage cleanup capacity is inconsistent.';
+                    END IF;
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_update',
+            <<<'SQL'
+            CREATE TRIGGER s3_storage_cleanup_capacity_update BEFORE UPDATE ON s3_storage_garbage
+            FOR EACH ROW BEGIN
+                IF OLD.recovery_admission <> NEW.recovery_admission THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Storage cleanup recovery admission is immutable.';
+                END IF;
+                IF BINARY OLD.operation = BINARY 'part_write_intent'
+                   AND BINARY NEW.operation <> BINARY 'part_write_intent' THEN
+                    UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count + 1
+                    WHERE id = 1 AND retained_count < IF(NEW.recovery_admission = 1, 1000000, 900000);
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Storage cleanup capacity is exhausted.';
+                    END IF;
+                ELSEIF BINARY OLD.operation <> BINARY 'part_write_intent'
+                   AND BINARY NEW.operation = BINARY 'part_write_intent' THEN
+                    UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count - 1
+                    WHERE id = 1 AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Storage cleanup capacity is inconsistent.';
                     END IF;
                 END IF;
             END
@@ -1184,6 +1287,15 @@ final class MysqlSchema
                       OR (TRIGGER_NAME = 's3_multipart_completion_capacity_delete'
                           AND EVENT_OBJECT_TABLE = 's3_multipart_write_intents'
                           AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_storage_cleanup_capacity_insert'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_storage_cleanup_capacity_delete'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_storage_cleanup_capacity_update'
+                          AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
+                          AND EVENT_MANIPULATION = 'UPDATE' AND ACTION_TIMING = 'BEFORE')
                   )
             )
             SQL;

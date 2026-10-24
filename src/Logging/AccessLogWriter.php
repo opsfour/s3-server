@@ -314,6 +314,8 @@ final class AccessLogWriter
 
                 public ?string $plannedPath = null;
 
+                public bool $cleanupAttempted = false;
+
                 public ?string $publishedVersionId = null;
 
                 public ?LocalObjectWriteLeaseGuard $lease = null;
@@ -554,12 +556,14 @@ final class AccessLogWriter
 
                 });
                 if (!$attempt->committed && $this->localFencedWriter === null) {
+                    $attempt->cleanupAttempted = true;
                     DurableStorageDelete::run(
                         $this->metadata,
                         $this->storage,
                         $targetBucket,
                         $this->storageTier,
                         $attempt->plannedPath ?? $attempt->writeResult->path,
+                        'access_log_uncommitted_path',
                     );
                     continue;
                 }
@@ -601,7 +605,8 @@ final class AccessLogWriter
                     }
                     $cleanupPath = null;
                 }
-                if ($this->localFencedWriter === null && $attempt->targetBucket !== null && $cleanupPath !== null) {
+                if ($this->localFencedWriter === null && !$attempt->cleanupAttempted
+                    && $attempt->targetBucket !== null && $cleanupPath !== null) {
                     try {
                         DurableStorageDelete::run(
                             $this->metadata,
@@ -609,6 +614,7 @@ final class AccessLogWriter
                             $attempt->targetBucket,
                             $this->storageTier,
                             $cleanupPath,
+                            'access_log_failed_attempt',
                         );
                     } catch (\Throwable $cleanupError) {
                         $this->logger->critical(

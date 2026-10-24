@@ -5,10 +5,15 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\CancelledException;
+use OpsFour\S3Server\Exception\RecoveryStorageCleanupCapacityException;
+use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
+use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Storage\DurableStorageDelete;
 use OpsFour\S3Server\Storage\StorageBackend;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 
 final class DurableStorageDeleteTest extends TestCase
@@ -28,8 +33,8 @@ final class DurableStorageDeleteTest extends TestCase
         $storage->expects(self::once())->method('deleteObjectByPath')
             ->with('bucket/path', 'bucket')
             ->willThrowException($cancellation);
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::once())->method('enqueueStorageGarbage')
+        $metadata = $this->recoveryMetadataMock();
+        $metadata->expects(self::once())->method('enqueueRecoveryStorageGarbage')
             ->with('bucket', 'STANDARD', 'bucket/path');
 
         try {
@@ -49,8 +54,8 @@ final class DurableStorageDeleteTest extends TestCase
         $storage = $this->createMock(StorageBackend::class);
         $storage->method('deleteObjectByPath')->willThrowException(new \RuntimeException('storage unavailable'));
         $cancellation = new CancelledException();
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->method('enqueueStorageGarbage')->willThrowException($cancellation);
+        $metadata = $this->recoveryMetadataMock();
+        $metadata->method('enqueueRecoveryStorageGarbage')->willThrowException($cancellation);
 
         try {
             DurableStorageDelete::run($metadata, $storage, 'bucket', 'STANDARD', 'bucket/path');
@@ -66,8 +71,8 @@ final class DurableStorageDeleteTest extends TestCase
         $queueCancellation = new CancelledException();
         $storage = $this->createMock(StorageBackend::class);
         $storage->method('deleteObjectByPath')->willThrowException($deleteCancellation);
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::once())->method('enqueueStorageGarbage')
+        $metadata = $this->recoveryMetadataMock();
+        $metadata->expects(self::once())->method('enqueueRecoveryStorageGarbage')
             ->willThrowException($queueCancellation);
 
         try {
@@ -76,5 +81,59 @@ final class DurableStorageDeleteTest extends TestCase
         } catch (CancelledException $error) {
             self::assertSame($deleteCancellation, $error);
         }
+    }
+
+    public function test_recovery_hard_cap_surfaces_safe_context_and_retains_delete_failure(): void
+    {
+        $deleteError = new \RuntimeException('storage unavailable');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('deleteObjectByPath')->willThrowException($deleteError);
+        $metadata = $this->recoveryCapacityMetadataMock();
+        $metadata->expects(self::once())->method('enqueueRecoveryStorageGarbage')
+            ->willThrowException(new StorageCleanupCapacityException());
+        $metadata->expects(self::once())->method('getStorageCleanupCount')->willReturn(1_000_000);
+
+        try {
+            DurableStorageDelete::run(
+                $metadata,
+                $storage,
+                'private-bucket',
+                'COLD',
+                '/private/storage/object',
+                'unit_test_cleanup',
+            );
+            self::fail('Recovery hard-cap rejection must fail visibly.');
+        } catch (RecoveryStorageCleanupCapacityException $error) {
+            self::assertSame($deleteError, $error->getPrevious());
+            self::assertSame('private-bucket', $error->bucket);
+            self::assertSame('COLD', $error->storageTier);
+            self::assertSame('unit_test_cleanup', $error->origin);
+            self::assertSame(1_000_000, $error->cleanupCount);
+            self::assertSame(hash('sha256', '/private/storage/object'), $error->storagePathHash);
+            self::assertStringNotContainsString('/private/storage/object', (string) $error);
+        }
+    }
+
+    private function recoveryMetadataMock(): MetadataStore&RecoveryStorageGarbageStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, RecoveryStorageGarbageStore::class]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        self::assertInstanceOf(RecoveryStorageGarbageStore::class, $metadata);
+
+        return $metadata;
+    }
+
+    private function recoveryCapacityMetadataMock(): MetadataStore&RecoveryStorageGarbageStore&StorageCleanupCapacityReader&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            RecoveryStorageGarbageStore::class,
+            StorageCleanupCapacityReader::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        self::assertInstanceOf(RecoveryStorageGarbageStore::class, $metadata);
+        self::assertInstanceOf(StorageCleanupCapacityReader::class, $metadata);
+
+        return $metadata;
     }
 }

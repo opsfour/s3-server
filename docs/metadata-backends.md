@@ -212,9 +212,10 @@ The DML-only serving role does not need trigger-creation rights.
 | 45 (MySQL) | Widen stored CORS rule IDs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
 | 46 (MySQL) | Widen lifecycle rule IDs stored with tier-transition jobs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
 | 47 (MySQL) | Expose the expected capacity-trigger count through a narrow definer-security function so DML-only serving nodes fail closed after trigger removal. |
+| 40 (SQLite) / 43 (PostgreSQL) / 48 (MySQL) | Add immutable cleanup admission classes, an exact singleton cleanup counter, and trigger-enforced 900,000 normal / 1,000,000 recovery boundaries. |
 
-SQLite currently uses schema version `39`; PostgreSQL uses `42`, and MySQL
-uses `47`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+SQLite currently uses schema version `40`; PostgreSQL uses `43`, and MySQL
+uses `48`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error
@@ -226,8 +227,10 @@ column also needs a migration-time and lock check on a representative copy.
 MySQL v45 and v46 widen CORS and lifecycle tier-job rule ID columns and can
 likewise wait for metadata locks or rebuild their tables; measure them on a
 representative copy.
-The completion, object and part counter migrations count retained rows and
-create DML triggers. Stop all old API nodes and workers before their backfill;
+The completion, object, part, and cleanup counter migrations count retained rows and
+create DML triggers. The cleanup migration preserves every legacy row even when
+the exact count exceeds one million; new admission stays blocked while collectors
+drain the queue. Stop all old API nodes and workers before their backfill;
 MySQL DDL auto-commits and does not provide a hot rolling cutover. The
 migrations require trigger-creation rights and a durable MySQL trigger
 definer. Startup verifies each counter against its table with a full count,
@@ -249,6 +252,20 @@ tuples through the definer-security function. DML-only nodes call that function
 at startup and during readiness without receiving the `TRIGGER` privilege. A
 missing trigger, function, durable definer, or narrow `EXECUTE` grant fails
 closed.
+
+Built-in stores count every `s3_storage_garbage` row except
+`part_write_intent`. Normal cleanup is admitted through 900,000 rows. Only a
+failed physical delete may use the reserved recovery band through 1,000,000.
+Database triggers enforce these boundaries and keep the singleton count exact
+for inserts, deletes, and operation transitions. Startup performs one exact
+recount; SQLite and PostgreSQL also inventory trigger definitions, while MySQL
+uses a rollback-only DML probe that exercises the interacting part-intent and
+cleanup counters with the serving role.
+
+Custom stores may implement `StorageCleanupCapacityReader` for O(1) metrics and
+`RecoveryStorageGarbageStore` for protected post-delete-failure admission. A
+store without the recovery capability fails closed when a physical delete also
+cannot be queued; it cannot claim access to the reserved recovery band.
 
 Custom metadata stores that implement `MultipartWriteIntentStore` must also
 implement `renewMultipartWriteIntent()`. It atomically extends an active

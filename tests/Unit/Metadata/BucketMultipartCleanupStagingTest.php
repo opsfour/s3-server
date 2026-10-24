@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
+use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use PHPUnit\Framework\TestCase;
 
@@ -83,6 +84,35 @@ final class BucketMultipartCleanupStagingTest extends TestCase
         $count = $pdo->query('SELECT COUNT(*) FROM s3_storage_garbage');
         self::assertInstanceOf(\PDOStatement::class, $count);
         self::assertSame(0, (int) $count->fetchColumn());
+    }
+
+    public function test_cleanup_capacity_rejection_rolls_back_bulk_rows_and_bucket_mutation(): void
+    {
+        $store = $this->store();
+        $store->createBucket('owner', 'target', 'us-east-1');
+        $store->createMultipartUpload('target-a', 'target', 'a', 'owner');
+        $store->putPart('target-a', 1, 'etag', 1, 'parts/target/a-1');
+        $store->putPart('target-a', 2, 'etag', 1, 'parts/target/a-2');
+        $pdo = new \PDO('sqlite:' . $this->path);
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        $pdo->exec('UPDATE s3_storage_cleanup_capacity SET retained_count = 899999 WHERE id = 1');
+
+        try {
+            $store->transaction(function () use ($store): void {
+                $store->stageBucketMultipartCleanup('target', 'STANDARD');
+                $store->deleteBucket('owner', 'target');
+            });
+            self::fail('Bulk cleanup exceeded the one remaining normal slot.');
+        } catch (StorageCleanupCapacityException) {
+        }
+
+        self::assertNotNull($store->getBucket('target'));
+        self::assertNotNull($store->getMultipartUpload('target-a'));
+        self::assertCount(2, $store->getParts('target-a'));
+        $garbage = $pdo->query('SELECT COUNT(*) FROM s3_storage_garbage');
+        self::assertInstanceOf(\PDOStatement::class, $garbage);
+        self::assertSame(0, (int) $garbage->fetchColumn());
+        self::assertSame(899_999, $store->getStorageCleanupCount());
     }
 
     private function store(): SqliteMetadataStore

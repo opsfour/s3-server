@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
 {
     private ?\PDO $pdo = null;
 
@@ -82,6 +82,8 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $schemaManager->migrate();
         $schemaManager->assertMultipartCompletionCapacityConsistent();
         $schemaManager->assertWriteIntentCapacityConsistent();
+        $schemaManager->assertStorageCleanupCapacityConsistent();
+        $schemaManager->assertStorageCleanupTriggers();
     }
 
     public function assertSupportedBucketEncryptionInventory(): void
@@ -3993,6 +3995,18 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         return ['object' => $counts['object'], 'part' => $counts['part']];
     }
 
+    public function getStorageCleanupCount(): int
+    {
+        $statement = $this->prepare('SELECT retained_count, typeof(retained_count) AS count_type FROM s3_storage_cleanup_capacity WHERE id = 1');
+        $statement->execute();
+        $row = $statement->fetch(\PDO::FETCH_ASSOC);
+        if ($row === false || $row['count_type'] !== 'integer' || ! is_numeric($row['retained_count'] ?? null)) {
+            throw new \RuntimeException('Storage cleanup capacity counter is unavailable.');
+        }
+
+        return (int) $row['retained_count'];
+    }
+
     public function updateNotificationStatus(
         int $id,
         string $status,
@@ -4060,10 +4074,26 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
     public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
-        $this->prepare(
-            'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
-             VALUES (?, ?, ?, ?)',
-        )->execute([$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()]);
+        try {
+            $this->prepare(
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
+                 VALUES (?, ?, ?, ?)',
+            )->execute([$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()]);
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
+    }
+
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        try {
+            $this->prepare(
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, recovery_admission, next_attempt_at)
+                 VALUES (?, ?, ?, 1, ?)',
+            )->execute([$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()]);
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
     }
 
     public function listMultipartPartWriteIntents(string $ownerId, int $afterId, int $limit): array
@@ -4281,14 +4311,18 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         if ($unknown->fetchColumn() !== false) {
             throw new \RuntimeException('Legacy multipart upload has no pinned storage tier.');
         }
-        $this->prepare(
-            "INSERT INTO s3_storage_garbage
+        try {
+            $this->prepare(
+                "INSERT INTO s3_storage_garbage
                 (bucket, storage_tier, storage_path, operation, key_name, upload_id, owner_id, next_attempt_at)
              SELECT u.bucket, u.storage_tier, p.storage_path, 'delete_path', u.key_name, u.upload_id, u.owner_id, ?
              FROM s3_multipart_uploads AS u
              JOIN s3_parts AS p ON p.upload_id = u.upload_id
              WHERE u.bucket = ?",
-        )->execute([$this->multipartWriteIntentNow(), $bucket]);
+            )->execute([$this->multipartWriteIntentNow(), $bucket]);
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
     }
 
     public function stageBucketMultipartCleanupForBucket(BucketInfo $bucket, string $storageTier): void
@@ -4567,6 +4601,14 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $this->immediateTransaction = false;
         $this->deferredTransactionMutated = false;
         $this->pdo = null;
+    }
+
+    private function translateStorageCleanupCapacity(\Throwable $error): never
+    {
+        if (str_contains($error->getMessage(), 'Storage cleanup capacity is exhausted.')) {
+            throw new \OpsFour\S3Server\Exception\StorageCleanupCapacityException(previous: $error);
+        }
+        throw $error;
     }
 
     private function beginImmediateTransaction(\PDO $pdo): void

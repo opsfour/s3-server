@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Observability;
 
+use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\GenerationBoundBucketMultipartCleanupStore;
@@ -16,6 +17,8 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MultipartCompletionCapacityReader;
 use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
+use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
+use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
@@ -30,7 +33,7 @@ use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
 {
     public function __construct(
         private MetadataStore $inner,
@@ -42,6 +45,18 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
     public function innerStore(): MetadataStore
     {
         return $this->inner;
+    }
+
+    public static function isObservedBy(MetadataStore $metadata, MetricsCollector $metrics): bool
+    {
+        while ($metadata instanceof self || $metadata instanceof CachedMetadataStoreDecorator) {
+            if ($metadata instanceof self && $metadata->metrics === $metrics) {
+                return true;
+            }
+            $metadata = $metadata->innerStore();
+        }
+
+        return false;
     }
 
     public function initialize(): void
@@ -938,6 +953,13 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
             : null;
     }
 
+    public function getStorageCleanupCount(): ?int
+    {
+        return $this->inner instanceof StorageCleanupCapacityReader
+            ? $this->observe(__FUNCTION__, fn() => $this->inner->getStorageCleanupCount())
+            : null;
+    }
+
     public function updateNotificationStatus(int $id, string $status, ?string $error = null, ?float $nextAttemptAt = null, bool $incrementAttempts = true, ?float $expectedLeaseExpiresAt = null): bool
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->updateNotificationStatus($id, $status, $error, $nextAttemptAt, $incrementAttempts, $expectedLeaseExpiresAt));
@@ -950,7 +972,25 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
 
     public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
-        $this->observe(__FUNCTION__, fn() => $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath));
+        try {
+            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath));
+        } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
+            $this->recordStorageCleanupAdmissionRejection($error, 'normal');
+            throw $error;
+        }
+    }
+
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        if (! $this->inner instanceof RecoveryStorageGarbageStore) {
+            throw new \RuntimeException('Protected storage cleanup recovery admission is unavailable.');
+        }
+        try {
+            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath));
+        } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
+            $this->recordStorageCleanupAdmissionRejection($error, 'recovery');
+            throw $error;
+        }
     }
 
     public function createMultipartPartWriteIntent(
@@ -1049,7 +1089,12 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
 
     public function stageBucketMultipartCleanup(string $bucket, string $storageTier): void
     {
-        $this->observe(__FUNCTION__, fn() => $this->inner->stageBucketMultipartCleanup($bucket, $storageTier));
+        try {
+            $this->observe(__FUNCTION__, fn() => $this->inner->stageBucketMultipartCleanup($bucket, $storageTier));
+        } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
+            $this->recordStorageCleanupAdmissionRejection($error, 'normal');
+            throw $error;
+        }
     }
 
     public function stageBucketMultipartCleanupForBucket(\OpsFour\S3Server\Dto\BucketInfo $bucket, string $storageTier): void
@@ -1057,12 +1102,27 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         if (! $this->inner instanceof GenerationBoundBucketMultipartCleanupStore) {
             throw new \OpsFour\S3Server\Exception\NotImplementedException('Generation-bound multipart cleanup is unavailable for this metadata backend.');
         }
-        $this->observe(__FUNCTION__, fn() => $this->inner->stageBucketMultipartCleanupForBucket($bucket, $storageTier));
+        try {
+            $this->observe(__FUNCTION__, fn() => $this->inner->stageBucketMultipartCleanupForBucket($bucket, $storageTier));
+        } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
+            $this->recordStorageCleanupAdmissionRejection($error, 'normal');
+            throw $error;
+        }
     }
 
     public function discardStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
         $this->observe(__FUNCTION__, fn() => $this->inner->discardStorageGarbage($bucket, $storageTier, $storagePath));
+    }
+
+    /** @param 'normal'|'recovery' $admission */
+    private function recordStorageCleanupAdmissionRejection(
+        \OpsFour\S3Server\Exception\StorageCleanupCapacityException $error,
+        string $admission,
+    ): void {
+        if ($error->markAdmissionRejectionObserved($admission, $this->metrics)) {
+            $this->metrics->recordStorageCleanupAdmissionRejection($admission);
+        }
     }
 
     public function dequeueStorageGarbage(int $limit): array

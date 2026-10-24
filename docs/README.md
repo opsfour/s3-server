@@ -23,6 +23,7 @@ available on request under separately agreed terms.
 
 - [Authentication](authentication.md) — SigV4, presigned URLs, credential providers
 - [Storage Backends](storage-backends.md) — Filesystem, Flysystem, in-memory
+- [Storage Write Paths](storage-write-paths.md) — Local write fencing, cleanup capacity, and recovery limits
 - [Metadata Backends](metadata-backends.md) — SQLite, PostgreSQL, MySQL
 - [Encryption](encryption.md) — SSE-S3 with key rotation, SSE-C
 

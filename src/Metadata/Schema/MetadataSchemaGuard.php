@@ -32,11 +32,13 @@ final class MetadataSchemaGuard
                 throw new \RuntimeException('Stored bucket encryption configuration is unsupported; repair metadata before serving.');
             }
             self::assertMultipartCompletionCapacityConsistent($pool);
+            self::assertStorageCleanupCapacityConsistent($pool);
             if ($pool instanceof PostgresConnectionPool) {
                 self::assertPostgresWriteIntentTriggers($pool);
                 self::assertPostgresSequenceUsage($pool);
             } else {
                 self::assertMysqlWriteIntentTriggers($pool);
+                self::assertMysqlStorageCleanupTriggerBehavior($pool);
             }
             foreach ([
                 'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
@@ -102,7 +104,8 @@ final class MetadataSchemaGuard
             )
               AND function_schema.oid = table_schema.oid
               AND (trigger.tgname LIKE 's3_write_intent_capacity_%'
-                   OR trigger.tgname LIKE 's3_multipart_completion_capacity_%')
+                   OR trigger.tgname LIKE 's3_multipart_completion_capacity_%'
+                   OR trigger.tgname LIKE 's3_storage_cleanup_capacity_%')
             SQL);
         while (($row = $rows->fetchRow()) !== null) {
             if (! is_string($row['name'] ?? null)) {
@@ -188,7 +191,8 @@ final class MetadataSchemaGuard
             FROM information_schema.TRIGGERS
             WHERE TRIGGER_SCHEMA = DATABASE()
               AND (TRIGGER_NAME LIKE 's3_write_intent_capacity_%'
-                   OR TRIGGER_NAME LIKE 's3_multipart_completion_capacity_%')
+                   OR TRIGGER_NAME LIKE 's3_multipart_completion_capacity_%'
+                   OR TRIGGER_NAME LIKE 's3_storage_cleanup_capacity_%')
             SQL);
         self::assertMysqlWriteIntentTriggerRows($rows);
     }
@@ -245,6 +249,75 @@ final class MetadataSchemaGuard
             's3_write_intent_capacity_part_update' => ['s3_storage_garbage', 'UPDATE', 's3_write_intent_capacity_part_fn'],
             's3_multipart_completion_capacity_insert' => ['s3_multipart_write_intents', 'INSERT', 's3_multipart_completion_capacity_insert_fn'],
             's3_multipart_completion_capacity_delete' => ['s3_multipart_write_intents', 'DELETE', 's3_multipart_completion_capacity_delete_fn'],
+            's3_storage_cleanup_capacity_insert' => ['s3_storage_garbage', 'INSERT', 's3_storage_cleanup_capacity_fn'],
+            's3_storage_cleanup_capacity_delete' => ['s3_storage_garbage', 'DELETE', 's3_storage_cleanup_capacity_fn'],
+            's3_storage_cleanup_capacity_update' => ['s3_storage_garbage', 'UPDATE', 's3_storage_cleanup_capacity_fn'],
         ];
+    }
+
+    public static function assertStorageCleanupCapacityConsistent(PostgresConnectionPool|MysqlConnectionPool $pool): void
+    {
+        $actualCount = $pool instanceof MysqlConnectionPool
+            ? "SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation <> BINARY 'part_write_intent'"
+            : "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation <> 'part_write_intent'";
+        try {
+            $capacity = $pool->query("SELECT retained_count,
+                ({$actualCount}) AS actual_count
+                FROM s3_storage_cleanup_capacity WHERE id = 1")->fetchRow();
+        } catch (\Throwable $error) {
+            throw new \RuntimeException('Storage cleanup capacity counter cannot be verified.', 0, $error);
+        }
+        if ($capacity === null || (int) $capacity['retained_count'] !== (int) $capacity['actual_count']) {
+            throw new \RuntimeException('Storage cleanup capacity counter is inconsistent; stop writers and repair metadata before serving.');
+        }
+    }
+
+    /** Behaviorally verify the MySQL cleanup and interacting part triggers using only DML. */
+    public static function assertMysqlStorageCleanupTriggerBehavior(MysqlConnectionPool $pool): void
+    {
+        if (\Fiber::getCurrent() === null) {
+            \Amp\async(static fn() => self::assertMysqlStorageCleanupTriggerBehavior($pool))->await();
+            return;
+        }
+        $transaction = $pool->beginTransaction();
+        $probe = 's3-cleanup-trigger-probe-' . bin2hex(random_bytes(12));
+        try {
+            $transaction->query("SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'part' FOR UPDATE")->fetchRow();
+            $transaction->query('SELECT retained_count FROM s3_storage_cleanup_capacity WHERE id = 1 FOR UPDATE')->fetchRow();
+            $transaction->execute("UPDATE s3_write_intent_capacity SET retained_count = 0 WHERE kind = 'part'");
+            $transaction->execute('UPDATE s3_storage_cleanup_capacity SET retained_count = 0 WHERE id = 1');
+            $transaction->execute(
+                "INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, operation, recovery_admission, next_attempt_at)
+                 VALUES (?, 'STANDARD', ?, 'delete_path', 0, 0)",
+                [$probe, $probe],
+            );
+            self::assertMysqlProbeCounts($transaction, 1, 0);
+            $transaction->execute("UPDATE s3_storage_garbage SET operation = 'part_write_intent' WHERE bucket = ? AND BINARY bucket = BINARY ?", [$probe, $probe]);
+            self::assertMysqlProbeCounts($transaction, 0, 1);
+            $transaction->execute("UPDATE s3_storage_garbage SET operation = 'delete_path' WHERE bucket = ? AND BINARY bucket = BINARY ?", [$probe, $probe]);
+            self::assertMysqlProbeCounts($transaction, 1, 0);
+            $transaction->execute('DELETE FROM s3_storage_garbage WHERE bucket = ? AND BINARY bucket = BINARY ?', [$probe, $probe]);
+            self::assertMysqlProbeCounts($transaction, 0, 0);
+        } catch (\Throwable $error) {
+            throw new \RuntimeException('Storage cleanup capacity triggers are behaviorally ineffective; repair metadata before serving.', 0, $error);
+        } finally {
+            try {
+                if ($transaction->isActive()) {
+                    $transaction->rollback();
+                }
+            } catch (\Throwable) {
+                // Preserve the behavioral probe failure.
+            }
+        }
+    }
+
+    private static function assertMysqlProbeCounts(\Amp\Mysql\MysqlTransaction $transaction, int $cleanup, int $part): void
+    {
+        $row = $transaction->query("SELECT
+            (SELECT retained_count FROM s3_storage_cleanup_capacity WHERE id = 1) AS cleanup_count,
+            (SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'part') AS part_count")->fetchRow();
+        if ($row === null || (int) $row['cleanup_count'] !== $cleanup || (int) $row['part_count'] !== $part) {
+            throw new \RuntimeException('MySQL storage cleanup trigger probe produced an invalid counter delta.');
+        }
     }
 }

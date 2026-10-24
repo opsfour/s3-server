@@ -1024,6 +1024,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $bucket,
             $storageTier,
             $path,
+            'complete_multipart_uncommitted_path',
         );
     }
 

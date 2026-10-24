@@ -34,6 +34,7 @@ use OpsFour\S3Server\Console\MultipartPartIntentCommand;
 use OpsFour\S3Server\Console\QuotaCommand;
 use OpsFour\S3Server\Console\ServeCommand;
 use OpsFour\S3Server\Console\StorageAuditCommand;
+use OpsFour\S3Server\Console\StorageInventoryCommand;
 use Composer\InstalledVersions;
 use Symfony\Component\Console\Application;
 
@@ -48,5 +49,6 @@ $app->addCommand(new CredentialsMigrateCommand());
 $app->addCommand(new MultipartPartIntentCommand());
 $app->addCommand(new QuotaCommand());
 $app->addCommand(new StorageAuditCommand());
+$app->addCommand(new StorageInventoryCommand());
 $app->setDefaultCommand('serve');
 $app->run();

@@ -27,6 +27,8 @@ final class LocalTierPhysicalInventorySet
         array $tierRoots,
         ?Closure $mountInfoReader = null,
         ?Closure $localRootIdentityReader = null,
+        bool $revealPaths = false,
+        bool $strictFormatValidation = true,
     ) {
         if ($tierRoots === []) {
             throw new \InvalidArgumentException('Physical inventory needs at least one local tier root.');
@@ -84,6 +86,8 @@ final class LocalTierPhysicalInventorySet
                 $tier,
                 $root,
                 $reader,
+                $revealPaths,
+                $strictFormatValidation,
             );
         }
         $this->inventories = $inventories;

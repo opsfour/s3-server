@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Observability;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 
 final class MetricsCollector
 {
@@ -77,6 +78,11 @@ final class MetricsCollector
 
     /** @var array{object: int, part: int}|null */
     private ?array $writeIntentCapacityCounts = null;
+
+    private ?int $storageCleanupCount = null;
+
+    /** @var array<string, int> */
+    private array $storageCleanupAdmissionRejections = [];
 
     /** @var array<string, int> */
     private array $notificationDeliveryTotals = [];
@@ -267,6 +273,23 @@ final class MetricsCollector
         }
 
         $this->writeIntentCapacityCounts = $counts;
+    }
+
+    public function setStorageCleanupCount(?int $count): void
+    {
+        if ($count !== null && $count < 0) {
+            throw new \UnexpectedValueException('Storage cleanup capacity counter is out of range.');
+        }
+        $this->storageCleanupCount = $count;
+    }
+
+    public function recordStorageCleanupAdmissionRejection(string $admission): void
+    {
+        if (! in_array($admission, ['normal', 'recovery'], true)) {
+            throw new \InvalidArgumentException('Unknown storage cleanup admission class.');
+        }
+        $key = $this->key(['admission' => $admission]);
+        $this->storageCleanupAdmissionRejections[$key] = ($this->storageCleanupAdmissionRejections[$key] ?? 0) + 1;
     }
 
     public function recordNotificationDelivery(string $status, int $count = 1): void
@@ -506,6 +529,23 @@ final class MetricsCollector
             $lines[] = 's3_server_multipart_part_write_intents ' . $this->writeIntentCapacityCounts['part'];
             $lines[] = 's3_server_multipart_part_write_capacity_remaining '
                 . (MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS - $this->writeIntentCapacityCounts['part']);
+        }
+
+        $lines[] = '# HELP s3_server_storage_cleanup_items Durable cleanup rows excluding multipart part write intents.';
+        $lines[] = '# TYPE s3_server_storage_cleanup_items gauge';
+        $lines[] = '# HELP s3_server_storage_cleanup_capacity_remaining Remaining cleanup admission slots by class.';
+        $lines[] = '# TYPE s3_server_storage_cleanup_capacity_remaining gauge';
+        if ($this->storageCleanupCount !== null) {
+            $lines[] = 's3_server_storage_cleanup_items ' . $this->storageCleanupCount;
+            $lines[] = 's3_server_storage_cleanup_capacity_remaining{admission="normal"} '
+                . max(0, StorageCleanupCapacityReader::NORMAL_LIMIT - $this->storageCleanupCount);
+            $lines[] = 's3_server_storage_cleanup_capacity_remaining{admission="recovery"} '
+                . max(0, StorageCleanupCapacityReader::RECOVERY_LIMIT - $this->storageCleanupCount);
+        }
+        $lines[] = '# HELP s3_server_storage_cleanup_admission_rejections_total Rejected durable cleanup admissions by class.';
+        $lines[] = '# TYPE s3_server_storage_cleanup_admission_rejections_total counter';
+        foreach ($this->storageCleanupAdmissionRejections as $key => $value) {
+            $lines[] = 's3_server_storage_cleanup_admission_rejections_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_notification_deliveries_total Total notification delivery outcomes by status.';

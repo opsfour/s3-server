@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/mysql for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader
+final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
 {
     /** Preserve S3 Last-Modified while changing version-list bookkeeping. */
     private const string VERSION_DEMOTION_UPDATE_SQL = <<<'SQL'
@@ -137,7 +137,9 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         $this->assertSupportedBucketEncryptionInventory();
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
+        MetadataSchemaGuard::assertStorageCleanupCapacityConsistent($this->pool);
         MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
+        MetadataSchemaGuard::assertMysqlStorageCleanupTriggerBehavior($this->pool);
     }
 
     public function initialize(): void
@@ -167,8 +169,10 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             $this->assertSupportedBucketEncryptionInventory();
             MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
             $this->assertWriteIntentCapacityConsistent();
+            MetadataSchemaGuard::assertStorageCleanupCapacityConsistent($this->pool);
             MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
             MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
+            MetadataSchemaGuard::assertMysqlStorageCleanupTriggerBehavior($this->pool);
             return;
         }
 
@@ -196,8 +200,10 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
 
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
         $this->assertWriteIntentCapacityConsistent();
+        MetadataSchemaGuard::assertStorageCleanupCapacityConsistent($this->pool);
         MetadataSchemaGuard::assertMysqlWriteIntentTriggersForMigration($this->pool);
         MetadataSchemaGuard::assertMysqlWriteIntentTriggers($this->pool);
+        MetadataSchemaGuard::assertMysqlStorageCleanupTriggerBehavior($this->pool);
 
         $this->pool->execute(
             'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
@@ -209,7 +215,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
     {
         foreach ([
             'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
-            'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
+            'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation = BINARY 'part_write_intent'",
         ] as $kind => $countSql) {
             try {
                 $row = $this->pool->execute(
@@ -3471,6 +3477,16 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         return ['object' => $counts['object'], 'part' => $counts['part']];
     }
 
+    public function getStorageCleanupCount(): int
+    {
+        $row = $this->conn()->query('SELECT retained_count FROM s3_storage_cleanup_capacity WHERE id = 1')->fetchRow();
+        if ($row === null || ! is_numeric($row['retained_count'] ?? null)) {
+            throw new \RuntimeException('Storage cleanup capacity counter is unavailable.');
+        }
+
+        return (int) $row['retained_count'];
+    }
+
     public function updateNotificationStatus(
         int $id,
         string $status,
@@ -3536,11 +3552,28 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
 
     public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
     {
-        $this->conn()->execute(
-            'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
-             VALUES (?, ?, ?, ?)',
-            [$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()],
-        );
+        try {
+            $this->conn()->execute(
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
+                 VALUES (?, ?, ?, ?)',
+                [$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()],
+            );
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
+    }
+
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    {
+        try {
+            $this->conn()->execute(
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, recovery_admission, next_attempt_at)
+                 VALUES (?, ?, ?, 1, ?)',
+                [$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()],
+            );
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
     }
 
     public function listMultipartPartWriteIntents(string $ownerId, int $afterId, int $limit): array
@@ -3798,15 +3831,19 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         if ($unknown !== null) {
             throw new \RuntimeException('Legacy multipart upload has no pinned storage tier.');
         }
-        $this->conn()->execute(
-            "INSERT INTO s3_storage_garbage
+        try {
+            $this->conn()->execute(
+                "INSERT INTO s3_storage_garbage
                 (bucket, storage_tier, storage_path, operation, key_name, upload_id, owner_id, next_attempt_at)
              SELECT u.bucket, u.storage_tier, p.storage_path, 'delete_path', u.key_name, u.upload_id, u.owner_id, ?
              FROM s3_multipart_uploads AS u
              JOIN s3_parts AS p ON p.upload_id = u.upload_id AND BINARY p.upload_id = BINARY u.upload_id
              WHERE u.bucket = ? AND BINARY u.bucket = BINARY ?",
-            [$this->multipartWriteIntentNow(), $bucket, $bucket],
-        );
+                [$this->multipartWriteIntentNow(), $bucket, $bucket],
+            );
+        } catch (\Throwable $error) {
+            $this->translateStorageCleanupCapacity($error);
+        }
     }
 
     public function stageBucketMultipartCleanupForBucket(BucketInfo $bucket, string $storageTier): void
@@ -4103,6 +4140,14 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         return $this->pool;
     }
 
+    private function translateStorageCleanupCapacity(\Throwable $error): never
+    {
+        if (str_contains($error->getMessage(), 'Storage cleanup capacity is exhausted.')) {
+            throw new \OpsFour\S3Server\Exception\StorageCleanupCapacityException(previous: $error);
+        }
+        throw $error;
+    }
+
     private function fiberTransaction(): ?MysqlTransaction
     {
         $fiber = \Fiber::getCurrent();
@@ -4119,6 +4164,10 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             || str_contains($message, 'already exists')
             || (
                 str_contains($sql, 'ADD CONSTRAINT chk_s3_encryption_configs_supported')
+                && str_contains($message, 'duplicate check constraint name')
+            )
+            || (
+                str_contains($sql, 'ADD CONSTRAINT chk_s3_storage_garbage_operation')
                 && str_contains($message, 'duplicate check constraint name')
             )
             || (

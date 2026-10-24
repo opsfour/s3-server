@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 42;
+    public const int VERSION = 43;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -498,6 +498,7 @@ final class PostgresSchema
                 storage_tier TEXT NOT NULL,
                 storage_path TEXT NOT NULL,
                 operation TEXT NOT NULL DEFAULT 'delete_path',
+                recovery_admission BOOLEAN NOT NULL DEFAULT FALSE,
                 key_name TEXT,
                 upload_id TEXT,
                 owner_id TEXT,
@@ -564,6 +565,7 @@ final class PostgresSchema
 
             ...self::completionCapacityStatements(),
             ...self::writeIntentCapacityStatements(),
+            ...self::storageCleanupCapacityStatements(),
         ];
     }
 
@@ -939,6 +941,10 @@ final class PostgresSchema
         if ($fromVersion < 42) {
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_account_quotas_owner_c ON s3_account_quotas(owner_id COLLATE "C")';
         }
+        if ($fromVersion < 43) {
+            $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS recovery_admission BOOLEAN NOT NULL DEFAULT FALSE';
+            array_push($statements, ...self::storageCleanupCapacityStatements());
+        }
 
         return $statements;
     }
@@ -1050,6 +1056,63 @@ final class PostgresSchema
             'CREATE TRIGGER s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_update ON s3_storage_garbage',
             'CREATE TRIGGER s3_write_intent_capacity_part_update BEFORE UPDATE OF operation ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
+        ];
+    }
+
+    /** @return list<string> */
+    private static function storageCleanupCapacityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity (
+                id SMALLINT PRIMARY KEY CHECK (id = 1),
+                retained_count BIGINT NOT NULL CHECK (retained_count >= 0)
+            )
+            SQL,
+            "INSERT INTO s3_storage_cleanup_capacity (id, retained_count)
+             SELECT 1, (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation <> 'part_write_intent')
+             WHERE NOT EXISTS (SELECT 1 FROM s3_storage_cleanup_capacity WHERE id = 1)",
+            <<<'SQL'
+            CREATE OR REPLACE FUNCTION s3_storage_cleanup_capacity_fn() RETURNS trigger AS $$
+            DECLARE delta INTEGER := 0;
+            DECLARE admission_limit BIGINT := 900000;
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    IF NEW.operation <> 'part_write_intent' THEN delta := 1; END IF;
+                ELSIF TG_OP = 'DELETE' THEN
+                    IF OLD.operation <> 'part_write_intent' THEN delta := -1; END IF;
+                ELSE
+                    IF OLD.recovery_admission <> NEW.recovery_admission THEN
+                        RAISE EXCEPTION 'Storage cleanup recovery admission is immutable.';
+                    END IF;
+                    IF (OLD.operation = 'part_write_intent') <> (NEW.operation = 'part_write_intent') THEN
+                        PERFORM retained_count FROM s3_write_intent_capacity WHERE kind = 'part' FOR UPDATE;
+                    END IF;
+                    IF OLD.operation = 'part_write_intent' AND NEW.operation <> 'part_write_intent' THEN delta := 1;
+                    ELSIF OLD.operation <> 'part_write_intent' AND NEW.operation = 'part_write_intent' THEN delta := -1;
+                    END IF;
+                END IF;
+                IF TG_OP <> 'DELETE' AND NEW.recovery_admission THEN admission_limit := 1000000; END IF;
+                IF delta <> 0 THEN
+                    UPDATE s3_storage_cleanup_capacity SET retained_count = retained_count + delta
+                    WHERE id = 1 AND retained_count + delta >= 0
+                      AND (delta < 0 OR retained_count + delta <= admission_limit);
+                    IF NOT FOUND THEN
+                        IF delta > 0 THEN RAISE EXCEPTION 'Storage cleanup capacity is exhausted.'; END IF;
+                        RAISE EXCEPTION 'Storage cleanup capacity is inconsistent.';
+                    END IF;
+                END IF;
+                IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_insert ON s3_storage_garbage',
+            'CREATE TRIGGER s3_storage_cleanup_capacity_insert BEFORE INSERT ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_storage_cleanup_capacity_fn()',
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_delete ON s3_storage_garbage',
+            'CREATE TRIGGER s3_storage_cleanup_capacity_delete BEFORE DELETE ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_storage_cleanup_capacity_fn()',
+            'DROP TRIGGER IF EXISTS s3_storage_cleanup_capacity_update ON s3_storage_garbage',
+            'CREATE TRIGGER s3_storage_cleanup_capacity_update BEFORE UPDATE OF operation, recovery_admission ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_storage_cleanup_capacity_fn()',
         ];
     }
 }

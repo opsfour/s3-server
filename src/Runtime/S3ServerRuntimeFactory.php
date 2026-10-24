@@ -72,8 +72,11 @@ final readonly class S3ServerRuntimeFactory
         $storageTiers ??= StorageTierRegistry::single($storage);
         $storageTiers = $storageTiers->withObservability($metrics);
         $storage = $storageTiers->defaultBackend();
-        if (! $metadata instanceof ObservedMetadataStore) {
+        if (! ObservedMetadataStore::isObservedBy($metadata, $metrics)) {
             $metadata = new ObservedMetadataStore($metadata, $metrics, $config->metadataDriver);
+        }
+        if (! $metadata instanceof ObjectWriteIntentStore) {
+            throw new \LogicException('Runtime metadata observability must preserve object write intents.');
         }
 
         $server = new S3Server(

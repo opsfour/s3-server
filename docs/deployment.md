@@ -390,6 +390,14 @@ admission deadline, because it could still commit to backing storage.
   against the one-million global limit. The server reads one counter row per
   authorized metrics scrape; the samples are absent when the metadata store
   does not support this read.
+- `s3_server_storage_cleanup_items` and
+  `s3_server_storage_cleanup_capacity_remaining{admission="normal|recovery"}`.
+  These gauges read the exact singleton counter without scanning the cleanup
+  queue. Normal admission stops at 900,000; the protected failed-delete band
+  ends at 1,000,000. Values are fixed safety limits, not sizing guidance.
+- `s3_server_storage_cleanup_admission_rejections_total{admission="normal|recovery"}`.
+  A recovery rejection means an exact failed-delete path could not be retained
+  and a physical orphan may exist.
 - `s3_server_notification_deliveries_total{status}`
 - `s3_server_worker_pool_tasks_total{pool,operation,status}`
 - `s3_server_flysystem_read_first_byte_seconds_bucket{le,result}` and its
@@ -414,6 +422,10 @@ Tune thresholds per installation, but start with these alerts:
 - Notification `dead_letter` queue depth above 0.
 - Tiering or restore `dead_letter` worker results above 0.
 - Storage capacity above 80 percent or projected exhaustion within 7 days.
+- Warn when normal cleanup capacity remaining is at or below 100,000 or the
+  queue rises persistently; alert critically at zero normal capacity.
+- Page when recovery cleanup capacity remaining is at or below 10,000, and
+  page immediately on any recovery admission rejection.
 - Database connections above 80 percent of the configured maximum.
 
 ### Access Logging
@@ -500,8 +512,8 @@ opening metadata and retains them through the audit. Any running `S3Server`
 process using a mapped root therefore makes the command fail instead of
 producing a live, cross-page view. Operators must also stop every separate or
 custom writer and worker that does not run inside that lifecycle lock. The
-persistent `.opsfour/runtime.lock` coordination file may be created; object files
-and metadata are never repaired or changed.
+persistent `.opsfour/runtime.lock` coordination file may be created; the audit
+leaves object bytes and metadata unchanged.
 
 The audit pages through every object version, committed restored copy, multipart
 part, and restore-job path that still exactly matches the referenced object
@@ -520,6 +532,62 @@ cleanup and need their recovery-specific gates. Output contains counts and
 SHA-256 identifiers only; it does not print object keys, tier names, or physical
 paths. A zero exit status means every enumerated required reference passed; any
 finding or inventory error returns a nonzero status.
+
+### Offline orphan inventory
+
+After any recovery-admission rejection, stop every API process and worker for
+the local-filesystem profile, then run the read-only inventory with the same
+metadata and tier mapping options as `storage:audit`:
+
+```bash
+php bin/s3-server storage:inventory \
+  --storage-tier-root='["STANDARD","/var/data/s3"]' \
+  --default-storage-tier=STANDARD \
+  --metadata-driver=sqlite \
+  --metadata-path=/var/data/s3/.opsfour/metadata.sqlite \
+  --scratch-path=/var/lib/opsfour-s3/inventory \
+  --scratch-max-bytes=1073741824
+```
+
+The command refuses a root held by a live server, scans only qualified local
+filesystems, and compares physical files with object, restored-object,
+multipart-part, garbage, write-intent, transition-job, and restore-job
+references. It reports SHA-256 path identifiers and leaves object bytes and
+metadata unchanged; acquiring the root lock may create the persistent
+`.opsfour/runtime.lock` control file. `--reveal-paths` explicitly prints local
+candidate paths for a terminal operator who will quarantine or remove them
+through a separate, reviewed procedure. The command makes no Flysystem, NFS,
+EFS, or generic remote storage reconciliation claim. The runtime locks cover
+cooperating package processes; stop any custom writer that does not acquire
+them before running the inventory.
+
+Map every local tier exactly once. With multiple mappings,
+`--default-storage-tier` is required so legacy metadata and restore-job targets
+without a persisted tier resolve to the configured write tier. An unmapped tier,
+duplicate tier name, overlapping root, or inode-aliased root fails the command.
+The exact reference set is indexed in a private temporary SQLite file with a
+bounded page cache and hard byte limit. `--scratch-path` must name an existing
+canonical directory outside every storage-tier root with enough free space for
+the configured limit plus a 64 MiB safety reserve. `--scratch-max-bytes`
+defaults to 1 GiB and accepts values from 1 MiB through 1 TiB; choose a limit
+that fits the complete reference and candidate index. The temporary index is
+removed on normal command exit. A persistent, empty coordination file in the
+scratch directory serializes inventory runs that share its free-space reserve.
+
+Candidate counting remains exact. Candidate output is ordered byte-exactly by
+tier and path digest and limited to 500 rows per invocation. When more rows
+exist, the command prints an opaque `Next candidate cursor`; pass it unchanged
+to `--after-candidate` in a subsequent stopped-profile invocation. Files whose
+contents begin with a reserved multipart or seal prefix but do not contain a
+valid internal header are reported as `malformed_reserved_prefix` candidates
+instead of aborting the inventory.
+
+Before rollout, measure cleanup-counter backfill, first-start exact recount,
+database growth, hot-row contention, and collector drain rate on a representative
+copy at 900,000, 1,000,000, and a legacy count above 1,000,000. Drain and stop
+old writers, run one DDL-capable migrator, verify trigger admission and metrics,
+then start DML-only serving nodes. Roll back only to a package version that
+understands the new schema, or restore the pre-migration metadata backup.
 
 ### Retained encrypted multipart part intents
 

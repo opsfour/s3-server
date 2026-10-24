@@ -41,7 +41,17 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(47, MysqlSchema::VERSION);
+        self::assertSame(48, MysqlSchema::VERSION);
+        $cleanupCapacityMigration = implode("\n", MysqlSchema::getMigrationStatements(47));
+        self::assertStringContainsString('ADD COLUMN recovery_admission', $cleanupCapacityMigration);
+        self::assertStringContainsString("WHEN operation = 'part_write_intent' THEN 'part_write_intent'", $cleanupCapacityMigration);
+        self::assertStringContainsString('operation VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin', $cleanupCapacityMigration);
+        self::assertStringContainsString('chk_s3_storage_garbage_operation', $cleanupCapacityMigration);
+        self::assertStringContainsString("BINARY operation = BINARY 'part_write_intent'", $cleanupCapacityMigration);
+        self::assertStringContainsString('ADD INDEX idx_s3_storage_gc_due (next_attempt_at, id)', $cleanupCapacityMigration);
+        self::assertStringContainsString('DROP INDEX idx_s3_storage_gc_status', $cleanupCapacityMigration);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity', $cleanupCapacityMigration);
+        self::assertStringContainsString('CREATE TRIGGER s3_storage_cleanup_capacity_update', $cleanupCapacityMigration);
         $triggerInventoryMigration = implode("\n", MysqlSchema::getMigrationStatements(46));
         self::assertStringContainsString(
             'CREATE FUNCTION s3_recovery_capacity_trigger_count() RETURNS INTEGER',
@@ -72,6 +82,10 @@ final class ExternalSchemaTest extends TestCase
         self::assertStringContainsString(') VIRTUAL', $recursiveCleanupMigration);
         self::assertStringContainsString('idx_s3_storage_gc_recursive_unsafe', $recursiveCleanupMigration);
         $mysqlCreate = implode("\n", MysqlSchema::getCreateStatements());
+        self::assertStringContainsString('operation VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin', $mysqlCreate);
+        self::assertStringContainsString('chk_s3_storage_garbage_operation', $mysqlCreate);
+        self::assertStringContainsString('idx_s3_storage_gc_due (next_attempt_at, id)', $mysqlCreate);
+        self::assertStringNotContainsString('idx_s3_storage_gc_status (status, next_attempt_at)', $mysqlCreate);
         self::assertStringContainsString(
             'CREATE FUNCTION IF NOT EXISTS s3_recovery_capacity_trigger_count() RETURNS INTEGER',
             $mysqlCreate,
@@ -155,7 +169,11 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(42, PostgresSchema::VERSION);
+        self::assertSame(43, PostgresSchema::VERSION);
+        $cleanupCapacityMigration = implode("\n", PostgresSchema::getMigrationStatements(42));
+        self::assertStringContainsString('ADD COLUMN IF NOT EXISTS recovery_admission', $cleanupCapacityMigration);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity', $cleanupCapacityMigration);
+        self::assertStringContainsString('CREATE TRIGGER s3_storage_cleanup_capacity_update', $cleanupCapacityMigration);
         $quotaCollationIndex = 'CREATE INDEX IF NOT EXISTS idx_s3_account_quotas_owner_c ON s3_account_quotas(owner_id COLLATE "C")';
         self::assertContains($quotaCollationIndex, PostgresSchema::getMigrationStatements(41));
         self::assertContains($quotaCollationIndex, PostgresSchema::getCreateStatements());

@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class SqliteSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 39;
+    public const int VERSION = 40;
 
     /**
      * Get the complete schema DDL for version 1.

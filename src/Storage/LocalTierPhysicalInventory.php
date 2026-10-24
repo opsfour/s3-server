@@ -49,6 +49,8 @@ final class LocalTierPhysicalInventory
         private readonly string $storageTier,
         private readonly string $root,
         ?Closure $mountInfoReader = null,
+        private readonly bool $revealPaths = false,
+        private readonly bool $strictFormatValidation = true,
     ) {
         if ($storageTier === '' || ! str_starts_with($root, '/') || $root === '/'
             || str_ends_with($root, '/') || str_contains($root, "\0") || str_contains($root, '//')
@@ -182,7 +184,7 @@ final class LocalTierPhysicalInventory
                     $size = $entry['size'];
                     $format = $this->inspectFile($path, $entry);
                 }
-                $rows[] = [
+                $row = [
                     'storage_tier' => $this->storageTier,
                     // SQL path_sha256 hashes the stored absolute spelling, not realpath().
                     'path_sha256' => hash('sha256', $path),
@@ -194,6 +196,10 @@ final class LocalTierPhysicalInventory
                     'format' => $format,
                     'basename_prefix_class' => self::basenamePrefixClass($name),
                 ];
+                if ($this->revealPaths) {
+                    $row['path'] = $path;
+                }
+                $rows[] = $row;
             }
             $this->assertPageBoundary();
             if ($this->stack === []) {
@@ -323,7 +329,15 @@ final class LocalTierPhysicalInventory
             fclose($handle);
         }
         $this->assertSameStat($entry, $this->safeStat($path, false));
-        return self::classifyHeader($header, $entry['size']);
+        try {
+            return self::classifyHeader($header, $entry['size']);
+        } catch (\RuntimeException) {
+            if ($this->strictFormatValidation) {
+                throw new \RuntimeException('Invalid physical inventory file format.');
+            }
+
+            return 'malformed_reserved_prefix';
+        }
     }
 
     private static function classifyHeader(string $header, int $size): string

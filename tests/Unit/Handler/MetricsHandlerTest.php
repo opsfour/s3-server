@@ -15,12 +15,63 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartCompletionCapacityReader;
 use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use PHPUnit\Framework\TestCase;
 
 final class MetricsHandlerTest extends TestCase
 {
+    public function test_cached_observed_store_records_each_scrape_read_once_with_the_real_driver(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-metrics-wrapper-order-' . bin2hex(random_bytes(6)) . '.sqlite';
+        try {
+            $store = new SqliteMetadataStore($path);
+            $store->initialize();
+            $metrics = new MetricsCollector();
+            $metadata = new CachedMetadataStoreDecorator(new ObservedMetadataStore($store, $metrics, 'sqlite'));
+            $handler = new MetricsHandler($metrics, $metadata);
+
+            $rendered = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+
+            foreach ([
+                'getNotificationQueueStats',
+                'getMultipartCompletionIntentCount',
+                'getWriteIntentCapacityCounts',
+                'getStorageCleanupCount',
+            ] as $operation) {
+                self::assertStringContainsString(
+                    's3_server_backend_operations_total{backend="metadata",driver="sqlite",operation="' . $operation . '"} 1',
+                    $rendered,
+                );
+            }
+            self::assertStringNotContainsString('driver="CachedMetadataStoreDecorator"', $rendered);
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_storage_cleanup_reader_is_refreshed_and_clears_an_unavailable_sample(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, StorageCleanupCapacityReader::class]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $metadata->method('getNotificationQueueStats')->willReturn([]);
+        $metadata->expects(self::exactly(2))->method('getStorageCleanupCount')
+            ->willReturnOnConsecutiveCalls(899_999, null);
+        $handler = new MetricsHandler(new MetricsCollector(), $metadata);
+
+        $first = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_storage_cleanup_items 899999', $first);
+        self::assertStringContainsString('s3_server_storage_cleanup_capacity_remaining{admission="normal"} 1', $first);
+        self::assertStringContainsString('s3_server_storage_cleanup_capacity_remaining{admission="recovery"} 100001', $first);
+
+        $second = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_capacity_remaining/m', $second);
+    }
+
     public function test_completion_capacity_metric_reads_persisted_counter_on_each_authorized_scrape(): void
     {
         $path = sys_get_temp_dir() . '/s3-metrics-completion-' . bin2hex(random_bytes(6)) . '.sqlite';
@@ -71,6 +122,7 @@ final class MetricsHandlerTest extends TestCase
         self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_capacity_remaining /m', $rendered);
         self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $rendered);
         self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_part_write_intents /m', $rendered);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $rendered);
     }
 
     public function test_write_intent_capacity_metrics_read_both_persisted_rows_and_fail_closed(): void

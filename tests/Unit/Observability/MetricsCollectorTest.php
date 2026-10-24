@@ -9,6 +9,26 @@ use PHPUnit\Framework\TestCase;
 
 final class MetricsCollectorTest extends TestCase
 {
+    public function test_storage_cleanup_metrics_bound_remaining_capacity_and_rejection_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $metrics->renderPrometheus());
+
+        $metrics->setStorageCleanupCount(950_000);
+        $metrics->recordStorageCleanupAdmissionRejection('normal');
+        $metrics->recordStorageCleanupAdmissionRejection('recovery');
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString('s3_server_storage_cleanup_items 950000', $rendered);
+        self::assertStringContainsString('s3_server_storage_cleanup_capacity_remaining{admission="normal"} 0', $rendered);
+        self::assertStringContainsString('s3_server_storage_cleanup_capacity_remaining{admission="recovery"} 50000', $rendered);
+        self::assertStringContainsString('s3_server_storage_cleanup_admission_rejections_total{admission="normal"} 1', $rendered);
+        self::assertStringContainsString('s3_server_storage_cleanup_admission_rejections_total{admission="recovery"} 1', $rendered);
+
+        $metrics->setStorageCleanupCount(null);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $metrics->renderPrometheus());
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_capacity_remaining/m', $metrics->renderPrometheus());
+    }
+
     public function test_completion_capacity_gauges_require_a_persisted_sample(): void
     {
         $metrics = new MetricsCollector();
