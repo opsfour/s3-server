@@ -86,7 +86,7 @@ The project follows [Semantic Versioning](https://semver.org/).
   retry contract applies to HTTP(S) webhooks.
 - New objects remain unencrypted unless SSE is requested or bucket default
   encryption is configured.
-- SQLite metadata schema is version 39, PostgreSQL is 42, and MySQL is 47.
+- SQLite metadata schema is version 40, PostgreSQL is 43, and MySQL is 48.
 - Raise the completed multipart object limit to S3's 50-TB limit (50,000 GiB)
   while retaining the 5-GiB per-part limit. A full GetObject above 5 TiB now
   returns HTTP 405; ranged GetObject requests and HeadObject remain available.
