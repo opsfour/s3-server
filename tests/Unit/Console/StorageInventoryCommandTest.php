@@ -134,6 +134,31 @@ final class StorageInventoryCommandTest extends TestCase
         self::assertFileExists($canonicalPath . '-journal');
     }
 
+    public function test_command_excludes_only_persistent_local_write_budget_control_files(): void
+    {
+        $metadata = new SqliteMetadataStore($this->databasePath);
+        $metadata->initialize();
+        $budgetDirectory = $this->root . '/.tmp/object-writes/.opsfour-s3-storage-budget';
+        self::assertTrue(mkdir($budgetDirectory, 0o700, true));
+        foreach (['budget' => '10737418240', 'lock' => '', 'total' => '0'] as $name => $contents) {
+            self::assertSame(strlen($contents), file_put_contents($budgetDirectory . '/' . $name, $contents));
+        }
+        $unexpected = $budgetDirectory . '/state-unexpected';
+        self::assertSame(7, file_put_contents($unexpected, 'visible'));
+
+        $tester = new CommandTester(new StorageInventoryCommand(
+            static fn(): string => "1 0 0:1 / / rw - ext4 /dev/mock rw\n",
+        ));
+        $exit = $tester->execute([
+            '--metadata-path' => $this->databasePath,
+            '--storage-path' => $this->root,
+        ]);
+
+        self::assertSame(Command::SUCCESS, $exit, $tester->getDisplay());
+        self::assertStringContainsString(hash('sha256', $unexpected), $tester->getDisplay());
+        self::assertStringContainsString('Physical files: 5; metadata references: 0; orphan candidates: 1', $tester->getDisplay());
+    }
+
     public function test_command_validates_scratch_constraints_and_candidate_cursor(): void
     {
         $metadata = new SqliteMetadataStore($this->databasePath);

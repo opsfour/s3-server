@@ -99,6 +99,10 @@ the call. S3 bucket naming remains checked separately at the API boundary.
 
 ## Filesystem (Default)
 
+Treat each canonical absolute tier root as part of the persisted storage
+layout. A matched backup restore must recreate the same roots; changing roots
+is not a supported relocation procedure.
+
 Stores objects as files on the local filesystem for the current one-host,
 one-process deployment target.
 

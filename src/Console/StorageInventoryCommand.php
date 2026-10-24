@@ -83,7 +83,14 @@ final class StorageInventoryCommand extends Command
             [$references, $pool, $metadataPath] = $this->references($input, $roots[$defaultStorageTier]);
             $excluded = [];
             foreach ($roots as $root) {
-                $excluded[] = hash('sha256', $root . '/.opsfour/runtime.lock');
+                foreach ([
+                    '/.opsfour/runtime.lock',
+                    '/.tmp/object-writes/.opsfour-s3-storage-budget/budget',
+                    '/.tmp/object-writes/.opsfour-s3-storage-budget/lock',
+                    '/.tmp/object-writes/.opsfour-s3-storage-budget/total',
+                ] as $internalPath) {
+                    $excluded[] = hash('sha256', $root . $internalPath);
+                }
             }
             if ($metadataPath !== null) {
                 foreach ([$metadataPath, $metadataPath . '-wal', $metadataPath . '-shm', $metadataPath . '-journal'] as $path) {

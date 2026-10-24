@@ -45,7 +45,8 @@ The initial production profile adds these gates:
 - [ ] Exercise restart, abrupt process termination, disk-full behavior,
   temporary-file recovery, orphan cleanup, backup, and restore.
 - [ ] With API and worker processes stopped, restore a matched metadata and
-  storage backup, map every referenced local tier explicitly, run
+  storage backup to the same canonical absolute tier roots, map every
+  referenced local tier explicitly, run
   `storage:audit`, and require exit status 0 before accepting writes. Run the
   separate recovery and garbage gates for transient or cleanup references.
 - [ ] Confirm the filesystem and mount support create-only hard links plus file

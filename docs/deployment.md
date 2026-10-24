@@ -487,6 +487,13 @@ and object storage must be restored to a mutually consistent point in time. If
 that is not possible, restore metadata first, then stop every API and worker
 process and run the local-storage reference audit before accepting writes:
 
+Restore each local tier at the same canonical absolute root it used when the
+backup was taken. The local filesystem backend stores absolute physical paths
+in metadata so that reads, cleanup, and recovery can reject paths outside the
+configured tier; copying a backup to a different root is therefore not a
+supported relocation procedure and `storage:audit` will report those references
+as `invalid_path`.
+
 ```bash
 php bin/s3-server storage:audit \
   --storage-tier-root='["STANDARD","/var/data/s3"]' \
@@ -554,12 +561,15 @@ filesystems, and compares physical files with object, restored-object,
 multipart-part, garbage, write-intent, transition-job, and restore-job
 references. It reports SHA-256 path identifiers and leaves object bytes and
 metadata unchanged; acquiring the root lock may create the persistent
-`.opsfour/runtime.lock` control file. `--reveal-paths` explicitly prints local
-candidate paths for a terminal operator who will quarantine or remove them
-through a separate, reviewed procedure. The command makes no Flysystem, NFS,
-EFS, or generic remote storage reconciliation claim. The runtime locks cover
-cooperating package processes; stop any custom writer that does not acquire
-them before running the inventory.
+`.opsfour/runtime.lock` control file. The inventory excludes that lock and the
+three exact persistent local-write budget files (`budget`, `lock`, and `total`),
+but deliberately reports unexpected lease, state, temporary, and staging files
+for operator review. `--reveal-paths` explicitly prints local candidate paths
+for a terminal operator who will quarantine or remove them through a separate,
+reviewed procedure. The command makes no Flysystem, NFS, EFS, or generic remote
+storage reconciliation claim. The runtime locks cover cooperating package
+processes; stop any custom writer that does not acquire them before running the
+inventory.
 
 Map every local tier exactly once. With multiple mappings,
 `--default-storage-tier` is required so legacy metadata and restore-job targets
