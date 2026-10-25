@@ -16,6 +16,132 @@ final class ProductionSoakDiagnostics
 
     private const MAX_LOG_BYTES = 256 * 1024;
 
+    private const MAX_MEMORY_SERIES_BYTES = 1024 * 1024;
+
+    private const RETAINED_MEMORY_SERIES_BYTES = 512 * 1024;
+
+    /**
+     * @return array{limit: int|null, current: int|null, peak: int|null, anon: int|null, file: int|null, shmem: int|null, kernel: int|null, slab: int|null}
+     */
+    public static function cgroupMemorySnapshot(string $directory = '/sys/fs/cgroup'): array
+    {
+        $statistics = [];
+        $contents = @file_get_contents($directory . '/memory.stat');
+        if (is_string($contents)) {
+            foreach (preg_split('/\R/', trim($contents)) ?: [] as $line) {
+                if (preg_match('/\A([a-z_]+) ([0-9]+)\z/', $line, $matches) === 1) {
+                    $statistics[$matches[1]] = (int) $matches[2];
+                }
+            }
+        }
+
+        return [
+            'limit' => self::readUnsignedInteger($directory . '/memory.max'),
+            'current' => self::readUnsignedInteger($directory . '/memory.current'),
+            'peak' => self::readUnsignedInteger($directory . '/memory.peak'),
+            'anon' => $statistics['anon'] ?? null,
+            'file' => $statistics['file'] ?? null,
+            'shmem' => $statistics['shmem'] ?? null,
+            'kernel' => $statistics['kernel'] ?? null,
+            'slab' => $statistics['slab'] ?? null,
+        ];
+    }
+
+    /**
+     * @param array{limit: int|null, current: int|null, peak: int|null, anon: int|null, file: int|null, shmem: int|null, kernel: int|null, slab: int|null} $cgroup
+     */
+    public static function persistMemorySample(
+        string $directory,
+        int $iteration,
+        string $stage,
+        int $warmupBatches,
+        ?int $serverRssBytes,
+        array $cgroup,
+    ): void {
+        if (! in_array($stage, ['warmup', 'baseline', 'steady', 'final'], true)) {
+            throw new \InvalidArgumentException('Unknown production soak memory-sample stage.');
+        }
+        self::assertDirectory($directory);
+        $path = $directory . '/memory.tsv';
+        $header = "captured_at\titeration\tstage\twarmup_batches\tserver_rss_bytes\tcgroup_limit_bytes"
+            . "\tcgroup_current_bytes\tcgroup_peak_bytes"
+            . "\tcgroup_anon_bytes\tcgroup_file_bytes\tcgroup_shmem_bytes\tcgroup_kernel_bytes"
+            . "\tcgroup_slab_bytes\n";
+        $line = implode("\t", [
+            gmdate('Y-m-d\TH:i:s\Z'),
+            (string) $iteration,
+            $stage,
+            (string) $warmupBatches,
+            self::nullableInteger($serverRssBytes),
+            self::nullableInteger($cgroup['limit']),
+            self::nullableInteger($cgroup['current']),
+            self::nullableInteger($cgroup['peak']),
+            self::nullableInteger($cgroup['anon']),
+            self::nullableInteger($cgroup['file']),
+            self::nullableInteger($cgroup['shmem']),
+            self::nullableInteger($cgroup['kernel']),
+            self::nullableInteger($cgroup['slab']),
+        ]) . "\n";
+
+        $handle = @fopen($path, 'c+b');
+        if ($handle === false) {
+            throw new \RuntimeException('Could not open the production soak memory series.');
+        }
+
+        $rotated = false;
+        try {
+            if (! flock($handle, LOCK_EX)) {
+                throw new \RuntimeException('Could not lock the production soak memory series.');
+            }
+            $status = fstat($handle);
+            if ($status === false) {
+                throw new \RuntimeException('Could not inspect the production soak memory series.');
+            }
+            $prefix = $status['size'] === 0 ? $header : '';
+            $payload = $prefix . $line;
+            if ($status['size'] + strlen($payload) > self::MAX_MEMORY_SERIES_BYTES) {
+                $tailBytes = min(self::RETAINED_MEMORY_SERIES_BYTES, $status['size']);
+                if (fseek($handle, -$tailBytes, SEEK_END) !== 0) {
+                    throw new \RuntimeException('Could not seek in the production soak memory series.');
+                }
+                $tail = stream_get_contents($handle);
+                if ($tail === false) {
+                    throw new \RuntimeException('Could not read the production soak memory-series tail.');
+                }
+                if ($status['size'] > $tailBytes) {
+                    $firstLineEnd = strpos($tail, "\n");
+                    $tail = $firstLineEnd === false ? '' : substr($tail, $firstLineEnd + 1);
+                }
+                if (ftruncate($handle, 0) === false || rewind($handle) === false) {
+                    throw new \RuntimeException('Could not rotate the production soak memory series.');
+                }
+                self::writeStream($handle, $header . $tail . $line);
+                $rotated = true;
+            } else {
+                if (fseek($handle, 0, SEEK_END) !== 0) {
+                    throw new \RuntimeException('Could not seek in the production soak memory series.');
+                }
+                self::writeStream($handle, $payload);
+            }
+            if (! fflush($handle)) {
+                throw new \RuntimeException('Could not flush the production soak memory series.');
+            }
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+
+        if (! chmod($path, 0o600)) {
+            throw new \RuntimeException('Could not restrict production soak memory-series permissions.');
+        }
+        if ($rotated) {
+            self::writePrivateFile(
+                $directory . '/memory-series-rotated',
+                'rotated_at=' . gmdate('Y-m-d\TH:i:s\Z') . "\n",
+            );
+        }
+    }
+
     /**
      * @return array{
      *     index: int|string,
@@ -117,6 +243,35 @@ final class ProductionSoakDiagnostics
         }
 
         return 'string-sha256:' . hash('sha256', $index);
+    }
+
+    private static function readUnsignedInteger(string $path): ?int
+    {
+        $value = @file_get_contents($path);
+        if ($value === false || ! ctype_digit(trim($value))) {
+            return null;
+        }
+
+        return (int) trim($value);
+    }
+
+    private static function nullableInteger(?int $value): string
+    {
+        return $value === null ? '' : (string) $value;
+    }
+
+    /** @param resource $handle */
+    private static function writeStream($handle, string $contents): void
+    {
+        $offset = 0;
+        $length = strlen($contents);
+        while ($offset < $length) {
+            $written = fwrite($handle, substr($contents, $offset));
+            if ($written === false || $written === 0) {
+                throw new \RuntimeException('Could not persist the production soak memory series.');
+            }
+            $offset += $written;
+        }
     }
 
     private static function safeInteger(mixed $value): ?int

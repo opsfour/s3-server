@@ -333,6 +333,7 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         $maximumBatchGapSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_MAX_BATCH_GAP_SECONDS', 120);
         $pauseMilliseconds = self::envNonNegativeInt('S3_TEST_PRODUCTION_SOAK_PAUSE_MILLISECONDS', 0);
         $progressSeconds = self::envInt('S3_TEST_PRODUCTION_SOAK_PROGRESS_SECONDS', 60);
+        $warmupBatches = self::envPositiveInt('S3_TEST_PRODUCTION_SOAK_WARMUP_BATCHES', 25);
 
         $memoryBaseline = null;
         $tmpBefore = self::storageTempArtifacts(self::$storagePath . '/.tmp');
@@ -398,24 +399,43 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
                 $this->assertStringContainsString('ok', strtolower($response));
             }
 
-            $memoryPeak = self::productionSoakMemoryBytes();
-            if ($memoryPeak !== null) {
-                $this->assertLessThanOrEqual(
-                    $maximumTotalRss,
-                    $memoryPeak,
-                    'Container memory peak or server process-tree RSS exceeded the production soak hard limit.',
-                );
+            $serverRss = self::serverRssBytes();
+            if ($serverRss === null) {
+                self::fail('Server process-tree RSS is unavailable during the production soak.');
+            }
+            $cgroupMemory = ProductionSoakDiagnostics::cgroupMemorySnapshot();
+            $memoryStage = $iteration < $warmupBatches
+                ? 'warmup'
+                : ($iteration === $warmupBatches ? 'baseline' : 'steady');
+            self::persistProductionSoakMemorySample(
+                $iteration,
+                $memoryStage,
+                $warmupBatches,
+                $serverRss,
+                $cgroupMemory,
+            );
 
-                // Establish the baseline after the first complete storage batch.
-                if ($memoryBaseline === null) {
-                    $memoryBaseline = $memoryPeak;
-                } else {
-                    $this->assertLessThanOrEqual(
-                        $allowedGrowth,
-                        max(0, $memoryPeak - $memoryBaseline),
-                        'Container memory peak or server process-tree RSS grew too much after worker warm-up.',
-                    );
+            $cgroupPeak = self::productionSoakCgroupPeakBytes($cgroupMemory);
+            $absoluteMemory = $cgroupPeak ?? $serverRss;
+            $this->assertLessThanOrEqual(
+                $maximumTotalRss,
+                $absoluteMemory,
+                'Container memory peak or server process-tree RSS exceeded the production soak hard limit.',
+            );
+
+            if ($iteration <= $warmupBatches) {
+                if ($iteration === $warmupBatches) {
+                    $memoryBaseline = $serverRss;
                 }
+            } else {
+                if ($memoryBaseline === null) {
+                    self::fail('Production soak RSS baseline is unavailable after warm-up.');
+                }
+                $this->assertLessThanOrEqual(
+                    $allowedGrowth,
+                    max(0, $serverRss - $memoryBaseline),
+                    'Server process-tree RSS grew too much after worker warm-up.',
+                );
             }
 
             $batchCompletedAt = microtime(true);
@@ -457,25 +477,47 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             ),
         );
         $this->assertGreaterThan(0, $iteration, 'Production soak did not complete a workload batch.');
+        if ($memoryBaseline === null && self::productionSoakRequiresWarmupBaseline()) {
+            self::fail('Production soak did not complete the configured RSS warm-up batches.');
+        }
         $tmpAfter = self::storageTempArtifacts(self::$storagePath . '/.tmp');
         $this->assertSame($tmpBefore, $tmpAfter, 'Production soak left stale temp files behind.');
 
-        $memoryPeak = self::productionSoakMemoryBytes();
-        if ($memoryBaseline !== null && $memoryPeak !== null) {
+        $serverRss = self::serverRssBytes();
+        if ($serverRss === null) {
+            self::fail('Server process-tree RSS is unavailable after the production soak.');
+        }
+        $cgroupMemory = ProductionSoakDiagnostics::cgroupMemorySnapshot();
+        self::persistProductionSoakMemorySample($iteration, 'final', $warmupBatches, $serverRss, $cgroupMemory);
+        if ($memoryBaseline !== null) {
             $this->assertLessThanOrEqual(
                 $allowedGrowth,
-                max(0, $memoryPeak - $memoryBaseline),
-                'Container memory peak or server process-tree RSS grew too much after worker warm-up.',
+                max(0, $serverRss - $memoryBaseline),
+                'Server process-tree RSS grew too much after worker warm-up.',
             );
         }
 
-        $cgroupPeak = self::productionSoakCgroupPeakBytes();
+        $cgroupPeak = self::productionSoakCgroupPeakBytes($cgroupMemory);
+        $this->assertLessThanOrEqual(
+            $maximumTotalRss,
+            $cgroupPeak ?? $serverRss,
+            'Container memory peak or server process-tree RSS exceeded the production soak hard limit.',
+        );
         if ($cgroupPeak !== null) {
             fwrite(STDOUT, sprintf(
                 "\nSoak cgroup-v2 memory.peak: %d bytes (%.1f MiB).\n",
                 $cgroupPeak,
                 $cgroupPeak / (1024 * 1024),
             ));
+        }
+        if ($memoryBaseline !== null) {
+            fwrite(STDOUT, sprintf(
+                "\nSoak server process-tree RSS: baseline=%d bytes, final=%d bytes.\n",
+                $memoryBaseline,
+                $serverRss,
+            ));
+        } else {
+            fwrite(STDOUT, "\nSoak server process-tree RSS baseline was not reached; relative growth was not qualified.\n");
         }
     }
 
@@ -586,6 +628,25 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         return max(0, (int) $value);
     }
 
+    private static function envPositiveInt(string $name, int $default): int
+    {
+        $value = getenv($name);
+        if ($value === false || $value === '') {
+            return $default;
+        }
+        $parsed = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($parsed === false) {
+            throw new \InvalidArgumentException("{$name} must be a positive integer.");
+        }
+
+        return $parsed;
+    }
+
+    private static function productionSoakRequiresWarmupBaseline(): bool
+    {
+        return strtolower((string) getenv('S3_SOAK_QUALIFICATION')) === 'release';
+    }
+
     private static function envBool(string $name): bool
     {
         $value = getenv($name);
@@ -593,27 +654,44 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
         return in_array(strtolower((string) $value), ['1', 'true', 'yes', 'on'], true);
     }
 
-    private static function productionSoakMemoryBytes(): ?int
+    /**
+     * @param array{limit: int|null, current: int|null, peak: int|null, anon: int|null, file: int|null, shmem: int|null, kernel: int|null, slab: int|null} $memory
+     */
+    private static function productionSoakCgroupPeakBytes(array $memory): ?int
     {
-        // The constrained cgroup peak includes the test client and every
-        // server worker, and captures spikes between workload batches.
-        return self::productionSoakCgroupPeakBytes() ?? self::serverRssBytes();
-    }
-
-    private static function productionSoakCgroupPeakBytes(): ?int
-    {
-        $memoryMax = @file_get_contents('/sys/fs/cgroup/memory.max');
-        if ($memoryMax === false || ! ctype_digit(trim($memoryMax))
-            || (int) trim($memoryMax) > 4 * 1024 * 1024 * 1024) {
+        if ($memory['limit'] === null || $memory['limit'] > 4 * 1024 * 1024 * 1024) {
             return null;
         }
-
-        $memoryPeak = @file_get_contents('/sys/fs/cgroup/memory.peak');
-        if ($memoryPeak === false || ! ctype_digit(trim($memoryPeak))) {
+        if ($memory['peak'] === null) {
             throw new \RuntimeException('The constrained cgroup-v2 memory.peak metric is unavailable.');
         }
 
-        return (int) trim($memoryPeak);
+        return $memory['peak'];
+    }
+
+    /**
+     * @param array{limit: int|null, current: int|null, peak: int|null, anon: int|null, file: int|null, shmem: int|null, kernel: int|null, slab: int|null} $cgroup
+     */
+    private static function persistProductionSoakMemorySample(
+        int $iteration,
+        string $stage,
+        int $warmupBatches,
+        ?int $serverRssBytes,
+        array $cgroup,
+    ): void {
+        $diagnosticsDir = getenv('S3_TEST_PRODUCTION_SOAK_DIAGNOSTICS_DIR');
+        if ($diagnosticsDir === false || $diagnosticsDir === '') {
+            return;
+        }
+
+        ProductionSoakDiagnostics::persistMemorySample(
+            $diagnosticsDir,
+            $iteration,
+            $stage,
+            $warmupBatches,
+            $serverRssBytes,
+            $cgroup,
+        );
     }
 
     /** @return list<string> */
@@ -634,9 +712,9 @@ final class ReliabilityStressTest extends S3FunctionalTestCase
             }
             $relative = substr($file->getPathname(), strlen($path) + 1);
             if (in_array($relative, [
-                '.opsfour-s3-storage-budget/budget',
-                '.opsfour-s3-storage-budget/lock',
-                '.opsfour-s3-storage-budget/total',
+                'object-writes/.opsfour-s3-storage-budget/budget',
+                'object-writes/.opsfour-s3-storage-budget/lock',
+                'object-writes/.opsfour-s3-storage-budget/total',
             ], true)) {
                 continue;
             }

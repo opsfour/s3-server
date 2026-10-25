@@ -286,5 +286,16 @@ use a new, empty, canonical state directory outside the checkout for every run.
 A shorter configured duration is marked `qualification=smoke`; release evidence
 requires `qualification=release`, `status=passed`, at least 43,200 requested and
 elapsed seconds, `source=unchanged`, exit status zero, and `oom=false` from
-`status`. The soak has no remote object-storage dependency and does not qualify
-Flysystem, shared filesystems, multiple processes, or multiple hosts.
+`status`. Relative memory growth is measured from the server process-tree RSS
+after 25 warm-up batches; override that warm-up only with
+`S3_SOAK_WARMUP_BATCHES`. The container cgroup peak remains an absolute safety
+limit. The bounded private `memory.tsv` evidence records the configured warm-up
+and identifies its baseline row. It separates server RSS from cgroup current,
+peak, anonymous, file, shared, kernel, and slab memory. Current and `memory.stat`
+fields describe each sample instant; the peak remains the lifetime high-water
+mark and is not attributed to that instant's categories. If the bounded series
+rotates, it keeps the recent tail and writes a `memory-series-rotated` marker.
+A short smoke may finish before its configured warm-up and then does not
+qualify relative RSS growth; a release run fails in that state. The soak has no
+remote object-storage dependency and does not qualify Flysystem, shared
+filesystems, multiple processes, or multiple hosts.

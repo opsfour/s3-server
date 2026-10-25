@@ -30,6 +30,82 @@ final class ProductionSoakDiagnosticsTest extends TestCase
         @rmdir($this->directory);
     }
 
+    public function test_cgroup_memory_snapshot_keeps_only_attributable_numeric_fields(): void
+    {
+        file_put_contents($this->directory . '/memory.max', "1073741824\n");
+        file_put_contents($this->directory . '/memory.current', "314572800\n");
+        file_put_contents($this->directory . '/memory.peak', "536870912\n");
+        file_put_contents($this->directory . '/memory.stat', implode("\n", [
+            'anon 209715200',
+            'file 94371840',
+            'shmem 8388608',
+            'kernel 15728640',
+            'slab 10485760',
+            'not_numeric invalid',
+            'unrelated 1234',
+        ]));
+
+        self::assertSame([
+            'limit' => 1073741824,
+            'current' => 314572800,
+            'peak' => 536870912,
+            'anon' => 209715200,
+            'file' => 94371840,
+            'shmem' => 8388608,
+            'kernel' => 15728640,
+            'slab' => 10485760,
+        ], ProductionSoakDiagnostics::cgroupMemorySnapshot($this->directory));
+    }
+
+    public function test_memory_series_is_private_attributable_and_bounded(): void
+    {
+        ProductionSoakDiagnostics::persistMemorySample($this->directory, 25, 'baseline', 25, 123456, [
+            'limit' => 1073741824,
+            'current' => 234567,
+            'peak' => 345678,
+            'anon' => 111111,
+            'file' => 222222,
+            'shmem' => 333333,
+            'kernel' => 444444,
+            'slab' => 555555,
+        ]);
+
+        $path = $this->directory . '/memory.tsv';
+        $lines = file($path, FILE_IGNORE_NEW_LINES);
+        self::assertIsArray($lines);
+        self::assertCount(2, $lines);
+        self::assertSame(
+            "captured_at\titeration\tstage\twarmup_batches\tserver_rss_bytes\tcgroup_limit_bytes"
+                . "\tcgroup_current_bytes\tcgroup_peak_bytes"
+                . "\tcgroup_anon_bytes\tcgroup_file_bytes\tcgroup_shmem_bytes\tcgroup_kernel_bytes"
+                . "\tcgroup_slab_bytes",
+            $lines[0],
+        );
+        self::assertStringEndsWith(
+            "\t25\tbaseline\t25\t123456\t1073741824\t234567\t345678"
+                . "\t111111\t222222\t333333\t444444\t555555",
+            $lines[1],
+        );
+        self::assertSame('0600', substr(sprintf('%04o', fileperms($path)), -4));
+
+        file_put_contents($path, str_repeat('x', 1024 * 1024), LOCK_EX);
+        ProductionSoakDiagnostics::persistMemorySample($this->directory, 26, 'steady', 25, null, [
+            'limit' => null,
+            'current' => null,
+            'peak' => null,
+            'anon' => null,
+            'file' => null,
+            'shmem' => null,
+            'kernel' => null,
+            'slab' => null,
+        ]);
+        $rotated = (string) file_get_contents($path);
+        self::assertLessThan(1024 * 1024, strlen($rotated));
+        self::assertStringStartsWith("captured_at\titeration\tstage\t", $rotated);
+        self::assertStringContainsString("\t26\tsteady\t25\t", $rotated);
+        self::assertFileExists($this->directory . '/memory-series-rotated');
+    }
+
     public function test_rejection_keeps_only_allowlisted_transport_fields(): void
     {
         $request = new Request(
