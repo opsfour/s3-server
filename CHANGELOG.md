@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-26
+
 ### Added
 
 - Bound durable storage cleanup with an exact cross-backend counter, a
@@ -429,6 +431,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Return the delete-marker response headers and `MethodNotAllowed` from
   GetObjectAttributes when an explicit delete-marker version is selected.
 
+### Validation
+
+- The one-host, one-process Linux/XFS/SQLite reference profile completed its
+  12-hour release soak with every workload phase successful, bounded memory
+  use, and no OOM.
+
 ### Upgrade Notes
 
 - Stop old API and worker processes before running PostgreSQL or MySQL schema
@@ -551,7 +559,8 @@ AWS STS Query API compatibility remains intentionally outside this release.
 
 - Initial public release.
 
-[Unreleased]: https://github.com/opsfour/s3-server/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/opsfour/s3-server/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/opsfour/s3-server/compare/v1.3.1...v2.0.0
 [1.3.1]: https://github.com/opsfour/s3-server/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/opsfour/s3-server/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/opsfour/s3-server/compare/v1.1.0...v1.2.0

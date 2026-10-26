@@ -8,7 +8,7 @@ canonical storage support matrix:
 
 | Backend | Status | Current use |
 |---------|--------|-------------|
-| Persistent local filesystem on Linux | Implemented and Supported | Current one-host, one-process release target; qualification is pending the release gates, including crash recovery on the exact filesystem and mount |
+| Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -146,8 +146,10 @@ target directory, removes the temporary name, and synchronizes the temporary
 directory. Exact-path deletion similarly synchronizes the nearest existing
 parent directory before reporting success. These guarantees cover the current
 one-process local-filesystem implementation. The exact Linux filesystem,
-mount, storage device, and host still need the release crash-recovery gate;
-unit and process-termination tests do not simulate a sudden loss of power.
+mount, storage device, and host used by the v2.0.0 Linux/XFS/SQLite reference
+profile passed the release crash-recovery gate. Any other deployment profile
+needs its applicable gates; process-termination tests do not simulate a sudden
+loss of host power.
 
 ## Flysystem
 
@@ -344,12 +346,14 @@ S3_STORAGE_DRIVER=memory
 
 ## Choosing a Backend
 
-Use `filesystem` for the current one-host, one-process release target and
-complete its release gates before deployment. PostgreSQL and MySQL can share
-metadata, but that does not change the storage status or qualify multiple
-hosts. Flysystem worker mode bounds event-loop blocking during experiments; it
-does not qualify an adapter or provider. Direct `FilesystemOperator` mode can
-stall unrelated requests in the Amp process.
+Use `filesystem` for the current one-host, one-process release target. The
+v2.0.0 Linux/XFS/SQLite reference profile completed its release gates; run the
+applicable gates for any other metadata, filesystem, mount, device, and host
+profile before deployment. PostgreSQL and MySQL can share metadata, but that
+does not change the storage status or qualify multiple hosts. Flysystem worker
+mode bounds event-loop blocking during experiments; it does not qualify an
+adapter or provider. Direct `FilesystemOperator` mode can stall unrelated
+requests in the Amp process.
 
 ## Physical Storage Tiers
 

@@ -33,14 +33,17 @@ see [Policy Compatibility](docs/policy-compatibility.md).
 
 ## Production Target
 
-The initial production target is Linux on one host with one API process,
+The v2.0.0 production target is Linux on one host with one API process,
 persistent local filesystem storage, and SQLite, PostgreSQL, or MySQL metadata.
 It supports the standalone CLI, Laravel, and Symfony, either directly or behind
 a reverse proxy that preserves the signed `Host` header exactly.
 
-Memory storage is test-only. Flysystem, remote and shared filesystems, NFS/EFS,
-multiple API processes, and multiple hosts remain experimental until each exact
-profile completes its own qualification gates. See the
+The qualified v2.0.0 reference profile uses PHP 8.4, SQLite metadata, and one
+API process on a Linux host with its exact local XFS mount. Other metadata,
+filesystem, mount, device, and host combinations require the applicable
+deployment gates. Memory storage is test-only. Flysystem, remote and shared
+filesystems, NFS/EFS, multiple API processes, and multiple hosts remain
+experimental until each exact profile completes its own qualification gates. See the
 [roadmap and status definitions](docs/production-feature-roadmap.md).
 
 ## Requirements

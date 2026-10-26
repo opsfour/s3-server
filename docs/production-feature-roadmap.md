@@ -21,7 +21,7 @@ do not block releases that do not advertise them.
 
 ## Current Target Contract
 
-The initial production target is:
+The current production target is:
 
 - Linux on one host;
 - one S3 API process;
@@ -40,22 +40,30 @@ Memory storage is test-only. Flysystem storage, remote filesystems, shared
 filesystems such as NFS or EFS, multiple hosts, and multiple API processes are
 experimental until the exact profile has its own qualification record.
 
+Other local filesystem types and mount configurations remain supported only to
+the extent documented by their guides; they need their own deployment
+qualification before they are advertised as a production profile.
+
+## Qualified in v2.0.0
+
+The exact release-soak profile used PHP 8.4, SQLite metadata, one API process,
+and one Linux host with its local XFS mount. It completed the 12-hour continuity
+and memory gate plus restart, disk-full, cleanup, backup and restore, and sudden
+process-termination gates. Separate integration gates covered PostgreSQL and
+MySQL metadata, the standalone, Laravel, and Symfony entry points, and a
+generic reverse proxy that preserves the signed `Host` header. These separate
+gates do not broaden the qualified storage topology, and the release does not
+claim sudden host power-loss durability.
+
 ## Now
 
-- Finish the universal release gates for the current target contract on PHP
-  8.4 and PHP 8.5.
-- Qualify local filesystem behavior on Linux, including restart, disk-full,
-  cleanup, backup and restore, and sudden process termination.
-- Run PostgreSQL and MySQL integration and migration profiles without hidden
-  skips. Keep SQLite covered by the default suite.
-- Verify the standalone, Laravel, and Symfony entry points use the same runtime
-  and security defaults.
-- Verify signed path-style and virtual-hosted requests through a generic reverse
-  proxy with exact `Host` preservation and trusted-proxy configuration.
-- Close correctness, security, and recovery bugs in the currently documented S3
-  surface. Keep unsupported AWS operations explicit and fail closed.
-- Publish a release only when the [release checklist](release-checklist.md) is
-  complete for this target contract.
+- Maintain the qualified target and close correctness, security, and recovery
+  defects in its documented S3 surface.
+- Keep unsupported AWS operations explicit and fail closed.
+- Apply the [release checklist](release-checklist.md), including the current
+  target-profile gates, to every release.
+- Keep optional deployment profiles in **Later** until they have a concrete
+  product need and their own qualification record.
 
 ## Later
 
