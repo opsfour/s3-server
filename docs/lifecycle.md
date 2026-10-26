@@ -155,9 +155,12 @@ The lifecycle executor runs automatically in the background when the server
 starts (if metadata and storage backends are available). It periodically
 evaluates all bucket lifecycle rules and applies them. The configured maximum
 action count is shared by all buckets and stale multipart cleanup in one sweep.
-When that budget is exhausted, a metadata-backed cursor lets the next sweep
-resume at the following bucket. The same mechanism can coordinate runners in a
-later separately qualified multi-process profile.
+The same configured value independently limits how many lifecycle candidates
+can be examined, so no-op or temporarily ineligible backlogs cannot turn one
+sweep into an unbounded metadata scan. When either budget is exhausted,
+metadata-backed action, stale-multipart, and bucket cursors let later sweeps
+resume incrementally and rotate to the following bucket. The same mechanism can
+coordinate runners in a later separately qualified multi-process profile.
 
 There is no manual trigger needed — the runner handles scheduling internally.
 

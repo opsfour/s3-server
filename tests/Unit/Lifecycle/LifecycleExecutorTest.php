@@ -835,6 +835,52 @@ final class LifecycleExecutorTest extends TestCase
         self::assertNull($this->metadata->getMultipartUpload($uploadId));
     }
 
+    public function test_global_stale_multipart_checkpoint_advances_past_a_failing_upload(): void
+    {
+        $this->createBucket('bucket');
+        $failingUpload = $this->createMultipartUploadWithPart('bucket', '00-failing.bin');
+        $laterUpload = $this->createMultipartUploadWithPart('bucket', '01-later.bin');
+        $this->ageMultipartUpload($failingUpload, 5);
+        $this->ageMultipartUpload($laterUpload, 5);
+        $this->sql(
+            'UPDATE s3_multipart_uploads SET storage_tier = ? WHERE upload_id = ?',
+            ['MISSING', $failingUpload],
+        );
+
+        $this->putObject('bucket', 'old.txt', 'expire after multipart progress');
+        $this->ageObject('bucket', 'old.txt', 5);
+        $this->configureOneDayExpiration();
+
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 1,
+            maxActionsPerRun: 2,
+            multipartMaxAgeSeconds: 1,
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNotNull($this->metadata->getMultipartUpload($failingUpload));
+        self::assertNotNull($this->metadata->getMultipartUpload($laterUpload));
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
+        self::assertSame(
+            ['cursorKey' => '00-failing.bin', 'cursorVersionId' => null, 'cursorUploadId' => $failingUpload],
+            $this->metadata->getLifecycleCheckpoint('bucket', '__opsfour_internal_stale_multipart__', 'next_upload'),
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNotNull($this->metadata->getMultipartUpload($failingUpload));
+        self::assertNull($this->metadata->getMultipartUpload($laterUpload));
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'old.txt'));
+        self::assertSame(
+            ['cursorKey' => '01-later.bin', 'cursorVersionId' => null, 'cursorUploadId' => $laterUpload],
+            $this->metadata->getLifecycleCheckpoint('bucket', '__opsfour_internal_stale_multipart__', 'next_upload'),
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNull($this->metadata->getLifecycleCheckpoint('bucket', '__opsfour_internal_stale_multipart__', 'next_upload'));
+    }
+
     public function test_expiration_tag_filter_deletes_only_matching_objects(): void
     {
         $this->createBucket('bucket');
@@ -1030,6 +1076,147 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertSame(2, $remaining);
     }
 
+    public function test_candidate_budget_resumes_no_op_transition_backlog_and_reaches_real_work(): void
+    {
+        $this->createBucket('bucket');
+
+        foreach (range(0, 4) as $index) {
+            $key = sprintf('logs/%02d-noop.txt', $index);
+            $write = $this->putObject('bucket', $key, 'already archived');
+            $this->ageObject('bucket', $key, 5);
+            $this->metadata->updateObjectPlacement(
+                bucket: 'bucket',
+                key: $key,
+                versionId: null,
+                storageClass: 'GLACIER',
+                storageTier: 'GLACIER',
+                storagePath: $write->path,
+            );
+        }
+        $this->putObject('bucket', 'logs/99-transition.txt', 'archive me');
+        $this->ageObject('bucket', 'logs/99-transition.txt', 5);
+
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'transition-logs',
+            'status' => 'Enabled',
+            'prefix' => 'logs/',
+            'filter' => null,
+            'transitions' => [['days' => 1, 'storageClass' => 'GLACIER']],
+            'expiration' => null,
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 10,
+            maxActionsPerRun: 2,
+            multipartMaxAgeSeconds: 0,
+        );
+
+        $executor->processBucket('bucket');
+        self::assertSame(
+            ['cursorKey' => 'logs/01-noop.txt', 'cursorVersionId' => null, 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'transition-logs', 'transition_current:GLACIER'),
+        );
+        self::assertSame([], $this->tierTransitionJobs());
+
+        $executor->processBucket('bucket');
+        self::assertSame(
+            ['cursorKey' => 'logs/03-noop.txt', 'cursorVersionId' => null, 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'transition-logs', 'transition_current:GLACIER'),
+        );
+        self::assertSame([], $this->tierTransitionJobs());
+
+        $executor->processBucket('bucket');
+        self::assertSame(
+            ['cursorKey' => 'logs/99-transition.txt', 'cursorVersionId' => null, 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'transition-logs', 'transition_current:GLACIER'),
+        );
+        self::assertCount(1, $this->tierTransitionJobs());
+
+        $executor->processBucket('bucket');
+        self::assertNull($this->metadata->getLifecycleCheckpoint('bucket', 'transition-logs', 'transition_current:GLACIER'));
+        self::assertCount(1, $this->tierTransitionJobs());
+    }
+
+    public function test_candidate_budget_is_global_across_rules_and_buckets(): void
+    {
+        $this->createBucket('bucket-a');
+        $this->createBucket('bucket-b');
+
+        foreach (['first/noop.txt', 'second/noop.txt'] as $key) {
+            $write = $this->putObject('bucket-a', $key, 'already archived');
+            $this->ageObject('bucket-a', $key, 5);
+            $this->metadata->updateObjectPlacement(
+                bucket: 'bucket-a',
+                key: $key,
+                versionId: null,
+                storageClass: 'GLACIER',
+                storageTier: 'GLACIER',
+                storagePath: $write->path,
+            );
+        }
+        $this->metadata->putBucketLifecycle('bucket-a', [
+            [
+                'id' => 'transition-first',
+                'status' => 'Enabled',
+                'prefix' => 'first/',
+                'filter' => null,
+                'transitions' => [['days' => 1, 'storageClass' => 'GLACIER']],
+                'expiration' => null,
+                'noncurrentTransitions' => null,
+                'noncurrentExpiration' => null,
+                'abortIncompleteDays' => null,
+            ],
+            [
+                'id' => 'transition-second',
+                'status' => 'Enabled',
+                'prefix' => 'second/',
+                'filter' => null,
+                'transitions' => [['days' => 1, 'storageClass' => 'GLACIER']],
+                'expiration' => null,
+                'noncurrentTransitions' => null,
+                'noncurrentExpiration' => null,
+                'abortIncompleteDays' => null,
+            ],
+        ]);
+
+        $this->putObject('bucket-b', 'old.txt', 'expire me');
+        $this->ageObject('bucket-b', 'old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket-b', [[
+            'id' => 'expire-old',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 10,
+            maxActionsPerRun: 2,
+            multipartMaxAgeSeconds: 0,
+        );
+
+        $executor->execute();
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
+        self::assertSame(
+            ['cursorKey' => 'bucket-b', 'cursorVersionId' => null, 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('', '__opsfour_internal_sweep__', 'next_bucket'),
+        );
+
+        $executor->execute();
+        self::assertNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
+    }
+
     public function test_execute_applies_action_budget_across_all_buckets(): void
     {
         foreach (['bucket-a', 'bucket-b'] as $bucket) {
@@ -1062,6 +1249,67 @@ final class LifecycleExecutorTest extends TestCase
 
         (new LifecycleExecutor($this->metadata, $this->storage, maxActionsPerRun: 1))->execute();
         self::assertNull($this->metadata->getObjectMetadata('bucket-a', 'old.txt'));
+        self::assertNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
+    }
+
+    public function test_global_budget_retains_stale_multipart_consumption_when_later_metadata_read_fails(): void
+    {
+        $this->createBucket('bucket-a');
+        $uploadId = $this->createMultipartUploadWithPart('bucket-a', 'stale.bin');
+        $this->ageMultipartUpload($uploadId, 5);
+        $this->metadata->putBucketLifecycle('bucket-a', [[
+            'id' => 'corrupted-after-cleanup',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+        $this->sql(
+            'UPDATE s3_lifecycle_rules SET transitions_json = ? WHERE bucket = ?',
+            ['{', 'bucket-a'],
+        );
+
+        $this->createBucket('bucket-b');
+        $this->putObject('bucket-b', 'old.txt', 'must wait for the next sweep');
+        $this->ageObject('bucket-b', 'old.txt', 5);
+        $this->metadata->putBucketLifecycle('bucket-b', [[
+            'id' => 'expire-old',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['days' => 1],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 1,
+            maxActionsPerRun: 1,
+            multipartMaxAgeSeconds: 1,
+        );
+        $executor->execute();
+
+        self::assertNull($this->metadata->getMultipartUpload($uploadId));
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
+        self::assertSame(
+            ['cursorKey' => 'bucket-b', 'cursorVersionId' => null, 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('', '__opsfour_internal_sweep__', 'next_bucket'),
+        );
+
+        $this->sql(
+            'UPDATE s3_lifecycle_rules SET transitions_json = NULL WHERE bucket = ?',
+            ['bucket-a'],
+        );
+        $executor->execute();
+
         self::assertNull($this->metadata->getObjectMetadata('bucket-b', 'old.txt'));
     }
 
@@ -1319,6 +1567,50 @@ final class LifecycleExecutorTest extends TestCase
         $this->assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'has-version.txt', $keptMarker));
     }
 
+    public function test_expired_object_delete_marker_resumes_and_removes_suspended_null_markers(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        self::assertSame('null', $this->metadata->deleteObjectVersioned('bucket', 'a-orphan.txt', 'owner', suspended: true));
+        self::assertSame('null', $this->metadata->deleteObjectVersioned('bucket', 'b-orphan.txt', 'owner', suspended: true));
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'delete-null-markers',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => ['expiredObjectDeleteMarker' => true],
+            'noncurrentTransitions' => null,
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 10,
+            maxActionsPerRun: 1,
+            multipartMaxAgeSeconds: 0,
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNull($this->metadata->getObjectMetadataByVersion('bucket', 'a-orphan.txt', 'null'));
+        self::assertNotNull($this->metadata->getObjectMetadataByVersion('bucket', 'b-orphan.txt', 'null'));
+        self::assertSame(
+            ['cursorKey' => 'a-orphan.txt', 'cursorVersionId' => 'null', 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'delete-null-markers', 'delete_marker'),
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNull($this->metadata->getObjectMetadataByVersion('bucket', 'b-orphan.txt', 'null'));
+        self::assertSame(
+            ['cursorKey' => 'b-orphan.txt', 'cursorVersionId' => 'null', 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'delete-null-markers', 'delete_marker'),
+        );
+
+        $executor->processBucket('bucket');
+        self::assertNull($this->metadata->getLifecycleCheckpoint('bucket', 'delete-null-markers', 'delete_marker'));
+    }
+
     public function test_transition_rule_enqueues_durable_job_idempotently(): void
     {
         $this->createBucket('bucket');
@@ -1458,6 +1750,52 @@ final class LifecycleExecutorTest extends TestCase
         self::assertSame('available', $this->metadata->getObjectMetadataByVersion('bucket', 'versioned.txt', $latest['versionId'])?->transitionStatus);
         self::assertFileExists($old->path);
         self::assertFileExists($latest['path']);
+    }
+
+    public function test_noncurrent_transition_cursor_resumes_after_suspended_null_version(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        foreach (['a-object.txt', 'b-object.txt'] as $key) {
+            $this->putObject('bucket', $key, 'null version');
+        }
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        foreach (['a-object.txt', 'b-object.txt'] as $key) {
+            $this->putVersionedObject('bucket', $key, 'numbered version');
+            $this->ageVersion('bucket', $key, 'null', 5);
+        }
+        $this->metadata->putBucketLifecycle('bucket', [[
+            'id' => 'transition-null-cursor',
+            'status' => 'Enabled',
+            'prefix' => null,
+            'filter' => null,
+            'transitions' => null,
+            'expiration' => null,
+            'noncurrentTransitions' => [['noncurrentDays' => 1, 'storageClass' => 'GLACIER']],
+            'noncurrentExpiration' => null,
+            'abortIncompleteDays' => null,
+        ]]);
+        $executor = new LifecycleExecutor(
+            $this->metadata,
+            $this->storage,
+            batchSize: 10,
+            maxActionsPerRun: 1,
+            multipartMaxAgeSeconds: 0,
+        );
+
+        $executor->processBucket('bucket');
+        self::assertSame(
+            ['cursorKey' => 'a-object.txt', 'cursorVersionId' => 'null', 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'transition-null-cursor', 'transition_noncurrent:GLACIER'),
+        );
+        self::assertCount(1, $this->tierTransitionJobs());
+
+        $executor->processBucket('bucket');
+        self::assertSame(
+            ['cursorKey' => 'b-object.txt', 'cursorVersionId' => 'null', 'cursorUploadId' => null],
+            $this->metadata->getLifecycleCheckpoint('bucket', 'transition-null-cursor', 'transition_noncurrent:GLACIER'),
+        );
+        self::assertCount(2, $this->tierTransitionJobs());
     }
 
     public function test_noncurrent_transition_skips_version_promoted_after_listing(): void

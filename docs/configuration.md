@@ -312,7 +312,7 @@ transitioned incrementally.
 |----------|---------|-------------|
 | `S3_LIFECYCLE_INTERVAL_SECONDS` | `60` | Seconds between lifecycle sweeps |
 | `S3_LIFECYCLE_BATCH_SIZE` | `1000` | Maximum rows fetched per lifecycle query |
-| `S3_LIFECYCLE_MAX_ACTIONS_PER_RUN` | `1000` | Maximum destructive or mutating actions per sweep |
+| `S3_LIFECYCLE_MAX_ACTIONS_PER_RUN` | `1000` | Maximum destructive or mutating actions per sweep; also bounds candidates examined per sweep independently |
 | `S3_LIFECYCLE_LOCK_TTL_SECONDS` | `300` | Metadata-backed lifecycle claim TTL; coordinated multi-process runners are a later profile |
 | `S3_MULTIPART_MAX_AGE_SECONDS` | `604800` | Global maximum age for incomplete multipart uploads; exact seconds, `0` disables global cleanup |
 

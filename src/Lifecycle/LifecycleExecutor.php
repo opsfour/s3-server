@@ -39,6 +39,10 @@ final class LifecycleExecutor
 
     private const string SWEEP_CURSOR_ACTION = 'next_bucket';
 
+    private const string STALE_MULTIPART_CHECKPOINT_RULE = '__opsfour_internal_stale_multipart__';
+
+    private const string STALE_MULTIPART_CHECKPOINT_ACTION = 'next_upload';
+
     private readonly string $lockOwnerId;
 
     private readonly StorageTierRegistry $storageTiers;
@@ -208,40 +212,62 @@ final class LifecycleExecutor
      */
     public function processBucket(string $bucket): void
     {
-        $this->processBucketWithBudget($bucket, $this->maxActionsPerRun);
+        $appliedActions = 0;
+        $scannedCandidates = 0;
+        $this->processBucketWithBudget(
+            $bucket,
+            $this->maxActionsPerRun,
+            $this->maxActionsPerRun,
+            $appliedActions,
+            $scannedCandidates,
+        );
     }
 
-    private function processBucketWithBudget(string $bucket, int $actionBudget): int
-    {
+    private function processBucketWithBudget(
+        string $bucket,
+        int $actionBudget,
+        int $candidateBudget,
+        int &$appliedActions,
+        int &$scannedCandidates,
+    ): void {
         $this->renewLeaseIfNeeded();
         $observedBucket = $this->metadata->getBucket($bucket);
         if ($observedBucket === null) {
-            return 0;
+            return;
         }
         $startedAt = hrtime(true);
-        $staleMultipartActions = $this->cleanupStaleMultipartUploads($observedBucket, $actionBudget);
+        $this->cleanupStaleMultipartUploads(
+            $observedBucket,
+            $actionBudget,
+            $candidateBudget,
+            $appliedActions,
+            $scannedCandidates,
+        );
         $rules = $this->metadata->getBucketLifecycle($bucket);
         if ($rules === []) {
-            return $staleMultipartActions;
+            return;
         }
 
-        $remainingActions = max(0, $actionBudget - $staleMultipartActions);
-        $appliedActions = $staleMultipartActions;
+        $remainingActions = max(0, $actionBudget - $appliedActions);
+        $remainingCandidates = max(0, $candidateBudget - $scannedCandidates);
 
         $this->logger->debug('Lifecycle bucket processing started.', $this->lifecycleContext([
             'event' => 'bucket_started',
             'bucket' => $bucket,
             'rules' => count($rules),
             'action_budget' => $actionBudget,
+            'candidate_budget' => $candidateBudget,
         ]));
 
         foreach ($rules as $rule) {
-            if ($remainingActions <= 0) {
-                $this->logger->info('Lifecycle bucket action budget exhausted.', $this->lifecycleContext([
+            if ($remainingActions <= 0 || $remainingCandidates <= 0) {
+                $this->logger->info('Lifecycle bucket budget exhausted.', $this->lifecycleContext([
                     'event' => 'bucket_budget_exhausted',
                     'bucket' => $bucket,
                     'remaining_actions' => $remainingActions,
+                    'remaining_candidates' => $remainingCandidates,
                     'applied_actions' => $appliedActions,
+                    'scanned_candidates' => $scannedCandidates,
                 ]));
 
                 break;
@@ -250,6 +276,9 @@ final class LifecycleExecutor
             $ruleStartedAt = hrtime(true);
             $ruleId = is_string($rule['id'] ?? null) ? $rule['id'] : 'invalid';
             $prefix = null;
+            $ruleActions = 0;
+            $ruleCandidates = 0;
+            $ruleCompleted = false;
 
             try {
                 LifecycleRuleValidator::assertValid($rule);
@@ -263,19 +292,18 @@ final class LifecycleExecutor
                     'rule_id' => $ruleId,
                     'prefix' => $prefix,
                     'action_budget' => $remainingActions,
+                    'candidate_budget' => $remainingCandidates,
                 ]));
-                $ruleActions = $this->processRule($observedBucket, $rule, $prefix, $remainingActions);
-                $remainingActions -= $ruleActions;
-                $appliedActions += $ruleActions;
-                $this->logger->info('Lifecycle rule processing completed.', $this->lifecycleContext([
-                    'event' => 'rule_completed',
-                    'bucket' => $bucket,
-                    'rule_id' => $ruleId,
-                    'prefix' => $prefix,
-                    'applied_actions' => $ruleActions,
-                    'remaining_actions' => $remainingActions,
-                    'duration_ms' => $this->durationMs($ruleStartedAt),
-                ]));
+                $this->processRule(
+                    $observedBucket,
+                    $rule,
+                    $prefix,
+                    $remainingActions,
+                    $remainingCandidates,
+                    $ruleActions,
+                    $ruleCandidates,
+                );
+                $ruleCompleted = true;
             } catch (\Throwable $e) {
                 if ($e instanceof \Amp\CancelledException || $e instanceof \OpsFour\S3Server\Exception\OperationAbortedException) {
                     throw $e;
@@ -287,6 +315,25 @@ final class LifecycleExecutor
                     'prefix' => $prefix,
                     'exception' => $e::class,
                 ]));
+            } finally {
+                $remainingActions -= $ruleActions;
+                $remainingCandidates -= $ruleCandidates;
+                $appliedActions += $ruleActions;
+                $scannedCandidates += $ruleCandidates;
+            }
+
+            if ($ruleCompleted) {
+                $this->logger->info('Lifecycle rule processing completed.', $this->lifecycleContext([
+                    'event' => 'rule_completed',
+                    'bucket' => $bucket,
+                    'rule_id' => $ruleId,
+                    'prefix' => $prefix,
+                    'applied_actions' => $ruleActions,
+                    'scanned_candidates' => $ruleCandidates,
+                    'remaining_actions' => $remainingActions,
+                    'remaining_candidates' => $remainingCandidates,
+                    'duration_ms' => $this->durationMs($ruleStartedAt),
+                ]));
             }
         }
 
@@ -295,25 +342,34 @@ final class LifecycleExecutor
             'bucket' => $bucket,
             'rules' => count($rules),
             'applied_actions' => $appliedActions,
+            'scanned_candidates' => $scannedCandidates,
             'remaining_actions' => $remainingActions,
+            'remaining_candidates' => $remainingCandidates,
             'duration_ms' => $this->durationMs($startedAt),
         ]));
-
-        return $appliedActions;
     }
 
     /** @param array<string, mixed> $rule */
-    private function processRule(BucketInfo $observedBucket, array $rule, ?string $prefix, int $actionBudget): int
-    {
+    private function processRule(
+        BucketInfo $observedBucket,
+        array $rule,
+        ?string $prefix,
+        int $actionBudget,
+        int $candidateBudget,
+        int &$actions,
+        int &$candidates,
+    ): void {
         $this->renewLeaseIfNeeded();
         BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
         $bucket = $observedBucket->name;
-        $actions = 0;
         $tags = $this->ruleTags($rule);
 
-        if (isset($rule['transitions']) && is_array($rule['transitions']) && $actions < $actionBudget) {
+        if (isset($rule['transitions']) && is_array($rule['transitions']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             foreach ($rule['transitions'] as $transition) {
-                if ($actions >= $actionBudget || ! is_array($transition) || ! isset($transition['storageClass'])) {
+                if ($actions >= $actionBudget || $candidates >= $candidateBudget) {
+                    break;
+                }
+                if (! is_array($transition) || ! isset($transition['storageClass'])) {
                     continue;
                 }
 
@@ -326,8 +382,9 @@ final class LifecycleExecutor
 
                 $queued = 0;
                 do {
-                    $limit = min($this->batchSize, $actionBudget - $actions);
+                    $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                     $objects = $this->metadata->listExpiredObjects($bucket, $prefix, $olderThan, $limit, $tags, $checkpoint['cursorKey'] ?? null);
+                    $candidates += count($objects);
 
                     if ($objects === []) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -352,7 +409,7 @@ final class LifecycleExecutor
                     if (count($objects) < $limit) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                     }
-                } while (count($objects) === $limit && $actions < $actionBudget);
+                } while (count($objects) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $queued, [
                     'target_storage_class' => (string) $transition['storageClass'],
@@ -360,9 +417,12 @@ final class LifecycleExecutor
             }
         }
 
-        if (isset($rule['noncurrentTransitions']) && is_array($rule['noncurrentTransitions']) && $actions < $actionBudget) {
+        if (isset($rule['noncurrentTransitions']) && is_array($rule['noncurrentTransitions']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             foreach ($rule['noncurrentTransitions'] as $transition) {
-                if ($actions >= $actionBudget || ! is_array($transition) || ! isset($transition['storageClass'], $transition['noncurrentDays'])) {
+                if ($actions >= $actionBudget || $candidates >= $candidateBudget) {
+                    break;
+                }
+                if (! is_array($transition) || ! isset($transition['storageClass'], $transition['noncurrentDays'])) {
                     continue;
                 }
 
@@ -371,7 +431,7 @@ final class LifecycleExecutor
                 $queued = 0;
 
                 do {
-                    $limit = min($this->batchSize, $actionBudget - $actions);
+                    $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                     $objects = $this->metadata->listExpiredNoncurrentVersions(
                         $bucket,
                         $prefix,
@@ -381,6 +441,7 @@ final class LifecycleExecutor
                         $checkpoint['cursorKey'] ?? null,
                         $checkpoint['cursorVersionId'] ?? null,
                     );
+                    $candidates += count($objects);
 
                     if ($objects === []) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -389,7 +450,7 @@ final class LifecycleExecutor
 
                     foreach ($objects as $obj) {
                         $this->saveObjectCheckpoint($observedBucket, $rule, $action, $obj);
-                        $checkpoint = ['cursorKey' => $obj->key, 'cursorVersionId' => $obj->versionId, 'cursorUploadId' => null];
+                        $checkpoint = ['cursorKey' => $obj->key, 'cursorVersionId' => $obj->versionId ?? 'null', 'cursorUploadId' => null];
 
                         if (! $this->objectMatchesRule($bucket, $obj, $rule)) {
                             continue;
@@ -405,7 +466,7 @@ final class LifecycleExecutor
                     if (count($objects) < $limit) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                     }
-                } while (count($objects) === $limit && $actions < $actionBudget);
+                } while (count($objects) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $queued, [
                     'target_storage_class' => (string) $transition['storageClass'],
@@ -415,7 +476,7 @@ final class LifecycleExecutor
         }
 
         // Expiration by days.
-        if (isset($rule['expiration']['days']) && $actions < $actionBudget) {
+        if (isset($rule['expiration']['days']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             $action = 'expire_current';
             $checkpoint = $this->checkpoint($observedBucket, $rule, $action);
             $days = (int) $rule['expiration']['days'];
@@ -423,8 +484,9 @@ final class LifecycleExecutor
             $deleted = 0;
 
             do {
-                $limit = min($this->batchSize, $actionBudget - $actions);
+                $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                 $expired = $this->metadata->listExpiredObjects($bucket, $prefix, $olderThan, $limit, $tags, $checkpoint['cursorKey'] ?? null);
+                $candidates += count($expired);
 
                 if ($expired === []) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -449,7 +511,7 @@ final class LifecycleExecutor
                 if (count($expired) < $limit) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                 }
-            } while (count($expired) === $limit && $actions < $actionBudget);
+            } while (count($expired) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted, [
                 'expiration_mode' => 'days',
@@ -458,7 +520,7 @@ final class LifecycleExecutor
         }
 
         // Expiration by date.
-        if (isset($rule['expiration']['date']) && $actions < $actionBudget) {
+        if (isset($rule['expiration']['date']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             $action = 'expire_current';
             $checkpoint = $this->checkpoint($observedBucket, $rule, $action);
             $date = new \DateTimeImmutable($rule['expiration']['date']);
@@ -466,8 +528,9 @@ final class LifecycleExecutor
             if ($now >= $date) {
                 $deleted = 0;
                 do {
-                    $limit = min($this->batchSize, $actionBudget - $actions);
+                    $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                     $expired = $this->metadata->listExpiredObjects($bucket, $prefix, $now, $limit, $tags, $checkpoint['cursorKey'] ?? null);
+                    $candidates += count($expired);
 
                     if ($expired === []) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -492,7 +555,7 @@ final class LifecycleExecutor
                     if (count($expired) < $limit) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                     }
-                } while (count($expired) === $limit && $actions < $actionBudget);
+                } while (count($expired) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
                 $this->logActionCompleted($bucket, $rule, $action, $deleted, [
                     'expiration_mode' => 'date',
@@ -502,14 +565,14 @@ final class LifecycleExecutor
         }
 
         // NoncurrentVersionExpiration.
-        if (isset($rule['noncurrentExpiration']['noncurrentDays']) && $actions < $actionBudget) {
+        if (isset($rule['noncurrentExpiration']['noncurrentDays']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             $action = 'expire_noncurrent';
             $checkpoint = $this->checkpoint($observedBucket, $rule, $action);
             $noncurrentDays = (int) $rule['noncurrentExpiration']['noncurrentDays'];
             $deleted = 0;
 
             do {
-                $limit = min($this->batchSize, $actionBudget - $actions);
+                $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                 $expired = $this->metadata->listExpiredNoncurrentVersions(
                     $bucket,
                     $prefix,
@@ -519,6 +582,7 @@ final class LifecycleExecutor
                     $checkpoint['cursorKey'] ?? null,
                     $checkpoint['cursorVersionId'] ?? null,
                 );
+                $candidates += count($expired);
 
                 if ($expired === []) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -551,13 +615,13 @@ final class LifecycleExecutor
                 if (count($expired) < $limit) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                 }
-            } while (count($expired) === $limit && $actions < $actionBudget);
+            } while (count($expired) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted);
         }
 
         // AbortIncompleteMultipartUpload.
-        if (isset($rule['abortIncompleteDays']) && $actions < $actionBudget) {
+        if (isset($rule['abortIncompleteDays']) && $actions < $actionBudget && $candidates < $candidateBudget) {
             $action = 'abort_multipart';
             $checkpoint = $this->checkpoint($observedBucket, $rule, $action);
             $days = (int) $rule['abortIncompleteDays'];
@@ -573,7 +637,7 @@ final class LifecycleExecutor
                 ]));
             } else {
                 do {
-                    $limit = min($this->batchSize, $actionBudget - $actions);
+                    $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                     $expired = $this->metadata->listExpiredMultipartUploads(
                         $bucket,
                         $days,
@@ -582,6 +646,7 @@ final class LifecycleExecutor
                         $checkpoint['cursorKey'] ?? null,
                         $checkpoint['cursorUploadId'] ?? null,
                     );
+                    $candidates += count($expired);
 
                     if ($expired === []) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -616,20 +681,20 @@ final class LifecycleExecutor
                     if (count($expired) < $limit) {
                         $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                     }
-                } while (count($expired) === $limit && $actions < $actionBudget);
+                } while (count($expired) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
             }
 
             $this->logActionCompleted($bucket, $rule, $action, $aborted);
         }
 
         // ExpiredObjectDeleteMarker.
-        if (isset($rule['expiration']['expiredObjectDeleteMarker']) && $rule['expiration']['expiredObjectDeleteMarker'] && $actions < $actionBudget) {
+        if (isset($rule['expiration']['expiredObjectDeleteMarker']) && $rule['expiration']['expiredObjectDeleteMarker'] && $actions < $actionBudget && $candidates < $candidateBudget) {
             $action = 'delete_marker';
             $checkpoint = $this->checkpoint($observedBucket, $rule, $action);
             $deleted = 0;
 
             do {
-                $limit = min($this->batchSize, $actionBudget - $actions);
+                $limit = min($this->batchSize, $actionBudget - $actions, $candidateBudget - $candidates);
                 $orphaned = $this->metadata->listOrphanedDeleteMarkers(
                     $bucket,
                     $prefix,
@@ -638,6 +703,7 @@ final class LifecycleExecutor
                     $checkpoint['cursorKey'] ?? null,
                     $checkpoint['cursorVersionId'] ?? null,
                 );
+                $candidates += count($orphaned);
 
                 if ($orphaned === []) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
@@ -646,30 +712,27 @@ final class LifecycleExecutor
 
                 foreach ($orphaned as $dm) {
                     $this->saveObjectCheckpoint($observedBucket, $rule, $action, $dm);
-                    $checkpoint = ['cursorKey' => $dm->key, 'cursorVersionId' => $dm->versionId, 'cursorUploadId' => null];
+                    $checkpoint = ['cursorKey' => $dm->key, 'cursorVersionId' => $dm->versionId ?? 'null', 'cursorUploadId' => null];
 
                     if (! $this->objectMatchesRule($bucket, $dm, $rule)) {
                         continue;
                     }
 
-                    if ($dm->versionId !== null) {
-                        if ($this->deleteOrphanedMarker($observedBucket, $dm, $rule)) {
-                            $deleted++;
-                            $actions++;
-                            $this->metrics?->recordLifecycleAction($action);
-                        }
+                    if ($this->deleteOrphanedMarker($observedBucket, $dm, $rule)) {
+                        $deleted++;
+                        $actions++;
+                        $this->metrics?->recordLifecycleAction($action);
                     }
                 }
 
                 if (count($orphaned) < $limit) {
                     $this->clearCheckpointIfPresent($observedBucket, $rule, $action, $checkpoint);
                 }
-            } while (count($orphaned) === $limit && $actions < $actionBudget);
+            } while (count($orphaned) === $limit && $actions < $actionBudget && $candidates < $candidateBudget);
 
             $this->logActionCompleted($bucket, $rule, $action, $deleted);
         }
 
-        return $actions;
     }
 
     /**
@@ -879,17 +942,15 @@ final class LifecycleExecutor
     {
         $bucket = $observedBucket->name;
         $bucketOwner = $observedBucket->ownerId;
-        if ($marker->versionId === null) {
-            return false;
-        }
+        $versionId = $marker->versionId ?? 'null';
 
-        return $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $marker, $rule): bool {
+        return $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $marker, $rule, $versionId): bool {
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $marker->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
                 return false;
             }
-            $current = $this->metadata->getObjectMetadataByVersion($bucket, $marker->key, $marker->versionId);
+            $current = $this->metadata->getObjectMetadataByVersion($bucket, $marker->key, $versionId);
             if (
                 $current === null
                 || ! $current->isDeleteMarker
@@ -900,7 +961,7 @@ final class LifecycleExecutor
                 return false;
             }
 
-            return $this->metadata->deleteObjectVersion($bucket, $marker->key, $marker->versionId) !== null;
+            return $this->metadata->deleteObjectVersion($bucket, $marker->key, $versionId) !== null;
         });
     }
 
@@ -1061,9 +1122,16 @@ final class LifecycleExecutor
                 $this->ruleId($rule),
                 $action,
                 $object->key,
-                $action === 'expire_noncurrent' ? ($object->versionId ?? 'null') : $object->versionId,
+                self::actionUsesVersionCursor($action) ? ($object->versionId ?? 'null') : $object->versionId,
             );
         });
+    }
+
+    private static function actionUsesVersionCursor(string $action): bool
+    {
+        return $action === 'expire_noncurrent'
+            || $action === 'delete_marker'
+            || str_starts_with($action, 'transition_noncurrent:');
     }
 
     /** @param array<string, mixed> $rule */
@@ -1149,21 +1217,23 @@ final class LifecycleExecutor
 
         $processed = 0;
         $appliedActions = 0;
+        $scannedCandidates = 0;
         $remainingActions = $this->maxActionsPerRun;
+        $remainingCandidates = $this->maxActionsPerRun;
         $nextBucketName = null;
         foreach ($buckets as $index => $bucket) {
             $this->renewLeaseIfNeeded();
+            $bucketActions = 0;
+            $bucketCandidates = 0;
             try {
-                $bucketActions = $this->processBucketWithBudget($bucket->name, $remainingActions);
-                $appliedActions += $bucketActions;
-                $remainingActions -= $bucketActions;
+                $this->processBucketWithBudget(
+                    $bucket->name,
+                    $remainingActions,
+                    $remainingCandidates,
+                    $bucketActions,
+                    $bucketCandidates,
+                );
                 $processed++;
-                if ($remainingActions <= 0) {
-                    $nextIndex = ($index + 1) % count($buckets);
-                    $nextBucketName = $buckets[$nextIndex]->name;
-
-                    break;
-                }
             } catch (\Throwable $e) {
                 if ($e instanceof \Amp\CancelledException || $e instanceof \OpsFour\S3Server\Exception\OperationAbortedException) {
                     throw $e;
@@ -1176,6 +1246,18 @@ final class LifecycleExecutor
                         'exception' => $e::class,
                     ]),
                 );
+            } finally {
+                $appliedActions += $bucketActions;
+                $scannedCandidates += $bucketCandidates;
+                $remainingActions -= $bucketActions;
+                $remainingCandidates -= $bucketCandidates;
+            }
+
+            if ($remainingActions <= 0 || $remainingCandidates <= 0) {
+                $nextIndex = ($index + 1) % count($buckets);
+                $nextBucketName = $buckets[$nextIndex]->name;
+
+                break;
             }
         }
 
@@ -1199,7 +1281,9 @@ final class LifecycleExecutor
             'processed_buckets' => $processed,
             'total_buckets' => count($buckets),
             'applied_actions' => $appliedActions,
+            'scanned_candidates' => $scannedCandidates,
             'remaining_actions' => $remainingActions,
+            'remaining_candidates' => $remainingCandidates,
         ]));
     }
 
@@ -1272,27 +1356,58 @@ final class LifecycleExecutor
         $this->runnerStopRequested = false;
     }
 
-    private function cleanupStaleMultipartUploads(BucketInfo $observedBucket, ?int $actionBudget = null): int
-    {
+    /**
+     * @param-out int $consumedActions
+     * @param-out int $consumedCandidates
+     * @return array{actions: int, candidates: int}
+     */
+    private function cleanupStaleMultipartUploads(
+        BucketInfo $observedBucket,
+        ?int $actionBudget = null,
+        ?int $candidateBudget = null,
+        ?int &$consumedActions = null,
+        ?int &$consumedCandidates = null,
+    ): array {
+        $consumedActions ??= 0;
+        $consumedCandidates ??= 0;
+        $initialActions = $consumedActions;
+        $initialCandidates = $consumedCandidates;
         $actionBudget ??= $this->maxActionsPerRun;
-        if ($this->multipartMaxAgeSeconds === 0 || $actionBudget <= 0) {
-            return 0;
+        $candidateBudget ??= $this->maxActionsPerRun;
+        if ($this->multipartMaxAgeSeconds === 0 || $actionBudget <= 0 || $candidateBudget <= 0) {
+            return ['actions' => 0, 'candidates' => 0];
         }
 
         $bucket = $observedBucket->name;
+        $checkpoint = $this->staleMultipartCheckpoint($observedBucket);
+        $limit = min($this->batchSize, $actionBudget, $candidateBudget);
         $uploads = $this->metadata->listExpiredMultipartUploads(
             $bucket,
             0,
-            $actionBudget,
+            $limit,
+            afterKey: $checkpoint['cursorKey'] ?? null,
+            afterUploadId: $checkpoint['cursorUploadId'] ?? null,
             createdBefore: (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
                 ->modify("-{$this->multipartMaxAgeSeconds} seconds"),
         );
-        $aborted = 0;
+        $consumedCandidates += count($uploads);
+        if ($uploads === []) {
+            $this->clearStaleMultipartCheckpointIfPresent($observedBucket, $checkpoint);
+
+            return ['actions' => 0, 'candidates' => 0];
+        }
+
         foreach ($uploads as $upload) {
             $this->renewLeaseIfNeeded();
+            $this->saveStaleMultipartCheckpoint($observedBucket, $upload['key_name'], $upload['upload_id']);
+            $checkpoint = [
+                'cursorKey' => $upload['key_name'],
+                'cursorVersionId' => null,
+                'cursorUploadId' => $upload['upload_id'],
+            ];
             try {
                 if ($this->abortMultipartUploadDurably($bucket, $upload['key_name'], $upload['upload_id'], $observedBucket)) {
-                    $aborted++;
+                    $consumedActions++;
                     $this->metrics?->recordLifecycleAction('abort_stale_multipart');
                 }
             } catch (\Throwable $error) {
@@ -1308,7 +1423,60 @@ final class LifecycleExecutor
             }
         }
 
-        return $aborted;
+        if (count($uploads) < $limit) {
+            $this->clearStaleMultipartCheckpointIfPresent($observedBucket, $checkpoint);
+        }
+
+        return [
+            'actions' => $consumedActions - $initialActions,
+            'candidates' => $consumedCandidates - $initialCandidates,
+        ];
+    }
+
+    /** @return array{cursorKey: string|null, cursorVersionId: string|null, cursorUploadId: string|null}|null */
+    private function staleMultipartCheckpoint(BucketInfo $observedBucket): ?array
+    {
+        BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
+
+        return $this->metadata->getLifecycleCheckpoint(
+            $observedBucket->name,
+            self::STALE_MULTIPART_CHECKPOINT_RULE,
+            self::STALE_MULTIPART_CHECKPOINT_ACTION,
+        );
+    }
+
+    private function saveStaleMultipartCheckpoint(BucketInfo $observedBucket, string $key, string $uploadId): void
+    {
+        $this->renewLeaseIfNeeded();
+        $this->metadata->transaction(function () use ($observedBucket, $key, $uploadId): void {
+            OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
+            $this->metadata->putLifecycleCheckpoint(
+                $observedBucket->name,
+                self::STALE_MULTIPART_CHECKPOINT_RULE,
+                self::STALE_MULTIPART_CHECKPOINT_ACTION,
+                $key,
+                cursorUploadId: $uploadId,
+            );
+        });
+    }
+
+    /** @param array{cursorKey: string|null, cursorVersionId: string|null, cursorUploadId: string|null}|null $checkpoint */
+    private function clearStaleMultipartCheckpointIfPresent(BucketInfo $observedBucket, ?array $checkpoint): void
+    {
+        if ($checkpoint === null) {
+            return;
+        }
+
+        $this->metadata->transaction(function () use ($observedBucket): void {
+            OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
+            $this->metadata->deleteLifecycleCheckpoint(
+                $observedBucket->name,
+                self::STALE_MULTIPART_CHECKPOINT_RULE,
+                self::STALE_MULTIPART_CHECKPOINT_ACTION,
+            );
+        });
     }
 
     /** @param array<string, mixed>|null $observedRule */
