@@ -25,10 +25,10 @@ final class MultipartPartIntentCommand extends Command
             ->addArgument('owner-id', InputArgument::REQUIRED, 'Owner/account ID whose retained intents are inspected')
             ->addOption('after-id', null, InputOption::VALUE_REQUIRED, 'Continue after this garbage-row ID', '0')
             ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Rows per page, 1-500', '100')
-            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
-            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null);
+            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', Environment::value('S3_METADATA_DRIVER', 'sqlite'))
+            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', Environment::value('S3_METADATA_DSN', ''))
+            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', Environment::value('S3_STORAGE_PATH'))
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', Environment::value('S3_METADATA_PATH'));
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -48,7 +48,12 @@ final class MultipartPartIntentCommand extends Command
         $sqlitePath = '';
         if ($driver === 'sqlite') {
             $metadataPath = $input->getOption('metadata-path');
-            if (is_string($metadataPath) && $metadataPath !== '') {
+            if (is_string($metadataPath)) {
+                if ($metadataPath === '') {
+                    $io->error('--metadata-path must not be empty when configured.');
+
+                    return Command::FAILURE;
+                }
                 $sqlitePath = SqliteMetadataPathResolver::resolve('', $metadataPath);
             } else {
                 $storagePath = $input->getOption('storage-path');

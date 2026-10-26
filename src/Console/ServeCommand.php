@@ -121,13 +121,18 @@ final class ServeCommand extends Command
 
     private static function envOption(string $name, ?string $default = null): ?string
     {
-        $value = getenv($name);
-
-        return $value === false ? $default : $value;
+        return Environment::value($name, $default);
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
+        $configurationError = $this->preflightConfigurationError($input);
+        if ($configurationError !== null) {
+            $output->writeln('<error>Error: ' . $configurationError . '</error>');
+
+            return Command::FAILURE;
+        }
+
         $storageDriver = (string) $input->getOption('storage-driver');
         $storagePath = $input->getOption('storage-path');
 
@@ -240,11 +245,32 @@ final class ServeCommand extends Command
         return Command::SUCCESS;
     }
 
+    private function preflightConfigurationError(InputInterface $input): ?string
+    {
+        if ((string) $input->getOption('metadata-driver') === 'sqlite'
+            && $input->getOption('metadata-path') === '') {
+            return '--metadata-path must not be empty when configured.';
+        }
+
+        $credentialsDriver = (string) $input->getOption('credentials-driver');
+        $credentialsDsn = $input->getOption('credentials-dsn');
+        if ($credentialsDriver === 'database' && (! is_string($credentialsDsn) || $credentialsDsn === '')) {
+            return '--credentials-dsn is required for the database credentials driver.';
+        }
+
+        $credentialsFile = $input->getOption('credentials-file');
+        if ($credentialsDriver === 'file' && (! is_string($credentialsFile) || $credentialsFile === '')) {
+            return '--credentials-file is required for the file credentials driver.';
+        }
+
+        return null;
+    }
+
     private function configFromInput(InputInterface $input, ?string $storagePath): S3ServerConfig
     {
         if ((string) $input->getOption('storage-driver') !== 'filesystem'
             && (string) $input->getOption('metadata-driver') === 'sqlite'
-            && $this->nullableString($input->getOption('metadata-path')) === null) {
+            && $this->configuredStringOption($input, 'metadata-path') === null) {
             throw new \InvalidArgumentException(
                 '--metadata-path is required when SQLite is used with non-filesystem storage.',
             );
@@ -395,7 +421,7 @@ final class ServeCommand extends Command
         if ($metadataDriver === 'sqlite') {
             $path = SqliteMetadataPathResolver::resolve(
                 $storagePath ?? (string) $input->getOption('storage-temp-dir'),
-                $this->nullableString($input->getOption('metadata-path')),
+                $this->configuredStringOption($input, 'metadata-path'),
             );
             $this->ensureDirectory(dirname($path), 'SQLite metadata');
             $metadataConfig['path'] = $path;
@@ -416,7 +442,7 @@ final class ServeCommand extends Command
     private function sqliteWorkerPoolSize(InputInterface $input): int
     {
         if ((string) $input->getOption('metadata-driver') === 'sqlite'
-            && $this->nullableString($input->getOption('metadata-path')) === ':memory:') {
+            && $this->configuredStringOption($input, 'metadata-path') === ':memory:') {
             return 0;
         }
 
@@ -461,6 +487,19 @@ final class ServeCommand extends Command
         return $value;
     }
 
+    private function configuredStringOption(InputInterface $input, string $name): ?string
+    {
+        $value = $input->getOption($name);
+        if ($value === null) {
+            return null;
+        }
+        if (! is_string($value) || trim($value) === '') {
+            throw new \InvalidArgumentException("--{$name} must not be empty when configured.");
+        }
+
+        return trim($value);
+    }
+
     private function ensureDirectory(string $path, string $purpose): void
     {
         if ($path === '') {
@@ -477,6 +516,20 @@ final class ServeCommand extends Command
     private function buildCredentialProvider(InputInterface $input, OutputInterface $output): ?\OpsFour\S3Server\Contracts\CredentialProvider
     {
         $driver = (string) $input->getOption('credentials-driver');
+
+        $credentialsDsn = $input->getOption('credentials-dsn');
+        if ($driver === 'database' && (! is_string($credentialsDsn) || $credentialsDsn === '')) {
+            $output->writeln('<error>Error: --credentials-dsn is required for the database credentials driver.</error>');
+
+            return null;
+        }
+
+        $credentialsFile = $input->getOption('credentials-file');
+        if ($driver === 'file' && (! is_string($credentialsFile) || $credentialsFile === '')) {
+            $output->writeln('<error>Error: --credentials-file is required for the file credentials driver.</error>');
+
+            return null;
+        }
 
         $config = match ($driver) {
             'memory' => [
@@ -536,20 +589,18 @@ final class ServeCommand extends Command
 
     private static function environmentValue(string $name, string|bool|int|null $default = null): string|bool|int|null
     {
-        $value = getenv($name);
-
-        return $value === false ? $default : $value;
+        return Environment::value($name, $default);
     }
 
     private function adminApiTokenFromEnv(): ?string
     {
-        $token = getenv('S3_ADMIN_API_TOKEN');
-        if ($token !== false) {
+        $token = Environment::value('S3_ADMIN_API_TOKEN');
+        if ($token !== null) {
             return trim($token);
         }
 
-        $externalIamToken = getenv('S3_EXTERNAL_IAM_ADMIN_TOKEN');
-        if ($externalIamToken !== false && trim($externalIamToken) !== '') {
+        $externalIamToken = Environment::value('S3_EXTERNAL_IAM_ADMIN_TOKEN');
+        if ($externalIamToken !== null && trim($externalIamToken) !== '') {
             return trim($externalIamToken);
         }
 

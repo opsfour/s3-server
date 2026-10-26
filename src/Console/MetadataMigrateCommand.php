@@ -19,10 +19,10 @@ final class MetadataMigrateCommand extends Command
     protected function configure(): void
     {
         $this
-            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
-            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
-            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', getenv('S3_STORAGE_PATH') ?: null);
+            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', Environment::value('S3_METADATA_DRIVER', 'sqlite'))
+            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', Environment::value('S3_METADATA_DSN', ''))
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'SQLite metadata database path', Environment::value('S3_METADATA_PATH'))
+            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', Environment::value('S3_STORAGE_PATH'));
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -33,7 +33,12 @@ final class MetadataMigrateCommand extends Command
 
         if ($driver === 'sqlite') {
             $configuredPath = $input->getOption('metadata-path');
-            if (is_string($configuredPath) && $configuredPath !== '') {
+            if (is_string($configuredPath)) {
+                if ($configuredPath === '') {
+                    $io->error('--metadata-path must not be empty when configured.');
+
+                    return Command::FAILURE;
+                }
                 $config['path'] = SqliteMetadataPathResolver::resolve('', $configuredPath);
             } else {
                 $storagePath = $input->getOption('storage-path');

@@ -30,11 +30,11 @@ final class CredentialsCommand extends Command
             ->addOption('display-name', null, InputOption::VALUE_REQUIRED, 'Human-readable display name', '')
             ->addOption('access-key', null, InputOption::VALUE_REQUIRED, 'Custom access key ID (auto-generated if omitted)')
             ->addOption('secret-key', null, InputOption::VALUE_REQUIRED, 'Custom secret key (auto-generated if omitted)')
-            ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: database|file', getenv('S3_CREDENTIALS_DRIVER') ?: 'file')
-            ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'Database DSN (database driver)', getenv('S3_CREDENTIALS_DSN') ?: null)
-            ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Username for credentials database', getenv('S3_CREDENTIALS_USERNAME') ?: null)
-            ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Password for credentials database', getenv('S3_CREDENTIALS_PASSWORD') === false ? null : getenv('S3_CREDENTIALS_PASSWORD'))
-            ->addOption('credentials-file', null, InputOption::VALUE_REQUIRED, 'Path to credentials JSON file (file driver)', getenv('S3_CREDENTIALS_PATH') ?: null);
+            ->addOption('credentials-driver', null, InputOption::VALUE_REQUIRED, 'Credentials backend: database|file', Environment::value('S3_CREDENTIALS_DRIVER', 'file'))
+            ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'Database DSN (database driver)', Environment::value('S3_CREDENTIALS_DSN'))
+            ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Username for credentials database', Environment::value('S3_CREDENTIALS_USERNAME'))
+            ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Password for credentials database', Environment::value('S3_CREDENTIALS_PASSWORD'))
+            ->addOption('credentials-file', null, InputOption::VALUE_REQUIRED, 'Path to credentials JSON file (file driver)', Environment::value('S3_CREDENTIALS_PATH'));
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -82,12 +82,14 @@ final class CredentialsCommand extends Command
             return null;
         }
 
-        if ($driver === 'database' && $input->getOption('credentials-dsn') === null) {
+        $credentialsDsn = $input->getOption('credentials-dsn');
+        if ($driver === 'database' && (! is_string($credentialsDsn) || $credentialsDsn === '')) {
             $io->error('--credentials-dsn is required for the database driver.');
 
             return null;
         }
-        if ($driver === 'file' && $input->getOption('credentials-file') === null) {
+        $credentialsFile = $input->getOption('credentials-file');
+        if ($driver === 'file' && (! is_string($credentialsFile) || $credentialsFile === '')) {
             $io->error('--credentials-file is required for the file driver.');
 
             return null;

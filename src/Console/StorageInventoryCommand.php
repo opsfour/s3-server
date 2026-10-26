@@ -38,10 +38,10 @@ final class StorageInventoryCommand extends Command
     {
         $defaultScratchPath = realpath(sys_get_temp_dir()) ?: sys_get_temp_dir();
         $this
-            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
-            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
-            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root', getenv('S3_STORAGE_PATH') ?: null)
+            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', Environment::value('S3_METADATA_DRIVER', 'sqlite'))
+            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', Environment::value('S3_METADATA_DSN', ''))
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', Environment::value('S3_METADATA_PATH'))
+            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root', Environment::value('S3_STORAGE_PATH'))
             ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping JSON tuple: ["HOT","/canonical/root"]')
             ->addOption('default-storage-tier', null, InputOption::VALUE_REQUIRED, 'Default write tier for metadata rows without a persisted tier')
             ->addOption('page-size', null, InputOption::VALUE_REQUIRED, 'Rows per metadata or physical page, 1-500', '500')
@@ -69,6 +69,12 @@ final class StorageInventoryCommand extends Command
                 StorageReferenceIndex::MIN_MAX_BYTES,
                 StorageReferenceIndex::MAX_MAX_BYTES,
             ));
+            return Command::FAILURE;
+        }
+        if ((string) $input->getOption('metadata-driver') === 'sqlite'
+            && $input->getOption('metadata-path') === '') {
+            $io->error('--metadata-path must not be empty when configured.');
+
             return Command::FAILURE;
         }
 
@@ -159,7 +165,10 @@ final class StorageInventoryCommand extends Command
         $dsn = (string) $input->getOption('metadata-dsn');
         if ($driver === 'sqlite') {
             $configured = $input->getOption('metadata-path');
-            $path = is_string($configured) && $configured !== ''
+            if (is_string($configured) && $configured === '') {
+                throw new \InvalidArgumentException('--metadata-path must not be empty when configured.');
+            }
+            $path = is_string($configured)
                 ? SqliteMetadataPathResolver::resolve('', $configured)
                 : SqliteMetadataPathResolver::resolve($standardRoot);
             $canonicalPath = realpath($path);

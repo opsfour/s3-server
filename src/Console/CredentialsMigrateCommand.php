@@ -18,9 +18,9 @@ final class CredentialsMigrateCommand extends Command
     protected function configure(): void
     {
         $this
-            ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'PDO DSN for the credentials database', getenv('S3_CREDENTIALS_DSN') ?: null)
-            ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Database username', getenv('S3_CREDENTIALS_USERNAME') ?: null)
-            ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Database password', getenv('S3_CREDENTIALS_PASSWORD') === false ? null : getenv('S3_CREDENTIALS_PASSWORD'));
+            ->addOption('credentials-dsn', null, InputOption::VALUE_REQUIRED, 'PDO DSN for the credentials database', Environment::value('S3_CREDENTIALS_DSN'))
+            ->addOption('credentials-username', null, InputOption::VALUE_REQUIRED, 'Database username', Environment::value('S3_CREDENTIALS_USERNAME'))
+            ->addOption('credentials-password', null, InputOption::VALUE_REQUIRED, 'Database password', Environment::value('S3_CREDENTIALS_PASSWORD'));
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int

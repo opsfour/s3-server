@@ -6,11 +6,11 @@ Laravel, they map to `config/s3-server.php`. In Symfony, they can be mirrored in
 service references such as Flysystem filesystems, event listeners, and custom
 encryption services are configured in YAML rather than environment variables.
 
-For the standalone `serve` command, a documented default is used only when its
-environment variable is absent. An explicit value of `0` is preserved exactly;
-an explicitly empty value is also preserved and is then normalized or rejected
-by the option's existing nullable/required validator rather than replaced by a
-default.
+For environment-backed CLI option defaults in all standalone commands, a
+documented default is used only when its environment variable is absent. An
+explicit value of `0` is preserved exactly. Empty handling is option-specific:
+an explicitly empty value is preserved when valid, such as for passwords or
+prefixes, and otherwise rejected rather than replaced by a default.
 
 ## Network
 
@@ -99,7 +99,7 @@ YAML, because each tier needs a named backend and optional service references.
 |----------|---------|-------------|
 | `S3_METADATA_DRIVER` | `sqlite` | Metadata backend: `sqlite`, `postgres`, or `mysql` |
 | `S3_METADATA_DSN` | - | Connection string for postgres/mysql |
-| `S3_METADATA_PATH` | `{storagePath}/.opsfour/metadata.sqlite` | Explicit standalone SQLite database path; an existing legacy `{storagePath}/metadata.sqlite` file remains the automatic default, while the presence of both files requires an explicit choice |
+| `S3_METADATA_PATH` | `{storagePath}/.opsfour/metadata.sqlite` | Explicit standalone SQLite database path; an existing legacy `{storagePath}/metadata.sqlite` file remains the automatic default, while the presence of both files requires an explicit choice. When configured, an explicitly empty value is rejected rather than replaced with a storage-derived path. |
 | `S3_METADATA_CACHE_TTL` | `5.0` | Finite, non-negative CORS metadata cache TTL in seconds (0 to disable); ownership, policies, Public Access Block, encryption, and versioning are always read from the shared store |
 
 See [Metadata Backends](metadata-backends.md) for driver-specific configuration.
@@ -123,13 +123,13 @@ S3_METADATA_DSN="host=localhost;port=3306;dbname=s3server;user=s3;password=secre
 | `S3_SECRET_KEY` | - | Secret access key (memory driver) |
 | `S3_OWNER_ID` | - | Owner/tenant ID (memory driver) |
 | `S3_DISPLAY_NAME` | - | Display name (memory driver) |
-| `S3_CREDENTIALS_DSN` | - | PDO DSN (database driver), for example `pgsql:host=db;port=5432;dbname=s3server` |
+| `S3_CREDENTIALS_DSN` | - | PDO DSN (database driver), for example `pgsql:host=db;port=5432;dbname=s3server`; an explicitly empty configured value is rejected rather than replaced with a default. |
 | `S3_CREDENTIALS_USERNAME` | - | Database username (database driver) |
 | `S3_CREDENTIALS_PASSWORD` | - | Database password (database driver) |
 | `S3_CREDENTIALS_CACHE_TTL` | `1.0` | Positive lookup cache in seconds; `0` observes revocations on the next request |
 | `S3_CREDENTIALS_WORKERS` | `4` | Worker processes that isolate PDO credential operations from the HTTP event loop; `0` opts into synchronous PDO |
 | `S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS` | `15` | Maximum runtime of one credential database operation in a serving process |
-| `S3_CREDENTIALS_PATH` | - | JSON file path (file driver) |
+| `S3_CREDENTIALS_PATH` | - | JSON file path (file driver); an explicitly empty configured value is rejected rather than replaced with a fallback path. |
 
 When a database credential provider is configured, `/.health` performs a
 read-only availability probe against that same provider. Credential database

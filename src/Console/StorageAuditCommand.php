@@ -24,10 +24,10 @@ final class StorageAuditCommand extends Command
     protected function configure(): void
     {
         $this
-            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
-            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
-            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root (shorthand)', getenv('S3_STORAGE_PATH') ?: null)
+            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', Environment::value('S3_METADATA_DRIVER', 'sqlite'))
+            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'PostgreSQL or MySQL DSN', Environment::value('S3_METADATA_DSN', ''))
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', Environment::value('S3_METADATA_PATH'))
+            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Single STANDARD-tier local root (shorthand)', Environment::value('S3_STORAGE_PATH'))
             ->addOption('storage-tier-root', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Byte-exact local tier mapping JSON tuple: ["HOT","/canonical/root"]')
             ->addOption('page-size', null, InputOption::VALUE_REQUIRED, 'Metadata rows per page, 1-10000', '5000')
             ->addOption('max-errors', null, InputOption::VALUE_REQUIRED, 'Maximum issue rows to print, 0-10000', '100');
@@ -41,6 +41,12 @@ final class StorageAuditCommand extends Command
         $maxErrors = filter_var($input->getOption('max-errors'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 0, 'max_range' => 10_000]]);
         if ((! is_string($storagePath) && $storagePath !== null) || $pageSize === false || $maxErrors === false) {
             $io->error('Valid local tier mappings, --page-size 1-10000, and --max-errors 0-10000 are required.');
+
+            return Command::FAILURE;
+        }
+        if ((string) $input->getOption('metadata-driver') === 'sqlite'
+            && $input->getOption('metadata-path') === '') {
+            $io->error('--metadata-path must not be empty when configured.');
 
             return Command::FAILURE;
         }
@@ -112,7 +118,10 @@ final class StorageAuditCommand extends Command
     private function sqlitePath(InputInterface $input, string $storagePath): string
     {
         $metadataPath = $input->getOption('metadata-path');
-        if (is_string($metadataPath) && $metadataPath !== '') {
+        if (is_string($metadataPath)) {
+            if ($metadataPath === '') {
+                throw new \InvalidArgumentException('--metadata-path must not be empty when configured.');
+            }
             return SqliteMetadataPathResolver::resolve('', $metadataPath);
         }
         if ($storagePath === '') {

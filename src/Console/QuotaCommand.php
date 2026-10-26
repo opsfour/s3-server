@@ -30,10 +30,10 @@ final class QuotaCommand extends Command
         $this
             ->addArgument('action', InputArgument::REQUIRED, 'Action: set, show, list, delete')
             ->addArgument('owner-id', InputArgument::OPTIONAL, 'Owner/account ID for set/show/delete')
-            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', getenv('S3_METADATA_DRIVER') ?: 'sqlite')
-            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', getenv('S3_METADATA_DSN') ?: '')
-            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', getenv('S3_STORAGE_PATH') ?: null)
-            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', getenv('S3_METADATA_PATH') ?: null)
+            ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', Environment::value('S3_METADATA_DRIVER', 'sqlite'))
+            ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', Environment::value('S3_METADATA_DSN', ''))
+            ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Storage path used to derive SQLite metadata path', Environment::value('S3_STORAGE_PATH'))
+            ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'Explicit SQLite metadata database path', Environment::value('S3_METADATA_PATH'))
             ->addOption('max-buckets', null, InputOption::VALUE_REQUIRED, 'Maximum buckets for the account (0 = unlimited)', '0')
             ->addOption('max-objects-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum objects per bucket (0 = unlimited)', '0')
             ->addOption('max-bytes-per-bucket', null, InputOption::VALUE_REQUIRED, 'Maximum bytes per bucket (0 = unlimited)', '0')
@@ -81,7 +81,12 @@ final class QuotaCommand extends Command
 
         if ($driver === 'sqlite') {
             $metadataPath = $input->getOption('metadata-path');
-            if ($metadataPath !== null && $metadataPath !== '') {
+            if (is_string($metadataPath)) {
+                if ($metadataPath === '') {
+                    $io->error('--metadata-path must not be empty when configured.');
+
+                    return null;
+                }
                 $config['path'] = SqliteMetadataPathResolver::resolve('', (string) $metadataPath);
             } else {
                 $storagePath = $input->getOption('storage-path');
