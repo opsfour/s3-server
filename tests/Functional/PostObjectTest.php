@@ -62,6 +62,45 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame([['Key' => 'project', 'Value' => 'post-object']], $tags['TagSet']);
     }
 
+    public function test_authenticated_browser_post_sets_auth_type_before_preflight_and_commit_recheck(): void
+    {
+        $prefix = 'auth-type-' . bin2hex(random_bytes(4));
+        $keys = [$prefix . '-v4.txt', $prefix . '-v2.txt'];
+        self::$s3->putBucketPolicy([
+            'Bucket' => self::$bucket,
+            'Policy' => json_encode([
+                'Statement' => [[
+                    'Effect' => 'Deny',
+                    'Principal' => '*',
+                    'Action' => 's3:PutObject',
+                    'Resource' => 'arn:aws:s3:::' . self::$bucket . '/' . $prefix . '-*',
+                    'Condition' => ['StringNotEquals' => ['s3:authType' => 'POST']],
+                ]],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+
+        try {
+            $v4 = $this->postV4($keys[0], 'upload.txt', 'authenticated v4 browser upload');
+            self::assertSame(204, $v4->getStatusCode(), (string) $v4->getBody());
+            self::assertSame('authenticated v4 browser upload', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $keys[0],
+            ])['Body']);
+
+            $v2 = $this->postV2($keys[1], 'upload.txt', 'authenticated v2 browser upload');
+            self::assertSame(204, $v2->getStatusCode(), (string) $v2->getBody());
+            self::assertSame('authenticated v2 browser upload', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $keys[1],
+            ])['Body']);
+        } finally {
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+            foreach ($keys as $key) {
+                self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            }
+        }
+    }
+
     public function test_object_lock_browser_form_requires_and_validates_a_payload_checksum(): void
     {
         $bucket = 'post-lock-' . bin2hex(random_bytes(4));
@@ -864,6 +903,18 @@ final class PostObjectTest extends S3FunctionalTestCase
         ]);
 
         try {
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode([
+                    'Statement' => [[
+                        'Effect' => 'Deny',
+                        'Principal' => '*',
+                        'Action' => 's3:PutObject',
+                        'Resource' => 'arn:aws:s3:::' . self::$bucket . '/anonymous/allowed.txt',
+                        'Condition' => ['Null' => ['s3:authType' => 'false']],
+                    ]],
+                ], JSON_THROW_ON_ERROR),
+            ]);
             $response = $this->postAnonymous('anonymous/allowed.txt', 'public write');
             $this->assertSame(204, $response->getStatusCode(), (string) $response->getBody());
 
@@ -877,6 +928,7 @@ final class PostObjectTest extends S3FunctionalTestCase
                 'Bucket' => self::$bucket,
                 'ACL' => 'private',
             ]);
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
         }
     }
 
@@ -989,6 +1041,25 @@ final class PostObjectTest extends S3FunctionalTestCase
     private function postAnonymous(string $key, string $body): \Psr\Http\Message\ResponseInterface
     {
         return $this->sendMultipart(['key' => $key], 'upload.txt', $body);
+    }
+
+    private function postV2(string $key, string $filename, string $body): \Psr\Http\Message\ResponseInterface
+    {
+        $policy = base64_encode(json_encode([
+            'expiration' => gmdate('Y-m-d\TH:i:s\Z', time() + 300),
+            'conditions' => [
+                ['bucket' => self::$bucket],
+                ['key' => $key],
+                ['AWSAccessKeyId' => self::$accessKey],
+            ],
+        ], JSON_THROW_ON_ERROR));
+
+        return $this->sendMultipart([
+            'key' => $key,
+            'AWSAccessKeyId' => self::$accessKey,
+            'policy' => $policy,
+            'signature' => base64_encode(hash_hmac('sha1', $policy, self::$secretKey, true)),
+        ], $filename, $body);
     }
 
     /**

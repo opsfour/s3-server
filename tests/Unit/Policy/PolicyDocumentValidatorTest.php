@@ -48,6 +48,39 @@ final class PolicyDocumentValidatorTest extends TestCase
         $this->addToAssertionCount(1);
     }
 
+    public function test_auth_type_accepts_only_string_and_null_operators(): void
+    {
+        foreach (['StringEquals', 'StringNotEquals', 'StringLike', 'StringNotLike', 'Null'] as $operator) {
+            PolicyDocumentValidator::validateBucketPolicy(json_encode([
+                'Statement' => [[
+                    'Effect' => 'Allow',
+                    'Principal' => '*',
+                    'Action' => 's3:GetObject',
+                    'Resource' => '*',
+                    'Condition' => [$operator => ['s3:authType' => $operator === 'Null' ? 'false' : 'REST-HEADER']],
+                ]],
+            ], JSON_THROW_ON_ERROR));
+            $this->addToAssertionCount(1);
+        }
+
+        foreach (['Bool', 'ForAnyValue:StringEquals'] as $operator) {
+            try {
+                PolicyDocumentValidator::validateBucketPolicy(json_encode([
+                    'Statement' => [[
+                        'Effect' => 'Allow',
+                        'Principal' => '*',
+                        'Action' => 's3:GetObject',
+                        'Resource' => '*',
+                        'Condition' => [$operator => ['s3:authType' => 'REST-HEADER']],
+                    ]],
+                ], JSON_THROW_ON_ERROR));
+                self::fail("{$operator} must not be accepted for single-valued s3:authType.");
+            } catch (MalformedPolicyException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
     public function test_identity_policy_accepts_empty_statements_and_supported_selectors(): void
     {
         foreach ([

@@ -15,6 +15,7 @@ use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
@@ -30,6 +31,7 @@ use OpsFour\S3Server\Handler\Object\DeleteObjectHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectsHandler;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
+use OpsFour\S3Server\Http\MissingObjectListVisibility;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
@@ -46,6 +48,124 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
     private string $path = '';
 
     private SqliteMetadataStore $metadata;
+
+    public function test_verified_auth_type_reaches_primary_recheck_and_missing_object_visibility_contexts(): void
+    {
+        $this->metadata->putAccountPolicy('owner', $this->policy([[
+            'Effect' => 'Deny',
+            'Action' => ['s3:GetObject', 's3:ListBucket'],
+            'Resource' => '*',
+            'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-HEADER']],
+        ]]));
+        $request = $this->request('GET', '/bucket/public/readme.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'public/readme.txt');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $request->setAttribute('ownerId', 'owner');
+        AuthType::set($request, AuthType::RestHeader);
+
+        $middleware = new PolicyEnforcementMiddleware($this->metadata);
+        self::assertSame(200, $middleware->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+        $middleware->assertAllowedAtReadCommit($request);
+        self::assertTrue(MissingObjectListVisibility::canList($this->metadata, $request, 'bucket'));
+    }
+
+    public function test_raw_auth_type_attribute_is_not_trusted_by_policy_context(): void
+    {
+        $this->metadata->putAccountPolicy('owner', $this->policy([[
+            'Effect' => 'Deny',
+            'Action' => 's3:GetObject',
+            'Resource' => '*',
+            'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-HEADER']],
+        ]]));
+        $request = $this->request('GET', '/bucket/public/readme.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'public/readme.txt');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute(AuthType::REQUEST_ATTRIBUTE, 'REST-HEADER');
+
+        $this->expectException(AccessDeniedException::class);
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest($request, new PolicyTerminalHandler());
+    }
+
+    public function test_anonymous_request_auth_type_is_absent(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/public/readme.txt',
+            'Condition' => ['Null' => ['s3:authType' => 'true']],
+        ]]));
+        $request = $this->request('GET', '/bucket/public/readme.txt');
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'public/readme.txt');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        $request->setAttribute('ownerId', '');
+
+        self::assertSame(200, (new PolicyEnforcementMiddleware($this->metadata))
+            ->handleRequest($request, new PolicyTerminalHandler())->getStatus());
+    }
+
+    public function test_verified_auth_type_reaches_list_buckets_secondary_delete_and_copy_source_checks(): void
+    {
+        $this->metadata->putAccountPolicy('owner', $this->policy([
+            [
+                'Effect' => 'Deny',
+                'Action' => 's3:ListAllMyBuckets',
+                'Resource' => '*',
+                'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-QUERY-STRING']],
+            ],
+            [
+                'Effect' => 'Deny',
+                'Action' => 's3:PutObjectAcl',
+                'Resource' => '*',
+                'Condition' => ['StringNotEquals' => ['s3:authType' => 'POST']],
+            ],
+            [
+                'Effect' => 'Deny',
+                'Action' => ['s3:DeleteObject', 's3:GetObject'],
+                'Resource' => '*',
+                'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-HEADER']],
+            ],
+        ]));
+
+        $list = $this->request('GET', '/');
+        $list->setAttribute('s3.operation', S3Operation::ListBuckets);
+        $list->setAttribute('ownerId', 'owner');
+        AuthType::set($list, AuthType::RestQueryString);
+        self::assertSame(200, (new PolicyEnforcementMiddleware($this->metadata))
+            ->handleRequest($list, new PolicyTerminalHandler())->getStatus());
+
+        $write = $this->request('POST', '/bucket/new.txt', ['x-amz-acl' => 'private']);
+        $write->setAttribute('s3.bucket', 'bucket');
+        $write->setAttribute('s3.key', 'new.txt');
+        $write->setAttribute('s3.operation', S3Operation::PostObject);
+        $write->setAttribute('ownerId', 'owner');
+        AuthType::set($write, AuthType::Post);
+        self::assertSame(200, (new PolicyEnforcementMiddleware($this->metadata))
+            ->handleRequest($write, new PolicyTerminalHandler())->getStatus());
+
+        $delete = $this->request('DELETE', '/bucket/public/readme.txt');
+        AuthType::set($delete, AuthType::RestHeader);
+        self::assertFalse((new ObjectDeletePolicyGuard($this->metadata))->check(
+            $delete,
+            'bucket',
+            'public/readme.txt',
+            null,
+            'owner',
+            'owner',
+        ));
+
+        $copy = $this->request('PUT', '/bucket/copy.txt');
+        $copy->setAttribute('ownerId', 'owner');
+        AuthType::set($copy, AuthType::RestHeader);
+        $object = $this->metadata->getObjectMetadata('bucket', 'public/readme.txt');
+        self::assertNotNull($object);
+        (new ObjectReadAuthorizer($this->metadata))->assertAllowed($copy, $object);
+        $this->addToAssertionCount(1);
+    }
 
     public function test_secure_transport_bucket_deny_uses_client_to_trusted_proxy_tls(): void
     {

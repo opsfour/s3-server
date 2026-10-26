@@ -1155,6 +1155,33 @@ final class AccessLogWriterTest extends TestCase
         self::assertSame([], $metadata->listObjects('log-target')->objects);
     }
 
+    public function test_internal_log_delivery_has_no_request_auth_type(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('alice', 'source', 'us-east-1');
+        $metadata->createBucket('alice', 'log-target', 'us-east-1');
+        $metadata->putBucketLogging('source', 'log-target', 'access/');
+        $metadata->putBucketPolicy('log-target', json_encode([
+            'Statement' => [[
+                'Effect' => 'Deny',
+                'Principal' => 'logging.s3.amazonaws.com',
+                'Action' => 's3:PutObject',
+                'Resource' => 'arn:aws:s3:::log-target/access/*',
+                'Condition' => ['Null' => ['s3:authType' => 'true']],
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('putObject');
+
+        $writer = new AccessLogWriter($metadata, $storage);
+        $writer->log('source', 'private-key', 'GetObject', 200, 42);
+        $writer->flush();
+
+        self::assertSame(1, $writer->getBufferCount());
+        self::assertSame([], $metadata->listObjects('log-target')->objects);
+    }
+
     public function test_target_bucket_policy_deny_added_during_storage_write_discards_staged_log(): void
     {
         $metadata = new SqliteMetadataStore(':memory:');

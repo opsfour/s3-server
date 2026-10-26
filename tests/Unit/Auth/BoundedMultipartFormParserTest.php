@@ -11,7 +11,10 @@ use Amp\Http\Server\FormParser\StreamingFormParser;
 use Amp\Http\Server\HttpErrorException;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Auth\BoundedMultipartFormParser;
+use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Auth\PostObjectFormParser;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Auth\PostObjectTempFileSweeper;
@@ -20,10 +23,69 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\KeyTooLongException;
 use OpsFour\S3Server\Exception\S3Exception;
+use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use PHPUnit\Framework\TestCase;
 
 final class BoundedMultipartFormParserTest extends TestCase
 {
+    /** @param 'v2'|'v4' $signatureVersion */
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidBrowserPostSignatureVersions')]
+    public function test_invalid_signed_browser_post_scrubs_preinstalled_auth_type(string $signatureVersion): void
+    {
+        $credential = new Credential('access-key', 'secret-key', 'owner');
+        $policy = base64_encode(json_encode([
+            'expiration' => gmdate('Y-m-d\TH:i:s\Z', time() + 300),
+            'conditions' => [['bucket' => 'source'], ['key' => 'object']],
+        ], JSON_THROW_ON_ERROR));
+        $fields = ['key' => 'object', 'policy' => $policy];
+        if ($signatureVersion === 'v4') {
+            $dateTime = gmdate('Ymd\THis\Z');
+            $fields += [
+                'x-amz-algorithm' => 'AWS4-HMAC-SHA256',
+                'x-amz-credential' => 'access-key/' . substr($dateTime, 0, 8) . '/us-east-1/s3/aws4_request',
+                'x-amz-date' => $dateTime,
+                'x-amz-signature' => str_repeat('0', 64),
+            ];
+        } else {
+            $fields += [
+                'AWSAccessKeyId' => 'access-key',
+                'signature' => base64_encode(str_repeat("\0", 20)),
+            ];
+        }
+
+        $body = '';
+        foreach ($fields as $name => $value) {
+            $body .= "--guard-boundary\r\n"
+                . 'Content-Disposition: form-data; name="' . $name . "\"\r\n\r\n"
+                . $value . "\r\n";
+        }
+        $body .= "--guard-boundary\r\n"
+            . "Content-Disposition: form-data; name=\"file\"; filename=\"object.txt\"\r\n\r\n"
+            . "payload\r\n--guard-boundary--\r\n";
+        $request = $this->request(new ReadableBuffer($body), 'guard-boundary');
+        AuthType::set($request, AuthType::RestHeader);
+        $parser = new PostObjectFormParser(
+            new InMemoryCredentialProvider($credential),
+            'us-east-1',
+            1_048_576,
+        );
+
+        try {
+            $parser->parse($request);
+            self::fail("An invalid {$signatureVersion} browser POST signature was accepted.");
+        } catch (SignatureDoesNotMatchException) {
+            self::assertNull(AuthType::get($request));
+            self::assertFalse($request->hasAttribute(AuthType::REQUEST_ATTRIBUTE));
+        }
+    }
+
+    /** @return iterable<string, array{'v2'|'v4'}> */
+    public static function invalidBrowserPostSignatureVersions(): iterable
+    {
+        yield 'SigV2' => ['v2'];
+        yield 'SigV4' => ['v4'];
+    }
+
     /** @param class-string<\Throwable> $exception */
     #[\PHPUnit\Framework\Attributes\DataProvider('invalidObjectKeys')]
     public function test_object_key_is_validated_before_authentication_and_spooling(string $key, string $exception): void

@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use OpsFour\S3Server\Acl\AclEvaluator;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
@@ -189,6 +190,7 @@ final readonly class ObjectReadAuthorizer
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
+        AuthType::addToPolicyContext($request, $conditions);
         // s3:VersionId describes the explicit copy-source request parameter,
         // not the current version that metadata resolved implicitly.
         if ($specificVersion && $object->versionId !== null) {

@@ -30,6 +30,7 @@ use OpsFour\S3Server\Routing\S3Operation;
  * - "credential": The resolved Credential object
  * - "ownerId": The tenant/owner ID string
  * - "signedHeaders": Array of signed header names
+ * - "s3.authType": The typed verified authentication mechanism, when authenticated
  *
  * If the request uses chunked SigV4, the body stream is replaced with
  * a verified stream that strips chunked framing and verifies each
@@ -84,6 +85,9 @@ final class AuthMiddleware implements AuthenticationMiddleware
 
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
+        // Never trust a value installed before built-in authentication runs.
+        AuthType::clear($request);
+
         // POST Object (HTML form upload) uses its own authentication via form fields.
         // Skip header SigV4 auth — the form parser verifies V2/V4 policy signatures.
         // Set empty defaults so downstream middleware doesn't crash on missing attributes.
@@ -118,6 +122,9 @@ final class AuthMiddleware implements AuthenticationMiddleware
         $request->setAttribute('credential', $authResult->credential);
         $request->setAttribute('ownerId', $authResult->ownerId);
         $request->setAttribute('signedHeaders', $authResult->signedHeaders);
+        if ($authResult->authType !== null) {
+            AuthType::set($request, $authResult->authType);
+        }
 
         // If chunked SigV4 streaming, wrap the body with signature verification.
         $contentSha = $request->getHeader('x-amz-content-sha256');

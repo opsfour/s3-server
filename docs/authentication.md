@@ -10,7 +10,13 @@ Every request is verified by the `AuthMiddleware`, which supports three authenti
 2. **Presigned URLs** — Time-limited URLs with `X-Amz-Algorithm` query parameter
 3. **Chunked streaming** — `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` for large uploads
 
-On success, the middleware sets request attributes: `credential`, `ownerId`, and `signedHeaders`.
+On success, the middleware sets request attributes: `credential`, `ownerId`, and
+`signedHeaders`. It also carries a typed, verified authentication classification
+into policy evaluation: `REST-HEADER` for header SigV4 (including aws-chunked),
+`REST-QUERY-STRING` for SigV4 presigned URLs, and `POST` for authenticated SigV2
+or SigV4 browser forms. Anonymous, invalid, website, and internal requests do
+not receive a classification. The server never derives this policy value from
+headers, query parameters, methods, form fields, or raw string attributes.
 
 ## Credential Providers
 
@@ -471,6 +477,7 @@ Add your own middleware for custom auth flows:
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 
 class MyAuthMiddleware implements AuthenticationMiddleware
@@ -479,12 +486,19 @@ class MyAuthMiddleware implements AuthenticationMiddleware
     {
         // Your auth logic here
         $request->setAttribute('ownerId', 'verified-owner-id');
+        // Optional: set this only after your own authentication succeeds.
+        AuthType::set($request, AuthType::RestHeader);
         return $handler->handleRequest($request);
     }
 }
 
 $server->addMiddleware(new MyAuthMiddleware());
 ```
+
+Custom authentication remains compatible without this opt-in: policies that
+do not use `s3:authType` behave unchanged, while policies that do use it see the
+key as missing. Supplying the string `REST-HEADER` as a request attribute is not
+an opt-in; policy builders accept only the typed `AuthType` value.
 
 ## Managing Credentials
 

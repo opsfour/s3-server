@@ -164,6 +164,7 @@ final class SignatureV4Verifier
             signature: $parsed['signature'],
             credentialDate: $parsed['date'],
             credentialRegion: $parsed['region'],
+            authType: AuthType::RestHeader,
         );
     }
 

@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\AccessDeniedException;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
@@ -33,6 +34,7 @@ final class MissingObjectListVisibility
                 $listRequest->setAttribute($name, $request->getAttribute($name));
             }
         }
+        AuthType::copy($request, $listRequest);
         $listRequest->setAttribute('s3.bucket', $bucket);
         $listRequest->setAttribute('s3.key', '');
         $listRequest->setAttribute('s3.operation', S3Operation::ListObjectsV2);

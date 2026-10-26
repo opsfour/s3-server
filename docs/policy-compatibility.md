@@ -99,6 +99,7 @@ Bucket policies are limited to 20 KiB, matching the S3 bucket-policy limit.
 | `aws:SecureTransport` | Supported | Direct TLS state, or the single `X-Forwarded-Proto` value supplied by a configured trusted proxy peer. Missing/ambiguous proxy values are insecure. |
 | `aws:SourceIp` | Supported | Direct remote internet address, or the rightmost untrusted `X-Forwarded-For` hop supplied by a configured trusted proxy peer. Missing or invalid forwarded chains are rejected for S3 requests. |
 | `aws:UserAgent` | Supported | `User-Agent` request header. |
+| `s3:authType` | Supported | Verified authentication mechanism: exactly `REST-HEADER`, `REST-QUERY-STRING`, or `POST`. Only `StringEquals`, `StringNotEquals`, `StringLike`, `StringNotLike`, and `Null` are supported for this key. It is absent for anonymous, website, invalid-auth, internal synthetic, and non-opting-in custom-auth requests. |
 | `s3:prefix` | Supported | `prefix` query parameter on list operations. |
 | `s3:delimiter` | Supported | `delimiter` query parameter on list operations. |
 | `s3:max-keys` | Supported | `max-keys` query parameter. |
@@ -109,6 +110,16 @@ Bucket policies are limited to 20 KiB, matching the S3 bucket-policy limit.
 | `s3:x-amz-server-side-encryption` | Supported | `x-amz-server-side-encryption` request header. |
 | `s3:x-amz-storage-class` | Supported | `x-amz-storage-class` request header. |
 | Organization, VPC, source ARN/account keys | Unsupported | There is no AWS Organization/VPC model. |
+
+The authentication type is installed only after successful verification and is
+preserved across primary checks, copy-source and additional-action checks,
+batch deletion, missing-object ListBucket visibility, and commit-time rechecks.
+It is not stored in multipart upload state. Policies that omit `s3:authType`
+retain their previous validation and authorization results. Before upgrading,
+inventory policies injected directly into metadata that already contain
+`s3:authType`: the key previously failed closed as unsupported, while it now has
+the semantics above. The package does not migrate or rewrite those raw policy
+documents.
 
 ## External Credential Scopes
 

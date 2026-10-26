@@ -18,6 +18,8 @@ use GuzzleHttp\Psr7\Request as PsrRequest;
 use League\Uri\Http;
 use OpsFour\S3Server\Auth\CanonicalRequest;
 use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\AuthResult;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Auth\PresignedUrlValidator;
@@ -31,6 +33,15 @@ use PHPUnit\Framework\TestCase;
 
 final class SessionCredentialVerifierTest extends TestCase
 {
+    public function test_auth_result_keeps_existing_constructor_compatible(): void
+    {
+        $credential = $this->temporaryCredential();
+        $result = new AuthResult($credential, $credential->ownerId, []);
+
+        self::assertSame($credential, $result->credential);
+        self::assertNull($result->authType);
+    }
+
     public function test_header_sigv4_accepts_valid_session_token(): void
     {
         $credential = $this->temporaryCredential();
@@ -43,6 +54,7 @@ final class SessionCredentialVerifierTest extends TestCase
         );
 
         $this->assertSame('tenant:acme', $result->ownerId);
+        $this->assertSame(AuthType::RestHeader, $result->authType);
     }
 
     public function test_header_sigv4_accepts_basic_utc_date_header_without_amz_date(): void
@@ -106,6 +118,7 @@ final class SessionCredentialVerifierTest extends TestCase
         self::assertSame(200, $response->getStatus());
         self::assertNull($request->getHeader('content-encoding'));
         self::assertSame($payload, $response->getBody()->read());
+        self::assertSame(AuthType::RestHeader, AuthType::get($request));
     }
 
     public function test_header_sigv4_rejects_rfc_date_header_used_for_signing(): void
@@ -372,6 +385,83 @@ final class SessionCredentialVerifierTest extends TestCase
         );
 
         $this->assertSame('tenant:acme', $result->ownerId);
+        $this->assertSame(AuthType::RestQueryString, $result->authType);
+    }
+
+    public function test_built_in_authentication_scrubs_untrusted_auth_type_before_a_failed_signature(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->signedHeaderRequest($credential, $credential->sessionToken);
+        AuthType::set($request, AuthType::RestQueryString);
+        $authorization = $request->getHeader('authorization');
+        self::assertNotNull($authorization);
+        $request->setHeader('authorization', substr($authorization, 0, -1) . ($authorization[-1] === '0' ? '1' : '0'));
+
+        try {
+            (new AuthMiddleware(new InMemoryCredentialProvider($credential), 'us-east-1'))->handleRequest(
+                $request,
+                new class implements RequestHandler {
+                    public function handleRequest(Request $request): Response
+                    {
+                        return new Response(200);
+                    }
+                },
+            );
+            self::fail('A request with an invalid signature was accepted.');
+        } catch (SignatureDoesNotMatchException) {
+            self::assertNull(AuthType::get($request));
+            self::assertFalse($request->hasAttribute(AuthType::REQUEST_ATTRIBUTE));
+        }
+    }
+
+    public function test_invalid_presign_never_installs_auth_type(): void
+    {
+        $credential = $this->temporaryCredential();
+        $request = $this->presignedRequest($credential, $credential->sessionToken);
+        AuthType::set($request, AuthType::RestHeader);
+        $uri = $request->getUri();
+        $request->setUri($uri->withQuery(preg_replace(
+            '/X-Amz-Signature=[a-f0-9]+/',
+            'X-Amz-Signature=' . str_repeat('0', 64),
+            $uri->getQuery(),
+        ) ?? $uri->getQuery()));
+
+        try {
+            (new AuthMiddleware(new InMemoryCredentialProvider($credential), 'us-east-1'))->handleRequest(
+                $request,
+                new class implements RequestHandler {
+                    public function handleRequest(Request $request): Response
+                    {
+                        return new Response(200);
+                    }
+                },
+            );
+            self::fail('A request with an invalid presign was accepted.');
+        } catch (SignatureDoesNotMatchException) {
+            self::assertNull(AuthType::get($request));
+            self::assertFalse($request->hasAttribute(AuthType::REQUEST_ATTRIBUTE));
+        }
+    }
+
+    public function test_anonymous_authentication_scrubs_preinstalled_typed_auth_type(): void
+    {
+        $request = $this->request('GET', '/bucket/key.txt', ['host' => ['127.0.0.1']]);
+        AuthType::set($request, AuthType::Post);
+
+        $response = (new AuthMiddleware(new InMemoryCredentialProvider(), 'us-east-1'))->handleRequest(
+            $request,
+            new class implements RequestHandler {
+                public function handleRequest(Request $request): Response
+                {
+                    return new Response(200, body: (string) $request->getAttribute('ownerId'));
+                }
+            },
+        );
+
+        self::assertSame(200, $response->getStatus());
+        self::assertNull($response->getBody()->read());
+        self::assertNull(AuthType::get($request));
+        self::assertFalse($request->hasAttribute(AuthType::REQUEST_ATTRIBUTE));
     }
 
     public function test_presigned_url_accepts_literal_plus_in_signed_session_token(): void

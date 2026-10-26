@@ -20,6 +20,7 @@ final class AuthResult
      * @param  string  $signature  The hex signature from the Authorization header (for chunked streaming).
      * @param  string  $credentialDate  The date portion from the credential scope (YYYYMMDD).
      * @param  string  $credentialRegion  The region from the credential scope.
+     * @param  AuthType|null  $authType  The verified authentication mechanism.
      */
     public function __construct(
         public private(set) Credential $credential,
@@ -28,5 +29,6 @@ final class AuthResult
         public private(set) string $signature = '',
         public private(set) string $credentialDate = '',
         public private(set) string $credentialRegion = '',
+        public private(set) ?AuthType $authType = null,
     ) {}
 }

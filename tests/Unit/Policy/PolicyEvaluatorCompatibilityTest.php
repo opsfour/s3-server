@@ -928,6 +928,62 @@ final class PolicyEvaluatorCompatibilityTest extends TestCase
         ));
     }
 
+    public function test_auth_type_conditions_are_case_sensitive_and_retain_missing_key_semantics(): void
+    {
+        foreach (['StringEquals', 'StringLike'] as $operator) {
+            $policy = $this->policy([[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => '*',
+                'Condition' => [$operator => ['s3:authType' => 'REST-*']],
+            ]]);
+            $expected = $operator === 'StringEquals' ? 'Neutral' : 'Allow';
+            self::assertSame($expected, PolicyEvaluator::evaluate(
+                $policy,
+                's3:GetObject',
+                'arn:aws:s3:::bucket/key',
+                'tenant',
+                ['s3:authType' => 'REST-HEADER'],
+            ));
+            self::assertSame('Neutral', PolicyEvaluator::evaluate(
+                $policy,
+                's3:GetObject',
+                'arn:aws:s3:::bucket/key',
+                'tenant',
+                ['s3:authType' => 'rest-header'],
+            ));
+        }
+
+        $notHeader = $this->policy([[
+            'Effect' => 'Deny',
+            'Principal' => '*',
+            'Action' => 's3:GetObject',
+            'Resource' => '*',
+            'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-HEADER']],
+        ]]);
+        self::assertSame('Deny', PolicyEvaluator::evaluate(
+            $notHeader,
+            's3:GetObject',
+            'arn:aws:s3:::bucket/key',
+            'anonymous',
+        ));
+
+        $missing = $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => '*',
+            'Action' => 's3:GetObject',
+            'Resource' => '*',
+            'Condition' => ['Null' => ['s3:authType' => 'true']],
+        ]]);
+        self::assertSame('Allow', PolicyEvaluator::evaluate(
+            $missing,
+            's3:GetObject',
+            'arn:aws:s3:::bucket/key',
+            'anonymous',
+        ));
+    }
+
     /**
      * @param list<array<string, mixed>> $statements
      */

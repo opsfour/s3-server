@@ -45,6 +45,7 @@ final class PolicyEvaluator
         'aws:SourceIp',
         'aws:UserAgent',
         's3:delimiter',
+        's3:authType',
         's3:max-keys',
         's3:prefix',
         's3:VersionId',
@@ -569,7 +570,17 @@ final class PolicyEvaluator
 
     public static function supportsCondition(string $operator, string $key): bool
     {
-        [, $baseOperator] = self::parseOperator($operator);
+        [$setModifier, $baseOperator] = self::parseOperator($operator);
+
+        if ($key === 's3:authType') {
+            return $setModifier === null && in_array($baseOperator, [
+                'Null',
+                'StringEquals',
+                'StringNotEquals',
+                'StringLike',
+                'StringNotLike',
+            ], true);
+        }
 
         return in_array($baseOperator, self::SUPPORTED_CONDITION_OPERATORS, true)
             && self::isSupportedConditionKey($key);

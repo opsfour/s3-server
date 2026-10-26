@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
@@ -439,6 +440,7 @@ final class PolicyEnforcementMiddleware implements Middleware
             }
         }
         $conditions['aws:CurrentTime'] = gmdate(\DateTimeInterface::ATOM);
+        AuthType::addToPolicyContext($request, $conditions);
 
         $requestTags = $this->requestObjectTags($request, $operation);
         foreach ($requestTags as $tagKey => $tagValue) {
@@ -680,6 +682,7 @@ final class PolicyEnforcementMiddleware implements Middleware
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
+        AuthType::addToPolicyContext($request, $conditions);
 
         $policies = [];
         $accountPolicy = $this->metadata->getAccountPolicy($ownerId);

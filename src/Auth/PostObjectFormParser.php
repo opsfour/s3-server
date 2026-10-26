@@ -79,6 +79,10 @@ final class PostObjectFormParser
 
     public function parse(Request $request): PostObjectForm
     {
+        // Browser form authentication owns this value; discard anything an
+        // earlier request component attempted to inject.
+        AuthType::clear($request);
+
         $contentType = RequestHeaderValues::singleton($request, 'content-type') ?? '';
         // The multipart boundary itself is limited to 70 bytes by RFC 2046.
         // Bound the whole header before the upstream boundary regex sees it.
@@ -153,6 +157,7 @@ final class PostObjectFormParser
                     // attacker-controlled body to temporary disk.
                     [$credential, $policy] = $this->authenticate($fields);
                     if ($credential !== null) {
+                        AuthType::set($request, AuthType::Post);
                         $request->setAttribute(
                             's3.signatureVersion',
                             self::value($fields, 'x-amz-algorithm') !== null ? 'SigV4' : 'SigV2',

@@ -6,6 +6,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add the verified `s3:authType` policy condition with `REST-HEADER`,
+  `REST-QUERY-STRING`, and `POST` values propagated through request-derived
+  authorization checks without trusting transport-shaped input.
+
 ## [2.0.0] - 2026-10-26
 
 ### Added

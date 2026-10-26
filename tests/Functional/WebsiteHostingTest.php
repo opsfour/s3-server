@@ -217,6 +217,7 @@ final class WebsiteHostingTest extends S3FunctionalTestCase
                     'Principal' => '*',
                     'Action' => 's3:GetObject',
                     'Resource' => 'arn:aws:s3:::' . self::$bucket . '/*',
+                    'Condition' => ['Null' => ['s3:authType' => 'true']],
                 ]],
             ], JSON_THROW_ON_ERROR),
         ]);

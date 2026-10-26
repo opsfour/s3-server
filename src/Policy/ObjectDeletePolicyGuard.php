@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Policy;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Acl\AclEvaluator;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\AccessDeniedException;
@@ -42,6 +43,7 @@ final class ObjectDeletePolicyGuard
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
+        AuthType::addToPolicyContext($request, $conditions);
         if ($versionId !== null) {
             $conditions['s3:VersionId'] = $versionId;
         }

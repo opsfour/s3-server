@@ -9,6 +9,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
@@ -72,6 +73,10 @@ final class WebsiteHostingMiddleware implements Middleware
         if (!in_array($request->getMethod(), ['GET', 'HEAD'], true)) {
             return $requestHandler->handleRequest($request);
         }
+
+        // Website authorization is always anonymous, even if an upstream
+        // component supplied a request attribute with the reserved name.
+        AuthType::clear($request);
 
         return (new CorsMiddleware($this->metadata))->handleRequest(
             $request,

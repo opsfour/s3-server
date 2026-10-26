@@ -189,6 +189,7 @@ final class PresignedUrlValidator
             credential: $credential,
             ownerId: $credential->ownerId,
             signedHeaders: $signedHeaders,
+            authType: AuthType::RestQueryString,
         );
     }
 

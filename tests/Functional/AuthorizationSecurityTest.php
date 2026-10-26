@@ -28,6 +28,58 @@ final class AuthorizationSecurityTest extends S3FunctionalTestCase
         ]);
     }
 
+    public function test_policy_context_distinguishes_verified_header_and_presigned_authentication(): void
+    {
+        $resource = 'arn:aws:s3:::' . self::$bucket . '/protected.txt';
+        $http = new Client(['http_errors' => false]);
+
+        try {
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode([
+                    'Statement' => [[
+                        'Effect' => 'Deny',
+                        'Principal' => '*',
+                        'Action' => 's3:GetObject',
+                        'Resource' => $resource,
+                        'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-HEADER']],
+                    ]],
+                ], JSON_THROW_ON_ERROR),
+            ]);
+            self::assertSame('protected', (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => 'protected.txt',
+            ])['Body']);
+            $presigned = self::$s3->createPresignedRequest(
+                self::$s3->getCommand('GetObject', ['Bucket' => self::$bucket, 'Key' => 'protected.txt']),
+                '+5 minutes',
+            );
+            self::assertSame(403, $http->get((string) $presigned->getUri())->getStatusCode());
+
+            self::$s3->putBucketPolicy([
+                'Bucket' => self::$bucket,
+                'Policy' => json_encode([
+                    'Statement' => [[
+                        'Effect' => 'Deny',
+                        'Principal' => '*',
+                        'Action' => 's3:GetObject',
+                        'Resource' => $resource,
+                        'Condition' => ['StringNotEquals' => ['s3:authType' => 'REST-QUERY-STRING']],
+                    ]],
+                ], JSON_THROW_ON_ERROR),
+            ]);
+            $presigned = self::$s3->createPresignedRequest(
+                self::$s3->getCommand('GetObject', ['Bucket' => self::$bucket, 'Key' => 'protected.txt']),
+                '+5 minutes',
+            );
+            $response = $http->get((string) $presigned->getUri());
+            self::assertSame(200, $response->getStatusCode());
+            self::assertSame('protected', (string) $response->getBody());
+        } finally {
+            self::$s3->deleteBucketPolicy(['Bucket' => self::$bucket]);
+        }
+    }
+
     public function test_anonymous_create_bucket_is_denied(): void
     {
         $bucket = 'anonymous-create-' . bin2hex(random_bytes(4));

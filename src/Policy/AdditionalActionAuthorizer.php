@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Policy;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\AuthType;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
@@ -45,6 +46,7 @@ final readonly class AdditionalActionAuthorizer
         if ($userAgent !== null && $userAgent !== '') {
             $conditions['aws:UserAgent'] = $userAgent;
         }
+        AuthType::addToPolicyContext($request, $conditions);
         foreach (['x-amz-acl', 'x-amz-server-side-encryption', 'x-amz-storage-class'] as $header) {
             $value = $conditionHeaders !== null
                 ? ($conditionHeaders[$header] ?? null)
