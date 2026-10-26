@@ -462,7 +462,7 @@ final class WebsiteHostingMiddleware implements Middleware
                 policyJson: $policy,
                 action: 's3:GetObject',
                 resource: "arn:aws:s3:::{$bucket}/{$key}",
-                principal: 'anonymous',
+                principal: '',
                 conditions: $this->policyConditions($request, $object),
             );
 

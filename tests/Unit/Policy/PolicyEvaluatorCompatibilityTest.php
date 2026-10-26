@@ -36,6 +36,29 @@ final class PolicyEvaluatorCompatibilityTest extends TestCase
         ));
     }
 
+    public function test_an_owner_named_anonymous_remains_an_exact_explicit_principal(): void
+    {
+        $policy = $this->policy([[
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'anonymous'],
+            'Action' => 's3:GetObject',
+            'Resource' => 'arn:aws:s3:::bucket/key',
+        ]]);
+
+        self::assertSame('Allow', PolicyEvaluator::evaluate(
+            $policy,
+            's3:GetObject',
+            'arn:aws:s3:::bucket/key',
+            'anonymous',
+        ));
+        self::assertSame('Neutral', PolicyEvaluator::evaluate(
+            $policy,
+            's3:GetObject',
+            'arn:aws:s3:::bucket/key',
+            '',
+        ));
+    }
+
     public function test_malformed_negated_selectors_fail_closed_in_stored_policies(): void
     {
         foreach ([

@@ -311,6 +311,37 @@ final class RestoreAwareObjectReadTest extends TestCase
         self::assertStringContainsString('AccessDenied', \Amp\ByteStream\buffer($response->getBody()));
     }
 
+    public function test_website_anonymous_request_does_not_assume_an_owner_named_anonymous(): void
+    {
+        $write = $this->hot->putObject('bucket', 'index.html', new ReadableBuffer('private owner content'));
+        $this->putMetadata('index.html', $write->path, $write->size, $write->md5Hex);
+        $this->metadata->putBucketWebsite('bucket', 'index.html');
+        $this->metadata->putBucketPolicy('bucket', json_encode([
+            'Version' => '2012-10-17',
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => ['AWS' => 'anonymous'],
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::bucket/index.html',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $middleware = new WebsiteHostingMiddleware($this->metadata, $this->tiers, '*.s3-website.test');
+        $request = $this->websiteRequest('GET', '/', 'bucket.s3-website.test');
+
+        $privateResponse = $middleware->handleRequest($request, new RestoreWebsiteTerminalHandler());
+
+        self::assertSame(403, $privateResponse->getStatus());
+        $privateBody = \Amp\ByteStream\buffer($privateResponse->getBody());
+        self::assertStringContainsString('AccessDenied', $privateBody);
+        self::assertStringNotContainsString('private owner content', $privateBody);
+
+        $this->allowPublicReadByPolicy();
+        $publicResponse = $middleware->handleRequest($request, new RestoreWebsiteTerminalHandler());
+
+        self::assertSame(200, $publicResponse->getStatus());
+        self::assertSame('private owner content', \Amp\ByteStream\buffer($publicResponse->getBody()));
+    }
+
     public function test_website_endpoint_serves_public_acl_object_from_configured_tier(): void
     {
         $publicTier = new InMemoryBackend();
