@@ -17,6 +17,8 @@
         "ext-libxml": "*",
         "ext-mbstring": "*",
         "ext-openssl": "*",
+        "ext-pcntl": "*",
+        "ext-posix": "*",
         "ext-simplexml": "*",
         "amphp/amp": "^3.1.2",
         "amphp/http-client": "^5.3",

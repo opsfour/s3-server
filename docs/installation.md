@@ -9,8 +9,8 @@
   - `ext-pdo_sqlite` (default metadata backend)
   - `ext-pdo_pgsql` (optional, for PostgreSQL metadata)
   - `ext-pdo_mysql` (optional, for MySQL metadata)
-  - `ext-pcntl` (recommended, for signal handling)
-  - `ext-posix` (required on Unix when writing credentials with the file provider)
+  - `ext-pcntl` (required for Linux process control and signal handling)
+  - `ext-posix` (required for process and credential-file ownership verification)
 - PHP's `proc_open` function must be enabled for the package's local helper
   worker processes.
 - **PostgreSQL API nodes:** `pecl-pq` and its `pecl-raphf` dependency are

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- PHP 8.4+ with extensions: mbstring, openssl, pdo_sqlite, pcntl
+- PHP 8.4+ with extensions: mbstring, openssl, pdo_sqlite, pcntl, posix
 - Composer 2.x
 
 ## Setup

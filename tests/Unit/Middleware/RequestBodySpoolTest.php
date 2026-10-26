@@ -20,10 +20,13 @@ use Amp\Parallel\Worker\WorkerPool;
 use Amp\Sync\Channel;
 use Amp\TimeoutCancellation;
 use League\Uri\Http;
+use OpsFour\S3Server\Auth\ChunkedSignatureVerifier;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
+use OpsFour\S3Server\Auth\UnsignedChunkedTrailerDecoder;
 use OpsFour\S3Server\Exception\BadDigestException;
-use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\RequestBodySpool;
@@ -35,6 +38,8 @@ use function Amp\Future\await;
 
 final class RequestBodySpoolTest extends TestCase
 {
+    private const string EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
     public function test_stale_sweep_cancellation_is_not_ignored_before_create(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
@@ -185,7 +190,234 @@ final class RequestBodySpoolTest extends TestCase
             'content-md5' => $emptyMd5,
             'x-amz-content-sha256' => $emptySha256,
         ], true];
-        yield 'special SHA-256 remains skipped' => ['ignored', ['x-amz-content-sha256' => 'UNSIGNED-PAYLOAD'], true];
+        yield 'empty unsigned payload' => ['', ['x-amz-content-sha256' => 'UNSIGNED-PAYLOAD'], true];
+        yield 'non-empty unsigned payload' => ['payload', ['x-amz-content-sha256' => 'UNSIGNED-PAYLOAD'], false];
+        yield 'empty payload without a hash' => ['', [], true];
+        yield 'non-empty payload without a hash' => ['payload', [], false];
+        yield 'empty aws-chunked payload' => ['', [
+            'x-amz-content-sha256' => 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'x-amz-decoded-content-length' => '0',
+        ], true];
+        yield 'non-zero aws-chunked decoded length' => ['', [
+            'x-amz-content-sha256' => 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'x-amz-decoded-content-length' => '1',
+        ], false];
+    }
+
+    public function test_bodyless_real_aws_chunked_decoders_dispatch_only_valid_empty_payloads(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('submit');
+        $middleware = new ChecksumValidationMiddleware(new RequestBodySpool($pool, $tempDir));
+        $handlerCalls = 0;
+        $handler = new class (static function () use (&$handlerCalls): void {
+            $handlerCalls++;
+        }) implements RequestHandler {
+            public function __construct(private readonly \Closure $onCall) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ($this->onCall)();
+
+                return new Response(204);
+            }
+        };
+        $key = random_bytes(32);
+        $timestamp = '20261026T120000Z';
+        $scope = '20261026/us-east-1/s3/aws4_request';
+        $seed = str_repeat('a', 64);
+        $checksum = base64_encode(hash('sha256', '', true));
+        $signedVerifier = new ChunkedSignatureVerifier();
+
+        $cases = [
+            'signed' => [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+                $signedVerifier->createVerifiedStream(
+                    new ReadableBuffer($this->signedEmptyBody($key, $timestamp, $scope, $seed)),
+                    $key,
+                    $timestamp,
+                    $scope,
+                    $seed,
+                ),
+            ],
+            'signed trailer' => [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+                $signedVerifier->createVerifiedStream(
+                    new ReadableBuffer($this->signedEmptyTrailerBody($key, $timestamp, $scope, $seed, $checksum)),
+                    $key,
+                    $timestamp,
+                    $scope,
+                    $seed,
+                    ['x-amz-checksum-sha256'],
+                ),
+            ],
+            'unsigned trailer' => [
+                'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                (new UnsignedChunkedTrailerDecoder())->createDecodedStream(
+                    new ReadableBuffer("0\r\nx-amz-checksum-sha256:{$checksum}\r\n\r\n"),
+                    ['x-amz-checksum-sha256'],
+                ),
+            ],
+        ];
+
+        try {
+            foreach ($cases as $label => [$marker, $body]) {
+                $request = $this->bodylessRequest($body, [
+                    'x-amz-content-sha256' => $marker,
+                    'x-amz-decoded-content-length' => '0',
+                ]);
+                self::assertSame(
+                    204,
+                    $middleware->handleRequest($request, $handler)->getStatus(),
+                    "The valid empty {$label} body must dispatch.",
+                );
+            }
+            self::assertSame(3, $handlerCalls);
+        } finally {
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    public function test_bodyless_real_aws_chunked_decoder_failures_never_dispatch(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('submit');
+        $middleware = new ChecksumValidationMiddleware(new RequestBodySpool($pool, $tempDir));
+        $handlerCalls = 0;
+        $handler = new class (static function () use (&$handlerCalls): void {
+            $handlerCalls++;
+        }) implements RequestHandler {
+            public function __construct(private readonly \Closure $onCall) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ($this->onCall)();
+
+                return new Response(204);
+            }
+        };
+        $key = random_bytes(32);
+        $timestamp = '20261026T120000Z';
+        $scope = '20261026/us-east-1/s3/aws4_request';
+        $seed = str_repeat('b', 64);
+        $badChecksum = base64_encode(hash('sha256', 'not-empty', true));
+        $signedVerifier = new ChunkedSignatureVerifier();
+        $failures = [
+            'signature' => [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+                $signedVerifier->createVerifiedStream(
+                    new ReadableBuffer('0;chunk-signature=' . str_repeat('0', 64) . "\r\n\r\n"),
+                    $key,
+                    $timestamp,
+                    $scope,
+                    $seed,
+                ),
+                SignatureDoesNotMatchException::class,
+            ],
+            'terminal chunk' => [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+                $signedVerifier->createVerifiedStream(
+                    new ReadableBuffer(''),
+                    $key,
+                    $timestamp,
+                    $scope,
+                    $seed,
+                ),
+                InternalErrorException::class,
+            ],
+            'signed trailer checksum' => [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+                $signedVerifier->createVerifiedStream(
+                    new ReadableBuffer($this->signedEmptyTrailerBody($key, $timestamp, $scope, $seed, $badChecksum)),
+                    $key,
+                    $timestamp,
+                    $scope,
+                    $seed,
+                    ['x-amz-checksum-sha256'],
+                ),
+                BadDigestException::class,
+            ],
+            'unsigned trailer checksum' => [
+                'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                (new UnsignedChunkedTrailerDecoder())->createDecodedStream(
+                    new ReadableBuffer("0\r\nx-amz-checksum-sha256:{$badChecksum}\r\n\r\n"),
+                    ['x-amz-checksum-sha256'],
+                ),
+                BadDigestException::class,
+            ],
+        ];
+
+        try {
+            foreach ($failures as $label => [$marker, $body, $expectedException]) {
+                $request = $this->bodylessRequest($body, [
+                    'x-amz-content-sha256' => $marker,
+                    'x-amz-decoded-content-length' => '0',
+                ]);
+                try {
+                    $middleware->handleRequest($request, $handler);
+                    self::fail("The {$label} failure must prevent dispatch.");
+                } catch (\Throwable $error) {
+                    self::assertInstanceOf($expectedException, $error);
+                    self::assertSame(0, $handlerCalls);
+                }
+            }
+        } finally {
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    public function test_bodyless_payload_rejection_closes_streams_promptly(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::never())->method('submit');
+        $middleware = new ChecksumValidationMiddleware(new RequestBodySpool($pool, $tempDir));
+        $handler = $this->createMock(RequestHandler::class);
+        $handler->expects(self::never())->method('handleRequest');
+
+        try {
+            $nonzeroCloseCalls = 0;
+            $nonzero = $this->createMock(ReadableStream::class);
+            $nonzero->expects(self::never())->method('read');
+            $nonzero->expects(self::atLeastOnce())->method('close')->willReturnCallback(
+                static function () use (&$nonzeroCloseCalls): void {
+                    $nonzeroCloseCalls++;
+                },
+            );
+            try {
+                $middleware->handleRequest($this->bodylessRequest($nonzero, [
+                    'x-amz-content-sha256' => 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+                    'x-amz-decoded-content-length' => '1',
+                ]), $handler);
+                self::fail('A non-zero decoded length must be rejected.');
+            } catch (BadDigestException) {
+                self::assertGreaterThanOrEqual(1, $nonzeroCloseCalls);
+            }
+
+            $nonemptyCloseCalls = 0;
+            $nonempty = $this->createMock(ReadableStream::class);
+            $nonempty->expects(self::once())->method('read')->willReturn('payload');
+            $nonempty->expects(self::atLeastOnce())->method('close')->willReturnCallback(
+                static function () use (&$nonemptyCloseCalls): void {
+                    $nonemptyCloseCalls++;
+                },
+            );
+            try {
+                $middleware->handleRequest($this->bodylessRequest($nonempty, [
+                    'x-amz-content-sha256' => 'UNSIGNED-PAYLOAD',
+                ]), $handler);
+                self::fail('A non-empty decoded body must be rejected.');
+            } catch (BadDigestException) {
+                self::assertGreaterThanOrEqual(1, $nonemptyCloseCalls);
+            }
+        } finally {
+            self::removeTempDir($tempDir);
+        }
     }
 
     public function test_bodyless_digest_validation_accepts_empty_stream_chunks_before_eof(): void
@@ -812,6 +1044,52 @@ final class RequestBodySpoolTest extends TestCase
             $pool->shutdown();
             self::removeTempDir($tempDir);
         }
+    }
+
+    private function signedEmptyBody(string $key, string $timestamp, string $scope, string $seed): string
+    {
+        $terminalSignature = self::chunkSignature('', $key, $timestamp, $scope, $seed);
+
+        return "0;chunk-signature={$terminalSignature}\r\n\r\n";
+    }
+
+    private function signedEmptyTrailerBody(
+        string $key,
+        string $timestamp,
+        string $scope,
+        string $seed,
+        string $checksum,
+    ): string {
+        $terminalSignature = self::chunkSignature('', $key, $timestamp, $scope, $seed);
+        $canonical = "x-amz-checksum-sha256:{$checksum}\n";
+        $trailerSignature = hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-TRAILER',
+            $timestamp,
+            $scope,
+            $terminalSignature,
+            hash('sha256', $canonical),
+        ]), $key);
+
+        return "0;chunk-signature={$terminalSignature}\r\n"
+            . "x-amz-checksum-sha256:{$checksum}\r\n"
+            . "x-amz-trailer-signature:{$trailerSignature}\r\n\r\n";
+    }
+
+    private static function chunkSignature(
+        string $payload,
+        string $key,
+        string $timestamp,
+        string $scope,
+        string $previous,
+    ): string {
+        return hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-PAYLOAD',
+            $timestamp,
+            $scope,
+            $previous,
+            self::EMPTY_SHA256,
+            hash('sha256', $payload),
+        ]), $key);
     }
 
     private function checksumRequest(string $body): Request

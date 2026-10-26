@@ -162,7 +162,7 @@ FROM php:8.4-cli
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl libcurl4-openssl-dev libonig-dev libpq-dev libsqlite3-dev libxml2-dev \
-    && docker-php-ext-install curl mbstring pcntl pdo_pgsql pdo_sqlite simplexml sockets \
+    && docker-php-ext-install curl mbstring pcntl pdo_pgsql pdo_sqlite posix simplexml sockets \
     && pecl install raphf-2.0.2 \
     && docker-php-ext-enable raphf \
     && pecl install pq-2.2.3 \
@@ -623,7 +623,7 @@ Before exposing the server to client traffic:
 
 ```bash
 php -v
-php -m | grep -E 'pdo|pcntl|openssl'
+php -m | grep -E 'pdo|pcntl|posix|openssl'
 php vendor/bin/s3-server --help
 curl -fsS http://127.0.0.1:9000/.health
 curl -fsS -H "Authorization: Bearer ${S3_METRICS_BEARER_TOKEN}" \
@@ -725,12 +725,15 @@ Use a dedicated service user. The storage path must not be inside a web root.
 install -d -o s3server -g s3server -m 0750 /var/data/s3
 install -d -o s3server -g s3server -m 0750 /etc/s3-server
 chmod 0640 /etc/s3-server/env
-chmod 0600 /etc/s3-server/credentials.json
+# Leave credentials.json absent until the credentials command creates valid JSON.
 ```
 
 Keep encryption master keys and admin tokens in the process environment, a
 secret manager, or root-owned service environment files. Do not store plaintext
-keys in a repository.
+keys in a repository. An existing credential file must be a non-empty regular
+file owned by root or the service user with no group or other permissions. The
+server refuses links, unsafe ancestors, unreadable or oversized files, and files
+that change identity while being opened.
 
 ## Database Least Privilege
 

@@ -50,6 +50,7 @@ final class ManagementCommandFailureDisclosureTest extends TestCase
     {
         $path = sys_get_temp_dir() . '/s3-credentials-invalid-' . bin2hex(random_bytes(6)) . '.json';
         file_put_contents($path, '{invalid json');
+        chmod($path, 0o600);
         try {
             $tester = new CommandTester(new CredentialsCommand());
             self::assertSame(Command::FAILURE, $tester->execute([

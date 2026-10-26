@@ -54,6 +54,8 @@ experimental until each exact profile completes its own qualification gates. See
 - ext-dom, ext-libxml, and ext-simplexml for S3 XML requests and responses
 - ext-mbstring for UTF-8 S3 Select string functions
 - ext-openssl (required for all request-body temporary spools)
+- ext-pcntl and ext-posix for Linux process control, signal handling, and
+  credential-file ownership verification
 - ext-pdo_sqlite for the default SQLite metadata backend
 - pecl-pq and its pecl-raphf dependency for PostgreSQL API nodes; the server
   refuses to start with only ext-pgsql

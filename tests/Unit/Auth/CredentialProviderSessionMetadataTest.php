@@ -107,10 +107,9 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         $path = $directory . '/credentials.json';
 
         try {
-            $provider = new ConfigFileCredentialProvider($path);
             $this->expectException(\RuntimeException::class);
             $this->expectExceptionMessage('Credentials directory must have trusted, private or sticky ancestors.');
-            $provider->putCredential($this->credential(new \DateTimeImmutable('+1 hour', new \DateTimeZone('UTC'))));
+            new ConfigFileCredentialProvider($path);
         } finally {
             self::assertFileDoesNotExist($path);
             self::assertSame([], glob($path . '.tmp.*') ?: []);
@@ -128,15 +127,54 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         $path = $private . '/credentials.json';
 
         try {
-            $provider = new ConfigFileCredentialProvider($path);
             $this->expectException(\RuntimeException::class);
             $this->expectExceptionMessage('Credentials directory must have trusted, private or sticky ancestors.');
-            $provider->putCredential($this->credential(new \DateTimeImmutable('+1 hour', new \DateTimeZone('UTC'))));
+            new ConfigFileCredentialProvider($path);
         } finally {
             self::assertFileDoesNotExist($path);
             self::assertSame([], glob($path . '.tmp.*') ?: []);
             @rmdir($private);
             @rmdir($ancestor);
+        }
+    }
+
+    public function test_config_file_provider_rejects_existing_file_below_unsafe_ancestor(): void
+    {
+        $ancestor = sys_get_temp_dir() . '/s3-credential-existing-ancestor-' . bin2hex(random_bytes(8));
+        $private = $ancestor . '/private';
+        self::assertTrue(mkdir($ancestor, 0o700));
+        self::assertTrue(mkdir($private, 0o700));
+        $path = $private . '/credentials.json';
+        self::writePrivateCredentialFile($path, '[]');
+        self::assertTrue(chmod($ancestor, 0o777));
+
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Credentials directory must have trusted, private or sticky ancestors.');
+            new ConfigFileCredentialProvider($path);
+        } finally {
+            @unlink($path);
+            @rmdir($private);
+            @rmdir($ancestor);
+        }
+    }
+
+    public function test_config_file_provider_rejects_existing_file_hidden_by_inaccessible_directory(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-credential-inaccessible-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($directory, 0o700));
+        $path = $directory . '/credentials.json';
+        self::writePrivateCredentialFile($path, '[]');
+        self::assertTrue(chmod($directory, 0o000));
+
+        try {
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Credentials directory is unavailable.');
+            new ConfigFileCredentialProvider($path);
+        } finally {
+            @chmod($directory, 0o700);
+            @unlink($path);
+            @rmdir($directory);
         }
     }
 
@@ -161,6 +199,101 @@ final class CredentialProviderSessionMetadataTest extends TestCase
             @unlink($directory . '/credentials.json');
             @unlink($alias);
             @rmdir($directory);
+        }
+    }
+
+    public function test_config_file_provider_rejects_unsafe_existing_files_before_loading_credentials(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-credential-load-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($directory, 0o700));
+        $validJson = json_encode([[
+            'accessKeyId' => 'AKIAUNSAFE123456789',
+            'secretAccessKey' => 'must-not-load',
+            'ownerId' => 'unsafe-owner',
+        ]], JSON_THROW_ON_ERROR);
+        $paths = [];
+
+        try {
+            $target = $directory . '/target.json';
+            self::writePrivateCredentialFile($target, $validJson);
+            $link = $directory . '/link.json';
+            if (@symlink($target, $link)) {
+                $paths['symbolic link'] = $link;
+            }
+
+            $nonRegular = $directory . '/directory.json';
+            self::assertTrue(mkdir($nonRegular, 0o700));
+            $paths['non-regular file'] = $nonRegular;
+
+            $public = $directory . '/public.json';
+            self::writePrivateCredentialFile($public, $validJson);
+            self::assertTrue(chmod($public, 0o640));
+            $paths['group-readable file'] = $public;
+
+            $empty = $directory . '/empty.json';
+            self::writePrivateCredentialFile($empty, '');
+            $paths['empty file'] = $empty;
+
+            $unreadable = $directory . '/unreadable.json';
+            self::writePrivateCredentialFile($unreadable, $validJson);
+            self::assertTrue(chmod($unreadable, 0o200));
+            $paths['owner-unreadable file'] = $unreadable;
+
+            $oversized = $directory . '/oversized.json';
+            self::writePrivateCredentialFile($oversized, str_repeat('x', 16_777_217));
+            $paths['oversized file'] = $oversized;
+
+            foreach ($paths as $label => $path) {
+                try {
+                    new ConfigFileCredentialProvider($path);
+                    self::fail("The {$label} must fail closed.");
+                } catch (\RuntimeException $error) {
+                    self::assertNotInstanceOf(\PHPUnit\Framework\AssertionFailedError::class, $error);
+                }
+            }
+        } finally {
+            foreach ($paths as $path) {
+                if (is_dir($path) && ! is_link($path)) {
+                    @rmdir($path);
+                } else {
+                    @unlink($path);
+                }
+            }
+            @unlink($target);
+            @rmdir($directory);
+        }
+    }
+
+    public function test_config_file_security_checks_reject_wrong_owner_and_inode_mismatch(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-credential-stat-' . bin2hex(random_bytes(8)) . '.json';
+        self::writePrivateCredentialFile($path, '[]');
+
+        try {
+            $status = lstat($path);
+            self::assertIsArray($status);
+            $effectiveUid = posix_geteuid();
+            $wrongOwner = $status;
+            $wrongOwner['uid'] = $effectiveUid === 1 ? 2 : 1;
+            $metadataCheck = new \ReflectionMethod(ConfigFileCredentialProvider::class, 'assertSecureCredentialFile');
+            try {
+                $metadataCheck->invoke(null, $wrongOwner, $effectiveUid);
+                self::fail('A credential file owned by another non-root user must be rejected.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('owned by root or the effective user', $error->getMessage());
+            }
+
+            $differentFile = $status;
+            $differentFile['ino']++;
+            $identityCheck = new \ReflectionMethod(ConfigFileCredentialProvider::class, 'assertSameCredentialFile');
+            try {
+                $identityCheck->invoke(null, $status, $differentFile);
+                self::fail('A path-to-handle inode mismatch must be rejected.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('changed while it was being opened or read', $error->getMessage());
+            }
+        } finally {
+            @unlink($path);
         }
     }
 
@@ -239,7 +372,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
     public function test_config_file_provider_rejects_non_list_json(): void
     {
         $path = sys_get_temp_dir() . '/s3-credential-invalid-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, '{"accessKeyId":"unsafe"}');
+        self::writePrivateCredentialFile($path, '{"accessKeyId":"unsafe"}');
 
         try {
             $this->expectException(\RuntimeException::class);
@@ -254,7 +387,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
     public function test_config_file_provider_rejects_duplicate_access_key_ids(): void
     {
         $path = sys_get_temp_dir() . '/s3-credential-duplicate-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, json_encode([
+        self::writePrivateCredentialFile($path, json_encode([
             ['accessKeyId' => 'duplicate', 'secretAccessKey' => 'first', 'ownerId' => 'owner-a'],
             ['accessKeyId' => 'duplicate', 'secretAccessKey' => 'second', 'ownerId' => 'owner-b'],
         ], JSON_THROW_ON_ERROR));
@@ -311,7 +444,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
                 ['policyNames' => ['readonly', 123]],
                 ['allowedPrefixes' => 'incoming/'],
             ] as $corruptField) {
-                file_put_contents($path, json_encode([$base + $corruptField], JSON_THROW_ON_ERROR));
+                self::writePrivateCredentialFile($path, json_encode([$base + $corruptField], JSON_THROW_ON_ERROR));
                 try {
                     new ConfigFileCredentialProvider($path);
                     self::fail('A malformed credential security field must reject the credential file.');
@@ -327,7 +460,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
     public function test_config_file_provider_rejects_unknown_fields_instead_of_ignoring_a_typo(): void
     {
         $path = sys_get_temp_dir() . '/s3-credential-unknown-field-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, json_encode([[
+        self::writePrivateCredentialFile($path, json_encode([[
             'accessKeyId' => 'AKIASESSION12345678',
             'secretAccessKey' => 'secret',
             'ownerId' => 'tenant:acme',
@@ -359,7 +492,7 @@ final class CredentialProviderSessionMetadataTest extends TestCase
                 ['ownerId' => "tenant:\u{FFFE}"],
                 ['displayName' => "Alice\u{FFFF}"],
             ] as $invalidIdentity) {
-                file_put_contents($path, json_encode([$invalidIdentity + $base], JSON_THROW_ON_ERROR));
+                self::writePrivateCredentialFile($path, json_encode([$invalidIdentity + $base], JSON_THROW_ON_ERROR));
                 try {
                     new ConfigFileCredentialProvider($path);
                     self::fail('An XML-invalid credential identity must reject the credential file.');
@@ -932,5 +1065,11 @@ final class CredentialProviderSessionMetadataTest extends TestCase
             policyNames: ['uploads'],
             allowedPrefixes: ['incoming/'],
         );
+    }
+
+    private static function writePrivateCredentialFile(string $path, string $contents): void
+    {
+        self::assertSame(strlen($contents), file_put_contents($path, $contents));
+        self::assertTrue(chmod($path, 0o600));
     }
 }

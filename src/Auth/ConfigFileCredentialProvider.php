@@ -176,18 +176,64 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
         // Use blocking PHP file functions here because this runs in the
         // constructor, which may execute before the Amp event loop starts
         // (e.g., during Laravel service provider registration).
-        if (!file_exists($this->filePath)) {
+        $this->assertTrustedExistingCredentialDirectoryAncestor(dirname($this->filePath));
+        clearstatcache(true, $this->filePath);
+        $initialPathStatus = @lstat($this->filePath);
+        if ($initialPathStatus === false) {
             return;
         }
 
-        $content = file_get_contents($this->filePath, false, null, 0, self::MAX_FILE_BYTES + 1);
-        if ($content === false || $content === '') {
-            return;
+        $directory = $this->trustedCredentialDirectory(dirname($this->filePath));
+        $targetPath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . basename($this->filePath);
+        clearstatcache(true, $targetPath);
+        $initialPathStatus = @lstat($targetPath);
+        if ($initialPathStatus === false) {
+            throw new \RuntimeException('Credentials file became unavailable before it could be opened.');
+        }
+
+        $effectiveUid = posix_geteuid();
+        self::assertSecureCredentialFile($initialPathStatus, $effectiveUid);
+
+        $handle = @fopen($targetPath, 'rb');
+        if ($handle === false) {
+            throw new \RuntimeException('Credentials file could not be opened for reading.');
+        }
+
+        try {
+            $openedStatus = fstat($handle);
+            if ($openedStatus === false) {
+                throw new \RuntimeException('Credentials file metadata could not be inspected.');
+            }
+            self::assertSecureCredentialFile($openedStatus, $effectiveUid);
+            self::assertSameCredentialFile($initialPathStatus, $openedStatus);
+
+            $content = stream_get_contents($handle, self::MAX_FILE_BYTES + 1);
+            if ($content === false) {
+                throw new \RuntimeException('Credentials file could not be read.');
+            }
+
+            $openedAfterRead = fstat($handle);
+            clearstatcache(true, $targetPath);
+            $pathAfterRead = @lstat($targetPath);
+            if ($openedAfterRead === false || $pathAfterRead === false) {
+                throw new \RuntimeException('Credentials file changed while it was being read.');
+            }
+            self::assertSecureCredentialFile($openedAfterRead, $effectiveUid);
+            self::assertSecureCredentialFile($pathAfterRead, $effectiveUid);
+            self::assertSameCredentialFile($openedStatus, $openedAfterRead);
+            self::assertSameCredentialFile($openedStatus, $pathAfterRead);
+            if ($openedAfterRead['size'] !== $openedStatus['size']) {
+                throw new \RuntimeException('Credentials file changed while it was being read.');
+            }
+        } finally {
+            fclose($handle);
+        }
+
+        if ($content === '') {
+            throw new \RuntimeException('Credentials file must not be empty.');
         }
         if (strlen($content) > self::MAX_FILE_BYTES) {
-            throw new \RuntimeException(
-                'Credentials file exceeds the maximum size of ' . self::MAX_FILE_BYTES . ' bytes.',
-            );
+            throw new \RuntimeException('Credentials file exceeds the maximum size of ' . self::MAX_FILE_BYTES . ' bytes.');
         }
 
         /** @var mixed $entries */
@@ -254,6 +300,63 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
                 throw new \RuntimeException("Credentials file contains duplicate accessKeyId at entry {$index}.");
             }
             $this->credentials[$credential->accessKeyId] = $credential;
+        }
+    }
+
+    private function assertTrustedExistingCredentialDirectoryAncestor(string $directory): void
+    {
+        for ($candidate = $directory; ; $candidate = dirname($candidate)) {
+            clearstatcache(true, $candidate);
+            if (@lstat($candidate) !== false) {
+                if (! is_dir($candidate)) {
+                    throw new \RuntimeException('Credentials directory is unavailable.');
+                }
+
+                $canonical = $this->trustedCredentialDirectory($candidate);
+                if (! is_executable($canonical)) {
+                    throw new \RuntimeException('Credentials directory is unavailable.');
+                }
+
+                return;
+            }
+
+            if ($candidate === dirname($candidate)) {
+                throw new \RuntimeException('Credentials directory is unavailable.');
+            }
+        }
+    }
+
+    /** @param array<string|int, int> $status */
+    private static function assertSecureCredentialFile(array $status, int $effectiveUid): void
+    {
+        if (($status['mode'] & 0o170000) !== 0o100000) {
+            throw new \RuntimeException('Credentials file must be a regular file and must not be a symbolic link.');
+        }
+        if ($status['uid'] !== 0 && $status['uid'] !== $effectiveUid) {
+            throw new \RuntimeException('Credentials file must be owned by root or the effective user.');
+        }
+        if (($status['mode'] & 0o077) !== 0) {
+            throw new \RuntimeException('Credentials file permissions must deny all group and other access.');
+        }
+        if (($status['mode'] & 0o400) === 0) {
+            throw new \RuntimeException('Credentials file must be readable by its owner.');
+        }
+        if ($status['size'] === 0) {
+            throw new \RuntimeException('Credentials file must not be empty.');
+        }
+        if ($status['size'] > self::MAX_FILE_BYTES) {
+            throw new \RuntimeException('Credentials file exceeds the maximum size of ' . self::MAX_FILE_BYTES . ' bytes.');
+        }
+    }
+
+    /**
+     * @param array<string|int, int> $expected
+     * @param array<string|int, int> $actual
+     */
+    private static function assertSameCredentialFile(array $expected, array $actual): void
+    {
+        if ($expected['dev'] !== $actual['dev'] || $expected['ino'] !== $actual['ino']) {
+            throw new \RuntimeException('Credentials file changed while it was being opened or read.');
         }
     }
 

@@ -34,10 +34,15 @@ process. This matches the current deployment profile; do not use a shared
 credential file to evaluate concurrent API processes or expect another running
 process to observe edits. A later multi-process profile requires the database
 provider and its own qualification.
-On Unix, file-provider writes require `ext-posix` so the writer can verify the
-effective user and every ancestor of the canonical credential directory.
+The package requires `ext-posix` so the file provider can verify the effective
+user, the credential file, and every ancestor of its canonical directory.
 The directory must be private or root-owned and sticky (such as `/tmp`);
 secrets are written in a private temporary directory before an atomic move.
+An existing file must be a non-empty regular file owned by root or the effective
+user, readable by its owner, inaccessible to group and other users, no larger
+than 16 MiB, and unchanged between path inspection and reading. Unsafe files and
+symbolic links make startup fail closed; a genuinely absent target remains a
+valid empty initial state.
 Each JSON entry is validated strictly at startup. Unknown fields and fields with
 the wrong JSON type make startup fail instead of falling back to credential
 defaults. Owner IDs and display names must be valid UTF-8 containing only XML

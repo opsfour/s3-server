@@ -8,6 +8,7 @@ use Amp\Http\Server\Middleware;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
+use OpsFour\S3Server\Auth\AwsChunkedContentLength;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Http\RequestBody;
 
@@ -29,26 +30,37 @@ final class ChecksumValidationMiddleware implements Middleware
     public function handleRequest(Request $request, RequestHandler $requestHandler): Response
     {
         $expected = $request->getHeader('x-amz-content-sha256');
+        if (RequestBody::isBodylessOperation($request)) {
+            if ($expected !== null && ! in_array($expected, self::SKIP_VALUES, true)) {
+                if (preg_match('/^[a-f0-9]{64}$/i', $expected) !== 1) {
+                    throw new BadDigestException('x-amz-content-sha256 must be a 64-character hexadecimal SHA-256 digest.');
+                }
+
+                $computed = hash('sha256', '');
+                if (! hash_equals(strtolower($expected), $computed)) {
+                    throw new BadDigestException(
+                        "The SHA-256 checksum you specified did not match what we received. Expected: {$expected}, Computed: {$computed}",
+                    );
+                }
+            }
+
+            $decodedLength = AwsChunkedContentLength::fromRequest($request);
+            if ($decodedLength !== null && $decodedLength !== 0) {
+                self::rejectBodylessPayload($request);
+            }
+            if (RequestBody::hasPayloadBytes($request)) {
+                self::rejectBodylessPayload($request);
+            }
+
+            return $requestHandler->handleRequest($request);
+        }
+
         if ($expected === null || in_array($expected, self::SKIP_VALUES, true)) {
             return $requestHandler->handleRequest($request);
         }
 
         if (preg_match('/^[a-f0-9]{64}$/i', $expected) !== 1) {
             throw new BadDigestException('x-amz-content-sha256 must be a 64-character hexadecimal SHA-256 digest.');
-        }
-
-        if (RequestBody::isBodylessOperation($request)) {
-            $computed = hash('sha256', '');
-            if (! hash_equals(strtolower($expected), $computed)) {
-                throw new BadDigestException(
-                    "The SHA-256 checksum you specified did not match what we received. Expected: {$expected}, Computed: {$computed}",
-                );
-            }
-            if (RequestBody::hasPayloadBytes($request)) {
-                throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
-            }
-
-            return $requestHandler->handleRequest($request);
         }
 
         $tempPath = $this->spool->create('s3-sha256-');
@@ -100,5 +112,15 @@ final class ChecksumValidationMiddleware implements Middleware
                 }
             }
         }
+    }
+
+    private static function rejectBodylessPayload(Request $request): never
+    {
+        try {
+            $request->getBody()->close();
+        } catch (\Throwable) {
+        }
+
+        throw new BadDigestException('A bodyless S3 operation cannot contain a payload.');
     }
 }
