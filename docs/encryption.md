@@ -212,6 +212,11 @@ They can also replace the complete encryption service with
 ## SSE-C (Customer-Provided Keys)
 
 The client provides the encryption key with each request. The server never stores the key.
+SSE-C does not require an SSE-S3 master key. The standalone, Laravel, and
+Symfony server entrypoints enable the built-in SSE-C service even when no
+master-key provider is configured; explicit and bucket-default SSE-S3 remain
+unavailable in that state. Applications that wire handlers manually must pass
+an `EncryptionService` (a null master-key provider is valid for SSE-C).
 
 ```php
 $customerKey = random_bytes(32);

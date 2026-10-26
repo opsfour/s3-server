@@ -451,6 +451,13 @@ When `parallel.encryption_workers` is greater than zero, the bundle builds a
 `ParallelEncryptionService` from the configured master key provider. Otherwise
 it builds the normal inline `EncryptionService`.
 
+Without a custom service or master-key provider, the runtime still creates the
+built-in inline or configured parallel service for SSE-C. SSE-C does not need
+a server master key; SSE-S3 remains unavailable until a provider is configured.
+An explicit `server.master_key_provider` value takes precedence over
+`S3_MASTER_KEY_PROVIDER`; when both are absent, the provider defaults to
+`config`. Empty or unsupported environment values fail startup.
+
 SSE-S3 and SSE-C use the core server limits:
 
 ```yaml

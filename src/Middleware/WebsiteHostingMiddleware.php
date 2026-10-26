@@ -342,7 +342,10 @@ final class WebsiteHostingMiddleware implements Middleware
         string $path,
         ObjectInfo $object,
     ): string {
-        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        EncryptionRequestResolver::requireEncryptionService(
+            $this->encryption,
+            EncryptionRequestResolver::SSE_S3,
+        );
         \assert($this->encryption !== null);
         if ($object->size > $this->maxEncryptedObjectSize) {
             throw new EntityTooLargeException(

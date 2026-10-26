@@ -148,7 +148,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('Legacy encrypted multipart upload must be aborted.');
         }
         if ($uploadEncryptionMode !== null) {
-            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            EncryptionRequestResolver::requireEncryptionService($this->encryption, $uploadEncryptionMode);
         }
         $completionCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
             $request,

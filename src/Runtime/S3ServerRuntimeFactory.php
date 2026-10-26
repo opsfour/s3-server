@@ -409,11 +409,8 @@ final readonly class S3ServerRuntimeFactory
     private function encryptionFromEnvironment(
         S3ServerConfig $config,
         MetricsCollector $metrics,
-    ): ?EncryptionServiceInterface {
+    ): EncryptionServiceInterface {
         $masterKeyProvider = $this->masterKeyProvider($config);
-        if ($masterKeyProvider === null) {
-            return null;
-        }
 
         // Encryption workers intentionally read config keys from inherited
         // environment variables. External providers stay in-process so key

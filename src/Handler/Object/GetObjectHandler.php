@@ -169,7 +169,10 @@ final class GetObjectHandler implements RequestHandler
         }
 
         if ($sseAlgo !== null) {
-            \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService(
+                $this->encryption,
+                $sseAlgo,
+            );
             \assert($this->encryption !== null);
             $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
             $decryptionCancellation = null;

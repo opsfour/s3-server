@@ -133,7 +133,9 @@ that fixed Laravel event name with the S3 event as its payload.
 The Artisan server uses an `EncryptionServiceInterface` binding when one is
 present. If only `MasterKeyProvider` is bound, it builds the standard inline or
 parallel encryption service from that provider. Without either binding, the
-existing environment-based provider configuration remains active.
+existing environment-based provider configuration remains active. When no
+environment master key is configured either, the runtime still enables SSE-C
+with its built-in service while SSE-S3 remains unavailable.
 
 ```php
 use OpsFour\S3Server\Encryption\MasterKeyProvider;

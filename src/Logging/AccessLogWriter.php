@@ -368,7 +368,10 @@ final class AccessLogWriter
                     if ($bucketEncryption['sseAlgorithm'] !== EncryptionRequestResolver::SSE_S3) {
                         throw new \RuntimeException('Unsupported access log target encryption algorithm.');
                     }
-                    EncryptionRequestResolver::requireEncryptionService($this->encryption);
+                    EncryptionRequestResolver::requireEncryptionService(
+                        $this->encryption,
+                        EncryptionRequestResolver::SSE_S3,
+                    );
                     if (strlen($logContent) > $this->maxEncryptedObjectSize) {
                         throw new \RuntimeException('Access log object exceeds the configured encryption size limit.');
                     }

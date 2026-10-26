@@ -47,7 +47,7 @@ final class EncryptionRequestResolver
             if ($algorithm !== null || $kmsKeyId !== null || $kmsContext !== null) {
                 throw new InvalidArgumentException('SSE-C headers cannot be combined with server-managed encryption headers.');
             }
-            self::requireEncryptionService($encryption);
+            self::requireEncryptionService($encryption, self::SSE_C);
             \assert($sseCHeaders[0] !== null && $sseCHeaders[1] !== null && $sseCHeaders[2] !== null);
             EncryptionService::validateSseCHeaders($sseCHeaders[0], $sseCHeaders[1], $sseCHeaders[2]);
 
@@ -72,7 +72,7 @@ final class EncryptionRequestResolver
             throw new InvalidArgumentException("Unsupported server-side encryption algorithm: {$algorithm}");
         }
 
-        self::requireEncryptionService($encryption);
+        self::requireEncryptionService($encryption, self::SSE_S3);
 
         return self::SSE_S3;
     }
@@ -88,9 +88,14 @@ final class EncryptionRequestResolver
         }
     }
 
-    public static function requireEncryptionService(?EncryptionServiceInterface $encryption): void
-    {
-        if ($encryption === null) {
+    public static function requireEncryptionService(
+        ?EncryptionServiceInterface $encryption,
+        ?string $encryptionMode = null,
+    ): void {
+        if ($encryption === null
+            || ($encryptionMode === self::SSE_S3
+                && $encryption instanceof SseS3Capability
+                && ! $encryption->supportsSseS3())) {
             throw new NotImplementedException(
                 'Server-side encryption was requested, but no master key provider is configured.',
             );

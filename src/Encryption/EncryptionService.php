@@ -17,7 +17,7 @@ namespace OpsFour\S3Server\Encryption;
  *
  * For SSE-C: uses the customer-provided key directly.
  */
-final class EncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible
+final class EncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability
 {
     private const string CIPHER = 'aes-256-gcm';
     private const int IV_LENGTH = 12; // GCM standard
@@ -36,6 +36,11 @@ final class EncryptionService implements EncryptionServiceInterface, ConfigWorke
             && $this->masterKeyProvider->matchesCurrentEnvironmentKeyring()
                 ? $this->masterKeyProvider->keyringFingerprint()
                 : null;
+    }
+
+    public function supportsSseS3(): bool
+    {
+        return $this->masterKeyProvider !== null;
     }
 
     /**

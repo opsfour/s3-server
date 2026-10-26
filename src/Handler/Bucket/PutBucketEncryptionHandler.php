@@ -38,7 +38,10 @@ final class PutBucketEncryptionHandler implements RequestHandler
                 'aws:kms bucket encryption requires a configured KMS adapter, which is not available.',
             );
         }
-        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        EncryptionRequestResolver::requireEncryptionService(
+            $this->encryption,
+            EncryptionRequestResolver::SSE_S3,
+        );
 
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::mutate(
             $this->metadata,

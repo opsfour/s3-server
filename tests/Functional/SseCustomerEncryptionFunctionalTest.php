@@ -9,12 +9,16 @@ use OpsFour\S3Server\Storage\StoragePath;
 
 final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
 {
-    private static string|false $previousMasterKey = false;
+    /** @var array<string, string|false> */
+    private static array $previousEncryptionEnvironment = [];
 
     public static function setUpBeforeClass(): void
     {
-        self::$previousMasterKey = getenv('S3_ENCRYPTION_MASTER_KEY');
-        putenv('S3_ENCRYPTION_MASTER_KEY=' . base64_encode(str_repeat('M', 32)));
+        foreach (['S3_ENCRYPTION_MASTER_KEY', 'S3_ENCRYPTION_MASTER_KEYS', 'S3_MASTER_KEY_PROVIDER'] as $name) {
+            self::$previousEncryptionEnvironment[$name] = getenv($name);
+            putenv($name);
+        }
+        putenv('S3_MASTER_KEY_PROVIDER=config');
 
         parent::setUpBeforeClass();
         self::allowSseCOverLocalHttp();
@@ -24,10 +28,8 @@ final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
     {
         parent::tearDownAfterClass();
 
-        if (self::$previousMasterKey === false) {
-            putenv('S3_ENCRYPTION_MASTER_KEY');
-        } else {
-            putenv('S3_ENCRYPTION_MASTER_KEY=' . self::$previousMasterKey);
+        foreach (self::$previousEncryptionEnvironment as $name => $value) {
+            putenv($value === false ? $name : "{$name}={$value}");
         }
     }
 

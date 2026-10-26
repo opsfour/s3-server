@@ -411,7 +411,7 @@ final class CopyObjectHandler implements RequestHandler
         (new ObjectLockRequestApplier($this->metadata))->validate($request, $dstBucket);
         $sourceEncryptionMode = $srcObjectInfo->userMetadata['__sse-algorithm'] ?? null;
         if ($sourceEncryptionMode !== null) {
-            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            EncryptionRequestResolver::requireEncryptionService($this->encryption, $sourceEncryptionMode);
             if (! in_array($sourceEncryptionMode, [EncryptionRequestResolver::SSE_C, EncryptionRequestResolver::SSE_S3], true)) {
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source has an unsupported stored encryption mode.');
             }
@@ -1043,7 +1043,7 @@ final class CopyObjectHandler implements RequestHandler
         string $destinationKey,
         string $destinationEncryptionMode,
     ): array {
-        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        EncryptionRequestResolver::requireEncryptionService($this->encryption, $destinationEncryptionMode);
         \assert($this->encryption !== null);
         if ($source->size > $this->maxEncryptedObjectSize) {
             throw new \OpsFour\S3Server\Exception\EntityTooLargeException(

@@ -128,7 +128,7 @@ final class UploadPartCopyHandler implements RequestHandler
         }
         $dispatchId = null;
         if ($encryptedV2) {
-            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            EncryptionRequestResolver::requireEncryptionService($this->encryption, $uploadSseAlgorithm);
             if ($uploadSseAlgorithm === null || $this->encryption === null) {
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart upload has no encryption mode.');
             }
@@ -256,7 +256,7 @@ final class UploadPartCopyHandler implements RequestHandler
         }
         $srcSseAlgo = $srcObject->userMetadata['__sse-algorithm'] ?? null;
         if ($srcSseAlgo !== null) {
-            EncryptionRequestResolver::requireEncryptionService($this->encryption);
+            EncryptionRequestResolver::requireEncryptionService($this->encryption, $srcSseAlgo);
         }
         $sourceCustomerKey = EncryptionRequestResolver::resolveCustomerKey(
             $request,

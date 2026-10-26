@@ -12,6 +12,7 @@ use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\MasterKeyProvider;
+use OpsFour\S3Server\Encryption\SseS3Capability;
 use OpsFour\S3Server\Observability\MetricsCollector;
 
 /**
@@ -21,13 +22,15 @@ use OpsFour\S3Server\Observability\MetricsCollector;
  * Below the size threshold, operations run inline (no IPC overhead).
  * Above the threshold, operations are submitted to a worker pool.
  */
-final class ParallelEncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible
+final class ParallelEncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability
 {
     private readonly WorkerPool $pool;
 
     private readonly EncryptionService $localService;
 
     private readonly ?string $keyringFingerprint;
+
+    private readonly bool $sseS3Supported;
 
     /**
      * @param  MasterKeyProvider|null  $masterKeyProvider  For inline (below-threshold) operations.
@@ -41,6 +44,7 @@ final class ParallelEncryptionService implements EncryptionServiceInterface, Con
         private readonly ?MetricsCollector $metrics = null,
         private readonly string $poolName = 'encryption',
     ) {
+        $this->sseS3Supported = $masterKeyProvider !== null;
         // A non-matching provider must be used in this process for SSE-S3.
         // SSE-C does not use a master key and may still offload safely.
         $this->keyringFingerprint = $masterKeyProvider instanceof ConfigMasterKeyProvider
@@ -50,6 +54,11 @@ final class ParallelEncryptionService implements EncryptionServiceInterface, Con
         $this->pool = new ContextWorkerPool($workerLimit);
         $this->localService = new EncryptionService($masterKeyProvider);
         $this->metrics?->registerWorkerPool($this->poolName, $workerLimit);
+    }
+
+    public function supportsSseS3(): bool
+    {
+        return $this->sseS3Supported;
     }
 
     public function encryptSseS3(string $plaintext): array

@@ -49,6 +49,7 @@ final class ParallelEncryptionServiceTest extends TestCase
     {
         $provider = new ConfigMasterKeyProvider($this->masterKeyB64);
         $service = new ParallelEncryptionService($provider, 2, 1024);
+        self::assertTrue($service->supportsSseS3());
         self::assertSame($provider->keyringFingerprint(), $service->configWorkerKeyringFingerprint());
         self::assertSame($provider->keyringFingerprint(), (new EncryptionService($provider))->configWorkerKeyringFingerprint());
 
@@ -188,6 +189,7 @@ final class ParallelEncryptionServiceTest extends TestCase
         $metrics = new MetricsCollector();
         $service = new ParallelEncryptionService(null, 2, 64, $metrics);
         try {
+            self::assertFalse($service->supportsSseS3());
             $body = str_repeat('C', 65_536);
             $customerKey = random_bytes(32);
             $encrypted = $service->encryptSseC($body, $customerKey);

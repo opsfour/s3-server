@@ -8,11 +8,13 @@ use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
+use OpsFour\S3Server\Encryption\SseS3Capability;
 use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Parallel\ParallelEncryptionService;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3Server;
@@ -28,9 +30,17 @@ final class S3ServerRuntimeFactoryTest extends TestCase
 {
     private string $storagePath = '';
 
+    /** @var array<string, string|false> */
+    private array $originalEncryptionEnvironment = [];
+
     protected function setUp(): void
     {
         parent::setUp();
+
+        foreach (['S3_ENCRYPTION_MASTER_KEY', 'S3_ENCRYPTION_MASTER_KEYS'] as $name) {
+            $this->originalEncryptionEnvironment[$name] = getenv($name);
+            putenv($name);
+        }
 
         $this->storagePath = sys_get_temp_dir() . '/s3-runtime-factory-' . bin2hex(random_bytes(4));
         mkdir($this->storagePath, 0o755, true);
@@ -38,8 +48,9 @@ final class S3ServerRuntimeFactoryTest extends TestCase
 
     protected function tearDown(): void
     {
-        putenv('S3_ENCRYPTION_MASTER_KEY');
-        putenv('S3_ENCRYPTION_MASTER_KEYS');
+        foreach ($this->originalEncryptionEnvironment as $name => $value) {
+            putenv($value === false ? $name : "{$name}={$value}");
+        }
 
         if ($this->storagePath !== '' && is_dir($this->storagePath)) {
             @rmdir($this->storagePath);
@@ -53,7 +64,9 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         $runtime = $this->createRuntime();
 
         self::assertInstanceOf(S3Server::class, $runtime->server);
-        self::assertNull($runtime->encryption);
+        self::assertInstanceOf(EncryptionService::class, $runtime->encryption);
+        self::assertInstanceOf(SseS3Capability::class, $runtime->encryption);
+        self::assertFalse($runtime->encryption->supportsSseS3());
         self::assertInstanceOf(\Amp\Parallel\Worker\WorkerPool::class, $runtime->selectWorkerPool);
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::PutObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::RestoreObject));
@@ -67,6 +80,31 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         $runtime = $this->createRuntime();
 
         self::assertInstanceOf(EncryptionService::class, $runtime->encryption);
+        self::assertTrue($runtime->encryption->supportsSseS3());
+    }
+
+    public function test_create_builds_parallel_sse_c_service_without_master_key(): void
+    {
+        $runtime = $this->createRuntime(config: new S3ServerConfig(
+            storagePath: $this->storagePath,
+            encryptionWorkerPoolSize: 1,
+            encryptionParallelThreshold: 1,
+        ));
+
+        try {
+            self::assertInstanceOf(ParallelEncryptionService::class, $runtime->encryption);
+            self::assertFalse($runtime->encryption->supportsSseS3());
+            $key = random_bytes(32);
+            $encrypted = $runtime->encryption->encryptSseC('customer data', $key);
+            self::assertSame('customer data', $runtime->encryption->decryptSseC(
+                $encrypted['ciphertext'],
+                $key,
+                $encrypted['iv'],
+                $encrypted['tag'],
+            ));
+        } finally {
+            $runtime->stop();
+        }
     }
 
     public function test_create_fails_closed_for_explicitly_empty_master_key_environment(): void
@@ -311,12 +349,13 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         ?EncryptionServiceInterface $encryption = null,
         ?\OpsFour\S3Server\Storage\StorageBackend $storage = null,
         ?LoggerInterface $logger = null,
+        ?S3ServerConfig $config = null,
     ): \OpsFour\S3Server\Runtime\S3ServerRuntime {
         $metadata = new SqliteMetadataStore(':memory:');
         $metadata->initialize();
 
         return (new S3ServerRuntimeFactory())->create(
-            config: new S3ServerConfig(storagePath: $this->storagePath),
+            config: $config ?? new S3ServerConfig(storagePath: $this->storagePath),
             metadata: $metadata,
             storage: $storage ?? new InMemoryBackend(),
             credentialProvider: new InMemoryCredentialProvider(

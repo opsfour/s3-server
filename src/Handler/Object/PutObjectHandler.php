@@ -727,7 +727,7 @@ final class PutObjectHandler implements RequestHandler
     /** @return array{array<string, string>, string} */
     private function encryptPayload(Request $request, string $plaintext, string $encryptionMode): array
     {
-        EncryptionRequestResolver::requireEncryptionService($this->encryption);
+        EncryptionRequestResolver::requireEncryptionService($this->encryption, $encryptionMode);
         \assert($this->encryption !== null);
 
         if ($encryptionMode === EncryptionRequestResolver::SSE_C) {

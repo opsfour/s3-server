@@ -36,7 +36,7 @@ final class Configuration implements ConfigurationInterface
                         ->scalarNode('base_domain')->defaultNull()->end()
                         ->booleanNode('strict_bucket_naming')->defaultTrue()->end()
                         ->scalarNode('website_host_pattern')->defaultNull()->end()
-                        ->scalarNode('master_key_provider')->defaultValue('config')->end()
+                        ->scalarNode('master_key_provider')->defaultNull()->end()
                         ->booleanNode('enforce_min_part_size')->defaultTrue()->end()
                         ->integerNode('max_encrypted_object_size')->defaultValue(268_435_456)->min(1)->end()
                         ->integerNode('max_select_object_size')->defaultValue(67_108_864)->min(1)->end()

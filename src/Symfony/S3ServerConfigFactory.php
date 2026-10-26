@@ -23,6 +23,14 @@ final class S3ServerConfigFactory
         $quotas = $config['quotas'];
         $lifecycle = $config['lifecycle'];
         $notifications = $config['notifications'];
+        $masterKeyProvider = $server['master_key_provider'];
+        if ($masterKeyProvider === null) {
+            $environmentProvider = getenv('S3_MASTER_KEY_PROVIDER');
+            $masterKeyProvider = $environmentProvider === false ? 'config' : $environmentProvider;
+        }
+        if (! is_string($masterKeyProvider)) {
+            throw new \InvalidArgumentException('masterKeyProvider must be a string.');
+        }
 
         $serverConfig = new S3ServerConfig(
             host: $server['host'],
@@ -47,7 +55,7 @@ final class S3ServerConfigFactory
             baseDomain: $server['base_domain'],
             strictBucketNaming: $server['strict_bucket_naming'],
             websiteHostPattern: $server['website_host_pattern'],
-            masterKeyProvider: $server['master_key_provider'],
+            masterKeyProvider: $masterKeyProvider,
             enforceMinPartSize: $server['enforce_min_part_size'],
             maxEncryptedObjectSize: $server['max_encrypted_object_size'],
             maxSelectObjectSize: $server['max_select_object_size'],

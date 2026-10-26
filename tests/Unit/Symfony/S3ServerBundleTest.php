@@ -73,6 +73,48 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(4, $metadataConfig['worker_pool_size']);
     }
 
+    public function test_master_key_provider_defaults_to_config_when_environment_is_absent(): void
+    {
+        self::assertSame('config', $this->configForMasterKeyProviderEnvironment(false)->masterKeyProvider);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function environmentMasterKeyProviders(): iterable
+    {
+        yield 'redis' => ['redis'];
+        yield 'vault' => ['vault'];
+    }
+
+    #[DataProvider('environmentMasterKeyProviders')]
+    public function test_master_key_provider_uses_environment_when_yaml_is_absent(string $provider): void
+    {
+        self::assertSame($provider, $this->configForMasterKeyProviderEnvironment($provider)->masterKeyProvider);
+    }
+
+    public function test_explicit_master_key_provider_yaml_overrides_environment(): void
+    {
+        self::assertSame(
+            'config',
+            $this->configForMasterKeyProviderEnvironment('vault', 'config')->masterKeyProvider,
+        );
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidEnvironmentMasterKeyProviders(): iterable
+    {
+        yield 'empty' => [''];
+        yield 'zero' => ['0'];
+    }
+
+    #[DataProvider('invalidEnvironmentMasterKeyProviders')]
+    public function test_invalid_environment_master_key_provider_fails_closed(string $provider): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('masterKeyProvider must be one of: config, redis, vault.');
+
+        $this->configForMasterKeyProviderEnvironment($provider);
+    }
+
     public function test_default_sqlite_metadata_uses_the_internal_storage_namespace(): void
     {
         $storagePath = sys_get_temp_dir() . '/s3-symfony-metadata-' . bin2hex(random_bytes(6));
@@ -833,6 +875,28 @@ final class S3ServerBundleTest extends TestCase
         $container->compile();
 
         return $container;
+    }
+
+    private function configForMasterKeyProviderEnvironment(
+        string|false $environmentProvider,
+        ?string $explicitProvider = null,
+    ): S3ServerConfig {
+        $previous = getenv('S3_MASTER_KEY_PROVIDER');
+        putenv($environmentProvider === false
+            ? 'S3_MASTER_KEY_PROVIDER'
+            : 'S3_MASTER_KEY_PROVIDER=' . $environmentProvider);
+
+        try {
+            $overrides = $explicitProvider === null
+                ? []
+                : ['server' => ['master_key_provider' => $explicitProvider]];
+
+            return $this->service($this->container($overrides), S3ServerConfig::class);
+        } finally {
+            putenv($previous === false
+                ? 'S3_MASTER_KEY_PROVIDER'
+                : 'S3_MASTER_KEY_PROVIDER=' . $previous);
+        }
     }
 
     private function tempPath(string $prefix, string $suffix = ''): string

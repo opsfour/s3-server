@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use GuzzleHttp\Client;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -99,6 +100,39 @@ final class EntrypointServeProfileTest extends TestCase
             self::assertSame(200, $object['@metadata']['statusCode']);
             self::assertSame($body, (string) $object['Body']);
             self::assertSame('text/plain', $object['ContentType']);
+
+            // The release entrypoints must expose SSE-C even when the child
+            // process has no server-managed encryption key.
+            $s3->getHandlerList()->remove('s3.ssec');
+            $customerKey = hash('sha256', 'entrypoint-sse-c-' . $profile, true);
+            $sseC = [
+                'SSECustomerAlgorithm' => 'AES256',
+                'SSECustomerKey' => base64_encode($customerKey),
+                'SSECustomerKeyMD5' => base64_encode(md5($customerKey, true)),
+            ];
+            self::assertSame(200, $s3->putObject([
+                'Bucket' => $bucket,
+                'Key' => 'sse-c.txt',
+                'Body' => $body,
+            ] + $sseC)['@metadata']['statusCode']);
+            $encrypted = $s3->getObject([
+                'Bucket' => $bucket,
+                'Key' => 'sse-c.txt',
+            ] + $sseC);
+            self::assertSame($body, (string) $encrypted['Body']);
+
+            try {
+                $s3->putObject([
+                    'Bucket' => $bucket,
+                    'Key' => 'unavailable-sse-s3.txt',
+                    'Body' => $body,
+                    'ServerSideEncryption' => 'AES256',
+                ]);
+                self::fail('SSE-S3 was accepted without a server master key.');
+            } catch (S3Exception $error) {
+                self::assertSame(501, $error->getStatusCode());
+                self::assertSame('NotImplemented', $error->getAwsErrorCode());
+            }
         } catch (\Throwable $error) {
             self::fail($error->getMessage() . "\n" . $this->logs());
         }
@@ -119,11 +153,16 @@ final class EntrypointServeProfileTest extends TestCase
             default => throw new \InvalidArgumentException("Unknown serve profile: {$profile}"),
         };
 
+        $environment = getenv();
+        self::assertIsArray($environment);
+        unset($environment['S3_ENCRYPTION_MASTER_KEY'], $environment['S3_ENCRYPTION_MASTER_KEYS']);
+        $environment['S3_MASTER_KEY_PROVIDER'] = 'config';
+
         $process = proc_open($command, [
             0 => ['pipe', 'r'],
             1 => ['file', $this->stdoutPath, 'a'],
             2 => ['file', $this->stderrPath, 'a'],
-        ], $this->pipes, dirname(__DIR__, 2));
+        ], $this->pipes, dirname(__DIR__, 2), $environment);
         if (! is_resource($process)) {
             self::fail("Failed to start the {$profile} serve profile.");
         }

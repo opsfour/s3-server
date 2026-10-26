@@ -8,9 +8,13 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
+use OpsFour\S3Server\Encryption\EncryptionService;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Console\MetadataMigrateCommand;
 use OpsFour\S3Server\Handler\Bucket\GetBucketEncryptionHandler;
+use OpsFour\S3Server\Handler\Bucket\PutBucketEncryptionHandler;
 use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\Schema\SchemaManager;
@@ -161,6 +165,87 @@ final class StoredBucketEncryptionConfigurationTest extends TestCase
         }
     }
 
+    public function test_sse_c_does_not_require_an_sse_s3_master_key(): void
+    {
+        $customerKey = str_repeat('K', 32);
+        $mode = EncryptionRequestResolver::resolveDestination($this->request('PUT', [
+            'x-amz-server-side-encryption-customer-algorithm' => 'AES256',
+            'x-amz-server-side-encryption-customer-key' => base64_encode($customerKey),
+            'x-amz-server-side-encryption-customer-key-md5' => base64_encode(md5($customerKey, true)),
+        ]), $this->metadata, 'bucket', new EncryptionService());
+
+        self::assertSame(EncryptionRequestResolver::SSE_C, $mode);
+    }
+
+    public function test_built_in_sse_c_only_service_rejects_explicit_and_bucket_default_sse_s3(): void
+    {
+        $service = new EncryptionService();
+        $requests = [
+            $this->request('PUT', ['x-amz-server-side-encryption' => 'AES256']),
+        ];
+        $this->metadata->putBucketEncryption('bucket', 'AES256', null, false);
+        $requests[] = $this->request('PUT');
+
+        foreach ($requests as $request) {
+            try {
+                EncryptionRequestResolver::resolveDestination($request, $this->metadata, 'bucket', $service);
+                self::fail('SSE-S3 was accepted without a master-key provider.');
+            } catch (NotImplementedException $error) {
+                self::assertStringContainsString('no master key provider is configured', $error->getMessage());
+            }
+        }
+    }
+
+    public function test_custom_encryption_service_without_capability_retains_sse_s3_compatibility(): void
+    {
+        $service = new class implements EncryptionServiceInterface {
+            public function encryptSseS3(string $plaintext): array
+            {
+                return ['ciphertext' => $plaintext, 'encryptedDataKey' => '', 'iv' => '', 'tag' => ''];
+            }
+
+            public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string
+            {
+                return $ciphertext;
+            }
+
+            public function encryptSseC(string $plaintext, string $customerKey): array
+            {
+                return ['ciphertext' => $plaintext, 'iv' => '', 'tag' => ''];
+            }
+
+            public function decryptSseC(string $ciphertext, string $customerKey, string $ivB64, string $tagB64): string
+            {
+                return $ciphertext;
+            }
+        };
+
+        self::assertSame(
+            EncryptionRequestResolver::SSE_S3,
+            EncryptionRequestResolver::resolveDestination(
+                $this->request('PUT', ['x-amz-server-side-encryption' => 'AES256']),
+                $this->metadata,
+                'bucket',
+                $service,
+            ),
+        );
+    }
+
+    public function test_put_bucket_encryption_does_not_persist_unusable_sse_s3_default(): void
+    {
+        $xml = '<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>'
+            . '<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>'
+            . '</Rule></ServerSideEncryptionConfiguration>';
+
+        try {
+            (new PutBucketEncryptionHandler($this->metadata, new EncryptionService()))
+                ->handleRequest($this->request('PUT', body: $xml));
+            self::fail('An unusable SSE-S3 bucket default was persisted.');
+        } catch (NotImplementedException) {
+            self::assertNull($this->metadata->getBucketEncryption('bucket'));
+        }
+    }
+
     public function test_uninitialized_sqlite_file_has_no_stored_encryption_inventory(): void
     {
         $path = sys_get_temp_dir() . '/s3-empty-encryption-' . bin2hex(random_bytes(6)) . '.sqlite';
@@ -220,9 +305,15 @@ final class StoredBucketEncryptionConfigurationTest extends TestCase
      * @param 'GET'|'PUT'|'POST' $method
      * @param array<non-empty-string, array<string>|string> $headers
      */
-    private function request(string $method, array $headers = []): Request
+    private function request(string $method, array $headers = [], string $body = ''): Request
     {
-        $request = new Request($this->createMock(Client::class), $method, Http::new('http://127.0.0.1/bucket/key'), $headers);
+        $request = new Request(
+            $this->createMock(Client::class),
+            $method,
+            Http::new('http://127.0.0.1/bucket/key'),
+            $headers,
+            $body,
+        );
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');
         $request->setAttribute('ownerId', 'owner');

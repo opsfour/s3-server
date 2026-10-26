@@ -197,8 +197,8 @@ another account's bucket. Stored byte totals include retained object versions.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_ENCRYPTION_MASTER_KEY` | - | Single master key (base64, 32 bytes decoded); an explicitly empty value fails startup |
-| `S3_ENCRYPTION_MASTER_KEYS` | - | Multi-key JSON for rotation (see below); when present, even if empty or `0`, it is validated and never falls back to the single key |
+| `S3_ENCRYPTION_MASTER_KEY` | - | Single SSE-S3 master key (base64, 32 bytes decoded); not required for SSE-C; an explicitly empty value fails startup |
+| `S3_ENCRYPTION_MASTER_KEYS` | - | Multi-key SSE-S3 JSON for rotation (see below); not required for SSE-C; when present, even if empty or `0`, it is validated and never falls back to the single key |
 | `S3_MASTER_KEY_PROVIDER` | `config` | Key provider: `config`, `redis`, or `vault` |
 | `S3_MAX_ENCRYPTED_OBJECT_SIZE` | `268435456` | Max direct SSE-S3/SSE-C PutObject/CopyObject size (256 MiB); budget at least 1.5 GiB PHP `memory_limit` per API process at the default cap, or lower this limit. Runtime memory headroom can reject smaller objects on constrained workers. Multipart staging has separate limits. |
 
