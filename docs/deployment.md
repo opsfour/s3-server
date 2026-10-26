@@ -42,6 +42,17 @@ using the same root fails startup. The lock file is persistent control state;
 do not delete or replace it. This lock enforces the supported process topology.
 It does not by itself prove durability after a crash or power loss.
 
+The server also refuses to start unless an `AuthenticationMiddleware` is
+registered. The marker prevents accidental omission but cannot validate a
+custom implementation, which remains responsible for enforcing its security
+contract. This mandatory startup invariant does not disable supported public
+access: unsigned bucket/object API requests remain subject to bucket policy,
+ACL, Object Ownership, and Public Access Block rules. Website-host `GET`/`HEAD`
+requests are anonymous; object and error-document content requires public read
+authorization, while redirect-all and prefix-only routing redirects do not read
+object content and need no object ACL or policy allow. There is no built-in
+global authentication-disabled server mode or built-in default anonymous owner.
+
 Multiple API processes, multiple hosts, shared filesystems, and remote storage
 are later experimental profiles. They are not alternative deployment recipes
 for the current release target; see the
@@ -734,6 +745,12 @@ keys in a repository. An existing credential file must be a non-empty regular
 file owned by root or the service user with no group or other permissions. The
 server refuses links, unsafe ancestors, unreadable or oversized files, and files
 that change identity while being opened.
+
+Local OIDC JWKS and PEM verification-key files follow the same ownership,
+regular-file, trusted-ancestor, bounded-read, and inode-stability checks, but
+they are public trust anchors rather than secrets: mode `0644` is allowed.
+Group and other write bits are forbidden. Unsafe links, replaceable ancestors,
+empty or unreadable files, and files larger than 1 MiB make startup fail.
 
 ## Database Least Privilege
 

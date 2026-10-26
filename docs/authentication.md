@@ -151,6 +151,14 @@ or wrongly typed key sources make startup fail. JWT clock skew is restricted to
 0–3,600 seconds so a configuration mistake cannot effectively disable token
 expiry and issued-at checks.
 
+Local JWKS and PEM verification-key files must be non-empty regular files no
+larger than 1 MiB, owned by root or the service user, and not writable by group
+or other users. Public verification keys may remain group- or world-readable
+(for example, mode `0644`). Every lexical and resolved directory ancestor must
+also be owned by root or the service user and must not be group/other-writable
+unless it is sticky. The server rejects unsafe links, unreadable files, and
+files replaced while they are opened or read.
+
 Issue credentials:
 
 ```bash
@@ -417,9 +425,29 @@ connections are poisoned and closed so already buffered follow-up requests
 cannot dispatch. Documented list-valued headers are combined and evaluated in
 full.
 
-## Unauthenticated Mode
+## Anonymous Requests and Required Middleware
 
-If no auth middleware is registered, the server runs unauthenticated (logs a warning). All operations use a default owner ID. Useful only for local development.
+Every programmatic server configuration must register an
+`AuthenticationMiddleware`; startup otherwise fails with
+`Refusing to start without authentication middleware.` There is no built-in
+global authentication-disabled mode, and the built-in anonymous path never
+assigns a default owner. The marker interface prevents accidental omission from the
+middleware stack; it does not validate a custom implementation. Custom
+authentication middleware remains responsible for enforcing its authentication
+contract and for introducing an anonymous principal only where intended.
+
+The built-in `AuthMiddleware` still supports unsigned bucket and object API
+requests by representing them as the anonymous principal. The normal bucket
+policy, ACL, Object Ownership, and Public Access Block checks then decide
+whether each operation is allowed; service-level and other
+authentication-required operations remain denied. Dedicated website-host
+`GET` and `HEAD` requests are also anonymous. Serving object or error-document
+content requires either an `AllUsers` object ACL with `READ` or a matching
+bucket-policy `Allow` for `s3:GetObject`, subject to explicit denies and Public
+Access Block settings. Redirect-all responses and routing-rule redirects that
+match only a key prefix are generated from the bucket website configuration
+without reading object content, so those redirects do not require an object ACL
+or bucket-policy allow.
 
 ## Custom Authentication
 

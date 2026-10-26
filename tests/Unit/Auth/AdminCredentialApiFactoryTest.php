@@ -2,6 +2,20 @@
 
 declare(strict_types=1);
 
+namespace OpsFour\S3Server\Auth\External;
+
+/** @return array<string|int, int>|false */
+function lstat(string $filename): array|false
+{
+    return \OpsFour\S3Server\Tests\Unit\Auth\AdminCredentialApiFactoryTest::interceptedLstat($filename);
+}
+
+/** @return array<string|int, int>|false */
+function fstat(mixed $stream): array|false
+{
+    return \OpsFour\S3Server\Tests\Unit\Auth\AdminCredentialApiFactoryTest::interceptedFstat($stream);
+}
+
 namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use OpsFour\S3Server\Auth\ChainCredentialProvider;
@@ -13,6 +27,50 @@ use PHPUnit\Framework\TestCase;
 
 final class AdminCredentialApiFactoryTest extends TestCase
 {
+    private static ?string $interceptedKeyPath = null;
+
+    private static bool $interceptHandleIdentity = false;
+
+    private static int $interceptHandleSizeDelta = 0;
+
+    private static int $interceptedKeyPathStatCalls = 0;
+
+    /** @return array<string|int, int>|false */
+    public static function interceptedLstat(string $filename): array|false
+    {
+        $status = \lstat($filename);
+        if ($status === false || $filename !== self::$interceptedKeyPath) {
+            return $status;
+        }
+
+        self::$interceptedKeyPathStatCalls++;
+        if (self::$interceptHandleIdentity && self::$interceptedKeyPathStatCalls > 1) {
+            $status['ino']++;
+        }
+
+        return $status;
+    }
+
+    /** @return array<string|int, int>|false */
+    public static function interceptedFstat(mixed $stream): array|false
+    {
+        if (! is_resource($stream)) {
+            return false;
+        }
+
+        $status = \fstat($stream);
+        if ($status === false || self::$interceptedKeyPath === null) {
+            return $status;
+        }
+
+        if (self::$interceptHandleIdentity) {
+            $status['ino']++;
+        }
+        $status['size'] += self::$interceptHandleSizeDelta;
+
+        return $status;
+    }
+
     public function test_returns_null_when_external_iam_is_disabled(): void
     {
         $handler = AdminCredentialApiFactory::create([], $this->credentialProvider());
@@ -426,12 +484,13 @@ final class AdminCredentialApiFactoryTest extends TestCase
     public function test_creates_handler_from_jwks_file(): void
     {
         $path = sys_get_temp_dir() . '/s3-external-iam-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, json_encode([
+        self::assertNotFalse(file_put_contents($path, json_encode([
             'keys' => [[
                 'kid' => 'key-1',
                 'pem' => $this->publicKey(),
             ]],
-        ], JSON_THROW_ON_ERROR));
+        ], JSON_THROW_ON_ERROR)));
+        self::assertTrue(chmod($path, 0o644));
 
         try {
             $handler = AdminCredentialApiFactory::create([
@@ -448,10 +507,243 @@ final class AdminCredentialApiFactoryTest extends TestCase
         $this->assertInstanceOf(AdminCredentialApiHandler::class, $handler);
     }
 
+    public function test_creates_handler_from_publicly_readable_trusted_public_key_file(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-public-' . bin2hex(random_bytes(4)) . '.pem';
+        self::assertNotFalse(file_put_contents($path, $this->publicKey()));
+        self::assertTrue(chmod($path, 0o644));
+
+        try {
+            $handler = AdminCredentialApiFactory::create([
+                'enabled' => true,
+                'admin_token' => 'admin-secret',
+                'public_key_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
+            ], $this->credentialProvider());
+        } finally {
+            @unlink($path);
+        }
+
+        self::assertInstanceOf(AdminCredentialApiHandler::class, $handler);
+    }
+
+    public function test_loader_rejects_initial_path_to_handle_identity_mismatch(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-identity-' . bin2hex(random_bytes(4)) . '.pem';
+        self::assertNotFalse(file_put_contents($path, $this->publicKey()));
+        self::assertTrue(chmod($path, 0o644));
+        $directory = realpath(dirname($path));
+        self::assertIsString($directory);
+        self::$interceptedKeyPath = $directory . DIRECTORY_SEPARATOR . basename($path);
+        self::$interceptHandleIdentity = true;
+        self::$interceptedKeyPathStatCalls = 0;
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('changed while it was being opened or read');
+            AdminCredentialApiFactory::create([
+                'enabled' => true,
+                'admin_token' => 'admin-secret',
+                'public_key_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
+            ], $this->credentialProvider());
+        } finally {
+            self::$interceptedKeyPath = null;
+            self::$interceptHandleIdentity = false;
+            self::$interceptedKeyPathStatCalls = 0;
+            @unlink($path);
+        }
+    }
+
+    public function test_loader_rejects_read_length_that_differs_from_stable_handle_size(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-size-' . bin2hex(random_bytes(4)) . '.pem';
+        self::assertNotFalse(file_put_contents($path, $this->publicKey()));
+        self::assertTrue(chmod($path, 0o644));
+        $directory = realpath(dirname($path));
+        self::assertIsString($directory);
+        self::$interceptedKeyPath = $directory . DIRECTORY_SEPARATOR . basename($path);
+        self::$interceptHandleSizeDelta = 1;
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('changed while it was being read');
+            AdminCredentialApiFactory::create([
+                'enabled' => true,
+                'admin_token' => 'admin-secret',
+                'public_key_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
+            ], $this->credentialProvider());
+        } finally {
+            self::$interceptedKeyPath = null;
+            self::$interceptHandleSizeDelta = 0;
+            @unlink($path);
+        }
+    }
+
+    public function test_rejects_unsafe_oidc_key_files_before_loading_them(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-external-iam-unsafe-' . bin2hex(random_bytes(4));
+        self::assertTrue(mkdir($directory, 0o700));
+        $paths = [];
+
+        try {
+            $target = $directory . '/target.pem';
+            self::assertNotFalse(file_put_contents($target, $this->publicKey()));
+            self::assertTrue(chmod($target, 0o644));
+
+            $link = $directory . '/link.pem';
+            self::assertTrue(symlink($target, $link));
+            $paths['symbolic link'] = $link;
+
+            $nonRegular = $directory . '/directory.pem';
+            self::assertTrue(mkdir($nonRegular, 0o700));
+            $paths['non-regular file'] = $nonRegular;
+
+            $writable = $directory . '/writable.pem';
+            self::assertNotFalse(file_put_contents($writable, $this->publicKey()));
+            self::assertTrue(chmod($writable, 0o666));
+            $paths['group/other-writable file'] = $writable;
+
+            $empty = $directory . '/empty.pem';
+            self::assertNotFalse(file_put_contents($empty, ''));
+            self::assertTrue(chmod($empty, 0o644));
+            $paths['empty file'] = $empty;
+
+            if (posix_geteuid() !== 0) {
+                $unreadable = $directory . '/unreadable.pem';
+                self::assertNotFalse(file_put_contents($unreadable, $this->publicKey()));
+                self::assertTrue(chmod($unreadable, 0o200));
+                $paths['unreadable file'] = $unreadable;
+            }
+
+            $oversized = $directory . '/oversized.pem';
+            self::assertNotFalse(file_put_contents($oversized, str_repeat('x', 1_048_577)));
+            self::assertTrue(chmod($oversized, 0o644));
+            $paths['oversized file'] = $oversized;
+
+            foreach ($paths as $label => $path) {
+                try {
+                    AdminCredentialApiFactory::create([
+                        'enabled' => true,
+                        'admin_token' => 'admin-secret',
+                        'public_key_path' => $path,
+                        'issuer' => 'https://issuer.example.test',
+                        'audience' => 's3-admin',
+                    ], $this->credentialProvider());
+                    self::fail("The {$label} must fail closed.");
+                } catch (\InvalidArgumentException $error) {
+                    self::assertStringNotContainsString($this->publicKey(), $error->getMessage());
+                }
+            }
+        } finally {
+            foreach ($paths as $path) {
+                if (is_dir($path) && ! is_link($path)) {
+                    @rmdir($path);
+                } else {
+                    @chmod($path, 0o600);
+                    @unlink($path);
+                }
+            }
+            @unlink($target);
+            @rmdir($directory);
+        }
+    }
+
+    public function test_rejects_oidc_key_below_replaceable_ancestor(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-external-iam-ancestor-' . bin2hex(random_bytes(4));
+        $private = $directory . '/private';
+        self::assertTrue(mkdir($directory, 0o700));
+        self::assertTrue(mkdir($private, 0o700));
+        $path = $private . '/key.pem';
+        self::assertNotFalse(file_put_contents($path, $this->publicKey()));
+        self::assertTrue(chmod($path, 0o644));
+        self::assertTrue(chmod($directory, 0o777));
+
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('trusted, private or sticky ancestors');
+            AdminCredentialApiFactory::create([
+                'enabled' => true,
+                'admin_token' => 'admin-secret',
+                'public_key_path' => $path,
+                'issuer' => 'https://issuer.example.test',
+                'audience' => 's3-admin',
+            ], $this->credentialProvider());
+        } finally {
+            @unlink($path);
+            @rmdir($private);
+            @rmdir($directory);
+        }
+    }
+
+    public function test_oidc_key_security_checks_reject_wrong_owner_and_inode_mismatch(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-stat-' . bin2hex(random_bytes(4)) . '.pem';
+        self::assertNotFalse(file_put_contents($path, $this->publicKey()));
+        self::assertTrue(chmod($path, 0o644));
+
+        try {
+            $status = lstat($path);
+            self::assertIsArray($status);
+            $effectiveUid = posix_geteuid();
+            $wrongOwner = $status;
+            $wrongOwner['uid'] = $effectiveUid === 1 ? 2 : 1;
+            $metadataCheck = new \ReflectionMethod(AdminCredentialApiFactory::class, 'assertSecureKeyFile');
+            try {
+                $metadataCheck->invoke(null, $wrongOwner, 'public key', $effectiveUid);
+                self::fail('A verification key owned by another non-root user must be rejected.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('owned by root or the effective user', $error->getMessage());
+            }
+
+            $differentFile = $status;
+            $differentFile['ino']++;
+            $identityCheck = new \ReflectionMethod(AdminCredentialApiFactory::class, 'assertSameKeyFile');
+            try {
+                $identityCheck->invoke(null, $status, $differentFile, 'public key');
+                self::fail('A path-to-handle verification-key inode mismatch must be rejected.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('changed while it was being opened or read', $error->getMessage());
+            }
+        } finally {
+            @unlink($path);
+        }
+    }
+
+    public function test_oidc_key_security_checks_reject_foreign_owned_regular_directory_component(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-external-iam-directory-' . bin2hex(random_bytes(4));
+        self::assertTrue(mkdir($path, 0o700));
+
+        try {
+            $status = lstat($path);
+            self::assertIsArray($status);
+            self::assertSame(0o040000, $status['mode'] & 0o170000);
+            $effectiveUid = posix_geteuid();
+            $status['uid'] = $effectiveUid === 1 ? 2 : 1;
+            $directoryCheck = new \ReflectionMethod(
+                AdminCredentialApiFactory::class,
+                'assertTrustedKeyDirectoryComponent',
+            );
+
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage('trusted, private or sticky ancestors');
+            $directoryCheck->invoke(null, $status, 'public key', $effectiveUid);
+        } finally {
+            @rmdir($path);
+        }
+    }
+
     public function test_rejects_oversized_jwks_file(): void
     {
         $path = sys_get_temp_dir() . '/s3-external-iam-large-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, str_repeat('x', 1_048_577));
+        self::assertNotFalse(file_put_contents($path, str_repeat('x', 1_048_577)));
+        self::assertTrue(chmod($path, 0o644));
 
         try {
             $this->expectException(\InvalidArgumentException::class);
@@ -472,12 +764,13 @@ final class AdminCredentialApiFactoryTest extends TestCase
     public function test_rejects_duplicate_jwks_key_ids(): void
     {
         $path = sys_get_temp_dir() . '/s3-external-iam-duplicate-' . bin2hex(random_bytes(4)) . '.json';
-        file_put_contents($path, json_encode([
+        self::assertNotFalse(file_put_contents($path, json_encode([
             'keys' => [
                 ['kid' => 'duplicate', 'pem' => $this->publicKey()],
                 ['kid' => 'duplicate', 'pem' => $this->publicKey()],
             ],
-        ], JSON_THROW_ON_ERROR));
+        ], JSON_THROW_ON_ERROR)));
+        self::assertTrue(chmod($path, 0o644));
 
         try {
             $this->expectException(\InvalidArgumentException::class);

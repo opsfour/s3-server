@@ -217,9 +217,60 @@ final class AdminCredentialApiFactory
 
     private static function readKeyFile(string $path, string $description): string
     {
-        $contents = @file_get_contents($path, false, null, 0, self::MAX_KEY_FILE_BYTES + 1);
-        if ($contents === false || $contents === '') {
+        if (DIRECTORY_SEPARATOR === '/' && ! function_exists('posix_geteuid')) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file requires POSIX ownership verification.",
+            );
+        }
+
+        $effectiveUid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+        $directory = self::trustedKeyDirectory(dirname($path), $description, $effectiveUid);
+        $targetPath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . basename($path);
+        clearstatcache(true, $targetPath);
+        $initialStatus = @lstat($targetPath);
+        if ($initialStatus === false) {
             throw new \InvalidArgumentException("External IAM {$description} file is not readable: {$path}");
+        }
+        self::assertSecureKeyFile($initialStatus, $description, $effectiveUid);
+
+        $handle = @fopen($targetPath, 'rb');
+        if ($handle === false) {
+            throw new \InvalidArgumentException("External IAM {$description} file is not readable: {$path}");
+        }
+
+        try {
+            $openedStatus = fstat($handle);
+            if ($openedStatus === false) {
+                throw new \InvalidArgumentException("External IAM {$description} file metadata could not be inspected.");
+            }
+            self::assertSecureKeyFile($openedStatus, $description, $effectiveUid);
+            self::assertSameKeyFile($initialStatus, $openedStatus, $description);
+
+            $contents = stream_get_contents($handle, self::MAX_KEY_FILE_BYTES + 1);
+            if ($contents === false) {
+                throw new \InvalidArgumentException("External IAM {$description} file could not be read.");
+            }
+
+            $openedAfterRead = fstat($handle);
+            clearstatcache(true, $targetPath);
+            $pathAfterRead = @lstat($targetPath);
+            if ($openedAfterRead === false || $pathAfterRead === false) {
+                throw new \InvalidArgumentException("External IAM {$description} file changed while it was being read.");
+            }
+            self::assertSecureKeyFile($openedAfterRead, $description, $effectiveUid);
+            self::assertSecureKeyFile($pathAfterRead, $description, $effectiveUid);
+            self::assertSameKeyFile($openedStatus, $openedAfterRead, $description);
+            self::assertSameKeyFile($openedStatus, $pathAfterRead, $description);
+            if ($openedAfterRead['size'] !== $openedStatus['size']
+                || strlen($contents) !== $openedAfterRead['size']) {
+                throw new \InvalidArgumentException("External IAM {$description} file changed while it was being read.");
+            }
+        } finally {
+            fclose($handle);
+        }
+
+        if ($contents === '') {
+            throw new \InvalidArgumentException("External IAM {$description} file must not be empty.");
         }
         if (strlen($contents) > self::MAX_KEY_FILE_BYTES) {
             throw new \InvalidArgumentException(
@@ -228,6 +279,133 @@ final class AdminCredentialApiFactory
         }
 
         return $contents;
+    }
+
+    private static function trustedKeyDirectory(string $directory, string $description, ?int $effectiveUid): string
+    {
+        self::assertTrustedLexicalKeyDirectory($directory, $description, $effectiveUid);
+
+        $canonical = realpath($directory);
+        if ($canonical === false || ! is_dir($canonical) || ! is_executable($canonical)) {
+            throw new \InvalidArgumentException("External IAM {$description} directory is unavailable.");
+        }
+
+        for ($path = $canonical; ; $path = dirname($path)) {
+            clearstatcache(true, $path);
+            $status = @lstat($path);
+            if ($status === false) {
+                throw new \InvalidArgumentException(
+                    "External IAM {$description} directory must have trusted, private or sticky ancestors.",
+                );
+            }
+            self::assertTrustedKeyDirectoryComponent($status, $description, $effectiveUid);
+            if ($path === dirname($path)) {
+                break;
+            }
+        }
+
+        return $canonical;
+    }
+
+    private static function assertTrustedLexicalKeyDirectory(
+        string $directory,
+        string $description,
+        ?int $effectiveUid,
+    ): void {
+        if (DIRECTORY_SEPARATOR !== '/') {
+            return;
+        }
+
+        $absolute = $directory;
+        if (! str_starts_with($absolute, DIRECTORY_SEPARATOR)) {
+            $workingDirectory = getcwd();
+            if ($workingDirectory === false) {
+                throw new \InvalidArgumentException("External IAM {$description} directory is unavailable.");
+            }
+            $absolute = $workingDirectory . DIRECTORY_SEPARATOR . $directory;
+        }
+
+        $path = DIRECTORY_SEPARATOR;
+        foreach (explode(DIRECTORY_SEPARATOR, ltrim($absolute, DIRECTORY_SEPARATOR)) as $component) {
+            if ($component === '') {
+                continue;
+            }
+            $path = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $component;
+            clearstatcache(true, $path);
+            $status = @lstat($path);
+            if ($status === false) {
+                throw new \InvalidArgumentException("External IAM {$description} directory is unavailable.");
+            }
+            self::assertTrustedKeyDirectoryComponent($status, $description, $effectiveUid);
+        }
+    }
+
+    /** @param array<string|int, int> $status */
+    private static function assertTrustedKeyDirectoryComponent(
+        array $status,
+        string $description,
+        ?int $effectiveUid,
+    ): void {
+        $type = $status['mode'] & 0o170000;
+        $trustedOwner = $effectiveUid === null || $status['uid'] === 0 || $status['uid'] === $effectiveUid;
+        if ($type === 0o120000) {
+            if (! $trustedOwner) {
+                throw new \InvalidArgumentException(
+                    "External IAM {$description} directory symlinks must be owned by root or the effective user.",
+                );
+            }
+
+            return;
+        }
+
+        if ($type !== 0o040000
+            || (($status['mode'] & 0o022) !== 0 && ($status['mode'] & 0o1000) === 0)
+            || ! $trustedOwner) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} directory must have trusted, private or sticky ancestors.",
+            );
+        }
+    }
+
+    /** @param array<string|int, int> $status */
+    private static function assertSecureKeyFile(array $status, string $description, ?int $effectiveUid): void
+    {
+        if (($status['mode'] & 0o170000) !== 0o100000) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file must be a regular file and must not be a symbolic link.",
+            );
+        }
+        if ($effectiveUid !== null && $status['uid'] !== 0 && $status['uid'] !== $effectiveUid) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file must be owned by root or the effective user.",
+            );
+        }
+        if (($status['mode'] & 0o022) !== 0) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file permissions must deny group and other writes.",
+            );
+        }
+        if ($status['size'] === 0) {
+            throw new \InvalidArgumentException("External IAM {$description} file must not be empty.");
+        }
+        if ($status['size'] > self::MAX_KEY_FILE_BYTES) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file exceeds " . self::MAX_KEY_FILE_BYTES . ' bytes.',
+            );
+        }
+    }
+
+    /**
+     * @param array<string|int, int> $expected
+     * @param array<string|int, int> $actual
+     */
+    private static function assertSameKeyFile(array $expected, array $actual, string $description): void
+    {
+        if ($expected['dev'] !== $actual['dev'] || $expected['ino'] !== $actual['ino']) {
+            throw new \InvalidArgumentException(
+                "External IAM {$description} file changed while it was being opened or read.",
+            );
+        }
     }
 
     private static function bool(mixed $value): bool

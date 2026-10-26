@@ -6,6 +6,12 @@ Laravel, they map to `config/s3-server.php`. In Symfony, they can be mirrored in
 service references such as Flysystem filesystems, event listeners, and custom
 encryption services are configured in YAML rather than environment variables.
 
+For the standalone `serve` command, a documented default is used only when its
+environment variable is absent. An explicit value of `0` is preserved exactly;
+an explicitly empty value is also preserved and is then normalized or rejected
+by the option's existing nullable/required validator rather than replaced by a
+default.
+
 ## Network
 
 | Variable | Default | Description |
@@ -154,6 +160,11 @@ See [Authentication](authentication.md) for multi-user setup.
 | `S3_EXTERNAL_IAM_ALLOWED_PREFIXES_CLAIM` | - | JWT claim listing allowed object prefixes |
 | `S3_EXTERNAL_IAM_OWNER_PREFIX` | - | Prefix prepended to mapped owner IDs |
 | `S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS` | `60` | Allowed JWT clock skew; integer from `0` through `3600` |
+
+Local `S3_EXTERNAL_IAM_JWKS_PATH` and `S3_EXTERNAL_IAM_PUBLIC_KEY_PATH` files
+must pass the ownership, write-permission, trusted-ancestor, regular-file,
+1 MiB size, and stable-read checks described in
+[External IAM / OIDC Credential Issuer](authentication.md#external-iam--oidc-credential-issuer).
 
 See [Authentication](authentication.md) for credential provider setup, runtime
 quota admin APIs, and external IAM/OIDC examples.

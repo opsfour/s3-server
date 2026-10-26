@@ -329,11 +329,82 @@ final class ServeCommandTest extends TestCase
     public function test_explicit_zero_environment_options_are_not_replaced_by_defaults(): void
     {
         $options = [
+            'S3_HOST' => 'host',
+            'S3_PORT' => 'port',
+            'S3_STORAGE_PATH' => 'storage-path',
+            'S3_STORAGE_DRIVER' => 'storage-driver',
+            'S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS' => 'allow-unfenced-storage-for-tests',
+            'S3_STORAGE_TEMP_DIR' => 'storage-temp-dir',
             'S3_STORAGE_TEMP_BUDGET' => 'storage-temp-budget',
+            'S3_FLYSYSTEM_WORKERS' => 'flysystem-workers',
+            'S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS' => 'flysystem-first-byte-timeout',
+            'S3_BACKING_BUCKET' => 'backing-bucket',
+            'S3_BACKING_REGION' => 'backing-region',
+            'S3_BACKING_ACCESS_KEY' => 'backing-access-key',
+            'S3_BACKING_SECRET_KEY' => 'backing-secret-key',
+            'S3_BACKING_ENDPOINT' => 'backing-endpoint',
+            'S3_BACKING_ALLOW_INSECURE_HTTP_FOR_TESTS' => 'backing-allow-insecure-http-for-tests',
+            'S3_BACKING_PATH_STYLE' => 'backing-path-style',
+            'S3_BACKING_PREFIX' => 'backing-prefix',
+            'S3_BACKING_CONNECT_TIMEOUT_SECONDS' => 'backing-connect-timeout',
+            'S3_BACKING_READ_TIMEOUT_SECONDS' => 'backing-read-timeout',
+            'S3_BACKING_REQUEST_TIMEOUT_SECONDS' => 'backing-request-timeout',
+            'S3_REGION' => 'region',
+            'S3_METADATA_DRIVER' => 'metadata-driver',
+            'S3_METADATA_DSN' => 'metadata-dsn',
+            'S3_METADATA_PATH' => 'metadata-path',
             'S3_METADATA_CACHE_TTL' => 'metadata-cache-ttl',
+            'S3_TLS_CERT' => 'tls-cert',
+            'S3_TLS_KEY' => 'tls-key',
             'S3_CREDENTIALS_CACHE_TTL' => 'credentials-cache-ttl',
+            'S3_MAX_CONNECTIONS' => 'max-connections',
+            'S3_CONNECTION_IDLE_TIMEOUT' => 'connection-idle-timeout',
+            'S3_BODY_SIZE_LIMIT' => 'body-size-limit',
+            'S3_POST_SPOOL_BUDGET' => 'post-spool-budget',
+            'S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS' => 'local-write-worker-timeout',
+            'S3_READ_TIMEOUT' => 'read-timeout',
+            'S3_WRITE_TIMEOUT' => 'write-timeout',
+            'S3_SHUTDOWN_DRAIN_TIMEOUT' => 'shutdown-drain-timeout',
+            'S3_REQUEST_BODY_SPOOL_WORKERS' => 'request-body-spool-workers',
+            'S3_SQLITE_WORKERS' => 'sqlite-workers',
+            'S3_ENCRYPTION_WORKERS' => 'encryption-workers',
+            'S3_SELECT_WORKERS' => 'select-workers',
+            'S3_ENCRYPTION_THRESHOLD' => 'encryption-threshold',
+            'S3_ENFORCE_MIN_PART_SIZE' => 'enforce-min-part-size',
+            'S3_NOTIFICATION_REQUIRE_HTTPS' => 'notification-require-https',
+            'S3_NOTIFICATION_WORKER' => 'notification-worker',
+            'S3_BASE_DOMAIN' => 'base-domain',
+            'S3_STRICT_BUCKET_NAMING' => 'strict-bucket-naming',
+            'S3_WEBSITE_HOST_PATTERN' => 'website-host-pattern',
             'S3_RATE_LIMIT' => 'rate-limit',
             'S3_TRUSTED_PROXY_CIDRS' => 'trusted-proxy-cidrs',
+            'S3_MASTER_KEY_PROVIDER' => 'master-key-provider',
+            'S3_MAX_ENCRYPTED_OBJECT_SIZE' => 'max-encrypted-object-size',
+            'S3_MAX_SELECT_OBJECT_SIZE' => 'max-select-object-size',
+            'S3_METRICS_BEARER_TOKEN' => 'metrics-bearer-token',
+            'S3_CREDENTIALS_DRIVER' => 'credentials-driver',
+            'S3_ACCESS_KEY' => 'access-key',
+            'S3_SECRET_KEY' => 'secret-key',
+            'S3_OWNER_ID' => 'owner-id',
+            'S3_DISPLAY_NAME' => 'display-name',
+            'S3_CREDENTIALS_DSN' => 'credentials-dsn',
+            'S3_CREDENTIALS_USERNAME' => 'credentials-username',
+            'S3_CREDENTIALS_PASSWORD' => 'credentials-password',
+            'S3_CREDENTIALS_WORKERS' => 'credentials-workers',
+            'S3_CREDENTIALS_OPERATION_TIMEOUT_SECONDS' => 'credentials-operation-timeout',
+            'S3_CREDENTIALS_PATH' => 'credentials-file',
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => 'quota-max-buckets-per-owner',
+            'S3_QUOTA_MAX_OBJECTS_PER_BUCKET' => 'quota-max-objects-per-bucket',
+            'S3_QUOTA_MAX_BYTES_PER_BUCKET' => 'quota-max-bytes-per-bucket',
+            'S3_QUOTA_MAX_BYTES_PER_OWNER' => 'quota-max-bytes-per-owner',
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_BUCKET' => 'quota-max-multipart-uploads-per-bucket',
+            'S3_QUOTA_MAX_MULTIPART_UPLOADS_PER_OWNER' => 'quota-max-multipart-uploads-per-owner',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_BUCKET' => 'quota-max-multipart-bytes-per-bucket',
+            'S3_QUOTA_MAX_MULTIPART_BYTES_PER_OWNER' => 'quota-max-multipart-bytes-per-owner',
+            'S3_LIFECYCLE_INTERVAL_SECONDS' => 'lifecycle-interval-seconds',
+            'S3_LIFECYCLE_BATCH_SIZE' => 'lifecycle-batch-size',
+            'S3_LIFECYCLE_MAX_ACTIONS_PER_RUN' => 'lifecycle-max-actions-per-run',
+            'S3_LIFECYCLE_LOCK_TTL_SECONDS' => 'lifecycle-lock-ttl-seconds',
             'S3_MULTIPART_MAX_AGE_SECONDS' => 'multipart-max-age-seconds',
         ];
         $originals = [];
@@ -345,6 +416,62 @@ final class ServeCommandTest extends TestCase
             $command = new ServeCommand();
             foreach ($options as $option) {
                 self::assertSame('0', $command->getDefinition()->getOption($option)->getDefault());
+            }
+        } finally {
+            foreach ($originals as $name => $original) {
+                putenv($original === false ? $name : $name . '=' . $original);
+            }
+        }
+    }
+
+    public function test_explicit_empty_environment_options_are_left_for_downstream_validation(): void
+    {
+        $options = [
+            'S3_HOST' => 'host',
+            'S3_STORAGE_PATH' => 'storage-path',
+            'S3_STORAGE_DRIVER' => 'storage-driver',
+            'S3_METADATA_PATH' => 'metadata-path',
+            'S3_REGION' => 'region',
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => 'quota-max-buckets-per-owner',
+        ];
+        $originals = [];
+        foreach ($options as $name => $_) {
+            $originals[$name] = getenv($name);
+            putenv($name . '=');
+        }
+
+        try {
+            $command = new ServeCommand();
+            foreach ($options as $option) {
+                self::assertSame('', $command->getDefinition()->getOption($option)->getDefault());
+            }
+        } finally {
+            foreach ($originals as $name => $original) {
+                putenv($original === false ? $name : $name . '=' . $original);
+            }
+        }
+    }
+
+    public function test_absent_environment_options_keep_their_previous_defaults(): void
+    {
+        $expected = [
+            'S3_HOST' => ['host', '0.0.0.0'],
+            'S3_STORAGE_PATH' => ['storage-path', null],
+            'S3_STORAGE_DRIVER' => ['storage-driver', 'filesystem'],
+            'S3_BACKING_PREFIX' => ['backing-prefix', ''],
+            'S3_METADATA_PATH' => ['metadata-path', null],
+            'S3_QUOTA_MAX_BUCKETS_PER_OWNER' => ['quota-max-buckets-per-owner', '0'],
+        ];
+        $originals = [];
+        foreach ($expected as $name => $_) {
+            $originals[$name] = getenv($name);
+            putenv($name);
+        }
+
+        try {
+            $command = new ServeCommand();
+            foreach ($expected as [$option, $default]) {
+                self::assertSame($default, $command->getDefinition()->getOption($option)->getDefault());
             }
         } finally {
             foreach ($originals as $name => $original) {
