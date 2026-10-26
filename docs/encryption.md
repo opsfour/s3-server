@@ -161,6 +161,8 @@ S3_REDIS_MASTER_KEY_DSN=redis://redis.internal:6379
 ```
 
 Multi-key: store keys as a Redis hash at `s3:master-keys` (key ID → base64 key). Set `s3:active-key-id` to the active key ID.
+The legacy key-name default is used only when `S3_REDIS_MASTER_KEY_NAME` is
+absent. An empty name fails closed; `0` names the literal Redis key `0`.
 
 #### Vault Provider
 
@@ -181,6 +183,14 @@ redirects, so `X-Vault-Token` is sent only to the configured HTTPS endpoint.
 The address may include a base path but cannot contain URL credentials, a query,
 or a fragment. The secret path cannot contain a query or fragment. Provider
 errors omit the configured path and raw client diagnostics.
+Vault path and field defaults apply only when their environment variables are
+absent. Empty values fail closed; `0` is used as the literal path or field name.
+
+For every built-in provider, environment fallbacks distinguish absence from a
+configured empty string. Config multi-key input takes precedence whenever
+`S3_ENCRYPTION_MASTER_KEYS` is present, so invalid values such as empty or `0`
+fail validation instead of selecting `S3_ENCRYPTION_MASTER_KEY`. The standalone
+runtime and encryption workers use the same rules as direct provider construction.
 
 ### Symfony Key Services
 

@@ -197,8 +197,8 @@ another account's bucket. Stored byte totals include retained object versions.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_ENCRYPTION_MASTER_KEY` | - | Single master key (base64, 32 bytes decoded) |
-| `S3_ENCRYPTION_MASTER_KEYS` | - | Multi-key JSON for rotation (see below) |
+| `S3_ENCRYPTION_MASTER_KEY` | - | Single master key (base64, 32 bytes decoded); an explicitly empty value fails startup |
+| `S3_ENCRYPTION_MASTER_KEYS` | - | Multi-key JSON for rotation (see below); when present, even if empty or `0`, it is validated and never falls back to the single key |
 | `S3_MASTER_KEY_PROVIDER` | `config` | Key provider: `config`, `redis`, or `vault` |
 | `S3_MAX_ENCRYPTED_OBJECT_SIZE` | `268435456` | Max direct SSE-S3/SSE-C PutObject/CopyObject size (256 MiB); budget at least 1.5 GiB PHP `memory_limit` per API process at the default cap, or lower this limit. Runtime memory headroom can reject smaller objects on constrained workers. Multipart staging has separate limits. |
 
@@ -220,8 +220,8 @@ emulators.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_REDIS_MASTER_KEY_DSN` | - | Redis connection string |
-| `S3_REDIS_MASTER_KEY_NAME` | `s3:master-key` | Redis key for legacy single-key |
+| `S3_REDIS_MASTER_KEY_DSN` | - | Redis connection string; an explicitly empty value fails startup |
+| `S3_REDIS_MASTER_KEY_NAME` | `s3:master-key` | Redis key for legacy single-key; the default applies only when absent, an empty name fails, and `0` is used literally |
 
 For multi-key mode, store the key map in the `s3:master-keys` hash and the
 required active key ID in `s3:active-key-id`.
@@ -230,10 +230,10 @@ required active key ID in `s3:active-key-id`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_VAULT_ADDR` | - | Vault server URL (must be HTTPS) |
-| `S3_VAULT_TOKEN` | - | Vault authentication token |
-| `S3_VAULT_PATH` | `secret/data/s3-server/master-key` | KV v2 secret path |
-| `S3_VAULT_KEY_FIELD` | `key` | Field name in secret data |
+| `S3_VAULT_ADDR` | - | Vault server URL (must be HTTPS); an explicitly empty value fails startup |
+| `S3_VAULT_TOKEN` | - | Vault authentication token; an explicitly empty value fails startup |
+| `S3_VAULT_PATH` | `secret/data/s3-server/master-key` | KV v2 secret path; the default applies only when absent, an empty path fails, and `0` is used literally |
+| `S3_VAULT_KEY_FIELD` | `key` | Field name in secret data; the default applies only when absent, an empty field fails, and `0` is used literally |
 
 For multi-key mode, the KV v2 data must contain `keys` and an `activeKeyId`
 which names one entry. Vault responses are bounded to 1 MiB.

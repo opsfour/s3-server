@@ -14,6 +14,28 @@ use PHPUnit\Framework\TestCase;
 
 final class VaultMasterKeyProviderTest extends TestCase
 {
+    /** @var array<string, string|false> */
+    private array $originalEnvironment = [];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        foreach (['S3_VAULT_ADDR', 'S3_VAULT_TOKEN', 'S3_VAULT_PATH', 'S3_VAULT_KEY_FIELD'] as $name) {
+            $this->originalEnvironment[$name] = getenv($name);
+            putenv($name);
+        }
+    }
+
+    protected function tearDown(): void
+    {
+        foreach ($this->originalEnvironment as $name => $value) {
+            putenv($value === false ? $name : "{$name}={$value}");
+        }
+
+        parent::tearDown();
+    }
+
     public function test_multi_key_configuration_uses_explicit_active_key(): void
     {
         $first = str_repeat('a', 32);
@@ -55,6 +77,116 @@ final class VaultMasterKeyProviderTest extends TestCase
 
         self::assertSame('default', $provider->getKeyId());
         self::assertSame($key, $provider->getMasterKey());
+    }
+
+    public function test_empty_environment_path_fails_closed(): void
+    {
+        putenv('S3_VAULT_PATH=');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Vault secret path must be a non-empty URL path');
+
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            httpClient: self::client(200, '{}'),
+        );
+    }
+
+    public function test_empty_environment_key_field_fails_closed(): void
+    {
+        putenv('S3_VAULT_KEY_FIELD=');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Vault key field must not be empty.');
+
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            httpClient: self::client(200, '{}'),
+        );
+    }
+
+    public function test_zero_environment_key_field_is_used_literally(): void
+    {
+        $key = str_repeat('z', 32);
+        putenv('S3_VAULT_KEY_FIELD=0');
+        $client = self::client(200, json_encode([
+            'data' => ['data' => ['0' => base64_encode($key)]],
+        ], JSON_THROW_ON_ERROR));
+
+        $provider = new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            httpClient: $client,
+        );
+
+        self::assertSame($key, $provider->getMasterKey());
+    }
+
+    public function test_zero_environment_path_is_used_literally(): void
+    {
+        putenv('S3_VAULT_PATH=0');
+        $key = base64_encode(str_repeat('z', 32));
+        $delegate = new class ($key) implements DelegateHttpClient {
+            public ?string $requestedUri = null;
+
+            public function __construct(private readonly string $key) {}
+
+            public function request(Request $request, Cancellation $cancellation): Response
+            {
+                $this->requestedUri = (string) $request->getUri();
+
+                return new Response('1.1', 200, null, [], json_encode([
+                    'data' => ['data' => ['key' => $this->key]],
+                ], JSON_THROW_ON_ERROR), $request);
+            }
+        };
+
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            vaultToken: 'secret-token',
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        self::assertSame('https://vault.internal/v1/0', $delegate->requestedUri);
+    }
+
+    public function test_zero_environment_address_reaches_url_validation(): void
+    {
+        putenv('S3_VAULT_ADDR=0');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Vault address must use HTTPS');
+
+        new VaultMasterKeyProvider(vaultToken: 'secret-token');
+    }
+
+    public function test_zero_environment_token_is_sent_literally(): void
+    {
+        putenv('S3_VAULT_TOKEN=0');
+        $key = base64_encode(str_repeat('z', 32));
+        $delegate = new class ($key) implements DelegateHttpClient {
+            public ?string $token = null;
+
+            public function __construct(private readonly string $key) {}
+
+            public function request(Request $request, Cancellation $cancellation): Response
+            {
+                $this->token = $request->getHeader('X-Vault-Token');
+
+                return new Response('1.1', 200, null, [], json_encode([
+                    'data' => ['data' => ['key' => $this->key]],
+                ], JSON_THROW_ON_ERROR), $request);
+            }
+        };
+
+        new VaultMasterKeyProvider(
+            vaultAddr: 'https://vault.internal',
+            httpClient: new HttpClient($delegate, []),
+        );
+
+        self::assertSame('0', $delegate->token);
     }
 
     public function test_numeric_master_key_id_remains_resolvable(): void

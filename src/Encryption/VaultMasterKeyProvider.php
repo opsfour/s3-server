@@ -36,7 +36,7 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
         ?string $keyField = null,
         ?HttpClient $httpClient = null,
     ) {
-        $addr = $vaultAddr ?? (getenv('S3_VAULT_ADDR') ?: false);
+        $addr = $vaultAddr ?? getenv('S3_VAULT_ADDR');
         if ($addr === false || $addr === '') {
             throw new \RuntimeException('S3_VAULT_ADDR environment variable or vaultAddr parameter is required.');
         }
@@ -52,15 +52,20 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
             throw new \RuntimeException('Vault address must be an HTTPS URL without credentials, query, or fragment.');
         }
 
-        $token = $vaultToken ?? (getenv('S3_VAULT_TOKEN') ?: false);
+        $token = $vaultToken ?? getenv('S3_VAULT_TOKEN');
         if ($token === false || $token === '') {
             throw new \RuntimeException('S3_VAULT_TOKEN environment variable or vaultToken parameter is required.');
         }
 
-        $path = $vaultPath ?? (getenv('S3_VAULT_PATH') ?: 'secret/data/s3-server/master-key');
-        $field = $keyField ?? (getenv('S3_VAULT_KEY_FIELD') ?: 'key');
+        $environmentPath = getenv('S3_VAULT_PATH');
+        $path = $vaultPath ?? ($environmentPath === false ? 'secret/data/s3-server/master-key' : $environmentPath);
+        $environmentField = getenv('S3_VAULT_KEY_FIELD');
+        $field = $keyField ?? ($environmentField === false ? 'key' : $environmentField);
         if ($path === '' || strpbrk($path, "?#\r\n\0") !== false) {
             throw new \RuntimeException('Vault secret path must be a non-empty URL path without query or fragment.');
+        }
+        if ($field === '') {
+            throw new \RuntimeException('Vault key field must not be empty.');
         }
 
         // Never follow redirects with the Vault token attached. In particular,

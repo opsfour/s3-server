@@ -442,13 +442,10 @@ final readonly class S3ServerRuntimeFactory
 
         $masterKey = getenv('S3_ENCRYPTION_MASTER_KEY');
         $masterKeys = getenv('S3_ENCRYPTION_MASTER_KEYS');
-        if (($masterKey === false || $masterKey === '') && ($masterKeys === false || $masterKeys === '')) {
+        if ($masterKey === false && $masterKeys === false) {
             return null;
         }
 
-        return new ConfigMasterKeyProvider(
-            $masterKey !== false && $masterKey !== '' ? $masterKey : null,
-            $masterKeys !== false && $masterKeys !== '' ? $masterKeys : null,
-        );
+        return new ConfigMasterKeyProvider();
     }
 }

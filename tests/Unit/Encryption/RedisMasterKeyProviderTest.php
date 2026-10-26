@@ -12,6 +12,30 @@ use PHPUnit\Framework\TestCase;
 
 final class RedisMasterKeyProviderTest extends TestCase
 {
+    private string|false $originalKeyName;
+
+    private string|false $originalDsn;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->originalKeyName = getenv('S3_REDIS_MASTER_KEY_NAME');
+        $this->originalDsn = getenv('S3_REDIS_MASTER_KEY_DSN');
+        putenv('S3_REDIS_MASTER_KEY_NAME');
+        putenv('S3_REDIS_MASTER_KEY_DSN');
+    }
+
+    protected function tearDown(): void
+    {
+        putenv($this->originalKeyName === false
+            ? 'S3_REDIS_MASTER_KEY_NAME'
+            : 'S3_REDIS_MASTER_KEY_NAME=' . $this->originalKeyName);
+        putenv($this->originalDsn === false
+            ? 'S3_REDIS_MASTER_KEY_DSN'
+            : 'S3_REDIS_MASTER_KEY_DSN=' . $this->originalDsn);
+        parent::tearDown();
+    }
+
     public function test_multi_key_configuration_uses_explicit_active_key(): void
     {
         $first = str_repeat('a', 32);
@@ -42,6 +66,52 @@ final class RedisMasterKeyProviderTest extends TestCase
 
         self::assertSame('default', $provider->getKeyId());
         self::assertSame($key, $provider->getMasterKey());
+    }
+
+    public function test_empty_environment_key_name_fails_closed(): void
+    {
+        putenv('S3_REDIS_MASTER_KEY_NAME=');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Redis master key name must not be empty.');
+
+        new RedisMasterKeyProvider(redisClient: self::client([
+            'HGETALL:s3:master-keys' => ['active', base64_encode(str_repeat('a', 32))],
+            'GET:s3:active-key-id' => 'active',
+        ]));
+    }
+
+    public function test_zero_environment_key_name_is_used_literally(): void
+    {
+        $key = str_repeat('z', 32);
+        putenv('S3_REDIS_MASTER_KEY_NAME=0');
+
+        $provider = new RedisMasterKeyProvider(redisClient: self::client([
+            'HGETALL:s3:master-keys' => [],
+            'GET:0' => base64_encode($key),
+        ]));
+
+        self::assertSame($key, $provider->getMasterKey());
+    }
+
+    public function test_empty_environment_dsn_fails_closed(): void
+    {
+        putenv('S3_REDIS_MASTER_KEY_DSN=');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('S3_REDIS_MASTER_KEY_DSN environment variable or redisDsn parameter is required.');
+
+        new RedisMasterKeyProvider();
+    }
+
+    public function test_zero_environment_dsn_reaches_connection_validation(): void
+    {
+        putenv('S3_REDIS_MASTER_KEY_DSN=0');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Unable to connect to Redis for master keys.');
+
+        new RedisMasterKeyProvider();
     }
 
     public function test_numeric_master_key_id_remains_resolvable(): void

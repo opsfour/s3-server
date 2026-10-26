@@ -26,9 +26,12 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
      */
     public function __construct(?string $base64Key = null, ?string $keysJson = null)
     {
-        $envMulti = $keysJson ?? (getenv('S3_ENCRYPTION_MASTER_KEYS') ?: false);
+        $envMulti = $keysJson ?? getenv('S3_ENCRYPTION_MASTER_KEYS');
 
-        if ($envMulti !== false && $envMulti !== '') {
+        if ($envMulti !== false) {
+            if ($envMulti === '') {
+                throw new \RuntimeException('S3_ENCRYPTION_MASTER_KEYS must be a non-empty JSON object of {keyId: base64Key}.');
+            }
             $parsed = json_decode($envMulti, true, 4, JSON_THROW_ON_ERROR);
             if (!is_array($parsed) || $parsed === []) {
                 throw new \RuntimeException('S3_ENCRYPTION_MASTER_KEYS must be a non-empty JSON object of {keyId: base64Key}.');
@@ -56,7 +59,7 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
         }
 
         // Legacy single-key format.
-        $envKey = $base64Key ?? (getenv('S3_ENCRYPTION_MASTER_KEY') ?: false);
+        $envKey = $base64Key ?? getenv('S3_ENCRYPTION_MASTER_KEY');
         if ($envKey === false || $envKey === '') {
             throw new \RuntimeException('S3_ENCRYPTION_MASTER_KEY or S3_ENCRYPTION_MASTER_KEYS environment variable is required.');
         }

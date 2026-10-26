@@ -41,7 +41,7 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
         }
 
         if ($redisClient === null) {
-            $dsn = $redisDsn ?? (getenv('S3_REDIS_MASTER_KEY_DSN') ?: false);
+            $dsn = $redisDsn ?? getenv('S3_REDIS_MASTER_KEY_DSN');
             if ($dsn === false || $dsn === '') {
                 throw new \RuntimeException('S3_REDIS_MASTER_KEY_DSN environment variable or redisDsn parameter is required.');
             }
@@ -51,6 +51,12 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
             } catch (\Throwable) {
                 throw new \RuntimeException('Unable to connect to Redis for master keys.');
             }
+        }
+
+        $environmentName = getenv('S3_REDIS_MASTER_KEY_NAME');
+        $name = $keyName ?? ($environmentName === false ? 's3:master-key' : $environmentName);
+        if ($name === '') {
+            throw new \RuntimeException('Redis master key name must not be empty.');
         }
 
         // Try multi-key format first (HGETALL s3:master-keys).
@@ -114,7 +120,6 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
         }
 
         // Fallback to legacy single-key.
-        $name = $keyName ?? (getenv('S3_REDIS_MASTER_KEY_NAME') ?: 's3:master-key');
         try {
             $base64Key = $redisClient->get($name);
         } catch (\Throwable) {

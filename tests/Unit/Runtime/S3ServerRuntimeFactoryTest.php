@@ -69,6 +69,27 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertInstanceOf(EncryptionService::class, $runtime->encryption);
     }
 
+    public function test_create_fails_closed_for_explicitly_empty_master_key_environment(): void
+    {
+        putenv('S3_ENCRYPTION_MASTER_KEY=');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('S3_ENCRYPTION_MASTER_KEY or S3_ENCRYPTION_MASTER_KEYS environment variable is required.');
+
+        $this->createRuntime();
+    }
+
+    public function test_create_does_not_fall_back_from_zero_multi_key_environment(): void
+    {
+        putenv('S3_ENCRYPTION_MASTER_KEY=' . base64_encode(str_repeat('a', 32)));
+        putenv('S3_ENCRYPTION_MASTER_KEYS=0');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('S3_ENCRYPTION_MASTER_KEYS must be a non-empty JSON object');
+
+        $this->createRuntime();
+    }
+
     public function test_create_registers_notification_listeners(): void
     {
         $events = [];
