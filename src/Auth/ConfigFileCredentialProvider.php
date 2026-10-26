@@ -447,31 +447,80 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
 
     private function trustedCredentialDirectory(string $directory): string
     {
-        $canonical = realpath($directory);
-        if ($canonical === false) {
-            throw new \RuntimeException('Credentials directory is unavailable.');
-        }
         if (DIRECTORY_SEPARATOR === '/' && ! function_exists('posix_geteuid')) {
             throw new \RuntimeException('Credential file writes require POSIX ownership verification.');
         }
         $effectiveUid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+        self::assertTrustedLexicalCredentialDirectory($directory, $effectiveUid);
+
+        $canonical = realpath($directory);
+        if ($canonical === false) {
+            throw new \RuntimeException('Credentials directory is unavailable.');
+        }
 
         // An attacker who owns any ancestor can rename a private child and
         // replace it between the permission check and the secret write.
         for ($path = $canonical; ; $path = dirname($path)) {
             clearstatcache(true, $path);
-            $permissions = @fileperms($path);
-            $owner = @fileowner($path);
-            if ($permissions === false
-                || (($permissions & 0o022) !== 0 && ($permissions & 0o1000) === 0)
-                || ($effectiveUid !== null && ($owner === false || ($owner !== 0 && $owner !== $effectiveUid)))) {
+            $status = @lstat($path);
+            if ($status === false) {
                 throw new \RuntimeException('Credentials directory must have trusted, private or sticky ancestors.');
             }
+            self::assertTrustedCredentialDirectoryComponent($status, $effectiveUid);
             if ($path === dirname($path)) {
                 break;
             }
         }
 
         return $canonical;
+    }
+
+    private static function assertTrustedLexicalCredentialDirectory(string $directory, ?int $effectiveUid): void
+    {
+        if (DIRECTORY_SEPARATOR !== '/') {
+            return;
+        }
+
+        $absolute = $directory;
+        if (! str_starts_with($absolute, DIRECTORY_SEPARATOR)) {
+            $workingDirectory = getcwd();
+            if ($workingDirectory === false) {
+                throw new \RuntimeException('Credentials directory is unavailable.');
+            }
+            $absolute = $workingDirectory . DIRECTORY_SEPARATOR . $directory;
+        }
+        $path = DIRECTORY_SEPARATOR;
+        foreach (explode(DIRECTORY_SEPARATOR, ltrim($absolute, DIRECTORY_SEPARATOR)) as $component) {
+            if ($component === '') {
+                continue;
+            }
+            $path = rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $component;
+            clearstatcache(true, $path);
+            $status = @lstat($path);
+            if ($status === false) {
+                return;
+            }
+            self::assertTrustedCredentialDirectoryComponent($status, $effectiveUid);
+        }
+    }
+
+    /** @param array<string|int, int> $status */
+    private static function assertTrustedCredentialDirectoryComponent(array $status, ?int $effectiveUid): void
+    {
+        $type = $status['mode'] & 0o170000;
+        $trustedOwner = $effectiveUid === null || $status['uid'] === 0 || $status['uid'] === $effectiveUid;
+        if ($type === 0o120000) {
+            if (! $trustedOwner) {
+                throw new \RuntimeException('Credentials directory symlinks must be owned by root or the effective user.');
+            }
+
+            return;
+        }
+
+        if ($type !== 0o040000
+            || (($status['mode'] & 0o022) !== 0 && ($status['mode'] & 0o1000) === 0)
+            || ! $trustedOwner) {
+            throw new \RuntimeException('Credentials directory must have trusted, private or sticky ancestors.');
+        }
     }
 }

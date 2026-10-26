@@ -202,6 +202,33 @@ final class CredentialProviderSessionMetadataTest extends TestCase
         }
     }
 
+    public function test_config_file_provider_rejects_simulated_foreign_owned_directory_symlink(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-credential-link-target-' . bin2hex(random_bytes(8));
+        $alias = $directory . '-alias';
+        self::assertTrue(mkdir($directory, 0o700));
+        if (! @symlink($directory, $alias)) {
+            @rmdir($directory);
+            self::markTestSkipped('Directory symlinks are unavailable.');
+        }
+
+        try {
+            $status = lstat($alias);
+            self::assertIsArray($status);
+            self::assertSame(0o120000, $status['mode'] & 0o170000);
+            $effectiveUid = posix_geteuid();
+            $status['uid'] = $effectiveUid === 1 ? 2 : 1;
+            $check = new \ReflectionMethod(ConfigFileCredentialProvider::class, 'assertTrustedCredentialDirectoryComponent');
+
+            $this->expectException(\RuntimeException::class);
+            $this->expectExceptionMessage('Credentials directory symlinks must be owned by root or the effective user.');
+            $check->invoke(null, $status, $effectiveUid);
+        } finally {
+            @unlink($alias);
+            @rmdir($directory);
+        }
+    }
+
     public function test_config_file_provider_rejects_unsafe_existing_files_before_loading_credentials(): void
     {
         $directory = sys_get_temp_dir() . '/s3-credential-load-' . bin2hex(random_bytes(8));

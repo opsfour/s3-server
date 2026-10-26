@@ -38,6 +38,8 @@ The package requires `ext-posix` so the file provider can verify the effective
 user, the credential file, and every ancestor of its canonical directory.
 The directory must be private or root-owned and sticky (such as `/tmp`);
 secrets are written in a private temporary directory before an atomic move.
+Directory symlinks are accepted only when the link is owned by root or the
+effective user and both its lexical and resolved ancestors pass the trust checks.
 An existing file must be a non-empty regular file owned by root or the effective
 user, readable by its owner, inaccessible to group and other users, no larger
 than 16 MiB, and unchanged between path inspection and reading. Unsafe files and
