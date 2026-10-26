@@ -10,6 +10,7 @@ use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
 use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 
 /**
  * Composite credential provider that tries multiple providers in order.
@@ -17,7 +18,7 @@ use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
  * The first provider is considered the "primary" and receives writes.
  * Reads try each provider until a match is found.
  */
-final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialHealthProbe, CredentialProvider, AtomicCredentialStatusUpdater, CredentialWorkerPoolOwner
+final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialHealthProbe, CredentialProvider, AtomicCredentialStatusUpdater, CredentialWorkerPoolOwner, AtomicExpiredCredentialPruner
 {
     /** @var list<CredentialProvider> */
     private readonly array $providers;
@@ -42,6 +43,7 @@ final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCr
 
         return $provider instanceof AtomicCredentialCreator
             && $provider instanceof AtomicCredentialDeleter
+            && $provider instanceof AtomicExpiredCredentialPruner
             && (!$provider instanceof self || $provider->supportsAtomicCredentialLifecycle());
     }
 
@@ -151,5 +153,19 @@ final class ChainCredentialProvider implements AtomicCredentialCreator, AtomicCr
         }
 
         return false;
+    }
+
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        if (count($this->providers) !== 1) {
+            throw new \RuntimeException('Expired credential pruning is unavailable across multiple credential providers.');
+        }
+
+        $provider = $this->providers[0];
+        if (! $provider instanceof AtomicExpiredCredentialPruner) {
+            throw new \RuntimeException('Primary credential provider does not support atomic expired credential pruning.');
+        }
+
+        return $provider->pruneExpiredCredentials($now, $limit);
     }
 }

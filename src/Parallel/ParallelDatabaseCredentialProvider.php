@@ -16,10 +16,11 @@ use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 use Revolt\EventLoop;
 
 /** Offload the synchronous PDO credential store from the API event loop. */
-final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, CredentialWorkerPoolOwner
+final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, CredentialWorkerPoolOwner, AtomicExpiredCredentialPruner
 {
     private readonly WorkerPool $pool;
 
@@ -114,6 +115,11 @@ final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreato
     public function setActiveIfCurrent(Credential $expected, bool $active): bool
     {
         return (bool) $this->submit('setActiveIfCurrent', [$expected, $active]);
+    }
+
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        return (int) $this->submit('pruneExpiredCredentials', [$now, $limit]);
     }
 
     /** @param list<mixed> $args */

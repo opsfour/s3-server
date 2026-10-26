@@ -23,6 +23,9 @@ use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiHandler;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
+use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
+use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
+use OpsFour\S3Server\Contracts\CredentialProvider;
 use PHPUnit\Framework\TestCase;
 
 final class AdminCredentialApiFactoryTest extends TestCase
@@ -142,6 +145,41 @@ final class AdminCredentialApiFactoryTest extends TestCase
             new InMemoryCredentialProvider(),
             new InMemoryCredentialProvider(),
         ));
+    }
+
+    public function test_rejects_custom_atomic_store_without_expired_credential_pruning(): void
+    {
+        $provider = new class implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider {
+            public function createCredentialIfAbsent(Credential $credential): bool
+            {
+                return true;
+            }
+            public function deleteCredentialIfCurrent(Credential $expected): bool
+            {
+                return true;
+            }
+            public function getCredential(string $accessKeyId): ?Credential
+            {
+                return null;
+            }
+            public function listCredentials(): array
+            {
+                return [];
+            }
+            public function putCredential(Credential $credential): void {}
+            public function deleteCredential(string $accessKeyId): void {}
+        };
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('atomic expired credential pruning');
+
+        AdminCredentialApiFactory::create([
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+            'public_key' => $this->publicKey(),
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
+        ], $provider);
     }
 
     public function test_accepts_nested_single_provider_chain_for_external_iam(): void

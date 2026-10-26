@@ -44,7 +44,9 @@ An existing file must be a non-empty regular file owned by root or the effective
 user, readable by its owner, inaccessible to group and other users, no larger
 than 16 MiB, and unchanged between path inspection and reading. Unsafe files and
 symbolic links make startup fail closed; a genuinely absent target remains a
-valid empty initial state.
+valid empty initial state. Writes that would exceed the same 16 MiB limit are
+rejected before a temporary file is created, leaving both the current file and
+the provider's in-memory snapshot unchanged.
 Each JSON entry is validated strictly at startup. Unknown fields and fields with
 the wrong JSON type make startup fail instead of falling back to credential
 defaults. Owner IDs and display names must be valid UTF-8 containing only XML
@@ -91,12 +93,16 @@ Before starting the API process or running credential management, execute
 database role. Set `S3_CREDENTIALS_DSN`, `S3_CREDENTIALS_USERNAME`, and
 `S3_CREDENTIALS_PASSWORD` in that bootstrap environment; the migrator preserves
 existing credentials. Serving processes verify the table, required columns,
-and a single byte-exact primary key on `access_key_id` without changing the
-schema. MySQL requires a full-length `VARBINARY(255)` primary key; SQLite
+the `(expires_at, access_key_id)` expiration index, and a single byte-exact
+primary key on `access_key_id` without changing the schema. MySQL requires a
+full-length `VARBINARY(255)` primary key; SQLite
 requires its `BINARY` collation, and PostgreSQL requires a deterministic
 text/varchar primary-key collation. The explicit migrator also rejects an
 existing table that cannot meet these checks instead of reporting a successful
-partial migration. Use a DML-only role for serving after the bootstrap. The
+partial migration. The explicit migrator replaces a package-named expiration
+index when its columns, access method, visibility, or predicate are invalid;
+serving processes never perform that DDL. Use a DML-only role for serving after
+the bootstrap. The
 DSN uses PDO syntax; credentials are passed separately so the
 same configuration works for PostgreSQL and MySQL. Positive lookups are cached
 for one second by default. Set
@@ -194,6 +200,14 @@ Successful revocation returns `204`. An unknown or concurrently removed key
 returns `404`; if the observed key was replaced before the compare-and-delete,
 the API preserves the replacement and returns `409` with `{"error":"conflict"}`.
 All admin responses use `Cache-Control: no-store`.
+
+Before each successful external issuance, the server atomically removes a
+small bounded batch of already expired temporary credentials. Permanent
+credentials and credentials whose expiry is still in the future are never
+included. Invalid identities and cleanup failures do not create a credential.
+The file provider performs this rewrite under its single-process writer mutex;
+use the database provider when credential state is shared by multiple API
+processes.
 
 With a database provider, revocation becomes visible after the positive-lookup
 cache TTL (one second by default). Set `S3_CREDENTIALS_CACHE_TTL=0` when the

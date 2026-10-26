@@ -161,6 +161,11 @@ See [Authentication](authentication.md) for multi-user setup.
 | `S3_EXTERNAL_IAM_OWNER_PREFIX` | - | Prefix prepended to mapped owner IDs |
 | `S3_EXTERNAL_IAM_CLOCK_SKEW_SECONDS` | `60` | Allowed JWT clock skew; integer from `0` through `3600` |
 
+External issuance requires a credential provider with atomic create, revoke,
+and bounded expired-credential pruning support. Built-in memory, file, and
+database providers support this contract; the file provider remains limited to
+the documented single-process profile.
+
 Local `S3_EXTERNAL_IAM_JWKS_PATH` and `S3_EXTERNAL_IAM_PUBLIC_KEY_PATH` files
 must pass the ownership, write-permission, trusted-ancestor, regular-file,
 1 MiB size, and stable-read checks described in

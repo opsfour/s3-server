@@ -9,6 +9,7 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 
 use function Amp\File\changePermissions;
 use function Amp\File\createDirectory;
@@ -33,7 +34,7 @@ use function Amp\File\write;
  * (safe for pre-event-loop contexts). Write operations (put/delete) update
  * both the in-memory store and the file using Amp\File async I/O.
  */
-final class ConfigFileCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater
+final class ConfigFileCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater, AtomicExpiredCredentialPruner
 {
     private const int MAX_FILE_BYTES = 16_777_216;
 
@@ -166,6 +167,39 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
             $this->credentials = $credentials;
 
             return true;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        if ($limit < 1) {
+            throw new \InvalidArgumentException('Expired credential prune limit must be >= 1.');
+        }
+
+        $lock = $this->writeMutex->acquire();
+        try {
+            $credentials = $this->credentials;
+            $deleted = 0;
+            foreach ($credentials as $accessKeyId => $credential) {
+                if ($credential->expiresAt === null || $credential->expiresAt > $now) {
+                    continue;
+                }
+
+                unset($credentials[$accessKeyId]);
+                if (++$deleted === $limit) {
+                    break;
+                }
+            }
+            if ($deleted === 0) {
+                return 0;
+            }
+
+            $this->saveToFile($credentials);
+            $this->credentials = $credentials;
+
+            return $deleted;
         } finally {
             $lock->release();
         }
@@ -402,6 +436,11 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
             ];
         }
 
+        $json = json_encode($entries, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR);
+        if (strlen($json) > self::MAX_FILE_BYTES) {
+            throw new \RuntimeException('Credentials file exceeds the maximum size of ' . self::MAX_FILE_BYTES . ' bytes.');
+        }
+
         $dir = dirname($this->filePath);
         if (! isDirectory($dir)) {
             createDirectoryRecursively($dir, 0o700);
@@ -409,8 +448,6 @@ final class ConfigFileCredentialProvider implements AtomicCredentialCreator, Ato
 
         $dir = $this->trustedCredentialDirectory($dir);
         $targetPath = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . basename($this->filePath);
-
-        $json = json_encode($entries, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR);
         $tempDir = $targetPath . '.tmp.' . bin2hex(random_bytes(16));
         createDirectory($tempDir, 0o700);
         $tempPath = $tempDir . '/credentials.json';

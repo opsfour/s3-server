@@ -18,6 +18,8 @@ use OpsFour\S3Server\Auth\CredentialDeletionResult;
  */
 final readonly class ExternalCredentialIssuer
 {
+    private const int CLEANUP_BATCH_SIZE = 100;
+
     public const int DEFAULT_TTL_SECONDS = 3_600;
 
     public const int MAX_TTL_SECONDS = 43_200;
@@ -48,10 +50,23 @@ final readonly class ExternalCredentialIssuer
             }
         }
         $sessionToken = $this->credentials->generateSessionToken();
+        $displayName = $identity->displayName !== '' ? $identity->displayName : $identity->subject;
+        $this->credentials->assertCredentialMetadataValid(
+            ownerId: $identity->ownerId,
+            displayName: $displayName,
+            sessionToken: $sessionToken,
+            expiresAt: $expiresAt,
+            policyNames: $identity->policyNames,
+            allowedPrefixes: $identity->allowedPrefixes,
+        );
+        // Invalid identities must never mutate the credential store. Prune
+        // only after every persisted field has been validated, immediately
+        // before the atomic create operation.
+        $this->credentials->pruneExpiredCredentials($now, self::CLEANUP_BATCH_SIZE);
 
         $credential = $this->credentials->createCredential(
             ownerId: $identity->ownerId,
-            displayName: $identity->displayName !== '' ? $identity->displayName : $identity->subject,
+            displayName: $displayName,
             sessionToken: $sessionToken,
             expiresAt: $expiresAt,
             policyNames: $identity->policyNames,

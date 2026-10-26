@@ -51,6 +51,7 @@ final class DatabaseCredentialTask implements Task
             'deleteCredential' => $provider->deleteCredential($this->stringArg(0)),
             'deleteCredentialIfCurrent' => $provider->deleteCredentialIfCurrent($this->credentialArg(0)),
             'setActiveIfCurrent' => $provider->setActiveIfCurrent($this->credentialArg(0), $this->boolArg(1)),
+            'pruneExpiredCredentials' => $provider->pruneExpiredCredentials($this->dateTimeArg(0), $this->positiveIntArg(1)),
             default => throw new \LogicException('Unsupported credential database worker operation.'),
         };
     }
@@ -89,6 +90,26 @@ final class DatabaseCredentialTask implements Task
     {
         $value = $this->args[$index] ?? null;
         if (! is_bool($value)) {
+            throw new \LogicException('Invalid credential database worker argument.');
+        }
+
+        return $value;
+    }
+
+    private function dateTimeArg(int $index): \DateTimeImmutable
+    {
+        $value = $this->args[$index] ?? null;
+        if (! $value instanceof \DateTimeImmutable) {
+            throw new \LogicException('Invalid credential database worker argument.');
+        }
+
+        return $value;
+    }
+
+    private function positiveIntArg(int $index): int
+    {
+        $value = $this->args[$index] ?? null;
+        if (! is_int($value) || $value < 1) {
             throw new \LogicException('Invalid credential database worker argument.');
         }
 

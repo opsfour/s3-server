@@ -9,6 +9,7 @@ use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 
 /**
  * PDO-backed credential store with a bounded-staleness in-memory cache.
@@ -17,7 +18,7 @@ use OpsFour\S3Server\Contracts\CredentialHealthProbe;
  * a short, configurable period. Expired entries are always re-read so
  * revocation and rotation performed by another server node become visible.
  */
-final class DatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider
+final class DatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, AtomicExpiredCredentialPruner
 {
     private const int DEFAULT_MAX_CACHE_ENTRIES = 10_000;
 
@@ -79,6 +80,7 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
                 . 'FROM s3_credentials WHERE 1 = 0',
             );
             $this->assertAccessKeyIdentity();
+            $this->assertExpiresAtIndex();
         } catch (\Throwable $error) {
             throw new \RuntimeException('Credential schema is not ready. Run credentials:migrate before starting API nodes.', 0, $error);
         }
@@ -186,6 +188,7 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
         if ($mysql) {
             $this->ensureMysqlBinaryAccessKey();
         }
+        $this->ensureExpiresAtIndex();
 
         // CREATE TABLE IF NOT EXISTS preserves an existing table, including
         // unsupported partial schemas. Never report a successful migration
@@ -396,6 +399,59 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
         return $stmt->fetchColumn() !== false;
     }
 
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        if ($limit < 1) {
+            throw new \InvalidArgumentException('Expired credential prune limit must be >= 1.');
+        }
+
+        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        $sql = match ($driver) {
+            'mysql' => <<<'SQL'
+                DELETE FROM s3_credentials
+                WHERE expires_at IS NOT NULL AND expires_at <= ?
+                ORDER BY expires_at ASC, access_key_id ASC
+                LIMIT ?
+                SQL,
+            'pgsql' => <<<'SQL'
+                DELETE FROM s3_credentials
+                WHERE access_key_id IN (
+                    SELECT access_key_id
+                    FROM s3_credentials
+                    WHERE expires_at IS NOT NULL AND expires_at <= ?
+                    ORDER BY expires_at ASC, access_key_id ASC
+                    LIMIT ?
+                    FOR UPDATE SKIP LOCKED
+                )
+                SQL,
+            'sqlite' => <<<'SQL'
+                DELETE FROM s3_credentials
+                WHERE access_key_id IN (
+                    SELECT access_key_id
+                    FROM s3_credentials
+                    WHERE expires_at IS NOT NULL AND expires_at <= ?
+                    ORDER BY expires_at ASC, access_key_id ASC
+                    LIMIT ?
+                )
+                SQL,
+            default => throw new \RuntimeException('Unsupported credential database driver.'),
+        };
+
+        $statement = $this->pdo->prepare($sql);
+        $statement->bindValue(1, $now->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s'));
+        $statement->bindValue(2, $limit, \PDO::PARAM_INT);
+        $statement->execute();
+        $deleted = $statement->rowCount();
+        if ($deleted > 0) {
+            // A bounded prune can remove any cached access key. Clearing this
+            // small bounded cache is safer than a second pre-delete key query.
+            $this->cache = [];
+            $this->cacheExpiresAt = [];
+        }
+
+        return $deleted;
+    }
+
     private function snapshotComparison(): string
     {
         return match ($this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME)) {
@@ -465,6 +521,184 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
         // This upgrades tables created by older package versions. A failed
         // conversion aborts initialization instead of serving ambiguous keys.
         $this->pdo->exec('ALTER TABLE s3_credentials MODIFY access_key_id VARBINARY(255) NOT NULL');
+    }
+
+    private function ensureExpiresAtIndex(): void
+    {
+        if ($this->hasExpiresAtIndex()) {
+            return;
+        }
+
+        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        if ($this->expiresAtIndexExists()) {
+            try {
+                if ($driver === 'mysql') {
+                    $this->pdo->exec('DROP INDEX idx_s3_credentials_expires_at ON s3_credentials');
+                } elseif ($driver === 'pgsql') {
+                    $index = $this->postgresExpiresAtIndex();
+                    if ($index !== null) {
+                        $this->pdo->exec('DROP INDEX '
+                            . self::quotePostgresIdentifier($index['schema']) . '.'
+                            . self::quotePostgresIdentifier($index['name']));
+                    }
+                } else {
+                    $this->pdo->exec('DROP INDEX IF EXISTS idx_s3_credentials_expires_at');
+                }
+            } catch (\PDOException $error) {
+                // An explicit migrator is expected to run alone, but a
+                // concurrent drop is harmless once the invalid name is gone.
+                if ($this->expiresAtIndexExists()) {
+                    throw $error;
+                }
+            }
+        }
+        try {
+            $this->pdo->exec($driver === 'mysql'
+                ? 'CREATE INDEX idx_s3_credentials_expires_at ON s3_credentials (expires_at, access_key_id)'
+                : 'CREATE INDEX IF NOT EXISTS idx_s3_credentials_expires_at ON s3_credentials (expires_at, access_key_id)');
+        } catch (\PDOException $error) {
+            // Concurrent migration is harmless only when the expected index
+            // is now visible with the expected leading column.
+            if (! $this->hasExpiresAtIndex()) {
+                throw $error;
+            }
+        }
+
+        $this->assertExpiresAtIndex();
+    }
+
+    /** @phpstan-impure */
+    private function expiresAtIndexExists(): bool
+    {
+        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        if ($driver === 'mysql') {
+            $statement = $this->pdo->query(
+                "SHOW INDEX FROM s3_credentials WHERE Key_name = 'idx_s3_credentials_expires_at'",
+            );
+
+            return $statement !== false && $statement->fetch(\PDO::FETCH_ASSOC) !== false;
+        }
+        if ($driver === 'pgsql') {
+            return $this->postgresExpiresAtIndex() !== null;
+        }
+        if ($driver === 'sqlite') {
+            $statement = $this->pdo->query('PRAGMA index_list(s3_credentials)');
+            $indexes = $statement !== false ? $statement->fetchAll(\PDO::FETCH_ASSOC) : [];
+
+            return array_any(
+                $indexes,
+                static fn(array $row): bool => ($row['name'] ?? null) === 'idx_s3_credentials_expires_at',
+            );
+        }
+
+        return false;
+    }
+
+    /** @return array{schema: string, name: string}|null */
+    private function postgresExpiresAtIndex(): ?array
+    {
+        $statement = $this->pdo->query(<<<'SQL'
+            SELECT index_namespace.nspname AS schema_name, index_class.relname AS index_name
+            FROM pg_index i
+            JOIN pg_class index_class ON index_class.oid = i.indexrelid
+            JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+            WHERE i.indrelid = 's3_credentials'::regclass
+              AND index_class.relname = 'idx_s3_credentials_expires_at'
+            SQL);
+        $row = $statement !== false ? $statement->fetch(\PDO::FETCH_ASSOC) : false;
+        if (! is_array($row)
+            || ! is_string($row['schema_name'] ?? null)
+            || ! is_string($row['index_name'] ?? null)) {
+            return null;
+        }
+
+        return ['schema' => $row['schema_name'], 'name' => $row['index_name']];
+    }
+
+    private static function quotePostgresIdentifier(string $identifier): string
+    {
+        return '"' . str_replace('"', '""', $identifier) . '"';
+    }
+
+    private function assertExpiresAtIndex(): void
+    {
+        if (! $this->hasExpiresAtIndex()) {
+            throw new \RuntimeException('Credential expiration index is missing or invalid.');
+        }
+    }
+
+    /** @phpstan-impure */
+    private function hasExpiresAtIndex(): bool
+    {
+        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        if ($driver === 'mysql') {
+            $statement = $this->pdo->query("SHOW INDEX FROM s3_credentials WHERE Key_name = 'idx_s3_credentials_expires_at'");
+            $rows = $statement !== false ? $statement->fetchAll(\PDO::FETCH_ASSOC) : [];
+            usort($rows, static fn(array $left, array $right): int
+                => (int) ($left['Seq_in_index'] ?? 0) <=> (int) ($right['Seq_in_index'] ?? 0));
+
+            return count($rows) === 2
+                && ($rows[0]['Column_name'] ?? null) === 'expires_at'
+                && (int) ($rows[0]['Seq_in_index'] ?? 0) === 1
+                && ($rows[0]['Sub_part'] ?? null) === null
+                && strtoupper((string) ($rows[0]['Index_type'] ?? '')) === 'BTREE'
+                && (!isset($rows[0]['Visible']) || strtoupper((string) $rows[0]['Visible']) !== 'NO')
+                && (!isset($rows[0]['Ignored']) || strtoupper((string) $rows[0]['Ignored']) !== 'YES')
+                && ($rows[1]['Column_name'] ?? null) === 'access_key_id'
+                && (int) ($rows[1]['Seq_in_index'] ?? 0) === 2
+                && ($rows[1]['Sub_part'] ?? null) === null
+                && strtoupper((string) ($rows[1]['Index_type'] ?? '')) === 'BTREE'
+                && (!isset($rows[1]['Visible']) || strtoupper((string) $rows[1]['Visible']) !== 'NO')
+                && (!isset($rows[1]['Ignored']) || strtoupper((string) $rows[1]['Ignored']) !== 'YES');
+        }
+
+        if ($driver === 'pgsql') {
+            $statement = $this->pdo->query(<<<'SQL'
+                SELECT first_column.attname AS first_column, second_column.attname AS second_column
+                FROM pg_index i
+                JOIN pg_class index_class ON index_class.oid = i.indexrelid
+                JOIN pg_am access_method ON access_method.oid = index_class.relam
+                JOIN pg_attribute first_column ON first_column.attrelid = i.indrelid AND first_column.attnum = i.indkey[0]
+                JOIN pg_attribute second_column ON second_column.attrelid = i.indrelid AND second_column.attnum = i.indkey[1]
+                WHERE i.indrelid = 's3_credentials'::regclass
+                  AND index_class.relname = 'idx_s3_credentials_expires_at'
+                  AND access_method.amname = 'btree'
+                  AND i.indnkeyatts = 2
+                  AND i.indisvalid
+                  AND i.indisready
+                  AND i.indpred IS NULL
+                  AND i.indexprs IS NULL
+                SQL);
+            $rows = $statement !== false ? $statement->fetchAll(\PDO::FETCH_ASSOC) : [];
+
+            return count($rows) === 1
+                && ($rows[0]['first_column'] ?? null) === 'expires_at'
+                && ($rows[0]['second_column'] ?? null) === 'access_key_id';
+        }
+
+        if ($driver === 'sqlite') {
+            $indexes = $this->pdo->query('PRAGMA index_list(s3_credentials)');
+            $rows = $indexes !== false ? $indexes->fetchAll(\PDO::FETCH_ASSOC) : [];
+            $found = array_filter(
+                $rows,
+                static fn(array $row): bool => ($row['name'] ?? null) === 'idx_s3_credentials_expires_at',
+            );
+            if (count($found) !== 1) {
+                return false;
+            }
+            $index = array_values($found)[0];
+            if ((int) ($index['partial'] ?? 0) !== 0) {
+                return false;
+            }
+            $parts = $this->pdo->query("PRAGMA index_info('idx_s3_credentials_expires_at')");
+            $columns = $parts !== false ? $parts->fetchAll(\PDO::FETCH_ASSOC) : [];
+
+            return count($columns) === 2
+                && ($columns[0]['name'] ?? null) === 'expires_at'
+                && ($columns[1]['name'] ?? null) === 'access_key_id';
+        }
+
+        return false;
     }
 
     /** @phpstan-impure */

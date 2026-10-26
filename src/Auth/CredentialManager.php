@@ -8,6 +8,7 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 
 /**
  * Shared service for managing S3 credentials.
@@ -102,6 +103,41 @@ final class CredentialManager
     public function getCredential(string $accessKeyId): ?Credential
     {
         return $this->provider->getCredential($accessKeyId);
+    }
+
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        if (! $this->provider instanceof AtomicExpiredCredentialPruner) {
+            throw new \RuntimeException('Credential provider does not support atomic expired credential pruning.');
+        }
+
+        return $this->provider->pruneExpiredCredentials($now, $limit);
+    }
+
+    /**
+     * Validate externally supplied credential metadata before any store mutation.
+     *
+     * @param list<string> $policyNames
+     * @param list<string> $allowedPrefixes
+     */
+    public function assertCredentialMetadataValid(
+        string $ownerId,
+        string $displayName,
+        string $sessionToken,
+        \DateTimeImmutable $expiresAt,
+        array $policyNames,
+        array $allowedPrefixes,
+    ): void {
+        new Credential(
+            accessKeyId: 'VALIDATION',
+            secretAccessKey: 'validation',
+            ownerId: $ownerId,
+            displayName: $displayName,
+            sessionToken: $sessionToken,
+            expiresAt: $expiresAt,
+            policyNames: $policyNames,
+            allowedPrefixes: $allowedPrefixes,
+        );
     }
 
     /**

@@ -8,6 +8,7 @@ use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
+use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 
 /**
  * In-memory credential store.
@@ -16,7 +17,7 @@ use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
  * Suitable for testing, development, and single-process deployments
  * where credentials are known at startup.
  */
-final class InMemoryCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater
+final class InMemoryCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, CredentialProvider, AtomicCredentialStatusUpdater, AtomicExpiredCredentialPruner
 {
     /**
      * @var array<string, Credential> Credentials keyed by accessKeyId.
@@ -110,5 +111,26 @@ final class InMemoryCredentialProvider implements AtomicCredentialCreator, Atomi
         );
 
         return true;
+    }
+
+    public function pruneExpiredCredentials(\DateTimeImmutable $now, int $limit): int
+    {
+        if ($limit < 1) {
+            throw new \InvalidArgumentException('Expired credential prune limit must be >= 1.');
+        }
+
+        $deleted = 0;
+        foreach ($this->credentials as $accessKeyId => $credential) {
+            if ($credential->expiresAt === null || $credential->expiresAt > $now) {
+                continue;
+            }
+
+            unset($this->credentials[$accessKeyId]);
+            if (++$deleted === $limit) {
+                break;
+            }
+        }
+
+        return $deleted;
     }
 }
