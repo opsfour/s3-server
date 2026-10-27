@@ -11,6 +11,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Add `BucketOwnerPreferred` for ordinary PUT, signed browser POST, and
   CopyObject writes, with exact canned-ACL transfer, canonical bucket-owner
   ACLs, stable quota ownership, and version-specific persistence.
+- Snapshot multipart destination ownership, canonical ACL, quota principal,
+  ownership mode, and canned-ACL intent at initiation so listings and
+  completion remain stable across later control changes while staging stays
+  attributed to the initiator.
 - Add the verified `s3:authType` policy condition with `REST-HEADER`,
   `REST-QUERY-STRING`, and `POST` values propagated through request-derived
   authorization checks without trusting transport-shaped input.

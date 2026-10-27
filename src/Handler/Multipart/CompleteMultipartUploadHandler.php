@@ -31,6 +31,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Event\S3Event;
@@ -109,6 +110,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                 'Multipart upload belongs to an unverified bucket generation.',
             );
+        }
+        $ownershipSnapshot = MultipartDestinationOwnershipSnapshot::decode($upload['user_metadata']);
+        if ($ownershipSnapshot !== null) {
+            $ownershipSnapshot->assertConsistent($ownerId, $bucketInfo->ownerId);
         }
         $objectLockConfig = $this->metadata->getObjectLockConfig($bucket);
         $configurationFingerprint = $upload['user_metadata'][ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY] ?? null;
@@ -251,6 +256,20 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 'The specified multipart object size does not match the selected parts.',
             );
         }
+
+        $quotaPrincipalId = $ownershipSnapshot instanceof MultipartDestinationOwnershipSnapshot
+            ? $ownershipSnapshot->quotaPrincipalId
+            : (BucketOwnership::isEnforced($this->metadata, $bucket) ? $bucketInfo->ownerId : $ownerId);
+        $this->assertExpectedSizeWithinQuota(
+            $request,
+            $bucketInfo,
+            $key,
+            $upload,
+            $ownershipSnapshot,
+            $expectedSize,
+            $storageTier,
+            $validatedParts,
+        );
 
         // A malformed part ETag must fail before assembly creates storage
         // data. The ETag is also part of the durable attempt's part digest.
@@ -488,6 +507,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $userMetadata['__mpu-acl-grants'],
             $userMetadata['__mpu-acl-explicit'],
             $userMetadata['__mpu-acl-header'],
+            $userMetadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY],
             $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY],
             $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY],
             $userMetadata['__mpu-tags'],
@@ -538,6 +558,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $cacheControl,
                     $userMetadata,
                     $aclGrants,
+                    $ownershipSnapshot,
+                    $quotaPrincipalId,
                     $request,
                     $tags,
                     $objectLockHeaders,
@@ -551,13 +573,21 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     &$versionId,
                     &$cleanupParts,
                 ) {
-                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                        $this->metadata,
+                        $ownerId,
+                        $bucketInfo->ownerId,
+                        $quotaPrincipalId,
+                    );
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                     $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
-                    $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
-                        ? $bucketInfo->ownerId : $ownerId;
-                    $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
-                        ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                    [$storedOwnerId, $storedAclGrants, $storedQuotaPrincipalId] = $this->destinationDecision(
+                        $ownershipSnapshot,
+                        $bucket,
+                        $bucketInfo->ownerId,
+                        $ownerId,
+                        $aclGrants,
+                    );
                     $this->assertCurrentPublicAclAllowed($bucket, $storedAclGrants);
                     if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                         throw new \OpsFour\S3Server\Exception\OperationAbortedException(
@@ -573,7 +603,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     );
                     $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
                     $this->quotas?->assertCanWriteObject(
-                        $storedOwnerId,
+                        $storedQuotaPrincipalId,
                         $bucket,
                         null,
                         $writeResult->size,
@@ -651,6 +681,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $cacheControl,
                     $userMetadata,
                     $aclGrants,
+                    $ownershipSnapshot,
+                    $quotaPrincipalId,
                     $request,
                     $tags,
                     $uploadId,
@@ -664,13 +696,21 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     &$oldPathsToClean,
                     &$cleanupParts,
                 ) {
-                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                        $this->metadata,
+                        $ownerId,
+                        $bucketInfo->ownerId,
+                        $quotaPrincipalId,
+                    );
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                     $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
-                    $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
-                        ? $bucketInfo->ownerId : $ownerId;
-                    $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
-                        ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                    [$storedOwnerId, $storedAclGrants, $storedQuotaPrincipalId] = $this->destinationDecision(
+                        $ownershipSnapshot,
+                        $bucket,
+                        $bucketInfo->ownerId,
+                        $ownerId,
+                        $aclGrants,
+                    );
                     $this->assertCurrentPublicAclAllowed($bucket, $storedAclGrants);
                     if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                         throw new \OpsFour\S3Server\Exception\OperationAbortedException(
@@ -696,7 +736,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     }
 
                     $this->quotas?->assertCanWriteObject(
-                        $storedOwnerId,
+                        $storedQuotaPrincipalId,
                         $bucket,
                         $oldObjectToClean,
                         $writeResult->size,
@@ -1083,6 +1123,124 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 'Bucket default encryption changed before multipart completion.',
             );
         }
+    }
+
+    /**
+     * Reject a known-size completion before assembly when the immutable final
+     * principal cannot admit it. Publication repeats the same check under its
+     * own transaction so a concurrent quota consumer cannot race this guard.
+     *
+     * @param array<string, mixed> $upload
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $selectedParts
+     */
+    private function assertExpectedSizeWithinQuota(
+        Request $request,
+        \OpsFour\S3Server\Dto\BucketInfo $bucketInfo,
+        string $key,
+        array $upload,
+        ?MultipartDestinationOwnershipSnapshot $ownershipSnapshot,
+        int $expectedSize,
+        string $storageTier,
+        array $selectedParts,
+    ): void {
+        if ($this->quotas === null) {
+            return;
+        }
+
+        $initiatorId = (string) $upload['owner_id'];
+        $snapshotQuotaPrincipalId = $ownershipSnapshot === null ? null : $ownershipSnapshot->quotaPrincipalId;
+        $candidateQuotaPrincipals = $snapshotQuotaPrincipalId === null
+            ? [$initiatorId, $bucketInfo->ownerId]
+            : [$snapshotQuotaPrincipalId, $bucketInfo->ownerId];
+        $hasRelevantQuota = false;
+        foreach (array_unique($candidateQuotaPrincipals) as $candidateQuotaPrincipal) {
+            if ($this->quotas->hasQuotaForOwner($candidateQuotaPrincipal)) {
+                $hasRelevantQuota = true;
+                break;
+            }
+        }
+        if (! $hasRelevantQuota) {
+            return;
+        }
+
+        $this->metadata->transaction(function () use (
+            $request,
+            $bucketInfo,
+            $key,
+            $upload,
+            $snapshotQuotaPrincipalId,
+            $expectedSize,
+            $storageTier,
+            $selectedParts,
+        ): void {
+            $initiatorId = (string) $upload['owner_id'];
+            \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                $this->metadata,
+                $initiatorId,
+                $snapshotQuotaPrincipalId ?? $initiatorId,
+                $bucketInfo->ownerId,
+            );
+            \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            $this->assertUploadIsActive(
+                (string) $upload['upload_id'],
+                $bucketInfo->name,
+                $key,
+                $initiatorId,
+                $bucketInfo->generation,
+                $storageTier,
+                $upload['user_metadata'],
+            );
+            $this->assertSelectedPartsUnchanged((string) $upload['upload_id'], $selectedParts);
+
+            $versioning = $this->metadata->getBucketVersioning($bucketInfo->name);
+            $existingObject = null;
+            if ($versioning !== 'Enabled') {
+                $nullVersion = $this->metadata->getObjectMetadataByVersion($bucketInfo->name, $key, 'null');
+                $existingObject = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+            }
+
+            // Marker-less uploads retain their historical current-mode rule,
+            // but resolve it only after both possible principals are locked.
+            $quotaPrincipalId = $snapshotQuotaPrincipalId
+                ?? (BucketOwnership::isEnforced($this->metadata, $bucketInfo->name)
+                    ? $bucketInfo->ownerId
+                    : $initiatorId);
+
+            $this->quotas->assertCanWriteObject(
+                $quotaPrincipalId,
+                $bucketInfo->name,
+                $existingObject,
+                $expectedSize,
+                $versioning === 'Enabled',
+                (string) $upload['upload_id'],
+                $initiatorId,
+            );
+        });
+    }
+
+    /**
+     * @param list<array{granteeType: string, granteeId: string, permission: string}> $legacyAclGrants
+     * @return array{string, list<array{granteeType: string, granteeId: string, permission: string}>, string}
+     */
+    private function destinationDecision(
+        ?MultipartDestinationOwnershipSnapshot $snapshot,
+        string $bucket,
+        string $bucketOwnerId,
+        string $initiatorId,
+        array $legacyAclGrants,
+    ): array {
+        if ($snapshot !== null) {
+            return [$snapshot->ownerId, $snapshot->aclGrants, $snapshot->quotaPrincipalId];
+        }
+
+        // Pre-feature uploads deliberately retain the historical behavior:
+        // only current Enforced mode substitutes the bucket owner. Preferred
+        // never infers a transfer for a marker-less upload.
+        if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
+            return [$bucketOwnerId, AclGrantResolver::privateAcl($bucketOwnerId), $bucketOwnerId];
+        }
+
+        return [$initiatorId, $legacyAclGrants, $initiatorId];
     }
 
     /** @param array<string, string>|null $expectedMetadata */

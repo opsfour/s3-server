@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Functional;
 
+use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Acl\ObjectWriteOwnershipDecision;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -38,18 +42,41 @@ final class MultipartStorageClassListingBackendTest extends TestCase
         $uploadId = bin2hex(random_bytes(16));
         $owner = 'class-list-owner';
         $key = 'docs/example.txt';
+        $aclGrants = AclGrantResolver::privateAcl($owner);
+        $ownershipSnapshot = MultipartDestinationOwnershipSnapshot::fromDecision(
+            new ObjectWriteOwnershipDecision(
+                $owner,
+                $aclGrants,
+                $owner,
+                BucketOwnership::OBJECT_WRITER,
+            ),
+            null,
+        )->encode();
+        $userMetadata = [
+            '__mpu-storage-class' => 'STANDARD_IA',
+            '__mpu-acl-grants' => json_encode($aclGrants, JSON_THROW_ON_ERROR),
+            MultipartDestinationOwnershipSnapshot::METADATA_KEY => $ownershipSnapshot,
+        ];
         $store->createBucket($owner, $bucket, 'us-east-1');
         try {
-            $store->createMultipartUpload($uploadId, $bucket, $key, $owner, userMetadata: ['__mpu-storage-class' => 'STANDARD_IA']);
+            $store->createMultipartUpload($uploadId, $bucket, $key, $owner, userMetadata: $userMetadata);
 
             $upload = $store->getMultipartUpload($uploadId);
             self::assertSame('STANDARD_IA', $upload['user_metadata']['__mpu-storage-class'] ?? null);
+            self::assertSame(
+                $ownershipSnapshot,
+                $upload['user_metadata'][MultipartDestinationOwnershipSnapshot::METADATA_KEY] ?? null,
+            );
 
             foreach ([null, '/'] as $delimiter) {
                 $listing = $store->listMultipartUploads($bucket, prefix: 'docs/', delimiter: $delimiter);
                 self::assertSame([$uploadId], array_column($listing['uploads'], 'upload_id'));
                 $metadata = json_decode($listing['uploads'][0]['user_metadata'] ?? '', true, 512, JSON_THROW_ON_ERROR);
                 self::assertSame('STANDARD_IA', $metadata['__mpu-storage-class']);
+                self::assertSame(
+                    $ownershipSnapshot,
+                    $metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY] ?? null,
+                );
             }
         } finally {
             $store->deleteMultipartUpload($uploadId);

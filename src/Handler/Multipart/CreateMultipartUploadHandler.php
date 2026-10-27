@@ -27,6 +27,7 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
@@ -97,6 +98,12 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $objectLockConfig = $this->metadata->getObjectLockConfig($bucket);
         ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
         (new ObjectLockRequestApplier($this->metadata))->validate($request, $bucket);
+        $ownershipDecision = BucketOwnership::resolveObjectWrite(
+            $request,
+            BucketOwnership::effectiveMode($this->metadata, $bucket),
+            $ownerId,
+            $bucketInfo->ownerId,
+        );
         $aclGrants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketInfo->ownerId)
             ?? AclGrantResolver::privateAcl($ownerId);
         $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
@@ -115,6 +122,11 @@ final class CreateMultipartUploadHandler implements RequestHandler
         $userMetadata = UserMetadataExtractor::extract($request);
         $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT;
         $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
+        $userMetadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]
+            = MultipartDestinationOwnershipSnapshot::fromDecision(
+                $ownershipDecision,
+                $request->getHeader('x-amz-acl'),
+            )->encode();
         foreach (['x-amz-acl', 'x-amz-grant-read', 'x-amz-grant-write', 'x-amz-grant-full-control', 'x-amz-grant-read-acp', 'x-amz-grant-write-acp'] as $aclHeader) {
             if ($request->getHeader($aclHeader) !== null) {
                 $userMetadata['__mpu-acl-explicit'] = '1';
@@ -202,7 +214,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
             }
         }
 
-        $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants, $request, $encryptionMode, $tierStore, $storageTier): void {
+        $this->metadata->transaction(function () use ($uploadId, $bucketInfo, $bucket, $key, $ownerId, $contentType, $userMetadata, $aclGrants, $ownershipDecision, $request, $encryptionMode, $tierStore, $storageTier): void {
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             ObjectLockConfigurationSnapshot::assertCurrent(
@@ -217,9 +229,14 @@ final class CreateMultipartUploadHandler implements RequestHandler
                 );
             }
             (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
-            if (BucketOwnership::isEnforced($this->metadata, $bucket)) {
-                BucketOwnership::assertWriteAclAllowed($request);
-            }
+            BucketOwnership::assertObjectWriteDecisionCurrent(
+                $this->metadata,
+                $bucket,
+                $request,
+                $ownerId,
+                $bucketInfo->ownerId,
+                $ownershipDecision,
+            );
             $publicAccessBlock = $this->metadata->getPublicAccessBlock($bucket);
             if (
                 $publicAccessBlock !== null

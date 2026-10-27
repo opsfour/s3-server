@@ -120,6 +120,12 @@ Preferred on an ACL-based cross-account workflow, require that exact canned
 ACL in both the writer configuration and any policy condition, and confirm
 that existing objects remain under their previously persisted owners.
 
+Multipart completion rechecks current policy with the original initiation
+header context, including the original `s3:x-amz-acl` value. It does not replace
+that value with the canonical ACL stored in the destination snapshot. Current
+Public Access Block settings are also rechecked against the snapshotted final
+ACL before publication.
+
 The authentication type is installed only after successful verification and is
 preserved across primary checks, copy-source and additional-action checks,
 batch deletion, missing-object ListBucket visibility, and commit-time rechecks.

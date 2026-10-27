@@ -44,7 +44,7 @@ final class MultipartPublicAccessBlockTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_enforced_bucket_ownership_discards_public_acl_before_pab_check(): void
+    public function test_later_enforced_mode_does_not_discard_snapshotted_public_acl_before_pab_check(): void
     {
         $bucket = 'mpu-enforced-' . bin2hex(random_bytes(5));
         self::$s3->createBucket(['Bucket' => $bucket]);
@@ -62,15 +62,31 @@ final class MultipartPublicAccessBlockTest extends S3FunctionalTestCase
                 'BlockPublicAcls' => true, 'IgnorePublicAcls' => false,
                 'BlockPublicPolicy' => false, 'RestrictPublicBuckets' => false,
             ]]);
-            self::$s3->completeMultipartUpload([
+            $completion = [
                 'Bucket' => $bucket, 'Key' => 'key', 'UploadId' => $created['UploadId'],
                 'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
-            ]);
-            self::assertCount(1, self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'key'])['Grants']);
+            ];
+            try {
+                self::$s3->completeMultipartUpload($completion);
+                self::fail('Current Public Access Block must reject the snapshotted public ACL.');
+            } catch (S3Exception $error) {
+                self::assertSame('AccessDenied', $error->getAwsErrorCode());
+            }
+            self::assertCount(1, self::$s3->listParts([
+                'Bucket' => $bucket, 'Key' => 'key', 'UploadId' => $created['UploadId'],
+            ])['Parts']);
+
+            self::$s3->deletePublicAccessBlock(['Bucket' => $bucket]);
+            self::$s3->completeMultipartUpload($completion);
+            self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+            self::assertCount(2, self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'key'])['Grants']);
         } finally {
             self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => 'key']);
             self::$s3->deletePublicAccessBlock(['Bucket' => $bucket]);
-            self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+            try {
+                self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+            } catch (S3Exception) {
+            }
             self::$s3->deleteBucket(['Bucket' => $bucket]);
         }
     }

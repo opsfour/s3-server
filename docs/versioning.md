@@ -36,6 +36,12 @@ only when their destination request uses the exact
 the bucket owner's `FULL_CONTROL` grant. This rule applies independently to
 numbered versions and the literal `null` version.
 
+Multipart uploads snapshot that same destination owner and ACL when initiated.
+Completion publishes every numbered or `null` version from the snapshot rather
+than reinterpreting the upload under controls active at completion. The upload
+initiator remains the authorization, staging-accounting, cleanup, and event
+principal even when the completed version belongs to the bucket owner.
+
 ### Version IDs
 
 When versioning is enabled, every PUT returns a `x-amz-version-id` header:

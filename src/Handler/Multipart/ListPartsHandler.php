@@ -14,6 +14,7 @@ use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class ListPartsHandler implements RequestHandler
@@ -91,7 +92,13 @@ final class ListPartsHandler implements RequestHandler
             'checksumAlgorithm' => $p['checksum_algorithm'] ?? null,
             'checksumValue' => $p['checksum_value'] ?? null,
         ], $parts);
-        $bucketOwnsObjects = BucketOwnership::isEnforced($this->metadata, $bucket);
+        $ownershipSnapshot = MultipartDestinationOwnershipSnapshot::decode($upload['user_metadata']);
+        if ($ownershipSnapshot !== null) {
+            $ownershipSnapshot->assertConsistent($upload['owner_id'], $bucketInfo->ownerId);
+        }
+        $listedOwnerId = $ownershipSnapshot instanceof MultipartDestinationOwnershipSnapshot
+            ? $ownershipSnapshot->ownerId
+            : (BucketOwnership::isEnforced($this->metadata, $bucket) ? $bucketInfo->ownerId : $upload['owner_id']);
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
 
         $xml = XmlResponseBuilder::listPartsResult([
@@ -103,7 +110,7 @@ final class ListPartsHandler implements RequestHandler
             'maxParts' => $maxParts,
             'isTruncated' => $isTruncated,
             'initiatorId' => $upload['owner_id'],
-            'ownerId' => $bucketOwnsObjects ? $bucketInfo->ownerId : $upload['owner_id'],
+            'ownerId' => $listedOwnerId,
             'storageClass' => $upload['user_metadata']['__mpu-storage-class'] ?? 'STANDARD',
             'parts' => $xmlParts,
         ]);

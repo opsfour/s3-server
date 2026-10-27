@@ -14,6 +14,7 @@ use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Http\ListingQuery;
 use OpsFour\S3Server\Metadata\GenerationBoundMultipartListingStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 final class ListMultipartUploadsHandler implements RequestHandler
@@ -59,7 +60,12 @@ final class ListMultipartUploadsHandler implements RequestHandler
             'uploadId' => $u['upload_id'],
             'initiated' => rtrim(str_replace(' ', 'T', $u['created_at']), 'Z') . 'Z',
             'initiatorId' => $u['owner_id'],
-            'ownerId' => $bucketOwnsObjects ? $bucketInfo->ownerId : $u['owner_id'],
+            'ownerId' => self::destinationOwner(
+                $u['user_metadata'] ?? null,
+                $u['owner_id'],
+                $bucketInfo->ownerId,
+                $bucketOwnsObjects,
+            ),
             'storageClass' => self::storageClass($u['user_metadata'] ?? null),
         ], $result['uploads']);
 
@@ -105,5 +111,35 @@ final class ListMultipartUploadsHandler implements RequestHandler
         $storageClass = is_array($metadata) ? ($metadata['__mpu-storage-class'] ?? null) : null;
 
         return is_string($storageClass) && $storageClass !== '' ? $storageClass : 'STANDARD';
+    }
+
+    private static function destinationOwner(
+        ?string $encodedMetadata,
+        string $initiatorId,
+        string $bucketOwnerId,
+        bool $legacyBucketOwnsObjects,
+    ): string {
+        if ($encodedMetadata !== null) {
+            try {
+                $metadata = json_decode($encodedMetadata, true, 64, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $error) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                    'Multipart upload metadata is invalid.',
+                    $error,
+                );
+            }
+            if (! is_array($metadata)) {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart upload metadata is invalid.');
+            }
+            /** @var array<string, string> $metadata */
+            $snapshot = MultipartDestinationOwnershipSnapshot::decode($metadata);
+            if ($snapshot !== null) {
+                $snapshot->assertConsistent($initiatorId, $bucketOwnerId);
+
+                return $snapshot->ownerId;
+            }
+        }
+
+        return $legacyBucketOwnsObjects ? $bucketOwnerId : $initiatorId;
     }
 }

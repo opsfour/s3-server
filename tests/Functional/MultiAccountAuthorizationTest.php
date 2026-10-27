@@ -8,6 +8,7 @@ use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use OpsFour\S3Server\Auth\SigningKey;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Quota\QuotaConfig;
 
 final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
@@ -323,11 +324,22 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
             'Bucket' => $bucket, 'Key' => 'parts.txt', 'UploadId' => $upload['UploadId'],
             'PartNumber' => 1, 'Body' => 'multipart data',
         ]);
+        self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+        self::assertSame(
+            'bucket-owner',
+            self::$writer->listParts([
+                'Bucket' => $bucket, 'Key' => 'parts.txt', 'UploadId' => $upload['UploadId'],
+            ])['Owner']['ID'],
+        );
         self::$writer->completeMultipartUpload([
             'Bucket' => $bucket, 'Key' => 'parts.txt', 'UploadId' => $upload['UploadId'],
             'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
         ]);
         $this->assertSame('bucket-owner', self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'parts.txt'])['Owner']['ID']);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerEnforced']]],
+        ]);
         foreach ([
             fn() => self::$writer->putObject(['Bucket' => $bucket, 'Key' => 'bad.txt', 'Body' => 'bad', 'ACL' => 'public-read']),
             fn() => self::$s3->putObjectAcl(['Bucket' => $bucket, 'Key' => 'new.txt', 'ACL' => 'private']),
@@ -740,7 +752,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         }
     }
 
-    public function test_multipart_completion_uses_mode_active_at_commit(): void
+    public function test_multipart_completion_keeps_the_destination_decision_from_initiation(): void
     {
         $bucket = $this->bucketWithWriterGrant();
         $upload = self::$writer->createMultipartUpload(['Bucket' => $bucket, 'Key' => 'switch.txt']);
@@ -752,7 +764,7 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         $this->putPolicy($bucket, [[
             'Effect' => 'Allow',
             'Principal' => ['AWS' => 'object-writer'],
-            'Action' => 's3:PutObject',
+            'Action' => ['s3:PutObject', 's3:GetObjectAcl'],
             'Resource' => "arn:aws:s3:::{$bucket}/switch.txt",
         ]]);
         self::$s3->putBucketOwnershipControls([
@@ -763,9 +775,367 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
             'Bucket' => $bucket, 'Key' => 'switch.txt', 'UploadId' => $upload['UploadId'],
             'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
         ]);
-        $this->assertSame('bucket-owner', $this->objectOwner($bucket, 'switch.txt'));
         self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
-        $this->assertSame('bucket-owner', $this->objectOwner($bucket, 'switch.txt'));
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => 'switch.txt'])['Owner']['ID'],
+        );
+    }
+
+    public function test_preferred_multipart_quota_uses_snapshotted_bucket_owner_after_mode_change(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'preferred-quota.txt';
+        $this->putPolicy($bucket, [[
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => ['s3:PutObject', 's3:PutObjectAcl'],
+            'Resource' => "arn:aws:s3:::{$bucket}/*",
+        ]]);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+        $upload = self::$writer->createMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $upload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => 'quota',
+        ]);
+        self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
+        $metadata->initialize();
+        $ownerBytesBefore = $metadata->getOwnerStorageStats('bucket-owner')['bytesUsed'];
+        $writerBytesBefore = $metadata->getOwnerStorageStats('object-writer')['bytesUsed'];
+        $metadata->putAccountQuota('bucket-owner', new QuotaConfig(maxBytesPerOwner: $ownerBytesBefore + 4));
+        $completion = [
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $upload['UploadId'],
+            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+        ];
+        try {
+            self::$writer->completeMultipartUpload($completion);
+            self::fail('The snapshotted bucket-owner quota must reject completion.');
+        } catch (S3Exception $error) {
+            self::assertSame('QuotaExceeded', $error->getAwsErrorCode());
+        } finally {
+            $metadata->deleteAccountQuota('bucket-owner');
+        }
+        self::assertNull($metadata->getObjectMetadata($bucket, $key));
+        self::assertNotNull($metadata->getMultipartUpload($upload['UploadId']));
+        self::assertSame($ownerBytesBefore, $metadata->getOwnerStorageStats('bucket-owner')['bytesUsed']);
+
+        self::$writer->completeMultipartUpload($completion);
+        self::assertSame($ownerBytesBefore + 5, $metadata->getOwnerStorageStats('bucket-owner')['bytesUsed']);
+        self::assertSame($writerBytesBefore, $metadata->getOwnerStorageStats('object-writer')['bytesUsed']);
+        self::assertSame('bucket-owner', $this->objectOwner($bucket, $key));
+    }
+
+    public function test_preferred_multipart_transfer_survives_mode_change_and_keeps_initiator_attribution(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'preferred-multipart.txt';
+        $this->putPolicy($bucket, [[
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => ['s3:PutObject', 's3:PutObjectAcl', 's3:GetObjectAcl'],
+            'Resource' => "arn:aws:s3:::{$bucket}/*",
+        ]]);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+        $upload = self::$writer->createMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        $uploadId = $upload['UploadId'];
+
+        $listedUpload = self::$s3->listMultipartUploads([
+            'Bucket' => $bucket,
+            'Prefix' => $key,
+        ])['Uploads'][0];
+        self::assertSame('object-writer', $listedUpload['Initiator']['ID']);
+        self::assertSame('bucket-owner', $listedUpload['Owner']['ID']);
+
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'preferred transfer',
+        ]);
+        self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+
+        $listedAfterTransferModeChange = self::$s3->listMultipartUploads([
+            'Bucket' => $bucket,
+            'Prefix' => $key,
+        ])['Uploads'][0];
+        self::assertSame('object-writer', $listedAfterTransferModeChange['Initiator']['ID']);
+        self::assertSame('bucket-owner', $listedAfterTransferModeChange['Owner']['ID']);
+
+        $listedParts = self::$writer->listParts([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ]);
+        self::assertSame('object-writer', $listedParts['Initiator']['ID']);
+        self::assertSame('bucket-owner', $listedParts['Owner']['ID']);
+
+        self::$writer->completeMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+        ]);
+        $acl = self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => $key]);
+        self::assertSame('bucket-owner', $acl['Owner']['ID']);
+        self::assertCount(1, $acl['Grants']);
+        self::assertSame('bucket-owner', $acl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $acl['Grants'][0]['Permission']);
+
+        $writerKey = 'preferred-writer-multipart.txt';
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+        $writerUpload = self::$writer->createMultipartUpload(['Bucket' => $bucket, 'Key' => $writerKey]);
+        $writerPart = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $writerKey,
+            'UploadId' => $writerUpload['UploadId'],
+            'PartNumber' => 1,
+            'Body' => 'preferred writer',
+        ]);
+        self::$s3->putBucketAcl(['Bucket' => $bucket, 'ACL' => 'private']);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerEnforced']]],
+        ]);
+        $listedAfterWriterModeChange = self::$s3->listMultipartUploads([
+            'Bucket' => $bucket,
+            'Prefix' => $writerKey,
+        ])['Uploads'][0];
+        self::assertSame('object-writer', $listedAfterWriterModeChange['Initiator']['ID']);
+        self::assertSame('object-writer', $listedAfterWriterModeChange['Owner']['ID']);
+        self::assertSame(
+            'object-writer',
+            self::$writer->listParts([
+                'Bucket' => $bucket,
+                'Key' => $writerKey,
+                'UploadId' => $writerUpload['UploadId'],
+            ])['Owner']['ID'],
+        );
+        self::$writer->completeMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $writerKey,
+            'UploadId' => $writerUpload['UploadId'],
+            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $writerPart['ETag']]]],
+        ]);
+        self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => $writerKey])['Owner']['ID'],
+        );
+    }
+
+    public function test_preferred_multipart_snapshot_publishes_versioned_and_null_versions(): void
+    {
+        foreach (['Enabled', 'Suspended'] as $status) {
+            $bucket = $this->bucketWithWriterGrant();
+            $key = strtolower($status) . '-preferred-version.txt';
+            $this->putPolicy($bucket, [[
+                'Effect' => 'Allow',
+                'Principal' => ['AWS' => 'object-writer'],
+                'Action' => ['s3:PutObject', 's3:PutObjectAcl'],
+                'Resource' => "arn:aws:s3:::{$bucket}/*",
+            ]]);
+            self::$s3->putBucketVersioning([
+                'Bucket' => $bucket,
+                'VersioningConfiguration' => ['Status' => $status],
+            ]);
+            self::$s3->putBucketOwnershipControls([
+                'Bucket' => $bucket,
+                'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+            ]);
+            $upload = self::$writer->createMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'ACL' => 'bucket-owner-full-control',
+            ]);
+            $part = self::$writer->uploadPart([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $upload['UploadId'],
+                'PartNumber' => 1,
+                'Body' => $status . ' multipart version',
+            ]);
+            self::$s3->deleteBucketOwnershipControls(['Bucket' => $bucket]);
+
+            $completed = self::$writer->completeMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $upload['UploadId'],
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ]);
+            $versionId = $completed['VersionId'];
+            if ($status === 'Enabled') {
+                self::assertNotSame('', $versionId);
+                self::assertNotSame('null', $versionId);
+            } else {
+                self::assertSame('null', $versionId);
+            }
+            self::assertSame('bucket-owner', self::$s3->getObjectAcl([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'VersionId' => $versionId,
+            ])['Owner']['ID']);
+        }
+    }
+
+    public function test_legacy_multipart_upload_never_infers_preferred_transfer(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'legacy-preferred.txt';
+        $this->putPolicy($bucket, [[
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => ['s3:PutObject', 's3:PutObjectAcl'],
+            'Resource' => "arn:aws:s3:::{$bucket}/*",
+        ]]);
+        $upload = self::$writer->createMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        $uploadId = $upload['UploadId'];
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'legacy preferred',
+        ]);
+        $this->updateMultipartMetadata($uploadId, static function (array $metadata): array {
+            unset($metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]);
+
+            return $metadata;
+        });
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+
+        self::$writer->completeMultipartUpload([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+        ]);
+        self::assertSame('object-writer', $this->objectOwner($bucket, $key));
+    }
+
+    public function test_corrupt_multipart_destination_snapshot_fails_closed_and_retains_upload(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'corrupt-snapshot.txt';
+        $upload = self::$writer->createMultipartUpload(['Bucket' => $bucket, 'Key' => $key]);
+        $uploadId = $upload['UploadId'];
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'corrupt snapshot',
+        ]);
+        $this->updateMultipartMetadata($uploadId, static function (array $metadata): array {
+            $metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY] = '{';
+
+            return $metadata;
+        });
+
+        try {
+            self::$writer->completeMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ]);
+            self::fail('A corrupt destination snapshot must not publish an object.');
+        } catch (S3Exception $error) {
+            self::assertSame('InternalError', $error->getAwsErrorCode());
+        }
+
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
+        $metadata->initialize();
+        self::assertNull($metadata->getObjectMetadata($bucket, $key));
+        self::assertNotNull($metadata->getMultipartUpload($uploadId));
+        self::assertCount(1, $metadata->getParts($uploadId));
+    }
+
+    public function test_semantically_inconsistent_destination_snapshot_fails_closed_in_all_consumers(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $key = 'inconsistent-snapshot.txt';
+        $upload = self::$writer->createMultipartUpload(['Bucket' => $bucket, 'Key' => $key]);
+        $uploadId = $upload['UploadId'];
+        $part = self::$writer->uploadPart([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'PartNumber' => 1,
+            'Body' => 'inconsistent snapshot',
+        ]);
+        $this->updateMultipartMetadata($uploadId, static function (array $metadata): array {
+            $snapshot = json_decode(
+                $metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY],
+                true,
+                16,
+                JSON_THROW_ON_ERROR,
+            );
+            self::assertIsArray($snapshot);
+            $snapshot['ownerId'] = 'bucket-owner';
+            $snapshot['quotaPrincipalId'] = 'bucket-owner';
+            $metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]
+                = json_encode($snapshot, JSON_THROW_ON_ERROR);
+
+            return $metadata;
+        });
+
+        foreach ([
+            fn() => self::$writer->listParts([
+                'Bucket' => $bucket, 'Key' => $key, 'UploadId' => $uploadId,
+            ]),
+            fn() => self::$s3->listMultipartUploads(['Bucket' => $bucket, 'Prefix' => $key]),
+            fn() => self::$writer->completeMultipartUpload([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [['PartNumber' => 1, 'ETag' => $part['ETag']]]],
+            ]),
+        ] as $consume) {
+            try {
+                $consume();
+                self::fail('A semantically inconsistent destination snapshot was accepted.');
+            } catch (S3Exception $error) {
+                self::assertSame('InternalError', $error->getAwsErrorCode());
+            }
+        }
+
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
+        $metadata->initialize();
+        self::assertNull($metadata->getObjectMetadata($bucket, $key));
+        self::assertNotNull($metadata->getMultipartUpload($uploadId));
+        self::assertCount(1, $metadata->getParts($uploadId));
     }
 
     public function test_copy_delete_and_multipart_require_the_right_account(): void
@@ -1184,6 +1554,22 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
     private function objectOwner(string $bucket, string $key): string
     {
         return (string) (self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => $key])['Owner']['ID'] ?? '');
+    }
+
+    /** @param callable(array<string, string>): array<string, string> $mutate */
+    private function updateMultipartMetadata(string $uploadId, callable $mutate): void
+    {
+        $metadata = new SqliteMetadataStore(self::sqliteMetadataPath());
+        $metadata->initialize();
+        $upload = $metadata->getMultipartUpload($uploadId);
+        self::assertNotNull($upload);
+        $database = new \PDO('sqlite:' . self::sqliteMetadataPath());
+        $statement = $database->prepare('UPDATE s3_multipart_uploads SET user_metadata = ? WHERE upload_id = ?');
+        self::assertTrue($statement->execute([
+            json_encode($mutate($upload['user_metadata']), JSON_THROW_ON_ERROR),
+            $uploadId,
+        ]));
+        self::assertSame(1, $statement->rowCount());
     }
 
     /**

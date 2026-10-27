@@ -92,6 +92,12 @@ and scale levels that were not measured for the exact deployment.
   requirement.
 - [ ] Abort or migrate legacy multipart uploads whose encryption, retention,
   Object Lock, ACL, storage class, or policy snapshot cannot be reconstructed.
+- [ ] Complete or abort multipart uploads created before destination ownership
+  snapshots before enabling `BucketOwnerPreferred`; marker-less uploads retain
+  legacy behavior and never infer a Preferred ownership transfer.
+- [ ] If a malformed ownership snapshot makes listing or completion fail closed,
+  abort the upload by its known upload ID. Repair metadata only by replacing it
+  with a fully validated snapshot.
 - [ ] Inventory legacy bucket and object tags and repair values outside the
   documented validation rules.
 - [ ] Verify that every persisted storage tier exists in the new configuration.

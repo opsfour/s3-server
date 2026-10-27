@@ -236,8 +236,11 @@ headers before reading or changing multipart metadata. This applies to every
 UploadPart subset, and to `x-amz-sdk-checksum-algorithm`.
 
 ListParts and ListMultipartUploads report the identity that created the upload
-as `Initiator`. Their `Owner` element follows the bucket ownership rules and
-can therefore differ under `BucketOwnerEnforced`.
+as `Initiator`. For new uploads, `Owner` is the intended final object owner
+snapshotted by CreateMultipartUpload; later Object Ownership control changes do
+not alter it. Uploads created before this snapshot format retain the legacy
+behavior where only the currently active `BucketOwnerEnforced` mode substitutes
+the bucket owner.
 
 ## Versioning
 
@@ -307,6 +310,14 @@ canonicalized to one bucket-owner `FULL_CONTROL` grant, and bucket-owner quota
 is used for both admission and publication. Omitted ACLs, other canned ACLs,
 and semantically equivalent `x-amz-grant-*` headers leave the authenticated
 writer as owner. CopyObject never inherits its source owner or ACL.
+
+CreateMultipartUpload applies the same rule once and stores the resulting final
+owner, canonical ACL, quota principal, ownership mode, and original canned-ACL
+intent with the upload. Listing and completion use that immutable decision even
+when controls change. Multipart staging counts and bytes remain charged to the
+initiator; only completed-object quota admission uses the snapshotted principal.
+Known selected-part size is checked before assembly and again in the locked
+publication transaction.
 
 `BucketOwnerEnforced` requires a private bucket ACL. In that mode object ACL
 grants are ignored, ACL updates fail, and object writes accept no ACL or
