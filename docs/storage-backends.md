@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission and durable create-only attempt primitive implemented; writer fence incomplete / not production-qualified | Read-only provider validation plus an internal, currently unreachable publication primitive; API startup always fails closed |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission and ordinary-object write fence implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy destination fence, exact Copy source read; API startup always fails closed |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -194,11 +194,35 @@ and one-shot dispatch identity before network I/O, and issues a create-only PUT
 or multipart completion with `ExpectedBucketOwner` and immutable attempt marker
 metadata. Its result is limited to confirmed success with a verified quoted
 ETag, exact conditional conflict, confirmed terminal rejection, or ambiguity.
-It never deletes, aborts, retries, consumes, or retires the armed intent.
+The primitive never deletes, aborts, retries, consumes, or retires the armed intent.
 
-This primitive is not exposed through `StorageBackend`, S3 handlers, or workers.
-Every ordinary AWS storage operation remains unavailable and API startup refuses
-the profile even when the unsafe Flysystem test override is enabled. Later
+The ordinary PUT and delegated browser POST handlers reserve capacity before
+final physical-body staging after authenticated POST spooling, then stage those
+bytes in private budgeted scratch.
+The scratch budget is private to this capability and does not reuse the public
+browser POST spool budget. Long staging renews only the exact undispatched
+reservation on a bounded cadence and aborts before provider dispatch if renewal
+authority is lost. That same renewable reservation covers SSE body ingestion,
+encryption, and encrypted Copy source acquisition and transforms, including an
+independent heartbeat while a yielding encryption worker is active. SSE payloads
+are staged as ciphertext. Complete staged size and checksum evidence is checked
+against the request or authorized Copy source before the sole provider request.
+CopyObject transforms a verified source before its one destination attempt;
+same-tier AWS copies use an exact owner-bound and attempt-marker-verified
+provider read. A confirmed attempt is
+consumed only in the same metadata transaction that publishes its logical
+object/version and immutable placement. Handler composition requires the exact
+admitted backend, provider profile, tier, and metadata-store identity, including
+through observability wrappers. Provider ETags are publication evidence,
+not logical MD5 values. Exact terminal refusal may retire by CAS; conflict,
+ambiguity, post-dispatch cancellation, and failed or uncertain commits retain
+recovery evidence. Exact safely-undispatched cancellation may retire its reservation.
+Request handlers never delete an AWS attempt path, and scratch-cleanup failure after
+metadata commit cannot replace the successful response.
+
+Generic `StorageBackend` AWS operations, provider-side copy, and background
+writers remain unavailable. API startup refuses the profile even when the
+unsafe Flysystem test override is enabled. Later
 qualification stories must connect and cover every writer, add reconciliation
 and sealing, and complete cleanup, health, and release gates before this profile
 can be described as fence-complete or production-qualified.

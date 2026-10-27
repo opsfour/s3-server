@@ -39,7 +39,7 @@ final class LocalScratchStager
     private readonly File\Filesystem $stageFilesystem;
 
     /** @var \WeakMap<LocalScratchStage, bool> */
-    private readonly \WeakMap $issuedStages;
+    private \WeakMap $issuedStages;
 
     private bool $shuttingDown = false;
 
@@ -73,9 +73,13 @@ final class LocalScratchStager
         ?Cancellation $cancellation = null,
         string $prefix = 's3fw-put-',
         bool $fullChecksums = false,
+        ?\Closure $heartbeat = null,
+        float $heartbeatIntervalSeconds = 60.0,
     ): LocalScratchStage {
         if ($this->shuttingDown || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)
-            || ! preg_match('/^s3fw-(?:put|part|get|mpu)-$/D', $prefix)) {
+            || ! preg_match('/^s3fw-(?:put|part|get|mpu)-$/D', $prefix)
+            || ($heartbeat !== null && (! is_finite($heartbeatIntervalSeconds)
+                || $heartbeatIntervalSeconds <= 0.0 || $heartbeatIntervalSeconds > 86400.0))) {
             throw new \InvalidArgumentException('Invalid local scratch staging request.');
         }
         $cancellation?->throwIfRequested();
@@ -91,11 +95,27 @@ final class LocalScratchStager
             $hash = $fullChecksums ? new ChecksumCalculator() : hash_init('sha256');
             $size = 0;
             $pending = '';
-            while (($chunk = $body->read($cancellation)) !== null) {
+            $heartbeatIntervalNanos = (int) min(PHP_INT_MAX, ceil($heartbeatIntervalSeconds * 1_000_000_000));
+            $nextHeartbeat = hrtime(true) + $heartbeatIntervalNanos;
+            $runHeartbeat = static function () use ($heartbeat, $heartbeatIntervalNanos, &$nextHeartbeat): void {
+                if ($heartbeat === null || hrtime(true) < $nextHeartbeat) {
+                    return;
+                }
+                $heartbeat();
+                $nextHeartbeat = hrtime(true) + $heartbeatIntervalNanos;
+            };
+            while (true) {
+                $runHeartbeat();
+                $chunk = $body->read($cancellation);
+                $runHeartbeat();
+                if ($chunk === null) {
+                    break;
+                }
                 $cancellation?->throwIfRequested();
                 $offset = 0;
                 $length = strlen($chunk);
                 while ($offset < $length) {
+                    $runHeartbeat();
                     $cancellation?->throwIfRequested();
                     if ($pending === '' && $length - $offset >= self::STAGE_BLOCK_BYTES) {
                         $block = substr($chunk, $offset, self::STAGE_BLOCK_BYTES);

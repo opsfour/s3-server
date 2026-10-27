@@ -126,6 +126,7 @@ final class HandlerRegistrar
         ?LocalFencedObjectWriter $localFencedWriter = null,
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         ?LocalFencedMultipartPartWriter $localPartWriter = null,
+        ?\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ): void {
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
             throw new \InvalidArgumentException('Local object writes need both writer and lease factory.');
@@ -145,6 +146,7 @@ final class HandlerRegistrar
             $localFencedWriter,
             $localLeaseFactory,
             $localPartWriter,
+            $awsObjectWriter,
         );
     }
 
@@ -162,6 +164,7 @@ final class HandlerRegistrar
         ?LocalFencedObjectWriter $localFencedWriter,
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory,
         ?LocalFencedMultipartPartWriter $localPartWriter = null,
+        ?\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
@@ -206,6 +209,7 @@ final class HandlerRegistrar
             $storageTiers,
             $localFencedWriter,
             $localLeaseFactory,
+            $awsObjectWriter,
         );
         $registry->register(
             S3Operation::PutObject,
@@ -265,6 +269,7 @@ final class HandlerRegistrar
                 $storageTiers,
                 $localFencedWriter,
                 $localLeaseFactory,
+                $awsObjectWriter,
             ),
         );
 

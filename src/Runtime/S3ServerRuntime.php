@@ -9,6 +9,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\Storage\DedicatedAmpObjectWriteLeaseRenewer;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use Psr\Log\LoggerInterface;
@@ -28,6 +29,8 @@ final class S3ServerRuntime
     private bool $encryptionClosed = false;
 
     private ?LocalFencedObjectWriter $localObjectWriter = null;
+
+    private ?AwsS3ForegroundObjectWriter $awsObjectWriter = null;
 
     private ?LocalFencedMultipartPartWriter $localMultipartPartWriter = null;
 
@@ -68,6 +71,14 @@ final class S3ServerRuntime
         $this->localObjectRenewer = $renewer;
     }
 
+    public function attachAwsObjectWriter(AwsS3ForegroundObjectWriter $writer): void
+    {
+        if ($this->stopped || $this->stopInProgress || $this->awsObjectWriter !== null) {
+            throw new \LogicException('AWS object writer was already attached or runtime stopped.');
+        }
+        $this->awsObjectWriter = $writer;
+    }
+
     public function stop(): void
     {
         if ($this->stopped) {
@@ -92,6 +103,14 @@ final class S3ServerRuntime
             $this->server->stop();
         } catch (\Throwable $e) {
             $this->logShutdownWarning('Server shutdown failed.', ['exception' => $e::class]);
+            $this->abortIncompleteShutdown();
+        }
+
+        try {
+            $this->awsObjectWriter?->shutdown();
+            $this->awsObjectWriter = null;
+        } catch (\Throwable $e) {
+            $this->logShutdownWarning('AWS object staging shutdown failed.', ['exception' => $e::class]);
             $this->abortIncompleteShutdown();
         }
 

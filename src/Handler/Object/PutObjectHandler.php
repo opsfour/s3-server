@@ -49,6 +49,10 @@ use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
 use OpsFour\S3Server\Storage\LocalObjectWriteOutcome;
 use OpsFour\S3Server\Storage\StoragePath;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectStage;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
 /**
@@ -76,10 +80,14 @@ final class PutObjectHandler implements RequestHandler
         ?StorageTierRegistry $storageTiers = null,
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
+        private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
             throw new \InvalidArgumentException('Local object writer and lease factory must be configured together.');
+        }
+        if ($localFencedWriter !== null && $awsObjectWriter !== null) {
+            throw new \InvalidArgumentException('Local and AWS object coordinators are mutually exclusive.');
         }
         if ($localFencedWriter !== null) {
             if (! $metadata instanceof ObjectWriteIntentStore) {
@@ -94,6 +102,21 @@ final class PutObjectHandler implements RequestHandler
                 || $default->name !== $localFencedWriter->storageTierName()
                 || realpath($backend->getBasePath()) !== $localFencedWriter->storageRoot()) {
                 throw new \InvalidArgumentException('Local object writer must match the default filesystem tier and root.');
+            }
+        }
+        if ($awsObjectWriter !== null) {
+            $default = $this->storageTiers->defaultTier();
+            $backend = $default->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if (! $metadata instanceof ObjectWriteIntentStore
+                || ! $backend instanceof AwsS3StorageBackend
+                || $storage !== $default->backend
+                || $awsObjectWriter->storageTierName() !== $default->name
+                || ($profile = $backend->admittedProfile()) === null
+                || ! $awsObjectWriter->isBoundTo($backend, $profile, $metadata)) {
+                throw new \InvalidArgumentException('AWS object writer must match the intent-capable default AWS tier.');
             }
         }
     }
@@ -162,9 +185,21 @@ final class PutObjectHandler implements RequestHandler
         }
 
         $localLease = null;
+        $awsReserved = null;
+        $awsStage = null;
+        $awsDispatchToken = null;
+        $bufferedWorkLock = null;
         $requestCancellation = null;
+        $publicationCommitted = false;
         try {
             $declaredLength = self::declaredObjectLength($request);
+            if ($encryptionMode !== null
+                && $declaredLength !== null
+                && $declaredLength > $this->maxEncryptedObjectSize) {
+                throw new EntityTooLargeException(
+                    'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                );
+            }
             if ($declaredLength !== null) {
                 $this->assertDeclaredLengthWithinQuota(
                     $request,
@@ -173,6 +208,14 @@ final class PutObjectHandler implements RequestHandler
                     $ownershipDecision,
                     $declaredLength,
                 );
+            }
+            if ($encryptionMode !== null && $this->awsObjectWriter !== null) {
+                // Bounded memory capacity is acquired before an AWS intent is
+                // reserved because no request byte has been consumed yet.
+                $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+            }
+            if ($this->awsObjectWriter !== null) {
+                $awsReserved = $this->awsObjectWriter->reserve($bucketInfo, $key, $objectOwnerId);
             }
             $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
             // 3. SSE payloads are encrypted before the first object-storage write.
@@ -185,18 +228,41 @@ final class PutObjectHandler implements RequestHandler
                     $objectOwnerId,
                     MultipartPartSize::boundedBody($request->getBody()),
                     $localLease,
+                    $awsReserved,
+                    $awsStage,
+                    $awsDispatchToken,
                 );
             } else {
-                $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+                $nonAwsBufferedWorkLock = $this->awsObjectWriter === null
+                    ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
+                    : null;
                 $encryptionCancellation = null;
                 try {
-                    [$plaintext, $plainChecksums] = BufferedSsePayload::read($request->getBody(), $this->maxEncryptedObjectSize);
-                    [$encMeta, $ciphertext] = $this->encryptPayload($request, $plaintext, $encryptionMode);
-                    $encryptedWrite = $this->writeObject($bucketInfo, $key, $objectOwnerId, new \Amp\ByteStream\ReadableBuffer($ciphertext), $localLease);
+                    $body = $request->getBody();
+                    if ($awsReserved !== null) {
+                        $body = $this->awsObjectWriter->renewingStream($awsReserved, $body);
+                        $this->awsObjectWriter->heartbeat($awsReserved);
+                    }
+                    [$plaintext, $plainChecksums] = BufferedSsePayload::read($body, $this->maxEncryptedObjectSize);
+                    if ($awsReserved !== null) {
+                        $this->awsObjectWriter->heartbeat($awsReserved);
+                        [$encMeta, $ciphertext] = $this->awsObjectWriter->transform(
+                            $awsReserved,
+                            fn(): array => $this->encryptPayload($request, $plaintext, $encryptionMode),
+                        );
+                    } else {
+                        [$encMeta, $ciphertext] = $this->encryptPayload($request, $plaintext, $encryptionMode);
+                    }
+                    $encryptedWrite = $this->writeObject($bucketInfo, $key, $objectOwnerId, new \Amp\ByteStream\ReadableBuffer($ciphertext), $localLease, $awsReserved, $awsStage, $awsDispatchToken);
                     if ($encryptedWrite->size !== strlen($ciphertext)
                         || ! hash_equals(md5($ciphertext), strtolower($encryptedWrite->md5Hex))) {
                         $this->deleteUncommittedPath($bucket, $encryptedWrite->path);
                         throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted object write does not match its payload.');
+                    }
+                    if ($awsReserved !== null) {
+                        $bufferedWorkLock?->release();
+                        $bufferedWorkLock = null;
+                        unset($plaintext, $ciphertext);
                     }
                     $result = new StorageWriteResult(
                         path: $encryptedWrite->path,
@@ -213,7 +279,9 @@ final class PutObjectHandler implements RequestHandler
                 } finally {
                     \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                         $encryptionCancellation,
-                        $bufferedWorkLock->release(...),
+                        static function () use ($nonAwsBufferedWorkLock): void {
+                            $nonAwsBufferedWorkLock?->release();
+                        },
                     );
                 }
             }
@@ -274,6 +342,16 @@ final class PutObjectHandler implements RequestHandler
                 );
             }
 
+            // The provider request is deliberately after every validation
+            // that can be decided from the complete staged evidence.
+            if ($awsStage !== null) {
+                \assert($awsReserved !== null);
+                $outcome = $this->awsObjectWriter?->dispatch($awsReserved, $key, $awsStage)
+                    ?? throw new \LogicException('AWS object coordinator disappeared.');
+                $awsDispatchToken = $outcome->dispatch;
+                $result = $encryptionMode === null ? $outcome->result : $result;
+            }
+
             // Merge encryption metadata into user metadata.
             if ($encMeta !== []) {
                 foreach ($encMeta as $k => $v) {
@@ -296,7 +374,7 @@ final class PutObjectHandler implements RequestHandler
             $oldPathsToClean = [];
             $publicationCallbackCompleted = false;
             $metadataWriteAttempted = false;
-            $dispatchToken = $localLease?->stopForCommit();
+            $dispatchToken = $localLease?->stopForCommit() ?? $awsDispatchToken;
 
             try {
                 $versioning = $this->metadata->getBucketVersioning($bucket);
@@ -578,6 +656,7 @@ final class PutObjectHandler implements RequestHandler
                 );
                 throw $e;
             }
+            $publicationCommitted = true;
 
             // Clean up old storage file on overwrite (non-versioned only).
             $this->deleteStagedData($bucket, $oldPathsToClean);
@@ -629,8 +708,25 @@ final class PutObjectHandler implements RequestHandler
             $requestCancellation = $error;
             throw $error;
         } finally {
+            if ($awsReserved !== null) {
+                $this->awsObjectWriter?->retireBeforeDispatch($awsReserved);
+            }
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                 $requestCancellation,
+                function () use ($awsStage, $publicationCommitted): void {
+                    if ($awsStage !== null) {
+                        try {
+                            $this->awsObjectWriter?->release($awsStage);
+                        } catch (\Throwable $error) {
+                            if (! $publicationCommitted) {
+                                throw $error;
+                            }
+                        }
+                    }
+                },
+                static function () use ($bufferedWorkLock): void {
+                    $bufferedWorkLock?->release();
+                },
                 static function () use ($localLease): void {
                     $localLease?->close();
                 },
@@ -673,6 +769,9 @@ final class PutObjectHandler implements RequestHandler
     /** @param list<array{tier: string, path: string}> $paths */
     private function deleteStagedData(string $bucket, array $paths): void
     {
+        if ($this->awsObjectWriter !== null) {
+            return;
+        }
         foreach ($paths as $entry) {
             try {
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
@@ -778,7 +877,7 @@ final class PutObjectHandler implements RequestHandler
 
     private function deleteUncommittedPath(string $bucket, string $path): void
     {
-        if ($this->localFencedWriter !== null) {
+        if ($this->localFencedWriter !== null || $this->awsObjectWriter !== null) {
             // An armed worker may still link this path after the request ends.
             // The intent collector seals it before any physical reclamation.
             return;
@@ -871,7 +970,15 @@ final class PutObjectHandler implements RequestHandler
         string $ownerId,
         ReadableStream $body,
         ?LocalObjectWriteLeaseGuard &$localLease,
+        ?AwsS3ForegroundObjectReservation &$awsReserved,
+        ?AwsS3ForegroundObjectStage &$awsStage,
+        ?LocalObjectWriteDispatchToken &$awsDispatchToken,
     ): StorageWriteResult {
+        if ($this->awsObjectWriter !== null) {
+            $awsReserved ??= $this->awsObjectWriter->reserve($bucket, $key, $ownerId);
+            $awsStage = $this->awsObjectWriter->stage($awsReserved, $body);
+            return $awsStage->result;
+        }
         if ($this->localFencedWriter === null || $this->localLeaseFactory === null) {
             return $this->storage->putObject($bucket->name, $key, $body);
         }

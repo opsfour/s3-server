@@ -29,9 +29,16 @@ final readonly class AwsS3WriteAttemptPublisher
     /** @param resource|string|\Psr\Http\Message\StreamInterface $body */
     public function publish(ObjectWriteIntent $planned, string $logicalKey, mixed $body): AwsS3WriteAttemptOutcome
     {
+        self::assertBody($body);
+
+        return $this->dispatch($this->reserve($planned, $logicalKey), $logicalKey, $body);
+    }
+
+    /** Reserve capacity before the foreground caller reads its body. */
+    public function reserve(ObjectWriteIntent $planned, string $logicalKey): ObjectWriteIntent
+    {
         AwsS3WriteAttemptPath::assertProfileIntentPath($this->profile, $planned, $logicalKey);
         self::assertPlanned($planned);
-        self::assertBody($body);
 
         try {
             $reserved = $this->intents->reserveObjectWriteIntent($planned, $this->leaseSeconds);
@@ -45,6 +52,19 @@ final readonly class AwsS3WriteAttemptPublisher
             || $reserved->leaseUntil <= 0.0
             || $reserved->claimGeneration !== 0
             || $reserved->dispatchId !== null) {
+            throw new AwsS3WriteAttemptArmException();
+        }
+
+        return $reserved;
+    }
+
+    /** @param resource|string|\Psr\Http\Message\StreamInterface $body */
+    public function dispatch(ObjectWriteIntent $reserved, string $logicalKey, mixed $body): AwsS3WriteAttemptOutcome
+    {
+        AwsS3WriteAttemptPath::assertProfileIntentPath($this->profile, $reserved, $logicalKey);
+        self::assertBody($body);
+        if ($reserved->state !== 'active' || $reserved->leaseUntil <= 0.0
+            || $reserved->claimGeneration !== 0 || $reserved->dispatchId !== null) {
             throw new AwsS3WriteAttemptArmException();
         }
 
@@ -64,7 +84,7 @@ final readonly class AwsS3WriteAttemptPublisher
             throw new AwsS3WriteAttemptArmException();
         }
         if ($armed === null
-            || ! self::sameIdentity($planned, $armed)
+            || ! self::sameIdentity($reserved, $armed)
             || $armed->state !== 'active'
             || $armed->leaseUntil < $reserved->leaseUntil
             || $armed->claimGeneration !== 0
@@ -75,6 +95,71 @@ final readonly class AwsS3WriteAttemptPublisher
         $provider = $this->writer->publish($armed, $logicalKey, $body);
 
         return AwsS3WriteAttemptOutcome::fromProvider($armed->attemptId, $dispatchId, $provider);
+    }
+
+    /** Renew only the exact reservation while foreground staging is still undispatched. */
+    public function renewUndispatched(ObjectWriteIntent $reserved): ObjectWriteIntent
+    {
+        if ($reserved->state !== 'active' || $reserved->leaseUntil <= 0.0
+            || $reserved->claimGeneration !== 0 || $reserved->dispatchId !== null) {
+            throw new AwsS3WriteAttemptArmException();
+        }
+        try {
+            $renewed = $this->intents->renewObjectWriteIntent(
+                $reserved->attemptId,
+                $reserved->leaseUntil,
+                $this->leaseSeconds,
+            );
+        } catch (\Throwable) {
+            throw new AwsS3WriteAttemptArmException();
+        }
+        if ($renewed === null
+            || ! self::sameIdentity($reserved, $renewed)
+            || $renewed->state !== 'active'
+            || $renewed->leaseUntil <= $reserved->leaseUntil
+            || $renewed->claimGeneration !== 0
+            || $renewed->dispatchId !== null) {
+            throw new AwsS3WriteAttemptArmException();
+        }
+
+        return $renewed;
+    }
+
+    public function leaseSeconds(): float
+    {
+        return $this->leaseSeconds;
+    }
+
+    /** An unarmed exact reservation can be retired after definite pre-dispatch failure. */
+    public function retireUndispatched(ObjectWriteIntent $reserved): void
+    {
+        try {
+            $current = $this->intents->getObjectWriteIntent($reserved->attemptId);
+            if ($current !== null && self::sameIdentity($reserved, $current)
+                && $current->dispatchId === null && $current->state === 'active') {
+                $this->intents->retireUndispatchedObjectWriteIntent($reserved->attemptId);
+            }
+        } catch (\Throwable) {
+            // Failed retirement leaves durable evidence for the collector.
+        }
+    }
+
+    /** Exact terminal refusal is the only armed request-path retirement. */
+    public function retireConfirmedRejection(AwsS3WriteAttemptOutcome $outcome): void
+    {
+        if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_REJECTION) {
+            return;
+        }
+        try {
+            $this->intents->retireTerminalPreLinkObjectWriteIntent($outcome->attemptId, $outcome->dispatchId);
+        } catch (\Throwable) {
+            // Preserve the row if CAS or metadata is uncertain.
+        }
+    }
+
+    public function isBoundTo(AwsS3ProviderProfile $profile, ObjectWriteIntentStore $intents): bool
+    {
+        return $this->profile === $profile && $this->intents === $intents;
     }
 
     private static function assertPlanned(ObjectWriteIntent $intent): void

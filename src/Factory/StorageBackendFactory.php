@@ -14,6 +14,7 @@ use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\LocalFlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
@@ -37,13 +38,14 @@ final class StorageBackendFactory
         array $config = [],
         ?MetricsCollector $metrics = null,
         ?string $metricsDriver = null,
+        ?AwsS3ProviderValidator $awsS3ProviderValidator = null,
     ): StorageBackend {
         $backend = match ($driver) {
             'filesystem' => new FilesystemBackend(
                 $config['path'] ?? throw new \InvalidArgumentException('Filesystem requires "path"'),
             ),
             'flysystem' => self::createFlysystem($config, $metrics),
-            'aws-s3' => self::createAwsS3($config),
+            'aws-s3' => self::createAwsS3($config, $awsS3ProviderValidator),
             'memory' => new InMemoryBackend(),
             default => throw new \InvalidArgumentException("Unknown storage driver: {$driver}"),
         };
@@ -61,9 +63,15 @@ final class StorageBackendFactory
     }
 
     /** @param array<string, mixed> $config */
-    private static function createAwsS3(array $config): StorageBackend
-    {
-        return new AwsS3StorageBackend((new AwsS3ProviderValidator())->validate($config));
+    private static function createAwsS3(
+        array $config,
+        ?AwsS3ProviderValidator $validator = null,
+    ): StorageBackend {
+        $binding = AwsS3ProviderValidatedBinding::fromConfiguration(
+            $config,
+            $validator ?? new AwsS3ProviderValidator(),
+        );
+        return new AwsS3StorageBackend($binding->admission, $binding->admission->providerAdmitted ? $binding : null);
     }
 
     /**

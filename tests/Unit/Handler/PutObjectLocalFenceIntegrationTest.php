@@ -16,7 +16,11 @@ use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Quota\QuotaManager;
+use OpsFour\S3Server\Quota\QuotaProvider;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Runtime\BufferedWorkLimiter;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -156,6 +160,48 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
             self::assertSame($payload, $decrypted);
             self::assertNull($this->metadata->getObjectWriteIntent(substr($object->systemMetadata['storagePath'], -32)));
         }
+    }
+
+    public function test_non_aws_sse_releases_buffer_capacity_before_metadata_commit(): void
+    {
+        $state = new BufferedWorkQuotaProbe();
+        $provider = new class ($state) implements QuotaProvider {
+            public function __construct(private BufferedWorkQuotaProbe $state) {}
+
+            public function quotaForOwner(string $ownerId): QuotaConfig
+            {
+                ++$this->state->calls;
+                if ($this->state->calls === 3) {
+                    $lock = BufferedWorkLimiter::acquire();
+                    $this->state->capacityWasAvailableAtCommit = true;
+                    $lock->release();
+                }
+
+                return new QuotaConfig(maxBytesPerBucket: 1_048_576);
+            }
+
+            public function hasQuotaForOwner(string $ownerId): bool
+            {
+                return true;
+            }
+        };
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $handler = new PutObjectHandler(
+            $this->metadata,
+            $this->storage,
+            encryption: $encryption,
+            quotas: new QuotaManager($this->metadata, $provider),
+            localFencedWriter: $this->writer,
+            localLeaseFactory: $this->factory(),
+        );
+
+        $response = $handler->handleRequest($this->request('payload', [
+            'x-amz-server-side-encryption' => 'AES256',
+        ]));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertTrue($state->capacityWasAvailableAtCommit);
+        self::assertGreaterThanOrEqual(4, $state->calls);
     }
 
     public function test_bad_checksum_leaves_fenced_path_for_collector_without_publishing_metadata(): void
@@ -318,4 +364,11 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
             }
         };
     }
+}
+
+final class BufferedWorkQuotaProbe
+{
+    public int $calls = 0;
+
+    public bool $capacityWasAvailableAtCommit = false;
 }

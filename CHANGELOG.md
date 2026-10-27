@@ -15,7 +15,17 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Add the internal AWS durable create-only attempt publisher with committed
   reservation/dispatch ordering, expected-owner and immutable attempt markers,
   bounded multipart completion validation, and closed secret-free outcomes.
-  Ordinary AWS storage operations and startup remain disabled pending later
+- Fence ordinary AWS PUT, browser POST, and CopyObject destinations through
+  private budgeted staging and exact dispatch consumption in the object metadata
+  transaction. CopyObject uses an owner-bound, marker-verified source read;
+  the exact undispatched reservation renews across staging, SSE preprocessing,
+  and encrypted Copy transforms (including while yielding workers are active),
+  and complete staged request/source evidence is validated before the sole
+  provider dispatch. Conflict, ambiguity, and failed commits preserve armed
+  recovery evidence, while post-commit scratch cleanup cannot replace success. Runtime
+  wiring is bound to the exact admitted backend/profile and uses a private
+  staging budget independent of the browser POST spool setting.
+  Generic AWS storage operations and API startup remain disabled pending later
   writer-coverage and reconciliation stories.
 
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and

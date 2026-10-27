@@ -52,6 +52,9 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 /**
@@ -80,13 +83,17 @@ final class CopyObjectHandler implements RequestHandler
         ?StorageTierRegistry $storageTiers = null,
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
+        private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
         if (($this->localFencedWriter === null) !== ($this->localLeaseFactory === null)) {
             throw new \InvalidArgumentException('Local copy fencing needs a writer and a lease factory.');
         }
+        if ($this->localFencedWriter !== null && $awsObjectWriter !== null) {
+            throw new \InvalidArgumentException('Local and AWS copy coordinators are mutually exclusive.');
+        }
         $localBackend = $this->storageTiers->defaultBackend();
-        if ($localBackend instanceof ObservedStorageBackend) {
+        while ($localBackend instanceof ObservedStorageBackend) {
             $localBackend = $localBackend->innerBackend();
         }
         if ($this->localFencedWriter !== null && (
@@ -96,6 +103,16 @@ final class CopyObjectHandler implements RequestHandler
             || realpath($localBackend->getBasePath()) !== $this->localFencedWriter->storageRoot()
         )) {
             throw new \InvalidArgumentException('Local copy fencing does not match the default filesystem tier and intent store.');
+        }
+        if ($awsObjectWriter !== null && (
+            ! $metadata instanceof ObjectWriteIntentStore
+            || ! $localBackend instanceof AwsS3StorageBackend
+            || $storage !== $this->storageTiers->defaultTier()->backend
+            || $awsObjectWriter->storageTierName() !== $this->storageTiers->defaultTier()->name
+            || ($profile = $localBackend->admittedProfile()) === null
+            || ! $awsObjectWriter->isBoundTo($localBackend, $profile, $metadata)
+        )) {
+            throw new \InvalidArgumentException('AWS copy fencing requires the exact default AWS tier and durable intents.');
         }
     }
 
@@ -114,8 +131,11 @@ final class CopyObjectHandler implements RequestHandler
         string $destinationKey,
         string $bucketGeneration,
         string $writeOwnerId,
+        \OpsFour\S3Server\Dto\BucketInfo $sourceBucketInfo,
+        string $sourceKey,
+        \OpsFour\S3Server\Dto\BucketInfo $destinationBucketInfo,
     ): array {
-        \assert($this->localFencedWriter !== null && $this->localLeaseFactory !== null);
+        \assert(($this->localFencedWriter !== null && $this->localLeaseFactory !== null) || $this->awsObjectWriter !== null);
         \assert($this->metadata instanceof ObjectWriteIntentStore);
 
         $plaintextChecksums = null;
@@ -125,37 +145,59 @@ final class CopyObjectHandler implements RequestHandler
         $body = null;
         $bufferLock = null;
         $copyCancellation = null;
+        $awsStage = null;
+        $awsReserved = null;
         try {
-            if ($sourceEncryptionMode !== null || $destinationEncryptionMode !== null) {
-                if ($source->size > $this->maxEncryptedObjectSize) {
-                    throw new EntityTooLargeException(
-                        'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
-                    );
-                }
+            $requiresBufferedTransform = $sourceEncryptionMode !== null || $destinationEncryptionMode !== null;
+            if ($requiresBufferedTransform && $source->size > $this->maxEncryptedObjectSize) {
+                throw new EntityTooLargeException(
+                    'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
+                );
+            }
+            if ($this->awsObjectWriter !== null
+                && $requiresBufferedTransform) {
+                // No source byte has been read, so acquire bounded buffering
+                // capacity before reserving durable AWS intent capacity.
                 $bufferLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+            }
+            $awsReserved = $this->awsObjectWriter?->reserve($destinationBucketInfo, $destinationKey, $writeOwnerId, 'copy_object');
+            if ($requiresBufferedTransform) {
+                $bufferLock ??= \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
                 [$sourceBytes] = BufferedSsePayload::readExpected(
-                    $sourceStorage->getObjectByPath($sourcePath),
+                    $this->copySourceStream($sourceStorage, $sourceBucketInfo, $source, $sourceKey, $sourcePath, $awsReserved),
                     $source->size,
                     $this->maxEncryptedObjectSize,
                 );
+                if ($awsReserved !== null) {
+                    $this->awsObjectWriter?->heartbeat($awsReserved);
+                }
                 if ($sourceEncryptionMode === EncryptionRequestResolver::SSE_C) {
                     \assert($this->encryption !== null && $sourceCustomerKey !== null);
-                    $plaintext = $this->encryption->decryptSseC(
-                        $sourceBytes,
-                        $sourceCustomerKey,
-                        $source->userMetadata['__sse-iv'],
-                        $source->userMetadata['__sse-tag'],
+                    $plaintext = $this->transformWithAwsHeartbeat(
+                        $awsReserved,
+                        fn(): string => $this->encryption->decryptSseC(
+                            $sourceBytes,
+                            $sourceCustomerKey,
+                            $source->userMetadata['__sse-iv'],
+                            $source->userMetadata['__sse-tag'],
+                        ),
                     );
                 } elseif ($sourceEncryptionMode === EncryptionRequestResolver::SSE_S3) {
                     \assert($this->encryption !== null);
-                    $plaintext = $this->encryption->decryptSseS3(
-                        $sourceBytes,
-                        $source->userMetadata['__sse-key'],
-                        $source->userMetadata['__sse-iv'],
-                        $source->userMetadata['__sse-tag'],
+                    $plaintext = $this->transformWithAwsHeartbeat(
+                        $awsReserved,
+                        fn(): string => $this->encryption->decryptSseS3(
+                            $sourceBytes,
+                            $source->userMetadata['__sse-key'],
+                            $source->userMetadata['__sse-iv'],
+                            $source->userMetadata['__sse-tag'],
+                        ),
                     );
                 } else {
                     $plaintext = $sourceBytes;
+                }
+                if ($awsReserved !== null) {
+                    $this->awsObjectWriter?->heartbeat($awsReserved);
                 }
                 $calculator = new ChecksumCalculator();
                 $calculator->update($plaintext);
@@ -171,7 +213,10 @@ final class CopyObjectHandler implements RequestHandler
                     $keyMd5 = $request->getHeader('x-amz-server-side-encryption-customer-key-MD5');
                     \assert($algorithm !== null && $encodedKey !== null && $keyMd5 !== null);
                     $customerKey = EncryptionService::validateSseCHeaders($algorithm, $encodedKey, $keyMd5);
-                    $encrypted = $this->encryption->encryptSseC($plaintext, $customerKey);
+                    $encrypted = $this->transformWithAwsHeartbeat(
+                        $awsReserved,
+                        fn(): array => $this->encryption->encryptSseC($plaintext, $customerKey),
+                    );
                     $encryptionMetadata = [
                         'sse-algorithm' => 'SSE-C',
                         'sse-iv' => $encrypted['iv'],
@@ -181,7 +226,10 @@ final class CopyObjectHandler implements RequestHandler
                     $expectedPhysicalPayload = $encrypted['ciphertext'];
                 } elseif ($destinationEncryptionMode === EncryptionRequestResolver::SSE_S3) {
                     \assert($this->encryption !== null);
-                    $encrypted = $this->encryption->encryptSseS3($plaintext);
+                    $encrypted = $this->transformWithAwsHeartbeat(
+                        $awsReserved,
+                        fn(): array => $this->encryption->encryptSseS3($plaintext),
+                    );
                     $encryptionMetadata = [
                         'sse-algorithm' => 'AES256',
                         'sse-key' => $encrypted['encryptedDataKey'],
@@ -192,10 +240,48 @@ final class CopyObjectHandler implements RequestHandler
                 } else {
                     $expectedPhysicalPayload = $plaintext;
                 }
+                if ($awsReserved !== null) {
+                    $this->awsObjectWriter?->heartbeat($awsReserved);
+                }
                 $body = new \Amp\ByteStream\ReadableBuffer($expectedPhysicalPayload);
             } else {
                 $readLimit = $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX;
-                $body = new LimitedReadableStream($sourceStorage->getObjectByPath($sourcePath), $readLimit);
+                $body = new LimitedReadableStream($this->copySourceStream($sourceStorage, $sourceBucketInfo, $source, $sourceKey, $sourcePath, $awsReserved), $readLimit);
+            }
+
+            if ($awsReserved !== null) {
+                $awsStage = $this->awsObjectWriter?->stage($awsReserved, $body)
+                    ?? throw new \LogicException('AWS copy writer disappeared.');
+                $write = $awsStage->result;
+                if ($expectedPhysicalPayload !== null && (
+                    $write->size !== strlen($expectedPhysicalPayload)
+                    || ! hash_equals(md5($expectedPhysicalPayload), strtolower($write->md5Hex))
+                )) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted copy write does not match its payload.');
+                }
+                $logicalSize = $plaintextChecksums !== null ? $plaintextChecksums->size : $write->size;
+                $logicalEtag = $etag ?? '"' . $write->md5Hex . '"';
+                if ($logicalSize !== $source->size) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source size does not match its metadata.');
+                }
+                if (preg_match('/\A"([0-9a-fA-F]{32})"\z/', $source->etag, $sourceMd5) === 1
+                    && ! hash_equals(strtolower($sourceMd5[1]), strtolower(trim($logicalEtag, '"')))) {
+                    throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source ETag does not match its payload.');
+                }
+                $this->assertSourceChecksums(
+                    $source,
+                    $this->storageTiers->defaultBackend(),
+                    $write,
+                    $plaintextChecksums,
+                    $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX,
+                );
+                // Only validated staged source evidence may cross the sole
+                // provider-dispatch boundary.
+                $outcome = $this->awsObjectWriter->dispatch($awsReserved, $destinationKey, $awsStage);
+                return [$write, $etag, $plaintextChecksums !== null ? $plaintextChecksums->size : $write->size, $encryptionMetadata, $plaintextChecksums, $outcome->dispatch];
+            }
+            if ($this->localFencedWriter === null || $this->localLeaseFactory === null) {
+                throw new \LogicException('Local copy writer disappeared.');
             }
 
             $attemptId = bin2hex(random_bytes(16));
@@ -239,8 +325,16 @@ final class CopyObjectHandler implements RequestHandler
             $copyCancellation = $error;
             throw $error;
         } finally {
+            if ($awsReserved !== null) {
+                $this->awsObjectWriter?->retireBeforeDispatch($awsReserved);
+            }
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                 $copyCancellation,
+                function () use ($awsStage): void {
+                    if ($awsStage !== null) {
+                        $this->awsObjectWriter?->release($awsStage);
+                    }
+                },
                 static function () use ($body): void {
                     $body?->close();
                 },
@@ -249,6 +343,52 @@ final class CopyObjectHandler implements RequestHandler
                 },
             );
         }
+    }
+
+    /**
+     * @template T
+     * @param \Closure(): T $transform
+     * @return T
+     */
+    private function transformWithAwsHeartbeat(
+        ?AwsS3ForegroundObjectReservation $reservation,
+        \Closure $transform,
+    ): mixed {
+        if ($reservation === null) {
+            return $transform();
+        }
+
+        return $this->awsObjectWriter?->transform($reservation, $transform)
+            ?? throw new \LogicException('AWS copy writer disappeared.');
+    }
+
+    private function copySourceStream(
+        StorageBackend $storage,
+        \OpsFour\S3Server\Dto\BucketInfo $bucket,
+        ObjectInfo $source,
+        string $key,
+        string $path,
+        ?AwsS3ForegroundObjectReservation $reservation = null,
+    ): \Amp\ByteStream\ReadableStream {
+        if ($reservation !== null) {
+            $this->awsObjectWriter?->heartbeat($reservation);
+        }
+        $backend = $storage;
+        while ($backend instanceof ObservedStorageBackend) {
+            $backend = $backend->innerBackend();
+        }
+        if ($backend instanceof AwsS3StorageBackend) {
+            $stream = $backend->readCopySource($bucket, $source, $key, $path);
+        } else {
+            $stream = $storage->getObjectByPath($path);
+        }
+        if ($reservation !== null) {
+            $this->awsObjectWriter?->heartbeat($reservation);
+            return $this->awsObjectWriter?->renewingStream($reservation, $stream)
+                ?? throw new \LogicException('AWS copy writer disappeared.');
+        }
+
+        return $stream;
     }
 
     private function consumeLocalWriteIntent(?LocalObjectWriteDispatchToken $token): void
@@ -559,7 +699,7 @@ final class CopyObjectHandler implements RequestHandler
         $localDispatchToken = null;
         $readLimit = $srcObjectInfo->size < PHP_INT_MAX ? $srcObjectInfo->size + 1 : PHP_INT_MAX;
         $request->setAttribute('s3.copySourceLogEligible', true);
-        if ($this->localFencedWriter !== null) {
+        if ($this->localFencedWriter !== null || $this->awsObjectWriter !== null) {
             [$writeResult, $preEncryptedEtag, $preEncryptedObjectSize, $preEncryptedMeta, $sourcePlaintextChecksums, $localDispatchToken] = $this->writeFencedCopy(
                 $request,
                 $srcObjectInfo,
@@ -572,6 +712,9 @@ final class CopyObjectHandler implements RequestHandler
                 $dstKey,
                 $dstBucketInfo->generation,
                 $objectOwnerId,
+                $srcBucketInfo,
+                $srcKey,
+                $dstBucketInfo,
             );
         } elseif ($preEncryptedDestination) {
             [$writeResult, $preEncryptedEtag, $preEncryptedObjectSize, $preEncryptedMeta, $sourcePlaintextChecksums] = $this->writeEncryptedCopy(
@@ -638,7 +781,7 @@ final class CopyObjectHandler implements RequestHandler
             $bufferedWorkLock = ! $preEncryptedDestination && $sourceEncryptionMode !== null
                 ? \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire()
                 : null;
-            if ($this->localFencedWriter === null && $this->encryption !== null && ! $preEncryptedDestination) {
+            if ($this->localFencedWriter === null && $this->awsObjectWriter === null && $this->encryption !== null && ! $preEncryptedDestination) {
                 $srcSseAlgo = $sourceEncryptionMode;
 
                 // If the source is encrypted, decrypt the copied file back to plaintext first.
@@ -712,7 +855,7 @@ final class CopyObjectHandler implements RequestHandler
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
                 function () use ($localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $sourceStorage, $srcPath): void {
-                    if ($localDispatchToken === null) {
+                    if ($localDispatchToken === null && $this->awsObjectWriter === null) {
                         $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, protectedPath: $sourceStorage === $destinationStorage ? $srcPath : null);
                     }
                 },
@@ -1015,7 +1158,7 @@ final class CopyObjectHandler implements RequestHandler
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
                 function () use ($metadataCallbackCompleted, $localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $versionId): void {
-                    if (! $metadataCallbackCompleted && $localDispatchToken === null) {
+                    if (! $metadataCallbackCompleted && $localDispatchToken === null && $this->awsObjectWriter === null) {
                         $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $versionId);
                     }
                 },
@@ -1265,6 +1408,9 @@ final class CopyObjectHandler implements RequestHandler
 
     private function deleteStoredData(ObjectInfo $object, string $preservePath): void
     {
+        if ($this->awsObjectWriter !== null) {
+            return;
+        }
         foreach ($this->oldObjectPathsToClean($object, $preservePath) as [$tier, $path]) {
             try {
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(

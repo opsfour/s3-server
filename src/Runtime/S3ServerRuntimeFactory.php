@@ -32,6 +32,8 @@ use OpsFour\S3Server\Parallel\ParallelEncryptionService;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
@@ -158,6 +160,7 @@ final readonly class S3ServerRuntimeFactory
             $localFencedWriter = null;
             $localLeaseFactory = null;
             $localPartWriter = null;
+            $awsObjectWriter = null;
             if ($config->localObjectWriteTestScratchPath !== null) {
                 [$localFencedWriter, $localLeaseFactory, $renewer, $localPartWriter] = $this->localObjectWriteWiring(
                     $config,
@@ -190,6 +193,19 @@ final readonly class S3ServerRuntimeFactory
                 $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory);
             }
 
+            $awsStorage = $storageTiers->defaultBackend();
+            while ($awsStorage instanceof ObservedStorageBackend) {
+                $awsStorage = $awsStorage->innerBackend();
+            }
+            if ($awsStorage instanceof AwsS3StorageBackend && $awsStorage->awsS3ProviderAdmission()->providerAdmitted) {
+                $awsObjectWriter = $awsStorage->createForegroundObjectWriter(
+                    $metadata,
+                    $this->awsObjectScratchPath(),
+                    $storageTiers->defaultTier()->name,
+                );
+                $runtime->attachAwsObjectWriter($awsObjectWriter);
+            }
+
             foreach ($notificationListeners as $listenerConfig) {
                 $pattern = $listenerConfig['pattern'] ?? null;
                 $listener = $listenerConfig['listener'] ?? null;
@@ -219,6 +235,7 @@ final readonly class S3ServerRuntimeFactory
                 localFencedWriter: $localFencedWriter,
                 localLeaseFactory: $localLeaseFactory,
                 localPartWriter: $localPartWriter,
+                awsObjectWriter: $awsObjectWriter,
             );
 
             return $runtime;
@@ -391,6 +408,20 @@ final readonly class S3ServerRuntimeFactory
             throw new \RuntimeException('Local object write scratch must not traverse symbolic links.');
         }
 
+        return $scratch;
+    }
+
+    private function awsObjectScratchPath(): string
+    {
+        $root = realpath(sys_get_temp_dir());
+        if ($root === false) {
+            throw new \RuntimeException('AWS object staging temporary root is unavailable.');
+        }
+        $scratch = $root . '/opsfour-aws-object-writes';
+        if (is_link($scratch) || (! is_dir($scratch) && ! @mkdir($scratch, 0700) && ! is_dir($scratch))
+            || realpath($scratch) !== $scratch) {
+            throw new \RuntimeException('Cannot create private AWS object staging scratch.');
+        }
         return $scratch;
     }
 
