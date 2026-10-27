@@ -152,6 +152,12 @@ size still includes `size: 0`. Completed restore events include
 `glacierEventData.restoreEventData` with the source storage class and restored
 copy's expiry time when the worker has both values.
 
+`userIdentity.principalId` identifies the request actor, independently of the
+persisted object or delete-marker owner. For example, an authenticated delete
+under `BucketOwnerEnforced` reports the requester even though the new marker is
+bucket-owned. Lifecycle events have background attribution because no HTTP
+request actor exists.
+
 ## Internal Listeners and Broker Adapters
 
 Applications can also listen to normalized in-process `S3Event` objects and

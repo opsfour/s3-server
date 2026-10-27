@@ -81,6 +81,21 @@ final class BucketOwnership
         );
     }
 
+    public static function resolveDeleteMarkerOwner(
+        string $ownershipMode,
+        string $bucketOwnerId,
+        string $requesterOwnerId,
+        bool $lifecycle = false,
+    ): string {
+        $ownershipMode = self::validateMode($ownershipMode);
+
+        if ($lifecycle || $requesterOwnerId === '' || $ownershipMode === self::BUCKET_OWNER_ENFORCED) {
+            return $bucketOwnerId;
+        }
+
+        return $requesterOwnerId;
+    }
+
     public static function assertObjectWriteDecisionCurrent(
         MetadataStore $metadata,
         string $bucket,

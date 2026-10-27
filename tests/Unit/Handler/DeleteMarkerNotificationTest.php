@@ -8,6 +8,7 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\Socket\InternetAddress;
 use League\Uri\Http;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Handler\Object\DeleteObjectHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectsHandler;
@@ -76,14 +77,58 @@ final class DeleteMarkerNotificationTest extends TestCase
         }
     }
 
+    public function test_marker_owner_is_separate_from_authenticated_event_actor(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('bucket-owner', 'bucket', 'us-east-1');
+        $metadata->setBucketVersioning('bucket', 'Enabled');
+        $metadata->putBucketOwnershipControls('bucket', BucketOwnership::BUCKET_OWNER_ENFORCED);
+        $metadata->putAccountPolicy('requester', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:DeleteObject',
+                'Resource' => 'arn:aws:s3:::bucket/*',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $metadata->putBucketPolicy('bucket', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => ['AWS' => 'requester'],
+                'Action' => 's3:DeleteObject',
+                'Resource' => 'arn:aws:s3:::bucket/*',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+        $notifications = new NotificationDispatcher($metadata);
+        $actor = null;
+        $notifications->listen('s3:ObjectRemoved:*', static function (S3Event $event) use (&$actor): void {
+            $actor = $event->ownerId;
+        });
+        $request = $this->request('DELETE', 'http://127.0.0.1/bucket/key', ownerId: 'requester');
+        $request->setAttribute('s3.key', 'key');
+
+        self::assertSame(204, (new DeleteObjectHandler(
+            $metadata,
+            StorageTierRegistry::single($storage),
+            $notifications,
+        ))->handleRequest($request)->getStatus());
+        $notifications->shutdown();
+
+        $marker = $metadata->listObjectVersions('bucket')['deleteMarkers'][0];
+        self::assertSame('bucket-owner', $marker->ownerId);
+        self::assertSame('requester', $actor);
+    }
+
     /** @param non-empty-string $method */
-    private function request(string $method, string $uri, string $body = ''): Request
+    private function request(string $method, string $uri, string $body = '', string $ownerId = 'owner'): Request
     {
         $client = $this->createMock(Client::class);
         $client->method('getRemoteAddress')->willReturn(new InternetAddress('127.0.0.1', 12345));
         $request = new Request($client, $method, Http::new($uri), [], $body);
         $request->setAttribute('s3.bucket', 'bucket');
-        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('ownerId', $ownerId);
 
         return $request;
     }

@@ -1933,6 +1933,58 @@ final class MetadataBackendIntegrationTest extends TestCase
         }
     }
 
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_versions_and_markers_preserve_stored_owner_accounting(
+        string $driver,
+        string $dsnVariable,
+    ): void {
+        $dsn = getenv($dsnVariable);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnVariable} for cross-owner version accounting tests.");
+        }
+
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'version-owner-' . $suffix;
+        $bucketOwner = 'bucket-owner-' . $suffix;
+        $ownerA = 'owner-a-' . $suffix;
+        $ownerB = 'owner-b-' . $suffix;
+        $markerOwner = 'marker-owner-' . $suffix;
+        $versions = [];
+
+        try {
+            $metadata->createBucket($bucketOwner, $bucket, 'us-east-1');
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $versions[] = $metadata->putObjectVersioned($bucket, 'key', $ownerA, 3, 'a', 'text/plain', 'path/a');
+            $versions[] = $metadata->putObjectVersioned($bucket, 'key', $ownerB, 5, 'b', 'text/plain', 'path/b');
+            $marker = $metadata->deleteObjectVersioned($bucket, 'key', $markerOwner);
+
+            $owners = [];
+            foreach ($metadata->listObjectVersions($bucket)['entries'] ?? [] as $entry) {
+                $owners[$entry->versionId ?? 'null'] = $entry->ownerId;
+            }
+            self::assertSame($ownerA, $owners[$versions[0]]);
+            self::assertSame($ownerB, $owners[$versions[1]]);
+            self::assertSame($markerOwner, $owners[$marker]);
+            self::assertSame(['objectCount' => 1, 'bytesUsed' => 3], $metadata->getOwnerStorageStats($ownerA));
+            self::assertSame(['objectCount' => 1, 'bytesUsed' => 5], $metadata->getOwnerStorageStats($ownerB));
+            self::assertSame(['objectCount' => 0, 'bytesUsed' => 0], $metadata->getOwnerStorageStats($markerOwner));
+
+            self::assertSame($ownerA, $metadata->deleteObjectVersion($bucket, 'key', $versions[0])?->ownerId);
+            self::assertSame(['objectCount' => 0, 'bytesUsed' => 0], $metadata->getOwnerStorageStats($ownerA));
+        } finally {
+            foreach ($versions as $versionId) {
+                $metadata->deleteObjectVersion($bucket, 'key', $versionId);
+            }
+            if (isset($marker)) {
+                $metadata->deleteObjectVersion($bucket, 'key', $marker);
+            }
+            if ($metadata->getBucketOwner($bucket) === $bucketOwner) {
+                $metadata->deleteBucket($bucketOwner, $bucket);
+            }
+        }
+    }
+
     public function test_mysql_account_and_named_policy_identifiers_are_byte_exact(): void
     {
         $dsn = getenv('S3_TEST_MYSQL_METADATA_DSN');

@@ -15,6 +15,9 @@ The project follows [Semantic Versioning](https://semver.org/).
   ownership mode, and canned-ACL intent at initiation so listings and
   completion remain stable across later control changes while staging stays
   attributed to the initiator.
+- Preserve each version's stored owner across ownership-control and ACL changes;
+  centralize request, anonymous, enforced, and lifecycle delete-marker
+  ownership; and lock affected persisted owners before quota-accounted deletes.
 - Add the verified `s3:authType` policy condition with `REST-HEADER`,
   `REST-QUERY-STRING`, and `POST` values propagated through request-derived
   authorization checks without trusting transport-shaped input.

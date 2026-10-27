@@ -26,7 +26,10 @@ $s3->putBucketVersioning([
 Delete-marker ownership follows the Object Ownership mode at the delete
 commit. Under `BucketOwnerEnforced`, and for anonymous deletes, the bucket
 owner owns the new marker. Under `ObjectWriter` or `BucketOwnerPreferred`, an
-authenticated requester owns the marker it creates.
+authenticated requester owns the marker it creates. Lifecycle-created markers
+are always owned by the bucket owner rather than inheriting the expired
+version's owner. Delete markers have no object ACL and are excluded from object
+and byte quota totals.
 
 Every ordinary object version stores the owner and ACL chosen when that write
 commits. Enabling `BucketOwnerPreferred` does not rewrite historical or current
@@ -35,6 +38,11 @@ only when their destination request uses the exact
 `bucket-owner-full-control` canned ACL; each transferred version stores only
 the bucket owner's `FULL_CONTROL` grant. This rule applies independently to
 numbered versions and the literal `null` version.
+
+Permanent deletion and suspended `null`-version replacement release quota from
+the removed version's persisted owner. The commit locks that owner together
+with the requester and bucket owner, then re-reads the target; an ownership
+replacement observed outside that lock set aborts before deletion.
 
 Multipart uploads snapshot that same destination owner and ACL when initiated.
 Completion publishes every numbered or `null` version from the snapshot rather

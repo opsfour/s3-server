@@ -11,6 +11,7 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Handler\Bucket\PutBucketAclHandler;
 use OpsFour\S3Server\Handler\Object\GetObjectAclHandler;
@@ -149,6 +150,69 @@ final class AclOwnershipTest extends TestCase
         )[0]['granteeId']);
     }
 
+    public function test_controls_and_acl_replacement_never_rewrite_version_owners(): void
+    {
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $firstVersion = $this->metadata->putObjectVersioned(
+            'bucket',
+            'history',
+            'first-owner',
+            3,
+            '"first"',
+            'text/plain',
+            'first-path',
+        );
+        $secondVersion = $this->metadata->putObjectVersioned(
+            'bucket',
+            'history',
+            'second-owner',
+            4,
+            '"second"',
+            'text/plain',
+            'second-path',
+        );
+        $firstResource = 'bucket/history?versionId=' . rawurlencode($firstVersion);
+        $secondResource = 'bucket/history?versionId=' . rawurlencode($secondVersion);
+        $firstAcl = [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'reader',
+            'permission' => 'READ',
+        ]];
+        $secondAcl = [[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'second-owner',
+            'permission' => 'FULL_CONTROL',
+        ]];
+        $this->metadata->putAcl('object', $firstResource, 'first-owner', $firstAcl);
+        $this->metadata->putAcl('object', $secondResource, 'second-owner', $secondAcl);
+
+        $this->metadata->putBucketOwnershipControls('bucket', BucketOwnership::BUCKET_OWNER_ENFORCED);
+        $masked = (new GetObjectAclHandler($this->metadata))->handleRequest(
+            $this->versionRequest('GET', 'history', $firstVersion),
+        );
+        $maskedXml = new \SimpleXMLElement(ByteStream\buffer($masked->getBody()));
+        self::assertSame('bucket-owner', (string) $maskedXml->Owner->ID);
+        self::assertSame('bucket-owner', (string) $maskedXml->AccessControlList->Grant[0]->Grantee->ID);
+
+        $this->metadata->putBucketOwnershipControls('bucket', BucketOwnership::BUCKET_OWNER_PREFERRED);
+        $revealed = (new GetObjectAclHandler($this->metadata))->handleRequest(
+            $this->versionRequest('GET', 'history', $firstVersion),
+        );
+        $revealedXml = new \SimpleXMLElement(ByteStream\buffer($revealed->getBody()));
+        self::assertSame('first-owner', (string) $revealedXml->Owner->ID);
+        self::assertSame('reader', (string) $revealedXml->AccessControlList->Grant[0]->Grantee->ID);
+
+        self::assertSame(200, (new PutObjectAclHandler($this->metadata))->handleRequest(
+            $this->versionRequest('PUT', 'history', $firstVersion, ['x-amz-acl' => 'private']),
+        )->getStatus());
+        self::assertSame('first-owner', $this->metadata
+            ->getObjectMetadataByVersion('bucket', 'history', $firstVersion)?->ownerId);
+        self::assertSame('second-owner', $this->metadata
+            ->getObjectMetadataByVersion('bucket', 'history', $secondVersion)?->ownerId);
+        self::assertSame('first-owner', $this->metadata->getAcl('object', $firstResource)[0]['granteeId']);
+        self::assertSame($secondAcl, $this->metadata->getAcl('object', $secondResource));
+    }
+
     /**
      * @param non-empty-string $method
      * @param array<non-empty-string, array<string>|string> $headers
@@ -158,6 +222,26 @@ final class AclOwnershipTest extends TestCase
         $request = new Request(new ObjectAclOwnershipTestClient(), $method, Http::new('http://127.0.0.1/bucket/key?acl'), $headers);
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'acl-reader');
+        $request->setAttribute('credential', null);
+
+        return $request;
+    }
+
+    /**
+     * @param non-empty-string $method
+     * @param array<non-empty-string, array<string>|string> $headers
+     */
+    private function versionRequest(string $method, string $key, string $versionId, array $headers = []): Request
+    {
+        $request = new Request(
+            new ObjectAclOwnershipTestClient(),
+            $method,
+            Http::new('http://127.0.0.1/bucket/' . rawurlencode($key) . '?acl&versionId=' . rawurlencode($versionId)),
+            $headers,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', $key);
         $request->setAttribute('ownerId', 'acl-reader');
         $request->setAttribute('credential', null);
 

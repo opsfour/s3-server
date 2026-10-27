@@ -56,7 +56,11 @@ Delete objects after a number of days or on a specific date:
 'Expiration' => ['Date' => '2025-12-31T00:00:00Z']
 ```
 
-In versioned buckets, expiration creates a delete marker on the current version.
+In versioned buckets, expiration creates a bucket-owned delete marker on the
+current version. It never inherits the expired object's owner, stores no object
+ACL, and does not consume object or byte quota. In suspended buckets, replacing
+a differently owned `null` version locks and revalidates that persisted owner
+before the marker is committed; a stale candidate is left unchanged.
 
 ### Noncurrent Version Expiration
 
@@ -67,6 +71,9 @@ Delete old versions of objects after they become noncurrent:
     'NoncurrentDays' => 30,
 ]
 ```
+
+Noncurrent expiration releases stored bytes from each version's persisted
+owner. Ownership-control changes do not rewrite historical version ownership.
 
 ### Abort Incomplete Multipart Uploads
 

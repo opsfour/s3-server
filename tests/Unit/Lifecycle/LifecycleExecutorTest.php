@@ -10,6 +10,7 @@ use Amp\File\Filesystem;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -362,6 +363,157 @@ final class LifecycleExecutorTest extends TestCase
         self::assertFileExists($oldNull->path);
         self::assertFileExists($latestNumbered['path']);
         self::assertSame($latestNumbered['versionId'], $this->metadata->getObjectMetadata('bucket', 'retained.txt')?->versionId);
+    }
+
+    public function test_enabled_expiration_creates_bucket_owned_marker_for_foreign_object(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'foreign.txt', 'foreign payload', 'foreign-owner');
+        $this->ageVersion('bucket', 'foreign.txt', $version['versionId'], 5);
+        $this->configureOneDayExpiration();
+
+        $this->executor()->processBucket('bucket');
+
+        $markers = $this->metadata->listObjectVersions('bucket')['deleteMarkers'];
+        self::assertCount(1, $markers);
+        self::assertSame('owner', $markers[0]->ownerId);
+        self::assertSame([], $this->metadata->getAcl(
+            'object',
+            'bucket/foreign.txt?versionId=' . rawurlencode($markers[0]->versionId ?? 'null'),
+        ));
+        self::assertSame('foreign-owner', $this->metadata
+            ->getObjectMetadataByVersion('bucket', 'foreign.txt', $version['versionId'])?->ownerId);
+        self::assertSame(
+            ['objectCount' => 1, 'bytesUsed' => strlen('foreign payload')],
+            $this->metadata->getOwnerStorageStats('foreign-owner'),
+        );
+        self::assertSame(['objectCount' => 0, 'bytesUsed' => 0], $this->metadata->getOwnerStorageStats('owner'));
+        self::assertFileExists($version['path']);
+    }
+
+    public function test_suspended_expiration_locks_and_releases_foreign_null_owner(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $null = $this->putObject('bucket', 'foreign-null.txt', 'foreign null', 'foreign-null-owner');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $numbered = $this->putVersionedObject('bucket', 'foreign-null.txt', 'current', 'current-owner');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->ageVersion('bucket', 'foreign-null.txt', $numbered['versionId'], 5);
+        $this->configureOneDayExpiration();
+        $lockedOwners = [];
+        $recordingStore = $this->metadataProxy(
+            lockOwner: function (string $ownerId) use (&$lockedOwners): void {
+                $lockedOwners[] = $ownerId;
+                $this->metadata->lockOwnerForUpdate($ownerId);
+            },
+        );
+
+        $this->executor($recordingStore)->processBucket('bucket');
+
+        self::assertContains('current-owner', $lockedOwners);
+        self::assertContains('foreign-null-owner', $lockedOwners);
+        self::assertContains('owner', $lockedOwners);
+        $marker = $this->metadata->getObjectMetadataByVersion('bucket', 'foreign-null.txt', 'null');
+        self::assertNotNull($marker);
+        self::assertTrue($marker->isDeleteMarker);
+        self::assertSame('owner', $marker->ownerId);
+        self::assertSame([], $this->metadata->getAcl('object', 'bucket/foreign-null.txt?versionId=null'));
+        self::assertSame(['objectCount' => 0, 'bytesUsed' => 0], $this->metadata->getOwnerStorageStats('foreign-null-owner'));
+        self::assertSame(
+            ['objectCount' => 1, 'bytesUsed' => strlen('current')],
+            $this->metadata->getOwnerStorageStats('current-owner'),
+        );
+        self::assertFileDoesNotExist($null->path);
+        self::assertSame('current-owner', $this->metadata
+            ->getObjectMetadataByVersion('bucket', 'foreign-null.txt', $numbered['versionId'])?->ownerId);
+        self::assertFileExists($numbered['path']);
+    }
+
+    public function test_suspended_expiration_rejects_an_owner_only_null_replacement(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->putObject('bucket', 'race.txt', 'observed null', 'observed-null-owner');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $numbered = $this->putVersionedObject('bucket', 'race.txt', 'current', 'current-owner');
+        $this->metadata->setBucketVersioning('bucket', 'Suspended');
+        $this->configureOneDayExpiration();
+        $candidate = $this->metadata->getObjectMetadataByVersion('bucket', 'race.txt', $numbered['versionId']);
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        $observedNull = $this->metadata->getObjectMetadataByVersion('bucket', 'race.txt', 'null');
+        self::assertNotNull($candidate);
+        self::assertNotNull($bucketInfo);
+        self::assertNotNull($observedNull);
+        $replaced = false;
+        $racingStore = $this->metadataProxy(
+            transaction: function (callable $callback) use (&$replaced): mixed {
+                if (! $replaced) {
+                    $replaced = true;
+                    $this->sql(
+                        'UPDATE s3_objects SET owner_id = ? WHERE bucket = ? AND key_name = ? AND version_id = ?',
+                        ['replacement-owner', 'bucket', 'race.txt', 'null'],
+                    );
+                }
+
+                return $this->metadata->transaction($callback);
+            },
+        );
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+        $deleted = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteObject')->invoke(
+            $this->executor($racingStore),
+            $bucketInfo,
+            $candidate,
+            $rule,
+        );
+
+        self::assertFalse($deleted);
+        $survivor = $this->metadata->getObjectMetadataByVersion('bucket', 'race.txt', 'null');
+        self::assertNotNull($survivor);
+        self::assertFalse($survivor->isDeleteMarker);
+        self::assertSame('replacement-owner', $survivor->ownerId);
+        self::assertSame($observedNull->etag, $survivor->etag);
+        self::assertSame($observedNull->systemMetadata['storagePath'], $survivor->systemMetadata['storagePath']);
+        self::assertSame([], $this->metadata->listObjectVersions('bucket')['deleteMarkers']);
+    }
+
+    public function test_expiration_rejects_a_versioning_mode_change_before_marker_creation(): void
+    {
+        $this->createBucket('bucket');
+        $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        $version = $this->putVersionedObject('bucket', 'mode-race.txt', 'current', 'current-owner');
+        $this->configureOneDayExpiration();
+        $candidate = $this->metadata->getObjectMetadataByVersion('bucket', 'mode-race.txt', $version['versionId']);
+        $bucketInfo = $this->metadata->getBucket('bucket');
+        self::assertNotNull($candidate);
+        self::assertNotNull($bucketInfo);
+        $changed = false;
+        $racingStore = $this->metadataProxy(
+            transaction: function (callable $callback) use (&$changed): mixed {
+                if (! $changed) {
+                    $changed = true;
+                    $this->metadata->setBucketVersioning('bucket', 'Suspended');
+                }
+
+                return $this->metadata->transaction($callback);
+            },
+        );
+        $rule = $this->metadata->getBucketLifecycle('bucket')[0];
+
+        $deleted = (new \ReflectionClass(LifecycleExecutor::class))->getMethod('deleteObject')->invoke(
+            $this->executor($racingStore),
+            $bucketInfo,
+            $candidate,
+            $rule,
+        );
+
+        self::assertFalse($deleted);
+        self::assertSame('Suspended', $this->metadata->getBucketVersioning('bucket'));
+        self::assertSame('current-owner', $this->metadata
+            ->getObjectMetadataByVersion('bucket', 'mode-race.txt', $version['versionId'])?->ownerId);
+        self::assertSame([], $this->metadata->listObjectVersions('bucket')['deleteMarkers']);
+        self::assertFileExists($version['path']);
     }
 
     #[DataProvider('recreatedBucketOwners')]
@@ -1841,9 +1993,9 @@ final class LifecycleExecutorTest extends TestCase
         self::assertFileExists($version['path']);
     }
 
-    private function executor(): LifecycleExecutor
+    private function executor(?MetadataStore $metadata = null): LifecycleExecutor
     {
-        return new LifecycleExecutor($this->metadata, $this->storage);
+        return new LifecycleExecutor($metadata ?? $this->metadata, $this->storage);
     }
 
     private function configureOneDayExpiration(): void
@@ -1867,13 +2019,13 @@ final class LifecycleExecutorTest extends TestCase
         $this->storage->createBucket($bucket);
     }
 
-    private function putObject(string $bucket, string $key, string $body): \OpsFour\S3Server\Storage\StorageWriteResult
+    private function putObject(string $bucket, string $key, string $body, string $ownerId = 'owner'): \OpsFour\S3Server\Storage\StorageWriteResult
     {
         $write = $this->storage->putObject($bucket, $key, new ReadableBuffer($body));
         $this->metadata->putObjectMetadata(
             bucket: $bucket,
             key: $key,
-            ownerId: 'owner',
+            ownerId: $ownerId,
             size: $write->size,
             etag: '"' . $write->md5Hex . '"',
             contentType: 'text/plain',
@@ -1886,13 +2038,13 @@ final class LifecycleExecutorTest extends TestCase
     /**
      * @return array{versionId: string, path: string}
      */
-    private function putVersionedObject(string $bucket, string $key, string $body): array
+    private function putVersionedObject(string $bucket, string $key, string $body, string $ownerId = 'owner'): array
     {
         $write = $this->storage->putObject($bucket, $key, new ReadableBuffer($body));
         $versionId = $this->metadata->putObjectVersioned(
             bucket: $bucket,
             key: $key,
-            ownerId: 'owner',
+            ownerId: $ownerId,
             size: $write->size,
             etag: '"' . $write->md5Hex . '"',
             contentType: 'text/plain',
@@ -1900,6 +2052,30 @@ final class LifecycleExecutorTest extends TestCase
         );
 
         return ['versionId' => $versionId, 'path' => $write->path];
+    }
+
+    private function metadataProxy(?callable $transaction = null, ?callable $lockOwner = null): MetadataStore
+    {
+        $proxy = $this->createMock(MetadataStore::class);
+        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
+            $name = $method->getName();
+            if ($name === 'transaction' || $name === 'lockOwnerForUpdate') {
+                continue;
+            }
+            $proxy->method($name)->willReturnCallback(
+                fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments),
+            );
+        }
+        $proxy->method('transaction')->willReturnCallback(
+            $transaction ?? fn(callable $callback): mixed => $this->metadata->transaction($callback),
+        );
+        $proxy->method('lockOwnerForUpdate')->willReturnCallback(
+            $lockOwner ?? function (string $ownerId): void {
+                $this->metadata->lockOwnerForUpdate($ownerId);
+            },
+        );
+
+        return $proxy;
     }
 
     private function createMultipartUploadWithPart(string $bucket, string $key): string

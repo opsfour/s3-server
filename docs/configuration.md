@@ -197,6 +197,9 @@ uploads from bypassing storage quotas. Bucket limits use the bucket owner's
 configuration and count objects and uploads from every account in that bucket.
 Owner limits use the object's or multipart upload's owner, including writes into
 another account's bucket. Stored byte totals include retained object versions.
+Delete markers are excluded. Removing an object or historical version releases
+usage from that version's persisted owner, not from the bucket owner or delete
+actor; delete commits lock that accounting principal before mutation.
 
 ## Encryption
 

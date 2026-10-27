@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Lifecycle;
 
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Event\S3Event;
@@ -825,9 +826,21 @@ final class LifecycleExecutor
     {
         $bucket = $observedBucket->name;
         $bucketOwner = $observedBucket->ownerId;
+        $observedVersioning = $this->metadata->getBucketVersioning($bucket);
+        $observedNullVersion = $observedVersioning === 'Suspended'
+            ? $this->metadata->getObjectMetadataByVersion($bucket, $obj->key, 'null')
+            : null;
+        $observedNullOwnerId = $observedNullVersion !== null && ! $observedNullVersion->isDeleteMarker
+            ? $observedNullVersion->ownerId
+            : '';
 
-        $objectToClean = $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $obj, $rule): ObjectInfo|false|null {
-            OwnerWriteLock::acquire($this->metadata, $bucketOwner, $obj->ownerId);
+        $objectToClean = $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $obj, $rule, $observedVersioning, $observedNullVersion, $observedNullOwnerId): ObjectInfo|false|null {
+            OwnerWriteLock::acquire(
+                $this->metadata,
+                $bucketOwner,
+                $obj->ownerId,
+                $observedNullOwnerId,
+            );
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
                 return false;
@@ -838,8 +851,17 @@ final class LifecycleExecutor
             }
 
             $versioning = $this->metadata->getBucketVersioning($bucket);
+            if ($versioning !== $observedVersioning) {
+                return false;
+            }
+            $deleteMarkerOwnerId = BucketOwnership::resolveDeleteMarkerOwner(
+                BucketOwnership::effectiveMode($this->metadata, $bucket),
+                $bucketOwner,
+                '',
+                lifecycle: true,
+            );
             if ($versioning === 'Enabled') {
-                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId);
+                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $deleteMarkerOwnerId);
 
                 return null;
             }
@@ -848,6 +870,9 @@ final class LifecycleExecutor
                 // The null delete marker replaces only an existing null version,
                 // which may itself be noncurrent behind that numbered version.
                 $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $obj->key, 'null');
+                if (! self::sameOptionalObject($nullVersion, $observedNullVersion)) {
+                    return false;
+                }
                 $replacedObject = $nullVersion !== null && ! $nullVersion->isDeleteMarker
                     ? $nullVersion
                     : null;
@@ -855,7 +880,7 @@ final class LifecycleExecutor
                     $this->objectLockChecker->checkProtection($bucket, $obj->key, 'null');
                     $this->enqueueStoredDataCleanup($replacedObject);
                 }
-                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $obj->ownerId, suspended: true);
+                $this->metadata->deleteObjectVersioned($bucket, $obj->key, $deleteMarkerOwnerId, suspended: true);
 
                 return $replacedObject;
             }
@@ -968,9 +993,19 @@ final class LifecycleExecutor
     private static function sameObject(ObjectInfo $left, ObjectInfo $right): bool
     {
         return $left->versionId === $right->versionId
+            && $left->ownerId === $right->ownerId
             && $left->etag === $right->etag
             && ($left->systemMetadata['storagePath'] ?? null) === ($right->systemMetadata['storagePath'] ?? null)
             && $left->isDeleteMarker === $right->isDeleteMarker;
+    }
+
+    private static function sameOptionalObject(?ObjectInfo $left, ?ObjectInfo $right): bool
+    {
+        if ($left === null || $right === null) {
+            return $left === $right;
+        }
+
+        return self::sameObject($left, $right);
     }
 
     /** @param array<string, mixed> $observedRule */

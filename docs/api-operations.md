@@ -84,6 +84,11 @@ writes retain the authenticated requester as object owner under
 transfer ownership only when the destination request uses the exact
 `bucket-owner-full-control` canned ACL. Equivalent explicit grants do not
 transfer ownership. `BucketOwnerEnforced` always assigns the bucket owner.
+For authenticated DeleteObject and DeleteObjects requests, `ObjectWriter` and
+`BucketOwnerPreferred` assign a new delete marker to the requester;
+`BucketOwnerEnforced` assigns it to the bucket owner. Lifecycle-created markers
+are always bucket-owned. Markers store no object ACL and do not count toward
+object or byte quotas.
 
 PutObject accepts one CRC32, CRC32C, SHA1, or SHA256 checksum header. The
 optional `x-amz-sdk-checksum-algorithm` selector must identify that same
@@ -289,7 +294,8 @@ GetObjectAcl and PutObjectAcl select the requested version and return its
 `x-amz-version-id` in versioned buckets, including the literal `null` version.
 An access-control policy may contain at most 100 grants, and each canonical
 grantee identifier is limited to 255 bytes. An invalid replacement leaves the
-stored ACL unchanged.
+stored ACL unchanged. Replacing an object ACL changes grants only: the selected
+version's persisted owner never changes.
 
 ## Object Ownership
 
@@ -322,10 +328,12 @@ publication transaction.
 `BucketOwnerEnforced` requires a private bucket ACL. In that mode object ACL
 grants are ignored, ACL updates fail, and object writes accept no ACL or
 `bucket-owner-full-control`. Objects created while the mode is enforced belong
-to the bucket owner even if the mode is later disabled. Delete markers created
-while the mode is enforced also belong to the bucket owner; with
-`ObjectWriter` or `BucketOwnerPreferred`, an authenticated requester owns its
-new delete marker.
+to the bucket owner even if the mode is later disabled. Historical owners and
+ACLs are not rewritten; disabling enforced mode reveals the persisted state.
+Delete markers created while the mode is enforced also belong to the bucket
+owner; with `ObjectWriter` or `BucketOwnerPreferred`, an authenticated
+requester owns its new delete marker. Anonymous and lifecycle markers are
+bucket-owned in every mode.
 
 ## Policies
 

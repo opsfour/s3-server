@@ -116,6 +116,10 @@ final class AnonymousMutationOwnershipTest extends TestCase
         $markers = $metadata->listObjectVersions('bucket')['deleteMarkers'];
         self::assertCount(1, $markers);
         self::assertSame('bucket-owner', $markers[0]->ownerId);
+        self::assertSame([], $metadata->getAcl(
+            'object',
+            'bucket/key?versionId=' . rawurlencode($markers[0]->versionId ?? 'null'),
+        ));
     }
 
     #[DataProvider('deleteCases')]
@@ -144,6 +148,10 @@ final class AnonymousMutationOwnershipTest extends TestCase
         $markers = $metadata->listObjectVersions('bucket')['deleteMarkers'];
         self::assertCount(1, $markers);
         self::assertSame('writer', $markers[0]->ownerId);
+        self::assertSame([], $metadata->getAcl(
+            'object',
+            'bucket/key?versionId=' . rawurlencode($markers[0]->versionId ?? 'null'),
+        ));
     }
 
     #[DataProvider('deleteCases')]
@@ -162,6 +170,9 @@ final class AnonymousMutationOwnershipTest extends TestCase
         $metadata->putBucketOwnershipControls('bucket', BucketOwnership::BUCKET_OWNER_ENFORCED);
         $this->deleteKey($metadata, $tiers, 'enforced', 'writer', $batch);
 
+        $metadata->putBucketOwnershipControls('bucket', BucketOwnership::BUCKET_OWNER_PREFERRED);
+        $this->deleteKey($metadata, $tiers, 'preferred', 'writer', $batch);
+
         $metadata->putBucketOwnershipControls('bucket', BucketOwnership::OBJECT_WRITER);
         $this->deleteKey($metadata, $tiers, 'writer-owned', 'writer', $batch);
 
@@ -170,6 +181,7 @@ final class AnonymousMutationOwnershipTest extends TestCase
             $ownersByKey[$marker->key] = $marker->ownerId;
         }
         self::assertSame('bucket-owner', $ownersByKey['enforced'] ?? null);
+        self::assertSame('writer', $ownersByKey['preferred'] ?? null);
         self::assertSame('writer', $ownersByKey['writer-owned'] ?? null);
     }
 

@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -68,6 +69,8 @@ final class DeleteObjectHandler implements RequestHandler
 
         // 3. Check versioning status.
         $versioning = $this->metadata->getBucketVersioning($bucket);
+        $observedRemovalTarget = $this->removalTarget($bucket, $key, $versionId, $versioning);
+        $ownerLocks = $this->ownerLocks($ownerId, $bucketInfo->ownerId, $observedRemovalTarget);
 
         // 4. Handle versioning-aware delete.
         if (($versioning === 'Enabled' || $versioning === 'Suspended') && $versionId === null) {
@@ -83,6 +86,7 @@ final class DeleteObjectHandler implements RequestHandler
                 $bucket,
                 $key,
                 $ownerId,
+                $ownerLocks,
                 $isSuspended,
                 &$event,
                 $versioning,
@@ -91,19 +95,29 @@ final class DeleteObjectHandler implements RequestHandler
                 &$oldObjectToClean,
                 &$deleteMarkerVersionId,
             ): void {
-                OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+                OwnerWriteLock::acquire($this->metadata, ...$ownerLocks);
                 \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                $nullVersion = $this->removalTarget($bucket, $key, null, $versioning);
                 $request->setAttribute(
                     's3.canBypassGovernanceRetention',
-                    $this->policyGuard->check($request, $bucket, $key, null, $ownerId, $bucketInfo->ownerId),
+                    $this->policyGuard->check(
+                        $request,
+                        $bucket,
+                        $key,
+                        null,
+                        $ownerId,
+                        $bucketInfo->ownerId,
+                        $nullVersion,
+                        targetResolved: true,
+                    ),
                 );
+                $this->assertRemovalTargetOwnerLocked($nullVersion, $ownerLocks);
                 if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                         'Bucket versioning changed while the delete was being committed.',
                     );
                 }
                 if ($isSuspended) {
-                    $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
                     if ($nullVersion !== null && ! $nullVersion->isDeleteMarker) {
                         $this->lockChecker->check($bucket, $key, 'null', $request);
                         if ($nullVersion->restoredStoragePath !== null) {
@@ -112,9 +126,11 @@ final class DeleteObjectHandler implements RequestHandler
                         $oldObjectToClean = $nullVersion;
                     }
                 }
-                $deleteMarkerOwnerId = $ownerId === '' || BucketOwnership::isEnforced($this->metadata, $bucket)
-                    ? $bucketInfo->ownerId
-                    : $ownerId;
+                $deleteMarkerOwnerId = BucketOwnership::resolveDeleteMarkerOwner(
+                    BucketOwnership::effectiveMode($this->metadata, $bucket),
+                    $bucketInfo->ownerId,
+                    $ownerId,
+                );
                 $deleteMarkerVersionId = $this->metadata->deleteObjectVersioned(
                     $bucket,
                     $key,
@@ -150,15 +166,25 @@ final class DeleteObjectHandler implements RequestHandler
             // Permanently delete a specific version.
             $deletedInfo = null;
             $event = $this->removalEvent($request, $bucket, $key, $ownerId, versionId: $versionId, bucketGeneration: $bucketInfo->generation);
-            $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $versionId, $request, $event, &$deletedInfo): void {
-                OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $ownerLocks, $versionId, $versioning, $request, $event, &$deletedInfo): void {
+                OwnerWriteLock::acquire($this->metadata, ...$ownerLocks);
                 \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+                $existing = $this->removalTarget($bucket, $key, $versionId, $versioning);
                 $request->setAttribute(
                     's3.canBypassGovernanceRetention',
-                    $this->policyGuard->check($request, $bucket, $key, $versionId, $ownerId, $bucketInfo->ownerId),
+                    $this->policyGuard->check(
+                        $request,
+                        $bucket,
+                        $key,
+                        $versionId,
+                        $ownerId,
+                        $bucketInfo->ownerId,
+                        $existing,
+                        targetResolved: true,
+                    ),
                 );
+                $this->assertRemovalTargetOwnerLocked($existing, $ownerLocks);
                 $this->lockChecker->check($bucket, $key, $versionId, $request);
-                $existing = $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
                 if ($existing !== null && $existing->restoredStoragePath !== null) {
                     RestoredCopyTierResolver::resolve($existing, $this->storageTiers);
                 }
@@ -198,16 +224,26 @@ final class DeleteObjectHandler implements RequestHandler
         //    Then best-effort storage cleanup (orphaned file is preferable to an object
         //    visible in ListObjects but unreadable due to missing storage).
         $event = $this->removalEvent($request, $bucket, $key, $ownerId, bucketGeneration: $bucketInfo->generation);
-        $objectInfo = $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $versioning, $event, $request): ?ObjectInfo {
-            OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+        $objectInfo = $this->metadata->transaction(function () use ($bucketInfo, $bucket, $key, $ownerId, $ownerLocks, $versioning, $event, $request): ?ObjectInfo {
+            OwnerWriteLock::acquire($this->metadata, ...$ownerLocks);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
-            $this->policyGuard->check($request, $bucket, $key, null, $ownerId, $bucketInfo->ownerId);
+            $object = $this->removalTarget($bucket, $key, null, $versioning);
+            $this->policyGuard->check(
+                $request,
+                $bucket,
+                $key,
+                null,
+                $ownerId,
+                $bucketInfo->ownerId,
+                $object,
+                targetResolved: true,
+            );
+            $this->assertRemovalTargetOwnerLocked($object, $ownerLocks);
             if ($this->metadata->getBucketVersioning($bucket) !== $versioning) {
                 throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                     'Bucket versioning changed while the delete was being committed.',
                 );
             }
-            $object = $this->metadata->getObjectMetadata($bucket, $key);
             if ($object !== null) {
                 if ($object->restoredStoragePath !== null) {
                     RestoredCopyTierResolver::resolve($object, $this->storageTiers);
@@ -278,6 +314,45 @@ final class DeleteObjectHandler implements RequestHandler
             ?? new S3Event($eventName, $bucket, $key, ownerId: $ownerId);
 
         return $versionId !== null && $versionId !== 'null' ? $event->withVersionId($versionId) : $event;
+    }
+
+    private function removalTarget(string $bucket, string $key, ?string $versionId, string $versioning): ?ObjectInfo
+    {
+        if ($versionId !== null) {
+            return $this->metadata->getObjectMetadataByVersion($bucket, $key, $versionId);
+        }
+        if ($versioning === 'Suspended') {
+            return $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+        }
+        if ($versioning === 'Enabled') {
+            return null;
+        }
+
+        return $this->metadata->getObjectMetadata($bucket, $key);
+    }
+
+    /** @return list<string> */
+    private function ownerLocks(string $requesterOwnerId, string $bucketOwnerId, ?ObjectInfo $target): array
+    {
+        $targetOwnerId = $target !== null && ! $target->isDeleteMarker ? $target->ownerId : '';
+
+        return array_values(array_unique(array_filter(
+            [$requesterOwnerId, $bucketOwnerId, $targetOwnerId],
+            static fn(string $ownerId): bool => $ownerId !== '',
+        )));
+    }
+
+    /** @param list<string> $ownerLocks */
+    private function assertRemovalTargetOwnerLocked(?ObjectInfo $target, array $ownerLocks): void
+    {
+        if ($target !== null
+            && ! $target->isDeleteMarker
+            && $target->ownerId !== ''
+            && ! in_array($target->ownerId, $ownerLocks, true)) {
+            throw new OperationAbortedException(
+                'Object ownership changed while the delete was being committed.',
+            );
+        }
     }
 
 }
