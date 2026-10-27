@@ -57,6 +57,7 @@
         "league/flysystem-aws-s3-v3": "^3.35.2"
     },
     "conflict": {
+        "aws/aws-sdk-php": "<3.384.9",
         "league/flysystem-aws-s3-v3": "<3.35.2",
         "symfony/http-foundation": "<7.4.21 || >=8.0,<8.1.9"
     },
@@ -90,7 +91,7 @@
         "symfony/http-kernel": "Required when using opsfour S3 Server as a Symfony Bundle.",
         "symfony/yaml": "Required when loading the documented Symfony YAML configuration files.",
         "amphp/redis": "Required when using the Redis master-key provider.",
-        "aws/aws-sdk-php": "Required for the S3-compatible Flysystem worker factory.",
+        "aws/aws-sdk-php": "Required for the explicit AWS S3 provider profile and the S3-compatible Flysystem worker factory.",
         "league/flysystem-aws-s3-v3": "Required for the S3-compatible Flysystem worker factory."
     },
     "extra": {

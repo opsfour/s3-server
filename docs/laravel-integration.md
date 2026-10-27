@@ -90,13 +90,20 @@ The service provider registers these singletons:
 | Abstract | Concrete | Description |
 |----------|----------|-------------|
 | `S3ServerConfig` | Config DTO | Resolved from `config('s3-server')` |
-| `StorageBackend` | Filesystem/Flysystem/Memory | Based on `S3_STORAGE_DRIVER` |
+| `StorageBackend` | Filesystem/AWS S3 profile/Flysystem/Memory | Based on `S3_STORAGE_DRIVER` |
 | `MetadataStore` | SQLite/Postgres/MySQL | Based on `S3_METADATA_DRIVER` |
 | `CredentialProvider` | Memory/Database/File | Based on `S3_CREDENTIALS_DRIVER` |
 
 When SQLite is combined with Flysystem or memory object storage, set
 `S3_METADATA_PATH` to an explicit persistent local path. Automatic SQLite path
 derivation is limited to filesystem object storage.
+
+The published `storage` config also accepts `driver: aws-s3` with `bucket`,
+`region`, `expected_owner_id`, `data_prefix`, `reserved_prefix`, and bounded
+connect/read/request timeouts. The profile uses the AWS SDK default credential
+chain and exposes no endpoint, path-style, retry, or inline-credential options.
+It validates provider admission but intentionally refuses serving until later
+writer-fence stories are complete.
 
 ### Resolving in Your Code
 

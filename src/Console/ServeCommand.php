@@ -43,7 +43,7 @@ final class ServeCommand extends Command
             ->addOption('host', null, InputOption::VALUE_REQUIRED, 'Listen address', self::envOption('S3_HOST', '0.0.0.0'))
             ->addOption('port', 'p', InputOption::VALUE_REQUIRED, 'Listen port', self::envOption('S3_PORT', '9000'))
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Root directory for object storage', self::envOption('S3_STORAGE_PATH'))
-            ->addOption('storage-driver', null, InputOption::VALUE_REQUIRED, 'Storage backend: filesystem|flysystem|memory', self::envOption('S3_STORAGE_DRIVER', 'filesystem'))
+            ->addOption('storage-driver', null, InputOption::VALUE_REQUIRED, 'Storage backend: filesystem|flysystem|aws-s3|memory', self::envOption('S3_STORAGE_DRIVER', 'filesystem'))
             ->addOption('allow-unfenced-storage-for-tests', null, InputOption::VALUE_REQUIRED, 'UNSAFE TEST ONLY: allow storage without a verified late-write fence (true|false)', self::envOption('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'false'))
             ->addOption('storage-temp-dir', null, InputOption::VALUE_REQUIRED, 'Local staging directory for remote storage transfers', self::envOption('S3_STORAGE_TEMP_DIR', sys_get_temp_dir()))
             ->addOption('storage-temp-budget', null, InputOption::VALUE_REQUIRED, 'Shared local Flysystem staging budget in bytes', self::envOption('S3_STORAGE_TEMP_BUDGET', '10737418240'))
@@ -60,6 +60,14 @@ final class ServeCommand extends Command
             ->addOption('backing-connect-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 connection timeout in seconds', self::envOption('S3_BACKING_CONNECT_TIMEOUT_SECONDS', '5'))
             ->addOption('backing-read-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 streamed-read idle timeout in seconds', self::envOption('S3_BACKING_READ_TIMEOUT_SECONDS', '15'))
             ->addOption('backing-request-timeout', null, InputOption::VALUE_REQUIRED, 'Backing S3 total request timeout in seconds (0 disables)', self::envOption('S3_BACKING_REQUEST_TIMEOUT_SECONDS', '0'))
+            ->addOption('aws-s3-bucket', null, InputOption::VALUE_REQUIRED, 'AWS S3 General Purpose Bucket for the explicit provider profile', self::envOption('S3_AWS_BUCKET'))
+            ->addOption('aws-s3-region', null, InputOption::VALUE_REQUIRED, 'Commercial AWS region for the explicit provider profile', self::envOption('S3_AWS_REGION'))
+            ->addOption('aws-s3-expected-owner-id', null, InputOption::VALUE_REQUIRED, 'Expected 12-digit AWS bucket owner account ID', self::envOption('S3_AWS_EXPECTED_OWNER_ID'))
+            ->addOption('aws-s3-data-prefix', null, InputOption::VALUE_REQUIRED, 'Isolated AWS S3 data key prefix', self::envOption('S3_AWS_DATA_PREFIX'))
+            ->addOption('aws-s3-reserved-prefix', null, InputOption::VALUE_REQUIRED, 'Reserved AWS S3 write-attempt key prefix', self::envOption('S3_AWS_RESERVED_PREFIX'))
+            ->addOption('aws-s3-connect-timeout', null, InputOption::VALUE_REQUIRED, 'AWS S3 provider connection timeout in seconds', self::envOption('S3_AWS_CONNECT_TIMEOUT_SECONDS', '5'))
+            ->addOption('aws-s3-read-timeout', null, InputOption::VALUE_REQUIRED, 'AWS S3 provider read timeout in seconds', self::envOption('S3_AWS_READ_TIMEOUT_SECONDS', '15'))
+            ->addOption('aws-s3-request-timeout', null, InputOption::VALUE_REQUIRED, 'AWS S3 provider total request timeout in seconds', self::envOption('S3_AWS_REQUEST_TIMEOUT_SECONDS', '20'))
             ->addOption('region', null, InputOption::VALUE_REQUIRED, 'AWS region identifier', self::envOption('S3_REGION', 'us-east-1'))
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', self::envOption('S3_METADATA_DRIVER', 'sqlite'))
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', self::envOption('S3_METADATA_DSN', ''))
@@ -403,6 +411,18 @@ final class ServeCommand extends Command
                 'temp_budget_bytes' => $this->integerOption($input, 'storage-temp-budget'),
             ];
         }
+        if ($storageDriver === 'aws-s3') {
+            $storageConfig += [
+                'bucket' => $this->requiredAwsS3StringOption($input, 'aws-s3-bucket'),
+                'region' => $this->requiredAwsS3StringOption($input, 'aws-s3-region'),
+                'expected_owner_id' => $this->requiredAwsS3StringOption($input, 'aws-s3-expected-owner-id'),
+                'data_prefix' => $this->requiredAwsS3StringOption($input, 'aws-s3-data-prefix'),
+                'reserved_prefix' => $this->requiredAwsS3StringOption($input, 'aws-s3-reserved-prefix'),
+                'connect_timeout_seconds' => $this->integerOption($input, 'aws-s3-connect-timeout'),
+                'read_timeout_seconds' => $this->integerOption($input, 'aws-s3-read-timeout'),
+                'request_timeout_seconds' => $this->integerOption($input, 'aws-s3-request-timeout'),
+            ];
+        }
 
         return StorageBackendFactory::createTierRegistry($storageConfig, $metrics);
     }
@@ -464,6 +484,16 @@ final class ServeCommand extends Command
         $value = $this->nullableString($input->getOption($name));
         if ($value === null) {
             throw new \InvalidArgumentException("--{$name} is required for standalone Flysystem storage.");
+        }
+
+        return $value;
+    }
+
+    private function requiredAwsS3StringOption(InputInterface $input, string $name): string
+    {
+        $value = $this->nullableString($input->getOption($name));
+        if ($value === null) {
+            throw new \InvalidArgumentException("--{$name} is required for aws-s3 storage.");
         }
 
         return $value;

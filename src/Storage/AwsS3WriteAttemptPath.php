@@ -18,6 +18,7 @@ final class AwsS3WriteAttemptPath
         string $bucketGeneration,
         string $storageTier,
         string $attemptId,
+        string $reservedPrefix = self::PREFIX,
     ): string {
         if (! preg_match('/^[a-z0-9][a-z0-9.-]{1,62}$/D', $bucket)
             || ! preg_match('/^[a-f0-9]{32}$/D', $bucketGeneration)
@@ -30,10 +31,15 @@ final class AwsS3WriteAttemptPath
         }
 
         StoragePath::assertBucketPathSegment($bucket);
+        AwsS3ProviderProfile::assertCanonicalPrefix(
+            $reservedPrefix,
+            'reserved write-attempt',
+            AwsS3ProviderProfile::MAX_RESERVED_PREFIX_BYTES,
+        );
 
         // Hex preserves the complete tier name without permitting path syntax
         // from a configured tier to change the physical key's segment layout.
-        $path = self::PREFIX . '/' . $bucket . '/' . $bucketGeneration . '/'
+        $path = $reservedPrefix . '/' . $bucket . '/' . $bucketGeneration . '/'
             . bin2hex($storageTier) . '/' . hash('sha256', $key) . '/' . $attemptId;
 
         if (strlen($path) > self::MAX_S3_KEY_BYTES) {
@@ -50,17 +56,21 @@ final class AwsS3WriteAttemptPath
         string $bucketGeneration,
         string $storageTier,
         string $attemptId,
+        string $reservedPrefix = self::PREFIX,
     ): void {
         if (strlen($path) > self::MAX_S3_KEY_BYTES
-            || ! hash_equals(self::forObject($bucket, $key, $bucketGeneration, $storageTier, $attemptId), $path)
+            || ! hash_equals(self::forObject($bucket, $key, $bucketGeneration, $storageTier, $attemptId, $reservedPrefix), $path)
         ) {
             throw new \InvalidArgumentException('AWS physical key does not match the exact write attempt.');
         }
     }
 
     /** Verify the durable row's entire identity before using its stored path. */
-    public static function assertIntentPath(ObjectWriteIntent $intent, string $key): void
-    {
+    public static function assertIntentPath(
+        ObjectWriteIntent $intent,
+        string $key,
+        string $reservedPrefix = self::PREFIX,
+    ): void {
         self::assertExactPath(
             $intent->storagePath,
             $intent->bucket,
@@ -68,7 +78,34 @@ final class AwsS3WriteAttemptPath
             $intent->bucketGeneration,
             $intent->storageTier,
             $intent->attemptId,
+            $reservedPrefix,
         );
+    }
+
+    public static function forProfileObject(
+        AwsS3ProviderProfile $profile,
+        string $logicalBucket,
+        string $key,
+        string $bucketGeneration,
+        string $storageTier,
+        string $attemptId,
+    ): string {
+        return self::forObject(
+            $logicalBucket,
+            $key,
+            $bucketGeneration,
+            $storageTier,
+            $attemptId,
+            $profile->reservedPrefix,
+        );
+    }
+
+    public static function assertProfileIntentPath(
+        AwsS3ProviderProfile $profile,
+        ObjectWriteIntent $intent,
+        string $key,
+    ): void {
+        self::assertIntentPath($intent, $key, $profile->reservedPrefix);
     }
 
     private function __construct() {}

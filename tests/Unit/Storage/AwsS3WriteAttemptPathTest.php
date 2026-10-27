@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Storage\AwsS3WriteAttemptPath;
+use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
 use PHPUnit\Framework\TestCase;
 
 final class AwsS3WriteAttemptPathTest extends TestCase
@@ -124,6 +125,81 @@ final class AwsS3WriteAttemptPathTest extends TestCase
             self::GENERATION,
             'cold-archive.v1',
             self::ATTEMPT,
+        ));
+    }
+
+    public function test_profile_attempt_path_is_beneath_the_validated_reserved_prefix(): void
+    {
+        $profile = new AwsS3ProviderProfile(
+            bucket: 'provider-bucket',
+            region: 'us-east-1',
+            expectedOwnerId: '123456789012',
+            dataPrefix: 'objects',
+            reservedPrefix: '.opsfour/private-attempts',
+        );
+
+        $path = AwsS3WriteAttemptPath::forProfileObject(
+            $profile,
+            'bucket-one',
+            'object',
+            self::GENERATION,
+            'STANDARD',
+            self::ATTEMPT,
+        );
+
+        self::assertStringStartsWith('.opsfour/private-attempts/', $path);
+        self::assertFalse(str_starts_with($path, $profile->dataPrefix . '/'));
+        AwsS3WriteAttemptPath::assertProfileIntentPath($profile, new ObjectWriteIntent(
+            attemptId: self::ATTEMPT,
+            bucket: 'bucket-one',
+            bucketGeneration: self::GENERATION,
+            ownerId: 'owner-one',
+            storageTier: 'STANDARD',
+            storagePath: $path,
+            purpose: 'put',
+        ), 'object');
+    }
+
+    public function test_maximum_valid_profile_prefix_always_fits_the_maximum_derived_attempt_path(): void
+    {
+        $profile = new AwsS3ProviderProfile(
+            bucket: 'provider-bucket',
+            region: 'us-east-1',
+            expectedOwnerId: '123456789012',
+            dataPrefix: 'objects',
+            reservedPrefix: str_repeat('r', AwsS3ProviderProfile::MAX_RESERVED_PREFIX_BYTES),
+        );
+
+        $path = AwsS3WriteAttemptPath::forProfileObject(
+            $profile,
+            str_repeat('b', 63),
+            str_repeat('k', 1024),
+            self::GENERATION,
+            str_repeat('T', 64),
+            self::ATTEMPT,
+        );
+
+        self::assertSame(1024, strlen($path));
+    }
+
+    public function test_reserved_prefix_validation_rejects_malformed_utf8_on_every_entry_path(): void
+    {
+        $malformed = ".opsfour/\xC3\x28";
+
+        self::assertRejected(static fn() => new AwsS3ProviderProfile(
+            bucket: 'provider-bucket',
+            region: 'us-east-1',
+            expectedOwnerId: '123456789012',
+            dataPrefix: 'objects',
+            reservedPrefix: $malformed,
+        ));
+        self::assertRejected(static fn() => AwsS3WriteAttemptPath::forObject(
+            'bucket-one',
+            'object',
+            self::GENERATION,
+            'STANDARD',
+            self::ATTEMPT,
+            $malformed,
         ));
     }
 

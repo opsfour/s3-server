@@ -11,6 +11,10 @@ final class ServeFailureMessage
     {
         $message = $error->getMessage();
 
+        if ($error instanceof AwsS3ProviderStartupException) {
+            return $error->safeMessage();
+        }
+
         // These exact package-owned diagnostics contain no dependency input.
         if ($message === 'PostgreSQL API servers require the pecl-pq PHP extension.'
             || $message === '--access-key and --secret-key require the memory credentials driver.') {

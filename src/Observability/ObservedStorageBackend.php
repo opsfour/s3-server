@@ -14,7 +14,7 @@ use OpsFour\S3Server\Storage\RecoverableObjectWriteBackend;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
-final readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
+readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
 {
     public function __construct(
         private StorageBackend $inner,

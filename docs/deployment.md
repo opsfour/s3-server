@@ -17,6 +17,11 @@ preserve the signed `Host` header exactly. Additional processes, remote storage,
 shared filesystems, and multiple hosts are separate experimental profiles; see
 the [roadmap](production-feature-roadmap.md).
 
+The explicit `aws-s3` driver is currently an admission-only rollout slice. It
+can prove its immutable configuration and read-only provider state, but it
+always refuses API startup because writer coverage is incomplete. Do not use an
+admitted report as evidence of a write fence or production qualification.
+
 ## Current One-Process Deployment
 
 The current release target runs exactly one S3 API process in total. That

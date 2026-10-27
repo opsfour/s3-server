@@ -8,6 +8,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Add an explicit `aws-s3` provider profile with strict commercial-region,
+  General Purpose Bucket, expected-owner, isolated-prefix, and bounded-timeout
+  validation; default-chain read-only admission probes; a secret-free immutable
+  report; and fail-closed startup while provider writer coverage is incomplete.
+
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
   MySQL, including completion-order boundaries, original upload part numbers,
   and verified optional part checksums. Legacy layouts are classified by a

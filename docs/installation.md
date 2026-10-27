@@ -18,6 +18,7 @@
 - **Composer 2.x**
 - **Symfony 7.4 LTS or 8.1+** when using the Symfony Bundle
 - **Laravel 12 or 13** when using the Laravel service provider
+- **aws/aws-sdk-php** when selecting the explicit `aws-s3` provider profile
 
 ## Install via Composer
 
@@ -52,13 +53,21 @@ it through shell history or process listings.
 | `--host` | `0.0.0.0` | Listen address |
 | `--port` | `9000` | Listen port |
 | `--storage-path` | (required) | Root directory for object data |
-| `--storage-driver` | `filesystem` | `filesystem`, `flysystem`, or `memory` |
+| `--storage-driver` | `filesystem` | `filesystem`, `aws-s3`, `flysystem`, or `memory` |
 | `--storage-temp-dir` | system temp | Local Flysystem staging directory |
 | `--flysystem-workers` | `0` | Bounded remote-storage workers; standalone Flysystem requires at least 1 |
 | `--backing-bucket` | - | Backing S3 bucket for standalone Flysystem |
 | `--backing-endpoint` | AWS default | HTTPS backing S3-compatible endpoint |
 | `--backing-allow-insecure-http-for-tests` | `false` | Unsafe test-only opt-in for an HTTP backing endpoint; never use in production |
 | `--backing-path-style` | `false` | Use path-style backing requests |
+| `--aws-s3-bucket` | - | General Purpose Bucket for the explicit AWS profile |
+| `--aws-s3-region` | - | Known commercial AWS region for the explicit AWS profile |
+| `--aws-s3-expected-owner-id` | - | Expected 12-digit bucket-owner account ID |
+| `--aws-s3-data-prefix` | - | Isolated data prefix |
+| `--aws-s3-reserved-prefix` | - | Non-overlapping future write-attempt prefix |
+| `--aws-s3-connect-timeout` | `5` | Per-request provider-admission connection timeout in seconds |
+| `--aws-s3-read-timeout` | `15` | Per-request provider-admission read timeout in seconds |
+| `--aws-s3-request-timeout` | `20` | Timeout for each provider-admission request, not the whole admission sequence |
 | `--region` | `us-east-1` | AWS region identifier |
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
 | `--metadata-dsn` | (auto) | Database DSN for postgres/mysql |

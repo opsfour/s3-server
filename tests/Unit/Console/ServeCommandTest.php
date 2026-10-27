@@ -12,6 +12,8 @@ use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Command\Command;
@@ -253,6 +255,31 @@ final class ServeCommandTest extends TestCase
         self::assertInstanceOf(ObservedStorageBackend::class, $storage);
         self::assertInstanceOf(ParallelFlysystemBackend::class, $storage->innerBackend());
         $storage->shutdown();
+    }
+
+    public function test_standalone_aws_s3_profile_uses_distinct_options_and_never_falls_back_to_flysystem(): void
+    {
+        $command = new ServeCommand();
+        $input = $this->input($command, [
+            '--storage-driver' => 'aws-s3',
+            '--aws-s3-bucket' => 'provider-bucket',
+            '--aws-s3-region' => 'us-east-1',
+            '--aws-s3-expected-owner-id' => 'invalid-owner',
+            '--aws-s3-data-prefix' => 'objects',
+            '--aws-s3-reserved-prefix' => '.opsfour/attempts',
+        ]);
+
+        $registry = $this->invoke($command, 'buildStorageTierRegistry', [
+            $input,
+            'aws-s3',
+            null,
+            new MetricsCollector(),
+        ]);
+        $backend = $registry->defaultBackend();
+
+        self::assertInstanceOf(AwsS3StorageBackend::class, $backend);
+        self::assertInstanceOf(AwsS3ProviderAdmissionCapability::class, $backend);
+        self::assertSame('configuration-invalid', $backend->awsS3ProviderAdmission()->reason);
     }
 
     public function test_standalone_flysystem_forwards_explicit_insecure_http_test_opt_in(): void

@@ -26,6 +26,7 @@ use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -105,6 +106,25 @@ final class S3ServerServiceProviderTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('explicit SQLite metadata path');
         $app->make(MetadataStore::class);
+    }
+
+    public function test_laravel_resolves_the_explicit_aws_s3_profile_without_flysystem_services(): void
+    {
+        $app = $this->application([
+            'storage' => [
+                'driver' => 'aws-s3',
+                'bucket' => 'provider-bucket',
+                'region' => 'us-east-1',
+                'expected_owner_id' => 'invalid-owner',
+                'data_prefix' => 'objects',
+                'reserved_prefix' => '.opsfour/attempts',
+            ],
+            'metadata' => ['path' => ':memory:'],
+        ]);
+
+        $backend = $app->make(StorageBackend::class);
+        self::assertInstanceOf(AwsS3ProviderAdmissionCapability::class, $backend);
+        self::assertSame('configuration-invalid', $backend->awsS3ProviderAdmission()->reason);
     }
 
     public function test_ambiguous_default_sqlite_files_require_an_explicit_metadata_path(): void

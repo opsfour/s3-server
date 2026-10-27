@@ -86,7 +86,7 @@ final class StorageTierRegistry
         $tiers = [];
         foreach ($this->tiers as $tier) {
             $backend = $tier->backend;
-            if (! $backend instanceof ObservedStorageBackend) {
+            if (! $backend instanceof ObservedStorageBackend && ! $backend instanceof AwsS3StorageBackend) {
                 $driver = self::metricsDriver($backend);
                 if ($multipleTiers) {
                     $driver .= ':' . $tier->name;
@@ -109,6 +109,7 @@ final class StorageTierRegistry
     {
         return match (true) {
             $backend instanceof FilesystemBackend => 'filesystem',
+            $backend instanceof AwsS3StorageBackend => 'aws-s3',
             $backend instanceof ParallelFlysystemBackend,
             $backend instanceof FlysystemBackend => 'flysystem',
             $backend instanceof InMemoryBackend => 'memory',

@@ -22,6 +22,7 @@ use OpsFour\S3Server\Storage\LocalFlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use OpsFour\S3Server\Symfony\Command\S3ServerCredentialsCommand;
 use OpsFour\S3Server\Symfony\Command\S3ServerQuotaCommand;
@@ -155,6 +156,27 @@ final class S3ServerBundleTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('explicit SQLite metadata path');
         $this->service($container, MetadataStore::class);
+    }
+
+    public function test_symfony_accepts_and_resolves_the_explicit_aws_s3_profile(): void
+    {
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'storage' => [
+                'driver' => 'aws-s3',
+                'bucket' => 'provider-bucket',
+                'region' => 'us-east-1',
+                'expected_owner_id' => 'invalid-owner',
+                'data_prefix' => 'objects',
+                'reserved_prefix' => '.opsfour/attempts',
+            ],
+            'metadata' => ['driver' => 'sqlite', 'path' => ':memory:'],
+        ]], $container);
+        $container->compile();
+
+        $backend = $this->service($container, StorageBackend::class);
+        self::assertInstanceOf(AwsS3ProviderAdmissionCapability::class, $backend);
+        self::assertSame('configuration-invalid', $backend->awsS3ProviderAdmission()->reason);
     }
 
     public function test_compiled_container_discovers_legacy_sqlite_after_runtime_mount(): void

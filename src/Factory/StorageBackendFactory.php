@@ -12,6 +12,9 @@ use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\LocalFlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
@@ -26,8 +29,8 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
 final class StorageBackendFactory
 {
     /**
-     * @param  string  $driver  One of: filesystem, flysystem, memory.
-     * @param array{path?: string, filesystem?: FilesystemOperator, filesystem_factory?: FlysystemFilesystemFactory, temp_dir?: string, temp_budget_bytes?: int|string, worker_pool_size?: int|string, pool_name?: string, read_first_byte_timeout_seconds?: int|string} $config
+     * @param  string  $driver  One of: filesystem, flysystem, aws-s3, memory.
+     * @param array<string, mixed> $config
      */
     public static function create(
         string $driver,
@@ -40,13 +43,27 @@ final class StorageBackendFactory
                 $config['path'] ?? throw new \InvalidArgumentException('Filesystem requires "path"'),
             ),
             'flysystem' => self::createFlysystem($config, $metrics),
+            'aws-s3' => self::createAwsS3($config),
             'memory' => new InMemoryBackend(),
             default => throw new \InvalidArgumentException("Unknown storage driver: {$driver}"),
         };
 
-        return $metrics === null
+        if ($metrics === null) {
+            return $backend;
+        }
+
+        // The admission-only AWS backend intentionally exposes no operational
+        // capability. Generic observability would falsely add recoverable
+        // write, multipart, and bounded-copy interfaces.
+        return $backend instanceof AwsS3StorageBackend
             ? $backend
             : new ObservedStorageBackend($backend, $metrics, $metricsDriver ?? $driver);
+    }
+
+    /** @param array<string, mixed> $config */
+    private static function createAwsS3(array $config): StorageBackend
+    {
+        return new AwsS3StorageBackend((new AwsS3ProviderValidator())->validate($config));
     }
 
     /**
@@ -115,9 +132,10 @@ final class StorageBackendFactory
             $configured = [];
             $created = [];
             $physicalIdentities = [];
+            $tierPlans = [];
             try {
                 foreach ($tiers as $name => $tierConfig) {
-                    if (!is_array($tierConfig)) {
+                    if (! is_array($tierConfig)) {
                         throw new \InvalidArgumentException("Storage tier {$name} must be configured as an array.");
                     }
 
@@ -134,6 +152,10 @@ final class StorageBackendFactory
                         }
                         $physicalIdentities[] = [$tierName, $physicalIdentity];
                     }
+                    $tierPlans[] = [$tierName, $driver, $tierConfig];
+                }
+
+                foreach ($tierPlans as [$tierName, $driver, $tierConfig]) {
                     $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
                     $tierConfig['temp_budget_bytes'] ??= $storageConfig['temp_budget_bytes'] ?? 10_737_418_240;
                     $tierConfig['read_first_byte_timeout_seconds'] ??= $storageConfig['read_first_byte_timeout_seconds'] ?? 20;
@@ -182,7 +204,7 @@ final class StorageBackendFactory
 
     /**
      * @param array<string, mixed> $config
-     * @return array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int}|null
+     * @return array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefixes: list<string>}|array{kind: 'object', id: int}|null
      */
     private static function configuredPhysicalIdentity(string $driver, array $config): ?array
     {
@@ -208,20 +230,34 @@ final class StorageBackendFactory
                     'kind' => 'aws',
                     'endpoint' => self::canonicalEndpoint($namespace['endpoint']),
                     'bucket' => $namespace['bucket'],
-                    'prefix' => $namespace['prefix'],
+                    'prefixes' => [$namespace['prefix']],
                 ];
             }
             if (is_object($operator)) {
                 return ['kind' => 'object', 'id' => spl_object_id($operator)];
             }
         }
+        if ($driver === 'aws-s3') {
+            try {
+                $profile = AwsS3ProviderProfile::fromConfig($config);
+            } catch (\InvalidArgumentException) {
+                return null;
+            }
+
+            return [
+                'kind' => 'aws',
+                'endpoint' => null,
+                'bucket' => $profile->bucket,
+                'prefixes' => [$profile->dataPrefix, $profile->reservedPrefix],
+            ];
+        }
 
         return null;
     }
 
     /**
-     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int} $first
-     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefix: string}|array{kind: 'object', id: int} $second
+     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefixes: list<string>}|array{kind: 'object', id: int} $first
+     * @param array{kind: 'local', root: string, existingAncestor: string}|array{kind: 'aws', endpoint: ?string, bucket: string, prefixes: list<string>}|array{kind: 'object', id: int} $second
      */
     private static function sharesPhysicalNamespace(array $first, array $second): bool
     {
@@ -241,10 +277,19 @@ final class StorageBackendFactory
                 && self::isCaseInsensitiveDirectory($second['existingAncestor']);
         }
         if ($first['kind'] === 'aws' && $second['kind'] === 'aws') {
-            return $first['endpoint'] === $second['endpoint']
-                && $first['bucket'] === $second['bucket']
-                && (self::prefixContains($first['prefix'], $second['prefix'])
-                    || self::prefixContains($second['prefix'], $first['prefix']));
+            if ($first['endpoint'] !== $second['endpoint'] || $first['bucket'] !== $second['bucket']) {
+                return false;
+            }
+            foreach ($first['prefixes'] as $firstPrefix) {
+                foreach ($second['prefixes'] as $secondPrefix) {
+                    if (self::prefixContains($firstPrefix, $secondPrefix)
+                        || self::prefixContains($secondPrefix, $firstPrefix)) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         if ($first['kind'] !== 'object' || $second['kind'] !== 'object') {
@@ -351,9 +396,17 @@ final class StorageBackendFactory
         $scheme = strtolower($uri['scheme']);
         $port = $uri['port'] ?? null;
         $defaultPort = $scheme === 'https' ? 443 : 80;
+        $host = strtolower($uri['host']);
+        $path = rtrim($uri['path'] ?? '', '/');
 
-        return $scheme . '://' . strtolower($uri['host'])
+        if (($port === null || $port === $defaultPort) && $path === ''
+            && ($host === 's3.amazonaws.com'
+                || preg_match('/^s3(?:-fips)?(?:[.-](?:dualstack\.)?[a-z0-9-]+)\.amazonaws\.com$/D', $host) === 1)) {
+            return null;
+        }
+
+        return $scheme . '://' . $host
             . ($port === null || $port === $defaultPort ? '' : ':' . $port)
-            . rtrim($uri['path'] ?? '', '/');
+            . $path;
     }
 }

@@ -264,6 +264,27 @@ runtime.
 
 ## Remote Storage Backends
 
+The provider-specific admission profile can be configured directly without a
+Flysystem service:
+
+```yaml
+opsfour_s3_server:
+  storage:
+    driver: aws-s3
+    bucket: '%env(S3_AWS_BUCKET)%'
+    region: '%env(S3_AWS_REGION)%'
+    expected_owner_id: '%env(S3_AWS_EXPECTED_OWNER_ID)%'
+    data_prefix: objects
+    reserved_prefix: .opsfour/write-attempts
+    connect_timeout_seconds: 5
+    read_timeout_seconds: 15
+    request_timeout_seconds: 20
+```
+
+This uses the AWS SDK default credential chain and read-only provider probes.
+Even an admitted profile refuses API startup until its writer fence is complete;
+it is not a production remote-storage recipe yet.
+
 For remote development and integration tests, register a serializable
 `FlysystemFilesystemFactory` as a Symfony service and run the adapter through a
 bounded worker pool. A direct `FilesystemOperator` service is also available,

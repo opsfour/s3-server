@@ -11,8 +11,8 @@ Powered by [Amp v3](https://amphp.org/) for async I/O with PHP Fibers.
   are also supported for the initial single-host target and provide shared
   metadata for later qualified profiles
 - **Multiple storage backends** — Persistent local filesystem for the current
-  production target; Flysystem and in-memory drivers for experimental and test
-  profiles
+  production target; a distinct AWS S3 provider-admission profile; Flysystem
+  and in-memory drivers for experimental and test profiles
 - **Optional server-side encryption** — SSE-S3 with key rotation support and SSE-C (customer-provided keys), using AES-256-GCM when configured
 - **Authentication** — AWS Signature V4, presigned URLs, signed and unsigned `aws-chunked` checksum trailers
 - **Multi-tenant** — Owner IDs isolate buckets by default; explicit grants can allow cross-account object access. Credential providers include memory, database, file, and chain.
@@ -41,7 +41,9 @@ a reverse proxy that preserves the signed `Host` header exactly.
 The qualified v2.0.0 reference profile uses PHP 8.4, SQLite metadata, and one
 API process on a Linux host with its exact local XFS mount. Other metadata,
 filesystem, mount, device, and host combinations require the applicable
-deployment gates. Memory storage is test-only. Flysystem, remote and shared
+deployment gates. The explicit `aws-s3` profile validates AWS identity, region,
+ownership, General Purpose Bucket evidence, and disabled versioning, but remains
+fail-closed until its writer fence is complete. Memory storage is test-only. Flysystem, remote and shared
 filesystems, NFS/EFS, multiple API processes, and multiple hosts remain
 experimental until each exact profile completes its own qualification gates. See the
 [roadmap and status definitions](docs/production-feature-roadmap.md).

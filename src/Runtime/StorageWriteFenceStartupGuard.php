@@ -8,6 +8,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
@@ -29,6 +30,11 @@ final class StorageWriteFenceStartupGuard
             $backend = $tier->backend;
             while ($backend instanceof ObservedStorageBackend) {
                 $backend = $backend->innerBackend();
+            }
+
+            if ($backend instanceof AwsS3ProviderAdmissionCapability) {
+                $admission = $backend->awsS3ProviderAdmission();
+                throw new AwsS3ProviderStartupException($admission);
             }
 
             if ($backend instanceof FilesystemBackend) {

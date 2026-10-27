@@ -9,7 +9,11 @@ use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
+use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
 
@@ -88,6 +92,89 @@ final class StorageBackendFactoryTest extends TestCase
             'worker_pool_size' => 1,
             'read_first_byte_timeout_seconds' => '20seconds',
         ]);
+    }
+
+    public function test_invalid_aws_profile_remains_distinct_and_exposes_a_closed_admission(): void
+    {
+        $backend = StorageBackendFactory::create('aws-s3', [
+            'bucket' => 'provider-bucket',
+            'region' => 'us-east-1',
+            'expected_owner_id' => 'not-an-account',
+            'data_prefix' => 'objects',
+            'reserved_prefix' => '.opsfour/attempts',
+        ], new MetricsCollector());
+
+        self::assertInstanceOf(AwsS3ProviderAdmissionCapability::class, $backend);
+        self::assertNotInstanceOf(ObservedStorageBackend::class, $backend);
+        self::assertSame('configuration-invalid', $backend->awsS3ProviderAdmission()->reason);
+    }
+
+    public function test_aws_tiers_cannot_overlap_data_or_reserved_namespaces(): void
+    {
+        $profile = [
+            'driver' => 'aws-s3',
+            'bucket' => 'provider-bucket',
+            'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'objects',
+            'reserved_prefix' => '.opsfour/attempts',
+        ];
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not share the same physical backend');
+        StorageBackendFactory::createTierRegistry([
+            'tiers' => [
+                'STANDARD' => $profile,
+                'ARCHIVE' => array_replace($profile, [
+                    'data_prefix' => 'archive',
+                    'reserved_prefix' => '.opsfour/attempts/archive',
+                ]),
+            ],
+        ]);
+    }
+
+    public function test_explicit_aws_and_official_endpoint_flysystem_tiers_cannot_overlap_in_either_order(): void
+    {
+        $profile = [
+            'driver' => 'aws-s3',
+            'bucket' => 'provider-bucket',
+            'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'objects',
+            'reserved_prefix' => '.opsfour/attempts',
+        ];
+        $cases = [
+            ['objects/archive', 'https://s3.amazonaws.com', false],
+            ['objects/archive', 'https://s3-us-east-1.amazonaws.com', true],
+            ['.opsfour', 'https://s3.dualstack.us-east-1.amazonaws.com', false],
+            ['.opsfour', 'https://s3-fips.us-east-1.amazonaws.com', true],
+        ];
+
+        foreach ($cases as [$prefix, $endpoint, $flysystemFirst]) {
+            $flysystem = [
+                'driver' => 'flysystem',
+                'filesystem_factory' => new AwsS3FlysystemFilesystemFactory(
+                    'provider-bucket',
+                    'us-east-1',
+                    'key',
+                    'secret',
+                    $endpoint,
+                    prefix: $prefix,
+                ),
+                'worker_pool_size' => 1,
+            ];
+            $tiers = $flysystemFirst
+                ? ['STANDARD' => $flysystem, 'ARCHIVE' => $profile]
+                : ['STANDARD' => $profile, 'ARCHIVE' => $flysystem];
+
+            try {
+                StorageBackendFactory::createTierRegistry(['tiers' => $tiers]);
+                self::fail('Mixed AWS namespaces must collide before backend construction.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('must not share the same physical backend', $error->getMessage());
+                self::assertStringNotContainsString('secret', $error->getMessage());
+            }
+        }
     }
 
     public function test_negative_sqlite_worker_count_is_not_treated_as_synchronous_mode(): void

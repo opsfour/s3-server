@@ -494,19 +494,25 @@ final class StorageTierRegistryTest extends TestCase
         ]);
     }
 
-    public function test_collision_rolls_back_constructed_worker_tier_before_clean_retry(): void
+    public function test_later_construction_failure_rolls_back_constructed_worker_tier_before_clean_retry(): void
     {
-        $factory = new LocalFlysystemFilesystemFactory(sys_get_temp_dir() . '/opsfour-tier-rollback-' . bin2hex(random_bytes(8)));
+        $root = sys_get_temp_dir() . '/opsfour-tier-rollback-' . bin2hex(random_bytes(8));
+        $factory = new LocalFlysystemFilesystemFactory($root . '/hot');
         try {
             StorageBackendFactory::createTierRegistry([
                 'tiers' => [
                     'STANDARD' => ['driver' => 'flysystem', 'filesystem_factory' => $factory, 'worker_pool_size' => 1, 'default' => true],
-                    'GLACIER' => ['driver' => 'flysystem', 'filesystem_factory' => $factory, 'worker_pool_size' => 1],
+                    'GLACIER' => [
+                        'driver' => 'flysystem',
+                        'filesystem_factory' => new LocalFlysystemFilesystemFactory($root . '/cold'),
+                        'worker_pool_size' => 1,
+                        'temp_budget_bytes' => 0,
+                    ],
                 ],
             ]);
-            self::fail('The second tier must collide after the first backend was constructed.');
+            self::fail('The second tier must fail after the distinct first worker backend was constructed.');
         } catch (\InvalidArgumentException $error) {
-            self::assertStringContainsString('must not share the same physical backend', $error->getMessage());
+            self::assertStringContainsString('temp_budget_bytes must be a positive decimal integer', $error->getMessage());
         }
 
         $registry = StorageBackendFactory::createTierRegistry([
@@ -516,6 +522,7 @@ final class StorageTierRegistryTest extends TestCase
         ]);
         try {
             self::assertCount(1, $registry->all());
+            self::assertFalse($registry->defaultBackend()->bucketExists('retry-bucket'));
         } finally {
             BootstrapResourceCleanup::release(null, $registry);
         }

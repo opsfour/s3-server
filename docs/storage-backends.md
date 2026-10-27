@@ -9,6 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission implemented; writer fence incomplete / not production-qualified | Read-only validation of one commercial-region General Purpose Bucket; API startup always fails closed in this delivery slice |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -150,6 +151,48 @@ mount, storage device, and host used by the v2.0.0 Linux/XFS/SQLite reference
 profile passed the release crash-recovery gate. Any other deployment profile
 needs its applicable gates; process-termination tests do not simulate a sudden
 loss of host power.
+
+## Explicit AWS S3 Provider Profile
+
+The `aws-s3` driver is a provider-specific identity and is never routed through
+Flysystem. Install the optional SDK and configure the profile with no inline
+credentials:
+
+```bash
+composer require aws/aws-sdk-php
+
+S3_STORAGE_DRIVER=aws-s3
+S3_AWS_BUCKET=private-provider-bucket
+S3_AWS_REGION=us-east-1
+S3_AWS_EXPECTED_OWNER_ID=123456789012
+S3_AWS_DATA_PREFIX=objects
+S3_AWS_RESERVED_PREFIX=.opsfour/write-attempts
+S3_AWS_CONNECT_TIMEOUT_SECONDS=5
+S3_AWS_READ_TIMEOUT_SECONDS=15
+S3_AWS_REQUEST_TIMEOUT_SECONDS=20
+```
+
+Credentials come only from the AWS SDK default credential provider chain. The
+client uses normal TLS endpoint resolution and virtual-host addressing; custom
+endpoints, path-style mode, inline credentials, unsupported partitions, and
+retry overrides are not profile options. The profile ignores endpoint URLs from
+AWS environment/shared configuration, selects the regional `us-east-1`
+endpoint, and explicitly disables ARN-region routing, MRAP, accelerate, FIPS,
+dual-stack, endpoint-discovery, and S3 Express behavior.
+
+Admission sends only `HeadBucket` and `GetBucketVersioning`, both with
+`ExpectedBucketOwner`. It requires the exact configured region, General Purpose
+Bucket evidence, and absent/empty versioning status. Enabled, suspended,
+unknown, inaccessible, ownership-mismatched, and wrong-region states are denied.
+The immutable admission report contains only provider type, configured region,
+owner-check result, versioning state, and a stable reason; it never includes the
+bucket, account ID, credentials, request material, or SDK exception text.
+
+Provider admission is not a write fence. Every storage operation remains
+unavailable and API startup refuses the profile even when the unsafe Flysystem
+test override is enabled. Later qualification stories must cover every writer,
+reconciliation, cleanup, health, and release gate before this profile can be
+described as fence-complete or production-qualified.
 
 ## Flysystem
 

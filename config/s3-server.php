@@ -165,7 +165,7 @@ return [
     | Storage Backend
     |--------------------------------------------------------------------------
     |
-    | Supported drivers: "filesystem", "flysystem", "memory"
+    | Supported drivers: "filesystem", "flysystem", "aws-s3", "memory"
     |
     */
     'storage' => [
@@ -177,6 +177,15 @@ return [
         'worker_pool_size' => EnvironmentNumber::integer('S3_FLYSYSTEM_WORKERS', 0),
         'read_first_byte_timeout_seconds' => EnvironmentNumber::integer('S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS', 20),
         'filesystem_factory_service' => env('S3_FLYSYSTEM_FACTORY_SERVICE', null),
+        // Explicit AWS profile. Credentials come only from the AWS SDK default chain.
+        'bucket' => env('S3_AWS_BUCKET'),
+        'region' => env('S3_AWS_REGION'),
+        'expected_owner_id' => env('S3_AWS_EXPECTED_OWNER_ID'),
+        'data_prefix' => env('S3_AWS_DATA_PREFIX'),
+        'reserved_prefix' => env('S3_AWS_RESERVED_PREFIX'),
+        'connect_timeout_seconds' => EnvironmentNumber::integer('S3_AWS_CONNECT_TIMEOUT_SECONDS', 5),
+        'read_timeout_seconds' => EnvironmentNumber::integer('S3_AWS_READ_TIMEOUT_SECONDS', 15),
+        'request_timeout_seconds' => EnvironmentNumber::integer('S3_AWS_REQUEST_TIMEOUT_SECONDS', 20),
         /*
         | Optional physical tier registry. When empty, the single backend above is
         | exposed as the STANDARD tier. Restore-required tiers are not read
