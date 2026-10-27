@@ -31,6 +31,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
+use OpsFour\S3Server\Multipart\MultipartAclSnapshot;
 use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
@@ -1284,15 +1285,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
      */
     private static function storedAclGrants(array $userMetadata, string $ownerId): array
     {
-        $encodedAclGrants = $userMetadata['__mpu-acl-grants'] ?? null;
-        if ($encodedAclGrants === null) {
-            return AclGrantResolver::privateAcl($ownerId);
-        }
-
-        /** @var list<array{granteeType: string, granteeId: string, permission: string}> $decodedAclGrants */
-        $decodedAclGrants = json_decode($encodedAclGrants, true, 16, JSON_THROW_ON_ERROR);
-
-        return AclGrantResolver::validateGrants($decodedAclGrants);
+        return MultipartAclSnapshot::fromMetadata($userMetadata, $ownerId);
     }
 
     /** @param array<string, string>|null $expectedMetadata */

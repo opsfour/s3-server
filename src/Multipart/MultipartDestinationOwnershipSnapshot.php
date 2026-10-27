@@ -63,9 +63,12 @@ final readonly class MultipartDestinationOwnershipSnapshot
         }
 
         try {
-            $record = json_decode($metadata[self::METADATA_KEY], true, 16, JSON_THROW_ON_ERROR);
-            if (! is_array($record)
-                || ! self::hasExactKeys($record, ['version', 'ownerId', 'aclGrants', 'quotaPrincipalId', 'ownershipMode', 'cannedAcl'])
+            $decodedRecord = json_decode($metadata[self::METADATA_KEY], false, 16, JSON_THROW_ON_ERROR);
+            if (! $decodedRecord instanceof \stdClass) {
+                throw new \UnexpectedValueException('Invalid multipart destination ownership record.');
+            }
+            $record = get_object_vars($decodedRecord);
+            if (! self::hasExactKeys($record, ['version', 'ownerId', 'aclGrants', 'quotaPrincipalId', 'ownershipMode', 'cannedAcl'])
                 || $record['version'] !== self::VERSION
                 || ! is_string($record['ownerId'])
                 || $record['ownerId'] === ''
@@ -91,14 +94,13 @@ final readonly class MultipartDestinationOwnershipSnapshot
                 throw new \UnexpectedValueException('Invalid multipart canned ACL snapshot.');
             }
 
-            $aclGrants = AclGrantResolver::validateGrants(self::decodeAclGrants($record['aclGrants']));
+            $aclGrants = MultipartAclSnapshot::fromDecoded($record['aclGrants']);
             $ownershipMode = BucketOwnership::validateMode($record['ownershipMode']);
-            $encodedInitiationAcl = $metadata['__mpu-acl-grants'] ?? null;
+            $encodedInitiationAcl = $metadata[MultipartAclSnapshot::METADATA_KEY] ?? null;
             if (! is_string($encodedInitiationAcl)) {
                 throw new \UnexpectedValueException('Multipart initiation ACL snapshot is missing.');
             }
-            $initiationAcl = json_decode($encodedInitiationAcl, true, 16, JSON_THROW_ON_ERROR);
-            $initiationAclGrants = AclGrantResolver::validateGrants(self::decodeAclGrants($initiationAcl));
+            $initiationAclGrants = MultipartAclSnapshot::decode($encodedInitiationAcl);
             $bucketOwned = $ownershipMode === BucketOwnership::BUCKET_OWNER_ENFORCED
                 || ($ownershipMode === BucketOwnership::BUCKET_OWNER_PREFERRED
                     && $record['cannedAcl'] === 'bucket-owner-full-control');
@@ -142,32 +144,6 @@ final readonly class MultipartDestinationOwnershipSnapshot
         } catch (\Throwable $error) {
             throw new InternalErrorException('Multipart destination ownership snapshot is inconsistent.', $error);
         }
-    }
-
-    /** @return list<array{granteeType: string, granteeId: string, permission: string}> */
-    private static function decodeAclGrants(mixed $value): array
-    {
-        if (! is_array($value) || ! array_is_list($value)) {
-            throw new \UnexpectedValueException('Invalid multipart destination ACL.');
-        }
-
-        $grants = [];
-        foreach ($value as $grant) {
-            if (! is_array($grant)
-                || ! self::hasExactKeys($grant, ['granteeType', 'granteeId', 'permission'])
-                || ! is_string($grant['granteeType'])
-                || ! is_string($grant['granteeId'])
-                || ! is_string($grant['permission'])) {
-                throw new \UnexpectedValueException('Invalid multipart destination ACL.');
-            }
-            $grants[] = [
-                'granteeType' => $grant['granteeType'],
-                'granteeId' => $grant['granteeId'],
-                'permission' => $grant['permission'],
-            ];
-        }
-
-        return $grants;
     }
 
     /**

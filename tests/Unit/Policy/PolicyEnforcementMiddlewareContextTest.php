@@ -2058,6 +2058,31 @@ final class PolicyEnforcementMiddlewareContextTest extends TestCase
         self::assertIsArray($request->getAttribute('s3.multipartCompletionPolicyContext'));
     }
 
+    public function test_corrupt_stored_multipart_acl_fails_policy_context_reconstruction(): void
+    {
+        $this->metadata->createMultipartUpload(
+            'corrupt-acl-context',
+            'bucket',
+            'corrupt-acl.txt',
+            'owner',
+            userMetadata: [
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
+                PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+                '__mpu-acl-grants' => json_encode([[
+                    'granteeType' => 'CanonicalUser',
+                    'granteeId' => 'owner',
+                ]], JSON_THROW_ON_ERROR),
+            ],
+        );
+
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Multipart upload ACL snapshot is invalid.');
+        (new PolicyEnforcementMiddleware($this->metadata))->handleRequest(
+            $this->multipartCompletionRequest('corrupt-acl-context', 'corrupt-acl.txt'),
+            new PolicyTerminalHandler(),
+        );
+    }
+
     public function test_commit_recheck_denial_precedes_newly_corrupt_multipart_context(): void
     {
         $request = $this->multipartCompletionRequest('commit-snapshot', 'commit.txt');

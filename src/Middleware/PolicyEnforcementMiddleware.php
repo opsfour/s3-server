@@ -19,6 +19,7 @@ use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Multipart\MultipartAclSnapshot;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Policy\AdditionalActionAuthorizer;
@@ -127,6 +128,9 @@ final class PolicyEnforcementMiddleware implements Middleware
             if (! is_string($header) || ! isset($allowedHeaders[$header]) || ! is_string($value) || $value === '') {
                 throw new InternalErrorException('Multipart upload policy header snapshot is invalid.');
             }
+        }
+        if (! array_key_exists(MultipartAclSnapshot::METADATA_KEY, $uploadMetadata)) {
+            throw new InternalErrorException('Multipart upload ACL snapshot is missing.');
         }
 
         $hasExplicitAcl = isset($uploadMetadata['__mpu-acl-explicit']);
@@ -338,9 +342,11 @@ final class PolicyEnforcementMiddleware implements Middleware
                         $tags = isset($uploadMetadata['__mpu-tags'])
                             ? ObjectTagValidator::validate(json_decode($uploadMetadata['__mpu-tags'], true, 16, JSON_THROW_ON_ERROR), 10)
                             : [];
-                        /** @var list<array{granteeType: string, granteeId: string, permission: string}> $aclGrants */
-                        $aclGrants = isset($uploadMetadata['__mpu-acl-grants'])
-                            ? AclGrantResolver::validateGrants(json_decode($uploadMetadata['__mpu-acl-grants'], true, 16, JSON_THROW_ON_ERROR))
+                        $aclGrants = array_key_exists(MultipartAclSnapshot::METADATA_KEY, $uploadMetadata)
+                            ? MultipartAclSnapshot::decode(
+                                $uploadMetadata[MultipartAclSnapshot::METADATA_KEY],
+                                (string) $ownerId,
+                            )
                             : AclGrantResolver::privateAcl((string) $ownerId);
                         $this->attachMultipartCompletionContext($request, $uploadMetadata, $tags, $aclGrants);
                     } catch (OperationAbortedException|InternalErrorException $error) {

@@ -229,6 +229,44 @@ final class MultipartCompletionRetryTest extends TestCase
         self::assertSame('payload', \Amp\ByteStream\buffer($this->storage->getObjectByPath($object->systemMetadata['storagePath'])));
     }
 
+    public function test_corrupt_stored_acl_fails_before_planning_intent_or_assembly(): void
+    {
+        [$uploadId, $body] = $this->createMultipartUpload();
+        $upload = $this->metadata->getMultipartUpload($uploadId);
+        self::assertNotNull($upload);
+        $metadata = $upload['user_metadata'];
+        unset($metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]);
+        $metadata['__mpu-acl-grants'] = json_encode([
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'owner',
+            'permission' => 'FULL_CONTROL',
+        ], JSON_THROW_ON_ERROR);
+        $update = (new \PDO('sqlite:' . $this->databasePath))
+            ->prepare('UPDATE s3_multipart_uploads SET user_metadata = ? WHERE upload_id = ?');
+        self::assertInstanceOf(\PDOStatement::class, $update);
+        $update->execute([json_encode($metadata, JSON_THROW_ON_ERROR), $uploadId]);
+
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->expects(self::never())->method('planMultipartCompletionPaths');
+        $storage->expects(self::never())->method('assembleMultipartUploadAtPath');
+
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))
+                ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body));
+            self::fail('A corrupt stored multipart ACL was accepted.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Multipart upload metadata is invalid.', $error->getMessage());
+        }
+
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+        self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+        self::assertCount(1, $this->metadata->getParts($uploadId));
+        $intentCount = (new \PDO('sqlite:' . $this->databasePath))
+            ->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
+        self::assertInstanceOf(\PDOStatement::class, $intentCount);
+        self::assertSame(0, (int) $intentCount->fetchColumn());
+    }
+
     public function test_block_public_acls_allows_private_snapshotted_destination(): void
     {
         [$uploadId, $body] = $this->createMultipartUpload();

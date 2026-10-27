@@ -24,6 +24,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Reject corrupt persisted multipart ACL snapshots deterministically as an
+  internal error before policy reconstruction, write intents, or assembly.
 - Reject multipart completions whose stored public destination ACL is already
   blocked before creating a write intent or assembling object data, while
   retaining the commit-time recheck for concurrent access-control changes.
