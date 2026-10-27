@@ -23,7 +23,6 @@ use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
-use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Storage\StorageBackend;
@@ -61,9 +60,8 @@ final class GetObjectHandler implements RequestHandler
         );
         $queryString = $request->getUri()->getQuery();
         $queryParams = $queryString !== '' ? QueryStringParser::parse($queryString) : [];
-        if (array_key_exists('partNumber', $queryParams)) {
-            throw new NotImplementedException('GetObject partNumber is not supported.');
-        }
+        $rangeHeader = RequestHeaderValues::combined($request, 'range');
+        $partSelector = ObjectPartSelector::fromRequest($queryParams, $rangeHeader);
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -131,15 +129,37 @@ final class GetObjectHandler implements RequestHandler
         BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
+        // Story 3.3 adds plaintext-aware selection for encrypted objects. Keep
+        // request validation and complete-object conditions authoritative now.
+        if ($partSelector->isRequested() && $sseAlgo !== null) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'GetObject partNumber is not supported for encrypted objects.',
+            );
+        }
+
+        $partSelection = null;
+        if ($partSelector->isRequested()) {
+            try {
+                $partSelection = $partSelector->select($this->metadata, $objectInfo);
+            } finally {
+                BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            }
+        }
+
         // 4. Parse Range header if present.
-        $rangeHeader = RequestHeaderValues::combined($request, 'range');
         $offset = null;
         $length = null;
         $isPartialContent = false;
         $contentRangeHeader = null;
         $contentLength = $objectInfo->size;
 
-        if ($rangeHeader !== null) {
+        if ($partSelection !== null) {
+            $offset = $partSelection->offset;
+            $length = $partSelection->size;
+            $contentLength = $partSelection->size;
+            $isPartialContent = true;
+            $contentRangeHeader = $partSelection->contentRange();
+        } elseif ($rangeHeader !== null) {
             $range = self::parseRangeHeader($rangeHeader, $objectInfo->size);
 
             if ($range !== null) {
@@ -257,12 +277,15 @@ final class GetObjectHandler implements RequestHandler
                 $objectInfo,
                 $contentLength,
                 $emitNullVersion,
-                $includeChecksums && ! $isPartialContent,
+                $includeChecksums && $partSelection === null && ! $isPartialContent,
             );
 
             // A range response never carries the checksum of the full object.
             if ($isPartialContent && $contentRangeHeader !== null) {
                 $headers['Content-Range'] = $contentRangeHeader;
+            }
+            if ($partSelection?->multipartPartCount !== null) {
+                $headers['x-amz-mp-parts-count'] = (string) $partSelection->multipartPartCount;
             }
 
             // 7. Apply response-* query parameter overrides only after the auth

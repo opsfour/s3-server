@@ -14,11 +14,67 @@ use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Storage\StorageBackend;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class GetObjectGenerationRaceTest extends TestCase
 {
+    /** @return iterable<string, array{string}> */
+    public static function partLayoutOutcomes(): iterable
+    {
+        yield 'successful selection' => ['success'];
+        yield 'stale 416' => ['out-of-range'];
+        yield 'stale 501' => ['unknown'];
+        yield 'stale InternalError' => ['size-mismatch'];
+    }
+
+    #[DataProvider('partLayoutOutcomes')]
+    public function test_bucket_reuse_during_part_layout_lookup_overrides_selection_outcome(string $outcome): void
+    {
+        $oldBucket = new BucketInfo('bucket', 'alice', generation: str_repeat('a', 32));
+        $newBucket = new BucketInfo('bucket', 'bob', generation: str_repeat('b', 32));
+        $currentBucket = $oldBucket;
+        $layout = $outcome === 'unknown'
+            ? new ObjectPartLayout(ObjectPartLayout::UNKNOWN, 3)
+            : ObjectPartLayout::knownSingle(3);
+        $objectSize = $outcome === 'size-mismatch' ? 4 : 3;
+        $ordinal = $outcome === 'out-of-range' ? 2 : 1;
+
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+        $metadata->method('getBucket')->willReturnCallback(static function () use (&$currentBucket): BucketInfo {
+            return $currentBucket;
+        });
+        $metadata->method('getCurrentObjectVersion')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            $objectSize,
+            '"old"',
+            systemMetadata: ['storagePath' => 'objects/old'],
+            partLayout: $layout->summary(1),
+        ));
+        $metadata->method('getBucketVersioning')->willReturn('');
+        $metadata->expects(self::once())->method('getObjectPartLayout')
+            ->willReturnCallback(static function () use (&$currentBucket, $newBucket, $layout): ObjectPartLayout {
+                $currentBucket = $newBucket;
+
+                return $layout;
+            });
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('getObjectByPath');
+        $request = $this->request($oldBucket, 'key');
+        $request->setUri(Http::new('http://127.0.0.1/bucket/key?partNumber=' . $ordinal));
+
+        $this->expectException(OperationAbortedException::class);
+        (new GetObjectHandler($metadata, $storage))->handleRequest($request);
+    }
+
     public function test_authorized_snapshot_prevents_aba_lookup_of_foreign_current_object(): void
     {
         $bucket = new BucketInfo('bucket', 'bucket-owner', generation: str_repeat('a', 32));

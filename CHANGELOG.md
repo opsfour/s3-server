@@ -12,6 +12,11 @@ The project follows [Semantic Versioning](https://semver.org/).
   MySQL, including completion-order boundaries, original upload part numbers,
   and verified optional part checksums. Legacy layouts are classified by a
   bounded, resumable maintenance migration without inventing boundaries.
+- Add unencrypted GET and HEAD `partNumber` selection from those authoritative
+  per-version layouts, with streamed plaintext slices, exact range/length and
+  multipart-count headers, whole-object conditional semantics, and no
+  misleading complete-object checksum headers. Encrypted part reads and
+  verified part-checksum delivery remain deferred.
 - Add `BucketOwnerPreferred` for ordinary PUT, signed browser POST, and
   CopyObject writes, with exact canned-ACL transfer, canonical bucket-owner
   ACLs, stable quota ownership, and version-specific persistence.

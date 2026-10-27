@@ -12,7 +12,6 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
-use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
@@ -130,7 +129,7 @@ final class ObjectChecksumModeTest extends TestCase
 
     /** @param 'GET'|'HEAD' $method */
     #[DataProvider('methods')]
-    public function test_part_number_is_rejected_before_metadata_or_storage_access(string $method): void
+    public function test_invalid_part_number_is_rejected_before_metadata_or_storage_access(string $method): void
     {
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->expects(self::never())->method('getBucket');
@@ -138,9 +137,9 @@ final class ObjectChecksumModeTest extends TestCase
         $storage->expects(self::never())->method('getObjectByPath');
 
         $request = $this->request($method);
-        $request->setUri(Http::new('http://127.0.0.1/bucket/key?partNumber=1'));
+        $request->setUri(Http::new('http://127.0.0.1/bucket/key?partNumber=invalid'));
 
-        $this->expectException(NotImplementedException::class);
+        $this->expectException(InvalidArgumentException::class);
         ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
             ->handleRequest($request);
     }

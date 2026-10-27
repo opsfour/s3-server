@@ -14,7 +14,6 @@ use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
-use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Http\QueryStringParser;
@@ -46,9 +45,8 @@ final class HeadObjectHandler implements RequestHandler
             RequestHeaderValues::singleton($request, 'x-amz-checksum-mode'),
         );
         $queryParams = QueryStringParser::parse($request->getUri()->getQuery());
-        if (array_key_exists('partNumber', $queryParams)) {
-            throw new NotImplementedException('HeadObject partNumber is not supported.');
-        }
+        $rangeHeader = RequestHeaderValues::combined($request, 'range');
+        $partSelector = ObjectPartSelector::fromRequest($queryParams, $rangeHeader);
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
         $ownerId = $request->getAttribute('ownerId');
@@ -115,13 +113,30 @@ final class HeadObjectHandler implements RequestHandler
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
 
+        if ($partSelector->isRequested() && $sseAlgo !== null) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException(
+                'HeadObject partNumber is not supported for encrypted objects.',
+            );
+        }
+
+        $partSelection = null;
+        if ($partSelector->isRequested()) {
+            try {
+                $partSelection = $partSelector->select($this->metadata, $objectInfo);
+            } finally {
+                \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            }
+        }
+
         // 4. Handle Range header for Content-Length calculation.
         // S3 ranged HEAD changes only Content-Length when satisfiable.
-        $rangeHeader = RequestHeaderValues::combined($request, 'range');
         $contentLength = $objectInfo->size;
         $isPartialContent = false;
 
-        if ($rangeHeader !== null) {
+        if ($partSelection !== null) {
+            $contentLength = $partSelection->size;
+            $isPartialContent = true;
+        } elseif ($rangeHeader !== null) {
             $range = self::parseRangeHeader($rangeHeader, $objectInfo->size);
 
             if ($range !== null) {
@@ -135,8 +150,11 @@ final class HeadObjectHandler implements RequestHandler
             $objectInfo,
             $contentLength,
             $emitNullVersion,
-            $includeChecksums && ! $isPartialContent,
+            $includeChecksums && $partSelection === null && ! $isPartialContent,
         );
+        if ($partSelection?->multipartPartCount !== null) {
+            $headers['x-amz-mp-parts-count'] = (string) $partSelection->multipartPartCount;
+        }
         $headers = S3ResponseHeaders::withAuthenticatedOverrides(
             $headers,
             $queryParams,
