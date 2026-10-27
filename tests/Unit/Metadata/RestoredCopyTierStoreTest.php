@@ -26,18 +26,16 @@ final class RestoredCopyTierStoreTest extends TestCase
         self::assertNull($row->fetchColumn());
     }
 
-    public function test_partial_legacy_schema_without_objects_table_can_finish_migration(): void
+    public function test_partial_legacy_schema_without_objects_table_fails_layout_migration(): void
     {
         $pdo = new \PDO('sqlite::memory:');
         $schema = new SchemaManager($pdo);
         $schema->migrate(29);
         $pdo->exec('DROP TABLE s3_objects');
-        $schema->migrate();
 
-        self::assertSame(SqliteSchema::VERSION, $schema->getCurrentVersion());
-        $tables = $pdo->query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 's3_objects'");
-        self::assertInstanceOf(\PDOStatement::class, $tables);
-        self::assertFalse($tables->fetchColumn());
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('SQLite metadata schema is corrupted: s3_objects is missing before object part layout migration.');
+        $schema->migrate();
     }
 
     public function test_restore_copy_path_tier_and_expiry_are_atomic_for_current_and_versioned_rows(): void

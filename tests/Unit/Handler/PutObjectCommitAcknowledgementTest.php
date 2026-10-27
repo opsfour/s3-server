@@ -11,18 +11,20 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
 
 final class PutObjectCommitAcknowledgementTest extends TestCase
 {
     #[DataProvider('versioningModes')]
     public function test_lost_commit_ack_does_not_delete_a_published_object(string $versioning): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $bucket = new BucketInfo('bucket', 'owner', generation: str_repeat('a', 32));
         $metadata->method('getBucket')->willReturn($bucket);
         $metadata->method('getBucketVersioning')->willReturn($versioning);
@@ -81,7 +83,7 @@ final class PutObjectCommitAcknowledgementTest extends TestCase
 
     public function test_failure_before_publication_still_cleans_unreferenced_path(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner', generation: str_repeat('a', 32)));
         $metadata->method('getBucketVersioning')->willReturn('Disabled');
         $metadata->method('transaction')->willThrowException(new \RuntimeException('pre-publication failure'));
@@ -104,7 +106,7 @@ final class PutObjectCommitAcknowledgementTest extends TestCase
 
     public function test_lost_replacement_commit_ack_has_already_staged_old_path_for_recovery(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $bucket = new BucketInfo('bucket', 'owner', generation: str_repeat('a', 32));
         $old = new ObjectInfo('bucket', 'key', 3, '"' . md5('old') . '"', ownerId: 'owner', systemMetadata: ['storagePath' => 'bucket/old-path']);
         $metadata->method('getBucket')->willReturn($bucket);
@@ -133,5 +135,16 @@ final class PutObjectCommitAcknowledgementTest extends TestCase
     {
         yield 'unversioned' => ['Disabled'];
         yield 'versioned' => ['Enabled'];
+    }
+
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+
+        return $metadata;
     }
 }

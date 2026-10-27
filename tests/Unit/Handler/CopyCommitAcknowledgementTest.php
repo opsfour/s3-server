@@ -10,6 +10,7 @@ use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
@@ -149,7 +150,13 @@ final class CopyCommitAcknowledgementTest extends TestCase
 
     private function acknowledgementMetadata(bool $commit, bool $failLookup = false, bool $rollbackAfterCallback = false): MetadataStore
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+        $metadata->method('putObjectPartLayout')->willReturnCallback($this->realMetadata->putObjectPartLayout(...));
+        $metadata->method('getObjectPartLayout')->willReturnCallback($this->realMetadata->getObjectPartLayout(...));
         $state = new class {
             public bool $transactionAttempted = false;
         };

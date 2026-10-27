@@ -27,13 +27,16 @@ use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectRetentionDeletionStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     public function __construct(
         private MetadataStore $inner,
@@ -218,6 +221,21 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
     public function objectExists(string $bucket, string $key): bool
     {
         return $this->observe(__FUNCTION__, fn() => $this->inner->objectExists($bucket, $key));
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return $this->inner instanceof ObjectPartLayoutStore && $this->inner->supportsObjectPartLayouts();
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        $this->observe(__FUNCTION__, fn() => ObjectPartLayoutCapability::require($this->inner)->putObjectPartLayout($bucket, $key, $versionId, $layout));
+    }
+
+    public function getObjectPartLayout(\OpsFour\S3Server\Dto\ObjectInfo $object): ObjectPartLayout
+    {
+        return $this->observe(__FUNCTION__, fn() => ObjectPartLayoutCapability::require($this->inner)->getObjectPartLayout($object));
     }
 
     public function updateObjectPlacement(string $bucket, string $key, ?string $versionId, string $storageClass, string $storageTier, string $storagePath, string $transitionStatus = 'available', ?string $transitionTargetTier = null, ?string $transitionError = null): void

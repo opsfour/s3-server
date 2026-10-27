@@ -155,6 +155,7 @@ final class RecursiveCleanupAdmissionStoreTest extends TestCase
         $this->insert('COLD', 'abort_multipart', 'processing');
         $this->writer->exec('DROP INDEX idx_s3_storage_gc_recursive_unsafe');
         $this->writer->exec('DELETE FROM s3_schema_version WHERE version >= 37');
+        $this->writer->exec("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
 
         (new SchemaManager($this->writer))->migrate();
 

@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class SqliteSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 40;
+    public const int VERSION = 41;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -179,6 +179,10 @@ final class SqliteSchema
             checksum_crc32c TEXT,
             checksum_sha1 TEXT,
             checksum_sha256 TEXT,
+            part_layout_kind TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown')),
+            part_layout_count INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000),
+            part_layout_compat_count INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000),
+            part_layout_digest TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             noncurrent_at TEXT,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -192,6 +196,18 @@ final class SqliteSchema
         CREATE INDEX IF NOT EXISTS idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status);
         CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier);
         CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at);
+
+        CREATE TABLE IF NOT EXISTS s3_object_parts (
+            object_id INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 10000),
+            upload_part_number INTEGER CHECK (upload_part_number BETWEEN 1 AND 10000),
+            plaintext_offset INTEGER NOT NULL CHECK (plaintext_offset >= 0),
+            plaintext_size INTEGER NOT NULL CHECK (plaintext_size >= 0),
+            checksum_algorithm TEXT,
+            checksum_value TEXT,
+            PRIMARY KEY (object_id, ordinal),
+            FOREIGN KEY (object_id) REFERENCES s3_objects(id) ON DELETE CASCADE
+        );
 
         CREATE TABLE IF NOT EXISTS s3_multipart_uploads (
             upload_id TEXT PRIMARY KEY,

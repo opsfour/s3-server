@@ -257,6 +257,16 @@ jobs:
           S3_POLICY_AUDIT_PASSWORD=s3audit \
           php scripts/audit-stored-identity-policies.php
 
+      - name: Object part layout checkpoint migration
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MYSQL_METADATA_DSN: "host=127.0.0.1;port=3306;dbname=s3audit_package;user=s3;password=s3audit"
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
+        run: >-
+          vendor/bin/phpunit --fail-on-skipped
+          tests/Functional/MetadataBackendIntegrationTest.php
+          --filter test_external_layout_backfill_resumes_checkpoint_and_rejects_rows_beyond_target
+
       - name: Collector generation migration compatibility
         env:
           S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
@@ -280,6 +290,8 @@ jobs:
       - name: MySQL v11-to-current migration
         env:
           S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MIGRATION_SCALE_OBJECTS: "10001"
+          S3_TEST_MYSQL_METADATA_DSN: "host=127.0.0.1;port=3306;dbname=s3audit_package;user=s3;password=s3audit"
         run: >-
           vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
           --filter 'migrates_v11_schema_to_current.*mysql'
@@ -287,6 +299,8 @@ jobs:
       - name: PostgreSQL v11-to-current migration
         env:
           S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MIGRATION_SCALE_OBJECTS: "10001"
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
         run: >-
           vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
           --filter 'migrates_v11_schema_to_current.*postgres'

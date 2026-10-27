@@ -381,6 +381,29 @@ final class DeleteOwnershipLockTest extends TestCase
         );
     }
 
+    public function test_guard_accepts_a_resolved_literal_null_version(): void
+    {
+        $target = new ObjectInfo(
+            'bucket',
+            'key',
+            1,
+            '"etag"',
+            ownerId: 'bucket-owner',
+            versionId: null,
+        );
+
+        self::assertFalse((new ObjectDeletePolicyGuard($this->metadata))->check(
+            $this->request('DELETE', '/bucket/key?versionId=null', ownerId: 'bucket-owner'),
+            'bucket',
+            'key',
+            'null',
+            'bucket-owner',
+            'bucket-owner',
+            $target,
+            targetResolved: true,
+        ));
+    }
+
     private function put(string $key, string $ownerId, string $body): void
     {
         $write = $this->storage->putObject('bucket', $key, new ReadableBuffer($body));

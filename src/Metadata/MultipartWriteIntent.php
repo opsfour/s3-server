@@ -26,7 +26,7 @@ final readonly class MultipartWriteIntent
     ) {}
 
     /**
-     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $parts
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string, checksumAlgorithm?: ?string, checksumValue?: ?string}> $parts
      */
     public static function digestParts(array $parts): string
     {

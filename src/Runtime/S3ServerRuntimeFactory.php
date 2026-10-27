@@ -22,6 +22,7 @@ use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -69,6 +70,7 @@ final readonly class S3ServerRuntimeFactory
         array $notificationListeners = [],
     ): S3ServerRuntime {
         $rawMetadata = $metadata;
+        ObjectPartLayoutCapability::require($metadata);
         $storageTiers ??= StorageTierRegistry::single($storage);
         $storageTiers = $storageTiers->withObservability($metrics);
         $storage = $storageTiers->defaultBackend();
@@ -78,6 +80,7 @@ final readonly class S3ServerRuntimeFactory
         if (! $metadata instanceof ObjectWriteIntentStore) {
             throw new \LogicException('Runtime metadata observability must preserve object write intents.');
         }
+        ObjectPartLayoutCapability::require($metadata);
 
         $server = new S3Server(
             config: $config,

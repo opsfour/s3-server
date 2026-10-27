@@ -18,6 +18,7 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Object\RestoreObjectHandler;
 use OpsFour\S3Server\Handler\Object\DeleteObjectHandler;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreGarbageCollector;
@@ -48,6 +49,18 @@ final class RestoreGarbageCollectorTest extends TestCase
         @unlink($this->path);
         @unlink($this->path . '-wal');
         @unlink($this->path . '-shm');
+    }
+
+    public function test_same_object_snapshot_includes_part_layout_digest(): void
+    {
+        $layout = ObjectPartLayout::knownSingle(4);
+        $observed = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(1));
+        $replacement = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(2));
+        $collector = new RestoreGarbageCollector($this->metadata, new InMemoryBackend());
+        $method = new \ReflectionMethod(RestoreGarbageCollector::class, 'sameObjectSnapshot');
+
+        self::assertTrue($method->invoke($collector, $observed, $observed));
+        self::assertFalse($method->invoke($collector, $observed, $replacement));
     }
 
     public function test_collect_removes_expired_restore_copy_and_clears_restore_state(): void

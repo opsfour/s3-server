@@ -130,6 +130,7 @@ final class RestoreGarbageCollector
             && $current->etag === $observed->etag
             && $current->size === $observed->size
             && $current->lastModified->format('U.u') === $observed->lastModified->format('U.u')
-            && ($current->systemMetadata['storagePath'] ?? null) === ($observed->systemMetadata['storagePath'] ?? null);
+            && ($current->systemMetadata['storagePath'] ?? null) === ($observed->systemMetadata['storagePath'] ?? null)
+            && $current->partLayout?->digest === $observed->partLayout?->digest;
     }
 }

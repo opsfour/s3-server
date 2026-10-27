@@ -41,7 +41,11 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(48, MysqlSchema::VERSION);
+        self::assertSame(49, MysqlSchema::VERSION);
+        $layoutMigration = implode("\n", MysqlSchema::getMigrationStatements(48));
+        self::assertStringContainsString('s3_object_parts', $layoutMigration);
+        self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);
+        self::assertStringContainsString('target_object_id', $layoutMigration);
         $cleanupCapacityMigration = implode("\n", MysqlSchema::getMigrationStatements(47));
         self::assertStringContainsString('ADD COLUMN recovery_admission', $cleanupCapacityMigration);
         self::assertStringContainsString("WHEN operation = 'part_write_intent' THEN 'part_write_intent'", $cleanupCapacityMigration);
@@ -169,7 +173,11 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(43, PostgresSchema::VERSION);
+        self::assertSame(44, PostgresSchema::VERSION);
+        $layoutMigration = implode("\n", PostgresSchema::getMigrationStatements(43));
+        self::assertStringContainsString('s3_object_parts', $layoutMigration);
+        self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);
+        self::assertStringContainsString('target_object_id', $layoutMigration);
         $cleanupCapacityMigration = implode("\n", PostgresSchema::getMigrationStatements(42));
         self::assertStringContainsString('ADD COLUMN IF NOT EXISTS recovery_admission', $cleanupCapacityMigration);
         self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_storage_cleanup_capacity', $cleanupCapacityMigration);

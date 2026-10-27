@@ -496,9 +496,12 @@ ownership or an explicit policy allow. Explicit Deny on either action rejects
 the request. See the [AWS GetObjectAttributes permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectAttributes.html)
 and [object ACL action mapping](https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html).
 
-The supported `ObjectParts` response contains `PartsCount` derived from the
-multipart ETag. Per-part entries and GetObjectAttributes part pagination are
-outside the current operation subset.
+The supported `ObjectParts` response contains `PartsCount` from the persisted
+logical layout. Known single-part objects omit the multipart container. A
+legacy multipart-shaped object whose original boundaries were not retained
+returns only its migration-stored compatibility count; opaque legacy ETags do
+not claim multipart structure. Per-part entries and GetObjectAttributes part
+pagination are outside the current operation subset.
 
 For a missing current object, `GetObject`, `HeadObject`, and
 `GetObjectAttributes` return `403 AccessDenied` unless the caller has effective

@@ -515,6 +515,7 @@ final class CopyObjectHandler implements RequestHandler
         }
 
         // 7. Perform the copy in storage.
+        $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
         $srcPath = $srcObjectInfo->systemMetadata['storagePath'] ?? null;
         if ($srcPath === null || $srcPath === '') {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Source object storage path missing.');
@@ -792,7 +793,7 @@ final class CopyObjectHandler implements RequestHandler
                 }
             }
             if ($dstVersioning === 'Enabled') {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $dstBucketInfo, $request);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
@@ -856,6 +857,7 @@ final class CopyObjectHandler implements RequestHandler
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
+                    $partLayouts->putObjectPartLayout($dstBucket, $dstKey, $versionId, \OpsFour\S3Server\Metadata\ObjectPartLayout::knownSingle($objectSize));
                     $this->metadata->updateObjectPlacement(
                         $dstBucket,
                         $dstKey,
@@ -883,7 +885,7 @@ final class CopyObjectHandler implements RequestHandler
                     $metadataCallbackCompleted = true;
                 });
             } else {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, $observedReplacementOwnerId, &$metadataCallbackCompleted, $localDispatchToken) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, $observedReplacementOwnerId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
                         $ownerId,
@@ -972,6 +974,7 @@ final class CopyObjectHandler implements RequestHandler
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
+                    $partLayouts->putObjectPartLayout($dstBucket, $dstKey, 'null', \OpsFour\S3Server\Metadata\ObjectPartLayout::knownSingle($objectSize));
                     $this->metadata->updateObjectPlacement(
                         $dstBucket,
                         $dstKey,

@@ -10,6 +10,7 @@ use OpsFour\S3Server\Metadata\Schema\SchemaManager;
 use OpsFour\S3Server\Metadata\Schema\SqliteSchema;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreExecutor;
@@ -65,6 +66,18 @@ final class TierTransitionExecutorTest extends TestCase
         @unlink($this->path);
         @unlink($this->path . '-wal');
         @unlink($this->path . '-shm');
+    }
+
+    public function test_same_object_snapshot_includes_part_layout_digest(): void
+    {
+        $layout = ObjectPartLayout::knownSingle(4);
+        $observed = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(1));
+        $replacement = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(2));
+        $executor = new TierTransitionExecutor($this->metadata, StorageTierRegistry::single(new InMemoryBackend()));
+        $method = new \ReflectionMethod(TierTransitionExecutor::class, 'sameObject');
+
+        self::assertTrue($method->invoke($executor, $observed, $observed));
+        self::assertFalse($method->invoke($executor, $observed, $replacement));
     }
 
     public function test_transition_cancels_pending_restore_for_the_old_source_placement(): void
@@ -1252,6 +1265,21 @@ final class TierTransitionExecutorTest extends TestCase
         $connection->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $connection->exec('CREATE TABLE s3_schema_version (version INTEGER NOT NULL, description TEXT NOT NULL)');
         $connection->exec("INSERT INTO s3_schema_version (version, description) VALUES (20, 'previous schema')");
+        $connection->exec("CREATE TABLE s3_objects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, key_name TEXT NOT NULL,
+            version_id TEXT NOT NULL DEFAULT 'null', is_latest INTEGER NOT NULL DEFAULT 1,
+            is_delete_marker INTEGER NOT NULL DEFAULT 0, owner_id TEXT NOT NULL, etag TEXT NOT NULL,
+            size INTEGER NOT NULL, content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            content_encoding TEXT, content_disposition TEXT, cache_control TEXT,
+            storage_class TEXT NOT NULL DEFAULT 'STANDARD', storage_tier TEXT NOT NULL DEFAULT 'STANDARD',
+            transition_status TEXT NOT NULL DEFAULT 'available', transition_target_tier TEXT, transition_error TEXT,
+            restore_status TEXT, restored_storage_path TEXT, restore_expires_at TEXT, storage_path TEXT NOT NULL,
+            user_metadata TEXT NOT NULL DEFAULT '{}', checksum_crc32 TEXT, checksum_crc32c TEXT,
+            checksum_sha1 TEXT, checksum_sha256 TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            UNIQUE(bucket, key_name, version_id)
+        )");
         $connection->exec('CREATE TABLE s3_tier_transition_jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL)');
         $connection->exec("INSERT INTO s3_tier_transition_jobs (id, status) VALUES (1, 'pending')");
         // The physical garbage queue was introduced in v14 and gained

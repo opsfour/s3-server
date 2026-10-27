@@ -70,7 +70,8 @@ final class AuthorizedObjectSnapshot
      *     bool,
      *     array<string, string>,
      *     array<string, string>,
-     *     string
+     *     string,
+     *     ?string
      * }|null
      */
     public static function identity(?ObjectInfo $object): ?array
@@ -108,6 +109,7 @@ final class AuthorizedObjectSnapshot
             $userMetadata,
             $systemMetadata,
             $object->lastModified->format('U.u'),
+            $object->partLayout?->digest,
         ];
     }
 }

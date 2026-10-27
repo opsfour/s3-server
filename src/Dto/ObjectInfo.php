@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Dto;
 
+use OpsFour\S3Server\Metadata\ObjectPartLayoutSummary;
+
 /**
  * Data transfer object representing S3 object metadata.
  */
@@ -52,5 +54,6 @@ final readonly class ObjectInfo
         public array $systemMetadata = [],
         public \DateTimeImmutable $lastModified = new \DateTimeImmutable(),
         public ?string $restoredStorageTier = null,
+        public ?ObjectPartLayoutSummary $partLayout = null,
     ) {}
 }

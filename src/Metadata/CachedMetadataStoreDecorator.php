@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -311,6 +311,21 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
     public function objectExists(string $bucket, string $key): bool
     {
         return $this->inner->objectExists($bucket, $key);
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return $this->inner instanceof ObjectPartLayoutStore && $this->inner->supportsObjectPartLayouts();
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        ObjectPartLayoutCapability::require($this->inner)->putObjectPartLayout($bucket, $key, $versionId, $layout);
+    }
+
+    public function getObjectPartLayout(ObjectInfo $object): ObjectPartLayout
+    {
+        return ObjectPartLayoutCapability::require($this->inner)->getObjectPartLayout($object);
     }
 
     public function updateObjectPlacement(

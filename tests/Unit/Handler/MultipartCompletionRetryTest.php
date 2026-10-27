@@ -39,6 +39,7 @@ use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -553,13 +554,18 @@ final class MultipartCompletionRetryTest extends TestCase
             $source->path,
         );
         $cancellation = new \Amp\CancelledException();
-        $metadata = $this->createMock(MetadataStore::class);
-        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
-            $name = $method->getName();
-            if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true)) {
-                continue;
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        foreach ([MetadataStore::class, ObjectPartLayoutStore::class] as $contract) {
+            foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
+                $name = $method->getName();
+                if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true)) {
+                    continue;
+                }
+                $metadata->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
             }
-            $metadata->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
         }
         $metadata->method('transaction')->willThrowException($cancellation);
         $metadata->method('enqueueStorageGarbage')->willThrowException(new \RuntimeException('cleanup queue failed'));
@@ -2316,6 +2322,74 @@ final class MultipartCompletionRetryTest extends TestCase
         $this->assertConcurrentPartReplacementRejected(false, true);
     }
 
+    public function test_completion_rejects_checksum_only_part_change_after_assembly(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata, $this->encryption))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $uploaded = (new UploadPartHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'original'));
+        $etag = $uploaded->getHeader('ETag');
+        self::assertNotNull($etag);
+        $stored = $this->metadata->getParts($uploadId)[0];
+        $this->metadata->putPartWithChecksum(
+            $uploadId,
+            1,
+            $stored['etag'],
+            $stored['size'],
+            $stored['storage_path'],
+            'SHA256',
+            'checksum-before-assembly',
+        );
+
+        $assembledPath = null;
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->method('planMultipartCompletionPaths')->willReturnCallback($this->storage->planMultipartCompletionPaths(...));
+        $storage->method('assembleMultipartUploadAtPath')->willReturnCallback(
+            function (string $bucket, string $key, string $id, array $parts, string $path) use ($uploadId, $stored, &$assembledPath): StorageWriteResult {
+                $assembled = $this->storage->assembleMultipartUploadAtPath($bucket, $key, $id, $parts, $path);
+                $assembledPath = $assembled->path;
+                $this->metadata->putPartWithChecksum(
+                    $uploadId,
+                    1,
+                    $stored['etag'],
+                    $stored['size'],
+                    $stored['storage_path'],
+                    'SHA256',
+                    'checksum-after-assembly',
+                );
+
+                return $assembled;
+            },
+        );
+        $storage->method('deleteObjectByPath')->willReturnCallback($this->storage->deleteObjectByPath(...));
+        $storage->method('abortMultipartUpload')->willReturnCallback($this->storage->abortMultipartUpload(...));
+
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))->handleRequest(
+                $this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body),
+            );
+            self::fail('Completion published an object after selected-part checksum metadata changed.');
+        } catch (InvalidPartException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertNotNull($assembledPath);
+            self::assertStoragePathMissing($this->storage, $assembledPath);
+            $currentPart = $this->metadata->getParts($uploadId)[0];
+            self::assertSame($stored['etag'], $currentPart['etag']);
+            self::assertSame($stored['size'], $currentPart['size']);
+            self::assertSame($stored['storage_path'], $currentPart['storage_path']);
+            self::assertSame('SHA256', $currentPart['checksum_algorithm'] ?? null);
+            self::assertSame('checksum-after-assembly', $currentPart['checksum_value'] ?? null);
+            $pdo = new \PDO('sqlite:' . $this->databasePath);
+            $layoutCount = $pdo->query('SELECT COUNT(*) FROM s3_object_parts');
+            self::assertInstanceOf(\PDOStatement::class, $layoutCount);
+            self::assertSame(0, (int) $layoutCount->fetchColumn());
+        }
+    }
+
     private function assertConcurrentPartReplacementRejected(bool $copy, bool $versioned = false): void
     {
         if ($versioned) {
@@ -3490,12 +3564,13 @@ final class MultipartCompletionRetryTest extends TestCase
         }
     }
 
-    private function metadataWithLostCompletionAck(): MetadataStore&MultipartWriteIntentStore
+    private function metadataWithLostCompletionAck(): MetadataStore&MultipartWriteIntentStore&ObjectPartLayoutStore
     {
-        $proxy = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, MultipartWriteIntentStore::class]);
+        $proxy = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, MultipartWriteIntentStore::class, ObjectPartLayoutStore::class]);
         self::assertInstanceOf(MetadataStore::class, $proxy);
         self::assertInstanceOf(MultipartWriteIntentStore::class, $proxy);
-        foreach ([MetadataStore::class, MultipartWriteIntentStore::class] as $contract) {
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $proxy);
+        foreach ([MetadataStore::class, MultipartWriteIntentStore::class, ObjectPartLayoutStore::class] as $contract) {
             foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
                 $name = $method->getName();
                 if ($name === 'transaction') {
@@ -3542,18 +3617,20 @@ final class MultipartCompletionRetryTest extends TestCase
         return $proxy;
     }
 
-    private function metadataWithCleanupFailures(bool $failAbandon = false): MetadataStore&FencedMultipartPartWriteIntentStore&MultipartWriteIntentStore
+    private function metadataWithCleanupFailures(bool $failAbandon = false): MetadataStore&FencedMultipartPartWriteIntentStore&MultipartWriteIntentStore&ObjectPartLayoutStore
     {
         $proxy = $this->createMockForIntersectionOfInterfaces([
             MetadataStore::class,
             FencedMultipartPartWriteIntentStore::class,
             MultipartWriteIntentStore::class,
+            ObjectPartLayoutStore::class,
         ]);
         self::assertInstanceOf(MetadataStore::class, $proxy);
         self::assertInstanceOf(FencedMultipartPartWriteIntentStore::class, $proxy);
         self::assertInstanceOf(MultipartWriteIntentStore::class, $proxy);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $proxy);
         $seen = [];
-        foreach ([MetadataStore::class, FencedMultipartPartWriteIntentStore::class, MultipartWriteIntentStore::class] as $contract) {
+        foreach ([MetadataStore::class, FencedMultipartPartWriteIntentStore::class, MultipartWriteIntentStore::class, ObjectPartLayoutStore::class] as $contract) {
             foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
                 $name = $method->getName();
                 if (isset($seen[$name]) || $name === 'enqueueStorageGarbage' || ($failAbandon && $name === 'abandonMultipartWriteIntent')) {

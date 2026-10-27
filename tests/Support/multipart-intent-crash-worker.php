@@ -19,6 +19,7 @@ use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
+use OpsFour\S3Server\Multipart\MultipartAclSnapshot;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 
@@ -39,6 +40,11 @@ $policyContext = [
     PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY
         => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
     PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+    MultipartAclSnapshot::METADATA_KEY => json_encode([[
+        'granteeType' => 'CanonicalUser',
+        'granteeId' => 'owner',
+        'permission' => 'FULL_CONTROL',
+    ]], JSON_THROW_ON_ERROR),
 ];
 $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner', userMetadata: $usesSse
     ? [

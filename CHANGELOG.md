@@ -8,6 +8,10 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
+  MySQL, including completion-order boundaries, original upload part numbers,
+  and verified optional part checksums. Legacy layouts are classified by a
+  bounded, resumable maintenance migration without inventing boundaries.
 - Add `BucketOwnerPreferred` for ordinary PUT, signed browser POST, and
   CopyObject writes, with exact canned-ACL transfer, canonical bucket-owner
   ACLs, stable quota ownership, and version-specific persistence.

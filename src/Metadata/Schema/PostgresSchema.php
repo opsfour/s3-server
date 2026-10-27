@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 43;
+    public const int VERSION = 44;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -208,6 +208,10 @@ final class PostgresSchema
                 checksum_crc32c TEXT,
                 checksum_sha1 TEXT,
                 checksum_sha256 TEXT,
+                part_layout_kind TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown')),
+                part_layout_count INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000),
+                part_layout_compat_count INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000),
+                part_layout_digest TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 noncurrent_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -224,6 +228,26 @@ final class PostgresSchema
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_tier_state ON s3_objects(storage_tier, transition_status, restore_status)',
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_transition_target_tier ON s3_objects(transition_target_tier)',
             'CREATE INDEX IF NOT EXISTS idx_s3_objects_noncurrent_at ON s3_objects(bucket, is_latest, is_delete_marker, noncurrent_at)',
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_parts (
+                object_id BIGINT NOT NULL REFERENCES s3_objects(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 10000),
+                upload_part_number INTEGER CHECK (upload_part_number BETWEEN 1 AND 10000),
+                plaintext_offset BIGINT NOT NULL CHECK (plaintext_offset >= 0),
+                plaintext_size BIGINT NOT NULL CHECK (plaintext_size >= 0),
+                checksum_algorithm TEXT,
+                checksum_value TEXT,
+                PRIMARY KEY (object_id, ordinal)
+            )
+            SQL,
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (
+                migration_name TEXT PRIMARY KEY,
+                last_object_id BIGINT NOT NULL,
+                target_object_id BIGINT
+            )
+            SQL,
 
             // Multipart uploads
             <<<'SQL'
@@ -944,6 +968,26 @@ final class PostgresSchema
         if ($fromVersion < 43) {
             $statements[] = 'ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS recovery_admission BOOLEAN NOT NULL DEFAULT FALSE';
             array_push($statements, ...self::storageCleanupCapacityStatements());
+        }
+        if ($fromVersion < 44) {
+            $statements[] = "ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS part_layout_kind TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown'))";
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS part_layout_count INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000)';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS part_layout_compat_count INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000)';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS part_layout_digest TEXT';
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_parts (
+                object_id BIGINT NOT NULL REFERENCES s3_objects(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 10000),
+                upload_part_number INTEGER CHECK (upload_part_number BETWEEN 1 AND 10000),
+                plaintext_offset BIGINT NOT NULL CHECK (plaintext_offset >= 0),
+                plaintext_size BIGINT NOT NULL CHECK (plaintext_size >= 0),
+                checksum_algorithm TEXT,
+                checksum_value TEXT,
+                PRIMARY KEY (object_id, ordinal)
+            )
+            SQL;
+            $statements[] = 'CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name TEXT PRIMARY KEY, last_object_id BIGINT NOT NULL, target_object_id BIGINT)';
+            $statements[] = 'ALTER TABLE s3_migration_checkpoints ADD COLUMN IF NOT EXISTS target_object_id BIGINT';
         }
 
         return $statements;

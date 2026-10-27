@@ -213,9 +213,15 @@ The DML-only serving role does not need trigger-creation rights.
 | 46 (MySQL) | Widen lifecycle rule IDs stored with tier-transition jobs to 1,020 bytes so the public 255-Unicode-character limit is portable across metadata backends. |
 | 47 (MySQL) | Expose the expected capacity-trigger count through a narrow definer-security function so DML-only serving nodes fail closed after trigger removal. |
 | 40 (SQLite) / 43 (PostgreSQL) / 48 (MySQL) | Add immutable cleanup admission classes, an exact singleton cleanup counter, and trigger-enforced 900,000 normal / 1,000,000 recovery boundaries. |
+| 41 (SQLite) / 44 (PostgreSQL) / 49 (MySQL) | Persist incarnation-bound object layout summaries and FK-cascaded logical parts; classify legacy rows in durable 10,000-row keyset batches without inferring multipart boundaries. |
 
-SQLite currently uses schema version `40`; PostgreSQL uses `43`, and MySQL
-uses `48`. SQLite applies each migration version in a transaction. PostgreSQL DDL is
+SQLite currently uses schema version `41`; PostgreSQL uses `44`, and MySQL
+uses `49`. SQLite normally applies each migration version in a transaction. The
+object-layout migration commits each 10,000-row keyset batch with a durable
+checkpoint containing its fixed starting high-water ID and publishes the new
+schema version only after the final batch. Rows beyond that target abort schema
+publication.
+PostgreSQL and MySQL use the same bounded checkpoint protocol. PostgreSQL DDL is
 retry-safe and records the new version only after every statement succeeds.
 MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error
@@ -286,6 +292,13 @@ value atomically with the part row. A missing or disabled capability returns
 HTTP 501 before metadata or storage access. Cached and observed decorators
 delegate this decision to their wrapped store instead of advertising it on the
 store's behalf.
+
+Every serving metadata path must implement `ObjectPartLayoutStore` and report
+the capability enabled. Object publication and its layout must share one
+metadata transaction, layout reads must verify the digest carried by the
+resolved `ObjectInfo`, and deletes/replacements must remove child rows with the
+same commit. Startup rejects custom stores and decorators that omit or disable
+this capability.
 
 Custom metadata stores that allow an empty PutObjectRetention configuration to
 clear eligible retention must implement `ObjectRetentionDeletionStore`.

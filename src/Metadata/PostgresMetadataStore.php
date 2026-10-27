@@ -29,10 +29,13 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
+
+    /** @var \WeakMap<object, array<int, true>> */
+    private \WeakMap $objectPartLayoutPublicationIds;
 
     private ?string $creationDsnFingerprint = null;
 
@@ -40,6 +43,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         private readonly PostgresConnectionPool $pool,
     ) {
         $this->fiberTxMap = new \WeakMap();
+        $this->objectPartLayoutPublicationIds = new \WeakMap();
     }
 
     public static function fromDsn(string $dsn): self
@@ -126,6 +130,9 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         foreach (PostgresSchema::getCreateStatements() as $sql) {
             $this->pool->execute($sql);
         }
+        if ($currentVersion > 0) {
+            $this->backfillLegacyObjectPartLayouts();
+        }
         $this->assertSupportedBucketEncryptionInventory();
 
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
@@ -137,6 +144,146 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             'INSERT INTO s3_schema_version (version, description) VALUES ($1, $2)',
             [PostgresSchema::VERSION, 'Schema version ' . PostgresSchema::VERSION],
         );
+    }
+
+    private function backfillLegacyObjectPartLayouts(): void
+    {
+        $this->initializeObjectPartLayoutMigrationTarget();
+        while (true) {
+            $transaction = $this->pool->beginTransaction();
+            try {
+                $checkpoint = $transaction->execute("SELECT last_object_id, target_object_id FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts' FOR UPDATE")->fetchRow();
+                if ($checkpoint === null || $checkpoint['target_object_id'] === null) {
+                    throw new \RuntimeException('Object part layout migration target cannot be read.');
+                }
+                $lastId = self::int($checkpoint['last_object_id']);
+                $targetId = self::int($checkpoint['target_object_id']);
+                if ($lastId > $targetId) {
+                    throw new \RuntimeException('Object part layout migration checkpoint exceeds its fixed target.');
+                }
+                $result = $transaction->execute('SELECT id, etag, size, is_delete_marker FROM s3_objects WHERE id > $1 AND id <= $2 ORDER BY id LIMIT 10000', [$lastId, $targetId]);
+                $rows = [];
+                while (($row = $result->fetchRow()) !== null) {
+                    $rows[] = $row;
+                }
+                if ($rows === []) {
+                    if ($transaction->execute('SELECT 1 FROM s3_objects WHERE id > $1 LIMIT 1', [$targetId])->fetchRow() !== null) {
+                        throw new \RuntimeException('Object rows were created beyond the fixed object-layout migration target.');
+                    }
+                    $transaction->commit();
+                    return;
+                }
+                foreach (array_chunk($rows, 500) as $chunk) {
+                    $this->writeLegacyObjectPartLayoutBatch($transaction, $chunk);
+                }
+                $lastRow = $rows[array_key_last($rows)];
+                $lastId = self::int($lastRow['id']);
+                $transaction->execute("UPDATE s3_migration_checkpoints SET last_object_id = $1 WHERE migration_name = 'object_part_layouts'", [$lastId]);
+                $transaction->commit();
+            } catch (\Throwable $error) {
+                $transaction->rollback();
+                throw $error;
+            }
+        }
+    }
+
+    /**
+     * @param list<array<string, mixed>> $rows
+     */
+    private function writeLegacyObjectPartLayoutBatch(PostgresTransaction $transaction, array $rows): void
+    {
+        $parentValues = [];
+        $parentParams = [];
+        $objectIds = [];
+        $knownSingles = [];
+
+        foreach ($rows as $row) {
+            $objectId = self::int($row['id']);
+            $objectIds[] = $objectId;
+            if ((bool) $row['is_delete_marker']) {
+                $kind = null;
+                $partCount = null;
+                $compatibilityPartCount = null;
+                $digest = null;
+            } else {
+                $layout = ObjectPartLayout::legacy(self::str($row['etag']), self::int($row['size']));
+                $summary = $layout->summary($objectId);
+                $kind = $summary->kind;
+                $partCount = $summary->partCount;
+                $compatibilityPartCount = $summary->compatibilityPartCount;
+                $digest = $summary->digest;
+                if ($summary->kind === ObjectPartLayout::KNOWN_SINGLE) {
+                    $knownSingles[] = [$objectId, self::int($row['size'])];
+                }
+            }
+
+            $offset = count($parentParams);
+            $parentValues[] = sprintf(
+                '($%d::BIGINT, $%d::VARCHAR, $%d::INTEGER, $%d::INTEGER, $%d::CHAR(64))',
+                $offset + 1,
+                $offset + 2,
+                $offset + 3,
+                $offset + 4,
+                $offset + 5,
+            );
+            array_push($parentParams, $objectId, $kind, $partCount, $compatibilityPartCount, $digest);
+        }
+
+        $transaction->execute(
+            'UPDATE s3_objects AS objects '
+            . 'SET part_layout_kind = migrated.kind, part_layout_count = migrated.part_count, '
+            . 'part_layout_compat_count = migrated.compatibility_part_count, part_layout_digest = migrated.digest '
+            . 'FROM (VALUES ' . implode(', ', $parentValues) . ') AS migrated(id, kind, part_count, compatibility_part_count, digest) '
+            . 'WHERE objects.id = migrated.id',
+            $parentParams,
+        );
+
+        $deletePlaceholders = [];
+        foreach (array_keys($objectIds) as $index) {
+            $deletePlaceholders[] = '$' . ($index + 1);
+        }
+        $transaction->execute(
+            'DELETE FROM s3_object_parts WHERE object_id IN (' . implode(', ', $deletePlaceholders) . ')',
+            $objectIds,
+        );
+
+        if ($knownSingles === []) {
+            return;
+        }
+
+        $childValues = [];
+        $childParams = [];
+        foreach ($knownSingles as [$objectId, $size]) {
+            $offset = count($childParams);
+            $childValues[] = sprintf('($%d::BIGINT, 1, NULL, 0, $%d::BIGINT, NULL, NULL)', $offset + 1, $offset + 2);
+            array_push($childParams, $objectId, $size);
+        }
+        $transaction->execute(
+            'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES '
+            . implode(', ', $childValues),
+            $childParams,
+        );
+    }
+
+    private function initializeObjectPartLayoutMigrationTarget(): void
+    {
+        $transaction = $this->pool->beginTransaction();
+        try {
+            $checkpoint = $transaction->execute("SELECT target_object_id FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts' FOR UPDATE")->fetchRow();
+            if ($checkpoint === null) {
+                $maximum = $transaction->execute('SELECT COALESCE(MAX(id), 0) AS target_object_id FROM s3_objects')->fetchRow();
+                if ($maximum === null) {
+                    throw new \RuntimeException('Object part layout migration target cannot be established.');
+                }
+                $transaction->execute("INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', 0, $1)", [self::int($maximum['target_object_id'])]);
+            } elseif ($checkpoint['target_object_id'] === null) {
+                $transaction->execute("UPDATE s3_migration_checkpoints SET target_object_id = (SELECT COALESCE(MAX(id), 0) FROM s3_objects) WHERE migration_name = 'object_part_layouts'");
+            }
+            $transaction->commit();
+        } catch (\Throwable $error) {
+            $transaction->rollback();
+            throw $error;
+        }
     }
 
     private function assertWriteIntentCapacityConsistent(): void
@@ -448,24 +595,33 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     $checksumSha256, $now, $now,
                 ],
             );
+            $objectRow = $this->conn()->execute("SELECT id FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'", [$bucket, $key])->fetchRow();
+            if ($objectRow === null) {
+                throw new \RuntimeException('New object incarnation cannot be resolved for its part layout.');
+            }
+            $this->authorizeObjectPartLayoutPublication(self::int($objectRow['id']));
+            $this->putObjectPartLayout($bucket, $key, 'null', ObjectPartLayout::knownSingle($size));
         });
     }
 
-    private function clearNullVersionMetadata(string $bucket, string $key): void
+    private function clearNullVersionMetadata(string $bucket, string $key, ?PostgresLink $link = null): void
     {
-        $this->conn()->execute(
+        $link ??= $this->conn();
+        $link->execute("DELETE FROM s3_object_parts WHERE object_id IN (SELECT id FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = 'null')", [$bucket, $key]);
+        $link->execute("UPDATE s3_objects SET part_layout_kind = NULL, part_layout_count = NULL, part_layout_compat_count = NULL, part_layout_digest = NULL WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'", [$bucket, $key]);
+        $link->execute(
             "DELETE FROM s3_object_retention WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             "DELETE FROM s3_object_legal_holds WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = $1 AND key_name = $2 AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             'DELETE FROM s3_acls WHERE resource_type = $1 AND resource_name IN ($2, $3)',
             [
                 'object',
@@ -473,6 +629,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 \OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, 'null'),
             ],
         );
+        $link->execute("DELETE FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'", [$bucket, $key]);
     }
 
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
@@ -486,7 +643,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND is_latest = TRUE AND is_delete_marker = FALSE
             SQL,
@@ -508,7 +665,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND is_latest = TRUE
             SQL,
@@ -535,6 +692,89 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         );
 
         return $result->fetchRow() !== null;
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return true;
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        if ($this->fiberTransaction() === null) {
+            throw new \LogicException('Object part layouts must be published inside the object metadata transaction.');
+        }
+        $row = $this->conn()->execute('SELECT id, size, is_delete_marker FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = $3', [$bucket, $key, $versionId])->fetchRow();
+        if ($row === null || (bool) $row['is_delete_marker'] || self::int($row['size']) !== $layout->objectSize) {
+            throw new \RuntimeException('Object part layout does not match a concrete object row.');
+        }
+        $objectId = self::int($row['id']);
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null) {
+            throw new \LogicException('Object part layouts must be published inside the object metadata transaction.');
+        }
+        $publicationIds = $this->objectPartLayoutPublicationIds[$fiber] ?? [];
+        if (! isset($publicationIds[$objectId])) {
+            throw new \LogicException('Published object part layouts are immutable.');
+        }
+        $this->conn()->execute('DELETE FROM s3_object_parts WHERE object_id = $1', [$objectId]);
+        $summary = $layout->summary($objectId);
+        $this->conn()->execute('UPDATE s3_objects SET part_layout_kind = $1, part_layout_count = $2, part_layout_compat_count = $3, part_layout_digest = $4 WHERE id = $5', [$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $objectId]);
+        foreach (array_chunk($layout->parts, 500) as $parts) {
+            $values = [];
+            $params = [];
+            foreach ($parts as $part) {
+                $offset = count($params);
+                $values[] = sprintf(
+                    '($%d::BIGINT, $%d::INTEGER, $%d::INTEGER, $%d::BIGINT, $%d::BIGINT, $%d::VARCHAR, $%d::TEXT)',
+                    $offset + 1,
+                    $offset + 2,
+                    $offset + 3,
+                    $offset + 4,
+                    $offset + 5,
+                    $offset + 6,
+                    $offset + 7,
+                );
+                array_push($params, $objectId, $part->ordinal, $part->uploadPartNumber, $part->offset, $part->size, $part->checksumAlgorithm, $part->checksumValue);
+            }
+            $this->conn()->execute(
+                'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES '
+                . implode(', ', $values),
+                $params,
+            );
+        }
+    }
+
+    public function getObjectPartLayout(ObjectInfo $object): ObjectPartLayout
+    {
+        $expected = $object->partLayout;
+        if ($object->isDeleteMarker || $expected === null) {
+            throw new \RuntimeException('Object metadata has no authoritative part layout.');
+        }
+        $row = $this->conn()->execute('SELECT id, size, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = $3', [$object->bucket, $object->key, $object->versionId ?? 'null'])->fetchRow();
+        if ($row === null) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        if ($row['part_layout_count'] === null || $row['part_layout_digest'] === null) {
+            throw new \RuntimeException('Stored object part layout summary is incomplete.');
+        }
+        if (! hash_equals($expected->digest, self::str($row['part_layout_digest']))) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        $parts = [];
+        $result = $this->conn()->execute('SELECT ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value FROM s3_object_parts WHERE object_id = $1 ORDER BY ordinal', [self::int($row['id'])]);
+        while (($part = $result->fetchRow()) !== null) {
+            $parts[] = new ObjectPart(self::int($part['ordinal']), $part['upload_part_number'] === null ? null : self::int($part['upload_part_number']), self::int($part['plaintext_offset']), self::int($part['plaintext_size']), $part['checksum_algorithm'] === null ? null : self::str($part['checksum_algorithm']), $part['checksum_value'] === null ? null : self::str($part['checksum_value']));
+        }
+        if (self::int($row['part_layout_count']) !== $expected->partCount || self::int($row['part_layout_count']) !== count($parts)) {
+            throw new \RuntimeException('Stored object part layout count is inconsistent.');
+        }
+        $layout = new ObjectPartLayout(self::str($row['part_layout_kind']), self::int($row['size']), $parts, $row['part_layout_compat_count'] === null ? null : self::int($row['part_layout_compat_count']));
+        if (! hash_equals($expected->digest, $layout->digestForObject(self::int($row['id'])))) {
+            throw new \RuntimeException('Stored object part layout digest is inconsistent.');
+        }
+
+        return $layout;
     }
 
     public function updateObjectPlacement(
@@ -934,7 +1174,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
             . 'FROM s3_objects WHERE bucket = $1 AND is_latest = TRUE AND is_delete_marker = FALSE';
 
         $params = [$bucket];
@@ -2025,6 +2265,18 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     $checksumSha256, $now, $now,
                 ],
             );
+            $layout = ObjectPartLayout::knownSingle($size);
+            $objectRow = $link->execute('SELECT id FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = $3', [$bucket, $key, $versionId])->fetchRow();
+            if ($objectRow === null) {
+                throw new \RuntimeException('New object version cannot be resolved for its part layout.');
+            }
+            $objectId = self::int($objectRow['id']);
+            if ($existingTx !== null) {
+                $this->authorizeObjectPartLayoutPublication($objectId);
+            }
+            $summary = $layout->summary($objectId);
+            $link->execute('UPDATE s3_objects SET part_layout_kind = $1, part_layout_count = $2, part_layout_compat_count = $3, part_layout_digest = $4 WHERE id = $5', [$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $objectId]);
+            $link->execute('INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES ($1, 1, NULL, 0, $2, NULL, NULL)', [$objectId, $size]);
 
             if ($ownTx) {
                 $link->commit();
@@ -2057,7 +2309,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
 
             if ($suspended) {
                 // Suspended: upsert delete marker with version_id='null'.
-                $this->clearNullVersionMetadata($bucket, $key);
+                $this->clearNullVersionMetadata($bucket, $key, $link);
                 $link->execute(
                     <<<'SQL'
                     INSERT INTO s3_objects (
@@ -2141,7 +2393,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, noncurrent_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND version_id = $3
             SQL,
@@ -2245,7 +2497,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = $1';
 
         $params = [$bucket];
@@ -3992,6 +4244,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             throw new \LogicException('Nested beginTransaction() is unsupported; use transaction() to join the current transaction.');
         }
         $this->fiberTxMap[$fiber] = $this->pool->beginTransaction();
+        $this->objectPartLayoutPublicationIds[$fiber] = [];
     }
 
     public function commit(): void
@@ -4002,6 +4255,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
         $transaction = $this->fiberTxMap[$fiber];
         unset($this->fiberTxMap[$fiber]);
+        unset($this->objectPartLayoutPublicationIds[$fiber]);
         $transaction->commit();
     }
 
@@ -4013,6 +4267,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
         $transaction = $this->fiberTxMap[$fiber];
         unset($this->fiberTxMap[$fiber]);
+        unset($this->objectPartLayoutPublicationIds[$fiber]);
         $transaction->rollback();
     }
 
@@ -4131,6 +4386,17 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return ($fiber !== null && isset($this->fiberTxMap[$fiber])) ? $this->fiberTxMap[$fiber] : null;
     }
 
+    private function authorizeObjectPartLayoutPublication(int $objectId): void
+    {
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || ! isset($this->fiberTxMap[$fiber])) {
+            throw new \LogicException('Object part layout publication authority requires an active transaction.');
+        }
+        $publicationIds = $this->objectPartLayoutPublicationIds[$fiber] ?? [];
+        $publicationIds[$objectId] = true;
+        $this->objectPartLayoutPublicationIds[$fiber] = $publicationIds;
+    }
+
     /** @param array<string, mixed> $row */
     private function rowToBucketInfo(array $row): BucketInfo
     {
@@ -4220,7 +4486,33 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             systemMetadata: $systemMetadata,
             lastModified: $lastModified,
             restoredStorageTier: isset($row['restored_storage_tier']) ? self::str($row['restored_storage_tier']) : null,
+            partLayout: $this->rowToObjectPartLayoutSummary($row),
         );
+    }
+
+    /** @param array<string, mixed> $row */
+    private function rowToObjectPartLayoutSummary(array $row): ?ObjectPartLayoutSummary
+    {
+        if ((bool) ($row['is_delete_marker'] ?? false)) {
+            foreach (['part_layout_kind', 'part_layout_count', 'part_layout_compat_count', 'part_layout_digest'] as $field) {
+                if (array_key_exists($field, $row) && $row[$field] !== null) {
+                    throw new \RuntimeException('Current metadata schema contains a delete marker with an object part layout.');
+                }
+            }
+
+            return null;
+        }
+        if (($row['part_layout_kind'] ?? null) === null) {
+            if (array_key_exists('part_layout_kind', $row)) {
+                throw new \RuntimeException('Current metadata schema contains an object without a part layout.');
+            }
+            return null;
+        }
+        if (($row['part_layout_count'] ?? null) === null || ($row['part_layout_digest'] ?? null) === null) {
+            throw new \RuntimeException('Current metadata schema contains an incomplete object part layout summary.');
+        }
+
+        return new ObjectPartLayoutSummary(self::str($row['part_layout_kind']), self::int($row['part_layout_count']), $row['part_layout_compat_count'] === null ? null : self::int($row['part_layout_compat_count']), self::str($row['part_layout_digest']));
     }
 
     /**

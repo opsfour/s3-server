@@ -435,6 +435,7 @@ final readonly class CurrentObjectReadAuthorizationMiddleware implements Middlew
             'userMetadata' => $userMetadata,
             'systemMetadata' => $systemMetadata,
             'lastModified' => $object->lastModified->format('U.u'),
+            'partLayoutDigest' => $object->partLayout?->digest,
         ];
     }
 }

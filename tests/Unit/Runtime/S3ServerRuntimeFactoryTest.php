@@ -11,6 +11,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\SseS3Capability;
 use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
@@ -71,6 +72,28 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::PutObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::RestoreObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::SelectObjectContent));
+    }
+
+    public function test_create_rejects_metadata_without_object_layout_capability_before_runtime_mutation(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Metadata store does not support authoritative object part layouts.');
+        $this->createRuntimeWithMetadata($metadata, new MetricsCollector());
+    }
+
+    public function test_create_rejects_explicitly_disabled_object_layout_capability(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore) {
+            throw new \LogicException('Intersection mock is missing the metadata-store interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(false);
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Metadata store does not support authoritative object part layouts.');
+        $this->createRuntimeWithMetadata($metadata, new MetricsCollector());
     }
 
     public function test_create_builds_encryption_from_environment(): void

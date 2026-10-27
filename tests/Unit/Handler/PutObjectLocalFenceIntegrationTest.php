@@ -14,6 +14,7 @@ use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -84,9 +85,25 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
         self::assertSame('STANDARD', $object->storageTier);
         self::assertSame('"' . md5($payload) . '"', $object->etag);
         self::assertSame(base64_encode(hash('sha256', $payload, true)), $object->systemMetadata['checksum-sha256']);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $object->partLayout?->kind);
+        $layout = $this->metadata->getObjectPartLayout($object);
+        self::assertSame(0, $layout->parts[0]->offset);
+        self::assertSame(strlen($payload), $layout->parts[0]->size);
         $path = $object->systemMetadata['storagePath'];
         self::assertSame($payload, file_get_contents($path));
         self::assertNull($this->metadata->getObjectWriteIntent(substr($path, -32)));
+    }
+
+    public function test_zero_byte_put_publishes_one_exact_logical_part(): void
+    {
+        self::assertSame(200, $this->handler()->handleRequest($this->request(''))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $layout = $this->metadata->getObjectPartLayout($object);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $layout->kind);
+        self::assertCount(1, $layout->parts);
+        self::assertSame(0, $layout->parts[0]->offset);
+        self::assertSame(0, $layout->parts[0]->size);
     }
 
     public function test_preferred_transfer_reserves_intent_for_writer_but_persists_bucket_owner(): void

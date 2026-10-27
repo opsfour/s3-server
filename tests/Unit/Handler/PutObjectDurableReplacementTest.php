@@ -10,6 +10,7 @@ use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -100,13 +101,21 @@ final class PutObjectDurableReplacementTest extends TestCase
         $storage = new InMemoryBackend();
         $storage->createBucket('bucket');
         $cancellation = new \Amp\CancelledException();
-        $metadata = $this->createMock(MetadataStore::class);
-        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
-            $name = $method->getName();
-            if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true)) {
-                continue;
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
+        $configured = [];
+        foreach ([MetadataStore::class, ObjectPartLayoutStore::class] as $contract) {
+            foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
+                $name = $method->getName();
+                if (in_array($name, ['transaction', 'enqueueStorageGarbage'], true) || isset($configured[$name])) {
+                    continue;
+                }
+                $configured[$name] = true;
+                $metadata->method($name)->willReturnCallback(
+                    fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments),
+                );
             }
-            $metadata->method($name)->willReturnCallback(fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments));
         }
         $metadata->method('transaction')->willThrowException($cancellation);
         $metadata->method('enqueueStorageGarbage')->willThrowException(new \RuntimeException('cleanup queue failed'));

@@ -11,6 +11,7 @@ use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -32,6 +33,7 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
 
 final class StorageWriteFenceStartupGuardTest extends TestCase
 {
@@ -562,7 +564,7 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
             notificationWorkerEnabled: false,
             allowUnfencedStorageForTests: true,
         );
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $storage = new InMemoryBackend();
         $server = new S3Server($config, $metadata, $storage);
         $registry = $server->getHandlerRegistry();
@@ -651,7 +653,7 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
         $port = (int) substr($address, strrpos($address, ':') + 1);
         fclose($socket);
 
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $server = new S3Server(new S3ServerConfig(
             host: '127.0.0.1',
             port: $port,
@@ -687,5 +689,16 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
         (new \ReflectionProperty(FilesystemBackend::class, 'basePath'))->setValue($filesystem, $basePath);
 
         return $filesystem;
+    }
+
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+
+        return $metadata;
     }
 }

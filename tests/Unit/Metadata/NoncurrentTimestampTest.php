@@ -123,6 +123,7 @@ final class NoncurrentTimestampTest extends TestCase
         $pdo->exec('DROP INDEX idx_s3_objects_noncurrent_at');
         $pdo->exec('ALTER TABLE s3_objects DROP COLUMN noncurrent_at');
         $pdo->exec('DELETE FROM s3_schema_version WHERE version >= 36');
+        $pdo->exec("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
         $pdo->prepare('UPDATE s3_objects SET created_at = ? WHERE version_id = ?')
             ->execute(['2000-01-01T00:00:00Z', $first]);
         $migrationStarted = new \DateTimeImmutable('-5 seconds');

@@ -221,6 +221,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 'etag' => $storedEtag,
                 'size' => $storedPartsMap[$partNumber]['size'],
                 'storagePath' => $storedPartsMap[$partNumber]['storage_path'],
+                'checksumAlgorithm' => $storedPartsMap[$partNumber]['checksum_algorithm'] ?? null,
+                'checksumValue' => $storedPartsMap[$partNumber]['checksum_value'] ?? null,
             ];
         }
 
@@ -290,6 +292,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         ) {
             throw new InternalErrorException('Multipart completion requires durable write-intent capable backends.');
         }
+        $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
 
         try {
             $aclGrants = self::storedAclGrants($upload['user_metadata'], $ownerId);
@@ -594,6 +597,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $uploadEncryptionMode,
                     &$versionId,
                     &$cleanupParts,
+                    $partLayouts,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
@@ -648,6 +652,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
+                    $partLayouts->putObjectPartLayout($bucket, $key, $versionId, \OpsFour\S3Server\Metadata\ObjectPartLayout::completedMultipart($writeResult->size, $validatedParts));
                     $this->metadata->updateObjectPlacement(
                         $bucket,
                         $key,
@@ -718,6 +723,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     &$oldObjectToClean,
                     &$oldPathsToClean,
                     &$cleanupParts,
+                    $partLayouts,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
@@ -795,6 +801,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
                     );
+                    $partLayouts->putObjectPartLayout($bucket, $key, 'null', \OpsFour\S3Server\Metadata\ObjectPartLayout::completedMultipart($writeResult->size, $validatedParts));
                     $this->metadata->updateObjectPlacement(
                         $bucket,
                         $key,
@@ -1167,7 +1174,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
      * own transaction so a concurrent quota consumer cannot race this guard.
      *
      * @param array<string, mixed> $upload
-     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $selectedParts
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string, checksumAlgorithm?: ?string, checksumValue?: ?string}> $selectedParts
      */
     private function assertExpectedSizeWithinQuota(
         Request $request,
@@ -1325,7 +1332,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
     }
 
     /**
-     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $selectedParts
+     * @param list<array{partNumber: int, etag: string, size: int, storagePath: string, checksumAlgorithm?: ?string, checksumValue?: ?string}> $selectedParts
      */
     private function assertSelectedPartsUnchanged(string $uploadId, array $selectedParts): void
     {
@@ -1339,7 +1346,9 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             if ($current === null
                 || $current['etag'] !== $selected['etag']
                 || $current['size'] !== $selected['size']
-                || $current['storage_path'] !== $selected['storagePath']) {
+                || $current['storage_path'] !== $selected['storagePath']
+                || ($current['checksum_algorithm'] ?? null) !== ($selected['checksumAlgorithm'] ?? null)
+                || ($current['checksum_value'] ?? null) !== ($selected['checksumValue'] ?? null)) {
                 throw new InvalidPartException('A selected part changed while the multipart upload was being assembled.');
             }
         }

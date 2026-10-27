@@ -10,6 +10,7 @@ use Amp\Http\Server\Response;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Http\ConditionalHeaderEvaluator;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Http\MissingObjectListVisibility;
@@ -120,6 +121,10 @@ final class GetObjectAttributesHandler implements RequestHandler
             && $this->metadata->getBucketVersioning($bucket) !== '';
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
+        \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
+        if (isset($requestedAttrs['ObjectParts']) && $objectInfo->partLayout === null) {
+            throw new InternalErrorException('Object part layout metadata is missing.');
+        }
 
         $writer = new \XMLWriter();
         $writer->openMemory();
@@ -212,18 +217,8 @@ final class GetObjectAttributesHandler implements RequestHandler
 
     private static function writeObjectParts(\XMLWriter $writer, \OpsFour\S3Server\Dto\ObjectInfo $obj): void
     {
-        // Only the established MD5-based multipart ETag format carries a part
-        // count. Other ETags are opaque even when they end in "-N".
-        $etag = $obj->etag;
-        if (strlen($etag) >= 2 && $etag[0] === '"' && $etag[-1] === '"') {
-            $etag = substr($etag, 1, -1);
-        }
-        if (preg_match('/\A[0-9a-f]{32}-([1-9][0-9]{0,4})\z/iD', $etag, $matches) !== 1) {
-            return;
-        }
-
-        $totalParts = (int) $matches[1];
-        if ($totalParts < 1 || $totalParts > 10_000) {
+        $totalParts = $obj->partLayout?->responsePartCount();
+        if ($totalParts === null) {
             return;
         }
 

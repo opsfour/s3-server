@@ -13,7 +13,10 @@ use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
+use OpsFour\S3Server\Metadata\ObjectPart;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -90,9 +93,59 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         $object = $this->metadata->getObjectMetadata('target', 'copied');
         self::assertNotNull($object);
         self::assertSame($versioned, $object->versionId !== null);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $object->partLayout?->kind);
+        $layout = $this->metadata->getObjectPartLayout($object);
+        self::assertSame(0, $layout->parts[0]->offset);
+        self::assertSame(strlen('payload'), $layout->parts[0]->size);
         self::assertSame('payload', file_get_contents($object->systemMetadata['storagePath']));
         self::assertNull($this->metadata->getObjectWriteIntent(substr($object->systemMetadata['storagePath'], -32)));
         self::assertSame([], $this->metadata->dequeueStorageGarbage(10));
+    }
+
+    public function test_copy_flattens_multipart_source_to_known_single_destination(): void
+    {
+        $payload = 'payload';
+        $write = $this->storage->putObject('source', 'key', new ReadableBuffer($payload));
+        $sourceLayout = new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, strlen($payload), [
+            new ObjectPart(1, 8, 0, 3),
+            new ObjectPart(2, 3, 3, 4),
+        ]);
+        $this->metadata->transaction(function () use ($write, $payload, $sourceLayout): void {
+            $this->metadata->putObjectMetadata('source', 'key', 'owner', strlen($payload), '"' . md5($payload) . '"', 'text/plain', $write->path);
+            $this->metadata->putObjectPartLayout('source', 'key', 'null', $sourceLayout);
+        });
+
+        self::assertSame(200, $this->handler()->handleRequest($this->request())->getStatus());
+        $destination = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($destination);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $destination->partLayout?->kind);
+        self::assertCount(1, $this->metadata->getObjectPartLayout($destination)->parts);
+
+        $attributesRequest = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/target/copied?attributes'),
+            ['x-amz-object-attributes' => 'ObjectParts'],
+        );
+        $attributesRequest->setAttribute('s3.bucket', 'target');
+        $attributesRequest->setAttribute('s3.key', 'copied');
+        $attributesRequest->setAttribute('ownerId', 'owner');
+        $body = \Amp\ByteStream\buffer((new GetObjectAttributesHandler($this->metadata))->handleRequest($attributesRequest)->getBody());
+        self::assertStringNotContainsString('<ObjectParts>', $body);
+    }
+
+    public function test_zero_byte_copy_publishes_one_exact_destination_part(): void
+    {
+        $this->source('');
+
+        self::assertSame(200, $this->handler()->handleRequest($this->request())->getStatus());
+        $object = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($object);
+        $layout = $this->metadata->getObjectPartLayout($object);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $layout->kind);
+        self::assertCount(1, $layout->parts);
+        self::assertSame(0, $layout->parts[0]->offset);
+        self::assertSame(0, $layout->parts[0]->size);
     }
 
     public function test_anonymous_copy_intent_is_reserved_for_destination_bucket_owner(): void

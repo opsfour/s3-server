@@ -20,6 +20,8 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Http\AuthorizedObjectSnapshot;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutSummary;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
@@ -179,6 +181,7 @@ final class CurrentObjectReadAuthorizationMiddlewareTest extends TestCase
         yield 'user metadata' => [['userMetadata' => ['color' => 'blue']]];
         yield 'primary storage path' => [['systemMetadata' => ['storagePath' => 'changed-cold-path']]];
         yield 'last modified' => [['lastModified' => new \DateTimeImmutable('2030-01-01T00:00:01Z')]];
+        yield 'part layout digest' => [['partLayout' => new ObjectPartLayoutSummary(ObjectPartLayout::KNOWN_SINGLE, 1, null, str_repeat('a', 64))]];
     }
 
     public function test_head_denies_second_snapshot_drift_without_a_third_attempt(): void

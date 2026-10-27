@@ -267,6 +267,7 @@ final class AccessLogWriter
         if ($this->buffer === []) {
             return;
         }
+        $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
 
         $entries = $this->buffer;
         $this->buffer = [];
@@ -459,7 +460,7 @@ final class AccessLogWriter
 
                 $dispatchToken = $attempt->lease?->stopForCommit();
 
-                $this->metadata->transaction(function () use ($sourceBucket, $sourceOwner, $sourceGeneration, $targetBucket, $targetGeneration, $logKey, $logContent, $bucketEncryption, $userMetadata, $attempt, $dispatchToken): void {
+                $this->metadata->transaction(function () use ($sourceBucket, $sourceOwner, $sourceGeneration, $targetBucket, $targetGeneration, $logKey, $logContent, $bucketEncryption, $userMetadata, $attempt, $dispatchToken, $partLayouts): void {
                     // External metadata stores share this owner lock with bucket
                     // deletion. SQLite keeps the read and write in one transaction.
                     // Do not publish a log object to a target with a reused name.
@@ -523,6 +524,7 @@ final class AccessLogWriter
                             userMetadata: $userMetadata,
                         );
                     }
+                    $partLayouts->putObjectPartLayout($targetBucket, $logKey, $versionId ?? 'null', \OpsFour\S3Server\Metadata\ObjectPartLayout::knownSingle(strlen($logContent)));
                     $this->metadata->updateObjectPlacement(
                         $targetBucket,
                         $logKey,

@@ -33,7 +33,7 @@ final class PhysicalTieringMetadataStoreTest extends TestCase
     public function test_schema_migrates_to_latest_version(): void
     {
         self::assertSame(SqliteSchema::VERSION, $this->schemaVersion());
-        self::assertSame(40, SqliteSchema::VERSION);
+        self::assertSame(41, SqliteSchema::VERSION);
     }
 
     public function test_owner_and_bucket_listing_indexes_are_added_to_existing_v14_database(): void
@@ -52,6 +52,7 @@ final class PhysicalTieringMetadataStoreTest extends TestCase
         $pdo->exec('ALTER TABLE s3_notification_queue DROP COLUMN lease_generation');
         $pdo->exec('ALTER TABLE s3_object_write_intents DROP COLUMN dispatch_id');
         $pdo->exec('DELETE FROM s3_schema_version WHERE version >= 15');
+        $pdo->exec("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
 
         (new \OpsFour\S3Server\Metadata\Schema\SchemaManager($pdo))->migrate();
 
@@ -87,6 +88,7 @@ final class PhysicalTieringMetadataStoreTest extends TestCase
         $pdo->exec('ALTER TABLE s3_notification_queue DROP COLUMN lease_generation');
         $pdo->exec('ALTER TABLE s3_object_write_intents DROP COLUMN dispatch_id');
         $pdo->exec('DELETE FROM s3_schema_version WHERE version >= 19');
+        $pdo->exec("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
         (new \OpsFour\S3Server\Metadata\Schema\SchemaManager($pdo))->migrate();
 
         $oldGeneration = $this->store->getBucket('bucket')?->generation;

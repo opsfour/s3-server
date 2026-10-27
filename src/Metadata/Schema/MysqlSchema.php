@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 48;
+    public const int VERSION = 49;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -211,6 +211,10 @@ final class MysqlSchema
                 checksum_crc32c VARCHAR(64),
                 checksum_sha1 VARCHAR(64),
                 checksum_sha256 VARCHAR(128),
+                part_layout_kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                part_layout_count INT NULL,
+                part_layout_compat_count INT NULL,
+                part_layout_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 noncurrent_at TIMESTAMP NULL,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -221,6 +225,29 @@ final class MysqlSchema
                 KEY idx_s3_objects_tier_state (storage_tier, transition_status, restore_status),
                 KEY idx_s3_objects_transition_target_tier (transition_target_tier),
                 KEY idx_s3_objects_noncurrent_at (bucket, is_latest, is_delete_marker, noncurrent_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_parts (
+                object_id BIGINT NOT NULL,
+                ordinal INT NOT NULL,
+                upload_part_number INT NULL,
+                plaintext_offset BIGINT UNSIGNED NOT NULL,
+                plaintext_size BIGINT UNSIGNED NOT NULL,
+                checksum_algorithm VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                checksum_value VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                PRIMARY KEY (object_id, ordinal),
+                FOREIGN KEY (object_id) REFERENCES s3_objects(id) ON DELETE CASCADE,
+                CONSTRAINT chk_s3_object_parts_ordinal CHECK (ordinal BETWEEN 1 AND 10000),
+                CONSTRAINT chk_s3_object_parts_upload_number CHECK (upload_part_number IS NULL OR upload_part_number BETWEEN 1 AND 10000)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL,
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (
+                migration_name VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+                last_object_id BIGINT UNSIGNED NOT NULL,
+                target_object_id BIGINT UNSIGNED NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -1057,6 +1084,29 @@ final class MysqlSchema
             array_push($statements, ...self::writeIntentCapacityStatements());
             array_push($statements, ...self::storageCleanupCapacityStatements());
             array_push($statements, ...self::recoveryCapacityTriggerInventoryFunctionStatements(true));
+        }
+        if ($fromVersion < 49) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN part_layout_kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN part_layout_count INT NULL';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN part_layout_compat_count INT NULL';
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN part_layout_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL';
+            $statements[] = <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_object_parts (
+                object_id BIGINT NOT NULL,
+                ordinal INT NOT NULL,
+                upload_part_number INT NULL,
+                plaintext_offset BIGINT UNSIGNED NOT NULL,
+                plaintext_size BIGINT UNSIGNED NOT NULL,
+                checksum_algorithm VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                checksum_value VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                PRIMARY KEY (object_id, ordinal),
+                FOREIGN KEY (object_id) REFERENCES s3_objects(id) ON DELETE CASCADE,
+                CONSTRAINT chk_s3_object_parts_ordinal CHECK (ordinal BETWEEN 1 AND 10000),
+                CONSTRAINT chk_s3_object_parts_upload_number CHECK (upload_part_number IS NULL OR upload_part_number BETWEEN 1 AND 10000)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            SQL;
+            $statements[] = 'CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, last_object_id BIGINT UNSIGNED NOT NULL, target_object_id BIGINT UNSIGNED NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
+            $statements[] = 'ALTER TABLE s3_migration_checkpoints ADD COLUMN target_object_id BIGINT UNSIGNED NULL';
         }
 
         return $statements;

@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     private ?\PDO $pdo = null;
 
@@ -40,6 +40,9 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
     /** @var array<string, \PDOStatement> Cached prepared statements keyed by SQL. */
     private array $stmtCache = [];
+
+    /** @var array<int, true> Layouts still being assembled in the active transaction. */
+    private array $objectPartLayoutPublicationIds = [];
 
     /**
      * @param  string  $databasePath  Absolute path to the SQLite database file.
@@ -393,11 +396,17 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
                 $checksumSha256, $now, $now,
             ]);
+            $this->authorizeObjectPartLayoutPublication($bucket, $key, 'null');
+            $this->putObjectPartLayout($bucket, $key, 'null', ObjectPartLayout::knownSingle($size));
         });
     }
 
     private function clearNullVersionMetadata(string $bucket, string $key): void
     {
+        $this->prepare("DELETE FROM s3_object_parts WHERE object_id IN (SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null')")
+            ->execute([$bucket, $key]);
+        $this->prepare("UPDATE s3_objects SET part_layout_kind = NULL, part_layout_count = NULL, part_layout_compat_count = NULL, part_layout_digest = NULL WHERE bucket = ? AND key_name = ? AND version_id = 'null'")
+            ->execute([$bucket, $key]);
         foreach (['s3_object_retention', 's3_object_legal_holds'] as $table) {
             $this->prepare("DELETE FROM {$table} WHERE bucket = ? AND key_name = ? AND version_id = 'null'")
                 ->execute([$bucket, $key]);
@@ -412,6 +421,8 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             $bucket . '/' . $key,
             \OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, 'null'),
         ]);
+        $this->prepare("DELETE FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null'")
+            ->execute([$bucket, $key]);
     }
 
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
@@ -425,7 +436,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, noncurrent_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1 AND is_delete_marker = 0
             SQL,
@@ -451,7 +462,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, noncurrent_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1
             SQL,
@@ -480,6 +491,85 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $stmt->execute([$bucket, $key]);
 
         return $stmt->fetch(\PDO::FETCH_ASSOC) !== false;
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return true;
+    }
+
+    private function authorizeObjectPartLayoutPublication(string $bucket, string $key, string $versionId): void
+    {
+        if (! $this->connection()->inTransaction()) {
+            throw new \LogicException('Object part layout publication authority requires an active transaction.');
+        }
+        $statement = $this->prepare('SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?');
+        $statement->execute([$bucket, $key, $versionId]);
+        $objectId = $statement->fetchColumn();
+        if (! is_int($objectId)) {
+            throw new \RuntimeException('New object incarnation cannot be resolved for its part layout.');
+        }
+        $this->objectPartLayoutPublicationIds[$objectId] = true;
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        if (! $this->connection()->inTransaction()) {
+            throw new \LogicException('Object part layouts must be published inside the object metadata transaction.');
+        }
+        $statement = $this->prepare('SELECT id, size, is_delete_marker FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?');
+        $statement->execute([$bucket, $key, $versionId]);
+        $row = $statement->fetch(\PDO::FETCH_ASSOC);
+        if ($row === false || (int) $row['is_delete_marker'] === 1 || (int) $row['size'] !== $layout->objectSize) {
+            throw new \RuntimeException('Object part layout does not match a concrete object row.');
+        }
+        $objectId = (int) $row['id'];
+        if (! isset($this->objectPartLayoutPublicationIds[$objectId])) {
+            throw new \LogicException('Published object part layouts are immutable.');
+        }
+        $this->prepare('DELETE FROM s3_object_parts WHERE object_id = ?')->execute([$objectId]);
+        $summary = $layout->summary($objectId);
+        $this->prepare('UPDATE s3_objects SET part_layout_kind = ?, part_layout_count = ?, part_layout_compat_count = ?, part_layout_digest = ? WHERE id = ?')
+            ->execute([$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $objectId]);
+        $insert = $this->prepare('INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        foreach ($layout->parts as $part) {
+            $insert->execute([$objectId, $part->ordinal, $part->uploadPartNumber, $part->offset, $part->size, $part->checksumAlgorithm, $part->checksumValue]);
+        }
+    }
+
+    public function getObjectPartLayout(ObjectInfo $object): ObjectPartLayout
+    {
+        $expected = $object->partLayout;
+        if ($object->isDeleteMarker || $expected === null) {
+            throw new \RuntimeException('Object metadata has no authoritative part layout.');
+        }
+        $statement = $this->prepare('SELECT id, size, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?');
+        $statement->execute([$object->bucket, $object->key, $object->versionId ?? 'null']);
+        $row = $statement->fetch(\PDO::FETCH_ASSOC);
+        if ($row === false) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        if ($row['part_layout_count'] === null || $row['part_layout_digest'] === null) {
+            throw new \RuntimeException('Stored object part layout summary is incomplete.');
+        }
+        if (! hash_equals($expected->digest, (string) $row['part_layout_digest'])) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        $partsStatement = $this->prepare('SELECT ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value FROM s3_object_parts WHERE object_id = ? ORDER BY ordinal');
+        $partsStatement->execute([(int) $row['id']]);
+        $parts = [];
+        foreach ($partsStatement->fetchAll(\PDO::FETCH_ASSOC) as $part) {
+            $parts[] = new ObjectPart((int) $part['ordinal'], $part['upload_part_number'] === null ? null : (int) $part['upload_part_number'], (int) $part['plaintext_offset'], (int) $part['plaintext_size'], $part['checksum_algorithm'] === null ? null : (string) $part['checksum_algorithm'], $part['checksum_value'] === null ? null : (string) $part['checksum_value']);
+        }
+        if ((int) $row['part_layout_count'] !== $expected->partCount || (int) $row['part_layout_count'] !== count($parts)) {
+            throw new \RuntimeException('Stored object part layout count is inconsistent.');
+        }
+        $layout = new ObjectPartLayout((string) $row['part_layout_kind'], (int) $row['size'], $parts, $row['part_layout_compat_count'] === null ? null : (int) $row['part_layout_compat_count']);
+        if (! hash_equals($expected->digest, $layout->digestForObject((int) $row['id']))) {
+            throw new \RuntimeException('Stored object part layout digest is inconsistent.');
+        }
+
+        return $layout;
     }
 
     public function updateObjectPlacement(
@@ -906,7 +996,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at '
             . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
@@ -2018,13 +2108,23 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
                 $checksumSha256, $now, $now,
             ]);
+            $this->authorizeObjectPartLayoutPublication($bucket, $key, $versionId);
+            $this->putObjectPartLayout($bucket, $key, $versionId, ObjectPartLayout::knownSingle($size));
 
             if ($ownTx) {
-                $pdo->commit();
+                try {
+                    $pdo->commit();
+                } finally {
+                    $this->objectPartLayoutPublicationIds = [];
+                }
             }
         } catch (\Throwable $e) {
             if ($ownTx) {
-                $pdo->rollBack();
+                try {
+                    $pdo->rollBack();
+                } finally {
+                    $this->objectPartLayoutPublicationIds = [];
+                }
             }
             throw $e;
         }
@@ -2139,7 +2239,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, noncurrent_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND version_id = ?
             SQL,
@@ -2255,7 +2355,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
@@ -4475,6 +4575,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $connection->beginTransaction();
         $this->immediateTransaction = false;
         $this->deferredTransactionMutated = false;
+        $this->objectPartLayoutPublicationIds = [];
     }
 
     public function commit(): void
@@ -4488,6 +4589,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         } finally {
             $this->immediateTransaction = false;
             $this->deferredTransactionMutated = false;
+            $this->objectPartLayoutPublicationIds = [];
         }
     }
 
@@ -4505,6 +4607,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         } finally {
             $this->immediateTransaction = false;
             $this->deferredTransactionMutated = false;
+            $this->objectPartLayoutPublicationIds = [];
         }
 
         // After rollback, prepared statements may reference invalidated transaction
@@ -4556,6 +4659,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             $pdo->beginTransaction();
             $this->immediateTransaction = false;
             $this->deferredTransactionMutated = false;
+            $this->objectPartLayoutPublicationIds = [];
         }
 
         try {
@@ -4567,6 +4671,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 } finally {
                     $this->immediateTransaction = false;
                     $this->deferredTransactionMutated = false;
+                    $this->objectPartLayoutPublicationIds = [];
                 }
             }
 
@@ -4583,6 +4688,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 } finally {
                     $this->immediateTransaction = false;
                     $this->deferredTransactionMutated = false;
+                    $this->objectPartLayoutPublicationIds = [];
                     $this->stmtCache = [];
                 }
             }
@@ -4600,6 +4706,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $this->stmtCache = [];
         $this->immediateTransaction = false;
         $this->deferredTransactionMutated = false;
+        $this->objectPartLayoutPublicationIds = [];
         $this->pdo = null;
     }
 
@@ -4616,6 +4723,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         $pdo->exec('BEGIN IMMEDIATE');
         $this->immediateTransaction = true;
         $this->deferredTransactionMutated = false;
+        $this->objectPartLayoutPublicationIds = [];
     }
 
     /**
@@ -4842,6 +4950,38 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             systemMetadata: $systemMetadata,
             lastModified: $lastModified,
             restoredStorageTier: $row['restored_storage_tier'] ?? null,
+            partLayout: $this->rowToObjectPartLayoutSummary($row),
+        );
+    }
+
+    /** @param array<string, mixed> $row */
+    private function rowToObjectPartLayoutSummary(array $row): ?ObjectPartLayoutSummary
+    {
+        if ((bool) (int) ($row['is_delete_marker'] ?? 0)) {
+            foreach (['part_layout_kind', 'part_layout_count', 'part_layout_compat_count', 'part_layout_digest'] as $field) {
+                if (array_key_exists($field, $row) && $row[$field] !== null) {
+                    throw new \RuntimeException('Current metadata schema contains a delete marker with an object part layout.');
+                }
+            }
+
+            return null;
+        }
+        if (($row['part_layout_kind'] ?? null) === null) {
+            if (array_key_exists('part_layout_kind', $row)) {
+                throw new \RuntimeException('Current metadata schema contains an object without a part layout.');
+            }
+
+            return null;
+        }
+        if (($row['part_layout_count'] ?? null) === null || ($row['part_layout_digest'] ?? null) === null) {
+            throw new \RuntimeException('Current metadata schema contains an incomplete object part layout summary.');
+        }
+
+        return new ObjectPartLayoutSummary(
+            (string) $row['part_layout_kind'],
+            (int) $row['part_layout_count'],
+            $row['part_layout_compat_count'] === null ? null : (int) $row['part_layout_compat_count'],
+            (string) $row['part_layout_digest'],
         );
     }
 

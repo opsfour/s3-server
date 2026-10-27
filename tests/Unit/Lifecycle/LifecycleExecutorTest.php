@@ -8,9 +8,11 @@ use Amp\ByteStream\ReadableBuffer;
 use Amp\File\Driver\BlockingFilesystemDriver;
 use Amp\File\Filesystem;
 use OpsFour\S3Server\Event\S3Event;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -52,6 +54,17 @@ final class LifecycleExecutorTest extends TestCase
         }
 
         parent::tearDown();
+    }
+
+    public function test_same_object_snapshot_includes_part_layout_digest(): void
+    {
+        $layout = ObjectPartLayout::knownSingle(4);
+        $observed = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(1));
+        $replacement = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(2));
+        $method = new \ReflectionMethod(LifecycleExecutor::class, 'sameObject');
+
+        self::assertTrue($method->invoke(null, $observed, $observed));
+        self::assertFalse($method->invoke(null, $observed, $replacement));
     }
 
     public function test_lifecycle_sweeps_stale_files_in_all_observed_filesystem_tiers(): void

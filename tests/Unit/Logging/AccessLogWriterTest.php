@@ -19,6 +19,8 @@ use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -34,6 +36,7 @@ use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
 use Psr\Log\AbstractLogger;
 
 final class AccessLogWriterTest extends TestCase
@@ -66,6 +69,11 @@ final class AccessLogWriterTest extends TestCase
         self::assertNotNull($object);
         self::assertSame('COLD', $object->storageTier);
         self::assertSame('STANDARD', $object->storageClass);
+        self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $object->partLayout?->kind);
+        $layout = $metadata->getObjectPartLayout($object);
+        self::assertCount(1, $layout->parts);
+        self::assertSame(0, $layout->parts[0]->offset);
+        self::assertSame($object->size, $layout->parts[0]->size);
         self::assertSame($object->systemMetadata['storagePath'], $metadata->getObjectMetadataByVersion('log-target', $object->key, $object->versionId ?? 'null')?->systemMetadata['storagePath']);
 
         foreach (['GET', 'HEAD'] as $method) {
@@ -99,7 +107,7 @@ final class AccessLogWriterTest extends TestCase
     #[DataProvider('commitAcknowledgementCases')]
     public function test_lost_commit_ack_does_not_delete_a_potentially_published_log_object(bool $versioned, bool $lookupFails): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $generation = str_repeat('a', 32);
         $metadata->method('getBucket')->willReturnCallback(
             static fn(string $bucket): BucketInfo => new BucketInfo($bucket, 'alice', generation: $generation),
@@ -353,7 +361,7 @@ final class AccessLogWriterTest extends TestCase
                 $this->records[] = ['message' => $message, 'context' => $context];
             }
         };
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willThrowException(new \RuntimeException('database-password-private-test-token'));
         (new AccessLogWriter($metadata, new InMemoryBackend(), $logger))
             ->log('source', 'key', 'GetObject', 200, 0);
@@ -385,7 +393,7 @@ final class AccessLogWriterTest extends TestCase
                 throw new \RuntimeException('logger unavailable');
             }
         };
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willThrowException(new \RuntimeException('metadata unavailable'));
 
         $writer = new AccessLogWriter($metadata, new InMemoryBackend(), $logger);
@@ -406,7 +414,7 @@ final class AccessLogWriterTest extends TestCase
                 $this->records[] = ['message' => $message, 'context' => $context];
             }
         };
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturnCallback(static fn(string $bucket): BucketInfo => new BucketInfo($bucket, 'owner'));
         $metadata->method('getBucketLogging')->willReturn(['targetBucket' => 'log-target', 'targetPrefix' => 'access/']);
         $metadata->method('transaction')->willReturnCallback(static fn(callable $callback): mixed => $callback());
@@ -592,8 +600,11 @@ final class AccessLogWriterTest extends TestCase
 
     public function test_metadata_failure_deletes_or_queues_written_log_object_and_retains_buffer(): void
     {
-        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, RecoveryStorageGarbageStore::class]);
-        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, RecoveryStorageGarbageStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
         $storage = $this->createMock(StorageBackend::class);
 
         $metadata->method('getBucketLogging')->willReturn([
@@ -1244,5 +1255,16 @@ final class AccessLogWriterTest extends TestCase
 
         self::assertSame(0, $writer->getBufferCount());
         self::assertSame([], $metadata->listObjects('log-target')->objects);
+    }
+
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+
+        return $metadata;
     }
 }

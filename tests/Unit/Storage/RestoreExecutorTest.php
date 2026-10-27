@@ -6,9 +6,11 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
+use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -63,6 +65,18 @@ final class RestoreExecutorTest extends TestCase
         @unlink($this->path);
         @unlink($this->path . '-wal');
         @unlink($this->path . '-shm');
+    }
+
+    public function test_same_object_snapshot_includes_part_layout_digest(): void
+    {
+        $layout = ObjectPartLayout::knownSingle(4);
+        $observed = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(1));
+        $replacement = new ObjectInfo('bucket', 'key', 4, '"etag"', ownerId: 'owner', systemMetadata: ['storagePath' => 'objects/key'], partLayout: $layout->summary(2));
+        $executor = new RestoreExecutor($this->metadata, StorageTierRegistry::single(new InMemoryBackend()));
+        $method = new \ReflectionMethod(RestoreExecutor::class, 'sameObject');
+
+        self::assertTrue($method->invoke($executor, $observed, $observed));
+        self::assertFalse($method->invoke($executor, $observed, $replacement));
     }
 
     public function test_backend_error_is_redacted_from_restore_job_and_logs(): void

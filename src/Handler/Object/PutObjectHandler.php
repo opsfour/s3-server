@@ -174,6 +174,7 @@ final class PutObjectHandler implements RequestHandler
                     $declaredLength,
                 );
             }
+            $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
             // 3. SSE payloads are encrypted before the first object-storage write.
             // Other payloads retain the storage backend's streaming checksum path.
             $encMeta = [];
@@ -337,6 +338,7 @@ final class PutObjectHandler implements RequestHandler
                         &$versionId,
                         &$publicationCallbackCompleted,
                         &$metadataWriteAttempted,
+                        $partLayouts,
                     ) {
                         \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                             $this->metadata,
@@ -389,6 +391,7 @@ final class PutObjectHandler implements RequestHandler
                             checksumSha1: $checksumSha1,
                             checksumSha256: $checksumSha256,
                         );
+                        $partLayouts->putObjectPartLayout($bucket, $key, $versionId, \OpsFour\S3Server\Metadata\ObjectPartLayout::knownSingle($result->size));
                         $this->metadata->updateObjectPlacement(
                             $bucket,
                             $key,
@@ -451,6 +454,7 @@ final class PutObjectHandler implements RequestHandler
                         &$oldPathsToClean,
                         &$publicationCallbackCompleted,
                         &$metadataWriteAttempted,
+                        $partLayouts,
                     ) {
                         \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                             $this->metadata,
@@ -526,6 +530,7 @@ final class PutObjectHandler implements RequestHandler
                             checksumSha1: $checksumSha1,
                             checksumSha256: $checksumSha256,
                         );
+                        $partLayouts->putObjectPartLayout($bucket, $key, 'null', \OpsFour\S3Server\Metadata\ObjectPartLayout::knownSingle($result->size));
                         $this->metadata->updateObjectPlacement(
                             $bucket,
                             $key,

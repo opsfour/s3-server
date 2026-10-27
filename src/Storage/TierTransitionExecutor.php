@@ -570,7 +570,8 @@ final class TierTransitionExecutor
             && $left->ownerId === $right->ownerId
             && $left->etag === $right->etag
             && $left->size === $right->size
-            && ($left->systemMetadata['storagePath'] ?? null) === ($right->systemMetadata['storagePath'] ?? null);
+            && ($left->systemMetadata['storagePath'] ?? null) === ($right->systemMetadata['storagePath'] ?? null)
+            && $left->partLayout?->digest === $right->partLayout?->digest;
     }
 
     /**

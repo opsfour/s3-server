@@ -231,9 +231,10 @@ final class ObjectDeletePolicyGuard
         string $key,
         ?string $versionId,
     ): void {
+        $targetVersionId = $target->versionId ?? 'null';
         if ($target->bucket !== $bucket
             || $target->key !== $key
-            || ($versionId !== null && $target->versionId !== $versionId)) {
+            || ($versionId !== null && $targetVersionId !== $versionId)) {
             throw new \LogicException('Resolved delete target does not match the requested object version.');
         }
     }

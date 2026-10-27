@@ -18,6 +18,8 @@ use OpsFour\S3Server\Metadata\GenerationBoundBucketMultipartCleanupStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectRetentionDeletionStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
 use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
@@ -51,7 +53,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * calling Fiber to a dedicated worker via WeakMap<Fiber, Worker>.
  * A TransactionGuard ensures abandoned fibers trigger a rollback.
  */
-final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     private readonly WorkerPool $pool;
 
@@ -330,6 +332,21 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
     public function objectExists(string $bucket, string $key): bool
     {
         return $this->submit('objectExists', [$bucket, $key]);
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return true;
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        $this->submit('putObjectPartLayout', [$bucket, $key, $versionId, $layout]);
+    }
+
+    public function getObjectPartLayout(ObjectInfo $object): ObjectPartLayout
+    {
+        return $this->submit('getObjectPartLayout', [$object]);
     }
 
     public function updateObjectPlacement(

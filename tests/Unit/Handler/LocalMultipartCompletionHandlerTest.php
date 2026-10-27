@@ -18,10 +18,14 @@ use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
 use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
+use OpsFour\S3Server\Multipart\MultipartAclSnapshot;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -35,15 +39,17 @@ use function Amp\ByteStream\buffer;
 
 final class LocalMultipartCompletionHandlerTest extends TestCase
 {
-    /** @return iterable<string, array{bool}> */
+    /** @return iterable<string, array{bool, bool}> */
     public static function modes(): iterable
     {
-        yield 'plaintext assembly' => [false];
-        yield 'SSE-S3 final' => [true];
+        yield 'plaintext assembly, literal null' => [false, false];
+        yield 'plaintext assembly, versioned' => [false, true];
+        yield 'SSE-S3 final, literal null' => [true, false];
+        yield 'SSE-S3 final, versioned' => [true, true];
     }
 
     #[DataProvider('modes')]
-    public function test_local_complete_commits_only_the_armed_physical_attempt(bool $encrypted): void
+    public function test_local_complete_commits_only_the_armed_physical_attempt(bool $encrypted, bool $versioned): void
     {
         $root = sys_get_temp_dir() . '/s3-local-complete-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($root, 0700));
@@ -53,6 +59,9 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             $metadata = new SqliteMetadataStore($databasePath);
             $metadata->initialize();
             $metadata->createBucket('owner', 'bucket', 'us-east-1');
+            if ($versioned) {
+                $metadata->setBucketVersioning('bucket', 'Enabled');
+            }
             $storage->createBucket('bucket');
             $bucket = $metadata->getBucket('bucket');
             self::assertNotNull($bucket);
@@ -69,22 +78,38 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
                     '__mpu-part-format' => EncryptedMultipartPartCodec::FORMAT,
                 ] : self::currentPolicyContext(),
             );
-            $plaintext = 'local multipart payload';
-            $partBody = $encrypted
-                ? EncryptedMultipartPartCodec::encode(
-                    $encryption,
-                    EncryptionRequestResolver::SSE_S3,
-                    $plaintext,
-                    null,
-                    $bucket->generation,
-                    'bucket',
+            $plaintextParts = [
+                3 => 'local multipart first payload',
+                8 => 'tail',
+            ];
+            $partEtags = [];
+            $partChecksums = [];
+            foreach ($plaintextParts as $partNumber => $plaintext) {
+                $partBody = $encrypted
+                    ? EncryptedMultipartPartCodec::encode(
+                        $encryption,
+                        EncryptionRequestResolver::SSE_S3,
+                        $plaintext,
+                        null,
+                        $bucket->generation,
+                        'bucket',
+                        $uploadId,
+                        $partNumber,
+                    ) : $plaintext;
+                $part = $storage->putPart('bucket', 'key', $uploadId, $partNumber, new ReadableBuffer($partBody));
+                $partEtags[$partNumber] = md5($plaintext);
+                $partChecksums[$partNumber] = base64_encode(hash('sha256', $plaintext, true));
+                $metadata->putPartWithChecksum(
                     $uploadId,
-                    1,
-                ) : $plaintext;
-            $part = $storage->putPart('bucket', 'key', $uploadId, 1, new ReadableBuffer($partBody));
-            $partEtag = md5($plaintext);
-            $metadata->putPart($uploadId, 1, $partEtag, strlen($plaintext), $part->path);
-            $request = self::completionRequest($uploadId, $partEtag);
+                    $partNumber,
+                    $partEtags[$partNumber],
+                    strlen($plaintext),
+                    $part->path,
+                    'SHA256',
+                    $partChecksums[$partNumber],
+                );
+            }
+            $request = self::completionRequestForParts($uploadId, $partEtags);
 
             $response = (new CompleteMultipartUploadHandler(
                 $metadata,
@@ -95,6 +120,33 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertSame(200, $response->getStatus());
             $object = $metadata->getObjectMetadata('bucket', 'key');
             self::assertNotNull($object);
+            self::assertSame($versioned, $object->versionId !== null);
+            self::assertSame(ObjectPartLayout::KNOWN_MULTIPART, $object->partLayout?->kind);
+            $layout = $metadata->getObjectPartLayout($object);
+            self::assertCount(2, $layout->parts);
+            self::assertSame(1, $layout->parts[0]->ordinal);
+            self::assertSame(3, $layout->parts[0]->uploadPartNumber);
+            self::assertSame(0, $layout->parts[0]->offset);
+            self::assertSame(strlen($plaintextParts[3]), $layout->parts[0]->size);
+            self::assertSame('SHA256', $layout->parts[0]->checksumAlgorithm);
+            self::assertSame($partChecksums[3], $layout->parts[0]->checksumValue);
+            self::assertSame(2, $layout->parts[1]->ordinal);
+            self::assertSame(8, $layout->parts[1]->uploadPartNumber);
+            self::assertSame(strlen($plaintextParts[3]), $layout->parts[1]->offset);
+            self::assertSame(strlen($plaintextParts[8]), $layout->parts[1]->size);
+            self::assertSame('SHA256', $layout->parts[1]->checksumAlgorithm);
+            self::assertSame($partChecksums[8], $layout->parts[1]->checksumValue);
+            $attributesRequest = new Request(
+                $request->getClient(),
+                'GET',
+                Http::new('http://127.0.0.1/bucket/key?attributes'),
+                ['x-amz-object-attributes' => 'ObjectParts'],
+            );
+            $attributesRequest->setAttribute('s3.bucket', 'bucket');
+            $attributesRequest->setAttribute('s3.key', 'key');
+            $attributesRequest->setAttribute('ownerId', 'owner');
+            $attributesBody = buffer((new GetObjectAttributesHandler($metadata))->handleRequest($attributesRequest)->getBody());
+            self::assertStringContainsString('<PartsCount>2</PartsCount>', $attributesBody);
             self::assertArrayNotHasKey(
                 PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY,
                 $object->userMetadata,
@@ -108,9 +160,9 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertStringEndsWith($encrypted ? '/final' : '/assembly', $path);
             $physical = buffer($storage->getObjectByPath($path));
             if ($encrypted) {
-                self::assertNotSame($plaintext, $physical);
+                self::assertNotSame(implode('', $plaintextParts), $physical);
             } else {
-                self::assertSame($plaintext, $physical);
+                self::assertSame(implode('', $plaintextParts), $physical);
             }
             self::assertNull($metadata->getMultipartUpload($uploadId));
             $intentCount = (new \PDO('sqlite:' . $databasePath))->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
@@ -188,11 +240,13 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             $proxy = $this->createMockForIntersectionOfInterfaces([
                 MetadataStore::class,
                 LocalMultipartCompletionIntentStore::class,
+                ObjectPartLayoutStore::class,
             ]);
             self::assertInstanceOf(MetadataStore::class, $proxy);
             self::assertInstanceOf(LocalMultipartCompletionIntentStore::class, $proxy);
+            self::assertInstanceOf(ObjectPartLayoutStore::class, $proxy);
             $methodNames = [];
-            foreach ([MetadataStore::class, LocalMultipartCompletionIntentStore::class] as $interface) {
+            foreach ([MetadataStore::class, LocalMultipartCompletionIntentStore::class, ObjectPartLayoutStore::class] as $interface) {
                 foreach ((new \ReflectionClass($interface))->getMethods() as $method) {
                     $methodNames[$method->getName()] = true;
                 }
@@ -366,8 +420,18 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
 
     private static function completionRequest(string $uploadId, string $etag): Request
     {
-        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
-            . $etag . '</ETag></Part></CompleteMultipartUpload>';
+        return self::completionRequestForParts($uploadId, [1 => $etag]);
+    }
+
+    /** @param array<int, string> $partEtags */
+    private static function completionRequestForParts(string $uploadId, array $partEtags): Request
+    {
+        $body = '<CompleteMultipartUpload>';
+        foreach ($partEtags as $partNumber => $etag) {
+            $body .= '<Part><PartNumber>' . $partNumber . '</PartNumber><ETag>'
+                . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part>';
+        }
+        $body .= '</CompleteMultipartUpload>';
         $request = new Request(
             new class implements Client {
                 public function getId(): int
@@ -413,6 +477,11 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION_KEY
                 => PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_VERSION,
             PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY => '[]',
+            MultipartAclSnapshot::METADATA_KEY => json_encode([[
+                'granteeType' => 'CanonicalUser',
+                'granteeId' => 'owner',
+                'permission' => 'FULL_CONTROL',
+            ]], JSON_THROW_ON_ERROR),
         ];
     }
 

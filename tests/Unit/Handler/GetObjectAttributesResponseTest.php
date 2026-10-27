@@ -11,16 +11,20 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Object\GetObjectAttributesHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
 
 final class GetObjectAttributesResponseTest extends TestCase
 {
     public function test_suspended_null_version_uses_response_headers_without_undeclared_xml_field(): void
     {
         $lastModified = new \DateTimeImmutable('2026-01-02T07:04:05+04:00');
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
             'bucket',
@@ -53,7 +57,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 
     public function test_repeated_attribute_names_do_not_duplicate_xml_fields(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, '"etag"'));
         $request = new Request(
@@ -75,7 +79,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 
     public function test_sse_s3_object_reports_encryption_header(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
             'bucket',
@@ -102,7 +106,7 @@ final class GetObjectAttributesResponseTest extends TestCase
     public function test_explicit_delete_marker_returns_method_not_allowed_with_marker_headers(): void
     {
         $lastModified = new \DateTimeImmutable('2026-02-03T08:05:06+04:00');
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadataByVersion')->willReturn(new ObjectInfo(
             'bucket',
@@ -136,7 +140,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 
     public function test_response_uses_wire_root_and_canonical_field_order(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
             'bucket',
@@ -170,7 +174,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 
     public function test_legacy_object_omits_empty_checksum_container_and_type(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, '"etag"'));
         $request = new Request(
@@ -191,7 +195,7 @@ final class GetObjectAttributesResponseTest extends TestCase
 
     public function test_standard_storage_class_is_omitted_from_attributes_response(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
         $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, '"etag"'));
         $request = new Request(
@@ -209,7 +213,7 @@ final class GetObjectAttributesResponseTest extends TestCase
         self::assertStringNotContainsString('<StorageClass>', $body);
     }
 
-    public function test_only_a_valid_multipart_etag_claims_object_parts(): void
+    public function test_explicit_unknown_layout_never_claims_object_parts_from_etag_shape(): void
     {
         foreach ([
             '"opaque-value-2"',
@@ -220,17 +224,28 @@ final class GetObjectAttributesResponseTest extends TestCase
             '"d41d8cd98f00b204e9800998ecf8427ee-2"',
             '"g41d8cd98f00b204e9800998ecf8427-2"',
         ] as $etag) {
-            $body = $this->objectPartsResponse($etag);
+            $body = $this->objectPartsResponse($etag, ObjectPartLayout::legacy($etag, 3));
 
             self::assertStringNotContainsString('<ObjectParts>', $body, $etag);
             self::assertStringNotContainsString('<PartsCount>', $body, $etag);
         }
     }
 
-    public function test_multipart_part_count_accepts_the_full_one_to_ten_thousand_range(): void
+    public function test_object_parts_request_rejects_missing_current_schema_layout_summary(): void
+    {
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Object part layout metadata is missing.');
+
+        $this->objectPartsResponse('"opaque"');
+    }
+
+    public function test_persisted_multipart_part_count_accepts_the_full_one_to_ten_thousand_range(): void
     {
         foreach ([1, 10_000] as $partsCount) {
-            $body = $this->objectPartsResponse('"D41D8CD98F00B204E9800998ECF8427E-' . $partsCount . '"');
+            $layout = $partsCount === 1
+                ? new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, 3, [new \OpsFour\S3Server\Metadata\ObjectPart(1, 7, 0, 3)])
+                : new ObjectPartLayout(ObjectPartLayout::UNKNOWN_MULTIPART, 3, compatibilityPartCount: $partsCount);
+            $body = $this->objectPartsResponse('"opaque"', $layout);
 
             self::assertStringContainsString('<ObjectParts>', $body);
             self::assertStringContainsString('<PartsCount>' . $partsCount . '</PartsCount>', $body);
@@ -243,7 +258,7 @@ final class GetObjectAttributesResponseTest extends TestCase
         $newBucket = new BucketInfo('bucket', 'bob', generation: str_repeat('b', 32));
         $currentBucket = $oldBucket;
 
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturnCallback(static function () use (&$currentBucket): BucketInfo {
             return $currentBucket;
         });
@@ -269,11 +284,11 @@ final class GetObjectAttributesResponseTest extends TestCase
         (new GetObjectAttributesHandler($metadata))->handleRequest($request);
     }
 
-    private function objectPartsResponse(string $etag): string
+    private function objectPartsResponse(string $etag, ?ObjectPartLayout $layout = null): string
     {
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
-        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, $etag));
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo('bucket', 'key', 3, $etag, partLayout: $layout?->summary(1)));
         $request = new Request(
             $this->createMock(Client::class),
             'GET',
@@ -293,7 +308,7 @@ final class GetObjectAttributesResponseTest extends TestCase
         $newBucket = new BucketInfo('bucket', 'bob', generation: str_repeat('b', 32));
         $currentBucket = $oldBucket;
 
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturnCallback(static function () use (&$currentBucket): BucketInfo {
             return $currentBucket;
         });
@@ -316,7 +331,7 @@ final class GetObjectAttributesResponseTest extends TestCase
         $newBucket = new BucketInfo('bucket', 'bob', generation: str_repeat('b', 32));
         $getBucketCalls = 0;
 
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturnCallback(static function () use (&$getBucketCalls, $oldBucket, $newBucket): BucketInfo {
             ++$getBucketCalls;
 
@@ -335,7 +350,7 @@ final class GetObjectAttributesResponseTest extends TestCase
         $newBucket = new BucketInfo('bucket', 'bob', generation: str_repeat('b', 32));
         $currentBucket = $oldBucket;
 
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('getBucket')->willReturnCallback(static function () use (&$currentBucket): BucketInfo {
             return $currentBucket;
         });
@@ -368,5 +383,16 @@ final class GetObjectAttributesResponseTest extends TestCase
         $request->setAttribute('s3.cachedBucketGeneration', $bucket->generation);
 
         return $request;
+    }
+
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+
+        return $metadata;
     }
 }

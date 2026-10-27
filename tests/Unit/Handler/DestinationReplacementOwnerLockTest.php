@@ -18,6 +18,7 @@ use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -580,18 +581,28 @@ final class DestinationReplacementOwnerLockTest extends TestCase
         ?callable $transaction = null,
         ?callable $lockOwner = null,
         ?callable $beforePutObjectMetadata = null,
-    ): MetadataStore {
-        $proxy = $this->createMock(MetadataStore::class);
-        foreach ((new \ReflectionClass(MetadataStore::class))->getMethods() as $method) {
-            $name = $method->getName();
-            if ($name === 'transaction'
-                || $name === 'lockOwnerForUpdate'
-                || ($name === 'putObjectMetadata' && $beforePutObjectMetadata !== null)) {
-                continue;
+    ): MetadataStore&ObjectPartLayoutStore {
+        $proxy = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            ObjectPartLayoutStore::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $proxy);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $proxy);
+        $configured = [];
+        foreach ([MetadataStore::class, ObjectPartLayoutStore::class] as $contract) {
+            foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
+                $name = $method->getName();
+                if ($name === 'transaction'
+                    || $name === 'lockOwnerForUpdate'
+                    || ($name === 'putObjectMetadata' && $beforePutObjectMetadata !== null)
+                    || isset($configured[$name])) {
+                    continue;
+                }
+                $configured[$name] = true;
+                $proxy->method($name)->willReturnCallback(
+                    fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments),
+                );
             }
-            $proxy->method($name)->willReturnCallback(
-                fn(mixed ...$arguments): mixed => $this->metadata->{$name}(...$arguments),
-            );
         }
         $proxy->method('transaction')->willReturnCallback(
             $transaction ?? fn(callable $callback): mixed => $this->metadata->transaction($callback),
@@ -650,15 +661,17 @@ final class DestinationReplacementOwnerLockTest extends TestCase
         ?callable $transaction = null,
         ?callable $lockOwner = null,
         ?callable $beforePutObjectMetadata = null,
-    ): MetadataStore&MultipartWriteIntentStore {
+    ): MetadataStore&MultipartWriteIntentStore&ObjectPartLayoutStore {
         $proxy = $this->createMockForIntersectionOfInterfaces([
             MetadataStore::class,
             MultipartWriteIntentStore::class,
+            ObjectPartLayoutStore::class,
         ]);
         self::assertInstanceOf(MetadataStore::class, $proxy);
         self::assertInstanceOf(MultipartWriteIntentStore::class, $proxy);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $proxy);
         $configured = [];
-        foreach ([MetadataStore::class, MultipartWriteIntentStore::class] as $contract) {
+        foreach ([MetadataStore::class, MultipartWriteIntentStore::class, ObjectPartLayoutStore::class] as $contract) {
             foreach ((new \ReflectionClass($contract))->getMethods() as $method) {
                 $name = $method->getName();
                 if ($name === 'transaction'

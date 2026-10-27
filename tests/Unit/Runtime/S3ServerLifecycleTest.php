@@ -19,6 +19,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Lifecycle\LifecycleRunner;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Runtime\S3ServerRuntime;
@@ -30,12 +31,57 @@ use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\MockObject\MockObject;
 use Psr\Log\AbstractLogger;
 use Revolt\EventLoop;
 
 final class S3ServerLifecycleTest extends TestCase
 {
+    /** @return iterable<string, array{bool}> */
+    public static function objectPartLayoutCapabilityStates(): iterable
+    {
+        yield 'absent' => [false];
+        yield 'disabled' => [true];
+    }
+
+    #[DataProvider('objectPartLayoutCapabilityStates')]
+    public function test_start_rejects_missing_layout_capability_before_listener_binding(bool $disabled): void
+    {
+        $metadata = $this->layoutCapabilityMetadataMock($disabled);
+        if ($disabled) {
+            self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
+            $metadata->method('supportsObjectPartLayouts')->willReturn(false);
+        }
+        $root = sys_get_temp_dir() . '/s3-layout-capability-start-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($root, 0700));
+        $port = $this->unusedPort();
+        $server = new S3Server(
+            new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: $root, perClientRateLimit: 0),
+            $metadata,
+            new FilesystemBackend($root),
+        );
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('Startup must reject metadata without authoritative object part layouts.');
+        } catch (\LogicException $error) {
+            self::assertSame('Metadata store does not support authoritative object part layouts.', $error->getMessage());
+        } finally {
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+            self::assertFalse($this->canConnect($port));
+            $server->stop();
+            @unlink($root . '/.opsfour/runtime.lock');
+            @rmdir($root . '/.opsfour');
+            @rmdir($root);
+        }
+    }
+
     public function test_local_intent_collector_gets_its_own_background_future(): void
     {
         $root = sys_get_temp_dir() . '/s3-local-collector-lifecycle-' . bin2hex(random_bytes(8));
@@ -626,7 +672,7 @@ final class S3ServerLifecycleTest extends TestCase
         $releaseWorker = new DeferredFuture();
         $requestStarted = new DeferredFuture();
         $releaseRequest = new DeferredFuture();
-        $metadata = $this->createMock(MetadataStore::class);
+        $metadata = $this->capableMetadataMock();
         $metadata->method('dequeueNotifications')->willReturnCallback(
             static function () use ($workerStarted, $releaseWorker): array {
                 if (! $workerStarted->isComplete()) {
@@ -776,5 +822,30 @@ final class S3ServerLifecycleTest extends TestCase
         fclose($socket);
 
         return true;
+    }
+
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+
+        return $metadata;
+    }
+
+    private function layoutCapabilityMetadataMock(bool $disabled): MetadataStore&MockObject
+    {
+        if (! $disabled) {
+            return $this->createMock(MetadataStore::class);
+        }
+        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+            throw new \LogicException('Intersection mock is missing a requested interface.');
+        }
+        $metadata->method('supportsObjectPartLayouts')->willReturn(false);
+
+        return $metadata;
     }
 }

@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/mysql for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore
+final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     /** Preserve S3 Last-Modified while changing version-list bookkeeping. */
     private const string VERSION_DEMOTION_UPDATE_SQL = <<<'SQL'
@@ -85,6 +85,9 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, MysqlTransaction> */
     private \WeakMap $fiberTxMap;
 
+    /** @var \WeakMap<object, array<int, true>> */
+    private \WeakMap $objectPartLayoutPublicationIds;
+
     private ?string $creationDsnFingerprint = null;
 
     /**
@@ -96,6 +99,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         private readonly MysqlConnectionPool $pool,
     ) {
         $this->fiberTxMap = new \WeakMap();
+        $this->objectPartLayoutPublicationIds = new \WeakMap();
     }
 
     public static function fromDsn(string $dsn): self
@@ -196,6 +200,9 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         foreach (MysqlSchema::getCreateStatements() as $sql) {
             $this->pool->query($sql);
         }
+        if ($currentVersion > 0) {
+            $this->backfillLegacyObjectPartLayouts();
+        }
         $this->assertSupportedBucketEncryptionInventory();
 
         MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
@@ -209,6 +216,145 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)',
             [MysqlSchema::VERSION, 'Schema version ' . MysqlSchema::VERSION],
         );
+    }
+
+    private function backfillLegacyObjectPartLayouts(): void
+    {
+        $this->initializeObjectPartLayoutMigrationTarget();
+        while (true) {
+            $transaction = $this->pool->beginTransaction();
+            try {
+                $checkpoint = $transaction->execute("SELECT last_object_id, target_object_id FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts' FOR UPDATE")->fetchRow();
+                if ($checkpoint === null || $checkpoint['target_object_id'] === null) {
+                    throw new \RuntimeException('Object part layout migration target cannot be read.');
+                }
+                $lastId = (int) $checkpoint['last_object_id'];
+                $targetId = (int) $checkpoint['target_object_id'];
+                if ($lastId > $targetId) {
+                    throw new \RuntimeException('Object part layout migration checkpoint exceeds its fixed target.');
+                }
+                $result = $transaction->execute('SELECT id, etag, size, is_delete_marker FROM s3_objects WHERE id > ? AND id <= ? ORDER BY id LIMIT 10000', [$lastId, $targetId]);
+                $rows = [];
+                while (($row = $result->fetchRow()) !== null) {
+                    $rows[] = $row;
+                }
+                if ($rows === []) {
+                    if ($transaction->execute('SELECT 1 FROM s3_objects WHERE id > ? LIMIT 1', [$targetId])->fetchRow() !== null) {
+                        throw new \RuntimeException('Object rows were created beyond the fixed object-layout migration target.');
+                    }
+                    $transaction->commit();
+                    return;
+                }
+                // Keep the CASE statement below well inside the Amp/MySQL
+                // binary-protocol parameter envelope. The contract permits
+                // subchunks of at most 500 rows; 100 keeps one update bounded
+                // to 900 parameters while avoiding per-row round trips.
+                foreach (array_chunk($rows, 100) as $chunk) {
+                    $this->writeLegacyObjectPartLayoutBatch($transaction, $chunk);
+                }
+                $lastRow = $rows[array_key_last($rows)];
+                $lastId = (int) $lastRow['id'];
+                $transaction->execute("UPDATE s3_migration_checkpoints SET last_object_id = ? WHERE migration_name = 'object_part_layouts'", [$lastId]);
+                $transaction->commit();
+            } catch (\Throwable $error) {
+                $transaction->rollback();
+                throw $error;
+            }
+        }
+    }
+
+    /**
+     * @param list<array<string, int|float|string|null>> $rows
+     */
+    private function writeLegacyObjectPartLayoutBatch(MysqlTransaction $transaction, array $rows): void
+    {
+        $kinds = [];
+        $partCounts = [];
+        $compatibilityPartCounts = [];
+        $digests = [];
+        $objectIds = [];
+        $knownSingles = [];
+
+        foreach ($rows as $row) {
+            $objectId = (int) $row['id'];
+            $objectIds[] = $objectId;
+            if ((bool) (int) $row['is_delete_marker']) {
+                $kind = null;
+                $partCount = null;
+                $compatibilityPartCount = null;
+                $digest = null;
+            } else {
+                $layout = ObjectPartLayout::legacy((string) $row['etag'], (int) $row['size']);
+                $summary = $layout->summary($objectId);
+                $kind = $summary->kind;
+                $partCount = $summary->partCount;
+                $compatibilityPartCount = $summary->compatibilityPartCount;
+                $digest = $summary->digest;
+                if ($summary->kind === ObjectPartLayout::KNOWN_SINGLE) {
+                    $knownSingles[] = [$objectId, (int) $row['size']];
+                }
+            }
+
+            array_push($kinds, $objectId, $kind);
+            array_push($partCounts, $objectId, $partCount);
+            array_push($compatibilityPartCounts, $objectId, $compatibilityPartCount);
+            array_push($digests, $objectId, $digest);
+        }
+
+        $cases = implode(' ', array_fill(0, count($rows), 'WHEN ? THEN ?'));
+        $where = implode(', ', array_fill(0, count($rows), '?'));
+        $transaction->execute(
+            'UPDATE s3_objects SET '
+            . "part_layout_kind = CASE id {$cases} END, "
+            . "part_layout_count = CASE id {$cases} END, "
+            . "part_layout_compat_count = CASE id {$cases} END, "
+            . "part_layout_digest = CASE id {$cases} END, "
+            . 'updated_at = updated_at '
+            . "WHERE id IN ({$where})",
+            [...$kinds, ...$partCounts, ...$compatibilityPartCounts, ...$digests, ...$objectIds],
+        );
+
+        $transaction->execute(
+            'DELETE FROM s3_object_parts WHERE object_id IN (' . implode(', ', array_fill(0, count($objectIds), '?')) . ')',
+            $objectIds,
+        );
+
+        if ($knownSingles === []) {
+            return;
+        }
+
+        $childValues = [];
+        $childParams = [];
+        foreach ($knownSingles as [$objectId, $size]) {
+            $childValues[] = '(?, 1, NULL, 0, ?, NULL, NULL)';
+            array_push($childParams, $objectId, $size);
+        }
+        $transaction->execute(
+            'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES '
+            . implode(', ', $childValues),
+            $childParams,
+        );
+    }
+
+    private function initializeObjectPartLayoutMigrationTarget(): void
+    {
+        $transaction = $this->pool->beginTransaction();
+        try {
+            $checkpoint = $transaction->execute("SELECT target_object_id FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts' FOR UPDATE")->fetchRow();
+            if ($checkpoint === null) {
+                $maximum = $transaction->execute('SELECT COALESCE(MAX(id), 0) AS target_object_id FROM s3_objects')->fetchRow();
+                if ($maximum === null) {
+                    throw new \RuntimeException('Object part layout migration target cannot be established.');
+                }
+                $transaction->execute("INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', 0, ?)", [(int) $maximum['target_object_id']]);
+            } elseif ($checkpoint['target_object_id'] === null) {
+                $transaction->execute("UPDATE s3_migration_checkpoints SET target_object_id = (SELECT COALESCE(MAX(id), 0) FROM s3_objects) WHERE migration_name = 'object_part_layouts'");
+            }
+            $transaction->commit();
+        } catch (\Throwable $error) {
+            $transaction->rollback();
+            throw $error;
+        }
     }
 
     private function assertWriteIntentCapacityConsistent(): void
@@ -515,24 +661,33 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                     $checksumSha256, $now, $now,
                 ],
             );
+            $objectRow = $this->conn()->execute("SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null'", [$bucket, $key])->fetchRow();
+            if ($objectRow === null) {
+                throw new \RuntimeException('New object incarnation cannot be resolved for its part layout.');
+            }
+            $this->authorizeObjectPartLayoutPublication((int) $objectRow['id']);
+            $this->putObjectPartLayout($bucket, $key, 'null', ObjectPartLayout::knownSingle($size));
         });
     }
 
-    private function clearNullVersionMetadata(string $bucket, string $key): void
+    private function clearNullVersionMetadata(string $bucket, string $key, ?MysqlLink $link = null): void
     {
-        $this->conn()->execute(
+        $link ??= $this->conn();
+        $link->execute("DELETE FROM s3_object_parts WHERE object_id IN (SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null')", [$bucket, $key]);
+        $link->execute("UPDATE s3_objects SET part_layout_kind = NULL, part_layout_count = NULL, part_layout_compat_count = NULL, part_layout_digest = NULL WHERE bucket = ? AND key_name = ? AND version_id = 'null'", [$bucket, $key]);
+        $link->execute(
             "DELETE FROM s3_object_retention WHERE bucket = ? AND key_name = ? AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             "DELETE FROM s3_object_legal_holds WHERE bucket = ? AND key_name = ? AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             "DELETE FROM s3_tagging WHERE resource_type = 'object' AND bucket = ? AND key_name = ? AND version_id = 'null'",
             [$bucket, $key],
         );
-        $this->conn()->execute(
+        $link->execute(
             'DELETE FROM s3_acls WHERE resource_type = ? AND resource_name IN (?, ?)',
             [
                 'object',
@@ -540,6 +695,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 \OpsFour\S3Server\Http\ObjectVersionResolver::aclResourceName($bucket, $key, 'null'),
             ],
         );
+        $link->execute("DELETE FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null'", [$bucket, $key]);
     }
 
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
@@ -553,7 +709,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1 AND is_delete_marker = 0
             SQL,
@@ -575,7 +731,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1
             SQL,
@@ -602,6 +758,79 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         );
 
         return $result->fetchRow() !== null;
+    }
+
+    public function supportsObjectPartLayouts(): bool
+    {
+        return true;
+    }
+
+    public function putObjectPartLayout(string $bucket, string $key, string $versionId, ObjectPartLayout $layout): void
+    {
+        if ($this->fiberTransaction() === null) {
+            throw new \LogicException('Object part layouts must be published inside the object metadata transaction.');
+        }
+        $row = $this->conn()->execute('SELECT id, size, is_delete_marker FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?', [$bucket, $key, $versionId])->fetchRow();
+        if ($row === null || (bool) (int) $row['is_delete_marker'] || (int) $row['size'] !== $layout->objectSize) {
+            throw new \RuntimeException('Object part layout does not match a concrete object row.');
+        }
+        $objectId = (int) $row['id'];
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null) {
+            throw new \LogicException('Object part layouts must be published inside the object metadata transaction.');
+        }
+        $publicationIds = $this->objectPartLayoutPublicationIds[$fiber] ?? [];
+        if (! isset($publicationIds[$objectId])) {
+            throw new \LogicException('Published object part layouts are immutable.');
+        }
+        $this->conn()->execute('DELETE FROM s3_object_parts WHERE object_id = ?', [$objectId]);
+        $summary = $layout->summary($objectId);
+        $this->conn()->execute('UPDATE s3_objects SET part_layout_kind = ?, part_layout_count = ?, part_layout_compat_count = ?, part_layout_digest = ?, updated_at = updated_at WHERE id = ?', [$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $objectId]);
+        foreach (array_chunk($layout->parts, 500) as $parts) {
+            $values = [];
+            $params = [];
+            foreach ($parts as $part) {
+                $values[] = '(?, ?, ?, ?, ?, ?, ?)';
+                array_push($params, $objectId, $part->ordinal, $part->uploadPartNumber, $part->offset, $part->size, $part->checksumAlgorithm, $part->checksumValue);
+            }
+            $this->conn()->execute(
+                'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES '
+                . implode(', ', $values),
+                $params,
+            );
+        }
+    }
+
+    public function getObjectPartLayout(ObjectInfo $object): ObjectPartLayout
+    {
+        $expected = $object->partLayout;
+        if ($object->isDeleteMarker || $expected === null) {
+            throw new \RuntimeException('Object metadata has no authoritative part layout.');
+        }
+        $row = $this->conn()->execute('SELECT id, size, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?', [$object->bucket, $object->key, $object->versionId ?? 'null'])->fetchRow();
+        if ($row === null) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        if ($row['part_layout_count'] === null || $row['part_layout_digest'] === null) {
+            throw new \RuntimeException('Stored object part layout summary is incomplete.');
+        }
+        if (! hash_equals($expected->digest, (string) $row['part_layout_digest'])) {
+            throw new \RuntimeException('Object part layout snapshot no longer matches the object incarnation.');
+        }
+        $parts = [];
+        $result = $this->conn()->execute('SELECT ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value FROM s3_object_parts WHERE object_id = ? ORDER BY ordinal', [(int) $row['id']]);
+        while (($part = $result->fetchRow()) !== null) {
+            $parts[] = new ObjectPart((int) $part['ordinal'], $part['upload_part_number'] === null ? null : (int) $part['upload_part_number'], (int) $part['plaintext_offset'], (int) $part['plaintext_size'], $part['checksum_algorithm'] === null ? null : (string) $part['checksum_algorithm'], $part['checksum_value'] === null ? null : (string) $part['checksum_value']);
+        }
+        if ((int) $row['part_layout_count'] !== $expected->partCount || (int) $row['part_layout_count'] !== count($parts)) {
+            throw new \RuntimeException('Stored object part layout count is inconsistent.');
+        }
+        $layout = new ObjectPartLayout((string) $row['part_layout_kind'], (int) $row['size'], $parts, $row['part_layout_compat_count'] === null ? null : (int) $row['part_layout_compat_count']);
+        if (! hash_equals($expected->digest, $layout->digestForObject((int) $row['id']))) {
+            throw new \RuntimeException('Stored object part layout digest is inconsistent.');
+        }
+
+        return $layout;
     }
 
     public function updateObjectPlacement(
@@ -985,7 +1214,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
             . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
@@ -2062,6 +2291,18 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                     $checksumSha256, $now, $now,
                 ],
             );
+            $layout = ObjectPartLayout::knownSingle($size);
+            $objectRow = $link->execute('SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?', [$bucket, $key, $versionId])->fetchRow();
+            if ($objectRow === null) {
+                throw new \RuntimeException('New object version cannot be resolved for its part layout.');
+            }
+            $objectId = (int) $objectRow['id'];
+            if ($existingTx !== null) {
+                $this->authorizeObjectPartLayoutPublication($objectId);
+            }
+            $summary = $layout->summary($objectId);
+            $link->execute('UPDATE s3_objects SET part_layout_kind = ?, part_layout_count = ?, part_layout_compat_count = ?, part_layout_digest = ?, updated_at = updated_at WHERE id = ?', [$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $objectId]);
+            $link->execute('INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES (?, 1, NULL, 0, ?, NULL, NULL)', [$objectId, $size]);
 
             if ($ownTx) {
                 $link->commit();
@@ -2091,7 +2332,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
 
             if ($suspended) {
                 // Suspended: upsert delete marker with version_id='null'.
-                $this->clearNullVersionMetadata($bucket, $key);
+                $this->clearNullVersionMetadata($bucket, $key, $link);
                 $link->execute(
                     <<<'SQL'
                     INSERT INTO s3_objects (
@@ -2175,7 +2416,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, noncurrent_at, updated_at
+                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND version_id = ?
             SQL,
@@ -2268,7 +2509,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
@@ -4012,6 +4253,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             throw new \LogicException('Nested beginTransaction() is unsupported; use transaction() to join the current transaction.');
         }
         $this->fiberTxMap[$fiber] = $this->pool->beginTransaction();
+        $this->objectPartLayoutPublicationIds[$fiber] = [];
     }
 
     public function commit(): void
@@ -4022,6 +4264,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         }
         $transaction = $this->fiberTxMap[$fiber];
         unset($this->fiberTxMap[$fiber]);
+        unset($this->objectPartLayoutPublicationIds[$fiber]);
         $transaction->commit();
     }
 
@@ -4033,6 +4276,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         }
         $transaction = $this->fiberTxMap[$fiber];
         unset($this->fiberTxMap[$fiber]);
+        unset($this->objectPartLayoutPublicationIds[$fiber]);
         $transaction->rollback();
     }
 
@@ -4155,6 +4399,17 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         return ($fiber !== null && isset($this->fiberTxMap[$fiber])) ? $this->fiberTxMap[$fiber] : null;
     }
 
+    private function authorizeObjectPartLayoutPublication(int $objectId): void
+    {
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || ! isset($this->fiberTxMap[$fiber])) {
+            throw new \LogicException('Object part layout publication authority requires an active transaction.');
+        }
+        $publicationIds = $this->objectPartLayoutPublicationIds[$fiber] ?? [];
+        $publicationIds[$objectId] = true;
+        $this->objectPartLayoutPublicationIds[$fiber] = $publicationIds;
+    }
+
     private static function isIgnorableSchemaMigrationError(string $sql, \Throwable $error): bool
     {
         $message = strtolower($error->getMessage());
@@ -4269,7 +4524,33 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             systemMetadata: $systemMetadata,
             lastModified: $lastModified,
             restoredStorageTier: isset($row['restored_storage_tier']) ? (string) $row['restored_storage_tier'] : null,
+            partLayout: $this->rowToObjectPartLayoutSummary($row),
         );
+    }
+
+    /** @param array<string, mixed> $row */
+    private function rowToObjectPartLayoutSummary(array $row): ?ObjectPartLayoutSummary
+    {
+        if ((bool) (int) ($row['is_delete_marker'] ?? 0)) {
+            foreach (['part_layout_kind', 'part_layout_count', 'part_layout_compat_count', 'part_layout_digest'] as $field) {
+                if (array_key_exists($field, $row) && $row[$field] !== null) {
+                    throw new \RuntimeException('Current metadata schema contains a delete marker with an object part layout.');
+                }
+            }
+
+            return null;
+        }
+        if (($row['part_layout_kind'] ?? null) === null) {
+            if (array_key_exists('part_layout_kind', $row)) {
+                throw new \RuntimeException('Current metadata schema contains an object without a part layout.');
+            }
+            return null;
+        }
+        if (($row['part_layout_count'] ?? null) === null || ($row['part_layout_digest'] ?? null) === null) {
+            throw new \RuntimeException('Current metadata schema contains an incomplete object part layout summary.');
+        }
+
+        return new ObjectPartLayoutSummary((string) $row['part_layout_kind'], (int) $row['part_layout_count'], $row['part_layout_compat_count'] === null ? null : (int) $row['part_layout_compat_count'], (string) $row['part_layout_digest']);
     }
 
     /**

@@ -34,6 +34,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
@@ -380,6 +381,10 @@ final class S3Server
                     throw new \RuntimeException('Local object write fencing requires multipart legacy-intent admission.');
                 }
                 $this->metadata->assertNoLegacyLocalMultipartIntents($configuredTiers->defaultTier()->name);
+            }
+
+            if ($this->metadata !== null) {
+                ObjectPartLayoutCapability::require($this->metadata);
             }
 
             // Storage admission above is side-effect free. Take exclusive

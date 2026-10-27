@@ -783,7 +783,8 @@ same storage root. Drain traffic, stop the existing process, deploy the new
 package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
-For a **schema upgrade** such as PostgreSQL v29 or MySQL v31, drain and stop the
+For a **schema upgrade** such as the object-layout migration to SQLite v41,
+PostgreSQL v44, or MySQL v49, drain and stop the
 API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a
 DDL-capable role and the matching package version. If
@@ -800,6 +801,30 @@ missing or legacy columns. Measure index-build/ALTER time and locks on a
 representative disposable snapshot before scheduling the maintenance window.
 The migrator has no cross-process DDL lock: run exactly one bootstrap job;
 concurrent migration commands may repeat or race DDL.
+
+The object-layout migration records the highest object ID present when it
+starts, then scans only through that fixed target in durable 10,000-row keyset
+batches. An interrupted run resumes strictly after its last committed ID and
+does not publish the current schema version until all rows are classified. If
+any writer creates an object beyond the recorded target, migration aborts
+instead of publishing a partially classified current schema.
+Simple 32-hex legacy ETags become known single-part layouts; strict multipart
+ETags retain only their compatibility count; every other non-marker object is
+explicitly unknown. Do not run old API nodes or workers during this maintenance
+migration, and do not attempt a rolling-schema deployment.
+
+Capacity planning must include `s3_object_parts`: every legacy object classified
+as known single-part adds one child row, while unknown layouts and delete markers
+add none. Size the database, temporary working space, and PostgreSQL WAL or MySQL
+binlog capacity for those child inserts plus parent-row updates, and validate the
+resulting volume on a representative snapshot. During the maintenance window,
+observe the durable keyset checkpoint with this backend-neutral query:
+
+```sql
+SELECT migration_name, last_object_id, target_object_id
+FROM s3_migration_checkpoints
+WHERE migration_name = 'object_part_layouts';
+```
 
 Before rolling back after a schema migration, verify that the previous package
 version understands the current metadata schema. If not, restore metadata from a

@@ -77,6 +77,10 @@ final class SchemaManager
         for ($v = $currentVersion + 1; $v <= $targetVersion; $v++) {
             $method = "applyVersion{$v}";
             if (method_exists($this, $method)) {
+                if ($v === 41) {
+                    $this->{$method}();
+                    continue;
+                }
                 $this->pdo->beginTransaction();
                 try {
                     $this->{$method}();
@@ -983,6 +987,110 @@ final class SchemaManager
         $this->assertStorageCleanupCapacityConsistent();
         $this->assertStorageCleanupTriggers();
         $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (40, 'Bound durable storage cleanup admission')");
+    }
+
+    private function applyVersion41(): void
+    {
+        if (! $this->tableExists('s3_objects')) {
+            throw new \RuntimeException('SQLite metadata schema is corrupted: s3_objects is missing before object part layout migration.');
+        }
+
+        $this->pdo->beginTransaction();
+        try {
+            foreach ([
+                'part_layout_kind' => "TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown'))",
+                'part_layout_count' => 'INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000)',
+                'part_layout_compat_count' => 'INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000)',
+                'part_layout_digest' => 'TEXT',
+            ] as $column => $definition) {
+                if (! $this->columnExists('s3_objects', $column)) {
+                    $this->pdo->exec("ALTER TABLE s3_objects ADD COLUMN {$column} {$definition}");
+                }
+            }
+            $this->pdo->exec(<<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_object_parts (
+                    object_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 10000),
+                    upload_part_number INTEGER CHECK (upload_part_number BETWEEN 1 AND 10000),
+                    plaintext_offset INTEGER NOT NULL CHECK (plaintext_offset >= 0),
+                    plaintext_size INTEGER NOT NULL CHECK (plaintext_size >= 0),
+                    checksum_algorithm TEXT,
+                    checksum_value TEXT,
+                    PRIMARY KEY (object_id, ordinal),
+                    FOREIGN KEY (object_id) REFERENCES s3_objects(id) ON DELETE CASCADE
+                )
+                SQL);
+            $this->pdo->exec(<<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (
+                    migration_name TEXT PRIMARY KEY,
+                    last_object_id INTEGER NOT NULL,
+                    target_object_id INTEGER
+                )
+                SQL);
+            if (! $this->columnExists('s3_migration_checkpoints', 'target_object_id')) {
+                $this->pdo->exec('ALTER TABLE s3_migration_checkpoints ADD COLUMN target_object_id INTEGER');
+            }
+            $this->pdo->exec("INSERT OR IGNORE INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) SELECT 'object_part_layouts', 0, COALESCE(MAX(id), 0) FROM s3_objects");
+            $this->pdo->exec("UPDATE s3_migration_checkpoints SET target_object_id = (SELECT COALESCE(MAX(id), 0) FROM s3_objects) WHERE migration_name = 'object_part_layouts' AND target_object_id IS NULL");
+            $this->pdo->commit();
+        } catch (\Throwable $error) {
+            $this->pdo->rollBack();
+            throw $error;
+        }
+
+        while (true) {
+            $this->pdo->beginTransaction();
+            try {
+                $checkpointQuery = $this->pdo->query("SELECT last_object_id, target_object_id FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
+                if ($checkpointQuery === false) {
+                    throw new \RuntimeException('Object part layout migration checkpoint cannot be read.');
+                }
+                $checkpointRow = $checkpointQuery->fetch(\PDO::FETCH_ASSOC);
+                if (! is_array($checkpointRow) || $checkpointRow['target_object_id'] === null) {
+                    throw new \RuntimeException('Object part layout migration target cannot be read.');
+                }
+                $lastId = (int) $checkpointRow['last_object_id'];
+                $targetId = (int) $checkpointRow['target_object_id'];
+                if ($lastId > $targetId) {
+                    throw new \RuntimeException('Object part layout migration checkpoint exceeds its fixed target.');
+                }
+                $statement = $this->pdo->prepare('SELECT id, etag, size, is_delete_marker FROM s3_objects WHERE id > ? AND id <= ? ORDER BY id LIMIT 10000');
+                $statement->execute([$lastId, $targetId]);
+                $rows = $statement->fetchAll(\PDO::FETCH_ASSOC);
+                if ($rows === []) {
+                    $beyondTarget = $this->pdo->prepare('SELECT 1 FROM s3_objects WHERE id > ? LIMIT 1');
+                    $beyondTarget->execute([$targetId]);
+                    if ($beyondTarget->fetchColumn() !== false) {
+                        throw new \RuntimeException('Object rows were created beyond the fixed object-layout migration target.');
+                    }
+                    $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (41, 'Persist authoritative object part layouts')");
+                    $this->pdo->commit();
+                    break;
+                }
+
+                $update = $this->pdo->prepare('UPDATE s3_objects SET part_layout_kind = ?, part_layout_count = ?, part_layout_compat_count = ?, part_layout_digest = ? WHERE id = ?');
+                $insertPart = $this->pdo->prepare('INSERT OR REPLACE INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size, checksum_algorithm, checksum_value) VALUES (?, 1, NULL, 0, ?, NULL, NULL)');
+                foreach ($rows as $row) {
+                    $lastId = (int) $row['id'];
+                    if ((int) $row['is_delete_marker'] === 1) {
+                        $update->execute([null, null, null, null, $lastId]);
+                        continue;
+                    }
+                    $layout = \OpsFour\S3Server\Metadata\ObjectPartLayout::legacy((string) $row['etag'], (int) $row['size']);
+                    $summary = $layout->summary($lastId);
+                    $update->execute([$summary->kind, $summary->partCount, $summary->compatibilityPartCount, $summary->digest, $lastId]);
+                    if ($summary->kind === \OpsFour\S3Server\Metadata\ObjectPartLayout::KNOWN_SINGLE) {
+                        $insertPart->execute([$lastId, (int) $row['size']]);
+                    }
+                }
+                $checkpoint = $this->pdo->prepare("UPDATE s3_migration_checkpoints SET last_object_id = ? WHERE migration_name = 'object_part_layouts'");
+                $checkpoint->execute([$lastId]);
+                $this->pdo->commit();
+            } catch (\Throwable $error) {
+                $this->pdo->rollBack();
+                throw $error;
+            }
+        }
     }
 
     public function assertWriteIntentCapacityConsistent(): void

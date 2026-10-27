@@ -54,6 +54,13 @@ final class PostObjectTest extends S3FunctionalTestCase
         $this->assertSame('text/plain', $object['ContentType']);
         $this->assertSame('browser', $object['Metadata']['origin']);
         $this->assertSame('STANDARD_IA', $object['StorageClass']);
+        $attributes = self::$s3->getObjectAttributes([
+            'Bucket' => self::$bucket,
+            'Key' => 'signed/hello.txt',
+            'ObjectAttributes' => ['ObjectParts', 'ObjectSize'],
+        ]);
+        $this->assertSame((string) strlen($body), $attributes['ObjectSize']);
+        $this->assertArrayNotHasKey('ObjectParts', $attributes->toArray());
 
         $tags = self::$s3->getObjectTagging([
             'Bucket' => self::$bucket,

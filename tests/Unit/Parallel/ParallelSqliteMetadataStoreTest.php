@@ -8,6 +8,8 @@ use OpsFour\S3Server\Exception\BucketAlreadyExistsException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPart;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Parallel\ParallelSqliteMetadataStore;
@@ -53,6 +55,33 @@ final class ParallelSqliteMetadataStoreTest extends TestCase
         $this->assertSame('test-bucket', $bucket->name);
         $this->assertSame('owner1', $bucket->ownerId);
         $this->assertSame('us-east-1', $bucket->region);
+    }
+
+    public function test_object_part_layout_publication_read_and_immutability_cross_worker_boundary(): void
+    {
+        $this->store->createBucket('owner1', 'layout-bucket', 'us-east-1');
+        $layout = new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, 9, [
+            new ObjectPart(1, 8, 0, 4, 'sha256', 'first'),
+            new ObjectPart(2, 3, 4, 5),
+        ]);
+
+        $this->store->transaction(function () use ($layout): void {
+            $this->store->putObjectMetadata('layout-bucket', 'key', 'owner1', 9, 'etag-2', 'application/octet-stream', 'objects/key');
+            $this->store->putObjectPartLayout('layout-bucket', 'key', 'null', $layout);
+        });
+
+        $object = $this->store->getObjectMetadata('layout-bucket', 'key');
+        self::assertNotNull($object);
+        $persisted = $this->store->getObjectPartLayout($object);
+        self::assertSame([8, 3], array_map(static fn(ObjectPart $part): ?int => $part->uploadPartNumber, $persisted->parts));
+        self::assertSame('first', $persisted->parts[0]->checksumValue);
+
+        try {
+            $this->store->transaction(fn() => $this->store->putObjectPartLayout('layout-bucket', 'key', 'null', ObjectPartLayout::knownSingle(9)));
+            self::fail('The parallel facade must preserve committed layout immutability.');
+        } catch (\LogicException $error) {
+            self::assertSame('Published object part layouts are immutable.', $error->getMessage());
+        }
     }
 
     public function test_nested_notification_enqueue_stays_in_outer_transaction(): void

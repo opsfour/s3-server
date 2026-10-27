@@ -39,6 +39,9 @@ use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectPart;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
+use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
 use OpsFour\S3Server\Metadata\UtcMysqlConnector;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
@@ -63,6 +66,307 @@ use Symfony\Component\Process\Process;
 
 final class MetadataBackendIntegrationTest extends TestCase
 {
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_layout_backfill_resumes_checkpoint_and_rejects_rows_beyond_target(string $driver, string $dsnEnv): void
+    {
+        if (getenv('S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS') !== '1') {
+            self::markTestSkipped('Set S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS=1 only for a disposable metadata database.');
+        }
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} object-part checkpoint tests.");
+        }
+
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
+        $pool = self::externalPool($driver, trim($dsn));
+        $suffix = bin2hex(random_bytes(8));
+        $bucket = 'layout-checkpoint-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $metadata->createBucket($owner, $bucket, 'us-east-1');
+
+        try {
+            $metadata->putObjectMetadata($bucket, 'first', $owner, 4, 'd41d8cd98f00b204e9800998ecf8427e', 'application/octet-stream', 'objects/first');
+            $metadata->putObjectMetadata($bucket, 'second', $owner, 4, 'opaque-etag', 'application/octet-stream', 'objects/second');
+            $metadata->putObjectMetadata($bucket, 'third', $owner, 5, 'd41d8cd98f00b204e9800998ecf8427e', 'application/octet-stream', 'objects/third');
+            $metadata->putObjectMetadata($bucket, 'fourth', $owner, 6, 'd41d8cd98f00b204e9800998ecf8427e', 'application/octet-stream', 'objects/fourth');
+            $metadata->putObjectMetadata($bucket, 'multipart', $owner, 9, 'd41d8cd98f00b204e9800998ecf8427e-7', 'application/octet-stream', 'objects/multipart');
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $markerVersion = $metadata->deleteObjectVersioned($bucket, 'marker', $owner);
+            $rows = $pool->execute(
+                $driver === 'mysql'
+                    ? 'SELECT id, key_name FROM s3_objects WHERE bucket = ? ORDER BY id'
+                    : 'SELECT id, key_name FROM s3_objects WHERE bucket = $1 ORDER BY id',
+                [$bucket],
+            );
+            $objects = [];
+            while (($row = $rows->fetchRow()) !== null) {
+                $keyName = $row['key_name'];
+                $objectId = $row['id'];
+                if (! is_string($keyName) || (! is_int($objectId) && ! is_string($objectId))) {
+                    throw new \RuntimeException('External object identity row has an invalid shape.');
+                }
+                $objects[$keyName] = (int) $objectId;
+            }
+            self::assertArrayHasKey('first', $objects);
+            self::assertArrayHasKey('second', $objects);
+            self::assertArrayHasKey('third', $objects);
+            self::assertArrayHasKey('fourth', $objects);
+            self::assertArrayHasKey('multipart', $objects);
+            self::assertArrayHasKey('marker', $objects);
+            $firstId = $objects['first'];
+            $secondId = $objects['second'];
+            $thirdId = $objects['third'];
+            $fourthId = $objects['fourth'];
+            $multipartId = $objects['multipart'];
+            $markerId = $objects['marker'];
+
+            foreach ([[$secondId, 4], [$markerId, 0]] as [$objectId, $size]) {
+                $pool->execute($driver === 'mysql' ? 'DELETE FROM s3_object_parts WHERE object_id = ?' : 'DELETE FROM s3_object_parts WHERE object_id = $1', [$objectId]);
+                $pool->execute(
+                    $driver === 'mysql'
+                        ? 'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size) VALUES (?, 1, NULL, 0, ?)'
+                        : 'INSERT INTO s3_object_parts (object_id, ordinal, upload_part_number, plaintext_offset, plaintext_size) VALUES ($1, 1, NULL, 0, $2)',
+                    [$objectId, $size],
+                );
+            }
+            foreach ([$secondId, $thirdId, $fourthId, $multipartId, $markerId] as $objectId) {
+                $pool->execute(
+                    $driver === 'mysql'
+                        ? 'UPDATE s3_objects SET part_layout_kind = NULL, part_layout_count = NULL, part_layout_compat_count = NULL, part_layout_digest = NULL WHERE id = ?'
+                        : 'UPDATE s3_objects SET part_layout_kind = NULL, part_layout_count = NULL, part_layout_compat_count = NULL, part_layout_digest = NULL WHERE id = $1',
+                    [$objectId],
+                );
+            }
+            $pool->execute("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
+            $pool->execute(
+                $driver === 'mysql'
+                    ? "INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', ?, ?)"
+                    : "INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', $1, $2)",
+                [$firstId, $markerId],
+            );
+
+            (new \ReflectionMethod($metadata, 'backfillLegacyObjectPartLayouts'))->invoke($metadata);
+            self::assertSame(ObjectPartLayout::UNKNOWN, $metadata->getObjectMetadata($bucket, 'second')?->partLayout?->kind);
+            $third = $metadata->getObjectMetadata($bucket, 'third');
+            self::assertNotNull($third);
+            self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $third->partLayout?->kind);
+            self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $metadata->getObjectMetadata($bucket, 'fourth')?->partLayout?->kind);
+            $knownSingle = $metadata->getObjectPartLayout($third);
+            self::assertCount(1, $knownSingle->parts);
+            self::assertSame(0, $knownSingle->parts[0]->offset);
+            self::assertSame(5, $knownSingle->parts[0]->size);
+            $multipart = $metadata->getObjectMetadata($bucket, 'multipart');
+            self::assertNotNull($multipart);
+            self::assertSame(ObjectPartLayout::UNKNOWN_MULTIPART, $multipart->partLayout?->kind);
+            self::assertSame(7, $multipart->partLayout->compatibilityPartCount);
+            self::assertSame(ObjectPartLayout::legacy('d41d8cd98f00b204e9800998ecf8427e-7', 9)->digestForObject($multipartId), $multipart->partLayout->digest);
+            $marker = $metadata->getObjectMetadataByVersion($bucket, 'marker', $markerVersion);
+            self::assertNotNull($marker);
+            self::assertTrue($marker->isDeleteMarker);
+            self::assertNull($marker->partLayout);
+            foreach ([$secondId, $multipartId, $markerId] as $objectId) {
+                $staleChild = $pool->execute(
+                    $driver === 'mysql'
+                        ? 'SELECT 1 FROM s3_object_parts WHERE object_id = ? LIMIT 1'
+                        : 'SELECT 1 FROM s3_object_parts WHERE object_id = $1 LIMIT 1',
+                    [$objectId],
+                )->fetchRow();
+                self::assertNull($staleChild);
+            }
+            foreach ([$thirdId, $fourthId] as $objectId) {
+                $knownChild = $pool->execute(
+                    $driver === 'mysql'
+                        ? 'SELECT COUNT(*) AS child_count FROM s3_object_parts WHERE object_id = ?'
+                        : 'SELECT COUNT(*) AS child_count FROM s3_object_parts WHERE object_id = $1',
+                    [$objectId],
+                )->fetchRow();
+                self::assertNotNull($knownChild);
+                self::assertSame(1, (int) $knownChild['child_count']);
+            }
+
+            $pool->execute(
+                $driver === 'mysql'
+                    ? "UPDATE s3_migration_checkpoints SET last_object_id = ?, target_object_id = ? WHERE migration_name = 'object_part_layouts'"
+                    : "UPDATE s3_migration_checkpoints SET last_object_id = $1, target_object_id = $2 WHERE migration_name = 'object_part_layouts'",
+                [$markerId + 1, $markerId],
+            );
+            try {
+                (new \ReflectionMethod($metadata, 'backfillLegacyObjectPartLayouts'))->invoke($metadata);
+                self::fail('A checkpoint beyond its fixed target must be rejected.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Object part layout migration checkpoint exceeds its fixed target.', $error->getMessage());
+            }
+            $pool->execute(
+                $driver === 'mysql'
+                    ? "UPDATE s3_migration_checkpoints SET last_object_id = ?, target_object_id = ? WHERE migration_name = 'object_part_layouts'"
+                    : "UPDATE s3_migration_checkpoints SET last_object_id = $1, target_object_id = $2 WHERE migration_name = 'object_part_layouts'",
+                [$markerId, $markerId],
+            );
+
+            $metadata->putObjectMetadata($bucket, 'beyond-target', $owner, 4, 'opaque-late', 'application/octet-stream', 'objects/beyond');
+            try {
+                (new \ReflectionMethod($metadata, 'backfillLegacyObjectPartLayouts'))->invoke($metadata);
+                self::fail('Rows beyond the fixed external-backend migration target must be rejected.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Object rows were created beyond the fixed object-layout migration target.', $error->getMessage());
+            }
+        } finally {
+            $pool->execute($driver === 'mysql' ? 'DELETE FROM s3_objects WHERE bucket = ?' : 'DELETE FROM s3_objects WHERE bucket = $1', [$bucket]);
+            $pool->execute("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
+            $metadata->deleteBucket($owner, $bucket);
+            $pool->close();
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_object_part_layout_publication_read_and_cascade(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} object-part layout parity tests.");
+        }
+
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
+        self::assertTrue($metadata->supportsObjectPartLayouts());
+        $pool = self::externalPool($driver, trim($dsn));
+        $suffix = bin2hex(random_bytes(8));
+        $bucket = 'layout-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $versionId = null;
+        $bulkVersionId = null;
+        $metadata->createBucket($owner, $bucket, 'us-east-1');
+
+        try {
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $metadata->transaction(function () use ($metadata, $bucket, $owner, &$versionId): void {
+                $versionId = $metadata->putObjectVersioned($bucket, 'multipart', $owner, 9, '"etag-2"', 'application/octet-stream', 'objects/multipart');
+                $metadata->putObjectPartLayout($bucket, 'multipart', $versionId, new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, 9, [
+                    new ObjectPart(1, 8, 0, 4, 'sha256', 'first'),
+                    new ObjectPart(2, 3, 4, 5),
+                ]));
+            });
+            self::assertIsString($versionId);
+
+            $object = $metadata->getObjectMetadataByVersion($bucket, 'multipart', $versionId);
+            self::assertNotNull($object);
+            $layout = $metadata->getObjectPartLayout($object);
+            self::assertSame([8, 3], array_map(static fn(ObjectPart $part): ?int => $part->uploadPartNumber, $layout->parts));
+            self::assertSame([0, 4], array_map(static fn(ObjectPart $part): int => $part->offset, $layout->parts));
+            self::assertSame('first', $layout->parts[0]->checksumValue);
+
+            $objectRow = $pool->execute(
+                $driver === 'mysql'
+                    ? 'SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                    : 'SELECT id FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
+                [$bucket, 'multipart', $versionId],
+            )->fetchRow();
+            self::assertNotNull($objectRow);
+            $objectId = (int) $objectRow['id'];
+            $pool->execute(
+                $driver === 'mysql'
+                    ? "UPDATE s3_object_parts SET checksum_value = 'tampered' WHERE object_id = ? AND ordinal = 1"
+                    : "UPDATE s3_object_parts SET checksum_value = 'tampered' WHERE object_id = $1 AND ordinal = 1",
+                [$objectId],
+            );
+            try {
+                $metadata->getObjectPartLayout($object);
+                self::fail('External child-row tampering must be rejected by the object-bound layout digest.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Stored object part layout digest is inconsistent.', $error->getMessage());
+            }
+            $pool->execute(
+                $driver === 'mysql'
+                    ? "UPDATE s3_object_parts SET checksum_value = 'first' WHERE object_id = ? AND ordinal = 1"
+                    : "UPDATE s3_object_parts SET checksum_value = 'first' WHERE object_id = $1 AND ordinal = 1",
+                [$objectId],
+            );
+
+            $pool->execute(
+                $driver === 'mysql'
+                    ? 'UPDATE s3_objects SET part_layout_count = NULL, updated_at = updated_at WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                    : 'UPDATE s3_objects SET part_layout_count = NULL WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
+                [$bucket, 'multipart', $versionId],
+            );
+            try {
+                $metadata->getObjectMetadataByVersion($bucket, 'multipart', $versionId);
+                self::fail('A NULL external layout count must be rejected as corruption.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Current metadata schema contains an incomplete object part layout summary.', $error->getMessage());
+            }
+            $pool->execute(
+                $driver === 'mysql'
+                    ? 'UPDATE s3_objects SET part_layout_count = 2, updated_at = updated_at WHERE bucket = ? AND key_name = ? AND version_id = ?'
+                    : 'UPDATE s3_objects SET part_layout_count = 2 WHERE bucket = $1 AND key_name = $2 AND version_id = $3',
+                [$bucket, 'multipart', $versionId],
+            );
+
+            try {
+                $metadata->transaction(fn() => $metadata->putObjectPartLayout($bucket, 'multipart', $versionId, ObjectPartLayout::knownSingle(9)));
+                self::fail('A committed external-backend layout must be immutable.');
+            } catch (\LogicException $error) {
+                self::assertSame('Published object part layouts are immutable.', $error->getMessage());
+            }
+
+            $bulkParts = [];
+            for ($ordinal = 1; $ordinal <= 1001; $ordinal++) {
+                $bulkParts[] = new ObjectPart($ordinal, $ordinal, $ordinal - 1, 1);
+            }
+            $metadata->transaction(function () use ($metadata, $bucket, $owner, $bulkParts, &$bulkVersionId): void {
+                $bulkVersionId = $metadata->putObjectVersioned($bucket, 'bulk-multipart', $owner, 1001, '"bulk-etag-1001"', 'application/octet-stream', 'objects/bulk-multipart');
+                $metadata->putObjectPartLayout($bucket, 'bulk-multipart', $bulkVersionId, new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, 1001, $bulkParts));
+            });
+            self::assertIsString($bulkVersionId);
+            $bulkObject = $metadata->getObjectMetadataByVersion($bucket, 'bulk-multipart', $bulkVersionId);
+            self::assertNotNull($bulkObject);
+            self::assertCount(1001, $metadata->getObjectPartLayout($bulkObject)->parts);
+            self::assertNotNull($metadata->deleteObjectVersion($bucket, 'bulk-multipart', $bulkVersionId));
+            $bulkVersionId = null;
+
+            $metadata->putObjectMetadata($bucket, 'null-object', $owner, 4, '"same-size-1"', 'application/octet-stream', 'objects/null-1');
+            $oldNullObject = $metadata->getObjectMetadata($bucket, 'null-object');
+            self::assertNotNull($oldNullObject);
+            $metadata->putObjectMetadata($bucket, 'null-object', $owner, 4, '"same-size-2"', 'application/octet-stream', 'objects/null-2');
+            $newNullObject = $metadata->getObjectMetadata($bucket, 'null-object');
+            self::assertNotNull($newNullObject);
+            self::assertNotSame($oldNullObject->partLayout?->digest, $newNullObject->partLayout?->digest);
+            try {
+                $metadata->getObjectPartLayout($oldNullObject);
+                self::fail('A replaced literal-null snapshot must not read the new incarnation layout.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Object part layout snapshot no longer matches the object incarnation.', $error->getMessage());
+            }
+
+            $markerVersion = $metadata->deleteObjectVersioned($bucket, 'null-object', $owner, true);
+            self::assertSame('null', $markerVersion);
+            $marker = $metadata->getCurrentObjectVersion($bucket, 'null-object');
+            self::assertNotNull($marker);
+            self::assertTrue($marker->isDeleteMarker);
+            self::assertNull($marker->partLayout);
+            $metadata->deleteObjectMetadata($bucket, 'null-object');
+
+            self::assertNotNull($metadata->deleteObjectVersion($bucket, 'multipart', $versionId));
+            $versionId = null;
+            $child = $pool->execute(
+                $driver === 'mysql'
+                    ? 'SELECT 1 FROM s3_object_parts WHERE object_id = ? LIMIT 1'
+                    : 'SELECT 1 FROM s3_object_parts WHERE object_id = $1 LIMIT 1',
+                [$objectId],
+            )->fetchRow();
+            self::assertNull($child);
+        } finally {
+            if ($bulkVersionId !== null) {
+                $metadata->deleteObjectVersion($bucket, 'bulk-multipart', $bulkVersionId);
+            }
+            if ($versionId !== null) {
+                $metadata->deleteObjectVersion($bucket, 'multipart', $versionId);
+            }
+            $metadata->deleteBucket($owner, $bucket);
+            $pool->close();
+        }
+    }
+
     public function test_mysql_tier_inventory_and_garbage_discard_are_byte_exact(): void
     {
         $dsn = getenv('S3_TEST_MYSQL_METADATA_DSN');
@@ -3657,8 +3961,14 @@ final class MetadataBackendIntegrationTest extends TestCase
             self::seedMigrationObjects($pool, $bucket, $ownerId, $scaleCount);
             $pool->execute('DROP TABLE IF EXISTS s3_storage_garbage');
             $pool->execute('DROP TABLE IF EXISTS s3_owner_write_locks');
+            $pool->execute('DROP TABLE IF EXISTS s3_object_parts');
+            $pool->execute('DROP TABLE IF EXISTS s3_migration_checkpoints');
 
             if ($driver === 'mysql') {
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_kind');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_count');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_compat_count');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_digest');
                 $pool->execute('ALTER TABLE s3_buckets DROP COLUMN generation');
                 $pool->execute('ALTER TABLE s3_objects DROP INDEX idx_s3_objects_owner');
                 $pool->execute('ALTER TABLE s3_objects DROP INDEX idx_s3_objects_tier_state');
@@ -3676,6 +3986,10 @@ final class MetadataBackendIntegrationTest extends TestCase
                 $pool->execute('ALTER TABLE s3_tagging ADD UNIQUE KEY uk_s3_tagging (resource_type, bucket, key_name(255), tag_key)');
                 $pool->execute('ALTER TABLE s3_tagging ADD KEY idx_s3_tagging_resource (resource_type, bucket, key_name(255))');
             } else {
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_kind');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_count');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_compat_count');
+                $pool->execute('ALTER TABLE s3_objects DROP COLUMN part_layout_digest');
                 $pool->execute('ALTER TABLE s3_buckets DROP COLUMN generation');
                 $pool->execute('DROP INDEX idx_s3_objects_owner');
                 $pool->execute('DROP INDEX idx_s3_objects_tier_state');
@@ -3701,6 +4015,7 @@ final class MetadataBackendIntegrationTest extends TestCase
                 self::recordMigrationProbeEvent($progressPath, 'migration-start', $scaleCount);
             }
             $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+            self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
             if ($progressPath !== false && $progressPath !== '') {
                 self::recordMigrationProbeEvent($progressPath, 'migration-complete', $scaleCount);
             }
@@ -3711,12 +4026,24 @@ final class MetadataBackendIntegrationTest extends TestCase
             $migratedBucket = $metadata->getBucket($bucket);
             self::assertNotNull($migratedBucket);
             self::assertSame(32, strlen($migratedBucket->generation));
+            self::assertNotNull($metadata->getObjectMetadata($bucket, 'owned.txt')?->partLayout);
             if ($scaleCount > 0) {
                 self::assertSame(1, $metadata->getObjectMetadata($bucket, sprintf('scale-%08d', $scaleCount - 1))?->size);
                 self::assertSame(
                     [['key' => 'state', 'value' => 'scale']],
                     $metadata->getObjectTagging($bucket, sprintf('scale-%08d', intdiv($scaleCount - 1, 10) * 10)),
                 );
+            }
+            if ($scaleCount > 10_000) {
+                foreach ([9998, 9999, 10_000] as $number) {
+                    $boundaryObject = $metadata->getObjectMetadata($bucket, sprintf('scale-%08d', $number));
+                    self::assertNotNull($boundaryObject);
+                    self::assertSame(ObjectPartLayout::KNOWN_SINGLE, $boundaryObject->partLayout?->kind);
+                    $boundaryLayout = $metadata->getObjectPartLayout($boundaryObject);
+                    self::assertCount(1, $boundaryLayout->parts);
+                    self::assertSame(0, $boundaryLayout->parts[0]->offset);
+                    self::assertSame(1, $boundaryLayout->parts[0]->size);
+                }
             }
 
             $row = $pool->execute('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
@@ -3861,7 +4188,10 @@ final class MetadataBackendIntegrationTest extends TestCase
             $tagRows = [];
             for ($number = $offset; $number < min($offset + 500, $count); $number++) {
                 $key = sprintf('scale-%08d', $number);
-                $rows[] = sprintf("('%s', '%s', '%s', '\"scale\"', 1, 'scale-path-%08d', '{}')", $bucket, $key, $ownerId, $number);
+                $etag = in_array($number, [9998, 9999, 10_000], true)
+                    ? 'd41d8cd98f00b204e9800998ecf8427e'
+                    : '"scale"';
+                $rows[] = sprintf("('%s', '%s', '%s', '%s', 1, 'scale-path-%08d', '{}')", $bucket, $key, $ownerId, $etag, $number);
                 if ($number % 10 === 0) {
                     $tagRows[] = sprintf("('object', '%s', '%s', 'state', 'scale')", $bucket, $key);
                 }

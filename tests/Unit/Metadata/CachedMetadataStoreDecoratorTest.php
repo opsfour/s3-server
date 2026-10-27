@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Metadata;
 
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
+use OpsFour\S3Server\Metadata\ObjectPart;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -69,6 +71,33 @@ final class CachedMetadataStoreDecoratorTest extends TestCase
         $this->inner->putBucketCors('bucket-a', $rules);
 
         self::assertSame($rules, $store->getBucketCors('bucket-a'));
+    }
+
+    public function test_object_part_layout_publication_read_and_immutability_are_forwarded(): void
+    {
+        $this->store->createBucket('owner-a', 'bucket-a', 'us-east-1');
+        $layout = new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, 9, [
+            new ObjectPart(1, 8, 0, 4, 'sha256', 'first'),
+            new ObjectPart(2, 3, 4, 5),
+        ]);
+
+        $this->store->transaction(function () use ($layout): void {
+            $this->store->putObjectMetadata('bucket-a', 'key', 'owner-a', 9, 'etag-2', 'application/octet-stream', 'objects/key');
+            $this->store->putObjectPartLayout('bucket-a', 'key', 'null', $layout);
+        });
+
+        $object = $this->store->getObjectMetadata('bucket-a', 'key');
+        self::assertNotNull($object);
+        $persisted = $this->store->getObjectPartLayout($object);
+        self::assertSame([8, 3], array_map(static fn(ObjectPart $part): ?int => $part->uploadPartNumber, $persisted->parts));
+        self::assertSame('first', $persisted->parts[0]->checksumValue);
+
+        try {
+            $this->store->transaction(fn() => $this->store->putObjectPartLayout('bucket-a', 'key', 'null', ObjectPartLayout::knownSingle(9)));
+            self::fail('The cache decorator must preserve committed layout immutability.');
+        } catch (\LogicException $error) {
+            self::assertSame('Published object part layouts are immutable.', $error->getMessage());
+        }
     }
 
     public function test_transaction_rollback_discards_values_cached_inside_callback(): void

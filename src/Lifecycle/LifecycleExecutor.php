@@ -996,6 +996,7 @@ final class LifecycleExecutor
             && $left->ownerId === $right->ownerId
             && $left->etag === $right->etag
             && ($left->systemMetadata['storagePath'] ?? null) === ($right->systemMetadata['storagePath'] ?? null)
+            && $left->partLayout?->digest === $right->partLayout?->digest
             && $left->isDeleteMarker === $right->isDeleteMarker;
     }
 
