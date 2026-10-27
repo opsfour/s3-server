@@ -290,6 +290,20 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             throw new InternalErrorException('Multipart completion requires durable write-intent capable backends.');
         }
 
+        try {
+            $aclGrants = self::storedAclGrants($upload['user_metadata'], $ownerId);
+        } catch (\Throwable $e) {
+            throw new InternalErrorException('Multipart upload metadata is invalid.', $e);
+        }
+        $preflightDecision = $this->destinationDecision(
+            $ownershipSnapshot,
+            $bucket,
+            $bucketInfo->ownerId,
+            $ownerId,
+            $aclGrants,
+        );
+        $this->assertCurrentPublicAclAllowed($bucket, $preflightDecision[1]);
+
         $attemptId = bin2hex(random_bytes(16));
         $plannedPaths = $uploadStorage->planMultipartCompletionPaths(
             $bucket,
@@ -312,8 +326,16 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             leaseUntil: $intentNow + $this->intentLeaseSeconds,
             nextAttemptAt: $intentNow + $this->intentLeaseSeconds,
         );
-        $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $request, $uploadId, $bucket, $key, $validatedParts, $intent, $uploadEncryptionMode): void {
+        $this->metadata->transaction(function () use ($ownerId, $bucketInfo, $request, $uploadId, $bucket, $key, $validatedParts, $intent, $uploadEncryptionMode, $ownershipSnapshot, $aclGrants): void {
             \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
+            $intentDecision = $this->destinationDecision(
+                $ownershipSnapshot,
+                $bucket,
+                $bucketInfo->ownerId,
+                $ownerId,
+                $aclGrants,
+            );
+            $this->assertCurrentPublicAclAllowed($bucket, $intentDecision[1]);
             \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
             ObjectLockConfigurationSnapshot::assertCurrent(
                 $request,
@@ -480,14 +502,6 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 }
                 /** @var list<array{key: string, value: string}> $tags */
                 $tags = $decodedTags;
-            }
-
-            $aclGrants = AclGrantResolver::privateAcl($ownerId);
-            $encodedAclGrants = $userMetadata['__mpu-acl-grants'] ?? null;
-            if ($encodedAclGrants !== null) {
-                /** @var list<array{granteeType: string, granteeId: string, permission: string}> $decodedAclGrants */
-                $decodedAclGrants = json_decode($encodedAclGrants, true, 16, JSON_THROW_ON_ERROR);
-                $aclGrants = AclGrantResolver::validateGrants($decodedAclGrants);
             }
         } catch (\Throwable $e) {
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
@@ -1262,6 +1276,23 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         }
 
         return [$initiatorId, $legacyAclGrants, $initiatorId];
+    }
+
+    /**
+     * @param array<string, string> $userMetadata
+     * @return list<array{granteeType: string, granteeId: string, permission: string}>
+     */
+    private static function storedAclGrants(array $userMetadata, string $ownerId): array
+    {
+        $encodedAclGrants = $userMetadata['__mpu-acl-grants'] ?? null;
+        if ($encodedAclGrants === null) {
+            return AclGrantResolver::privateAcl($ownerId);
+        }
+
+        /** @var list<array{granteeType: string, granteeId: string, permission: string}> $decodedAclGrants */
+        $decodedAclGrants = json_decode($encodedAclGrants, true, 16, JSON_THROW_ON_ERROR);
+
+        return AclGrantResolver::validateGrants($decodedAclGrants);
     }
 
     /** @param array<string, string>|null $expectedMetadata */

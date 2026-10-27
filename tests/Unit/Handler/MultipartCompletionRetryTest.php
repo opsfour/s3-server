@@ -10,9 +10,11 @@ use Amp\Socket\InternetAddress;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
+use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
+use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
@@ -37,6 +39,7 @@ use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
@@ -72,6 +75,13 @@ final class MultipartCompletionRetryTest extends TestCase
     {
         yield 'unversioned' => [false];
         yield 'versioned' => [true];
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function multipartOwnershipSnapshotModes(): iterable
+    {
+        yield 'snapshotted destination' => [false];
+        yield 'legacy destination' => [true];
     }
 
     public function test_replaced_object_and_restored_copy_cleanup_survive_lost_complete_acknowledgement(): void
@@ -178,6 +188,150 @@ final class MultipartCompletionRetryTest extends TestCase
             self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
             self::assertCount(1, $this->metadata->getParts($uploadId));
         }
+    }
+
+    #[DataProvider('multipartOwnershipSnapshotModes')]
+    public function test_block_public_acls_rejects_public_completion_before_planning_or_assembly(bool $legacy): void
+    {
+        [$uploadId, $body] = $this->createMultipartUpload('public-read');
+        if ($legacy) {
+            $this->removeDestinationOwnershipSnapshot($uploadId);
+        } else {
+            // The immutable initiation snapshot must remain authoritative even
+            // if the current ownership mode would make a new upload private.
+            $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerEnforced');
+        }
+        $this->metadata->putPublicAccessBlock('bucket', true, false, false, false);
+
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->expects(self::never())->method('planMultipartCompletionPaths');
+        $storage->expects(self::never())->method('assembleMultipartUploadAtPath');
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))
+                ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body));
+            self::fail('BlockPublicAcls accepted a public multipart destination.');
+        } catch (AccessDeniedException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertCount(1, $this->metadata->getParts($uploadId));
+        }
+
+        $intentCount = (new \PDO('sqlite:' . $this->databasePath))
+            ->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
+        self::assertInstanceOf(\PDOStatement::class, $intentCount);
+        self::assertSame(0, (int) $intentCount->fetchColumn());
+
+        $this->metadata->deletePublicAccessBlock('bucket');
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'retry.bin');
+        self::assertNotNull($object);
+        self::assertSame('payload', \Amp\ByteStream\buffer($this->storage->getObjectByPath($object->systemMetadata['storagePath'])));
+    }
+
+    public function test_block_public_acls_allows_private_snapshotted_destination(): void
+    {
+        [$uploadId, $body] = $this->createMultipartUpload();
+        $this->metadata->putPublicAccessBlock('bucket', true, false, false, false);
+
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))->getStatus());
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+        self::assertSame(
+            AclGrantResolver::privateAcl('owner'),
+            $this->metadata->getAcl('object', 'bucket/retry.bin?versionId=null'),
+        );
+    }
+
+    public function test_block_public_acls_allows_legacy_public_grants_resolved_by_current_enforced_mode(): void
+    {
+        [$uploadId, $body] = $this->createMultipartUpload('public-read');
+        $this->removeDestinationOwnershipSnapshot($uploadId);
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerEnforced');
+        $this->metadata->putPublicAccessBlock('bucket', true, false, false, false);
+
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'retry.bin');
+        self::assertNotNull($object);
+        self::assertSame('owner', $object->ownerId);
+        self::assertSame(
+            AclGrantResolver::privateAcl('owner'),
+            $this->metadata->getAcl('object', 'bucket/retry.bin?versionId=null'),
+        );
+    }
+
+    public function test_block_public_acls_enabled_during_path_planning_prevents_intent_and_assembly(): void
+    {
+        [$uploadId, $body] = $this->createMultipartUpload('public-read');
+
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->expects(self::once())
+            ->method('planMultipartCompletionPaths')
+            ->willReturnCallback(function (string $bucket, string $key, string $generation, string $attemptId): array {
+                $this->metadata->putPublicAccessBlock('bucket', true, false, false, false);
+
+                return $this->storage->planMultipartCompletionPaths($bucket, $key, $generation, $attemptId);
+            });
+        $storage->expects(self::never())->method('assembleMultipartUploadAtPath');
+
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))
+                ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body));
+            self::fail('A PAB change during path planning created an intent.');
+        } catch (AccessDeniedException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertCount(1, $this->metadata->getParts($uploadId));
+        }
+
+        $intentCount = (new \PDO('sqlite:' . $this->databasePath))
+            ->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
+        self::assertInstanceOf(\PDOStatement::class, $intentCount);
+        self::assertSame(0, (int) $intentCount->fetchColumn());
+
+        $this->metadata->deletePublicAccessBlock('bucket');
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))->getStatus());
+    }
+
+    #[DataProvider('completionVersioningModes')]
+    public function test_block_public_acls_enabled_during_assembly_is_rechecked_at_commit(bool $versioned): void
+    {
+        if ($versioned) {
+            $this->metadata->setBucketVersioning('bucket', 'Enabled');
+        }
+        [$uploadId, $body] = $this->createMultipartUpload('public-read');
+
+        $assemblyPath = null;
+        $storage = $this->createMock(RecoverableMultipartAssemblyBackend::class);
+        $storage->method('planMultipartCompletionPaths')
+            ->willReturnCallback($this->storage->planMultipartCompletionPaths(...));
+        $storage->method('assembleMultipartUploadAtPath')
+            ->willReturnCallback(function (string $bucket, string $key, string $id, array $parts, string $path) use (&$assemblyPath): StorageWriteResult {
+                $result = $this->storage->assembleMultipartUploadAtPath($bucket, $key, $id, $parts, $path);
+                $assemblyPath = $path;
+                $this->metadata->putPublicAccessBlock('bucket', true, false, false, false);
+
+                return $result;
+            });
+        $storage->method('deleteObjectByPath')->willReturnCallback($this->storage->deleteObjectByPath(...));
+
+        try {
+            (new CompleteMultipartUploadHandler($this->metadata, $storage))
+                ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body));
+            self::fail('A public multipart object committed after BlockPublicAcls changed during assembly.');
+        } catch (AccessDeniedException) {
+            self::assertNotNull($assemblyPath);
+            self::assertStoragePathMissing($this->storage, $assemblyPath);
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'retry.bin'));
+            self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+            self::assertCount(1, $this->metadata->getParts($uploadId));
+        }
+
+        $this->metadata->deletePublicAccessBlock('bucket');
+        self::assertSame(200, (new CompleteMultipartUploadHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploadId=' . $uploadId, $body))->getStatus());
     }
 
     public function test_object_lock_default_change_after_initiation_rejects_completion_before_assembly(): void
@@ -3254,6 +3408,34 @@ final class MultipartCompletionRetryTest extends TestCase
         self::assertNotNull($upload);
         $metadata = $upload['user_metadata'];
         unset($metadata['__mpu-part-format']);
+        $update = (new \PDO('sqlite:' . $this->databasePath))
+            ->prepare('UPDATE s3_multipart_uploads SET user_metadata = ? WHERE upload_id = ?');
+        self::assertInstanceOf(\PDOStatement::class, $update);
+        $update->execute([json_encode($metadata, JSON_THROW_ON_ERROR), $uploadId]);
+    }
+
+    /** @return array{string, string} */
+    private function createMultipartUpload(?string $cannedAcl = null): array
+    {
+        $headers = $cannedAcl === null ? [] : ['x-amz-acl' => $cannedAcl];
+        $created = (new CreateMultipartUploadHandler($this->metadata))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads', headers: $headers));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'));
+        $etag = (string) $part->getHeader('ETag');
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+
+        return [$uploadId, $body];
+    }
+
+    private function removeDestinationOwnershipSnapshot(string $uploadId): void
+    {
+        $upload = $this->metadata->getMultipartUpload($uploadId);
+        self::assertNotNull($upload);
+        $metadata = $upload['user_metadata'];
+        unset($metadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]);
         $update = (new \PDO('sqlite:' . $this->databasePath))
             ->prepare('UPDATE s3_multipart_uploads SET user_metadata = ? WHERE upload_id = ?');
         self::assertInstanceOf(\PDOStatement::class, $update);

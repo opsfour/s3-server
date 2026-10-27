@@ -22,6 +22,12 @@ The project follows [Semantic Versioning](https://semver.org/).
   `REST-QUERY-STRING`, and `POST` values propagated through request-derived
   authorization checks without trusting transport-shaped input.
 
+### Fixed
+
+- Reject multipart completions whose stored public destination ACL is already
+  blocked before creating a write intent or assembling object data, while
+  retaining the commit-time recheck for concurrent access-control changes.
+
 ## [2.0.0] - 2026-10-26
 
 ### Added
