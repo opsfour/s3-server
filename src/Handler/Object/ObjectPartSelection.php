@@ -12,6 +12,8 @@ final readonly class ObjectPartSelection
         public int $size,
         public int $objectSize,
         public ?int $multipartPartCount,
+        public ?string $checksumAlgorithm,
+        public ?string $checksumValue,
     ) {}
 
     public function contentRange(): string

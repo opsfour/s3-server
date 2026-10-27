@@ -114,10 +114,17 @@ final class GetObjectHandler implements RequestHandler
         // SSE-C headers are required even if a conditional request would
         // otherwise return 304/412 without reading the object body.
         $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        if ($partSelector->isRequested() && $sseAlgo !== null && ! in_array($sseAlgo, ['AES256', 'SSE-C'], true)) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object encryption mode is invalid.');
+        }
+        $customerKeyMd5 = $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null;
+        if ($partSelector->isRequested() && $sseAlgo === 'SSE-C' && ($customerKeyMd5 === null || $customerKeyMd5 === '')) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored SSE-C key metadata is missing.');
+        }
         $customerKey = \OpsFour\S3Server\Encryption\EncryptionRequestResolver::resolveCustomerKey(
             $request,
             $sseAlgo === 'SSE-C',
-            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+            $customerKeyMd5,
         );
         if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
             throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
@@ -128,14 +135,6 @@ final class GetObjectHandler implements RequestHandler
             && $this->metadata->getBucketVersioning($bucket) !== '';
         BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
-
-        // Story 3.3 adds plaintext-aware selection for encrypted objects. Keep
-        // request validation and complete-object conditions authoritative now.
-        if ($partSelector->isRequested() && $sseAlgo !== null) {
-            throw new \OpsFour\S3Server\Exception\NotImplementedException(
-                'GetObject partNumber is not supported for encrypted objects.',
-            );
-        }
 
         $partSelection = null;
         if ($partSelector->isRequested()) {
@@ -189,11 +188,13 @@ final class GetObjectHandler implements RequestHandler
         }
 
         if ($sseAlgo !== null) {
-            \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService(
-                $this->encryption,
-                $sseAlgo,
-            );
-            \assert($this->encryption !== null);
+            if ($partSelection === null) {
+                \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService(
+                    $this->encryption,
+                    $sseAlgo,
+                );
+                \assert($this->encryption !== null);
+            }
             $bufferedWorkLock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
             $decryptionCancellation = null;
             try {
@@ -202,6 +203,16 @@ final class GetObjectHandler implements RequestHandler
                     throw new \OpsFour\S3Server\Exception\EntityTooLargeException(
                         'Encrypted object exceeds maximum size for decryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                     );
+                }
+                $encryptionMetadata = $partSelection !== null
+                    ? self::encryptionMetadata($objectInfo, $sseAlgo)
+                    : null;
+                if ($partSelection !== null) {
+                    \OpsFour\S3Server\Encryption\EncryptionRequestResolver::requireEncryptionService(
+                        $this->encryption,
+                        $sseAlgo,
+                    );
+                    \assert($this->encryption !== null);
                 }
 
                 // Encrypted objects: read full ciphertext, decrypt, then apply range.
@@ -215,16 +226,16 @@ final class GetObjectHandler implements RequestHandler
                     $plaintext = $this->encryption->decryptSseC(
                         $ciphertext,
                         $customerKey,
-                        $objectInfo->userMetadata['__sse-iv'],
-                        $objectInfo->userMetadata['__sse-tag'],
+                        $encryptionMetadata['iv'] ?? $objectInfo->userMetadata['__sse-iv'],
+                        $encryptionMetadata['tag'] ?? $objectInfo->userMetadata['__sse-tag'],
                     );
                 } else {
                     // SSE-S3.
                     $plaintext = $this->encryption->decryptSseS3(
                         $ciphertext,
-                        $objectInfo->userMetadata['__sse-key'],
-                        $objectInfo->userMetadata['__sse-iv'],
-                        $objectInfo->userMetadata['__sse-tag'],
+                        $encryptionMetadata['key'] ?? $objectInfo->userMetadata['__sse-key'],
+                        $encryptionMetadata['iv'] ?? $objectInfo->userMetadata['__sse-iv'],
+                        $encryptionMetadata['tag'] ?? $objectInfo->userMetadata['__sse-tag'],
                     );
                 }
 
@@ -287,6 +298,12 @@ final class GetObjectHandler implements RequestHandler
             if ($partSelection?->multipartPartCount !== null) {
                 $headers['x-amz-mp-parts-count'] = (string) $partSelection->multipartPartCount;
             }
+            $headers = S3ResponseHeaders::withPartChecksum(
+                $headers,
+                $includeChecksums,
+                $partSelection?->checksumAlgorithm,
+                $partSelection?->checksumValue,
+            );
 
             // 7. Apply response-* query parameter overrides only after the auth
             // middleware has resolved a real identity. A bare, unsigned
@@ -420,6 +437,25 @@ final class GetObjectHandler implements RequestHandler
         return (new InvalidRangeException())->withExtraHeaders([
             'Content-Range' => 'bytes */' . $objectSize,
         ]);
+    }
+
+    /** @return array{key: string, iv: string, tag: string} */
+    private static function encryptionMetadata(ObjectInfo $objectInfo, string $mode): array
+    {
+        $key = '';
+        if ($mode === 'AES256') {
+            $key = $objectInfo->userMetadata['__sse-key'] ?? null;
+            if ($key === null || $key === '') {
+                throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object encryption metadata is incomplete.');
+            }
+        }
+        $iv = $objectInfo->userMetadata['__sse-iv'] ?? null;
+        $tag = $objectInfo->userMetadata['__sse-tag'] ?? null;
+        if ($iv === null || $iv === '' || $tag === null || $tag === '') {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object encryption metadata is incomplete.');
+        }
+
+        return ['key' => $key, 'iv' => $iv, 'tag' => $tag];
     }
 
     private static function bufferCiphertext(\Amp\ByteStream\ReadableStream $source, int $expectedSize): string

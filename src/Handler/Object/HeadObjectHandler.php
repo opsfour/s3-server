@@ -98,10 +98,17 @@ final class HeadObjectHandler implements RequestHandler
         }
 
         $sseAlgo = $objectInfo->userMetadata['__sse-algorithm'] ?? null;
+        if ($partSelector->isRequested() && $sseAlgo !== null && ! in_array($sseAlgo, ['AES256', 'SSE-C'], true)) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored object encryption mode is invalid.');
+        }
+        $customerKeyMd5 = $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null;
+        if ($partSelector->isRequested() && $sseAlgo === 'SSE-C' && ($customerKeyMd5 === null || $customerKeyMd5 === '')) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException('Stored SSE-C key metadata is missing.');
+        }
         $customerKey = EncryptionRequestResolver::resolveCustomerKey(
             $request,
             $sseAlgo === 'SSE-C',
-            $objectInfo->userMetadata['__sse-customer-key-md5'] ?? null,
+            $customerKeyMd5,
         );
         if ($sseAlgo !== 'SSE-C' && $customerKey !== null) {
             throw new InvalidArgumentException('SSE-C headers are not valid for this object.');
@@ -112,12 +119,6 @@ final class HeadObjectHandler implements RequestHandler
             && $this->metadata->getBucketVersioning($bucket) !== '';
         \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
         ConditionalHeaderEvaluator::evaluate($request, $objectInfo, $emitNullVersion);
-
-        if ($partSelector->isRequested() && $sseAlgo !== null) {
-            throw new \OpsFour\S3Server\Exception\NotImplementedException(
-                'HeadObject partNumber is not supported for encrypted objects.',
-            );
-        }
 
         $partSelection = null;
         if ($partSelector->isRequested()) {
@@ -155,6 +156,12 @@ final class HeadObjectHandler implements RequestHandler
         if ($partSelection?->multipartPartCount !== null) {
             $headers['x-amz-mp-parts-count'] = (string) $partSelection->multipartPartCount;
         }
+        $headers = S3ResponseHeaders::withPartChecksum(
+            $headers,
+            $includeChecksums,
+            $partSelection?->checksumAlgorithm,
+            $partSelection?->checksumValue,
+        );
         $headers = S3ResponseHeaders::withAuthenticatedOverrides(
             $headers,
             $queryParams,

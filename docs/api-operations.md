@@ -111,11 +111,16 @@ Stored checksum headers on GET and HEAD require
 `x-amz-checksum-mode: ENABLED`; other nonempty values are rejected. The
 `partNumber` selector accepts completion ordinals 1 through 10,000 for objects
 with an authoritative layout. It never selects by the original upload part
-number. Unencrypted GET streams the selected plaintext slice with HTTP 206,
-part-specific `Content-Length` and `Content-Range`; HEAD returns HTTP 200 with
-the selected length and no body. A part response from a multipart completion,
-including a one-part completion, also carries `x-amz-mp-parts-count`. Ordinary
-single-part destinations do not carry that header. `Range` and `partNumber`
+number. GET returns the selected plaintext slice with HTTP 206, part-specific
+`Content-Length` and `Content-Range`; HEAD returns HTTP 200 with the selected
+length and no body. Unencrypted GET remains streaming. SSE-S3 and SSE-C GET
+authenticate and decrypt the bounded complete object before selecting the
+plaintext slice; a small selected part does not bypass the configured complete
+encrypted-object size limit. Encrypted HEAD validates SSE-C credentials but
+does not read or decrypt object storage. A part response from a multipart
+completion, including a one-part completion, also carries
+`x-amz-mp-parts-count`. Ordinary single-part destinations do not carry that
+header. `Range` and `partNumber`
 cannot be combined: that conflict returns HTTP 400 `InvalidRequest`. Empty,
 non-decimal, zero, and greater-than-10,000 selectors return HTTP 400
 `InvalidArgument`. An unavailable ordinal returns HTTP 416, and selecting a
@@ -124,10 +129,13 @@ zero-length part returns HTTP 416 with `Content-Range: bytes */0`.
 Part selection evaluates conditions against the complete object's ETag and
 modification time before reading its immutable layout. Recognized legacy
 objects without authoritative boundaries return HTTP 501 without object-byte
-I/O. SSE-S3 and SSE-C part selection is deferred; after normal SSE-C request
-validation and complete-object condition evaluation it returns HTTP 501. Part
-responses omit complete-object checksum headers even when checksum mode is
-enabled. Successful and `304 Not Modified` GET, HEAD and GetObjectAttributes
+I/O. Part responses omit complete-object checksum headers even when checksum
+mode is enabled. When checksum mode is enabled and the selected authoritative
+part row contains a verified CRC32, CRC32C, SHA1, or SHA256 checksum, GET and
+HEAD emit only that algorithm-specific `x-amz-checksum-*` header. They do not
+recompute a missing checksum, substitute an object checksum, or emit
+`x-amz-checksum-type` for a selected part. Successful and `304 Not Modified`
+GET, HEAD and GetObjectAttributes
 responses carry the selected
 `x-amz-version-id`; this includes the literal `null` version of a bucket whose
 versioning is suspended. When an enabled full-object GET or HEAD response

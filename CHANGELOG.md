@@ -15,8 +15,11 @@ The project follows [Semantic Versioning](https://semver.org/).
 - Add unencrypted GET and HEAD `partNumber` selection from those authoritative
   per-version layouts, with streamed plaintext slices, exact range/length and
   multipart-count headers, whole-object conditional semantics, and no
-  misleading complete-object checksum headers. Encrypted part reads and
-  verified part-checksum delivery remain deferred.
+  misleading complete-object checksum headers.
+- Extend `partNumber` selection to SSE-S3 and SSE-C while preserving bounded,
+  authenticated complete-object decryption for GET and storage-free HEAD.
+  Checksum-mode responses expose only the selected layout row's verified part
+  checksum and omit object-level checksum type claims.
 - Add `BucketOwnerPreferred` for ordinary PUT, signed browser POST, and
   CopyObject writes, with exact canned-ACL transfer, canonical bucket-owner
   ACLs, stable quota ownership, and version-specific persistence.

@@ -77,6 +77,8 @@ final readonly class ObjectPartSelector
             multipartPartCount: $layout->kind === ObjectPartLayout::KNOWN_MULTIPART
                 ? count($layout->parts)
                 : null,
+            checksumAlgorithm: $part->checksumAlgorithm,
+            checksumValue: $part->checksumValue,
         );
     }
 

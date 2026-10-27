@@ -234,7 +234,7 @@ final class ObjectPartSelectionTest extends TestCase
 
     /** @param 'GET'|'HEAD' $method */
     #[DataProvider('methods')]
-    public function test_complete_object_conditions_run_before_encrypted_story_boundary(string $method): void
+    public function test_complete_object_conditions_run_before_encrypted_part_selection(string $method): void
     {
         $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
         $encrypted = $encryption->encryptSseS3('secret');
@@ -262,8 +262,6 @@ final class ObjectPartSelectionTest extends TestCase
         } catch (PreconditionFailedException) {
         }
 
-        $this->expectException(NotImplementedException::class);
-        $handler->handleRequest($this->request($method, '/bucket/encrypted?partNumber=1'));
     }
 
     public function test_failed_complete_object_condition_precedes_layout_child_read(): void
@@ -286,7 +284,7 @@ final class ObjectPartSelectionTest extends TestCase
 
     /** @param 'GET'|'HEAD' $method */
     #[DataProvider('methods')]
-    public function test_sse_c_validation_and_conditions_precede_encrypted_story_boundary(string $method): void
+    public function test_sse_c_validation_and_conditions_precede_encrypted_part_selection(string $method): void
     {
         $customerKey = random_bytes(32);
         $keyMd5 = base64_encode(md5($customerKey, true));
@@ -327,8 +325,6 @@ final class ObjectPartSelectionTest extends TestCase
         } catch (PreconditionFailedException) {
         }
 
-        $this->expectException(NotImplementedException::class);
-        $handler->handleRequest($this->request($method, '/bucket/customer?partNumber=1', $headers));
     }
 
     public function test_explicit_numbered_and_literal_null_versions_use_their_own_layouts(): void
