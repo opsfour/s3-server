@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Acl;
 
 use OpsFour\S3Server\Acl\AclEvaluator;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Routing\S3Operation;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -28,6 +29,23 @@ final class AclEvaluatorTest extends TestCase
         );
 
         $this->assertTrue($result);
+    }
+
+    public function test_corrupt_stored_acl_fails_before_evaluator_owner_shortcut(): void
+    {
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Stored ACL grant metadata is invalid.');
+
+        AclEvaluator::isAllowed(
+            operation: S3Operation::GetObject,
+            requesterId: 'owner-1',
+            ownerId: 'owner-1',
+            grants: [[
+                'granteeType' => 'CanonicalUser',
+                'granteeId' => "reader-\u{FFFF}",
+                'permission' => 'READ',
+            ]],
+        );
     }
 
     public function test_empty_requester_id_blocks_owner_bypass(): void
@@ -347,20 +365,19 @@ final class AclEvaluatorTest extends TestCase
         $this->assertFalse($result);
     }
 
-    public function test_unknown_group_uri_denied(): void
+    public function test_unknown_stored_group_uri_fails_closed(): void
     {
         $grants = [
             ['granteeType' => 'Group', 'granteeId' => 'http://invalid/group', 'permission' => 'READ'],
         ];
 
-        $result = AclEvaluator::isAllowed(
+        $this->expectException(InternalErrorException::class);
+        AclEvaluator::isAllowed(
             operation: S3Operation::GetObject,
             requesterId: 'user-a',
             ownerId: 'owner-1',
             grants: $grants,
         );
-
-        $this->assertFalse($result);
     }
 
     // -----------------------------------------------------------------

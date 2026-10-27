@@ -67,6 +67,11 @@ final class MultipartAclSnapshotTest extends TestCase
             'granteeId' => 'owner',
             'permission' => 'FUTURE_PERMISSION',
         ]]];
+        yield 'XML-invalid canonical ID' => [[[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => "owner-\u{FFFF}",
+            'permission' => 'FULL_CONTROL',
+        ]]];
     }
 
     #[DataProvider('invalidDecodedSnapshots')]

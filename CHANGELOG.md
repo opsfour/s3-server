@@ -24,6 +24,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Reject canonical ACL grantee IDs that violate the server's UTF-8, XML 1.0,
+  or C0/DEL identity-text contract, and fail closed when corrupt persisted ACLs
+  are evaluated or rendered.
 - Reject corrupt persisted multipart ACL snapshots deterministically as an
   internal error before policy reconstruction, write intents, or assembly.
 - Reject multipart completions whose stored public destination ACL is already

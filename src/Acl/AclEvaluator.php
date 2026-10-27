@@ -36,6 +36,8 @@ final class AclEvaluator
         bool $isAuthenticated = true,
         bool $ignorePublicAcls = false,
     ): bool {
+        $grants = AclGrantResolver::validateStoredGrants($grants);
+
         // Owner always has FULL_CONTROL.
         if ($requesterId === $ownerId && $requesterId !== '') {
             return true;

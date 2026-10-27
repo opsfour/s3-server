@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Acl;
 
 use Amp\Http\Server\Request;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Http\RequestHeaderValues;
+use OpsFour\S3Server\Xml\XmlText;
 
 final class AclGrantResolver
 {
@@ -134,10 +136,53 @@ final class AclGrantResolver
                 }
             } elseif ($grant['granteeType'] !== 'CanonicalUser') {
                 throw new InvalidArgumentException("Unsupported ACL grantee type: {$grant['granteeType']}.");
+            } elseif (preg_match('/[\x00-\x1F\x7F]/', $grant['granteeId']) === 1
+                || ! XmlText::isValid($grant['granteeId'])) {
+                throw new InvalidArgumentException(
+                    'Canonical ACL grantee identifiers must be valid UTF-8 containing only XML 1.0 text without C0 or DEL control characters.',
+                );
             }
         }
 
         return $grants;
+    }
+
+    /**
+     * @param array<array-key, mixed> $grants
+     * @return list<array{granteeType: string, granteeId: string, permission: string}>
+     */
+    public static function validateStoredGrants(array $grants): array
+    {
+        if ($grants === []) {
+            return [];
+        }
+
+        try {
+            if (! array_is_list($grants)) {
+                throw new \UnexpectedValueException('Stored ACL grants must be a list.');
+            }
+
+            $normalized = [];
+            foreach ($grants as $grant) {
+                if (! is_array($grant)
+                    || count($grant) !== 3
+                    || array_diff(array_keys($grant), ['granteeType', 'granteeId', 'permission']) !== []
+                    || ! is_string($grant['granteeType'])
+                    || ! is_string($grant['granteeId'])
+                    || ! is_string($grant['permission'])) {
+                    throw new \UnexpectedValueException('Stored ACL grant shape is invalid.');
+                }
+                $normalized[] = [
+                    'granteeType' => $grant['granteeType'],
+                    'granteeId' => $grant['granteeId'],
+                    'permission' => $grant['permission'],
+                ];
+            }
+
+            return self::validateGrants($normalized);
+        } catch (\Throwable $error) {
+            throw new InternalErrorException('Stored ACL grant metadata is invalid.', $error);
+        }
     }
 
     /**
@@ -165,6 +210,8 @@ final class AclGrantResolver
      */
     public static function effectiveGrants(array $grants, bool $ignorePublicAcls): array
     {
+        $grants = self::validateStoredGrants($grants);
+
         if (! $ignorePublicAcls) {
             return $grants;
         }

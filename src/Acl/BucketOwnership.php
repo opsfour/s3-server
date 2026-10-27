@@ -126,7 +126,7 @@ final class BucketOwnership
 
     public static function assertPrivateBucketAcl(MetadataStore $metadata, string $bucket, string $ownerId): void
     {
-        $grants = $metadata->getAcl('bucket', $bucket);
+        $grants = AclGrantResolver::validateStoredGrants($metadata->getAcl('bucket', $bucket));
         if (count($grants) > 1) {
             throw new InvalidBucketAclWithObjectOwnershipException();
         }

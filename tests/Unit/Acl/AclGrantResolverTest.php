@@ -12,7 +12,9 @@ use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -115,6 +117,97 @@ final class AclGrantResolverTest extends TestCase
             'owner',
             'bucket',
         );
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function invalidCanonicalIds(): iterable
+    {
+        yield 'invalid UTF-8' => ["reader-\xFF"];
+        yield 'tab control' => ["reader-\t"];
+        yield 'line-feed control' => ["reader-\n"];
+        yield 'carriage-return control' => ["reader-\r"];
+        yield 'XML control' => ["reader-\x0B"];
+        yield 'DEL control' => ["reader-\x7F"];
+        yield 'XML noncharacter' => ["reader-\u{FFFF}"];
+    }
+
+    #[DataProvider('invalidCanonicalIds')]
+    public function test_canonical_grantee_ids_must_be_xml_safe(string $granteeId): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('valid UTF-8');
+
+        AclGrantResolver::validateGrants([[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => $granteeId,
+            'permission' => 'READ',
+        ]]);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function validCanonicalIds(): iterable
+    {
+        yield 'portable byte boundary' => [str_repeat('a', 255)];
+        yield 'Unicode' => ['café-讀者'];
+        yield 'XML-valid C1 character' => ["reader-\u{0085}"];
+    }
+
+    #[DataProvider('validCanonicalIds')]
+    public function test_canonical_grantee_ids_preserve_valid_identity_text(string $granteeId): void
+    {
+        self::assertSame($granteeId, AclGrantResolver::validateGrants([[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => $granteeId,
+            'permission' => 'READ',
+        ]])[0]['granteeId']);
+    }
+
+    public function test_grant_header_rejects_xml_invalid_canonical_id(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('valid UTF-8');
+
+        AclGrantResolver::fromHeaders(
+            $this->request(['x-amz-grant-read' => "id=\"reader-\u{FFFF}\""]),
+            'owner',
+            'bucket',
+        );
+    }
+
+    public function test_stored_acl_validation_allows_absence_and_maps_corruption_to_internal_error(): void
+    {
+        self::assertSame([], AclGrantResolver::validateStoredGrants([]));
+
+        $this->expectException(InternalErrorException::class);
+        $this->expectExceptionMessage('Stored ACL grant metadata is invalid.');
+        AclGrantResolver::effectiveGrants([[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => "reader-\u{FFFF}",
+            'permission' => 'READ',
+        ]], false);
+    }
+
+    public function test_stored_acl_validation_rejects_malformed_records_without_typed_access(): void
+    {
+        $this->expectException(InternalErrorException::class);
+
+        AclGrantResolver::validateStoredGrants([[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => 'reader',
+        ]]);
+    }
+
+    public function test_private_bucket_acl_check_maps_corrupt_stored_grants_to_internal_error(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getAcl')->with('bucket', 'bucket')->willReturn([[
+            'granteeType' => 'CanonicalUser',
+            'granteeId' => "owner-\u{FFFF}",
+            'permission' => 'FULL_CONTROL',
+        ]]);
+
+        $this->expectException(InternalErrorException::class);
+        BucketOwnership::assertPrivateBucketAcl($metadata, 'bucket', 'owner');
     }
 
     public function test_invalid_repeated_grant_field_line_is_not_ignored(): void
