@@ -1428,6 +1428,35 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         });
     }
 
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        self::validateObjectWriteLease($leaseSeconds);
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('Physical write lease refresh requires its own committed transaction.');
+        }
+
+        return $this->transaction(function () use ($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds): ?ObjectWriteIntent {
+            $updated = $this->conn()->execute(<<<'SQL'
+                UPDATE s3_object_write_intents
+                SET lease_until = GREATEST(lease_until, UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) + ?)
+                WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+                  AND lease_until = ? AND lease_until > UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))
+                SQL, [$leaseSeconds, $attemptId, $dispatchId, $expectedLeaseUntil]);
+            if ($updated->getRowCount() === 1) {
+                return $this->getObjectWriteIntent($attemptId);
+            }
+
+            $row = $this->conn()->execute(<<<'SQL'
+                SELECT * FROM s3_object_write_intents
+                WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+                  AND lease_until = ? AND lease_until > UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))
+                SQL, [$attemptId, $dispatchId, $expectedLeaseUntil])->fetchRow();
+
+            return $row === null ? null : self::objectWriteIntentFromRow($row);
+        });
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->fiberTransaction() !== null) {

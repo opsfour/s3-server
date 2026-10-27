@@ -413,6 +413,11 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         return $this->observe(__FUNCTION__, fn() => $this->objectIntentStore()->armObjectWriteIntent($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds));
     }
 
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->observe(__FUNCTION__, fn() => $this->objectIntentStore()->renewArmedObjectWriteIntent($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds));
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         return $this->observe(__FUNCTION__, fn() => $this->objectIntentStore()->retireUndispatchedObjectWriteIntent($attemptId));

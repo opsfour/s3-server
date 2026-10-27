@@ -23,8 +23,11 @@ interface ObjectWriteIntentStore
 
     public function renewObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent;
 
-    /** Commit a one-shot local dispatch before submitting any physical task. */
+    /** Commit a one-shot physical dispatch before submitting any provider task. */
     public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent;
+
+    /** Commit a DB-clock lease refresh for one exact armed dispatch. */
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent;
 
     /** Retire only a row that could never have started physical work. */
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool;

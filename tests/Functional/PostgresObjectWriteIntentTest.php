@@ -118,6 +118,47 @@ final class PostgresObjectWriteIntentTest extends TestCase
         });
     }
 
+    public function test_armed_renewal_uses_database_time_and_exact_dispatch_cas(): void
+    {
+        $reserved = $this->first->reserveObjectWriteIntent($this->intent('owner-armed-renewal'), 60.0);
+        $this->attempts[] = $reserved->attemptId;
+        $armed = $this->arm($reserved);
+        self::assertNotNull($armed->dispatchId);
+
+        $renewed = $this->second->renewArmedObjectWriteIntent(
+            $armed->attemptId,
+            $armed->dispatchId,
+            $armed->leaseUntil,
+            120.0,
+        );
+        self::assertNotNull($renewed);
+        self::assertGreaterThan($armed->leaseUntil, $renewed->leaseUntil);
+        self::assertSame($armed->dispatchId, $renewed->dispatchId);
+        self::assertNull($this->first->renewArmedObjectWriteIntent(
+            $renewed->attemptId,
+            str_repeat('9', 32),
+            $renewed->leaseUntil,
+            120.0,
+        ));
+        self::assertNull($this->first->renewArmedObjectWriteIntent(
+            $renewed->attemptId,
+            $armed->dispatchId,
+            $armed->leaseUntil,
+            120.0,
+        ));
+
+        $this->pool->execute(
+            'UPDATE s3_object_write_intents SET lease_until = 0 WHERE attempt_id = $1',
+            [$renewed->attemptId],
+        );
+        self::assertNull($this->second->renewArmedObjectWriteIntent(
+            $renewed->attemptId,
+            $renewed->dispatchId ?? '',
+            0.0,
+            120.0,
+        ));
+    }
+
     public function test_claim_excludes_due_intents_on_other_storage_tiers(): void
     {
         $remote = $this->first->reserveObjectWriteIntent($this->intent('owner-a', null, 'REMOTE'), 60.0);

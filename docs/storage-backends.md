@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission implemented; writer fence incomplete / not production-qualified | Read-only validation of one commercial-region General Purpose Bucket; API startup always fails closed in this delivery slice |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission and durable create-only attempt primitive implemented; writer fence incomplete / not production-qualified | Read-only provider validation plus an internal, currently unreachable publication primitive; API startup always fails closed |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -188,11 +188,20 @@ The immutable admission report contains only provider type, configured region,
 owner-check result, versioning state, and a stable reason; it never includes the
 bucket, account ID, credentials, request material, or SDK exception text.
 
-Provider admission is not a write fence. Every storage operation remains
-unavailable and API startup refuses the profile even when the unsafe Flysystem
-test override is enabled. Later qualification stories must cover every writer,
-reconciliation, cleanup, health, and release gate before this profile can be
-described as fence-complete or production-qualified.
+The package also contains an internal AWS publication primitive. It validates
+one exact profile-scoped physical attempt path, commits its metadata reservation
+and one-shot dispatch identity before network I/O, and issues a create-only PUT
+or multipart completion with `ExpectedBucketOwner` and immutable attempt marker
+metadata. Its result is limited to confirmed success with a verified quoted
+ETag, exact conditional conflict, confirmed terminal rejection, or ambiguity.
+It never deletes, aborts, retries, consumes, or retires the armed intent.
+
+This primitive is not exposed through `StorageBackend`, S3 handlers, or workers.
+Every ordinary AWS storage operation remains unavailable and API startup refuses
+the profile even when the unsafe Flysystem test override is enabled. Later
+qualification stories must connect and cover every writer, add reconciliation
+and sealing, and complete cleanup, health, and release gates before this profile
+can be described as fence-complete or production-qualified.
 
 ## Flysystem
 

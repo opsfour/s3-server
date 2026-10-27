@@ -1242,6 +1242,40 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         });
     }
 
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        self::validateObjectWriteLease($leaseSeconds);
+        if ($this->connection()->inTransaction()) {
+            throw new \LogicException('Physical write lease refresh requires its own committed transaction.');
+        }
+
+        return $this->transaction(function () use ($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds): ?ObjectWriteIntent {
+            $stmt = $this->prepare(<<<'SQL'
+                UPDATE s3_object_write_intents
+                SET lease_until = MAX(lease_until, (julianday('now') - 2440587.5) * 86400.0 + ?)
+                WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+                  AND lease_until = CAST(? AS REAL)
+                  AND lease_until > (julianday('now') - 2440587.5) * 86400.0
+                SQL);
+            $stmt->execute([$leaseSeconds, $attemptId, $dispatchId, sprintf('%.17F', $expectedLeaseUntil)]);
+            if ($stmt->rowCount() === 1) {
+                return $this->getObjectWriteIntent($attemptId);
+            }
+
+            $unchanged = $this->prepare(<<<'SQL'
+                SELECT * FROM s3_object_write_intents
+                WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+                  AND lease_until = CAST(? AS REAL)
+                  AND lease_until > (julianday('now') - 2440587.5) * 86400.0
+                SQL);
+            $unchanged->execute([$attemptId, $dispatchId, sprintf('%.17F', $expectedLeaseUntil)]);
+            $row = $unchanged->fetch(\PDO::FETCH_ASSOC);
+
+            return $row === false ? null : self::objectWriteIntentFromRow($row);
+        });
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->connection()->inTransaction()) {

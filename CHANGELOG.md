@@ -12,6 +12,11 @@ The project follows [Semantic Versioning](https://semver.org/).
   General Purpose Bucket, expected-owner, isolated-prefix, and bounded-timeout
   validation; default-chain read-only admission probes; a secret-free immutable
   report; and fail-closed startup while provider writer coverage is incomplete.
+- Add the internal AWS durable create-only attempt publisher with committed
+  reservation/dispatch ordering, expected-owner and immutable attempt markers,
+  bounded multipart completion validation, and closed secret-free outcomes.
+  Ordinary AWS storage operations and startup remain disabled pending later
+  writer-coverage and reconciliation stories.
 
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
   MySQL, including completion-order boundaries, original upload part numbers,

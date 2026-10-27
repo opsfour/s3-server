@@ -1396,6 +1396,28 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         });
     }
 
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        self::validateObjectWriteLease($leaseSeconds);
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('Physical write lease refresh requires its own committed transaction.');
+        }
+
+        return $this->transaction(function () use ($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds): ?ObjectWriteIntent {
+            $row = $this->conn()->execute(<<<'SQL'
+                UPDATE s3_object_write_intents
+                SET lease_until = GREATEST(lease_until, EXTRACT(EPOCH FROM clock_timestamp()) + $1::double precision)
+                WHERE attempt_id = $2 AND state = 'active' AND dispatch_id = $3
+                  AND lease_until = $4::double precision
+                  AND lease_until > EXTRACT(EPOCH FROM clock_timestamp())
+                RETURNING *
+                SQL, [$leaseSeconds, $attemptId, $dispatchId, sprintf('%.17F', $expectedLeaseUntil)])->fetchRow();
+
+            return $row === null ? null : self::objectWriteIntentFromRow($row);
+        });
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->fiberTransaction() !== null) {

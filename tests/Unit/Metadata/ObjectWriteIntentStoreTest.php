@@ -302,6 +302,38 @@ final class ObjectWriteIntentStoreTest extends TestCase
         self::assertNull($store->renewObjectWriteClaim($claim->attemptId, $claim->claimGeneration, $renewedClaim->leaseUntil, 180.0));
     }
 
+    public function test_armed_writer_lease_refresh_uses_database_time_and_rejects_expired_or_mismatched_dispatch(): void
+    {
+        $store = $this->store();
+        $reserved = $store->reserveObjectWriteIntent($this->intent('8', 'objects/armed-refresh'), 60.0);
+        $armed = $this->arm($store, $reserved);
+        self::assertNotNull($armed->dispatchId);
+
+        $renewed = $store->renewArmedObjectWriteIntent(
+            $armed->attemptId,
+            $armed->dispatchId,
+            $armed->leaseUntil,
+            120.0,
+        );
+        self::assertNotNull($renewed);
+        self::assertGreaterThan($armed->leaseUntil, $renewed->leaseUntil);
+        self::assertSame($armed->dispatchId, $renewed->dispatchId);
+        self::assertNull($store->renewArmedObjectWriteIntent(
+            $renewed->attemptId,
+            str_repeat('9', 32),
+            $renewed->leaseUntil,
+            120.0,
+        ));
+
+        $this->expire($renewed->attemptId);
+        self::assertNull($store->renewArmedObjectWriteIntent(
+            $renewed->attemptId,
+            $renewed->dispatchId ?? '',
+            0.0,
+            120.0,
+        ));
+    }
+
     public function test_sqlite_renewal_reads_its_cas_result_before_other_connections_can_see_it(): void
     {
         $first = $this->store();

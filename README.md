@@ -43,7 +43,9 @@ API process on a Linux host with its exact local XFS mount. Other metadata,
 filesystem, mount, device, and host combinations require the applicable
 deployment gates. The explicit `aws-s3` profile validates AWS identity, region,
 ownership, General Purpose Bucket evidence, and disabled versioning, but remains
-fail-closed until its writer fence is complete. Memory storage is test-only. Flysystem, remote and shared
+fail-closed until its writer fence is complete. A package-internal AWS primitive
+can now durably arm an exact create-only attempt and return a closed provider
+outcome, but ordinary S3 operations do not use it yet. Memory storage is test-only. Flysystem, remote and shared
 filesystems, NFS/EFS, multiple API processes, and multiple hosts remain
 experimental until each exact profile completes its own qualification gates. See the
 [roadmap and status definitions](docs/production-feature-roadmap.md).
