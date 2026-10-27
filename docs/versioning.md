@@ -25,8 +25,16 @@ $s3->putBucketVersioning([
 
 Delete-marker ownership follows the Object Ownership mode at the delete
 commit. Under `BucketOwnerEnforced`, and for anonymous deletes, the bucket
-owner owns the new marker. Under `ObjectWriter`, an authenticated requester
-owns the marker it creates.
+owner owns the new marker. Under `ObjectWriter` or `BucketOwnerPreferred`, an
+authenticated requester owns the marker it creates.
+
+Every ordinary object version stores the owner and ACL chosen when that write
+commits. Enabling `BucketOwnerPreferred` does not rewrite historical or current
+versions. New PUT, browser POST, and CopyObject versions become bucket-owned
+only when their destination request uses the exact
+`bucket-owner-full-control` canned ACL; each transferred version stores only
+the bucket owner's `FULL_CONTROL` grant. This rule applies independently to
+numbered versions and the literal `null` version.
 
 ### Version IDs
 

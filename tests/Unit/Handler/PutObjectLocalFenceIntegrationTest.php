@@ -89,6 +89,25 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
         self::assertNull($this->metadata->getObjectWriteIntent(substr($path, -32)));
     }
 
+    public function test_preferred_transfer_reserves_intent_for_writer_but_persists_bucket_owner(): void
+    {
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerPreferred');
+        $intentOwner = null;
+        $factory = $this->factory(function (ObjectWriteIntent $armed) use (&$intentOwner): void {
+            $intentOwner = $armed->ownerId;
+        });
+
+        $response = $this->handler(factory: $factory)->handleRequest($this->request(
+            'payload',
+            ['x-amz-acl' => 'bucket-owner-full-control'],
+            'writer',
+        ));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('writer', $intentOwner);
+        self::assertSame('owner', $this->metadata->getObjectMetadata('bucket', 'key')?->ownerId);
+    }
+
     public function test_sse_s3_and_sse_c_publish_ciphertext_with_plaintext_checksums(): void
     {
         $key = random_bytes(32);
@@ -211,7 +230,7 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
     }
 
     /** @param array<non-empty-string, string> $headers */
-    private function request(string $payload, array $headers = []): Request
+    private function request(string $payload, array $headers = [], string $ownerId = 'owner'): Request
     {
         $requestHeaders = ['content-length' => (string) strlen($payload)];
         foreach ($headers as $name => $value) {
@@ -226,7 +245,7 @@ final class PutObjectLocalFenceIntegrationTest extends TestCase
         );
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');
-        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('ownerId', $ownerId);
         $request->setAttribute('s3.operation', S3Operation::PutObject);
 
         return $request;

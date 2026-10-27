@@ -32,6 +32,7 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Recov
         private readonly ?\Closure $beforeDelete = null,
         private readonly ?\Closure $afterAssemble = null,
         private readonly ?\Closure $beforeRead = null,
+        private readonly ?\Closure $afterCopy = null,
     ) {}
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
@@ -146,23 +147,32 @@ final class CallbackStorageBackend implements ShutdownAwareStorageBackend, Recov
     public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
     {
         $this->copyCalls++;
+        $this->lastWrite = $this->delegate->copyObject($srcPath, $dstBucket, $dstKey);
+        if ($this->afterCopy !== null) {
+            ($this->afterCopy)($this->lastWrite);
+        }
 
-        return $this->lastWrite = $this->delegate->copyObject($srcPath, $dstBucket, $dstKey);
+        return $this->lastWrite;
     }
 
     public function copyObjectBounded(string $srcPath, string $dstBucket, string $dstKey, int $maxBytes): StorageWriteResult
     {
         $this->copyCalls++;
         if ($this->delegate instanceof BoundedCopyStorageBackend) {
-            return $this->lastWrite = $this->delegate->copyObjectBounded($srcPath, $dstBucket, $dstKey, $maxBytes);
+            $this->lastWrite = $this->delegate->copyObjectBounded($srcPath, $dstBucket, $dstKey, $maxBytes);
+        } else {
+            $source = new LimitedReadableStream($this->delegate->getObjectByPath($srcPath), $maxBytes);
+            try {
+                $this->lastWrite = $this->delegate->putObject($dstBucket, $dstKey, $source);
+            } finally {
+                $source->close();
+            }
+        }
+        if ($this->afterCopy !== null) {
+            ($this->afterCopy)($this->lastWrite);
         }
 
-        $source = new LimitedReadableStream($this->delegate->getObjectByPath($srcPath), $maxBytes);
-        try {
-            return $this->lastWrite = $this->delegate->putObject($dstBucket, $dstKey, $source);
-        } finally {
-            $source->close();
-        }
+        return $this->lastWrite;
     }
 
     public function shutdown(): void

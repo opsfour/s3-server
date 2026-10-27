@@ -8,9 +8,11 @@ use Amp\ByteStream;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
+use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Exception\QuotaExceededException;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Quota\QuotaProvider;
@@ -54,6 +56,53 @@ final class PutObjectQuotaAdmissionTest extends TestCase
         $this->handler($storage, [
             'writer' => new QuotaConfig(maxBytesPerOwner: 5),
         ])->handleRequest($this->request('writer', 'new', 'x'));
+    }
+
+    public function test_preferred_transfer_uses_bucket_owner_quota_before_backend(): void
+    {
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerPreferred');
+        $this->metadata->putObjectMetadata('bucket', 'existing', 'bucket-owner', 5, '"old"', 'text/plain', 'old-path');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::never())->method('putObject');
+
+        $this->expectException(QuotaExceededException::class);
+        $this->handler($storage, [
+            'bucket-owner' => new QuotaConfig(maxBytesPerOwner: 5),
+        ])->handleRequest($this->request(
+            'writer',
+            'new',
+            'x',
+            ['x-amz-acl' => 'bucket-owner-full-control'],
+        ));
+    }
+
+    public function test_preferred_transfer_keeps_uploader_notification_attribution(): void
+    {
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerPreferred');
+        $storage = new InMemoryBackend();
+        $storage->createBucket('bucket');
+        $notifications = new NotificationDispatcher($this->metadata);
+        $received = null;
+        $notifications->listen('s3:ObjectCreated:Put', static function (S3Event $event) use (&$received): void {
+            $received = $event;
+        });
+
+        $response = (new PutObjectHandler(
+            $this->metadata,
+            $storage,
+            notifications: $notifications,
+        ))->handleRequest($this->request(
+            'writer',
+            'transferred',
+            'payload',
+            ['x-amz-acl' => 'bucket-owner-full-control'],
+        ));
+        $notifications->shutdown();
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('bucket-owner', $this->metadata->getObjectMetadata('bucket', 'transferred')?->ownerId);
+        self::assertInstanceOf(S3Event::class, $received);
+        self::assertSame('writer', $received->ownerId);
     }
 
     public function test_unversioned_overwrite_uses_size_delta_during_preflight(): void
@@ -138,6 +187,44 @@ final class PutObjectQuotaAdmissionTest extends TestCase
         }
     }
 
+    public function test_preferred_transfer_final_check_uses_bucket_owner_quota_and_cleans_write(): void
+    {
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerPreferred');
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('putObject')->willReturnCallback(
+            function (string $bucket, string $key, ByteStream\ReadableStream $body): StorageWriteResult {
+                self::assertSame('12345', ByteStream\buffer($body));
+                $this->metadata->putObjectMetadata(
+                    $bucket,
+                    'racing-winner',
+                    'bucket-owner',
+                    1,
+                    '"winner"',
+                    'text/plain',
+                    'winner-path',
+                );
+
+                return new StorageWriteResult('rejected-preferred-path', 5, md5('12345'));
+            },
+        );
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('rejected-preferred-path', 'bucket');
+
+        try {
+            $this->handler($storage, [
+                'bucket-owner' => new QuotaConfig(maxBytesPerOwner: 5),
+            ])->handleRequest($this->request(
+                'writer',
+                'preferred-loser',
+                '12345',
+                ['x-amz-acl' => 'bucket-owner-full-control'],
+            ));
+            self::fail('The final quota check must charge the transferred object to the bucket owner.');
+        } catch (QuotaExceededException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'preferred-loser'));
+            self::assertSame('bucket-owner', $this->metadata->getObjectMetadata('bucket', 'racing-winner')?->ownerId);
+        }
+    }
+
     /** @param array<string, QuotaConfig> $quotas */
     private function handler(StorageBackend $storage, array $quotas): PutObjectHandler
     {
@@ -156,13 +243,14 @@ final class PutObjectQuotaAdmissionTest extends TestCase
         );
     }
 
-    private function request(string $ownerId, string $key, string $body): Request
+    /** @param array<non-empty-string, string> $headers */
+    private function request(string $ownerId, string $key, string $body, array $headers = []): Request
     {
         $request = new Request(
             $this->createMock(Client::class),
             'PUT',
             Http::new('http://127.0.0.1/bucket/' . $key),
-            ['content-length' => (string) strlen($body)],
+            ['content-length' => (string) strlen($body), ...$headers],
             $body,
         );
         $request->setAttribute('s3.bucket', 'bucket');

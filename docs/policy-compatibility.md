@@ -111,6 +111,15 @@ Bucket policies are limited to 20 KiB, matching the S3 bucket-policy limit.
 | `s3:x-amz-storage-class` | Supported | `x-amz-storage-class` request header. |
 | Organization, VPC, source ARN/account keys | Unsupported | There is no AWS Organization/VPC model. |
 
+`BucketOwnerPreferred` does not change policy input: `s3:x-amz-acl` continues
+to reflect the actual request header and request attribution remains the
+authenticated uploader. Ownership transfers only for the exact
+`bucket-owner-full-control` canned value; an expanded or semantically
+equivalent grant header does not match this migration trigger. Before enabling
+Preferred on an ACL-based cross-account workflow, require that exact canned
+ACL in both the writer configuration and any policy condition, and confirm
+that existing objects remain under their previously persisted owners.
+
 The authentication type is installed only after successful verification and is
 preserved across primary checks, copy-source and additional-action checks,
 batch deletion, missing-object ListBucket visibility, and commit-time rechecks.

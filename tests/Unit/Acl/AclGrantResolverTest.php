@@ -11,6 +11,7 @@ use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Acl\AclGrantResolver;
+use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -179,6 +180,83 @@ final class AclGrantResolverTest extends TestCase
         self::assertNotNull($bucket);
         self::assertSame(['FULL_CONTROL', 'WRITE', 'READ_ACP'], array_column($bucket, 'permission'));
         self::assertSame(AclGrantResolver::LOG_DELIVERY_URI, $bucket[1]['granteeId']);
+    }
+
+    public function test_preferred_mode_transfers_only_for_the_exact_canned_acl(): void
+    {
+        $transferred = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-acl' => 'bucket-owner-full-control']),
+            BucketOwnership::BUCKET_OWNER_PREFERRED,
+            'writer',
+            'bucket-owner',
+        );
+        self::assertSame('bucket-owner', $transferred->ownerId);
+        self::assertSame('bucket-owner', $transferred->quotaPrincipalId);
+        self::assertSame(AclGrantResolver::privateAcl('bucket-owner'), $transferred->aclGrants);
+
+        $explicitEquivalent = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-grant-full-control' => 'id="bucket-owner"']),
+            BucketOwnership::BUCKET_OWNER_PREFERRED,
+            'writer',
+            'bucket-owner',
+        );
+        self::assertSame('writer', $explicitEquivalent->ownerId);
+        self::assertSame('writer', $explicitEquivalent->quotaPrincipalId);
+        self::assertSame(['writer', 'bucket-owner'], array_column($explicitEquivalent->aclGrants, 'granteeId'));
+    }
+
+    public function test_object_write_decision_covers_existing_modes_without_changing_semantics(): void
+    {
+        $objectWriter = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-acl' => 'bucket-owner-full-control']),
+            BucketOwnership::OBJECT_WRITER,
+            'writer',
+            'bucket-owner',
+        );
+        self::assertSame('writer', $objectWriter->ownerId);
+        self::assertSame(['writer', 'bucket-owner'], array_column($objectWriter->aclGrants, 'granteeId'));
+
+        $enforced = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-acl' => 'bucket-owner-full-control']),
+            BucketOwnership::BUCKET_OWNER_ENFORCED,
+            'writer',
+            'bucket-owner',
+        );
+        self::assertSame('bucket-owner', $enforced->ownerId);
+        self::assertSame(AclGrantResolver::privateAcl('bucket-owner'), $enforced->aclGrants);
+
+        $preferredPrivate = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-acl' => 'private']),
+            BucketOwnership::BUCKET_OWNER_PREFERRED,
+            'writer',
+            'bucket-owner',
+        );
+        self::assertSame('writer', $preferredPrivate->ownerId);
+        self::assertSame(AclGrantResolver::privateAcl('writer'), $preferredPrivate->aclGrants);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function preferredNonTransferCannedAcls(): iterable
+    {
+        yield 'private' => ['private'];
+        yield 'public read' => ['public-read'];
+        yield 'bucket owner read' => ['bucket-owner-read'];
+    }
+
+    #[DataProvider('preferredNonTransferCannedAcls')]
+    public function test_preferred_mode_preserves_normal_acl_expansion_without_transfer(string $cannedAcl): void
+    {
+        $decision = BucketOwnership::resolveObjectWrite(
+            $this->request(['x-amz-acl' => $cannedAcl]),
+            BucketOwnership::BUCKET_OWNER_PREFERRED,
+            'writer',
+            'bucket-owner',
+        );
+
+        self::assertSame('writer', $decision->ownerId);
+        self::assertSame('writer', $decision->quotaPrincipalId);
+        self::assertSame('writer', $decision->aclGrants[0]['granteeId']);
+        self::assertSame('FULL_CONTROL', $decision->aclGrants[0]['permission']);
     }
 
     public function test_xml_email_grantee_is_rejected_by_validation(): void

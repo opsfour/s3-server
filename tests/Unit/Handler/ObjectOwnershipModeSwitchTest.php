@@ -8,9 +8,9 @@ use Amp\ByteStream\ReadableStream;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
-use OpsFour\S3Server\Exception\AccessControlListNotSupportedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
+use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Http\ObjectVersionResolver;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -42,26 +42,76 @@ final class ObjectOwnershipModeSwitchTest extends TestCase
         @unlink($this->path . '-shm');
     }
 
-    public function test_mode_change_during_storage_write_rejects_unsupported_acl_before_commit(): void
+    public function test_mode_change_during_storage_write_rejects_public_acl_decision_before_commit(): void
     {
         $storage = $this->storageThatSwitchesMode();
         $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://bucket/key', 'bucket');
         try {
             (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request(['x-amz-acl' => 'public-read']));
             self::fail('A mode change must reject the ACL before object metadata commits.');
-        } catch (AccessControlListNotSupportedException) {
+        } catch (OperationAbortedException) {
             self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
             self::assertSame('BucketOwnerEnforced', $this->metadata->getBucketOwnershipControls('bucket'));
         }
     }
 
-    public function test_mode_change_during_storage_write_assigns_new_object_to_bucket_owner(): void
+    public function test_mode_change_during_storage_write_does_not_reinterpret_owner_or_acl(): void
     {
         $storage = $this->storageThatSwitchesMode();
-        $response = (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request());
-        self::assertSame(200, $response->getStatus());
-        self::assertSame('bucket-owner', $this->metadata->getObjectMetadata('bucket', 'key')?->ownerId);
-        self::assertSame('bucket-owner', $this->metadata->getAcl('object', ObjectVersionResolver::aclResourceName('bucket', 'key', null))[0]['granteeId'] ?? null);
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://bucket/key', 'bucket');
+        try {
+            (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request());
+            self::fail('A mode change must not reinterpret the preflight ownership decision.');
+        } catch (OperationAbortedException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+            self::assertSame([], $this->metadata->getAcl(
+                'object',
+                ObjectVersionResolver::aclResourceName('bucket', 'key', null),
+            ));
+        }
+    }
+
+    public function test_copy_mode_change_cleans_bytes_without_reinterpreting_preferred_decision(): void
+    {
+        $this->metadata->putBucketOwnershipControls('bucket', 'BucketOwnerPreferred');
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source',
+            'writer',
+            7,
+            '"' . md5('payload') . '"',
+            'text/plain',
+            'memory://bucket/source',
+        );
+        $this->metadata->putAccountPolicy('writer', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::bucket/source',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->with('memory://bucket/source')->willReturn(
+            new \Amp\ByteStream\ReadableBuffer('payload'),
+        );
+        $storage->method('putObject')->willReturnCallback(function (): StorageWriteResult {
+            $this->metadata->putBucketOwnershipControls('bucket', 'ObjectWriter');
+
+            return new StorageWriteResult('memory://bucket/copy', 7, md5('payload'));
+        });
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://bucket/copy', 'bucket');
+        $request = $this->request([
+            'x-amz-copy-source' => '/bucket/source',
+            'x-amz-acl' => 'bucket-owner-full-control',
+        ]);
+        $request->setAttribute('s3.key', 'copy');
+
+        try {
+            (new CopyObjectHandler($this->metadata, $storage))->handleRequest($request);
+            self::fail('A copy must not reinterpret its Preferred ownership decision after storage I/O.');
+        } catch (OperationAbortedException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'copy'));
+        }
     }
 
     public function test_bucket_name_reuse_during_storage_write_cannot_publish_into_new_bucket(): void

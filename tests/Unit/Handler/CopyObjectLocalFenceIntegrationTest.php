@@ -128,6 +128,32 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         self::assertSame('owner', $this->metadata->getObjectMetadata('target', 'copied')?->ownerId);
     }
 
+    public function test_preferred_transfer_reserves_intent_for_writer_but_persists_bucket_owner(): void
+    {
+        $this->source('payload', owner: 'writer');
+        $this->metadata->putBucketOwnershipControls('target', 'BucketOwnerPreferred');
+        $this->metadata->putAccountPolicy('writer', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::source/key',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $intentOwner = null;
+        $factory = $this->factory(function (string $attemptId) use (&$intentOwner): void {
+            $intentOwner = $this->metadata->getObjectWriteIntent($attemptId)?->ownerId;
+        });
+
+        $response = $this->handler(factory: $factory)->handleRequest($this->request(
+            ['x-amz-acl' => 'bucket-owner-full-control'],
+            'writer',
+        ));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('writer', $intentOwner);
+        self::assertSame('owner', $this->metadata->getObjectMetadata('target', 'copied')?->ownerId);
+    }
+
     public function test_sse_source_is_decrypted_before_one_fenced_plaintext_write(): void
     {
         $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
@@ -277,13 +303,13 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
     }
 
     /** @param array<string, string> $userMetadata */
-    private function source(string $physicalBytes, array $userMetadata = [], ?string $etag = null): void
+    private function source(string $physicalBytes, array $userMetadata = [], ?string $etag = null, string $owner = 'owner'): void
     {
         $write = $this->storage->putObject('source', 'key', new ReadableBuffer($physicalBytes));
         $this->metadata->putObjectMetadata(
             'source',
             'key',
-            'owner',
+            $owner,
             strlen($physicalBytes),
             $etag ?? '"' . md5($physicalBytes) . '"',
             'text/plain',
@@ -304,7 +330,7 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
     }
 
     /** @param array<non-empty-string, string> $headers */
-    private function request(array $headers = []): Request
+    private function request(array $headers = [], string $ownerId = 'owner'): Request
     {
         $requestHeaders = ['x-amz-copy-source' => '/source/key'];
         foreach ($headers as $name => $value) {
@@ -318,7 +344,7 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         );
         $request->setAttribute('s3.bucket', 'target');
         $request->setAttribute('s3.key', 'copied');
-        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('ownerId', $ownerId);
 
         return $request;
     }

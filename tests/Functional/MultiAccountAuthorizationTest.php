@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
+use OpsFour\S3Server\Auth\SigningKey;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Quota\QuotaConfig;
 
@@ -352,6 +353,161 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         }
     }
 
+    public function test_bucket_owner_preferred_transfers_only_exact_opted_in_ordinary_writes(): void
+    {
+        $bucket = $this->bucketWithWriterGrant();
+        $this->putPolicy($bucket, [[
+            'Effect' => 'Allow',
+            'Principal' => ['AWS' => 'object-writer'],
+            'Action' => ['s3:PutObject', 's3:PutObjectAcl', 's3:GetObject', 's3:GetObjectAcl'],
+            'Resource' => "arn:aws:s3:::{$bucket}/*",
+        ]]);
+
+        self::$writer->putObject(['Bucket' => $bucket, 'Key' => 'existing.txt', 'Body' => 'existing']);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $bucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+        self::assertSame(
+            'BucketOwnerPreferred',
+            self::$s3->getBucketOwnershipControls(['Bucket' => $bucket])['OwnershipControls']['Rules'][0]['ObjectOwnership'],
+        );
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => 'existing.txt'])['Owner']['ID'],
+        );
+
+        self::$writer->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'transferred.txt',
+            'Body' => 'transferred',
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        $transferredAcl = self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'transferred.txt']);
+        self::assertSame('bucket-owner', $transferredAcl['Owner']['ID']);
+        self::assertCount(1, $transferredAcl['Grants']);
+        self::assertSame('bucket-owner', $transferredAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $transferredAcl['Grants'][0]['Permission']);
+
+        self::$writer->putObject(['Bucket' => $bucket, 'Key' => 'writer.txt', 'Body' => 'writer']);
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => 'writer.txt'])['Owner']['ID'],
+        );
+        self::$writer->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'explicit.txt',
+            'Body' => 'explicit',
+            'GrantFullControl' => 'id="bucket-owner"',
+        ]);
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => 'explicit.txt'])['Owner']['ID'],
+        );
+
+        self::$writer->copyObject([
+            'Bucket' => $bucket,
+            'Key' => 'copy-transferred.txt',
+            'CopySource' => "{$bucket}/writer.txt",
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        $transferredCopyAcl = self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'copy-transferred.txt']);
+        self::assertSame('bucket-owner', $transferredCopyAcl['Owner']['ID']);
+        self::assertCount(1, $transferredCopyAcl['Grants']);
+        self::assertSame('bucket-owner', $transferredCopyAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $transferredCopyAcl['Grants'][0]['Permission']);
+        self::$writer->copyObject([
+            'Bucket' => $bucket,
+            'Key' => 'copy-writer.txt',
+            'CopySource' => "{$bucket}/transferred.txt",
+        ]);
+        self::assertSame(
+            'object-writer',
+            self::$writer->getObjectAcl(['Bucket' => $bucket, 'Key' => 'copy-writer.txt'])['Owner']['ID'],
+        );
+
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Enabled'],
+        ]);
+        $bucketVersion = self::$writer->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'versioned.txt',
+            'Body' => 'bucket version',
+            'ACL' => 'bucket-owner-full-control',
+        ])['VersionId'];
+        $writerVersion = self::$writer->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'versioned.txt',
+            'Body' => 'writer version',
+        ])['VersionId'];
+        $bucketVersionAcl = self::$s3->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'versioned.txt', 'VersionId' => $bucketVersion,
+        ]);
+        self::assertSame('bucket-owner', $bucketVersionAcl['Owner']['ID']);
+        self::assertCount(1, $bucketVersionAcl['Grants']);
+        self::assertSame('bucket-owner', $bucketVersionAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $bucketVersionAcl['Grants'][0]['Permission']);
+        $writerVersionAcl = self::$writer->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'versioned.txt', 'VersionId' => $writerVersion,
+        ]);
+        self::assertSame('object-writer', $writerVersionAcl['Owner']['ID']);
+        self::assertCount(1, $writerVersionAcl['Grants']);
+        self::assertSame('object-writer', $writerVersionAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $writerVersionAcl['Grants'][0]['Permission']);
+
+        $bucketCopyVersion = self::$writer->copyObject([
+            'Bucket' => $bucket,
+            'Key' => 'versioned-copy.txt',
+            'CopySource' => "{$bucket}/writer.txt",
+            'ACL' => 'bucket-owner-full-control',
+        ])['VersionId'];
+        $writerCopyVersion = self::$writer->copyObject([
+            'Bucket' => $bucket,
+            'Key' => 'versioned-copy.txt',
+            'CopySource' => "{$bucket}/transferred.txt",
+        ])['VersionId'];
+        $bucketCopyVersionAcl = self::$s3->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'versioned-copy.txt', 'VersionId' => $bucketCopyVersion,
+        ]);
+        self::assertSame('bucket-owner', $bucketCopyVersionAcl['Owner']['ID']);
+        self::assertCount(1, $bucketCopyVersionAcl['Grants']);
+        self::assertSame('bucket-owner', $bucketCopyVersionAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $bucketCopyVersionAcl['Grants'][0]['Permission']);
+        $writerCopyVersionAcl = self::$writer->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'versioned-copy.txt', 'VersionId' => $writerCopyVersion,
+        ]);
+        self::assertSame('object-writer', $writerCopyVersionAcl['Owner']['ID']);
+        self::assertCount(1, $writerCopyVersionAcl['Grants']);
+        self::assertSame('object-writer', $writerCopyVersionAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $writerCopyVersionAcl['Grants'][0]['Permission']);
+
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Suspended'],
+        ]);
+        $nullVersion = self::$writer->putObject([
+            'Bucket' => $bucket,
+            'Key' => 'null-version.txt',
+            'Body' => 'null version',
+            'ACL' => 'bucket-owner-full-control',
+        ]);
+        self::assertSame('null', $nullVersion['VersionId']);
+        $nullVersionAcl = self::$s3->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'null-version.txt', 'VersionId' => 'null',
+        ]);
+        self::assertSame('bucket-owner', $nullVersionAcl['Owner']['ID']);
+        self::assertCount(1, $nullVersionAcl['Grants']);
+        self::assertSame('bucket-owner', $nullVersionAcl['Grants'][0]['Grantee']['ID']);
+        self::assertSame('FULL_CONTROL', $nullVersionAcl['Grants'][0]['Permission']);
+
+        $post = $this->postAsWriter($bucket, 'post-transferred.txt', 'post body', 'bucket-owner-full-control');
+        self::assertSame(204, $post->getStatusCode(), (string) $post->getBody());
+        self::assertSame('bucket-owner', self::$s3->getObjectAcl([
+            'Bucket' => $bucket, 'Key' => 'post-transferred.txt',
+        ])['Owner']['ID']);
+    }
+
     public function test_create_bucket_can_explicitly_start_with_bucket_owner_enforced(): void
     {
         $invalidBucket = 'enforced-invalid-' . bin2hex(random_bytes(5));
@@ -370,6 +526,38 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         $this->assertSame('BucketOwnerEnforced', self::$s3->getBucketOwnershipControls(['Bucket' => $bucket])['OwnershipControls']['Rules'][0]['ObjectOwnership']);
         self::$s3->putObject(['Bucket' => $bucket, 'Key' => 'owner.txt', 'Body' => 'body']);
         $this->assertSame('bucket-owner', self::$s3->getObjectAcl(['Bucket' => $bucket, 'Key' => 'owner.txt'])['Owner']['ID']);
+    }
+
+    public function test_create_bucket_can_start_preferred_while_bucket_acls_remain_active(): void
+    {
+        $bucket = 'preferred-create-' . bin2hex(random_bytes(5));
+        self::$s3->createBucket(['Bucket' => $bucket, 'ObjectOwnership' => 'BucketOwnerPreferred']);
+        self::assertSame(
+            'BucketOwnerPreferred',
+            self::$s3->getBucketOwnershipControls(['Bucket' => $bucket])['OwnershipControls']['Rules'][0]['ObjectOwnership'],
+        );
+
+        self::$s3->putBucketAcl(['Bucket' => $bucket, 'ACL' => 'public-read']);
+        self::assertContains(
+            'READ',
+            array_column(self::$s3->getBucketAcl(['Bucket' => $bucket])['Grants'], 'Permission'),
+        );
+
+        $updatedBucket = 'preferred-update-' . bin2hex(random_bytes(5));
+        self::$s3->createBucket(['Bucket' => $updatedBucket]);
+        self::$s3->putBucketAcl(['Bucket' => $updatedBucket, 'ACL' => 'public-read']);
+        self::$s3->putBucketOwnershipControls([
+            'Bucket' => $updatedBucket,
+            'OwnershipControls' => ['Rules' => [['ObjectOwnership' => 'BucketOwnerPreferred']]],
+        ]);
+        self::assertSame(
+            'BucketOwnerPreferred',
+            self::$s3->getBucketOwnershipControls(['Bucket' => $updatedBucket])['OwnershipControls']['Rules'][0]['ObjectOwnership'],
+        );
+        self::assertContains(
+            'READ',
+            array_column(self::$s3->getBucketAcl(['Bucket' => $updatedBucket])['Grants'], 'Permission'),
+        );
     }
 
     public function test_bucket_policy_can_delegate_ownership_control_read(): void
@@ -892,6 +1080,52 @@ final class MultiAccountAuthorizationTest extends S3FunctionalTestCase
         self::$s3->putBucketAcl(['Bucket' => $bucket, 'GrantWrite' => 'id="object-writer"']);
 
         return $bucket;
+    }
+
+    private function postAsWriter(
+        string $bucket,
+        string $key,
+        string $body,
+        string $acl,
+    ): \Psr\Http\Message\ResponseInterface {
+        $dateTime = gmdate('Ymd\THis\Z');
+        $date = substr($dateTime, 0, 8);
+        $credential = "writerAccessKey/{$date}/us-east-1/s3/aws4_request";
+        $fields = [
+            'key' => $key,
+            'acl' => $acl,
+            'x-amz-algorithm' => 'AWS4-HMAC-SHA256',
+            'x-amz-credential' => $credential,
+            'x-amz-date' => $dateTime,
+        ];
+        $policy = base64_encode(json_encode([
+            'expiration' => gmdate('Y-m-d\TH:i:s\Z', time() + 300),
+            'conditions' => [
+                ['bucket' => $bucket],
+                ...array_map(
+                    static fn(string $name, string $value): array => [$name => $value],
+                    array_keys($fields),
+                    array_values($fields),
+                ),
+            ],
+        ], JSON_THROW_ON_ERROR));
+        $fields['policy'] = $policy;
+        $fields['x-amz-signature'] = hash_hmac(
+            'sha256',
+            $policy,
+            SigningKey::derive('writerSecretKey', $date, 'us-east-1', 's3'),
+        );
+        $multipart = [];
+        foreach ($fields as $name => $value) {
+            $multipart[] = ['name' => $name, 'contents' => $value];
+        }
+        $multipart[] = ['name' => 'file', 'contents' => $body, 'filename' => 'upload.txt'];
+
+        return (new \GuzzleHttp\Client(['http_errors' => false, 'timeout' => 30]))->request(
+            'POST',
+            sprintf('http://%s:%d/%s', self::$host, self::$port, $bucket),
+            ['multipart' => $multipart],
+        );
     }
 
     public function test_foreign_multipart_writer_cannot_complete_after_tagging_grant_is_revoked(): void

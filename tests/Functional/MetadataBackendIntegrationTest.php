@@ -2809,6 +2809,8 @@ final class MetadataBackendIntegrationTest extends TestCase
             self::assertNull($metadata->getBucketOwnershipControls($bucket));
             $metadata->putBucketOwnershipControls($bucket, 'BucketOwnerEnforced');
             self::assertSame('BucketOwnerEnforced', $metadata->getBucketOwnershipControls($bucket));
+            $metadata->putBucketOwnershipControls($bucket, 'BucketOwnerPreferred');
+            self::assertSame('BucketOwnerPreferred', $metadata->getBucketOwnershipControls($bucket));
             $metadata->putBucketOwnershipControls($bucket, 'ObjectWriter');
             self::assertSame('ObjectWriter', $metadata->getBucketOwnershipControls($bucket));
             $metadata->deleteBucket($ownerId, $bucket);

@@ -78,9 +78,12 @@ documented subset and returns HTTP 501 before metadata or storage access.
 
 For anonymous writes authorized by bucket policy or ACL, copied objects and
 new delete markers are owned by the destination bucket owner. Request and
-notification attribution remains anonymous. Authenticated cross-account writes
-retain the authenticated requester as object owner unless
-`BucketOwnerEnforced` is active.
+notification attribution remains anonymous. Authenticated cross-account
+writes retain the authenticated requester as object owner under
+`ObjectWriter`. Under `BucketOwnerPreferred`, PUT, browser POST, and CopyObject
+transfer ownership only when the destination request uses the exact
+`bucket-owner-full-control` canned ACL. Equivalent explicit grants do not
+transfer ownership. `BucketOwnerEnforced` always assigns the bucket owner.
 
 PutObject accepts one CRC32, CRC32C, SHA1, or SHA256 checksum header. The
 optional `x-amz-sdk-checksum-algorithm` selector must identify that same
@@ -290,18 +293,28 @@ stored ACL unchanged.
 | Operation | Method | Path | Description |
 |-----------|--------|------|-------------|
 | GetBucketOwnershipControls | `GET` | `/{bucket}?ownershipControls` | Get explicitly stored Object Ownership controls |
-| PutBucketOwnershipControls | `PUT` | `/{bucket}?ownershipControls` | Set `ObjectWriter` or `BucketOwnerEnforced` |
+| PutBucketOwnershipControls | `PUT` | `/{bucket}?ownershipControls` | Set `ObjectWriter`, `BucketOwnerPreferred`, or `BucketOwnerEnforced` |
 | DeleteBucketOwnershipControls | `DELETE` | `/{bucket}?ownershipControls` | Remove explicit controls and use the `ObjectWriter` default |
 
-New buckets use `ObjectWriter` unless `x-amz-object-ownership: BucketOwnerEnforced`
-is sent at creation. Existing buckets without controls also use `ObjectWriter`;
-they are not migrated automatically. `BucketOwnerEnforced` requires a private
-bucket ACL. In that mode object ACL grants are ignored, ACL updates fail, and
-object writes accept no ACL or `bucket-owner-full-control`. Objects created
-while the mode is enforced belong to the bucket owner even if the mode is
-later disabled. Delete markers created while the mode is enforced also belong
-to the bucket owner; with `ObjectWriter`, an authenticated requester owns its
-new delete marker. `BucketOwnerPreferred` is not implemented.
+New buckets use `ObjectWriter` unless `x-amz-object-ownership` selects another
+supported mode. Existing buckets without controls also use `ObjectWriter`; no
+mode change migrates or rewrites existing object versions or ACLs.
+
+`BucketOwnerPreferred` keeps ACL APIs active. PUT, signed browser POST, and
+CopyObject assign a new destination version to the bucket owner only for the
+exact validated `bucket-owner-full-control` canned ACL. The stored ACL is then
+canonicalized to one bucket-owner `FULL_CONTROL` grant, and bucket-owner quota
+is used for both admission and publication. Omitted ACLs, other canned ACLs,
+and semantically equivalent `x-amz-grant-*` headers leave the authenticated
+writer as owner. CopyObject never inherits its source owner or ACL.
+
+`BucketOwnerEnforced` requires a private bucket ACL. In that mode object ACL
+grants are ignored, ACL updates fail, and object writes accept no ACL or
+`bucket-owner-full-control`. Objects created while the mode is enforced belong
+to the bucket owner even if the mode is later disabled. Delete markers created
+while the mode is enforced also belong to the bucket owner; with
+`ObjectWriter` or `BucketOwnerPreferred`, an authenticated requester owns its
+new delete marker.
 
 ## Policies
 

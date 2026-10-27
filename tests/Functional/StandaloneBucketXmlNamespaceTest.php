@@ -129,13 +129,14 @@ final class StandaloneBucketXmlNamespaceTest extends S3FunctionalTestCase
                 self::assertSame('ObjectWriter', self::$s3->getBucketOwnershipControls(['Bucket' => self::$source])['OwnershipControls']['Rules'][0]['ObjectOwnership']);
             }
 
-            $unsupported = '<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>';
-            self::assertSame(501, $this->sendRaw('PutBucketOwnershipControls', ['OwnershipControls' => $controls], $unsupported)->getStatusCode());
-            self::assertSame('ObjectWriter', self::$s3->getBucketOwnershipControls(['Bucket' => self::$source])['OwnershipControls']['Rules'][0]['ObjectOwnership']);
+            $preferred = '<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>';
+            self::assertSame(200, $this->sendRaw('PutBucketOwnershipControls', ['OwnershipControls' => $controls], $preferred)->getStatusCode());
+            self::assertSame('BucketOwnerPreferred', self::$s3->getBucketOwnershipControls(['Bucket' => self::$source])['OwnershipControls']['Rules'][0]['ObjectOwnership']);
 
             $malformed = $this->sendRaw('PutBucketOwnershipControls', ['OwnershipControls' => $controls], '<OwnershipControls/>');
             self::assertSame(400, $malformed->getStatusCode());
             self::assertStringContainsString('<Code>MalformedXML</Code>', (string) $malformed->getBody());
+            self::assertSame('BucketOwnerPreferred', self::$s3->getBucketOwnershipControls(['Bucket' => self::$source])['OwnershipControls']['Rules'][0]['ObjectOwnership']);
 
             $plain = '<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>';
             self::assertSame(200, $this->sendRaw('PutBucketOwnershipControls', ['OwnershipControls' => $controls], $plain)->getStatusCode());

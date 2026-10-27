@@ -10,6 +10,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Acl\AclGrantResolver;
 use OpsFour\S3Server\Acl\BucketOwnership;
+use OpsFour\S3Server\Acl\ObjectWriteOwnershipDecision;
 use OpsFour\S3Server\Auth\AwsChunkedContentLength;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
@@ -116,8 +117,13 @@ final class PutObjectHandler implements RequestHandler
         // Anonymous POST Object writes are authorized as anonymous throughout
         // the request, while the resulting object belongs to the bucket owner.
         $objectOwnerId = $ownerId !== '' ? $ownerId : $bucketInfo->ownerId;
-
-        $aclGrants = $this->resolveObjectAclGrants($request, $objectOwnerId, $bucketInfo->ownerId);
+        $ownershipDecision = BucketOwnership::resolveObjectWrite(
+            $request,
+            BucketOwnership::effectiveMode($this->metadata, $bucket),
+            $objectOwnerId,
+            $bucketInfo->ownerId,
+        );
+        $this->assertPublicAclAllowed($bucket, $ownershipDecision->aclGrants);
         $tagging = $this->parseObjectTagging($request->getHeader('x-amz-tagging'));
         $encryptionMode = EncryptionRequestResolver::resolveDestination(
             $request,
@@ -164,7 +170,7 @@ final class PutObjectHandler implements RequestHandler
                     $request,
                     $bucketInfo,
                     $key,
-                    $objectOwnerId,
+                    $ownershipDecision,
                     $declaredLength,
                 );
             }
@@ -312,7 +318,7 @@ final class PutObjectHandler implements RequestHandler
                         $checksumCrc32c,
                         $checksumSha1,
                         $checksumSha256,
-                        $aclGrants,
+                        $ownershipDecision,
                         $tagging,
                         $request,
                         $encryptionMode,
@@ -344,20 +350,24 @@ final class PutObjectHandler implements RequestHandler
                             );
                         }
                         (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
-                        $this->assertPublicAclAllowed($bucket, $aclGrants, $request);
-                        $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
-                            ? $bucketInfo->ownerId : $objectOwnerId;
-                        $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
-                            ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                        BucketOwnership::assertObjectWriteDecisionCurrent(
+                            $this->metadata,
+                            $bucket,
+                            $request,
+                            $objectOwnerId,
+                            $bucketInfo->ownerId,
+                            $ownershipDecision,
+                        );
+                        $this->assertPublicAclAllowed($bucket, $ownershipDecision->aclGrants);
                         $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
-                        $this->quotas?->assertCanWriteObject($storedOwnerId, $bucket, null, $result->size, true);
+                        $this->quotas?->assertCanWriteObject($ownershipDecision->quotaPrincipalId, $bucket, null, $result->size, true);
 
                         $this->consumeLocalWriteIntent($dispatchToken);
                         $metadataWriteAttempted = true;
                         $versionId = $this->metadata->putObjectVersioned(
                             bucket: $bucket,
                             key: $key,
-                            ownerId: $storedOwnerId,
+                            ownerId: $ownershipDecision->ownerId,
                             size: $result->size,
                             etag: $etag,
                             contentType: $contentType,
@@ -380,12 +390,12 @@ final class PutObjectHandler implements RequestHandler
                             $this->storageTiers->defaultTier()->name,
                             $result->path,
                         );
-                        $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
+                        $this->metadata->putAcl('object', $bucket . '/' . $key, $ownershipDecision->ownerId, []);
                         $this->metadata->putAcl(
                             'object',
                             ObjectVersionResolver::aclResourceName($bucket, $key, $versionId),
-                            $storedOwnerId,
-                            $storedAclGrants,
+                            $ownershipDecision->ownerId,
+                            $ownershipDecision->aclGrants,
                         );
                         $this->metadata->putObjectTagging($bucket, $key, $tagging ?? [], $versionId);
                         (new ObjectLockRequestApplier($this->metadata))->apply(
@@ -420,7 +430,7 @@ final class PutObjectHandler implements RequestHandler
                         $checksumCrc32c,
                         $checksumSha1,
                         $checksumSha256,
-                        $aclGrants,
+                        $ownershipDecision,
                         $tagging,
                         $request,
                         $encryptionMode,
@@ -453,11 +463,15 @@ final class PutObjectHandler implements RequestHandler
                             );
                         }
                         (new PolicyEnforcementMiddleware($this->metadata))->assertAllowedAtCommit($request);
-                        $this->assertPublicAclAllowed($bucket, $aclGrants, $request);
-                        $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucket)
-                            ? $bucketInfo->ownerId : $objectOwnerId;
-                        $storedAclGrants = BucketOwnership::isEnforced($this->metadata, $bucket)
-                            ? AclGrantResolver::privateAcl($storedOwnerId) : $aclGrants;
+                        BucketOwnership::assertObjectWriteDecisionCurrent(
+                            $this->metadata,
+                            $bucket,
+                            $request,
+                            $objectOwnerId,
+                            $bucketInfo->ownerId,
+                            $ownershipDecision,
+                        );
+                        $this->assertPublicAclAllowed($bucket, $ownershipDecision->aclGrants);
                         $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
                         $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
                         $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
@@ -469,14 +483,14 @@ final class PutObjectHandler implements RequestHandler
                             }
                         }
 
-                        $this->quotas?->assertCanWriteObject($storedOwnerId, $bucket, $oldObjectToClean, $result->size, false);
+                        $this->quotas?->assertCanWriteObject($ownershipDecision->quotaPrincipalId, $bucket, $oldObjectToClean, $result->size, false);
 
                         $this->consumeLocalWriteIntent($dispatchToken);
                         $metadataWriteAttempted = true;
                         $this->metadata->putObjectMetadata(
                             bucket: $bucket,
                             key: $key,
-                            ownerId: $storedOwnerId,
+                            ownerId: $ownershipDecision->ownerId,
                             size: $result->size,
                             etag: $etag,
                             contentType: $contentType,
@@ -499,12 +513,12 @@ final class PutObjectHandler implements RequestHandler
                             $this->storageTiers->defaultTier()->name,
                             $result->path,
                         );
-                        $this->metadata->putAcl('object', $bucket . '/' . $key, $storedOwnerId, []);
+                        $this->metadata->putAcl('object', $bucket . '/' . $key, $ownershipDecision->ownerId, []);
                         $this->metadata->putAcl(
                             'object',
                             ObjectVersionResolver::aclResourceName($bucket, $key, null),
-                            $storedOwnerId,
-                            $storedAclGrants,
+                            $ownershipDecision->ownerId,
+                            $ownershipDecision->aclGrants,
                         );
                         $this->metadata->putObjectTagging($bucket, $key, $tagging ?? []);
                         (new ObjectLockRequestApplier($this->metadata))->apply(
@@ -680,30 +694,10 @@ final class PutObjectHandler implements RequestHandler
     }
 
     /**
-     * Every successful replacement receives a fresh ACL. This matches S3,
-     * where omitting ACL headers means private instead of preserving the old
-     * object's grants.
-     *
-     * @return list<array{granteeType: string, granteeId: string, permission: string}>
-     */
-    private function resolveObjectAclGrants(Request $request, string $ownerId, string $bucketOwnerId): array
-    {
-        $grants = AclGrantResolver::fromHeaders($request, $ownerId, 'object', $bucketOwnerId)
-            ?? AclGrantResolver::privateAcl($ownerId);
-
-        $this->assertPublicAclAllowed((string) $request->getAttribute('s3.bucket'), $grants, $request);
-
-        return $grants;
-    }
-
-    /**
      * @param list<array{granteeType: string, granteeId: string, permission: string}> $grants
      */
-    private function assertPublicAclAllowed(string $bucket, array $grants, ?Request $request = null): void
+    private function assertPublicAclAllowed(string $bucket, array $grants): void
     {
-        if ($request !== null && BucketOwnership::isEnforced($this->metadata, $bucket)) {
-            BucketOwnership::assertWriteAclAllowed($request);
-        }
         $pab = $this->metadata->getPublicAccessBlock($bucket);
         if ($pab !== null && $pab['blockPublicAcls'] && AclGrantResolver::isPublic($grants)) {
             throw new \OpsFour\S3Server\Exception\AccessDeniedException(
@@ -805,23 +799,30 @@ final class PutObjectHandler implements RequestHandler
         Request $request,
         BucketInfo $bucketInfo,
         string $key,
-        string $objectOwnerId,
+        ObjectWriteOwnershipDecision $ownershipDecision,
         int $declaredLength,
     ): void {
         if ($this->quotas === null
-            || (! $this->quotas->hasQuotaForOwner($objectOwnerId)
+            || (! $this->quotas->hasQuotaForOwner($ownershipDecision->quotaPrincipalId)
                 && ! $this->quotas->hasQuotaForOwner($bucketInfo->ownerId))) {
             return;
         }
 
-        $this->metadata->transaction(function () use ($request, $bucketInfo, $key, $objectOwnerId, $declaredLength): void {
-            OwnerWriteLock::acquire($this->metadata, $objectOwnerId, $bucketInfo->ownerId);
+        $this->metadata->transaction(function () use ($request, $bucketInfo, $key, $ownershipDecision, $declaredLength): void {
+            OwnerWriteLock::acquire($this->metadata, $ownershipDecision->quotaPrincipalId, $bucketInfo->ownerId);
             BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
+            BucketOwnership::assertObjectWriteDecisionCurrent(
+                $this->metadata,
+                $bucketInfo->name,
+                $request,
+                $request->getAttribute('ownerId') !== ''
+                    ? (string) $request->getAttribute('ownerId')
+                    : $bucketInfo->ownerId,
+                $bucketInfo->ownerId,
+                $ownershipDecision,
+            );
 
             $versioning = $this->metadata->getBucketVersioning($bucketInfo->name);
-            $storedOwnerId = BucketOwnership::isEnforced($this->metadata, $bucketInfo->name)
-                ? $bucketInfo->ownerId
-                : $objectOwnerId;
             $existingObject = null;
             if ($versioning !== 'Enabled') {
                 $nullVersion = $this->metadata->getObjectMetadataByVersion($bucketInfo->name, $key, 'null');
@@ -829,7 +830,7 @@ final class PutObjectHandler implements RequestHandler
             }
 
             $this->quotas->assertCanWriteObject(
-                $storedOwnerId,
+                $ownershipDecision->quotaPrincipalId,
                 $bucketInfo->name,
                 $existingObject,
                 $declaredLength,

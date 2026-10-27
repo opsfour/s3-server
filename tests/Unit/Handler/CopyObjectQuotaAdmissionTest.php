@@ -103,6 +103,55 @@ final class CopyObjectQuotaAdmissionTest extends TestCase
         }
     }
 
+    public function test_preferred_transfer_uses_bucket_owner_quota_before_destination_storage(): void
+    {
+        $this->metadata->putBucketOwnershipControls('target', 'BucketOwnerPreferred');
+        $source = $this->metadata->getObjectMetadata('source', 'key');
+        self::assertNotNull($source);
+        $this->metadata->putObjectMetadata(
+            'source',
+            'key',
+            'writer',
+            $source->size,
+            $source->etag,
+            $source->contentType,
+            (string) $source->systemMetadata['storagePath'],
+        );
+        $this->metadata->putAccountPolicy('writer', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::source/key',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $this->store('target', 'existing', 'target-owner', '1234567');
+        $storage = new CallbackStorageBackend($this->storage);
+        $provider = $this->createMock(QuotaProvider::class);
+        $provider->method('quotaForOwner')->willReturnCallback(
+            static fn(string $ownerId): QuotaConfig => $ownerId === 'target-owner'
+                ? new QuotaConfig(maxBytesPerOwner: 7)
+                : new QuotaConfig(),
+        );
+        $provider->method('hasQuotaForOwner')->willReturnCallback(
+            static fn(string $ownerId): bool => $ownerId === 'target-owner',
+        );
+
+        $this->expectException(QuotaExceededException::class);
+        try {
+            (new CopyObjectHandler(
+                $this->metadata,
+                $storage,
+                quotas: new QuotaManager($this->metadata, $provider),
+            ))->handleRequest($this->request(
+                'writer',
+                ['x-amz-acl' => 'bucket-owner-full-control'],
+            ));
+        } finally {
+            self::assertSame(0, $storage->copyCalls);
+            self::assertSame(0, $storage->putCalls);
+        }
+    }
+
     public function test_final_transaction_check_rejects_quota_that_tightens_after_preflight(): void
     {
         $provider = new class implements QuotaProvider {
@@ -132,6 +181,71 @@ final class CopyObjectQuotaAdmissionTest extends TestCase
         } catch (QuotaExceededException) {
             self::assertSame(1, $storage->copyCalls);
             self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
+            self::assertNull($storage->lastWrite === null
+                ? null
+                : $this->readPathOrNull($storage->lastWrite->path));
+        }
+    }
+
+    public function test_preferred_transfer_final_check_uses_bucket_owner_quota_and_cleans_copy(): void
+    {
+        $this->metadata->putBucketOwnershipControls('target', 'BucketOwnerPreferred');
+        $source = $this->metadata->getObjectMetadata('source', 'key');
+        self::assertNotNull($source);
+        $this->metadata->putObjectMetadata(
+            'source',
+            'key',
+            'writer',
+            $source->size,
+            $source->etag,
+            $source->contentType,
+            (string) $source->systemMetadata['storagePath'],
+        );
+        $this->metadata->putAccountPolicy('writer', json_encode([
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::source/key',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+        $storage = new CallbackStorageBackend(
+            $this->storage,
+            afterCopy: function (): void {
+                $this->metadata->putObjectMetadata(
+                    'target',
+                    'racing-winner',
+                    'target-owner',
+                    1,
+                    '"winner"',
+                    'text/plain',
+                    'winner-path',
+                );
+            },
+        );
+        $provider = $this->createMock(QuotaProvider::class);
+        $provider->method('quotaForOwner')->willReturnCallback(
+            static fn(string $ownerId): QuotaConfig => $ownerId === 'target-owner'
+                ? new QuotaConfig(maxBytesPerOwner: 7)
+                : new QuotaConfig(),
+        );
+        $provider->method('hasQuotaForOwner')->willReturnCallback(
+            static fn(string $ownerId): bool => $ownerId === 'target-owner',
+        );
+
+        try {
+            (new CopyObjectHandler(
+                $this->metadata,
+                $storage,
+                quotas: new QuotaManager($this->metadata, $provider),
+            ))->handleRequest($this->request(
+                'writer',
+                ['x-amz-acl' => 'bucket-owner-full-control'],
+            ));
+            self::fail('The final quota check must charge the transferred copy to the bucket owner.');
+        } catch (QuotaExceededException) {
+            self::assertSame(1, $storage->copyCalls);
+            self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
+            self::assertSame('target-owner', $this->metadata->getObjectMetadata('target', 'racing-winner')?->ownerId);
             self::assertNull($storage->lastWrite === null
                 ? null
                 : $this->readPathOrNull($storage->lastWrite->path));
@@ -175,17 +289,18 @@ final class CopyObjectQuotaAdmissionTest extends TestCase
         }
     }
 
-    private function request(): Request
+    /** @param array<non-empty-string, string> $headers */
+    private function request(string $ownerId = 'target-owner', array $headers = []): Request
     {
         $request = new Request(
             $this->createMock(Client::class),
             'PUT',
             Http::new('http://127.0.0.1/target/copied'),
-            ['x-amz-copy-source' => '/source/key'],
+            ['x-amz-copy-source' => '/source/key', ...$headers],
         );
         $request->setAttribute('s3.bucket', 'target');
         $request->setAttribute('s3.key', 'copied');
-        $request->setAttribute('ownerId', 'target-owner');
+        $request->setAttribute('ownerId', $ownerId);
 
         return $request;
     }
