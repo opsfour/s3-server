@@ -784,6 +784,13 @@ final class CopyObjectHandler implements RequestHandler
 
         try {
             $dstVersioning = $this->metadata->getBucketVersioning($dstBucket);
+            $observedReplacementOwnerId = null;
+            if ($dstVersioning !== 'Enabled') {
+                $observedNullVersion = $this->metadata->getObjectMetadataByVersion($dstBucket, $dstKey, 'null');
+                if ($observedNullVersion !== null && ! $observedNullVersion->isDeleteMarker) {
+                    $observedReplacementOwnerId = $observedNullVersion->ownerId;
+                }
+            }
             if ($dstVersioning === 'Enabled') {
                 $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
@@ -876,8 +883,14 @@ final class CopyObjectHandler implements RequestHandler
                     $metadataCallbackCompleted = true;
                 });
             } else {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, &$metadataCallbackCompleted, $localDispatchToken) {
-                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, $observedReplacementOwnerId, &$metadataCallbackCompleted, $localDispatchToken) {
+                    \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
+                        $this->metadata,
+                        $ownerId,
+                        $dstBucketInfo->ownerId,
+                        $srcBucketInfo->ownerId,
+                        $observedReplacementOwnerId ?? '',
+                    );
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $dstBucketInfo, $request);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
                     $bucketEncryption = $this->metadata->getBucketEncryption($dstBucket);
@@ -921,6 +934,18 @@ final class CopyObjectHandler implements RequestHandler
                     }
                     $nullVersion = $this->metadata->getObjectMetadataByVersion($dstBucket, $dstKey, 'null');
                     $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+                    if ($oldObjectToClean !== null && (
+                        $oldObjectToClean->ownerId === ''
+                        || ! in_array(
+                            $oldObjectToClean->ownerId,
+                            [$ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId, $observedReplacementOwnerId],
+                            true,
+                        )
+                    )) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                            'The destination owner changed while the copy was being committed.',
+                        );
+                    }
                     if ($oldObjectToClean !== null) {
                         (new \OpsFour\S3Server\ObjectLock\ObjectLockChecker($this->metadata))
                             ->checkProtection($dstBucket, $dstKey, 'null');

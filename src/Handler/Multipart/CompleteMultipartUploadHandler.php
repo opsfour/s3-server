@@ -543,6 +543,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler
 
         try {
             $versioning = $this->metadata->getBucketVersioning($bucket);
+            $observedReplacementOwnerId = null;
+            if ($versioning !== 'Enabled') {
+                $observedNullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+                if ($observedNullVersion !== null && ! $observedNullVersion->isDeleteMarker) {
+                    $observedReplacementOwnerId = $observedNullVersion->ownerId;
+                }
+            }
             if ($versioning === 'Enabled') {
                 $this->metadata->transaction(function () use (
                     $bucket,
@@ -691,6 +698,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $localDispatchId,
                     $event,
                     $versioning,
+                    $observedReplacementOwnerId,
                     $uploadEncryptionMode,
                     &$oldObjectToClean,
                     &$oldPathsToClean,
@@ -701,6 +709,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         $ownerId,
                         $bucketInfo->ownerId,
                         $quotaPrincipalId,
+                        $observedReplacementOwnerId ?? '',
                     );
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                     $this->assertPlainUploadAllowed($bucket, $uploadEncryptionMode);
@@ -727,6 +736,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $this->assertSelectedPartsUnchanged($uploadId, $validatedParts);
                     $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
                     $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+                    if ($oldObjectToClean !== null && (
+                        $oldObjectToClean->ownerId === ''
+                        || ! in_array(
+                            $oldObjectToClean->ownerId,
+                            [$ownerId, $bucketInfo->ownerId, $quotaPrincipalId, $observedReplacementOwnerId],
+                            true,
+                        )
+                    )) {
+                        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                            'The destination owner changed while the multipart upload was being committed.',
+                        );
+                    }
                     if ($oldObjectToClean !== null) {
                         (new \OpsFour\S3Server\ObjectLock\ObjectLockChecker($this->metadata))
                             ->checkProtection($bucket, $key, 'null');

@@ -120,6 +120,9 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Serialize PUT/browser POST, CopyObject, and multipart completion against the
+  persisted owner of a replaced null version so concurrent owner quota checks
+  cannot observe an unlocked usage release.
 - Acquire SQLite writer locks before transactional metadata reads and initialize
   schemas only through the explicit startup task, preventing parallel API and
   lifecycle mutations from failing with `database is locked`.

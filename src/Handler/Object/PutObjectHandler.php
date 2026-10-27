@@ -299,6 +299,13 @@ final class PutObjectHandler implements RequestHandler
 
             try {
                 $versioning = $this->metadata->getBucketVersioning($bucket);
+                $observedReplacementOwnerId = null;
+                if ($versioning !== 'Enabled') {
+                    $observedNullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
+                    if ($observedNullVersion !== null && ! $observedNullVersion->isDeleteMarker) {
+                        $observedReplacementOwnerId = $observedNullVersion->ownerId;
+                    }
+                }
                 if ($versioning === 'Enabled') {
                     // Versioning is enabled: create a new version.
                     $this->metadata->transaction(function () use (
@@ -439,6 +446,7 @@ final class PutObjectHandler implements RequestHandler
                         $dispatchToken,
                         $event,
                         $versioning,
+                        $observedReplacementOwnerId,
                         &$oldObjectToClean,
                         &$oldPathsToClean,
                         &$publicationCallbackCompleted,
@@ -448,6 +456,7 @@ final class PutObjectHandler implements RequestHandler
                             $this->metadata,
                             $objectOwnerId,
                             $bucketInfo->ownerId,
+                            $observedReplacementOwnerId ?? '',
                         );
                         BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                         $bucketEncryption = $this->metadata->getBucketEncryption($bucket);
@@ -475,6 +484,18 @@ final class PutObjectHandler implements RequestHandler
                         $this->evaluatePutConditionals($bucket, $key, $ifMatch, $ifNoneMatch);
                         $nullVersion = $this->metadata->getObjectMetadataByVersion($bucket, $key, 'null');
                         $oldObjectToClean = $nullVersion?->isDeleteMarker === true ? null : $nullVersion;
+                        if ($oldObjectToClean !== null && (
+                            $oldObjectToClean->ownerId === ''
+                            || ! in_array(
+                                $oldObjectToClean->ownerId,
+                                [$objectOwnerId, $bucketInfo->ownerId, $observedReplacementOwnerId],
+                                true,
+                            )
+                        )) {
+                            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                                'The destination owner changed while the object write was being committed.',
+                            );
+                        }
                         if ($oldObjectToClean !== null) {
                             (new \OpsFour\S3Server\ObjectLock\ObjectLockChecker($this->metadata))
                                 ->checkProtection($bucket, $key, 'null');
