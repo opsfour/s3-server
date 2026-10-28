@@ -112,16 +112,26 @@ final class AwsS3ProviderValidator implements AwsS3ProviderProbe
             );
         }
 
-        foreach (['BucketLocationType', 'BucketLocationName', 'BucketArn', 'AccessPointAlias'] as $unsupportedField) {
-            if ($head->hasKey($unsupportedField)) {
-                return AwsS3ProviderAdmission::denied(
-                    $profile->region,
-                    true,
-                    true,
-                    AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED,
-                    AwsS3ProviderAdmission::REASON_BUCKET_TYPE_UNSUPPORTED,
-                );
-            }
+        $bucketArn = $head->get('BucketArn');
+        $accessPointAlias = $head->get('AccessPointAlias');
+        $expectedBucketArn = sprintf('arn:aws:s3:::%s', $profile->bucket);
+        $metadata = $head->get('@metadata');
+        $headers = is_array($metadata) ? ($metadata['headers'] ?? null) : null;
+        $rawAccessPointAlias = is_array($headers) ? ($headers['x-amz-access-point-alias'] ?? null) : null;
+        $hasRawHeader = static fn(string $name): bool => is_array($headers) && array_key_exists($name, $headers);
+        if ($head->hasKey('BucketLocationType') || $hasRawHeader('x-amz-bucket-location-type')
+            || $head->hasKey('BucketLocationName') || $hasRawHeader('x-amz-bucket-location-name')
+            || (($head->hasKey('BucketArn') || $hasRawHeader('x-amz-bucket-arn'))
+                && (! is_string($bucketArn) || ! hash_equals($expectedBucketArn, $bucketArn)))
+            || (($head->hasKey('AccessPointAlias') || $hasRawHeader('x-amz-access-point-alias'))
+                && ($accessPointAlias !== false || $rawAccessPointAlias !== 'false'))) {
+            return AwsS3ProviderAdmission::denied(
+                $profile->region,
+                true,
+                true,
+                AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED,
+                AwsS3ProviderAdmission::REASON_BUCKET_TYPE_UNSUPPORTED,
+            );
         }
 
         try {

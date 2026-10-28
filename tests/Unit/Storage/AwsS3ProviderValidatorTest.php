@@ -25,7 +25,11 @@ final class AwsS3ProviderValidatorTest extends TestCase
     {
         $requests = [];
         $client = self::client([
-            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [
+                'x-amz-bucket-region' => 'us-east-1',
+                'x-amz-bucket-arn' => 'arn:aws:s3:::backing-private',
+                'x-amz-access-point-alias' => 'false',
+            ]),
             new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
         ], $requests);
 
@@ -57,6 +61,45 @@ final class AwsS3ProviderValidatorTest extends TestCase
         self::assertSame(self::OWNER, $requests[0]->getHeaderLine('x-amz-expected-bucket-owner'));
         self::assertSame(self::OWNER, $requests[1]->getHeaderLine('x-amz-expected-bucket-owner'));
         self::assertSame('versioning', $requests[1]->getUri()->getQuery());
+    }
+
+    public function test_legacy_general_purpose_bucket_response_without_optional_fields_is_admitted(): void
+    {
+        $requests = [];
+        $client = self::client([
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+        ], $requests);
+
+        $admission = (new AwsS3ProviderValidator())->validate(self::profile(), static fn() => $client);
+
+        self::assertTrue($admission->providerAdmitted);
+        self::assertSame(AwsS3ProviderAdmission::VERSIONING_DISABLED, $admission->versioningState);
+        self::assertCount(2, $requests);
+    }
+
+    /** @param array<string, string> $headers */
+    #[DataProvider('partialGeneralPurposeHeadResponses')]
+    public function test_general_purpose_optional_evidence_is_independently_admitted(array $headers): void
+    {
+        $requests = [];
+        $client = self::client([
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1'] + $headers),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+        ], $requests);
+
+        $admission = (new AwsS3ProviderValidator())->validate(self::profile(), static fn() => $client);
+
+        self::assertTrue($admission->providerAdmitted);
+        self::assertSame(AwsS3ProviderAdmission::VERSIONING_DISABLED, $admission->versioningState);
+        self::assertCount(2, $requests);
+    }
+
+    /** @return iterable<string, array{array<string, string>}> */
+    public static function partialGeneralPurposeHeadResponses(): iterable
+    {
+        yield 'exact bucket ARN only' => [['x-amz-bucket-arn' => 'arn:aws:s3:::backing-private']];
+        yield 'false access-point alias only' => [['x-amz-access-point-alias' => 'false']];
     }
 
     public function test_invalid_configuration_never_constructs_a_client_or_sends_a_request(): void
@@ -180,16 +223,35 @@ final class AwsS3ProviderValidatorTest extends TestCase
                 'x-amz-bucket-location-name' => 'use1-az1',
             ]),
         ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
-        yield 'bucket ARN evidence' => [[
+        yield 'directory bucket ARN evidence' => [[
             new Response(200, [
                 'x-amz-bucket-region' => 'us-east-1',
                 'x-amz-bucket-arn' => 'arn:aws:s3express:us-east-1:123456789012:bucket/private',
+            ]),
+        ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
+        yield 'mismatched general purpose bucket ARN evidence' => [[
+            new Response(200, [
+                'x-amz-bucket-region' => 'us-east-1',
+                'x-amz-bucket-arn' => 'arn:aws:s3:::different-private-bucket',
+                'x-amz-access-point-alias' => 'false',
             ]),
         ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
         yield 'access point alias evidence' => [[
             new Response(200, [
                 'x-amz-bucket-region' => 'us-east-1',
                 'x-amz-access-point-alias' => 'true',
+            ]),
+        ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
+        yield 'malformed access point alias evidence' => [[
+            new Response(200, [
+                'x-amz-bucket-region' => 'us-east-1',
+                'x-amz-access-point-alias' => 'garbage',
+            ]),
+        ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
+        yield 'empty access point alias evidence' => [[
+            new Response(200, [
+                'x-amz-bucket-region' => 'us-east-1',
+                'x-amz-access-point-alias' => '',
             ]),
         ], 'bucket-type-unsupported', AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED, 1];
         yield 'versioning enabled' => [[
