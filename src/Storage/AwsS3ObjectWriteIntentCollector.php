@@ -25,6 +25,7 @@ final readonly class AwsS3ObjectWriteIntentCollector
         LoggerInterface $logger = new NullLogger(),
         private ?MetricsCollector $metrics = null,
         private float $claimLeaseSeconds = 300.0,
+        private ?AwsS3OperationalState $operationalState = null,
     ) {
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0.0 || $claimLeaseSeconds > 86390.0) {
             throw new \InvalidArgumentException('AWS object claim lease must be between 0 and 86390 seconds.');
@@ -38,6 +39,7 @@ final readonly class AwsS3ObjectWriteIntentCollector
         if ($limit < 1 || $limit > 1000) {
             throw new \InvalidArgumentException('AWS object collection limit must be between 1 and 1000.');
         }
+        $this->operationalState?->assertMutationReady();
         $cancellation?->throwIfRequested();
         $retired = $this->metadata->retireExpiredUndispatchedObjectWriteIntents($this->tierName, $limit);
         $sealed = 0;
@@ -51,10 +53,12 @@ final readonly class AwsS3ObjectWriteIntentCollector
                 $this->reconciler->reconcile($claims[0], $cancellation, $this->claimLeaseSeconds);
                 ++$sealed;
                 $this->metrics?->recordAwsWriteReconciliation('sealed');
+                $this->operationalState?->markCollectorHealthy();
             } catch (CancelledException $error) {
                 throw $error;
             } catch (AwsS3SealIntegrityException $error) {
                 $this->metrics?->recordAwsWriteReconciliation('integrity_conflict');
+                $this->operationalState?->markIntegrityConflict();
                 $this->logger->error('AWS write reconciliation found conflicting immutable evidence.', [
                     'component' => 'aws_object_intent_reconciler',
                     'storage_tier' => $this->tierName,
@@ -62,6 +66,7 @@ final readonly class AwsS3ObjectWriteIntentCollector
                 ]);
             } catch (\Throwable $error) {
                 $this->metrics?->recordAwsWriteReconciliation('retry');
+                $this->operationalState?->markCollectorFailure();
                 $this->logger->warning('AWS write reconciliation remains unresolved.', [
                     'component' => 'aws_object_intent_reconciler',
                     'storage_tier' => $this->tierName,

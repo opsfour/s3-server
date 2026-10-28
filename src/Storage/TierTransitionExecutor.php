@@ -356,7 +356,8 @@ final class TierTransitionExecutor
             return 'completed';
         } catch (CancelledException $e) {
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $writeResult !== null
-                && (! $publicationCallbackCompleted || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
+                && (! $publicationCallbackCompleted || $targetTier === null
+                    || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
                 $this->cleanTarget($job, $targetBackend, $writeResult->path, $cleanupOwnerId);
             }
 

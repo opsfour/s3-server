@@ -21,6 +21,8 @@ use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -67,6 +69,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly ?CredentialHealthProbe $credentialHealthProbe = null,
         private readonly int $readinessCheckIntervalSeconds = 30,
         private readonly float $readinessCheckTimeoutSeconds = 5.0,
+        private readonly ?AwsS3OperationalState $awsOperationalState = null,
     ) {
         if ($readinessCheckIntervalSeconds < 0) {
             throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
@@ -123,6 +126,15 @@ final class HealthCheckHandler implements RequestHandler
 
     private function runReadinessCheck(int $generation): void
     {
+        if ($this->awsOperationalState !== null) {
+            try {
+                $this->awsOperationalState->assertMutationReady();
+            } catch (\Throwable $e) {
+                $this->recordDegraded($generation, 'aws', $e);
+                return;
+            }
+        }
+
         if ($this->metadata !== null) {
             try {
                 // The read proves query availability. Built-in stores also run
@@ -239,6 +251,10 @@ final class HealthCheckHandler implements RequestHandler
                     // a preceding filesystem stat could otherwise strand a
                     // production metadata worker before the timeout applies.
                     $backend->assertWritable();
+                } elseif ($backend instanceof AwsS3StorageBackend && $backend->operationalState() !== null) {
+                    // The shared state already ran the exact owner-bound AWS
+                    // probes above; generic backend probes stay deliberately closed.
+                    continue;
                 } else {
                     // The result is irrelevant: a successful lookup proves
                     // that the backend can execute a read operation.
@@ -277,10 +293,29 @@ final class HealthCheckHandler implements RequestHandler
 
     private function readinessResponse(): Response
     {
+        if ($this->awsOperationalState !== null) {
+            $snapshot = $this->awsOperationalState->snapshot();
+            $body = json_encode([
+                'status' => $this->readinessHealthy ? 'ok' : 'degraded',
+                'aws' => [
+                    'provider_type' => $snapshot['provider_type'],
+                    'fingerprint' => $snapshot['fingerprint'],
+                    'configuration_valid' => $snapshot['configuration_valid'],
+                    'provider_admitted' => $snapshot['provider_admitted'],
+                    'fence_complete' => $snapshot['fence_complete'],
+                    'production_qualified' => $snapshot['production_qualified'],
+                    'mutation_ready' => $snapshot['mutation_ready'],
+                    'reason' => $snapshot['reason'],
+                ],
+            ], JSON_THROW_ON_ERROR);
+        } else {
+            $body = $this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}';
+        }
+
         return new Response(
             status: $this->readinessHealthy ? 200 : 503,
             headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-            body: $this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}',
+            body: $body,
         );
     }
 }

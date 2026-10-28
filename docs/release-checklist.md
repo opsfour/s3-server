@@ -71,6 +71,23 @@ The initial production profile adds these gates:
 
 ## Later Profiles
 
+### AWS S3 pre-qualification gate
+
+- [ ] Render `deploy/aws-s3-profile.cloudformation.yaml` into a new isolated
+  stack; confirm it creates only the bucket, bucket policy, and runtime role.
+- [ ] Use the default credential chain and PostgreSQL; verify `/.live` remains
+  200 while provider or credential drift makes `/.health` 503 and closes new
+  provider mutations.
+- [ ] Alert at 15 minutes oldest retained recovery age, any integrity conflict,
+  repeated collector failure, 80% global capacity, or 80% maximum per-owner
+  capacity. Treat hard capacity as an incident before request ingestion rejects.
+- [ ] Exercise drain, credential rotation, matched PostgreSQL-first restore,
+  reconciliation, and the audited seal break-glass procedure in the operations
+  runbook. Never delete a seal automatically.
+- [ ] Keep `production_qualified=false` until the bounded, isolated real-AWS
+  release run is accepted for the exact commit, topology, region, IAM policy,
+  PostgreSQL version, concurrency, timeouts, and artifacts.
+
 Multiple API processes, multiple hosts, remote storage, shared filesystems,
 strict whole-system encryption-at-rest claims, and larger scale profiles are
 not gates for this release. Promote one only for a concrete deployment need,

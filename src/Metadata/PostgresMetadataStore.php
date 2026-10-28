@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -3790,6 +3790,66 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
 
         return (int) $row['retained_count'];
+    }
+
+    public function getAwsS3OperationalSummary(): array
+    {
+        $row = $this->conn()->query(<<<'SQL'
+            WITH object_rows AS (
+                SELECT owner_id, state, seal_reserved, created_at FROM s3_object_write_intents
+            ), part_rows AS (
+                SELECT owner_id, attempts, created_at FROM s3_storage_garbage WHERE operation = 'part_write_intent'
+            ), cleanup_rows AS (
+                SELECT attempts, created_at FROM s3_storage_garbage WHERE operation <> 'part_write_intent'
+            ), owner_object AS (
+                SELECT owner_id,
+                       COUNT(*) FILTER (WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
+                       COUNT(*) FILTER (WHERE seal_reserved) AS seal_count
+                FROM object_rows GROUP BY owner_id
+            ), owner_part AS (
+                SELECT owner_id, COUNT(*) AS part_count FROM part_rows
+                WHERE owner_id IS NOT NULL GROUP BY owner_id
+            ), oldest AS (
+                SELECT MIN(created_at) AS created_at FROM (
+                    SELECT created_at FROM object_rows WHERE NOT (seal_reserved AND state = 'sealed')
+                    UNION ALL SELECT created_at FROM part_rows
+                    UNION ALL SELECT created_at FROM cleanup_rows
+                    UNION ALL SELECT created_at FROM s3_multipart_write_intents
+                ) retained
+            )
+            SELECT
+                (SELECT COUNT(*) FROM object_rows WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
+                (SELECT COUNT(*) FROM object_rows WHERE state = 'reconciling') AS ambiguous_count,
+                (SELECT COUNT(*) FROM object_rows WHERE seal_reserved) AS seal_reserved_count,
+                (SELECT COUNT(*) FROM object_rows WHERE seal_reserved AND state = 'sealed') AS sealed_count,
+                (SELECT COUNT(*) FROM s3_multipart_write_intents) AS multipart_count,
+                (SELECT COUNT(*) FROM part_rows) AS part_count,
+                (SELECT COUNT(*) FROM cleanup_rows) AS cleanup_count,
+                (SELECT COUNT(*) FROM cleanup_rows WHERE attempts > 0) +
+                    (SELECT COUNT(*) FROM part_rows WHERE attempts > 0) AS failure_count,
+                COALESCE(GREATEST(0, EXTRACT(EPOCH FROM clock_timestamp() - (SELECT created_at FROM oldest))), 0) AS oldest_age_seconds,
+                COALESCE((SELECT MAX(open_count) FROM owner_object), 0) AS max_owner_open,
+                COALESCE((SELECT MAX(seal_count) FROM owner_object), 0) AS max_owner_sealed,
+                COALESCE((SELECT MAX(part_count) FROM owner_part), 0) AS max_owner_part
+            SQL)->fetchRow();
+        if ($row === null) {
+            throw new \RuntimeException('AWS operational summary is unavailable.');
+        }
+
+        return [
+            'open' => self::int($row['open_count']),
+            'ambiguous' => self::int($row['ambiguous_count']),
+            'seal_reserved' => self::int($row['seal_reserved_count']),
+            'sealed' => self::int($row['sealed_count']),
+            'multipart' => self::int($row['multipart_count']),
+            'part' => self::int($row['part_count']),
+            'cleanup' => self::int($row['cleanup_count']),
+            'failures' => self::int($row['failure_count']),
+            'oldest_age_seconds' => self::float($row['oldest_age_seconds']),
+            'max_owner_open' => self::int($row['max_owner_open']),
+            'max_owner_sealed' => self::int($row['max_owner_sealed']),
+            'max_owner_part' => self::int($row['max_owner_part']),
+        ];
     }
 
     public function updateNotificationStatus(

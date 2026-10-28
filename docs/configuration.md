@@ -60,14 +60,15 @@ list ignores forwarded headers.
 ## Storage
 
 `filesystem` is the storage driver for the current production target. The
-explicit `aws-s3` driver can validate provider admission but cannot yet start
-an API server because its writer fence is incomplete. `flysystem`, remote or
+explicit `aws-s3` driver may start only with PostgreSQL after its provider
+profile and complete writer inventory pass; it remains pre-production until
+the bounded qualification run is accepted. `flysystem`, remote or
 shared storage, and `memory` belong to experimental or test-only profiles until the exact deployment is qualified. See the canonical
 [storage support matrix](storage-backends.md).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S3_STORAGE_DRIVER` | `filesystem` | Storage backend: `filesystem`, `aws-s3`, `flysystem`, or `memory`. Only `filesystem` belongs to the current production target. |
+| `S3_STORAGE_DRIVER` | `filesystem` | Storage backend: `filesystem`, `aws-s3`, `flysystem`, or `memory`. `aws-s3` is fence-complete with PostgreSQL but is not production-qualified until its release run succeeds. |
 | `S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS` | `false` | **Unsafe test-only override:** permits API startup with Flysystem or unverified custom storage tiers. Never enable in production; a remote late write may recreate an abandoned path after cleanup. Laravel uses `allow_unfenced_storage_for_tests`; Symfony uses `server.allow_unfenced_storage_for_tests`. |
 | `S3_STORAGE_TEMP_DIR` | system temp directory | Local staging directory for Flysystem transfers |
 | `S3_STORAGE_TEMP_BUDGET` | `10737418240` (10 GiB) | Maximum concurrent temporary bytes for direct and worker-backed Flysystem staging, including PUT, UploadPart, CopyObject, and multipart assembly, among processes sharing `S3_STORAGE_TEMP_DIR`; writes that exceed the budget receive 503 SlowDown. GET streams directly from a read worker. Worker mode may need space for both its API and worker copy. |
@@ -89,7 +90,7 @@ shared storage, and `memory` belong to experimental or test-only profiles until 
 | `S3_AWS_REGION` | - | Exact known commercial AWS region required by `aws-s3`; GovCloud, China, ISO, and unknown partitions are rejected. |
 | `S3_AWS_EXPECTED_OWNER_ID` | - | Required 12-digit expected AWS account ID. It is sent as `ExpectedBucketOwner` on every admission probe and is never included in diagnostics. |
 | `S3_AWS_DATA_PREFIX` | - | Required canonical data prefix for the explicit provider profile. |
-| `S3_AWS_RESERVED_PREFIX` | - | Required canonical future attempt/seal prefix; it must not overlap the data prefix or another tier namespace. |
+| `S3_AWS_RESERVED_PREFIX` | - | Required canonical attempt/seal prefix; it must not overlap the data prefix or another tier namespace. |
 | `S3_AWS_CONNECT_TIMEOUT_SECONDS` | `5` | Per-request AWS admission connection timeout, constrained to 1–30 seconds. |
 | `S3_AWS_READ_TIMEOUT_SECONDS` | `15` | Per-request AWS admission read timeout, constrained to 1–120 seconds and no longer than the request timeout. |
 | `S3_AWS_REQUEST_TIMEOUT_SECONDS` | `20` | Timeout applied independently to each admission request (HeadBucket and GetBucketVersioning), not to the whole admission sequence; constrained to 1–120 seconds and no shorter than connect/read timeouts. |

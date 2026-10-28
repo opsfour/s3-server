@@ -135,6 +135,24 @@ final readonly class AwsS3ProviderAdmission
         );
     }
 
+    public function withQualification(bool $fenceComplete, bool $productionQualified = false): self
+    {
+        if (! $this->providerAdmitted || ($productionQualified && ! $fenceComplete)) {
+            throw new \LogicException('AWS provider qualification requires an admitted fence-complete profile.');
+        }
+
+        return new self(
+            configuredRegion: $this->configuredRegion,
+            configurationValid: $this->configurationValid,
+            ownerCheckPassed: $this->ownerCheckPassed,
+            versioningState: $this->versioningState,
+            providerAdmitted: true,
+            reason: $this->reason,
+            fenceComplete: $fenceComplete,
+            productionQualified: $productionQualified,
+        );
+    }
+
     public function providerType(): string
     {
         return $this->providerType;

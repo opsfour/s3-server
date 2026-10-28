@@ -17,9 +17,11 @@ use Psr\Log\LoggerInterface;
 use Psr\Http\Message\StreamInterface;
 
 /** Provider identity plus narrowly scoped ordinary-object fence capabilities. */
-final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissionCapability
+final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissionCapability
 {
     private object $garbageDeletionAuthority;
+
+    private ?AwsS3OperationalState $operationalState = null;
 
     public function __construct(
         private AwsS3ProviderAdmission $admission,
@@ -50,6 +52,29 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
         return $this->binding?->profile === $profile;
     }
 
+    public function validatedBinding(): ?AwsS3ProviderValidatedBinding
+    {
+        return $this->binding;
+    }
+
+    public function attachOperationalState(AwsS3OperationalState $state): void
+    {
+        if ($this->operationalState !== null) {
+            throw new \LogicException('AWS operational state is already attached.');
+        }
+        $profile = $this->admittedProfile() ?? throw $this->unavailable();
+        if (! hash_equals($state->fingerprint(), self::fingerprint($profile))) {
+            throw new \LogicException('AWS operational state is bound to another profile.');
+        }
+        $this->operationalState = $state;
+        $this->admission = $this->admission->withQualification(true);
+    }
+
+    public function operationalState(): ?AwsS3OperationalState
+    {
+        return $this->operationalState;
+    }
+
     /** Narrow ordinary-write capability; StorageBackend operations remain closed. */
     public function createForegroundObjectWriter(
         ObjectWriteIntentStore $intents,
@@ -78,6 +103,7 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             new LocalScratchStager($scratch, $budgetBytes),
             $storageTier,
             $renewIntervalSeconds,
+            $this->operationalState,
         );
     }
 
@@ -100,6 +126,7 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             $logger,
             $metrics,
             $claimLeaseSeconds,
+            $this->operationalState,
         );
     }
 
@@ -318,6 +345,7 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
     /** Provider mutation is private so it cannot run outside claim coordination. */
     private function deleteClaimedGarbagePath(string $path, string $bucket, string $tier, string $ownerId): void
     {
+        $this->operationalState?->assertMutationReady();
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted || $ownerId === '') {
@@ -489,5 +517,18 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
     private function unavailable(): \LogicException
     {
         return new \LogicException('AWS S3 storage operations are unavailable until the provider write fence is complete.');
+    }
+
+    private static function fingerprint(AwsS3ProviderProfile $profile): string
+    {
+        return hash('sha256', json_encode([
+            'provider' => AwsS3ProviderAdmission::PROVIDER_TYPE,
+            'bucket' => $profile->bucket,
+            'region' => $profile->region,
+            'owner' => $profile->expectedOwnerId,
+            'data' => $profile->dataPrefix,
+            'reserved' => $profile->reservedPrefix,
+            'timeouts' => [$profile->connectTimeoutSeconds, $profile->readTimeoutSeconds, $profile->requestTimeoutSeconds],
+        ], JSON_THROW_ON_ERROR));
     }
 }

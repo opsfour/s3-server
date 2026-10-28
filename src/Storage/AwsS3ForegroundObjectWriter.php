@@ -23,6 +23,7 @@ final readonly class AwsS3ForegroundObjectWriter
         private LocalScratchStager $stager,
         private string $storageTier,
         private float $renewIntervalSeconds = 60.0,
+        private ?AwsS3OperationalState $operationalState = null,
     ) {
         if ($storageTier === ''
             || ! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0.0
@@ -174,6 +175,7 @@ final readonly class AwsS3ForegroundObjectWriter
         StorageWriteResult $result,
     ): AwsS3ForegroundObjectOutcome {
         self::assertMultipartCompletionScope($key, $uploadId);
+        $this->operationalState?->assertMutationReady();
         $this->heartbeat($reservation, true);
         $current = $reservation->current($this->authority);
         if (! hash_equals($current->storagePath, $result->path)) {
@@ -368,6 +370,7 @@ final readonly class AwsS3ForegroundObjectWriter
         string $key,
         AwsS3ForegroundObjectStage $stage,
     ): AwsS3ForegroundObjectOutcome {
+        $this->operationalState?->assertMutationReady();
         if ($stage->reservation($this->authority) !== $reservation) {
             throw new \InvalidArgumentException('AWS foreground stage does not match its reservation.');
         }

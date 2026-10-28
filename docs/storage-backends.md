@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission and fenced foreground, background, access-log, and exact garbage paths implemented; full writer fence incomplete / not production-qualified | Read-only admission and internal attempt/garbage capabilities; API startup always fails closed |
+| Explicit AWS S3 provider (`aws-s3`) | Configuration-valid and fence-complete with PostgreSQL; not production-qualified until the bounded release run passes | Shared revalidation/readiness, fenced writers, reconciliation, exact garbage, and bounded operations telemetry |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -281,7 +281,8 @@ multipart recovery, physical bucket creation, and generic backend/Flysystem muta
 have no physical AWS mutator registration. Unknown or unsupported registrations
 fail the inventory's AWS capability check. Generic `StorageBackend` AWS write,
 copy, move, multipart abort, and delete methods remain closed. API startup
-refuses the profile even when the unsafe Flysystem test override is enabled.
+requires the exact admitted binding, complete inventory, and PostgreSQL; the
+unsafe Flysystem test override never bypasses these checks.
 
 Every AWS reservation charges fixed open-attempt and permanent-seal capacity
 before body ingestion: 4,096 of each per owner and 1,000,000 of each globally.
@@ -294,9 +295,10 @@ seal capacity remains charged permanently. Generic 404/409/412 responses,
 timeouts, malformed bodies, and foreign markers never retire uncertainty.
 This release exposes no seal deletion or break-glass removal operation.
 
-Later qualification stories must close the unsupported maintenance paths and
-complete health and release gates before this profile
-can be described as fence-complete or production-qualified.
+The profile reports configuration validity, writer-fence completeness, and
+production qualification independently. It is fence-complete here and always
+reports `production_qualified=false`; only the bounded release run may change
+that release decision.
 
 ## Flysystem
 

@@ -9,24 +9,19 @@ use GuzzleHttp\Psr7\Response;
 use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
-use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
-use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\AwsS3ProviderStartupException;
 use OpsFour\S3Server\Runtime\ServeFailureMessage;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
-use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ProviderAdmission;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
-use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageTier;
-use OpsFour\S3Server\Storage\TierTransitionExecutor;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use PHPUnit\Framework\TestCase;
@@ -116,7 +111,7 @@ final class AwsS3ProviderStartupGuardTest extends TestCase
         $method->invoke(new S3ServerRuntimeFactory(), $tiers);
     }
 
-    public function test_mixed_local_default_and_aws_archive_wires_one_background_capability_to_both_executors(): void
+    public function test_mixed_local_default_and_aws_archive_rejects_non_postgres_metadata(): void
     {
         $oldAccessKey = getenv('AWS_ACCESS_KEY_ID');
         $oldSecretKey = getenv('AWS_SECRET_ACCESS_KEY');
@@ -148,31 +143,20 @@ final class AwsS3ProviderStartupGuardTest extends TestCase
         $runtime = null;
 
         try {
-            $runtime = (new S3ServerRuntimeFactory())->create(
-                config: new S3ServerConfig(storagePath: $localRoot),
-                metadata: $metadata,
-                storage: $local,
-                credentialProvider: new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
-                logger: new NullLogger(),
-                metrics: new MetricsCollector(),
-                storageTiers: $tiers,
-            );
-            $server = $runtime->server;
-            $background = (new \ReflectionProperty($server, 'awsBackgroundWriter'))->getValue($server);
-            self::assertInstanceOf(AwsS3FencedBackgroundObjectWriter::class, $background);
-
-            $components = (new \ReflectionMethod($server, 'prepareBackgroundComponents'))->invoke($server);
-            self::assertIsArray($components);
-            $transition = $components['transitionExecutor'] ?? null;
-            $restore = $components['restoreExecutor'] ?? null;
-            self::assertInstanceOf(TierTransitionExecutor::class, $transition);
-            self::assertInstanceOf(RestoreExecutor::class, $restore);
-            self::assertSame($background, (new \ReflectionProperty($transition, 'awsFencedWriter'))->getValue($transition));
-            self::assertSame($background, (new \ReflectionProperty($restore, 'awsFencedWriter'))->getValue($restore));
-
-            $put = $server->getHandlerRegistry()->get(S3Operation::PutObject);
-            self::assertInstanceOf(PutObjectHandler::class, $put);
-            self::assertNull((new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put));
+            try {
+                $runtime = (new S3ServerRuntimeFactory())->create(
+                    config: new S3ServerConfig(storagePath: $localRoot),
+                    metadata: $metadata,
+                    storage: $local,
+                    credentialProvider: new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+                    logger: new NullLogger(),
+                    metrics: new MetricsCollector(),
+                    storageTiers: $tiers,
+                );
+                self::fail('An AWS tier must not inherit qualification from SQLite metadata.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('The qualified AWS S3 profile requires PostgreSQL metadata.', $error->getMessage());
+            }
         } finally {
             $runtime?->stop();
             putenv($oldAccessKey === false ? 'AWS_ACCESS_KEY_ID' : 'AWS_ACCESS_KEY_ID=' . $oldAccessKey);

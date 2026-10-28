@@ -17,13 +17,11 @@ preserve the signed `Host` header exactly. Additional processes, remote storage,
 shared filesystems, and multiple hosts are separate experimental profiles; see
 the [roadmap](production-feature-roadmap.md).
 
-The explicit `aws-s3` driver now includes ordinary, multipart,
-lifecycle-transition, and restore-copy publication fences plus ambiguous-write
-same-key sealing. It supports exactly one admitted tier binding and fails closed
-if multiple bindings are present, but it always refuses API startup because
-access-log, garbage-deletion, remaining internal-writer, and release
-qualification coverage remains incomplete. Do
-not use an admitted report or a healthy reconciler as production qualification.
+The explicit `aws-s3` driver includes the complete registered writer fence,
+ambiguous-write sealing, exact garbage deletion, and shared operational state.
+It may start with PostgreSQL when provider admission and the independent writer
+inventory pass. This is fence-complete, not production-qualified: do not release
+the profile until the separate bounded real-AWS qualification run succeeds.
 
 ## Current One-Process Deployment
 
@@ -65,6 +63,70 @@ Multiple API processes, multiple hosts, shared filesystems, and remote storage
 are later experimental profiles. They are not alternative deployment recipes
 for the current release target; see the
 [production feature roadmap](production-feature-roadmap.md).
+
+## AWS S3 fence-complete operations
+
+Use `deploy/aws-s3-profile.cloudformation.yaml` only for a fresh isolated
+profile. The stack creates one new bucket, its policy, and one runtime role; it
+does not discover or update existing buckets, roles, keys, lifecycle rules, or
+unrelated resources. Review the exact trust principal before deployment. The
+runtime role is limited to admission reads and object operations beneath the
+two configured prefixes. The bucket policy denies plaintext transport and any
+versioning change. Obtain the expected owner separately from the authenticated
+deployment account; do not copy it into dashboards or support bundles.
+
+The process must obtain short-lived credentials through the AWS SDK default
+chain. Do not set static keys in the server configuration. For rotation, drain
+new traffic, rotate the upstream role/session source, wait for in-flight
+requests to finish, restart nodes one at a time, and require the same opaque
+profile fingerprint plus `mutation_ready=true` before restoring traffic.
+Expired or revoked credentials leave `/.live` at 200, change `/.health` to 503,
+and close new provider dispatch and worker claims while durable rows remain.
+
+Provision the process temporary volume for the configured maximum object size
+times admitted concurrent foreground transformations, plus browser POST spool
+and operating-system headroom. Staging contains package ciphertext for SSE
+paths, is mode 0700, and must not be backed up. Start with conservative request,
+staging, and worker concurrency. The profile uses zero blind SDK retries and
+bounded connect/read/request timeouts; increase a bound only with evidence that
+the resulting intent backlog and temporary-space cost remain acceptable.
+
+Scrape `/.metrics` behind its bearer-token boundary. Alert on any non-healthy
+AWS reason, integrity conflict, collector retry growth, oldest recovery age at
+15 minutes (three normal 300-second claim leases), 80% global capacity, 80%
+maximum-per-owner capacity, and hard-capacity rejection. The series contain
+only fixed categories, aggregates, maximum-per-owner values, and the opaque
+profile fingerprint. They never contain bucket, prefix, key, path, owner,
+account, credential, or attempt labels. Budget for S3 request charges from
+readiness revalidation, write attempts, same-key seal verification, and cleanup;
+also budget retained seals and PostgreSQL recovery rows as permanent control
+state.
+
+For planned maintenance, stop admission at the load balancer, wait for active
+requests and staging to drain, then let collectors reduce open and ambiguous
+rows. Do not wait for permanent seals to reach zero. Stop API/worker processes
+before taking a matched PostgreSQL snapshot. S3 object bytes and seals must be
+retained with the database snapshot. Restore PostgreSQL first into an isolated
+environment, restore the exact profile configuration and IAM role, keep traffic
+closed, run metadata migration/audit, then allow reconciliation to settle before
+readiness and traffic are enabled. Never restore metadata without the matching
+bucket generation and retained control objects.
+
+After a crash or provider outage, keep the profile drained while credentials,
+region, ownership, versioning, and fingerprint are checked. Resume collectors;
+do not replay armed writes or delete ambiguous attempts. Reconciliation either
+proves absence or installs/verifies the deterministic same-key seal. If an
+integrity conflict remains, preserve the database row, provider object, logs,
+and immutable artifact identifiers for investigation.
+
+Seal removal is a manual audited break-glass action only. It requires an
+approved incident, a stopped/drained profile, two-person review, proof that no
+delayed create-only request can still arrive, a retained export of the exact SQL
+row and provider evidence, and a rollback plan. Remove the provider seal first
+only under that evidence, then update metadata in one reviewed PostgreSQL
+transaction, record the actor/reason/time/artifact hashes outside the public
+repository, and rerun admission, audit, and reconciliation before reopening.
+There is deliberately no automatic or server API seal-deletion path.
 
 ## TLS
 

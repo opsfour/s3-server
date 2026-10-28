@@ -13,6 +13,7 @@ use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Storage\AwsS3OperationalState;
 
 final class MetricsHandler implements RequestHandler
 {
@@ -20,6 +21,7 @@ final class MetricsHandler implements RequestHandler
         private readonly MetricsCollector $metrics,
         private readonly ?MetadataStore $metadata = null,
         private readonly ?string $bearerToken = null,
+        private readonly ?AwsS3OperationalState $awsOperationalState = null,
     ) {
         if ($bearerToken !== null && trim($bearerToken) === '') {
             throw new \InvalidArgumentException('Metrics bearer token must not be empty when configured.');
@@ -76,6 +78,9 @@ final class MetricsHandler implements RequestHandler
             $this->refreshMultipartCompletionCapacity();
             $this->refreshWriteIntentCapacity();
             $this->refreshStorageCleanupCapacity();
+        }
+        if ($this->awsOperationalState !== null) {
+            $this->metrics->setAwsOperationalSnapshot($this->awsOperationalState->snapshot());
         }
 
         return $this->response();

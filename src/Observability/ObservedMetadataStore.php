@@ -36,8 +36,9 @@ use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
+use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 
-final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore
+final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
 {
     public function __construct(
         private MetadataStore $inner,
@@ -982,6 +983,15 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         return $this->inner instanceof StorageCleanupCapacityReader
             ? $this->observe(__FUNCTION__, fn() => $this->inner->getStorageCleanupCount())
             : null;
+    }
+
+    public function getAwsS3OperationalSummary(): array
+    {
+        if (! $this->inner instanceof AwsS3OperationalSummaryReader) {
+            throw new \RuntimeException('AWS operational summary requires PostgreSQL metadata.');
+        }
+
+        return $this->observe(__FUNCTION__, fn() => $this->inner->getAwsS3OperationalSummary());
     }
 
     public function updateNotificationStatus(int $id, string $status, ?string $error = null, ?float $nextAttemptAt = null, bool $incrementAttempts = true, ?float $expectedLeaseExpiresAt = null): bool

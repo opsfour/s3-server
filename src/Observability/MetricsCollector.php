@@ -87,6 +87,9 @@ final class MetricsCollector
     /** @var array<string, int> */
     private array $awsWriteReconciliations = [];
 
+    /** @var array<string, bool|float|int|string>|null */
+    private ?array $awsOperationalSnapshot = null;
+
     /** @var array<string, int> */
     private array $notificationDeliveryTotals = [];
 
@@ -315,6 +318,18 @@ final class MetricsCollector
         }
         $key = $this->key(['status' => $status]);
         $this->awsWriteReconciliations[$key] = ($this->awsWriteReconciliations[$key] ?? 0) + 1;
+    }
+
+    /** @param array<string, bool|float|int|string> $snapshot */
+    public function setAwsOperationalSnapshot(array $snapshot): void
+    {
+        $reason = $snapshot['reason'] ?? null;
+        $fingerprint = $snapshot['fingerprint'] ?? null;
+        if (! is_string($reason) || ! in_array($reason, ['healthy', 'provider', 'credentials', 'configuration', 'capacity', 'collector', 'integrity'], true)
+            || ! is_string($fingerprint) || preg_match('/^[a-f0-9]{64}$/D', $fingerprint) !== 1) {
+            throw new \UnexpectedValueException('AWS operational snapshot is not bounded or opaque.');
+        }
+        $this->awsOperationalSnapshot = $snapshot;
     }
 
     public function recordNotificationDelivery(string $status, int $count = 1): void
@@ -583,6 +598,35 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_aws_write_reconciliations_total counter';
         foreach ($this->awsWriteReconciliations as $key => $value) {
             $lines[] = 's3_server_aws_write_reconciliations_total{' . $key . '} ' . $value;
+        }
+        $lines[] = '# HELP s3_server_aws_profile_state Secret-free AWS profile state by fixed reason category.';
+        $lines[] = '# TYPE s3_server_aws_profile_state gauge';
+        $lines[] = '# HELP s3_server_aws_profile_qualification AWS configuration, fence and production qualification states.';
+        $lines[] = '# TYPE s3_server_aws_profile_qualification gauge';
+        $lines[] = '# HELP s3_server_aws_recovery_items Bounded retained AWS recovery rows by fixed kind.';
+        $lines[] = '# TYPE s3_server_aws_recovery_items gauge';
+        $lines[] = '# HELP s3_server_aws_recovery_oldest_age_seconds Oldest retained AWS recovery row age using database time.';
+        $lines[] = '# TYPE s3_server_aws_recovery_oldest_age_seconds gauge';
+        $lines[] = '# HELP s3_server_aws_recovery_max_owner_items Maximum retained rows for any owner, without identity labels.';
+        $lines[] = '# TYPE s3_server_aws_recovery_max_owner_items gauge';
+        if ($this->awsOperationalSnapshot !== null) {
+            $snapshot = $this->awsOperationalSnapshot;
+            $fingerprint = (string) $snapshot['fingerprint'];
+            foreach (['healthy', 'provider', 'credentials', 'configuration', 'capacity', 'collector', 'integrity'] as $reason) {
+                $lines[] = 's3_server_aws_profile_state{fingerprint="' . $fingerprint . '",reason="' . $reason . '"} '
+                    . ($snapshot['reason'] === $reason ? '1' : '0');
+            }
+            foreach (['configuration_valid', 'provider_admitted', 'fence_complete', 'production_qualified', 'mutation_ready'] as $state) {
+                $lines[] = 's3_server_aws_profile_qualification{state="' . $state . '"} ' . ((bool) $snapshot[$state] ? '1' : '0');
+            }
+            foreach (['open', 'ambiguous', 'seal_reserved', 'sealed', 'multipart', 'part', 'cleanup', 'failures'] as $kind) {
+                $lines[] = 's3_server_aws_recovery_items{kind="' . $kind . '"} ' . (int) $snapshot[$kind];
+            }
+            $lines[] = 's3_server_aws_recovery_oldest_age_seconds ' . self::formatFloat((float) $snapshot['oldest_age_seconds']);
+            foreach (['open', 'sealed', 'part'] as $kind) {
+                $lines[] = 's3_server_aws_recovery_max_owner_items{kind="' . $kind . '"} '
+                    . (int) $snapshot['max_owner_' . $kind];
+            }
         }
 
         $lines[] = '# HELP s3_server_notification_deliveries_total Total notification delivery outcomes by status.';

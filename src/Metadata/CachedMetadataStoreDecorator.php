@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore
+final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -1067,6 +1067,15 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         return $this->inner instanceof StorageCleanupCapacityReader
             ? $this->inner->getStorageCleanupCount()
             : null;
+    }
+
+    public function getAwsS3OperationalSummary(): array
+    {
+        if (! $this->inner instanceof AwsS3OperationalSummaryReader) {
+            throw new \RuntimeException('AWS operational summary requires PostgreSQL metadata.');
+        }
+
+        return $this->inner->getAwsS3OperationalSummary();
     }
 
     public function updateNotificationStatus(

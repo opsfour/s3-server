@@ -418,7 +418,7 @@ final class UploadPartHandler implements RequestHandler
                 );
                 throw $error;
             } catch (\Throwable $error) {
-                if ($awsReservation !== null && $awsDispatchToken === null) {
+                if ($awsReservation !== null) {
                     $activeAwsObjectWriter?->retireBeforeDispatch($awsReservation);
                 }
                 throw $error;

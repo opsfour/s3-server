@@ -18,6 +18,7 @@ use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
 use OpsFour\S3Server\Metadata\FencedQueueStore;
 use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
+use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
@@ -61,6 +62,7 @@ final class ExternalGarbageAtomicityTest extends TestCase
         putenv('AWS_SECRET_ACCESS_KEY=test');
         $metadata = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
         self::assertInstanceOf(AwsS3GarbageClaimStore::class, $metadata);
+        self::assertInstanceOf(StorageGarbageLeaseStore::class, $metadata);
         $pool = new PostgresConnectionPool(PostgresConfig::fromString($dsn));
         $suffix = bin2hex(random_bytes(6));
         $bucket = 'aws-garbage-success-' . $suffix;

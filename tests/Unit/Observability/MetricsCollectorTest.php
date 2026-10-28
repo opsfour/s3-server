@@ -84,6 +84,40 @@ final class MetricsCollectorTest extends TestCase
         self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_reconciliations_total\{[^}]*,(?:owner|key|path)=/m', $rendered);
     }
 
+    public function test_aws_operational_metrics_are_fixed_cardinality_and_identity_free(): void
+    {
+        $metrics = new MetricsCollector();
+        $metrics->setAwsOperationalSnapshot([
+            'provider_type' => 'aws-s3',
+            'fingerprint' => str_repeat('a', 64),
+            'configuration_valid' => true,
+            'provider_admitted' => true,
+            'fence_complete' => true,
+            'production_qualified' => false,
+            'mutation_ready' => true,
+            'reason' => 'healthy',
+            'open' => 3,
+            'ambiguous' => 2,
+            'seal_reserved' => 5,
+            'sealed' => 4,
+            'multipart' => 1,
+            'part' => 7,
+            'cleanup' => 8,
+            'failures' => 1,
+            'oldest_age_seconds' => 12.5,
+            'max_owner_open' => 2,
+            'max_owner_sealed' => 3,
+            'max_owner_part' => 4,
+        ]);
+
+        $rendered = $metrics->renderPrometheus();
+        self::assertSame(7, preg_match_all('/^s3_server_aws_profile_state\{/m', $rendered));
+        self::assertStringContainsString('s3_server_aws_profile_qualification{state="production_qualified"} 0', $rendered);
+        self::assertStringContainsString('s3_server_aws_recovery_oldest_age_seconds 12.5', $rendered);
+        self::assertStringContainsString('s3_server_aws_recovery_max_owner_items{kind="open"} 2', $rendered);
+        self::assertDoesNotMatchRegularExpression('/(?:owner|account|bucket|key|path|attempt)="/', $rendered);
+    }
+
     public function test_request_histogram_and_backend_metrics_render(): void
     {
         $metrics = new MetricsCollector();

@@ -398,10 +398,6 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
             throw $error;
         }
-        if (! $intent instanceof MultipartWriteIntent) {
-            throw new \LogicException('Multipart completion intent construction did not finish.');
-        }
-
         // The local filesystem publisher is create-only, but the one-shot SQL
         // token must be durable before a worker can attempt its hard link.
         // Arm before starting the heartbeat so its expected-lease CAS cannot

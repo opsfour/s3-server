@@ -1198,7 +1198,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 // a COMMIT error may have succeeded and must never be retried.
                 // The transaction can throw while committing after the callback
                 // has returned and changed this by-reference safety flag.
-                if (/* @phpstan-ignore booleanOr.leftAlwaysFalse */ $callbackCompleted || ! self::isSqliteBusy($e) || $retries >= 5) {
+                if ($callbackCompleted || ! self::isSqliteBusy($e) || $retries >= 5) {
                     throw $e;
                 }
 

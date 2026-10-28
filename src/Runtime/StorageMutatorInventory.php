@@ -80,4 +80,9 @@ final class StorageMutatorInventory
             throw new \LogicException('AWS storage mutation has no registered qualified capability.');
         }
     }
+
+    public function isComplete(): bool
+    {
+        return $this->frozen && $this->registered == self::REQUIRED;
+    }
 }

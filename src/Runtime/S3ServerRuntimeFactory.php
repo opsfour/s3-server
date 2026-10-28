@@ -24,6 +24,7 @@ use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
+use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
@@ -35,6 +36,8 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -198,6 +201,24 @@ final readonly class S3ServerRuntimeFactory
             $awsBinding = $this->admittedAwsTier($storageTiers);
             if ($awsBinding !== null) {
                 [$awsTier, $awsStorage] = $awsBinding;
+                if ($config->metadataDriver !== 'postgres' || ! $metadata instanceof AwsS3OperationalSummaryReader) {
+                    throw new \RuntimeException('The qualified AWS S3 profile requires PostgreSQL metadata.');
+                }
+                $binding = $awsStorage->validatedBinding()
+                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its validated binding.');
+                $inventory = StorageMutatorInventory::forEnabledRuntime([
+                    ...HandlerRegistrar::storageMutatorRegistrations(),
+                    ...S3Server::storageMutatorRegistrations(),
+                    ...\OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler::storageMutatorRegistrations(),
+                ]);
+                $awsOperationalState = new AwsS3OperationalState(
+                    $binding,
+                    new AwsS3ProviderValidator(),
+                    $inventory,
+                    $metadata,
+                );
+                $awsStorage->attachOperationalState($awsOperationalState);
+                $server->setAwsOperationalState($awsOperationalState);
                 $awsTierWriter = $awsStorage->createForegroundObjectWriter(
                     $metadata,
                     $this->awsObjectScratchPath(),

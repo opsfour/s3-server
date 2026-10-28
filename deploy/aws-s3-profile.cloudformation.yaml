@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Isolated least-privilege AWS S3 profile for opsfour s3-server.
+
+Parameters:
+  BucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+  DataPrefix:
+    Type: String
+    Default: data
+    AllowedPattern: '^[^/].*[^/]$|^[^/]$'
+  ReservedPrefix:
+    Type: String
+    Default: .opsfour
+    AllowedPattern: '^[^/].*[^/]$|^[^/]$'
+  RuntimePrincipalArn:
+    Type: String
+    Description: Exact IAM principal allowed to assume the runtime role.
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:(role|user)/.+$'
+
+Resources:
+  ProfileBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref RuntimePrincipalArn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: isolated-s3-profile
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadBucketAdmissionState
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                Resource: !GetAtt ProfileBucket.Arn
+              - Sid: MutateOnlyIsolatedPrefixes
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${ProfileBucket.Arn}/${DataPrefix}/*'
+                  - !Sub '${ProfileBucket.Arn}/${ReservedPrefix}/*'
+
+  ProfileBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProfileBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ProfileBucket.Arn
+              - !Sub '${ProfileBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: KeepVersioningDisabled
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutBucketVersioning
+            Resource: !GetAtt ProfileBucket.Arn
+
+Outputs:
+  BucketName:
+    Description: New isolated bucket to configure in the AWS profile.
+    Value: !Ref ProfileBucket
+  RuntimeRoleArn:
+    Description: Runtime role consumed through the default AWS credential chain.
+    Value: !GetAtt RuntimeRole.Arn
+  DataPrefix:
+    Value: !Ref DataPrefix
+  ReservedPrefix:
+    Value: !Ref ReservedPrefix

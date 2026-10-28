@@ -73,6 +73,7 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
@@ -184,6 +185,8 @@ final class S3Server
     private ?AwsS3FencedBackgroundObjectWriter $awsBackgroundWriter = null;
 
     private ?AwsS3ForegroundObjectWriter $awsAccessLogWriter = null;
+
+    private ?AwsS3OperationalState $awsOperationalState = null;
 
     private ?DeferredCancellation $backgroundCancellation = null;
 
@@ -513,6 +516,7 @@ final class S3Server
                         credentialHealthProbe: $this->authenticationCredentialProvider instanceof CredentialHealthProbe
                             ? $this->authenticationCredentialProvider
                             : null,
+                        awsOperationalState: $this->awsOperationalState,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
@@ -521,6 +525,7 @@ final class S3Server
                     $this->metrics,
                     $this->metadata,
                     $this->config->metricsBearerToken,
+                    $this->awsOperationalState,
                 )));
                 if ($this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler($this->adminCredentialApiHandler);
@@ -761,6 +766,7 @@ final class S3Server
                     try {
                         while ($this->tieringRunning) {
                             try {
+                                $this->awsOperationalState?->assertMutationReady();
                                 $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
                                 $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
                                 $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
@@ -858,6 +864,15 @@ final class S3Server
             throw new \LogicException('AWS object intent collector is already configured.');
         }
         $this->awsObjectIntentCollector = $collector;
+    }
+
+    public function setAwsOperationalState(AwsS3OperationalState $state): void
+    {
+        $this->assertConfigurationMutable('AWS operational state');
+        if ($this->awsOperationalState !== null) {
+            throw new \LogicException('AWS operational state is already configured.');
+        }
+        $this->awsOperationalState = $state;
     }
 
     public function setAwsBackgroundObjectWriter(AwsS3FencedBackgroundObjectWriter $writer): void

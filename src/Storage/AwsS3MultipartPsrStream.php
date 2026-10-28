@@ -79,7 +79,7 @@ final class AwsS3MultipartPsrStream implements StreamInterface
         return null;
     }
 
-    public function getSize(): ?int
+    public function getSize(): int
     {
         return $this->size;
     }
