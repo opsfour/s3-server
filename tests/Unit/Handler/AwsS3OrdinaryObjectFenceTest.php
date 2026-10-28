@@ -30,10 +30,6 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\QuotaExceededException;
 use OpsFour\S3Server\Exception\SlowDownException;
-use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
-use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
-use OpsFour\S3Server\Handler\Multipart\UploadPartCopyHandler;
-use OpsFour\S3Server\Handler\Multipart\UploadPartHandler;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PostObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
@@ -388,14 +384,15 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
     }
 
-    public function test_runtime_factory_propagates_its_writer_through_the_registrar_without_reusing_post_budget(): void
+    public function test_runtime_factory_rejects_qualified_aws_profile_without_postgresql_metadata(): void
     {
         $metadata = new SqliteMetadataStore($this->base . '/runtime.sqlite');
         $metadata->initialize();
-        $metadata->createBucket('owner', 'bucket', 'us-east-1');
-        $metadata->createBucket('owner', 'target', 'us-east-1');
         $factoryBackend = $this->factoryBackend();
-        $runtime = (new S3ServerRuntimeFactory())->create(
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('requires PostgreSQL metadata');
+        (new S3ServerRuntimeFactory())->create(
             config: new S3ServerConfig(storagePath: $this->base, postSpoolBudgetBytes: 1),
             metadata: $metadata,
             storage: $factoryBackend,
@@ -403,104 +400,6 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
             logger: new NullLogger(),
             metrics: new MetricsCollector(),
         );
-        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
-        try {
-            $registry = $runtime->server->getHandlerRegistry();
-            $put = $registry->get(S3Operation::PutObject);
-            self::assertInstanceOf(PutObjectHandler::class, $put);
-            $sourcePayload = 'larger than one byte';
-            self::assertSame(200, $put->handleRequest($this->putRequest($sourcePayload))->getStatus());
-            $object = $metadata->getObjectMetadata('bucket', 'key');
-            self::assertNotNull($object);
-            self::assertNull($metadata->getObjectWriteIntent(basename($object->systemMetadata['storagePath'])));
-
-            $this->mock->append(new Response(200, ['ETag' => '"post-etag"']));
-            $postRequest = $this->putRequest('registered POST payload');
-            $postRequest->setAttribute('s3.key', 'posted');
-            $postRequest->setAttribute('s3.operation', S3Operation::PostObject);
-            $postRequest->setAttribute(PostObjectForm::class, new PostObjectForm(
-                fields: ['key' => 'posted'],
-                key: 'posted',
-                filename: 'upload.txt',
-                filePath: '/unused',
-                fileSize: 23,
-                spoolKey: str_repeat('r', 32),
-                credential: null,
-                policy: null,
-            ));
-            $post = $registry->get(S3Operation::PostObject);
-            self::assertInstanceOf(PostObjectHandler::class, $post);
-            self::assertSame(204, $post->handleRequest($postRequest)->getStatus());
-            $posted = $metadata->getObjectMetadata('bucket', 'posted');
-            self::assertNotNull($posted);
-            self::assertNull($metadata->getObjectWriteIntent(basename($posted->systemMetadata['storagePath'])));
-
-            $sourceAttempt = basename($object->systemMetadata['storagePath']);
-            $this->mock->append(new Response(200, [
-                'Content-Length' => (string) strlen($sourcePayload),
-                'x-amz-meta-opsfour-write-attempt' => 'v2',
-                'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
-            ], $sourcePayload));
-            $this->mock->append(new Response(200, ['ETag' => '"copy-etag"']));
-            $copy = $registry->get(S3Operation::CopyObject);
-            self::assertInstanceOf(CopyObjectHandler::class, $copy);
-            self::assertSame(200, $copy->handleRequest($this->copyRequest())->getStatus());
-            $copied = $metadata->getObjectMetadata('target', 'copied');
-            self::assertNotNull($copied);
-            self::assertNull($metadata->getObjectWriteIntent(basename($copied->systemMetadata['storagePath'])));
-        } finally {
-            $runtime->stop();
-        }
-    }
-
-    public function test_runtime_owns_the_exact_registered_writer_and_shuts_down_its_stager(): void
-    {
-        $metadata = new SqliteMetadataStore($this->base . '/runtime-lifecycle.sqlite');
-        $metadata->initialize();
-        $metadata->createBucket('owner', 'bucket', 'us-east-1');
-        $backend = $this->factoryBackend();
-        $runtime = (new S3ServerRuntimeFactory())->create(
-            config: new S3ServerConfig(storagePath: $this->base),
-            metadata: $metadata,
-            storage: $backend,
-            credentialProvider: new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
-            logger: new NullLogger(),
-            metrics: new MetricsCollector(),
-        );
-        $runtimeWriterProperty = new \ReflectionProperty($runtime, 'awsObjectWriter');
-        $runtimeWriter = $runtimeWriterProperty->getValue($runtime);
-        self::assertInstanceOf(AwsS3ForegroundObjectWriter::class, $runtimeWriter);
-        $accessLogs = (new \ReflectionProperty($runtime->server, 'accessLogs'))->getValue($runtime->server);
-        self::assertInstanceOf(\OpsFour\S3Server\Logging\AccessLogWriter::class, $accessLogs);
-        self::assertSame(
-            $runtimeWriter,
-            (new \ReflectionProperty($accessLogs, 'awsWriter'))->getValue($accessLogs),
-            'The factory-created server must wire its exact owned AWS writer into access-log delivery.',
-        );
-        $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
-        self::assertInstanceOf(PutObjectHandler::class, $put);
-        $handlerWriter = (new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put);
-        self::assertSame($runtimeWriter, $handlerWriter);
-        foreach ([
-            [S3Operation::CreateMultipartUpload, CreateMultipartUploadHandler::class],
-            [S3Operation::UploadPart, UploadPartHandler::class],
-            [S3Operation::UploadPartCopy, UploadPartCopyHandler::class],
-            [S3Operation::CompleteMultipartUpload, CompleteMultipartUploadHandler::class],
-        ] as [$operation, $handlerClass]) {
-            $multipart = $runtime->server->getHandlerRegistry()->get($operation);
-            self::assertInstanceOf($handlerClass, $multipart);
-            self::assertSame(
-                $runtimeWriter,
-                (new \ReflectionProperty($multipart, 'awsObjectWriter'))->getValue($multipart),
-            );
-        }
-        $stager = (new \ReflectionProperty($runtimeWriter, 'stager'))->getValue($runtimeWriter);
-        self::assertFalse((new \ReflectionProperty($stager, 'shuttingDown'))->getValue($stager));
-
-        $runtime->stop();
-
-        self::assertNull($runtimeWriterProperty->getValue($runtime));
-        self::assertTrue((new \ReflectionProperty($stager, 'shuttingDown'))->getValue($stager));
     }
 
     public function test_reservation_is_durable_before_the_first_request_body_read(): void

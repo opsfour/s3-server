@@ -18,11 +18,17 @@ final class AwsS3ProfileTemplateTest extends TestCase
         self::assertSame(1, preg_match_all('/^    Type: AWS::IAM::Role$/m', $template));
         self::assertStringContainsString('aws:SecureTransport: false', $template);
         self::assertStringContainsString('s3:PutBucketVersioning', $template);
+        self::assertStringContainsString('s3:AbortMultipartUpload', $template);
+        self::assertStringContainsString('KeepLifecycleConfigurationAbsent', $template);
+        self::assertStringContainsString('s3:PutLifecycleConfiguration', $template);
+        self::assertStringContainsString('ExpectedOwnerAccountId:', $template);
+        self::assertStringContainsString('Value: !Ref AWS::AccountId', $template);
         self::assertStringContainsString('${DataPrefix}/*', $template);
         self::assertStringContainsString('${ReservedPrefix}/*', $template);
         self::assertStringContainsString('DeletionPolicy: Retain', $template);
         self::assertStringNotContainsString('AccessKey', $template);
         self::assertStringNotContainsString('Secret', $template);
         self::assertStringNotContainsString('AWS::S3::AccessPoint', $template);
+        self::assertStringNotContainsString('LifecycleConfiguration:', $template);
     }
 }

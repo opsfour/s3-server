@@ -29,6 +29,8 @@ final class AwsS3OperationalState
 
     private bool $collectorHealthy = true;
 
+    private bool $summaryHealthy = true;
+
     private bool $integrityHealthy = true;
 
     private bool $startupValidated = false;
@@ -41,6 +43,7 @@ final class AwsS3OperationalState
         private readonly AwsS3ProviderValidator $validator,
         private readonly StorageMutatorInventory $inventory,
         private readonly AwsS3OperationalSummaryReader $metadata,
+        private readonly string $storageTier,
         private readonly float $revalidationIntervalSeconds = 30.0,
     ) {
         if ($binding->profile === null || $binding->client === null || ! $binding->admission->providerAdmitted) {
@@ -48,6 +51,9 @@ final class AwsS3OperationalState
         }
         if (! $inventory->isComplete()) {
             throw new \InvalidArgumentException('AWS operational state requires the frozen complete writer inventory.');
+        }
+        if ($storageTier === '') {
+            throw new \InvalidArgumentException('AWS operational state requires the exact admitted storage tier.');
         }
         if (! is_finite($revalidationIntervalSeconds) || $revalidationIntervalSeconds < 0.0 || $revalidationIntervalSeconds > 300.0) {
             throw new \InvalidArgumentException('AWS operational revalidation interval must be between 0 and 300 seconds.');
@@ -77,13 +83,13 @@ final class AwsS3OperationalState
         }
         $this->admission = $this->binding->revalidate($this->validator);
         $this->lastValidationAt = $now;
-        $this->collectorHealthy = false;
-        $this->summary = null;
         try {
-            $this->summary = $this->metadata->getAwsS3OperationalSummary();
-            $this->collectorHealthy = true;
+            $this->summary = $this->metadata->getAwsS3OperationalSummary($this->storageTier);
+            $this->summaryHealthy = true;
         } catch (\Throwable) {
-            // Keep admission closed until the next bounded refresh succeeds.
+            // Preserve the last durable sample, but close foreground admission
+            // until the bounded aggregate is readable again.
+            $this->summaryHealthy = false;
         }
     }
 
@@ -106,6 +112,15 @@ final class AwsS3OperationalState
         }
     }
 
+    /** Recovery remains admitted when recovery pressure itself closes publication. */
+    public function assertRecoveryReady(): void
+    {
+        $this->revalidate();
+        if (! $this->recoveryReady()) {
+            throw new \RuntimeException('AWS provider recovery admission is closed: ' . $this->reason() . '.');
+        }
+    }
+
     public function markCollectorFailure(): void
     {
         $this->collectorHealthy = false;
@@ -123,12 +138,17 @@ final class AwsS3OperationalState
 
     public function mutationReady(): bool
     {
-        return $this->admission->providerAdmitted
-            && $this->inventory->isComplete()
+        return $this->recoveryReady()
             && $this->collectorHealthy
+            && $this->summaryHealthy
             && $this->integrityHealthy
             && ! $this->capacityExhausted()
             && ! $this->backlogStale();
+    }
+
+    public function recoveryReady(): bool
+    {
+        return $this->admission->providerAdmitted && $this->inventory->isComplete();
     }
 
     public function reason(): string
@@ -148,7 +168,7 @@ final class AwsS3OperationalState
         if (! $this->integrityHealthy) {
             return self::REASON_INTEGRITY;
         }
-        if (! $this->collectorHealthy || $this->backlogStale()) {
+        if (! $this->collectorHealthy || ! $this->summaryHealthy || $this->backlogStale()) {
             return self::REASON_COLLECTOR;
         }
         if ($this->capacityExhausted()) {
@@ -166,10 +186,16 @@ final class AwsS3OperationalState
             'provider_type' => AwsS3ProviderAdmission::PROVIDER_TYPE,
             'fingerprint' => $this->fingerprint(),
             'configuration_valid' => $this->admission->configurationValid,
+            'owner_check_passed' => $this->admission->ownerCheckPassed,
+            'versioning_state' => $this->admission->versioningState,
             'provider_admitted' => $this->admission->providerAdmitted,
             'fence_complete' => $this->inventory->isComplete(),
+            'writer_coverage_complete' => $this->inventory->isComplete(),
+            'drift_state' => $this->driftState(),
             'production_qualified' => false,
             'mutation_ready' => $this->mutationReady(),
+            'recovery_ready' => $this->recoveryReady(),
+            'reconciliation_state' => $this->reconciliationState(),
             'reason' => $this->reason(),
             'open' => (int) ($summary['open'] ?? 0),
             'ambiguous' => (int) ($summary['ambiguous'] ?? 0),
@@ -206,5 +232,39 @@ final class AwsS3OperationalState
             || (int) $summary['part'] >= MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS
             || (int) $summary['cleanup'] >= StorageCleanupCapacityReader::RECOVERY_LIMIT
         );
+    }
+
+    private function reconciliationState(): string
+    {
+        if (! $this->integrityHealthy) {
+            return 'integrity_conflict';
+        }
+        if (! $this->collectorHealthy || ! $this->summaryHealthy) {
+            return 'failed';
+        }
+        if ($this->backlogStale()) {
+            return 'stale';
+        }
+        if ($this->capacityExhausted()) {
+            return 'capacity';
+        }
+        return 'healthy';
+    }
+
+    private function driftState(): string
+    {
+        if ($this->admission->providerAdmitted) {
+            return 'clear';
+        }
+        if (in_array($this->admission->reason, [
+            AwsS3ProviderAdmission::REASON_REGION_MISMATCH,
+            AwsS3ProviderAdmission::REASON_BUCKET_TYPE_UNSUPPORTED,
+            AwsS3ProviderAdmission::REASON_VERSIONING_ENABLED,
+            AwsS3ProviderAdmission::REASON_VERSIONING_SUSPENDED,
+            AwsS3ProviderAdmission::REASON_VERSIONING_UNKNOWN,
+        ], true)) {
+            return 'detected';
+        }
+        return 'unknown';
     }
 }

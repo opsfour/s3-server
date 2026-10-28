@@ -66,6 +66,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
+                  - s3:AbortMultipartUpload
                 Resource:
                   - !Sub '${ProfileBucket.Arn}/${DataPrefix}/*'
                   - !Sub '${ProfileBucket.Arn}/${ReservedPrefix}/*'
@@ -92,6 +93,11 @@ Resources:
             Principal: '*'
             Action: s3:PutBucketVersioning
             Resource: !GetAtt ProfileBucket.Arn
+          - Sid: KeepLifecycleConfigurationAbsent
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutLifecycleConfiguration
+            Resource: !GetAtt ProfileBucket.Arn
 
 Outputs:
   BucketName:
@@ -100,6 +106,9 @@ Outputs:
   RuntimeRoleArn:
     Description: Runtime role consumed through the default AWS credential chain.
     Value: !GetAtt RuntimeRole.Arn
+  ExpectedOwnerAccountId:
+    Description: Exact account ID to configure as expected_owner_id.
+    Value: !Ref AWS::AccountId
   DataPrefix:
     Value: !Ref DataPrefix
   ReservedPrefix:

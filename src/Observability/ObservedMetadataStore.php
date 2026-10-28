@@ -985,13 +985,13 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
             : null;
     }
 
-    public function getAwsS3OperationalSummary(): array
+    public function getAwsS3OperationalSummary(string $storageTier): array
     {
         if (! $this->inner instanceof AwsS3OperationalSummaryReader) {
             throw new \RuntimeException('AWS operational summary requires PostgreSQL metadata.');
         }
 
-        return $this->observe(__FUNCTION__, fn() => $this->inner->getAwsS3OperationalSummary());
+        return $this->observe(__FUNCTION__, fn() => $this->inner->getAwsS3OperationalSummary($storageTier));
     }
 
     public function updateNotificationStatus(int $id, string $status, ?string $error = null, ?float $nextAttemptAt = null, bool $incrementAttempts = true, ?float $expectedLeaseExpiresAt = null): bool

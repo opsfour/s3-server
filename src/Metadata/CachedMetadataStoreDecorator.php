@@ -1069,13 +1069,13 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
             : null;
     }
 
-    public function getAwsS3OperationalSummary(): array
+    public function getAwsS3OperationalSummary(string $storageTier): array
     {
         if (! $this->inner instanceof AwsS3OperationalSummaryReader) {
             throw new \RuntimeException('AWS operational summary requires PostgreSQL metadata.');
         }
 
-        return $this->inner->getAwsS3OperationalSummary();
+        return $this->inner->getAwsS3OperationalSummary($storageTier);
     }
 
     public function updateNotificationStatus(

@@ -3792,15 +3792,23 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return (int) $row['retained_count'];
     }
 
-    public function getAwsS3OperationalSummary(): array
+    public function getAwsS3OperationalSummary(string $storageTier): array
     {
-        $row = $this->conn()->query(<<<'SQL'
+        if ($storageTier === '') {
+            throw new \InvalidArgumentException('AWS operational summary requires an exact storage tier.');
+        }
+        $row = $this->conn()->execute(<<<'SQL'
             WITH object_rows AS (
-                SELECT owner_id, state, seal_reserved, created_at FROM s3_object_write_intents
+                SELECT owner_id, state, seal_reserved, dispatch_id, created_at
+                FROM s3_object_write_intents WHERE storage_tier = $1
             ), part_rows AS (
-                SELECT owner_id, attempts, created_at FROM s3_storage_garbage WHERE operation = 'part_write_intent'
+                SELECT owner_id, attempts, created_at FROM s3_storage_garbage
+                WHERE storage_tier = $1 AND operation = 'part_write_intent'
             ), cleanup_rows AS (
-                SELECT attempts, created_at FROM s3_storage_garbage WHERE operation <> 'part_write_intent'
+                SELECT attempts, created_at FROM s3_storage_garbage
+                WHERE storage_tier = $1 AND operation <> 'part_write_intent'
+            ), multipart_rows AS (
+                SELECT created_at FROM s3_multipart_write_intents WHERE storage_tier = $1
             ), owner_object AS (
                 SELECT owner_id,
                        COUNT(*) FILTER (WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
@@ -3814,15 +3822,16 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     SELECT created_at FROM object_rows WHERE NOT (seal_reserved AND state = 'sealed')
                     UNION ALL SELECT created_at FROM part_rows
                     UNION ALL SELECT created_at FROM cleanup_rows
-                    UNION ALL SELECT created_at FROM s3_multipart_write_intents
+                    UNION ALL SELECT created_at FROM multipart_rows
                 ) retained
             )
             SELECT
                 (SELECT COUNT(*) FROM object_rows WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
-                (SELECT COUNT(*) FROM object_rows WHERE state = 'reconciling') AS ambiguous_count,
+                (SELECT COUNT(*) FROM object_rows
+                    WHERE state = 'reconciling' OR (state = 'active' AND dispatch_id IS NOT NULL)) AS ambiguous_count,
                 (SELECT COUNT(*) FROM object_rows WHERE seal_reserved) AS seal_reserved_count,
                 (SELECT COUNT(*) FROM object_rows WHERE seal_reserved AND state = 'sealed') AS sealed_count,
-                (SELECT COUNT(*) FROM s3_multipart_write_intents) AS multipart_count,
+                (SELECT COUNT(*) FROM multipart_rows) AS multipart_count,
                 (SELECT COUNT(*) FROM part_rows) AS part_count,
                 (SELECT COUNT(*) FROM cleanup_rows) AS cleanup_count,
                 (SELECT COUNT(*) FROM cleanup_rows WHERE attempts > 0) +
@@ -3831,7 +3840,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 COALESCE((SELECT MAX(open_count) FROM owner_object), 0) AS max_owner_open,
                 COALESCE((SELECT MAX(seal_count) FROM owner_object), 0) AS max_owner_sealed,
                 COALESCE((SELECT MAX(part_count) FROM owner_part), 0) AS max_owner_part
-            SQL)->fetchRow();
+            SQL, [$storageTier])->fetchRow();
         if ($row === null) {
             throw new \RuntimeException('AWS operational summary is unavailable.');
         }

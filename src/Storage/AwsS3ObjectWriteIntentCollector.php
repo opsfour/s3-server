@@ -39,13 +39,30 @@ final readonly class AwsS3ObjectWriteIntentCollector
         if ($limit < 1 || $limit > 1000) {
             throw new \InvalidArgumentException('AWS object collection limit must be between 1 and 1000.');
         }
-        $this->operationalState?->assertMutationReady();
+        $this->operationalState?->assertRecoveryReady();
         $cancellation?->throwIfRequested();
-        $retired = $this->metadata->retireExpiredUndispatchedObjectWriteIntents($this->tierName, $limit);
+        try {
+            $retired = $this->metadata->retireExpiredUndispatchedObjectWriteIntents($this->tierName, $limit);
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable $error) {
+            $this->metrics?->recordAwsWriteReconciliation('retry');
+            $this->operationalState?->markCollectorFailure();
+            throw $error;
+        }
         $sealed = 0;
+        $failed = false;
         for ($i = $retired; $i < $limit; ++$i) {
             $cancellation?->throwIfRequested();
-            $claims = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+            try {
+                $claims = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+            } catch (CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                $this->metrics?->recordAwsWriteReconciliation('retry');
+                $this->operationalState?->markCollectorFailure();
+                throw $error;
+            }
             if ($claims === []) {
                 break;
             }
@@ -53,7 +70,6 @@ final readonly class AwsS3ObjectWriteIntentCollector
                 $this->reconciler->reconcile($claims[0], $cancellation, $this->claimLeaseSeconds);
                 ++$sealed;
                 $this->metrics?->recordAwsWriteReconciliation('sealed');
-                $this->operationalState?->markCollectorHealthy();
             } catch (CancelledException $error) {
                 throw $error;
             } catch (AwsS3SealIntegrityException $error) {
@@ -65,6 +81,7 @@ final readonly class AwsS3ObjectWriteIntentCollector
                     'exception' => $error::class,
                 ]);
             } catch (\Throwable $error) {
+                $failed = true;
                 $this->metrics?->recordAwsWriteReconciliation('retry');
                 $this->operationalState?->markCollectorFailure();
                 $this->logger->warning('AWS write reconciliation remains unresolved.', [
@@ -73,6 +90,9 @@ final readonly class AwsS3ObjectWriteIntentCollector
                     'exception' => $error::class,
                 ]);
             }
+        }
+        if (! $failed && $sealed > 0) {
+            $this->operationalState?->markCollectorHealthy();
         }
 
         return $retired + $sealed;

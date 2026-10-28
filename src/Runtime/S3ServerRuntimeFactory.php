@@ -216,6 +216,7 @@ final readonly class S3ServerRuntimeFactory
                     new AwsS3ProviderValidator(),
                     $inventory,
                     $metadata,
+                    $awsTier->name,
                 );
                 $awsStorage->attachOperationalState($awsOperationalState);
                 $server->setAwsOperationalState($awsOperationalState);
@@ -223,6 +224,7 @@ final readonly class S3ServerRuntimeFactory
                     $metadata,
                     $this->awsObjectScratchPath(),
                     $awsTier->name,
+                    metrics: $metrics,
                 );
                 $server->setAwsObjectWriteIntentCollector($awsStorage->createObjectWriteIntentCollector(
                     $metadata,

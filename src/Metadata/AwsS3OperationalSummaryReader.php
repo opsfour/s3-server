@@ -23,5 +23,5 @@ interface AwsS3OperationalSummaryReader
      *   max_owner_part: int
      * }
      */
-    public function getAwsS3OperationalSummary(): array;
+    public function getAwsS3OperationalSummary(string $storageTier): array;
 }

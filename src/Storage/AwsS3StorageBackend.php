@@ -83,6 +83,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         int $budgetBytes = 10_737_418_240,
         float $leaseSeconds = 300.0,
         float $renewIntervalSeconds = 60.0,
+        ?MetricsCollector $metrics = null,
     ): AwsS3ForegroundObjectWriter {
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
@@ -104,6 +105,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
             $storageTier,
             $renewIntervalSeconds,
             $this->operationalState,
+            $metrics,
         );
     }
 
@@ -345,7 +347,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
     /** Provider mutation is private so it cannot run outside claim coordination. */
     private function deleteClaimedGarbagePath(string $path, string $bucket, string $tier, string $ownerId): void
     {
-        $this->operationalState?->assertMutationReady();
+        $this->operationalState?->assertRecoveryReady();
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted || $ownerId === '') {

@@ -87,6 +87,9 @@ final class MetricsCollector
     /** @var array<string, int> */
     private array $awsWriteReconciliations = [];
 
+    /** @var array<string, int> */
+    private array $awsPublicationOutcomes = [];
+
     /** @var array<string, bool|float|int|string>|null */
     private ?array $awsOperationalSnapshot = null;
 
@@ -320,13 +323,28 @@ final class MetricsCollector
         $this->awsWriteReconciliations[$key] = ($this->awsWriteReconciliations[$key] ?? 0) + 1;
     }
 
+    public function recordAwsPublicationOutcome(string $status): void
+    {
+        if (! in_array($status, ['confirmed_success', 'precondition_conflict', 'confirmed_rejection', 'ambiguous'], true)) {
+            throw new \InvalidArgumentException('Unknown AWS publication outcome.');
+        }
+        $key = $this->key(['status' => $status]);
+        $this->awsPublicationOutcomes[$key] = ($this->awsPublicationOutcomes[$key] ?? 0) + 1;
+    }
+
     /** @param array<string, bool|float|int|string> $snapshot */
     public function setAwsOperationalSnapshot(array $snapshot): void
     {
         $reason = $snapshot['reason'] ?? null;
         $fingerprint = $snapshot['fingerprint'] ?? null;
+        $versioningState = $snapshot['versioning_state'] ?? null;
+        $driftState = $snapshot['drift_state'] ?? null;
+        $reconciliationState = $snapshot['reconciliation_state'] ?? null;
         if (! is_string($reason) || ! in_array($reason, ['healthy', 'provider', 'credentials', 'configuration', 'capacity', 'collector', 'integrity'], true)
-            || ! is_string($fingerprint) || preg_match('/^[a-f0-9]{64}$/D', $fingerprint) !== 1) {
+            || ! is_string($fingerprint) || preg_match('/^[a-f0-9]{64}$/D', $fingerprint) !== 1
+            || ! is_string($versioningState) || ! in_array($versioningState, ['not-checked', 'disabled', 'enabled', 'suspended', 'unknown'], true)
+            || ! is_string($driftState) || ! in_array($driftState, ['clear', 'detected', 'unknown'], true)
+            || ! is_string($reconciliationState) || ! in_array($reconciliationState, ['healthy', 'failed', 'stale', 'capacity', 'integrity_conflict'], true)) {
             throw new \UnexpectedValueException('AWS operational snapshot is not bounded or opaque.');
         }
         $this->awsOperationalSnapshot = $snapshot;
@@ -599,16 +617,29 @@ final class MetricsCollector
         foreach ($this->awsWriteReconciliations as $key => $value) {
             $lines[] = 's3_server_aws_write_reconciliations_total{' . $key . '} ' . $value;
         }
+        $lines[] = '# HELP s3_server_aws_publication_outcomes_total Bounded AWS create-only publication outcomes.';
+        $lines[] = '# TYPE s3_server_aws_publication_outcomes_total counter';
+        foreach ($this->awsPublicationOutcomes as $key => $value) {
+            $lines[] = 's3_server_aws_publication_outcomes_total{' . $key . '} ' . $value;
+        }
         $lines[] = '# HELP s3_server_aws_profile_state Secret-free AWS profile state by fixed reason category.';
         $lines[] = '# TYPE s3_server_aws_profile_state gauge';
         $lines[] = '# HELP s3_server_aws_profile_qualification AWS configuration, fence and production qualification states.';
         $lines[] = '# TYPE s3_server_aws_profile_qualification gauge';
+        $lines[] = '# HELP s3_server_aws_profile_versioning_state Observed bucket versioning state using fixed values.';
+        $lines[] = '# TYPE s3_server_aws_profile_versioning_state gauge';
+        $lines[] = '# HELP s3_server_aws_profile_drift_state Profile drift assessment using fixed values.';
+        $lines[] = '# TYPE s3_server_aws_profile_drift_state gauge';
         $lines[] = '# HELP s3_server_aws_recovery_items Bounded retained AWS recovery rows by fixed kind.';
         $lines[] = '# TYPE s3_server_aws_recovery_items gauge';
         $lines[] = '# HELP s3_server_aws_recovery_oldest_age_seconds Oldest retained AWS recovery row age using database time.';
         $lines[] = '# TYPE s3_server_aws_recovery_oldest_age_seconds gauge';
         $lines[] = '# HELP s3_server_aws_recovery_max_owner_items Maximum retained rows for any owner, without identity labels.';
         $lines[] = '# TYPE s3_server_aws_recovery_max_owner_items gauge';
+        $lines[] = '# HELP s3_server_aws_reconciliation_state Current reconciliation health using fixed states.';
+        $lines[] = '# TYPE s3_server_aws_reconciliation_state gauge';
+        $lines[] = '# HELP s3_server_aws_reconciliation_failures Retained recovery rows with one or more failed attempts.';
+        $lines[] = '# TYPE s3_server_aws_reconciliation_failures gauge';
         if ($this->awsOperationalSnapshot !== null) {
             $snapshot = $this->awsOperationalSnapshot;
             $fingerprint = (string) $snapshot['fingerprint'];
@@ -616,9 +647,22 @@ final class MetricsCollector
                 $lines[] = 's3_server_aws_profile_state{fingerprint="' . $fingerprint . '",reason="' . $reason . '"} '
                     . ($snapshot['reason'] === $reason ? '1' : '0');
             }
-            foreach (['configuration_valid', 'provider_admitted', 'fence_complete', 'production_qualified', 'mutation_ready'] as $state) {
+            foreach (['configuration_valid', 'owner_check_passed', 'provider_admitted', 'fence_complete', 'writer_coverage_complete', 'production_qualified', 'mutation_ready', 'recovery_ready'] as $state) {
                 $lines[] = 's3_server_aws_profile_qualification{state="' . $state . '"} ' . ((bool) $snapshot[$state] ? '1' : '0');
             }
+            foreach (['not-checked', 'disabled', 'enabled', 'suspended', 'unknown'] as $state) {
+                $lines[] = 's3_server_aws_profile_versioning_state{state="' . $state . '"} '
+                    . ($snapshot['versioning_state'] === $state ? '1' : '0');
+            }
+            foreach (['clear', 'detected', 'unknown'] as $state) {
+                $lines[] = 's3_server_aws_profile_drift_state{state="' . $state . '"} '
+                    . ($snapshot['drift_state'] === $state ? '1' : '0');
+            }
+            foreach (['healthy', 'failed', 'stale', 'capacity', 'integrity_conflict'] as $state) {
+                $lines[] = 's3_server_aws_reconciliation_state{state="' . $state . '"} '
+                    . ($snapshot['reconciliation_state'] === $state ? '1' : '0');
+            }
+            $lines[] = 's3_server_aws_reconciliation_failures ' . (int) $snapshot['failures'];
             foreach (['open', 'ambiguous', 'seal_reserved', 'sealed', 'multipart', 'part', 'cleanup', 'failures'] as $kind) {
                 $lines[] = 's3_server_aws_recovery_items{kind="' . $kind . '"} ' . (int) $snapshot[$kind];
             }

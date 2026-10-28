@@ -74,7 +74,9 @@ The initial production profile adds these gates:
 ### AWS S3 pre-qualification gate
 
 - [ ] Render `deploy/aws-s3-profile.cloudformation.yaml` into a new isolated
-  stack; confirm it creates only the bucket, bucket policy, and runtime role.
+  stack; confirm it creates only the bucket, bucket policy, and runtime role,
+  outputs the expected owner account, grants multipart abort, and enforces the
+  no-S3-lifecycle contract for all data, attempt, and seal prefixes.
 - [ ] Use the default credential chain and PostgreSQL; verify `/.live` remains
   200 while provider or credential drift makes `/.health` 503 and closes new
   provider mutations.

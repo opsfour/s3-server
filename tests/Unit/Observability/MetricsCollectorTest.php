@@ -84,6 +84,22 @@ final class MetricsCollectorTest extends TestCase
         self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_reconciliations_total\{[^}]*,(?:owner|key|path)=/m', $rendered);
     }
 
+    public function test_aws_publication_metrics_have_only_fixed_outcome_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        foreach (['confirmed_success', 'precondition_conflict', 'confirmed_rejection', 'ambiguous'] as $status) {
+            $metrics->recordAwsPublicationOutcome($status);
+        }
+        $rendered = $metrics->renderPrometheus();
+        foreach (['confirmed_success', 'precondition_conflict', 'confirmed_rejection', 'ambiguous'] as $status) {
+            self::assertStringContainsString(
+                's3_server_aws_publication_outcomes_total{status="' . $status . '"} 1',
+                $rendered,
+            );
+        }
+        self::assertDoesNotMatchRegularExpression('/^s3_server_aws_publication_outcomes_total\{[^}]*(?:owner|key|path|attempt)=/m', $rendered);
+    }
+
     public function test_aws_operational_metrics_are_fixed_cardinality_and_identity_free(): void
     {
         $metrics = new MetricsCollector();
@@ -91,10 +107,16 @@ final class MetricsCollectorTest extends TestCase
             'provider_type' => 'aws-s3',
             'fingerprint' => str_repeat('a', 64),
             'configuration_valid' => true,
+            'owner_check_passed' => true,
+            'versioning_state' => 'disabled',
             'provider_admitted' => true,
             'fence_complete' => true,
+            'writer_coverage_complete' => true,
+            'drift_state' => 'clear',
             'production_qualified' => false,
             'mutation_ready' => true,
+            'recovery_ready' => true,
+            'reconciliation_state' => 'healthy',
             'reason' => 'healthy',
             'open' => 3,
             'ambiguous' => 2,
@@ -115,6 +137,9 @@ final class MetricsCollectorTest extends TestCase
         self::assertStringContainsString('s3_server_aws_profile_qualification{state="production_qualified"} 0', $rendered);
         self::assertStringContainsString('s3_server_aws_recovery_oldest_age_seconds 12.5', $rendered);
         self::assertStringContainsString('s3_server_aws_recovery_max_owner_items{kind="open"} 2', $rendered);
+        self::assertStringContainsString('s3_server_aws_profile_versioning_state{state="disabled"} 1', $rendered);
+        self::assertStringContainsString('s3_server_aws_profile_drift_state{state="clear"} 1', $rendered);
+        self::assertStringContainsString('s3_server_aws_reconciliation_state{state="healthy"} 1', $rendered);
         self::assertDoesNotMatchRegularExpression('/(?:owner|account|bucket|key|path|attempt)="/', $rendered);
     }
 

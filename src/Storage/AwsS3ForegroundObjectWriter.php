@@ -9,6 +9,7 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Observability\MetricsCollector;
 
 /** The sole ordinary-object AWS destination coordinator. */
 final readonly class AwsS3ForegroundObjectWriter
@@ -24,6 +25,7 @@ final readonly class AwsS3ForegroundObjectWriter
         private string $storageTier,
         private float $renewIntervalSeconds = 60.0,
         private ?AwsS3OperationalState $operationalState = null,
+        private ?MetricsCollector $metrics = null,
     ) {
         if ($storageTier === ''
             || ! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0.0
@@ -78,6 +80,8 @@ final readonly class AwsS3ForegroundObjectWriter
         string $ownerId,
         string $purpose = 'put_object',
     ): AwsS3ForegroundObjectReservation {
+        // This precedes durable reservation and therefore any request-body read.
+        $this->operationalState?->assertMutationReady();
         if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart', 'tier_transition', 'restore_copy', 'access_log'], true)) {
             throw new \InvalidArgumentException('AWS foreground publication purpose is unsupported.');
         }
@@ -190,6 +194,7 @@ final readonly class AwsS3ForegroundObjectWriter
                 ? $body->sha256Hex()
                 : self::sha256Hex($result),
         );
+        $this->recordPublicationOutcome($outcome);
         if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
             $this->publisher->retireConfirmedRejection($outcome);
             throw new InternalErrorException('AWS multipart completion publication was not confirmed.');
@@ -392,6 +397,7 @@ final readonly class AwsS3ForegroundObjectWriter
                 $stage->result->size,
                 self::sha256Hex($stage->result),
             );
+            $this->recordPublicationOutcome($outcome);
             if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
                 $this->publisher->retireConfirmedRejection($outcome);
                 throw new InternalErrorException('AWS object publication was not confirmed.');
@@ -437,5 +443,13 @@ final readonly class AwsS3ForegroundObjectWriter
             throw new InternalErrorException('AWS object staging produced invalid SHA-256 evidence.');
         }
         return bin2hex($raw);
+    }
+
+    private function recordPublicationOutcome(AwsS3WriteAttemptOutcome $outcome): void
+    {
+        $this->metrics?->recordAwsPublicationOutcome($outcome->state);
+        if ($outcome->state === AwsS3CreateOnlyWriteOutcome::PRECONDITION_CONFLICT) {
+            $this->operationalState?->markIntegrityConflict();
+        }
     }
 }

@@ -71,9 +71,13 @@ profile. The stack creates one new bucket, its policy, and one runtime role; it
 does not discover or update existing buckets, roles, keys, lifecycle rules, or
 unrelated resources. Review the exact trust principal before deployment. The
 runtime role is limited to admission reads and object operations beneath the
-two configured prefixes. The bucket policy denies plaintext transport and any
-versioning change. Obtain the expected owner separately from the authenticated
-deployment account; do not copy it into dashboards or support bundles.
+two configured prefixes, including aborting incomplete multipart uploads. The
+bucket policy denies plaintext transport, any versioning change, and creation
+of an S3 lifecycle configuration; the AWS bucket must have no lifecycle rules
+because data, attempt, and seal prefixes are controlled only by PostgreSQL-led
+recovery. Configure `expected_owner_id` from the stack's
+`ExpectedOwnerAccountId` output; do not copy it into dashboards or support
+bundles.
 
 The process must obtain short-lived credentials through the AWS SDK default
 chain. Do not set static keys in the server configuration. For rotation, drain
@@ -81,7 +85,10 @@ new traffic, rotate the upstream role/session source, wait for in-flight
 requests to finish, restart nodes one at a time, and require the same opaque
 profile fingerprint plus `mutation_ready=true` before restoring traffic.
 Expired or revoked credentials leave `/.live` at 200, change `/.health` to 503,
-and close new provider dispatch and worker claims while durable rows remain.
+and close provider access while durable rows remain. Recovery retries resume as
+soon as provider admission returns. Recovery pressure, collector failure, or
+an integrity conflict closes new foreground/background publication but does
+not gate the reconciler or claimed-garbage cleanup from repairing that state.
 
 Provision the process temporary volume for the configured maximum object size
 times admitted concurrent foreground transformations, plus browser POST spool

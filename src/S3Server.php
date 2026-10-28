@@ -766,7 +766,6 @@ final class S3Server
                     try {
                         while ($this->tieringRunning) {
                             try {
-                                $this->awsOperationalState?->assertMutationReady();
                                 $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
                                 $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
                                 $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
