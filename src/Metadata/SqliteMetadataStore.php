@@ -1304,6 +1304,22 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         });
     }
 
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        if ($this->connection()->inTransaction()) {
+            throw new \LogicException('Physical write recovery scheduling requires its own committed transaction.');
+        }
+        $stmt = $this->prepare(<<<'SQL'
+            UPDATE s3_object_write_intents
+            SET lease_until = (julianday('now') - 2440587.5) * 86400.0
+            WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+            SQL);
+        $stmt->execute([$attemptId, $dispatchId]);
+
+        return $stmt->rowCount() === 1;
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->connection()->inTransaction()) {

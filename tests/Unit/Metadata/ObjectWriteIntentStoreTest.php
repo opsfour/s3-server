@@ -334,6 +334,24 @@ final class ObjectWriteIntentStoreTest extends TestCase
         ));
     }
 
+    public function test_exact_armed_dispatch_can_be_made_due_without_expiring_another_dispatch(): void
+    {
+        $store = $this->store();
+        $reserved = $store->reserveObjectWriteIntent($this->intent('7', 'objects/ambiguous-due'), 60.0);
+        $armed = $this->arm($store, $reserved);
+        self::assertNotNull($armed->dispatchId);
+
+        self::assertFalse($store->expireArmedObjectWriteIntent($armed->attemptId, str_repeat('9', 32)));
+        self::assertSame([], $store->claimDueObjectWriteIntents('STANDARD', 1, 60.0));
+        self::assertTrue($store->expireArmedObjectWriteIntent($armed->attemptId, $armed->dispatchId));
+        /** @var list<ObjectWriteIntent> $claimed */
+        $claimed = $store->claimDueObjectWriteIntents('STANDARD', 1, 60.0);
+        self::assertCount(1, $claimed);
+        $claim = $claimed[0] ?? throw new \LogicException('Exact due intent was not claimed.');
+        self::assertSame($armed->dispatchId, $claim->dispatchId);
+        self::assertFalse($store->expireArmedObjectWriteIntent($armed->attemptId, $armed->dispatchId));
+    }
+
     public function test_sqlite_renewal_reads_its_cas_result_before_other_connections_can_see_it(): void
     {
         $first = $this->store();

@@ -23,6 +23,10 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
 
     private ?AwsS3OperationalState $operationalState = null;
 
+    private ?string $operationalTier = null;
+
+    private bool $operationalAttachmentCommitted = false;
+
     public function __construct(
         private AwsS3ProviderAdmission $admission,
         private ?AwsS3ProviderValidatedBinding $binding = null,
@@ -57,22 +61,55 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         return $this->binding;
     }
 
-    public function attachOperationalState(AwsS3OperationalState $state): void
+    public function attachOperationalState(AwsS3OperationalState $state, string $storageTier, object $metadata): void
     {
         if ($this->operationalState !== null) {
             throw new \LogicException('AWS operational state is already attached.');
         }
-        $profile = $this->admittedProfile() ?? throw $this->unavailable();
-        if (! hash_equals($state->fingerprint(), self::fingerprint($profile))) {
-            throw new \LogicException('AWS operational state is bound to another profile.');
-        }
+        $binding = $this->binding ?? throw $this->unavailable();
+        $state->assertExecutionBinding($binding, $storageTier, $metadata);
         $this->operationalState = $state;
+        $this->operationalTier = $storageTier;
+        $this->operationalAttachmentCommitted = false;
+    }
+
+    public function commitOperationalStateAttachment(
+        AwsS3OperationalState $state,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        $this->assertExactOperationalAttachment($state, $storageTier, $metadata);
+        $binding = $this->binding ?? throw $this->unavailable();
+        $state->commitRuntimeAttachment($binding, $storageTier, $metadata);
+        $this->operationalAttachmentCommitted = true;
         $this->admission = $this->admission->withQualification(true);
+    }
+
+    public function rollbackOperationalStateAttachment(
+        AwsS3OperationalState $state,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        $this->assertExactOperationalAttachment($state, $storageTier, $metadata);
+        if ($this->operationalAttachmentCommitted) {
+            throw new \LogicException('A committed AWS operational state attachment cannot be rolled back.');
+        }
+        $binding = $this->binding ?? throw $this->unavailable();
+        $state->rollbackRuntimeAttachment($binding, $storageTier, $metadata);
+        $this->operationalState = null;
+        $this->operationalTier = null;
+        $this->operationalAttachmentCommitted = false;
+        $this->admission = $this->admission->withQualification(false);
     }
 
     public function operationalState(): ?AwsS3OperationalState
     {
         return $this->operationalState;
+    }
+
+    public function operationalAttachmentCommitted(): bool
+    {
+        return $this->operationalAttachmentCommitted;
     }
 
     /** Narrow ordinary-write capability; StorageBackend operations remain closed. */
@@ -90,6 +127,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
             throw $this->unavailable();
         }
+        $this->assertOperationalBinding($storageTier, $intents);
         $publisher = new AwsS3WriteAttemptPublisher(
             $profile,
             $intents,
@@ -121,6 +159,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
             throw $this->unavailable();
         }
+        $this->assertOperationalBinding($storageTier, $intents);
         return new AwsS3ObjectWriteIntentCollector(
             $intents,
             $storageTier,
@@ -141,6 +180,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         ?int $offset = null,
         ?int $length = null,
     ): ReadableStream {
+        $this->operationalState?->assertRecoveryReady();
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
@@ -217,6 +257,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         int $expectedSize,
         int $maximumSize,
     ): ReadableStream {
+        $this->operationalState?->assertRecoveryReady();
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
@@ -304,6 +345,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
     ): bool {
+        $this->assertOperationalBinding($tier, $claims);
         $deletion = new AwsS3GarbageDeletion(
             $this,
             $this->garbageDeletionAuthority,
@@ -521,16 +563,29 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         return new \LogicException('AWS S3 storage operations are unavailable until the provider write fence is complete.');
     }
 
-    private static function fingerprint(AwsS3ProviderProfile $profile): string
+    private function assertOperationalBinding(string $storageTier, object $metadata): void
     {
-        return hash('sha256', json_encode([
-            'provider' => AwsS3ProviderAdmission::PROVIDER_TYPE,
-            'bucket' => $profile->bucket,
-            'region' => $profile->region,
-            'owner' => $profile->expectedOwnerId,
-            'data' => $profile->dataPrefix,
-            'reserved' => $profile->reservedPrefix,
-            'timeouts' => [$profile->connectTimeoutSeconds, $profile->readTimeoutSeconds, $profile->requestTimeoutSeconds],
-        ], JSON_THROW_ON_ERROR));
+        $state = $this->operationalState;
+        $binding = $this->binding;
+        if ($state === null || $binding === null || $this->operationalTier === null) {
+            throw new \LogicException('AWS operational state is not attached.');
+        }
+        if (! hash_equals($this->operationalTier, $storageTier)) {
+            throw new \LogicException('AWS writer requested a different operational storage tier.');
+        }
+        $state->assertExecutionBinding($binding, $storageTier, $metadata);
+    }
+
+    private function assertExactOperationalAttachment(
+        AwsS3OperationalState $state,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        if ($this->operationalState !== $state || $this->operationalTier === null
+            || ! hash_equals($this->operationalTier, $storageTier)) {
+            throw new \LogicException('Only the exact attached AWS operational state can be managed.');
+        }
+        $binding = $this->binding ?? throw $this->unavailable();
+        $state->assertExecutionBinding($binding, $storageTier, $metadata);
     }
 }

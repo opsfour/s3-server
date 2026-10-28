@@ -75,17 +75,24 @@ The initial production profile adds these gates:
 
 - [ ] Render `deploy/aws-s3-profile.cloudformation.yaml` into a new isolated
   stack; confirm it creates only the bucket, bucket policy, and runtime role,
-  outputs the expected owner account, grants multipart abort, and enforces the
-  no-S3-lifecycle contract for all data, attempt, and seal prefixes.
+  outputs the expected owner account, grants unconditional bucket-scope
+  `ListBucket` for admission plus prefix-scoped object access and multipart
+  abort, and enforces the no-S3-lifecycle contract for all data, attempt, and
+  seal prefixes.
+- [ ] Grant the exact `RuntimePrincipalArn` source identity permission to assume
+  the output target role and configure `role_arn` with `source_profile` or the
+  applicable `credential_source`; do not treat the output role as directly
+  attached or as federated trust.
 - [ ] Use the default credential chain and PostgreSQL; verify `/.live` remains
   200 while provider or credential drift makes `/.health` 503 and closes new
   provider mutations.
 - [ ] Alert at 15 minutes oldest retained recovery age, any integrity conflict,
   repeated collector failure, 80% global capacity, or 80% maximum per-owner
   capacity. Treat hard capacity as an incident before request ingestion rejects.
-- [ ] Exercise drain, credential rotation, matched PostgreSQL-first restore,
-  reconciliation, and the audited seal break-glass procedure in the operations
-  runbook. Never delete a seal automatically.
+- [ ] Exercise drain, credential rotation, an exact provider copy/manifest,
+  provider-objects-first then matched PostgreSQL restore, reconciliation, and
+  the audited seal break-glass procedure in the operations runbook. Never
+  delete a seal automatically; a PostgreSQL snapshot alone is not restorable.
 - [ ] Keep `production_qualified=false` until the bounded, isolated real-AWS
   release run is accepted for the exact commit, topology, region, IAM policy,
   PostgreSQL version, concurrency, timeouts, and artifacts.

@@ -325,6 +325,7 @@ INI));
         $script = implode('', [
             'require ', var_export($root . '/src/Storage/AwsS3ProviderProfile.php', true), ';',
             'require ', var_export($root . '/src/Storage/AwsS3ProviderAdmission.php', true), ';',
+            'require ', var_export($root . '/src/Storage/AwsS3ProviderProbe.php', true), ';',
             'require ', var_export($root . '/src/Storage/AwsS3ProviderValidator.php', true), ';',
             '$profile=new OpsFour\\S3Server\\Storage\\AwsS3ProviderProfile(',
             "'backing-private','us-east-1','123456789012','objects','.opsfour/attempts');",

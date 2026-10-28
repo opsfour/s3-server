@@ -275,6 +275,29 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame(2, $probe->calls);
     }
 
+    public function test_healthy_probe_that_finishes_after_response_timeout_is_adopted(): void
+    {
+        $probe = new class implements CredentialHealthProbe {
+            public int $calls = 0;
+
+            public function assertCredentialStoreAvailable(): void
+            {
+                ++$this->calls;
+                \Amp\delay(0.03);
+            }
+        };
+        $handler = new HealthCheckHandler(
+            credentialHealthProbe: $probe,
+            readinessCheckIntervalSeconds: 30,
+            readinessCheckTimeoutSeconds: 0.005,
+        );
+
+        self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
+        \Amp\delay(0.04);
+        self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+        self::assertSame(1, $probe->calls, 'The late healthy result must be cached instead of discarded.');
+    }
+
     public function test_credential_probe_propagates_the_original_cancellation(): void
     {
         $cancellation = new CancelledException();

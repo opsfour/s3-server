@@ -112,6 +112,11 @@ final class AccessLogWriter
         }
     }
 
+    public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->awsWriter === $writer;
+    }
+
     public function setNotificationDispatcher(NotificationDispatcher $notifications): void
     {
         $this->notifications = $notifications;

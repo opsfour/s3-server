@@ -35,9 +35,14 @@ final class StorageWriteFenceStartupGuard
             if ($backend instanceof AwsS3ProviderAdmissionCapability) {
                 $admission = $backend->awsS3ProviderAdmission();
                 if ($metadataDriver !== 'postgres' || ! $backend instanceof \OpsFour\S3Server\Storage\AwsS3StorageBackend
-                    || $backend->operationalState() === null) {
+                    || $backend->operationalState() === null || $metadata === null) {
                     throw new AwsS3ProviderStartupException($admission);
                 }
+                $binding = $backend->validatedBinding();
+                if ($binding === null) {
+                    throw new AwsS3ProviderStartupException($admission);
+                }
+                $backend->operationalState()->assertQualifiedExecutionBinding($binding, $tier->name, $metadata);
                 $backend->operationalState()->assertStartupReady();
                 continue;
             }

@@ -70,17 +70,36 @@ Use `deploy/aws-s3-profile.cloudformation.yaml` only for a fresh isolated
 profile. The stack creates one new bucket, its policy, and one runtime role; it
 does not discover or update existing buckets, roles, keys, lifecycle rules, or
 unrelated resources. Review the exact trust principal before deployment. The
-runtime role is limited to admission reads and object operations beneath the
-two configured prefixes, including aborting incomplete multipart uploads. The
+runtime role has unconditional bucket-scope `ListBucket` for the SDK
+`HeadBucket` admission probe together with the required versioning read; object
+reads and mutations remain limited to the two configured
+prefixes, including aborting incomplete multipart uploads. The
 bucket policy denies plaintext transport, any versioning change, and creation
 of an S3 lifecycle configuration; the AWS bucket must have no lifecycle rules
 because data, attempt, and seal prefixes are controlled only by PostgreSQL-led
 recovery. Configure `expected_owner_id` from the stack's
 `ExpectedOwnerAccountId` output; do not copy it into dashboards or support
-bundles.
+bundles. Configure the runtime bucket and both prefixes from the corresponding
+stack outputs. The template deliberately fixes separate `data` and `.opsfour`
+leading namespaces and accepts only canonical ASCII path segments, so equal,
+nested, wildcard-bearing, and runtime-invalid prefix inputs cannot render.
 
 The process must obtain short-lived credentials through the AWS SDK default
-chain. Do not set static keys in the server configuration. For rotation, drain
+chain. The `RuntimeRoleArn` output does not make the SDK assume that role. The
+IAM role or user named by `RuntimePrincipalArn` is the source principal: it must
+have an identity policy permitting `sts:AssumeRole` on `RuntimeRoleArn`, and the
+generated target role's trust policy permits that exact source principal. This
+template neither modifies the source identity policy nor configures an OIDC or
+other federated trust relationship, and the generated role is not directly
+attachable as an ECS task, EC2 instance, or EKS web-identity role.
+
+Configure a named shared AWS profile with `role_arn = <RuntimeRoleArn>` and
+either `source_profile = <profile-containing-the-source-principal>` or an
+applicable `credential_source` such as `Ec2InstanceMetadata` or
+`EcsContainer`. Set `AWS_PROFILE` to the assuming profile (and enable shared SDK
+configuration where the platform requires it) before startup. Confirm the
+assumed target identity with a read-only STS check outside the server. Do not
+set static keys in the server configuration. For rotation, drain
 new traffic, rotate the upstream role/session source, wait for in-flight
 requests to finish, restart nodes one at a time, and require the same opaque
 profile fingerprint plus `mutation_ready=true` before restoring traffic.
@@ -89,6 +108,12 @@ and close provider access while durable rows remain. Recovery retries resume as
 soon as provider admission returns. Recovery pressure, collector failure, or
 an integrity conflict closes new foreground/background publication but does
 not gate the reconciler or claimed-garbage cleanup from repairing that state.
+Abandoned AWS multipart-completion tombstones remain observable in multipart
+backlog, per-owner, and global-capacity gauges. Their retained age does not
+degrade the actionable recovery-age gauge. Until an exact
+proof-safe AWS retirement capability is qualified, their expected retention is
+not classified as a collector failure; capacity and backlog alerts still
+require operator attention.
 
 Provision the process temporary volume for the configured maximum object size
 times admitted concurrent foreground transformations, plus browser POST spool
@@ -112,12 +137,20 @@ state.
 For planned maintenance, stop admission at the load balancer, wait for active
 requests and staging to drain, then let collectors reduce open and ambiguous
 rows. Do not wait for permanent seals to reach zero. Stop API/worker processes
-before taking a matched PostgreSQL snapshot. S3 object bytes and seals must be
-retained with the database snapshot. Restore PostgreSQL first into an isolated
-environment, restore the exact profile configuration and IAM role, keep traffic
-closed, run metadata migration/audit, then allow reconciliation to settle before
-readiness and traffic are enabled. Never restore metadata without the matching
-bucket generation and retained control objects.
+before taking a matched backup. While the profile is stopped, create and verify
+a provider copy/export that preserves every exact key, byte, and
+`x-amz-meta-*` value under both configured prefixes, including data objects,
+attempts, and seals. Retain an immutable manifest that binds that provider
+export to the PostgreSQL snapshot. For replacement-bucket recovery, restore and
+verify those provider objects first, then restore the matching PostgreSQL
+snapshot into an isolated environment, restore the exact profile configuration
+and IAM role, keep traffic closed, run metadata migration/audit, and allow
+reconciliation to settle before readiness and traffic are enabled. A
+PostgreSQL snapshot alone is not restorable. If the operator has no exact-copy
+mechanism with metadata preservation, disaster restore to a replacement bucket
+is not qualified and the original retained bucket is a required dependency.
+Versioning cannot supply point-in-time recovery because this profile prohibits
+it.
 
 After a crash or provider outage, keep the profile drained while credentials,
 region, ownership, versioning, and fingerprint are checked. Resume collectors;

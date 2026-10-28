@@ -40,6 +40,9 @@ interface ObjectWriteIntentStore
     /** Commit a DB-clock lease refresh for one exact armed dispatch. */
     public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent;
 
+    /** Make one exact active armed dispatch immediately eligible for recovery. */
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool;
+
     /** Retire only a row that could never have started physical work. */
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool;
 

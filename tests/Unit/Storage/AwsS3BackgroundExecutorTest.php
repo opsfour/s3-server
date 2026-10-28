@@ -30,6 +30,7 @@ use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
+use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
@@ -43,6 +44,8 @@ final class AwsS3BackgroundExecutorTest extends TestCase
     private MockHandler $mock;
 
     private AwsS3StorageBackend $aws;
+
+    private AwsS3ProviderValidatedBinding $binding;
 
     private AwsS3ForegroundObjectWriter $writer;
 
@@ -90,6 +93,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             return ($this->mock)($request, $options);
         }));
         self::assertTrue($binding->admission->providerAdmitted);
+        $this->binding = $binding;
         $this->aws = new AwsS3StorageBackend($binding->admission, $binding);
     }
 
@@ -267,6 +271,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     public function test_stale_or_referenced_aws_garbage_claim_never_contacts_provider(): void
     {
+        $this->ensureGarbageOperationalState();
         $claims = $this->createMockForIntersectionOfInterfaces([
             MetadataStore::class,
             FencedStorageGarbageStore::class,
@@ -315,6 +320,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     public function test_aws_garbage_collector_completes_only_after_provider_absence(): void
     {
+        $this->ensureGarbageOperationalState();
         $profile = $this->aws->admittedProfile();
         self::assertNotNull($profile);
         $bucket = $this->metadata->getBucket('bucket');
@@ -376,6 +382,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     public function test_aws_garbage_operation_is_revoked_when_claim_coordination_returns(): void
     {
+        $this->ensureGarbageOperationalState();
         $captured = null;
         $claims = $this->createMock(AwsS3GarbageClaimStore::class);
         $claims->method('deleteAwsGarbageClaim')->willReturnCallback(
@@ -520,6 +527,11 @@ final class AwsS3BackgroundExecutorTest extends TestCase
     public function test_transition_from_aws_requires_current_v2_evidence_and_never_calls_generic_delete(): void
     {
         $this->bind('ARCHIVE');
+        $state = $this->aws->operationalState();
+        self::assertNotNull($state);
+        $state->markCollectorFailure('storage_garbage');
+        self::assertFalse($state->mutationReady());
+        self::assertTrue($state->recoveryReady());
         $target = new InMemoryBackend();
         $target->createBucket('bucket');
         $payload = 'aws source bytes';
@@ -567,6 +579,50 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             static fn(RequestInterface $request): string => $request->getMethod(),
             array_slice($this->requests, 2),
         ));
+    }
+
+    public function test_closed_aws_publication_does_not_block_a_local_only_transition_job(): void
+    {
+        $this->bind('ARCHIVE');
+        $state = $this->aws->operationalState();
+        self::assertNotNull($state);
+        $state->markCollectorFailure('storage_garbage');
+        self::assertFalse($state->mutationReady());
+
+        $hot = new InMemoryBackend();
+        $cold = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        $cold->createBucket('bucket');
+        $source = $hot->putObject('bucket', 'local-only', new ReadableBuffer('local bytes'));
+        $this->putObject('local-only', 'HOT', $source->path, 'local bytes');
+        $this->metadata->enqueueTierTransitionJob(
+            'bucket',
+            'local-only',
+            null,
+            'HOT',
+            'COLD',
+            'GLACIER',
+            $source->path,
+        );
+
+        $stats = (new TierTransitionExecutor(
+            $this->metadata,
+            new StorageTierRegistry([
+                new StorageTier('HOT', $hot, defaultWriteTier: true),
+                new StorageTier('COLD', $cold, restoreRequired: true),
+                new StorageTier('ARCHIVE', $this->aws, restoreRequired: true),
+            ]),
+            awsFencedWriter: $this->background,
+        ))->processNext(1);
+
+        self::assertSame(['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0], $stats);
+        $moved = $this->metadata->getObjectMetadata('bucket', 'local-only');
+        self::assertNotNull($moved);
+        self::assertSame('COLD', $moved->storageTier);
+        self::assertSame('local bytes', $cold->getObjectByPath(
+            (string) $moved->systemMetadata['storagePath'],
+        )->read());
+        self::assertCount(2, $this->requests);
     }
 
     public function test_restore_from_aws_reads_exact_v2_source_before_publishing_restored_metadata(): void
@@ -729,7 +785,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
         self::assertSame($prior, $this->activeAttemptIds());
     }
 
-    public function test_ambiguous_transition_retry_uses_fresh_attempt_and_keeps_prior_intent(): void
+    public function test_ambiguous_transition_is_due_immediately_and_closes_same_process_retry(): void
     {
         $this->bind('ARCHIVE');
         $source = new InMemoryBackend();
@@ -772,6 +828,10 @@ final class AwsS3BackgroundExecutorTest extends TestCase
         $prior = $this->activeAttemptIds();
         self::assertCount(1, $prior);
         self::assertNotNull($this->metadata->getObjectWriteIntent($prior[0])?->dispatchId);
+        self::assertSame('integrity', $this->aws->operationalState()?->snapshot()['reason']);
+        $dueIntent = $this->metadata->claimDueObjectWriteIntents('ARCHIVE', 1, 300.0);
+        self::assertCount(1, $dueIntent);
+        self::assertSame($prior[0], $dueIntent[0]->attemptId);
         self::assertSame(['PUT'], $this->mutationMethods());
 
         $pdo = new \PDO('sqlite:' . $this->base . '/metadata.sqlite');
@@ -780,22 +840,19 @@ final class AwsS3BackgroundExecutorTest extends TestCase
         $this->mock->append(new Response(200, ['ETag' => '"aws-retry"']));
 
         self::assertSame(
-            ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+            ['processed' => 1, 'completed' => 0, 'retried' => 1, 'deadLetter' => 0],
             $executor->processNext(1),
         );
         $published = $this->metadata->getObjectMetadata('bucket', 'ambiguous');
         self::assertNotNull($published);
-        self::assertSame('ARCHIVE', $published->storageTier);
-        $freshAttempt = basename($published->systemMetadata['storagePath']);
-        self::assertNotSame($prior[0], $freshAttempt);
+        self::assertSame('HOT', $published->storageTier);
         self::assertSame($prior, $this->activeAttemptIds());
-        self::assertSame(['PUT', 'PUT'], $this->mutationMethods());
+        self::assertSame(['PUT'], $this->mutationMethods());
         $providerWrites = array_values(array_filter(
             array_slice($this->requests, 2),
             static fn(RequestInterface $request): bool => $request->getMethod() === 'PUT',
         ));
-        self::assertCount(2, $providerWrites);
-        self::assertNotSame($providerWrites[0]->getUri()->getPath(), $providerWrites[1]->getUri()->getPath());
+        self::assertCount(1, $providerWrites);
     }
 
     public function test_committed_source_rejects_legacy_foreign_malformed_oversized_and_short_evidence(): void
@@ -849,6 +906,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     private function bind(string $tier): void
     {
+        AwsS3OperationalStateFixture::attach($this->aws, $this->binding, $tier);
         $this->writer = $this->aws->createForegroundObjectWriter(
             $this->metadata,
             $this->base . '/scratch',
@@ -860,6 +918,7 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     private function deleteClaimedGarbage(string $path): void
     {
+        $this->ensureGarbageOperationalState();
         $claims = $this->createMock(AwsS3GarbageClaimStore::class);
         $claims->method('deleteAwsGarbageClaim')->willReturnCallback(
             static function (int $id, string $bucket, string $tier, string $claimedPath, string $ownerId, int $generation, \Closure $currentLeaseUntil, \Closure $stopRenewal, \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion): bool {
@@ -881,6 +940,13 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             static fn(): float => microtime(true) + 300,
             static function (): void {},
         );
+    }
+
+    private function ensureGarbageOperationalState(): void
+    {
+        if ($this->aws->operationalState() === null) {
+            AwsS3OperationalStateFixture::attach($this->aws, $this->binding, 'STANDARD');
+        }
     }
 
     private function putObject(string $key, string $tier, string $path, string $payload): void

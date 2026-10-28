@@ -39,8 +39,8 @@ final readonly class AwsS3ObjectWriteIntentCollector
         if ($limit < 1 || $limit > 1000) {
             throw new \InvalidArgumentException('AWS object collection limit must be between 1 and 1000.');
         }
-        $this->operationalState?->assertRecoveryReady();
         $cancellation?->throwIfRequested();
+        $this->operationalState?->assertRecoveryReady();
         try {
             $retired = $this->metadata->retireExpiredUndispatchedObjectWriteIntents($this->tierName, $limit);
         } catch (CancelledException $error) {
@@ -68,6 +68,12 @@ final readonly class AwsS3ObjectWriteIntentCollector
             }
             try {
                 $this->reconciler->reconcile($claims[0], $cancellation, $this->claimLeaseSeconds);
+                if ($claims[0]->dispatchId !== null) {
+                    $this->operationalState?->resolveObjectRecoveryPending(
+                        $claims[0]->attemptId,
+                        $claims[0]->dispatchId,
+                    );
+                }
                 ++$sealed;
                 $this->metrics?->recordAwsWriteReconciliation('sealed');
             } catch (CancelledException $error) {
@@ -75,6 +81,12 @@ final readonly class AwsS3ObjectWriteIntentCollector
             } catch (AwsS3SealIntegrityException $error) {
                 $this->metrics?->recordAwsWriteReconciliation('integrity_conflict');
                 $this->operationalState?->markIntegrityConflict();
+                if ($claims[0]->dispatchId !== null) {
+                    $this->operationalState?->resolveObjectRecoveryPending(
+                        $claims[0]->attemptId,
+                        $claims[0]->dispatchId,
+                    );
+                }
                 $this->logger->error('AWS write reconciliation found conflicting immutable evidence.', [
                     'component' => 'aws_object_intent_reconciler',
                     'storage_tier' => $this->tierName,
@@ -91,7 +103,7 @@ final readonly class AwsS3ObjectWriteIntentCollector
                 ]);
             }
         }
-        if (! $failed && $sealed > 0) {
+        if (! $failed) {
             $this->operationalState?->markCollectorHealthy();
         }
 
@@ -101,5 +113,17 @@ final readonly class AwsS3ObjectWriteIntentCollector
     public function shutdown(): void
     {
         // The admitted SDK client is owned by the storage backend.
+    }
+
+    public function isBoundTo(
+        ObjectWriteIntentStore $metadata,
+        string $tierName,
+        AwsS3OperationalState $operationalState,
+        AwsS3ProviderValidatedBinding $binding,
+    ): bool {
+        return $this->metadata === $metadata
+            && hash_equals($this->tierName, $tierName)
+            && $this->operationalState === $operationalState
+            && $this->reconciler->isBoundTo($metadata, $tierName, $binding);
     }
 }

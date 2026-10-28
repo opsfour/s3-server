@@ -67,7 +67,7 @@ use OpsFour\S3Server\Xml\XmlResponseBuilder;
  *   x-amz-copy-source-if-modified-since, x-amz-copy-source-if-unmodified-since
  * - Cross-bucket copies with source read and destination write permission
  */
-final class CopyObjectHandler implements RequestHandler
+final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
     private const int MAX_SINGLE_COPY_BYTES = 5_368_709_120;
 
@@ -114,6 +114,11 @@ final class CopyObjectHandler implements RequestHandler
         )) {
             throw new \InvalidArgumentException('AWS copy fencing requires the exact default AWS tier and durable intents.');
         }
+    }
+
+    public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->awsObjectWriter === $writer;
     }
 
     /**

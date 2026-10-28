@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 
 /** Tier-bound AWS publication and source-read capability for background workers. */
 final readonly class AwsS3FencedBackgroundObjectWriter
@@ -29,6 +30,34 @@ final readonly class AwsS3FencedBackgroundObjectWriter
         }
 
         return $backend === $this->backend && hash_equals($this->storageTier, $storageTier);
+    }
+
+    public function isBoundTo(
+        AwsS3ForegroundObjectWriter $writer,
+        AwsS3StorageBackend $backend,
+        string $storageTier,
+    ): bool {
+        return $this->writer === $writer
+            && $this->backend === $backend
+            && hash_equals($this->storageTier, $storageTier);
+    }
+
+    public function foregroundWriter(): AwsS3ForegroundObjectWriter
+    {
+        return $this->writer;
+    }
+
+    public function isBoundToGraph(
+        AwsS3StorageBackend $backend,
+        AwsS3ProviderProfile $profile,
+        ObjectWriteIntentStore $metadata,
+        string $storageTier,
+        AwsS3OperationalState $operationalState,
+    ): bool {
+        return $this->backend === $backend
+            && hash_equals($this->storageTier, $storageTier)
+            && $this->writer->isBoundToOperationalGraph($backend, $profile, $metadata, $operationalState)
+            && hash_equals($this->writer->storageTierName(), $storageTier);
     }
 
     public function reserve(

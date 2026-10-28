@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
+use Amp\DeferredCancellation;
 use Aws\Handler\Guzzle\GuzzleHandler;
 use Aws\S3\S3Client;
 use GuzzleHttp\Client;
@@ -11,11 +12,19 @@ use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Psr7\Response;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler;
+use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3SameKeySealWriter;
+use OpsFour\S3Server\Handler\HandlerRegistrar;
+use OpsFour\S3Server\Runtime\StorageMutatorInventory;
+use OpsFour\S3Server\S3Server;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 
@@ -45,15 +54,21 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
         $requests = [];
         $client = self::client([new Response(404), self::error(404, 'NoSuchKey'), new Response(200, ['ETag' => '"seal"']), self::matchingGet()], $requests);
         $metrics = new MetricsCollector();
+        $state = self::operationalState();
+        self::assertNotNull($armed->dispatchId);
+        $state->markObjectRecoveryPending($armed->attemptId, $armed->dispatchId);
 
         $collector = new AwsS3ObjectWriteIntentCollector(
             $store,
             'AWS',
             new AwsS3SameKeySealWriter($client, 'backing', '123456789012'),
             metrics: $metrics,
+            operationalState: $state,
         );
 
+        self::assertSame('integrity', $state->snapshot()['reason']);
         self::assertSame(1, $collector->collect());
+        self::assertSame('healthy', $state->snapshot()['reason']);
         self::assertSame('sealed', $store->getObjectWriteIntent($armed->attemptId)?->state);
         self::assertSame(['object' => 0, 'object_seal' => 1, 'part' => 0], $store->getWriteIntentCapacityCounts());
         self::assertSame(['HEAD', 'GET', 'PUT', 'GET'], array_map(static fn(RequestInterface $request): string => $request->getMethod(), $requests));
@@ -67,17 +82,23 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
         $requests = [];
         $client = self::client([new Response(200, ['ETag' => '"foreign"', 'Content-Length' => '4'])], $requests);
         $metrics = new MetricsCollector();
+        $state = self::operationalState();
+        self::assertNotNull($armed->dispatchId);
+        $state->markObjectRecoveryPending($armed->attemptId, $armed->dispatchId);
         $collector = new AwsS3ObjectWriteIntentCollector(
             $store,
             'AWS',
             new AwsS3SameKeySealWriter($client, 'backing', '123456789012'),
             metrics: $metrics,
+            operationalState: $state,
         );
 
         self::assertSame(0, $collector->collect());
         self::assertSame('reconciling', $store->getObjectWriteIntent($armed->attemptId)?->state);
         self::assertSame(['object' => 1, 'object_seal' => 1, 'part' => 0], $store->getWriteIntentCapacityCounts());
         self::assertSame(['HEAD'], array_map(static fn(RequestInterface $request): string => $request->getMethod(), $requests));
+        self::assertSame([], (new \ReflectionProperty($state, 'objectRecoveryPending'))->getValue($state));
+        self::assertSame('integrity', $state->snapshot()['reason']);
         $rendered = $metrics->renderPrometheus();
         self::assertStringContainsString('s3_server_aws_write_reconciliations_total{status="integrity_conflict"} 1', $rendered);
         self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_reconciliations_total\{[^}]*owner/m', $rendered);
@@ -141,6 +162,62 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
         }
         self::assertSame([], $requests);
         self::assertSame('reconciling', $first->getObjectWriteIntent($armed->attemptId)?->state);
+    }
+
+    public function test_transient_failure_closes_shared_state_and_empty_successful_sweep_reopens_it(): void
+    {
+        $metadata = $this->createMock(ObjectWriteIntentStore::class);
+        $attempt = 0;
+        $metadata->expects(self::exactly(2))->method('retireExpiredUndispatchedObjectWriteIntents')
+            ->willReturnCallback(static function () use (&$attempt): int {
+                ++$attempt;
+                if ($attempt === 1) {
+                    throw new \RuntimeException('transient SQL failure');
+                }
+                return 0;
+            });
+        $metadata->expects(self::once())->method('claimDueObjectWriteIntents')->willReturn([]);
+        $state = self::operationalState();
+        $requests = [];
+        $collector = new AwsS3ObjectWriteIntentCollector(
+            $metadata,
+            'AWS',
+            new AwsS3SameKeySealWriter(self::client([], $requests), 'backing', '123456789012'),
+            operationalState: $state,
+        );
+
+        try {
+            $collector->collect();
+            self::fail('Transient collector failure was swallowed.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('transient SQL failure', $error->getMessage());
+        }
+        self::assertSame('collector', $state->snapshot()['reason']);
+        self::assertFalse($state->snapshot()['mutation_ready']);
+
+        self::assertSame(0, $collector->collect());
+        self::assertSame('healthy', $state->snapshot()['reason']);
+        self::assertTrue($state->snapshot()['mutation_ready']);
+    }
+
+    public function test_already_cancelled_sweep_does_not_run_recovery_admission_or_metadata(): void
+    {
+        $metadata = $this->createMock(ObjectWriteIntentStore::class);
+        $metadata->expects(self::never())->method('retireExpiredUndispatchedObjectWriteIntents');
+        $state = self::operationalState();
+        $state->markCollectorFailure();
+        $requests = [];
+        $collector = new AwsS3ObjectWriteIntentCollector(
+            $metadata,
+            'AWS',
+            new AwsS3SameKeySealWriter(self::client([], $requests), 'backing', '123456789012'),
+            operationalState: $state,
+        );
+        $cancel = new DeferredCancellation();
+        $cancel->cancel();
+
+        $this->expectException(\Amp\CancelledException::class);
+        $collector->collect(cancellation: $cancel->getCancellation());
     }
 
     private function store(): SqliteMetadataStore
@@ -215,6 +292,56 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
             'x-amz-meta-opsfour-write-seal' => 'v1',
             'x-amz-meta-opsfour-attempt-id' => $attemptId,
         ], $body);
+    }
+
+    private static function operationalState(): AwsS3OperationalState
+    {
+        $mock = new MockHandler([
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+        ]);
+        $validator = new AwsS3ProviderValidator(static function (RequestInterface $request, array $options) use ($mock) {
+            return $mock($request, $options);
+        });
+        $binding = AwsS3ProviderValidatedBinding::fromConfiguration([
+            'bucket' => 'backing-private',
+            'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'objects',
+            'reserved_prefix' => '.opsfour/attempts',
+        ], $validator);
+        $summary = new class implements AwsS3OperationalSummaryReader {
+            public function getAwsS3OperationalSummary(string $storageTier): array
+            {
+                return [
+                    'open' => 0, 'ambiguous' => 0, 'seal_reserved' => 0, 'sealed' => 0,
+                    'multipart' => 0, 'part' => 0, 'cleanup' => 0, 'failures' => 0,
+                    'oldest_age_seconds' => 0.0, 'max_owner_open' => 0, 'max_owner_sealed' => 0,
+                    'max_owner_multipart' => 0, 'max_owner_part' => 0, 'global_open' => 0,
+                    'global_seal_reserved' => 0, 'global_multipart' => 0, 'global_part' => 0,
+                    'global_cleanup' => 0,
+                ];
+            }
+        };
+        $state = new AwsS3OperationalState(
+            $binding,
+            $validator,
+            StorageMutatorInventory::forEnabledRuntime([
+                ...HandlerRegistrar::storageMutatorRegistrations(),
+                ...S3Server::storageMutatorRegistrations(),
+                ...AwsS3ObjectWriteIntentReconciler::storageMutatorRegistrations(),
+            ]),
+            $summary,
+            'AWS',
+        );
+        $backend = new \OpsFour\S3Server\Storage\AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
+        $state->assertStartupReady();
+
+        return $state;
     }
 
     private static function error(int $status, string $code): Response

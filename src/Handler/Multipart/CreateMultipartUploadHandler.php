@@ -35,7 +35,7 @@ use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
-final class CreateMultipartUploadHandler implements RequestHandler
+final class CreateMultipartUploadHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
     private readonly ?StorageTierRegistry $storageTiers;
 
@@ -65,6 +65,11 @@ final class CreateMultipartUploadHandler implements RequestHandler
                 throw new \InvalidArgumentException('AWS multipart creation must match the exact default AWS tier.');
             }
         }
+    }
+
+    public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->awsObjectWriter === $writer;
     }
 
     public function handleRequest(Request $request): Response

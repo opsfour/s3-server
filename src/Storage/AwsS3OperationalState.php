@@ -4,11 +4,16 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Storage;
 
+use Amp\Sync\LocalMutex;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
+use Amp\Parallel\Worker\WorkerPool;
 
 /** Shared, secret-free source of AWS readiness, mutation admission and diagnostics. */
 final class AwsS3OperationalState
@@ -25,9 +30,15 @@ final class AwsS3OperationalState
 
     private AwsS3ProviderAdmission $admission;
 
+    private LocalMutex $refreshMutex;
+
     private float $lastValidationAt = -INF;
 
-    private bool $collectorHealthy = true;
+    /** @var array<string, true> */
+    private array $collectorFailures = [];
+
+    /** @var array<string, array{attempt_id: string, dispatch_id: string}> */
+    private array $objectRecoveryPending = [];
 
     private bool $summaryHealthy = true;
 
@@ -35,12 +46,14 @@ final class AwsS3OperationalState
 
     private bool $startupValidated = false;
 
+    private bool $runtimeCommitted = false;
+
     /** @var array<string, int|float>|null */
     private ?array $summary = null;
 
     public function __construct(
         private readonly AwsS3ProviderValidatedBinding $binding,
-        private readonly AwsS3ProviderValidator $validator,
+        private readonly AwsS3ProviderProbe $probe,
         private readonly StorageMutatorInventory $inventory,
         private readonly AwsS3OperationalSummaryReader $metadata,
         private readonly string $storageTier,
@@ -59,6 +72,7 @@ final class AwsS3OperationalState
             throw new \InvalidArgumentException('AWS operational revalidation interval must be between 0 and 300 seconds.');
         }
         $this->admission = $binding->admission;
+        $this->refreshMutex = new LocalMutex();
     }
 
     public function fingerprint(): string
@@ -75,16 +89,45 @@ final class AwsS3OperationalState
         ], JSON_THROW_ON_ERROR));
     }
 
-    public function revalidate(bool $force = false): void
+    public function refresh(bool $force = false): void
+    {
+        $lock = $this->refreshMutex->acquire();
+        try {
+            $this->refreshLocked($force);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function refreshLocked(bool $force): void
     {
         $now = hrtime(true) / 1e9;
         if (! $force && $now - $this->lastValidationAt < $this->revalidationIntervalSeconds) {
             return;
         }
-        $this->admission = $this->binding->revalidate($this->validator);
+        try {
+            $this->admission = $this->probe->revalidate($this->profile());
+        } catch (\Throwable) {
+            $this->admission = AwsS3ProviderAdmission::denied(
+                $this->profile()->region,
+                true,
+                false,
+                AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED,
+                AwsS3ProviderAdmission::REASON_OWNER_OR_ACCESS_CHECK_FAILED,
+            );
+        }
         $this->lastValidationAt = $now;
         try {
             $this->summary = $this->metadata->getAwsS3OperationalSummary($this->storageTier);
+            if ($this->metadata instanceof ObjectWriteIntentStore) {
+                foreach ($this->objectRecoveryPending as $token => $pending) {
+                    $intent = $this->metadata->getObjectWriteIntent($pending['attempt_id']);
+                    if ($intent !== null && $intent->state === 'sealed'
+                        && $intent->dispatchId === $pending['dispatch_id']) {
+                        unset($this->objectRecoveryPending[$token]);
+                    }
+                }
+            }
             $this->summaryHealthy = true;
         } catch (\Throwable) {
             // Preserve the last durable sample, but close foreground admission
@@ -96,17 +139,46 @@ final class AwsS3OperationalState
     public function assertStartupReady(): void
     {
         if (! $this->startupValidated) {
-            $this->revalidate(true);
-            $this->startupValidated = true;
+            $this->refresh(true);
         }
         if (! $this->admission->providerAdmitted || ! $this->inventory->isComplete()) {
             throw new \RuntimeException('AWS provider startup state is not fence-complete.');
         }
+        $this->startupValidated = true;
+    }
+
+    /** Require a fresh provider check before a later startup attempt. */
+    public function invalidateStartupValidation(): void
+    {
+        $this->startupValidated = false;
+    }
+
+    public function usesProviderProbePool(WorkerPool $pool): bool
+    {
+        return $this->probe instanceof AwsS3ProviderWorkerProbe && $this->probe->usesPool($pool);
+    }
+
+    public function commitRuntimeAttachment(
+        AwsS3ProviderValidatedBinding $binding,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        $this->assertQualifiedExecutionBinding($binding, $storageTier, $metadata);
+        $this->runtimeCommitted = true;
+    }
+
+    public function rollbackRuntimeAttachment(
+        AwsS3ProviderValidatedBinding $binding,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        $this->assertQualifiedExecutionBinding($binding, $storageTier, $metadata);
+        $this->runtimeCommitted = false;
     }
 
     public function assertMutationReady(): void
     {
-        $this->revalidate();
+        $this->refresh();
         if (! $this->mutationReady()) {
             throw new \RuntimeException('AWS provider mutation admission is closed: ' . $this->reason() . '.');
         }
@@ -115,20 +187,37 @@ final class AwsS3OperationalState
     /** Recovery remains admitted when recovery pressure itself closes publication. */
     public function assertRecoveryReady(): void
     {
-        $this->revalidate();
+        $this->refresh();
         if (! $this->recoveryReady()) {
             throw new \RuntimeException('AWS provider recovery admission is closed: ' . $this->reason() . '.');
         }
     }
 
-    public function markCollectorFailure(): void
+    public function markCollectorFailure(string $collector = 'object_intent'): void
     {
-        $this->collectorHealthy = false;
+        if ($collector === '') {
+            throw new \InvalidArgumentException('AWS collector health source must not be empty.');
+        }
+        $this->collectorFailures[$collector] = true;
     }
 
-    public function markCollectorHealthy(): void
+    /** Close publication until the object collector observes the durable attempt. */
+    public function markObjectRecoveryPending(string $attemptId, string $dispatchId): void
     {
-        $this->collectorHealthy = true;
+        $this->objectRecoveryPending[$this->recoveryToken($attemptId, $dispatchId)] = [
+            'attempt_id' => $attemptId,
+            'dispatch_id' => $dispatchId,
+        ];
+    }
+
+    public function resolveObjectRecoveryPending(string $attemptId, string $dispatchId): void
+    {
+        unset($this->objectRecoveryPending[$this->recoveryToken($attemptId, $dispatchId)]);
+    }
+
+    public function markCollectorHealthy(string $collector = 'object_intent'): void
+    {
+        unset($this->collectorFailures[$collector]);
     }
 
     public function markIntegrityConflict(): void
@@ -136,14 +225,46 @@ final class AwsS3OperationalState
         $this->integrityHealthy = false;
     }
 
+    public function assertExecutionBinding(
+        AwsS3ProviderValidatedBinding $binding,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        if ($binding !== $this->binding || $storageTier === '' || ! hash_equals($this->storageTier, $storageTier)
+            || ($this->metadata instanceof MetadataStore && $metadata !== $this->metadata)) {
+            throw new \LogicException('AWS operational state is bound to another validated client, storage tier, or metadata graph.');
+        }
+    }
+
+    public function assertQualifiedExecutionBinding(
+        AwsS3ProviderValidatedBinding $binding,
+        string $storageTier,
+        object $metadata,
+    ): void {
+        $this->assertExecutionBinding($binding, $storageTier, $metadata);
+        if ($metadata !== $this->metadata) {
+            throw new \LogicException('Qualified AWS operational state requires the exact metadata graph.');
+        }
+    }
+
+    public function isBoundTo(AwsS3ProviderValidatedBinding $binding, string $storageTier, object $metadata): bool
+    {
+        return $binding === $this->binding
+            && hash_equals($this->storageTier, $storageTier)
+            && $metadata === $this->metadata;
+    }
+
     public function mutationReady(): bool
     {
         return $this->recoveryReady()
-            && $this->collectorHealthy
+            && $this->runtimeCommitted
+            && $this->collectorFailures === []
+            && $this->objectRecoveryPending === []
             && $this->summaryHealthy
             && $this->integrityHealthy
-            && ! $this->capacityExhausted()
-            && ! $this->backlogStale();
+            && ! $this->durablePublicationFailure()
+            && ! $this->backlogStale()
+            && ! $this->capacityExhausted();
     }
 
     public function recoveryReady(): bool
@@ -165,10 +286,12 @@ final class AwsS3OperationalState
         if (! $this->admission->providerAdmitted) {
             return self::REASON_PROVIDER;
         }
-        if (! $this->integrityHealthy) {
+        if (! $this->integrityHealthy || $this->objectRecoveryPending !== []
+            || (int) ($this->summary['ambiguous'] ?? 0) > 0) {
             return self::REASON_INTEGRITY;
         }
-        if (! $this->collectorHealthy || ! $this->summaryHealthy || $this->backlogStale()) {
+        if ($this->collectorFailures !== [] || ! $this->summaryHealthy || $this->backlogStale()
+            || (int) ($this->summary['failures'] ?? 0) > 0) {
             return self::REASON_COLLECTOR;
         }
         if ($this->capacityExhausted()) {
@@ -178,9 +301,8 @@ final class AwsS3OperationalState
     }
 
     /** @return array<string, bool|float|int|string> */
-    public function snapshot(bool $force = false): array
+    public function snapshot(): array
     {
-        $this->revalidate($force);
         $summary = $this->summary ?? [];
         return [
             'provider_type' => AwsS3ProviderAdmission::PROVIDER_TYPE,
@@ -189,7 +311,7 @@ final class AwsS3OperationalState
             'owner_check_passed' => $this->admission->ownerCheckPassed,
             'versioning_state' => $this->admission->versioningState,
             'provider_admitted' => $this->admission->providerAdmitted,
-            'fence_complete' => $this->inventory->isComplete(),
+            'fence_complete' => $this->runtimeCommitted && $this->inventory->isComplete(),
             'writer_coverage_complete' => $this->inventory->isComplete(),
             'drift_state' => $this->driftState(),
             'production_qualified' => false,
@@ -208,7 +330,13 @@ final class AwsS3OperationalState
             'oldest_age_seconds' => (float) ($summary['oldest_age_seconds'] ?? 0.0),
             'max_owner_open' => (int) ($summary['max_owner_open'] ?? 0),
             'max_owner_sealed' => (int) ($summary['max_owner_sealed'] ?? 0),
+            'max_owner_multipart' => (int) ($summary['max_owner_multipart'] ?? 0),
             'max_owner_part' => (int) ($summary['max_owner_part'] ?? 0),
+            'global_open' => (int) ($summary['global_open'] ?? 0),
+            'global_seal_reserved' => (int) ($summary['global_seal_reserved'] ?? 0),
+            'global_multipart' => (int) ($summary['global_multipart'] ?? 0),
+            'global_part' => (int) ($summary['global_part'] ?? 0),
+            'global_cleanup' => (int) ($summary['global_cleanup'] ?? 0),
         ];
     }
 
@@ -227,19 +355,28 @@ final class AwsS3OperationalState
     {
         $summary = $this->summary;
         return $summary !== null && (
-            (int) $summary['open'] >= ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL
-            || (int) $summary['seal_reserved'] >= ObjectWriteIntentStore::MAX_SEALS_GLOBAL
-            || (int) $summary['part'] >= MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS
-            || (int) $summary['cleanup'] >= StorageCleanupCapacityReader::RECOVERY_LIMIT
+            (int) $summary['global_open'] >= ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL
+            || (int) $summary['global_seal_reserved'] >= ObjectWriteIntentStore::MAX_SEALS_GLOBAL
+            || (int) $summary['global_multipart'] >= MultipartWriteIntentStore::MAX_OUTSTANDING_COMPLETION_INTENTS_GLOBAL
+            || (int) $summary['global_part'] >= MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS
+            || (int) $summary['global_cleanup'] >= StorageCleanupCapacityReader::RECOVERY_LIMIT
         );
+    }
+
+    private function durablePublicationFailure(): bool
+    {
+        return (int) ($this->summary['ambiguous'] ?? 0) > 0
+            || (int) ($this->summary['failures'] ?? 0) > 0;
     }
 
     private function reconciliationState(): string
     {
-        if (! $this->integrityHealthy) {
+        if (! $this->integrityHealthy || $this->objectRecoveryPending !== []
+            || (int) ($this->summary['ambiguous'] ?? 0) > 0) {
             return 'integrity_conflict';
         }
-        if (! $this->collectorHealthy || ! $this->summaryHealthy) {
+        if ($this->collectorFailures !== [] || ! $this->summaryHealthy
+            || (int) ($this->summary['failures'] ?? 0) > 0) {
             return 'failed';
         }
         if ($this->backlogStale()) {
@@ -249,6 +386,17 @@ final class AwsS3OperationalState
             return 'capacity';
         }
         return 'healthy';
+    }
+
+    private function recoveryToken(string $attemptId, string $dispatchId): string
+    {
+        if (preg_match('/^[a-f0-9]{32}$/D', $attemptId) !== 1
+            || preg_match('/^[a-f0-9]{32}$/D', $dispatchId) !== 1
+            || $dispatchId === ObjectWriteIntent::LEGACY_UNKNOWN_DISPATCH) {
+            throw new \InvalidArgumentException('AWS recovery pending state requires one exact dispatch token.');
+        }
+
+        return $attemptId . ':' . $dispatchId;
     }
 
     private function driftState(): string

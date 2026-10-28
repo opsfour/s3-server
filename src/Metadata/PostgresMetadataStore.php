@@ -1432,6 +1432,21 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         });
     }
 
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('Physical write recovery scheduling requires its own committed transaction.');
+        }
+        $result = $this->conn()->execute(<<<'SQL'
+            UPDATE s3_object_write_intents
+            SET lease_until = EXTRACT(EPOCH FROM clock_timestamp())
+            WHERE attempt_id = $1 AND state = 'active' AND dispatch_id = $2
+            SQL, [$attemptId, $dispatchId]);
+
+        return ($result->getRowCount() ?? 0) === 1;
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->fiberTransaction() !== null) {
@@ -3798,8 +3813,10 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             throw new \InvalidArgumentException('AWS operational summary requires an exact storage tier.');
         }
         $row = $this->conn()->execute(<<<'SQL'
-            WITH object_rows AS (
-                SELECT owner_id, state, seal_reserved, dispatch_id, created_at
+            WITH db_clock AS (
+                SELECT clock_timestamp() AS now
+            ), object_rows AS (
+                SELECT owner_id, state, seal_reserved, dispatch_id, lease_until, created_at
                 FROM s3_object_write_intents WHERE storage_tier = $1
             ), part_rows AS (
                 SELECT owner_id, attempts, created_at FROM s3_storage_garbage
@@ -3808,27 +3825,37 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 SELECT attempts, created_at FROM s3_storage_garbage
                 WHERE storage_tier = $1 AND operation <> 'part_write_intent'
             ), multipart_rows AS (
-                SELECT created_at FROM s3_multipart_write_intents WHERE storage_tier = $1
+                SELECT owner_id, state, lease_until, created_at
+                FROM s3_multipart_write_intents WHERE storage_tier = $1
             ), owner_object AS (
                 SELECT owner_id,
                        COUNT(*) FILTER (WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
                        COUNT(*) FILTER (WHERE seal_reserved) AS seal_count
-                FROM object_rows GROUP BY owner_id
+                FROM s3_object_write_intents GROUP BY owner_id
+            ), owner_multipart AS (
+                SELECT owner_id, COUNT(*) AS multipart_count
+                FROM s3_multipart_write_intents GROUP BY owner_id
             ), owner_part AS (
-                SELECT owner_id, COUNT(*) AS part_count FROM part_rows
-                WHERE owner_id IS NOT NULL GROUP BY owner_id
+                SELECT owner_id, COUNT(*) AS part_count FROM s3_storage_garbage
+                WHERE operation = 'part_write_intent' AND owner_id IS NOT NULL GROUP BY owner_id
             ), oldest AS (
                 SELECT MIN(created_at) AS created_at FROM (
-                    SELECT created_at FROM object_rows WHERE NOT (seal_reserved AND state = 'sealed')
+                    SELECT created_at FROM object_rows
+                    WHERE state = 'reconciling'
+                       OR (state = 'active' AND lease_until <= EXTRACT(EPOCH FROM (SELECT now FROM db_clock)))
                     UNION ALL SELECT created_at FROM part_rows
                     UNION ALL SELECT created_at FROM cleanup_rows
                     UNION ALL SELECT created_at FROM multipart_rows
+                    WHERE state = 'active'
+                      AND lease_until <= EXTRACT(EPOCH FROM (SELECT now FROM db_clock))
                 ) retained
             )
             SELECT
                 (SELECT COUNT(*) FROM object_rows WHERE NOT seal_reserved OR state <> 'sealed') AS open_count,
                 (SELECT COUNT(*) FROM object_rows
-                    WHERE state = 'reconciling' OR (state = 'active' AND dispatch_id IS NOT NULL)) AS ambiguous_count,
+                    WHERE state = 'reconciling'
+                       OR (state = 'active' AND dispatch_id IS NOT NULL
+                           AND lease_until <= EXTRACT(EPOCH FROM (SELECT now FROM db_clock)))) AS ambiguous_count,
                 (SELECT COUNT(*) FROM object_rows WHERE seal_reserved) AS seal_reserved_count,
                 (SELECT COUNT(*) FROM object_rows WHERE seal_reserved AND state = 'sealed') AS sealed_count,
                 (SELECT COUNT(*) FROM multipart_rows) AS multipart_count,
@@ -3836,10 +3863,16 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 (SELECT COUNT(*) FROM cleanup_rows) AS cleanup_count,
                 (SELECT COUNT(*) FROM cleanup_rows WHERE attempts > 0) +
                     (SELECT COUNT(*) FROM part_rows WHERE attempts > 0) AS failure_count,
-                COALESCE(GREATEST(0, EXTRACT(EPOCH FROM clock_timestamp() - (SELECT created_at FROM oldest))), 0) AS oldest_age_seconds,
+                COALESCE(GREATEST(0, EXTRACT(EPOCH FROM (SELECT now FROM db_clock) - (SELECT created_at FROM oldest))), 0) AS oldest_age_seconds,
                 COALESCE((SELECT MAX(open_count) FROM owner_object), 0) AS max_owner_open,
                 COALESCE((SELECT MAX(seal_count) FROM owner_object), 0) AS max_owner_sealed,
-                COALESCE((SELECT MAX(part_count) FROM owner_part), 0) AS max_owner_part
+                COALESCE((SELECT MAX(multipart_count) FROM owner_multipart), 0) AS max_owner_multipart,
+                COALESCE((SELECT MAX(part_count) FROM owner_part), 0) AS max_owner_part,
+                COALESCE((SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'object'), -1) AS global_open,
+                COALESCE((SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'object_seal'), -1) AS global_seal_reserved,
+                COALESCE((SELECT retained_count FROM s3_multipart_completion_capacity WHERE id = 1), -1) AS global_multipart,
+                COALESCE((SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'part'), -1) AS global_part,
+                COALESCE((SELECT retained_count FROM s3_storage_cleanup_capacity WHERE id = 1), -1) AS global_cleanup
             SQL, [$storageTier])->fetchRow();
         if ($row === null) {
             throw new \RuntimeException('AWS operational summary is unavailable.');
@@ -3857,7 +3890,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             'oldest_age_seconds' => self::float($row['oldest_age_seconds']),
             'max_owner_open' => self::int($row['max_owner_open']),
             'max_owner_sealed' => self::int($row['max_owner_sealed']),
+            'max_owner_multipart' => self::int($row['max_owner_multipart']),
             'max_owner_part' => self::int($row['max_owner_part']),
+            'global_open' => self::nonNegativeInt($row['global_open'], 'AWS global object capacity'),
+            'global_seal_reserved' => self::nonNegativeInt($row['global_seal_reserved'], 'AWS global seal capacity'),
+            'global_multipart' => self::nonNegativeInt($row['global_multipart'], 'AWS global multipart capacity'),
+            'global_part' => self::nonNegativeInt($row['global_part'], 'AWS global part capacity'),
+            'global_cleanup' => self::nonNegativeInt($row['global_cleanup'], 'AWS global cleanup capacity'),
         ];
     }
 
@@ -4820,6 +4859,15 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     {
         if (is_array($value)) {
             return 0;
+        }
+
+        return (int) $value;
+    }
+
+    private static function nonNegativeInt(mixed $value, string $name): int
+    {
+        if (! is_numeric($value) || (int) $value < 0) {
+            throw new \RuntimeException($name . ' counter is unavailable.');
         }
 
         return (int) $value;

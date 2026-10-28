@@ -37,7 +37,7 @@ use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
-use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
+use OpsFour\S3Server\Storage\AwsS3ProviderWorkerProbe;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -98,6 +98,10 @@ final readonly class S3ServerRuntimeFactory
         );
         $server->setStorageTierRegistry($storageTiers);
         $runtime = null;
+        $attachedAwsStorage = null;
+        $attachedAwsState = null;
+        $attachedAwsTier = null;
+        $attachedAwsMetadata = null;
         $localStorageRootLocks = $server->transferLocalStorageRootLockOwnership();
 
         try {
@@ -206,19 +210,30 @@ final readonly class S3ServerRuntimeFactory
                 }
                 $binding = $awsStorage->validatedBinding()
                     ?? throw new \RuntimeException('The admitted AWS S3 profile lost its validated binding.');
+                $profile = $binding->profile
+                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its provider profile.');
                 $inventory = StorageMutatorInventory::forEnabledRuntime([
                     ...HandlerRegistrar::storageMutatorRegistrations(),
                     ...S3Server::storageMutatorRegistrations(),
                     ...\OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler::storageMutatorRegistrations(),
                 ]);
+                $probePool = new ContextWorkerPool(1);
+                $server->addWorkerPool($probePool, 'aws_provider_probe', 1, forceKillOnShutdown: true);
                 $awsOperationalState = new AwsS3OperationalState(
                     $binding,
-                    new AwsS3ProviderValidator(),
+                    new AwsS3ProviderWorkerProbe(
+                        $probePool,
+                        $profile->requestTimeoutSeconds * 2 + 5.0,
+                    ),
                     $inventory,
                     $metadata,
                     $awsTier->name,
                 );
-                $awsStorage->attachOperationalState($awsOperationalState);
+                $awsStorage->attachOperationalState($awsOperationalState, $awsTier->name, $metadata);
+                $attachedAwsStorage = $awsStorage;
+                $attachedAwsState = $awsOperationalState;
+                $attachedAwsTier = $awsTier->name;
+                $attachedAwsMetadata = $metadata;
                 $server->setAwsOperationalState($awsOperationalState);
                 $awsTierWriter = $awsStorage->createForegroundObjectWriter(
                     $metadata,
@@ -313,6 +328,22 @@ final readonly class S3ServerRuntimeFactory
                     $localStorageRootLocks->release();
                 } else {
                     $localStorageRootLocks->retainUntilProcessExit();
+                }
+            }
+
+            if ($cleanupComplete && $attachedAwsStorage instanceof AwsS3StorageBackend
+                && $attachedAwsState instanceof AwsS3OperationalState
+                && is_string($attachedAwsTier) && is_object($attachedAwsMetadata)
+                && $attachedAwsStorage->operationalState() === $attachedAwsState
+                && ! $attachedAwsStorage->operationalAttachmentCommitted()) {
+                try {
+                    $attachedAwsStorage->rollbackOperationalStateAttachment(
+                        $attachedAwsState,
+                        $attachedAwsTier,
+                        $attachedAwsMetadata,
+                    );
+                } catch (\Throwable $cleanupError) {
+                    self::logCleanupFailure($logger, 'Runtime factory AWS state rollback failed.', $cleanupError);
                 }
             }
 

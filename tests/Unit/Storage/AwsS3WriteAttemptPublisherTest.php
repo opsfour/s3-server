@@ -86,6 +86,16 @@ final class AwsS3WriteAttemptPublisherTest extends TestCase
             self::assertNull($outcome->etag);
             self::assertSame(['attemptId', 'dispatchId', 'state', 'etag'], array_keys(get_object_vars($outcome)));
             self::assertNotNull($store->getObjectWriteIntent($planned->attemptId));
+            $due = $store->claimDueObjectWriteIntents('AWS', 1, 300.0);
+            if (in_array($expected, [
+                AwsS3CreateOnlyWriteOutcome::PRECONDITION_CONFLICT,
+                AwsS3CreateOnlyWriteOutcome::AMBIGUOUS,
+            ], true)) {
+                self::assertCount(1, $due, 'Uncertain provider evidence must be due immediately.');
+                self::assertSame($outcome->dispatchId, $due[0]->dispatchId);
+            } else {
+                self::assertSame([], $due, 'A confirmed rejection must retain its live lease until retirement.');
+            }
             self::assertCount(1, $requests);
         }
     }
@@ -476,6 +486,10 @@ final readonly class PublisherObjectWriteIntentStore implements ObjectWriteInten
     public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
     {
         return $this->inner->renewArmedObjectWriteIntent($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds);
+    }
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->inner->expireArmedObjectWriteIntent($attemptId, $dispatchId);
     }
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {

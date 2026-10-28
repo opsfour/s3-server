@@ -9,7 +9,7 @@ use Aws\Exception\AwsException;
 use Aws\S3\S3Client;
 
 /** Performs only read-only probes against an immutable AWS S3 profile. */
-final class AwsS3ProviderValidator
+final class AwsS3ProviderValidator implements AwsS3ProviderProbe
 {
     private readonly ?\Closure $httpHandler;
 
@@ -179,6 +179,11 @@ final class AwsS3ProviderValidator
         }
 
         return new S3Client($this->clientConfiguration($profile));
+    }
+
+    public function revalidate(AwsS3ProviderProfile $profile): AwsS3ProviderAdmission
+    {
+        return $this->validate($profile);
     }
 
     /** @return array<string, mixed> */

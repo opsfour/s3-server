@@ -66,7 +66,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
  *
  * The storage backend is responsible for atomic writes (temp file + rename).
  */
-final class PutObjectHandler implements RequestHandler
+final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
     private readonly StorageTierRegistry $storageTiers;
 
@@ -119,6 +119,11 @@ final class PutObjectHandler implements RequestHandler
                 throw new \InvalidArgumentException('AWS object writer must match the intent-capable default AWS tier.');
             }
         }
+    }
+
+    public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->awsObjectWriter === $writer;
     }
 
     public function handleRequest(Request $request): Response

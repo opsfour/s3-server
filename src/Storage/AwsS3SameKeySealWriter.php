@@ -29,6 +29,14 @@ final readonly class AwsS3SameKeySealWriter
         }
     }
 
+    public function isBoundTo(AwsS3ProviderValidatedBinding $binding): bool
+    {
+        return $binding->client === $this->client
+            && $binding->profile !== null
+            && hash_equals($binding->profile->bucket, $this->bucket)
+            && hash_equals($binding->profile->expectedOwnerId, $this->expectedOwnerId);
+    }
+
     /** Reconcile only exact v2 attempt evidence, a verified seal, or a conclusive NoSuchKey. */
     public function reconcile(ObjectWriteIntent $intent, ?\Closure $heartbeat = null): void
     {

@@ -32,6 +32,7 @@ use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 
@@ -106,6 +107,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         }));
         self::assertTrue($binding->admission->providerAdmitted);
         $this->backend = new AwsS3StorageBackend($binding->admission, $binding);
+        AwsS3OperationalStateFixture::attach($this->backend, $binding, 'STANDARD');
         $this->writer = $this->backend->createForegroundObjectWriter(
             $this->metadata,
             $this->base . '/scratch',
@@ -813,6 +815,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         self::assertSame('PUT', $finalRequest->getMethod());
         $finalAttempt = basename($finalRequest->getUri()->getPath());
         self::assertNotNull($this->metadata->getObjectWriteIntent($finalAttempt)?->dispatchId);
+        self::assertSame('integrity', $this->backend->operationalState()?->snapshot()['reason']);
         $multipartIntent = $this->multipartIntent($uploadId);
         self::assertSame('abandoned', $multipartIntent['state']);
         self::assertSame($finalAttempt, basename($multipartIntent['final_path']));

@@ -25,12 +25,17 @@ use OpsFour\S3Server\Security\RequestNetworkContext;
  * the same versioning, quota, encryption, ACL, checksum, cleanup, and
  * notification behavior as regular PutObject requests.
  */
-final class PostObjectHandler implements RequestHandler
+final class PostObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly PutObjectHandler $putObject,
     ) {}
+
+    public function usesAwsS3ForegroundObjectWriter(\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->putObject->usesAwsS3ForegroundObjectWriter($writer);
+    }
 
     public function handleRequest(Request $request): Response
     {

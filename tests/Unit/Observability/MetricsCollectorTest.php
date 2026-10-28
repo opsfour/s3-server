@@ -129,7 +129,13 @@ final class MetricsCollectorTest extends TestCase
             'oldest_age_seconds' => 12.5,
             'max_owner_open' => 2,
             'max_owner_sealed' => 3,
+            'max_owner_multipart' => 6,
             'max_owner_part' => 4,
+            'global_open' => 30,
+            'global_seal_reserved' => 31,
+            'global_multipart' => 32,
+            'global_part' => 33,
+            'global_cleanup' => 34,
         ]);
 
         $rendered = $metrics->renderPrometheus();
@@ -137,6 +143,8 @@ final class MetricsCollectorTest extends TestCase
         self::assertStringContainsString('s3_server_aws_profile_qualification{state="production_qualified"} 0', $rendered);
         self::assertStringContainsString('s3_server_aws_recovery_oldest_age_seconds 12.5', $rendered);
         self::assertStringContainsString('s3_server_aws_recovery_max_owner_items{kind="open"} 2', $rendered);
+        self::assertStringContainsString('s3_server_aws_recovery_max_owner_items{kind="multipart"} 6', $rendered);
+        self::assertStringContainsString('s3_server_aws_recovery_global_capacity_items{kind="multipart"} 32', $rendered);
         self::assertStringContainsString('s3_server_aws_profile_versioning_state{state="disabled"} 1', $rendered);
         self::assertStringContainsString('s3_server_aws_profile_drift_state{state="clear"} 1', $rendered);
         self::assertStringContainsString('s3_server_aws_reconciliation_state{state="healthy"} 1', $rendered);

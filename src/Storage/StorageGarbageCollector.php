@@ -30,6 +30,7 @@ final readonly class StorageGarbageCollector
         private StorageTierRegistry $tiers,
         LoggerInterface $logger = new NullLogger(),
         private float $renewIntervalSeconds = 100.0,
+        private ?AwsS3OperationalState $awsOperationalState = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0 || $renewIntervalSeconds >= 150) {
@@ -45,6 +46,10 @@ final readonly class StorageGarbageCollector
         $leases = $this->metadata;
         $completed = 0;
         $processed = 0;
+        $awsFailure = false;
+        $awsObserved = false;
+        $queueExhausted = false;
+        $hasAwsTier = $this->hasAwsTier();
         $limit = max(1, $limit);
 
         if ($this->metadata instanceof FencedMultipartPartWriteIntentStore) {
@@ -54,10 +59,19 @@ final readonly class StorageGarbageCollector
                     $backend = $backend->innerBackend();
                 }
                 if ($backend instanceof FilesystemBackend) {
-                    $retired = $this->metadata->retireExpiredUndispatchedLocalMultipartPartWriteIntents(
-                        $tier->name,
-                        $limit - $processed,
-                    );
+                    try {
+                        $retired = $this->metadata->retireExpiredUndispatchedLocalMultipartPartWriteIntents(
+                            $tier->name,
+                            $limit - $processed,
+                        );
+                    } catch (CancelledException $error) {
+                        throw $error;
+                    } catch (\Throwable $error) {
+                        if ($hasAwsTier) {
+                            $this->awsOperationalState?->markCollectorFailure('storage_garbage');
+                        }
+                        throw $error;
+                    }
                     $processed += $retired;
                     $completed += $retired;
                     if ($processed >= $limit) {
@@ -69,8 +83,18 @@ final readonly class StorageGarbageCollector
 
         while ($processed < $limit) {
             $cancellation?->throwIfRequested();
-            $items = $this->metadata->dequeueStorageGarbage(1);
+            try {
+                $items = $this->metadata->dequeueStorageGarbage(1);
+            } catch (CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                if ($hasAwsTier) {
+                    $this->awsOperationalState?->markCollectorFailure('storage_garbage');
+                }
+                throw $error;
+            }
             if ($items === []) {
+                $queueExhausted = true;
                 break;
             }
 
@@ -104,6 +128,7 @@ final readonly class StorageGarbageCollector
                     $physicalBackend = $physicalBackend->innerBackend();
                 }
                 $awsBackend = $physicalBackend instanceof AwsS3StorageBackend;
+                $awsObserved = $awsObserved || $awsBackend;
                 if ($awsBackend && $item['operation'] !== 'delete_path') {
                     throw new \RuntimeException('AWS garbage operation has no registered cleanup capability.');
                 }
@@ -194,6 +219,10 @@ final readonly class StorageGarbageCollector
             try {
                 $heartbeat->stop();
             } catch (\Throwable $e) {
+                if ($awsBackend) {
+                    $awsFailure = true;
+                    $this->awsOperationalState?->markCollectorFailure('storage_garbage');
+                }
                 $this->logger->warning('Storage garbage claim was lost during physical cleanup.', [
                     'component' => 'storage_gc',
                     'garbage_id' => $item['id'],
@@ -203,6 +232,9 @@ final readonly class StorageGarbageCollector
             }
             $item['lease_expires_at'] = $leaseUntil;
             if ($failed !== null) {
+                if ($awsBackend) {
+                    $awsFailure = true;
+                }
                 $attempts = $item['attempts'] + 1;
                 $retryScheduled = $this->retryClaim(
                     $item,
@@ -248,7 +280,28 @@ final readonly class StorageGarbageCollector
             $cancellation?->throwIfRequested();
         }
 
+        if ($awsFailure) {
+            $this->awsOperationalState?->markCollectorFailure('storage_garbage');
+        } elseif ($awsObserved || ($hasAwsTier && $queueExhausted)) {
+            $this->awsOperationalState?->markCollectorHealthy('storage_garbage');
+        }
+
         return $completed;
+    }
+
+    private function hasAwsTier(): bool
+    {
+        foreach ($this->tiers->all() as $tier) {
+            $backend = $tier->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if ($backend instanceof AwsS3StorageBackend) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function sealLocalPart(FilesystemBackend $backend, string $path, ?string $uploadId): void

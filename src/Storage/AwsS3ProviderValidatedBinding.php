@@ -35,18 +35,4 @@ final readonly class AwsS3ProviderValidatedBinding
         );
     }
 
-    /** Re-run bounded read-only probes with the exact admitted profile and client. */
-    public function revalidate(AwsS3ProviderValidator $validator): AwsS3ProviderAdmission
-    {
-        $profile = $this->profile;
-        $client = $this->client;
-        if ($profile === null || $client === null) {
-            return $this->admission;
-        }
-
-        return $validator->validate($profile, static fn(AwsS3ProviderProfile $candidate): S3Client
-            => $candidate === $profile
-                ? $client
-                : throw new \LogicException('AWS revalidation profile identity changed.'));
-    }
 }

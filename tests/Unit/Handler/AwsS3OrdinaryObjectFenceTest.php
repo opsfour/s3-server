@@ -56,6 +56,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
@@ -122,6 +123,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         }));
         self::assertTrue($binding->admission->providerAdmitted);
         $this->backend = new AwsS3StorageBackend($binding->admission, $binding);
+        AwsS3OperationalStateFixture::attach($this->backend, $binding, 'STANDARD');
         $this->writer = $this->backend->createForegroundObjectWriter($this->metadata, $this->base . '/scratch', 'STANDARD', 1_048_576);
     }
 
@@ -708,6 +710,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $binding = $property->getValue($this->backend);
         self::assertInstanceOf(AwsS3ProviderValidatedBinding::class, $binding);
         $otherBackend = new AwsS3StorageBackend($binding->admission, $binding);
+        AwsS3OperationalStateFixture::attach($otherBackend, $binding, 'STANDARD');
         self::assertTrue(mkdir($this->base . '/other-backend-scratch', 0700));
         $otherWriter = $otherBackend->createForegroundObjectWriter(
             $this->metadata,
@@ -728,26 +731,15 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         }
     }
 
-    public function test_handlers_reject_a_writer_with_a_different_tier_name(): void
+    public function test_backend_rejects_a_writer_with_a_different_tier_name(): void
     {
         self::assertTrue(mkdir($this->base . '/other-tier-scratch', 0700));
-        $otherTierWriter = $this->backend->createForegroundObjectWriter(
+        $this->expectException(\LogicException::class);
+        $this->backend->createForegroundObjectWriter(
             $this->metadata,
             $this->base . '/other-tier-scratch',
             'ARCHIVE',
         );
-        try {
-            foreach ([PutObjectHandler::class, CopyObjectHandler::class] as $handlerClass) {
-                try {
-                    new $handlerClass($this->metadata, $this->backend, awsObjectWriter: $otherTierWriter);
-                    self::fail('A handler accepted an AWS writer for another tier name.');
-                } catch (\InvalidArgumentException) {
-                    self::addToAssertionCount(1);
-                }
-            }
-        } finally {
-            $otherTierWriter->shutdown();
-        }
     }
 
     public function test_known_oversized_sse_put_rejects_before_buffer_and_intent_capacity(): void
@@ -894,23 +886,28 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         }
     }
 
-    public function test_conflict_and_ambiguous_provider_results_leave_armed_recovery_evidence(): void
-    {
-        foreach ([
-            new Response(412, [], '<Error><Code>PreconditionFailed</Code></Error>'),
-            new Response(503, [], '<Error><Code>ServiceUnavailable</Code></Error>'),
-        ] as $response) {
-            $this->mock->append($response);
-            try {
-                $this->put()->handleRequest($this->putRequest('payload'));
-                self::fail('Unconfirmed publication became visible.');
-            } catch (InternalErrorException) {
-                self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
-            }
-            $request = end($this->requests);
-            self::assertInstanceOf(RequestInterface::class, $request);
-            self::assertNotNull($this->metadata->getObjectWriteIntent(basename($request->getUri()->getPath()))?->dispatchId);
+    #[DataProvider('unconfirmedPublicationProvider')]
+    public function test_conflict_and_ambiguous_provider_results_leave_armed_recovery_evidence(
+        int $status,
+        string $body,
+    ): void {
+        $this->mock->append(new Response($status, [], $body));
+        try {
+            $this->put()->handleRequest($this->putRequest('payload'));
+            self::fail('Unconfirmed publication became visible.');
+        } catch (InternalErrorException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
         }
+        $request = end($this->requests);
+        self::assertInstanceOf(RequestInterface::class, $request);
+        self::assertNotNull($this->metadata->getObjectWriteIntent(basename($request->getUri()->getPath()))?->dispatchId);
+    }
+
+    /** @return iterable<string, array{int, string}> */
+    public static function unconfirmedPublicationProvider(): iterable
+    {
+        yield 'conflict' => [412, '<Error><Code>PreconditionFailed</Code></Error>'];
+        yield 'ambiguous' => [503, '<Error><Code>ServiceUnavailable</Code></Error>'];
     }
 
     public function test_same_tier_copy_reads_exact_source_and_publishes_once(): void

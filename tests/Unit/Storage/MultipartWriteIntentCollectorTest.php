@@ -5,19 +5,97 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\Psr7\Response;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\MultipartWriteIntentCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
 
 final class MultipartWriteIntentCollectorTest extends TestCase
 {
+    public function test_retained_aws_tombstone_is_backlog_not_a_collector_failure(): void
+    {
+        $oldKey = getenv('AWS_ACCESS_KEY_ID');
+        $oldSecret = getenv('AWS_SECRET_ACCESS_KEY');
+        putenv('AWS_ACCESS_KEY_ID=test');
+        putenv('AWS_SECRET_ACCESS_KEY=test');
+        try {
+            $requests = [];
+            $mock = new MockHandler([
+                new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+                new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+            ]);
+            $binding = AwsS3ProviderValidatedBinding::fromConfiguration([
+                'bucket' => 'backing-private',
+                'region' => 'us-east-1',
+                'expected_owner_id' => '123456789012',
+                'data_prefix' => 'data',
+                'reserved_prefix' => '.opsfour',
+            ], new AwsS3ProviderValidator(static function (RequestInterface $request, array $options) use ($mock, &$requests) {
+                $requests[] = $request;
+                return $mock($request, $options);
+            }));
+            self::assertTrue($binding->admission->providerAdmitted);
+            $backend = new AwsS3StorageBackend($binding->admission, $binding);
+            $metadata = new SqliteMetadataStore(':memory:');
+            $metadata->initialize();
+            $operationalMetadata = new AwsS3MultipartOperationalMetadataFixture($metadata);
+            $state = AwsS3OperationalStateFixture::attach($backend, $binding, 'AWS', $operationalMetadata);
+            $state->markCollectorFailure('storage_garbage');
+            $metadata->createBucket('owner', 'bucket', 'us-east-1');
+            $metadata->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'AWS');
+            $bucket = $metadata->getBucket('bucket');
+            self::assertNotNull($bucket);
+            $attemptId = str_repeat('a', 32);
+            $path = '.opsfour/write-attempts/bucket/key/' . $attemptId;
+            $metadata->createMultipartWriteIntent(new MultipartWriteIntent(
+                attemptId: $attemptId,
+                uploadId: 'upload',
+                bucket: 'bucket',
+                bucketGeneration: $bucket->generation,
+                ownerId: 'owner',
+                storageTier: 'AWS',
+                assemblyPath: $path,
+                finalPath: $path,
+                partDigest: str_repeat('b', 64),
+                sseMode: null,
+                leaseUntil: microtime(true) - 1,
+                nextAttemptAt: microtime(true) - 1,
+            ));
+
+            $collector = new MultipartWriteIntentCollector(
+                $operationalMetadata,
+                StorageTierRegistry::single($backend, 'AWS'),
+                awsOperationalState: $state,
+            );
+            self::assertSame(1, $collector->collect(1));
+            self::assertSame('abandoned', $metadata->getMultipartWriteIntent($attemptId)?->state);
+            self::assertSame('collector', $state->snapshot()['reason']);
+            $state->markCollectorHealthy('storage_garbage');
+            self::assertSame('healthy', $state->snapshot()['reason']);
+            self::assertTrue($state->mutationReady());
+            self::assertCount(2, $requests);
+        } finally {
+            putenv($oldKey === false ? 'AWS_ACCESS_KEY_ID' : 'AWS_ACCESS_KEY_ID=' . $oldKey);
+            putenv($oldSecret === false ? 'AWS_SECRET_ACCESS_KEY' : 'AWS_SECRET_ACCESS_KEY=' . $oldSecret);
+        }
+    }
+
     public function test_local_collector_retires_never_dispatched_attempt_but_preserves_armed_and_legacy_fences(): void
     {
         $root = sys_get_temp_dir() . '/s3-multipart-undispatched-' . bin2hex(random_bytes(8));
@@ -287,5 +365,68 @@ final class MultipartWriteIntentCollectorTest extends TestCase
             }
         }
         rmdir($path);
+    }
+}
+
+/** Exact operational identity for the retained AWS multipart collector fixture. */
+final readonly class AwsS3MultipartOperationalMetadataFixture implements MultipartWriteIntentStore, FencedMultipartWriteIntentStore, AwsS3OperationalSummaryReader
+{
+    public function __construct(private SqliteMetadataStore $inner) {}
+
+    public function multipartWriteIntentNow(): float
+    {
+        return $this->inner->multipartWriteIntentNow();
+    }
+    public function createMultipartWriteIntent(MultipartWriteIntent $intent): void
+    {
+        $this->inner->createMultipartWriteIntent($intent);
+    }
+    public function getMultipartWriteIntent(string $attemptId): ?MultipartWriteIntent
+    {
+        return $this->inner->getMultipartWriteIntent($attemptId);
+    }
+    public function renewMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $newLeaseUntil): bool
+    {
+        return $this->inner->renewMultipartWriteIntent($attemptId, $expectedLeaseUntil, $newLeaseUntil);
+    }
+    public function abandonMultipartWriteIntent(string $attemptId, float $nextAttemptAt): bool
+    {
+        return $this->inner->abandonMultipartWriteIntent($attemptId, $nextAttemptAt);
+    }
+    public function abandonMultipartWriteIntentsForUpload(string $uploadId, float $nextAttemptAt): int
+    {
+        return $this->inner->abandonMultipartWriteIntentsForUpload($uploadId, $nextAttemptAt);
+    }
+    public function consumeMultipartWriteIntent(string $attemptId): bool
+    {
+        return $this->inner->consumeMultipartWriteIntent($attemptId);
+    }
+    public function claimDueMultipartWriteIntents(int $limit, float $now, float $leaseUntil): array
+    {
+        return $this->inner->claimDueMultipartWriteIntents($limit, $now, $leaseUntil);
+    }
+    public function retryMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $nextAttemptAt): bool
+    {
+        return $this->inner->retryMultipartWriteIntent($attemptId, $expectedLeaseUntil, $nextAttemptAt);
+    }
+    public function renewMultipartCollectorClaim(string $attemptId, float $newLeaseUntil, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        return $this->inner->renewMultipartCollectorClaim($attemptId, $newLeaseUntil, $expectedLeaseUntil, $claimGeneration);
+    }
+    public function retryMultipartCollectorClaim(string $attemptId, float $nextAttemptAt, float $expectedLeaseUntil, int $claimGeneration): bool
+    {
+        return $this->inner->retryMultipartCollectorClaim($attemptId, $nextAttemptAt, $expectedLeaseUntil, $claimGeneration);
+    }
+
+    public function getAwsS3OperationalSummary(string $storageTier): array
+    {
+        return [
+            'open' => 0, 'ambiguous' => 0, 'seal_reserved' => 0, 'sealed' => 0,
+            'multipart' => 1, 'part' => 0, 'cleanup' => 0, 'failures' => 0,
+            'oldest_age_seconds' => 0.0, 'max_owner_open' => 0, 'max_owner_sealed' => 0,
+            'max_owner_multipart' => 1, 'max_owner_part' => 0, 'global_open' => 0,
+            'global_seal_reserved' => 0, 'global_multipart' => 1, 'global_part' => 0,
+            'global_cleanup' => 0,
+        ];
     }
 }

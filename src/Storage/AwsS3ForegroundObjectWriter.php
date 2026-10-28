@@ -63,6 +63,16 @@ final readonly class AwsS3ForegroundObjectWriter
             && $this->intents === $intents;
     }
 
+    public function isBoundToOperationalGraph(
+        AwsS3StorageBackend $backend,
+        AwsS3ProviderProfile $profile,
+        ObjectWriteIntentStore $intents,
+        AwsS3OperationalState $operationalState,
+    ): bool {
+        return $this->isBoundTo($backend, $profile, $intents)
+            && $this->operationalState === $operationalState;
+    }
+
     /** Exact backend/tier binding used by the background publication adapter. */
     public function isBoundToBackend(AwsS3StorageBackend $backend, string $storageTier): bool
     {
@@ -193,6 +203,12 @@ final readonly class AwsS3ForegroundObjectWriter
             $body instanceof AwsS3MultipartPsrStream
                 ? $body->sha256Hex()
                 : self::sha256Hex($result),
+            function (AwsS3WriteAttemptOutcome $outcome): void {
+                $this->operationalState?->markObjectRecoveryPending(
+                    $outcome->attemptId,
+                    $outcome->dispatchId,
+                );
+            },
         );
         $this->recordPublicationOutcome($outcome);
         if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
@@ -396,6 +412,12 @@ final readonly class AwsS3ForegroundObjectWriter
                 $input,
                 $stage->result->size,
                 self::sha256Hex($stage->result),
+                function (AwsS3WriteAttemptOutcome $outcome): void {
+                    $this->operationalState?->markObjectRecoveryPending(
+                        $outcome->attemptId,
+                        $outcome->dispatchId,
+                    );
+                },
             );
             $this->recordPublicationOutcome($outcome);
             if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
@@ -448,8 +470,9 @@ final readonly class AwsS3ForegroundObjectWriter
     private function recordPublicationOutcome(AwsS3WriteAttemptOutcome $outcome): void
     {
         $this->metrics?->recordAwsPublicationOutcome($outcome->state);
-        if ($outcome->state === AwsS3CreateOnlyWriteOutcome::PRECONDITION_CONFLICT) {
-            $this->operationalState?->markIntegrityConflict();
-        }
+        // Ambiguous and precondition-conflict outcomes remain durable, due
+        // intents and close admission through the operational aggregate until
+        // the collector seals them. Only the collector can establish an
+        // immutable-evidence conflict worthy of the one-way integrity latch.
     }
 }

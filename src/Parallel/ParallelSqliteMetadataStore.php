@@ -1242,6 +1242,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         return $this->submit('renewArmedObjectWriteIntent', [$attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds]);
     }
 
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->submit('expireArmedObjectWriteIntent', [$attemptId, $dispatchId]);
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         return $this->submit('retireUndispatchedObjectWriteIntent', [$attemptId]);

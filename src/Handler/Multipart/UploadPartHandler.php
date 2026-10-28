@@ -35,7 +35,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
-final class UploadPartHandler implements RequestHandler
+final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
     private readonly StorageTierRegistry $storageTiers;
 
@@ -69,6 +69,11 @@ final class UploadPartHandler implements RequestHandler
                 throw new \InvalidArgumentException('AWS multipart part writer must match the intent-capable default AWS tier.');
             }
         }
+    }
+
+    public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
+    {
+        return $this->awsObjectWriter === $writer;
     }
 
     public function handleRequest(Request $request): Response

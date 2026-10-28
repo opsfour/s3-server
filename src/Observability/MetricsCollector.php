@@ -636,6 +636,8 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_aws_recovery_oldest_age_seconds gauge';
         $lines[] = '# HELP s3_server_aws_recovery_max_owner_items Maximum retained rows for any owner, without identity labels.';
         $lines[] = '# TYPE s3_server_aws_recovery_max_owner_items gauge';
+        $lines[] = '# HELP s3_server_aws_recovery_global_capacity_items Database-global retained rows used by hard admission limits.';
+        $lines[] = '# TYPE s3_server_aws_recovery_global_capacity_items gauge';
         $lines[] = '# HELP s3_server_aws_reconciliation_state Current reconciliation health using fixed states.';
         $lines[] = '# TYPE s3_server_aws_reconciliation_state gauge';
         $lines[] = '# HELP s3_server_aws_reconciliation_failures Retained recovery rows with one or more failed attempts.';
@@ -667,9 +669,13 @@ final class MetricsCollector
                 $lines[] = 's3_server_aws_recovery_items{kind="' . $kind . '"} ' . (int) $snapshot[$kind];
             }
             $lines[] = 's3_server_aws_recovery_oldest_age_seconds ' . self::formatFloat((float) $snapshot['oldest_age_seconds']);
-            foreach (['open', 'sealed', 'part'] as $kind) {
+            foreach (['open', 'sealed', 'multipart', 'part'] as $kind) {
                 $lines[] = 's3_server_aws_recovery_max_owner_items{kind="' . $kind . '"} '
                     . (int) $snapshot['max_owner_' . $kind];
+            }
+            foreach (['open', 'seal_reserved', 'multipart', 'part', 'cleanup'] as $kind) {
+                $lines[] = 's3_server_aws_recovery_global_capacity_items{kind="' . $kind . '"} '
+                    . (int) $snapshot['global_' . $kind];
             }
         }
 

@@ -8,6 +8,8 @@ use Amp\Http\Server\RequestHandler;
 use OpsFour\S3Server\Exception\NotImplementedException;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer;
 
 /**
  * Maps S3Operation enum cases to Amp RequestHandler instances.
@@ -101,5 +103,28 @@ final class HandlerRegistry
     public function has(S3Operation $operation): bool
     {
         return isset($this->handlers[$operation->value]);
+    }
+
+    /** Prove that every registered AWS publication endpoint uses one exact writer. */
+    public function assertAwsS3ForegroundWriterCoverage(AwsS3ForegroundObjectWriter $writer): void
+    {
+        foreach ([
+            S3Operation::PutObject,
+            S3Operation::PostObject,
+            S3Operation::CopyObject,
+            S3Operation::CreateMultipartUpload,
+            S3Operation::UploadPart,
+            S3Operation::UploadPartCopy,
+            S3Operation::CompleteMultipartUpload,
+        ] as $operation) {
+            $handler = $this->handlers[$operation->value] ?? null;
+            if (! $handler instanceof AwsS3ForegroundWriterConsumer
+                || ! $handler->usesAwsS3ForegroundObjectWriter($writer)) {
+                throw new \LogicException(sprintf(
+                    'AWS publication handler %s is missing or does not use the exact qualified writer.',
+                    $operation->value,
+                ));
+            }
+        }
     }
 }

@@ -1473,6 +1473,21 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         });
     }
 
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        self::validateObjectWriteDispatchId($dispatchId);
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('Physical write recovery scheduling requires its own committed transaction.');
+        }
+        $result = $this->conn()->execute(<<<'SQL'
+            UPDATE s3_object_write_intents
+            SET lease_until = UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))
+            WHERE attempt_id = ? AND state = 'active' AND dispatch_id = ?
+            SQL, [$attemptId, $dispatchId]);
+
+        return ($result->getRowCount() ?? 0) === 1;
+    }
+
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         if ($this->fiberTransaction() !== null) {

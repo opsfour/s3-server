@@ -461,6 +461,14 @@ final class WriterObjectWriteIntentStore implements ObjectWriteIntentStore
 
         return $this->intent;
     }
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        if ($this->intent?->attemptId !== $attemptId || $this->intent->dispatchId !== $dispatchId
+            || $this->intent->state !== 'active') {
+            return false;
+        }
+        return true;
+    }
     public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
     {
         throw new \LogicException('Not supported.');

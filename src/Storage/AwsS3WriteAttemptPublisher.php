@@ -85,6 +85,7 @@ final readonly class AwsS3WriteAttemptPublisher
         mixed $body,
         ?int $expectedSize = null,
         ?string $expectedSha256 = null,
+        ?\Closure $beforeRecoverableExpiry = null,
     ): AwsS3WriteAttemptOutcome {
         AwsS3WriteAttemptPath::assertProfileIntentPath($this->profile, $reserved, $logicalKey);
         self::assertBody($body);
@@ -126,8 +127,21 @@ final readonly class AwsS3WriteAttemptPublisher
         }
 
         $provider = $this->writer->publish($armed, $logicalKey, $body);
+        $outcome = AwsS3WriteAttemptOutcome::fromProvider($armed->attemptId, $dispatchId, $provider);
+        if (in_array($outcome->state, [
+            AwsS3CreateOnlyWriteOutcome::AMBIGUOUS,
+            AwsS3CreateOnlyWriteOutcome::PRECONDITION_CONFLICT,
+        ], true)) {
+            $beforeRecoverableExpiry?->__invoke($outcome);
+            try {
+                $this->intents->expireArmedObjectWriteIntent($outcome->attemptId, $outcome->dispatchId);
+            } catch (\Throwable) {
+                // Immediate local integrity closure still prevents publication;
+                // the exact durable lease remains recoverable when it expires.
+            }
+        }
 
-        return AwsS3WriteAttemptOutcome::fromProvider($armed->attemptId, $dispatchId, $provider);
+        return $outcome;
     }
 
     /** Renew only the exact reservation while foreground staging is still undispatched. */

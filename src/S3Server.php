@@ -68,12 +68,14 @@ use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
+use OpsFour\S3Server\Runtime\AwsS3ProviderStartupException;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
@@ -199,7 +201,7 @@ final class S3Server
 
     private ?StorageTierRegistry $storageTiers = null;
 
-    /** @var list<array{pool: WorkerPool, name: string}> Worker pools to shut down on stop. */
+    /** @var list<array{pool: WorkerPool, name: string, forceKillOnShutdown: bool}> Worker pools to shut down on stop. */
     private array $workerPools = [];
 
     /** @var list<Middleware> Additional middleware to insert into the stack. */
@@ -297,8 +299,20 @@ final class S3Server
         $registryFreezeToken = $this->handlerRegistry->freeze();
         $this->starting = true;
         try {
+            $directStorage = $this->storage;
             $configuredTiers = $this->storageTiers
-                ?? ($this->storage !== null ? StorageTierRegistry::single($this->storage) : null);
+                ?? ($directStorage !== null ? StorageTierRegistry::single($directStorage) : null);
+            $startupTierRegistries = $configuredTiers !== null ? [$configuredTiers] : [];
+            if ($directStorage !== null && ($configuredTiers === null || $directStorage !== $configuredTiers->defaultBackend())) {
+                $startupTierRegistries[] = StorageTierRegistry::single($directStorage);
+            }
+            foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+                $startupTierRegistries[] = $registration['tiers'];
+                if ($registration['storage'] !== $registration['tiers']->defaultBackend()) {
+                    $startupTierRegistries[] = StorageTierRegistry::single($registration['storage']);
+                }
+            }
+            $this->assertAwsOperationalGraph($startupTierRegistries);
             if ($configuredTiers !== null) {
                 $unsafeTiers = StorageWriteFenceStartupGuard::assertReady(
                     $configuredTiers,
@@ -618,7 +632,11 @@ final class S3Server
                 foreach (array_slice($this->workerPools, $startupPoolCount) as $entry) {
                     $id = spl_object_id($entry['pool']);
                     try {
-                        $entry['pool']->shutdown();
+                        if ($entry['forceKillOnShutdown']) {
+                            $entry['pool']->kill();
+                        } else {
+                            $entry['pool']->shutdown();
+                        }
                         if ($entry['pool']->isRunning()) {
                             throw new \RuntimeException('Worker pool remained running after shutdown.');
                         }
@@ -652,6 +670,7 @@ final class S3Server
             }
         } catch (\Throwable $error) {
             $this->starting = false;
+            $this->awsOperationalState?->invalidateStartupValidation();
             if (! $this->shutdown) {
                 $this->handlerRegistry->rollbackFreeze($registryFreezeToken);
                 if ($this->ownsLocalStorageRootLockRelease) {
@@ -799,11 +818,13 @@ final class S3Server
                 $this->logger->info('Tiering background processor started.');
             }
 
+            $this->commitAwsOperationalAttachments();
             $this->logger->info('S3 server listening on {host}:{port}', [
                 'host' => $this->config->host,
                 'port' => $this->config->port,
             ]);
         } catch (\Throwable $error) {
+            $this->awsOperationalState?->invalidateStartupValidation();
             try {
                 $this->stop();
             } catch (\Throwable $cleanupError) {
@@ -1061,6 +1082,10 @@ final class S3Server
         }
         $this->notifications = null;
 
+        // A runtime that never completed startup must release its exact
+        // provisional attachment so the backend can be adopted elsewhere.
+        $this->rollbackUncommittedAwsOperationalAttachments();
+
         $shutdownStorage = [];
         $storageBackends = [];
         foreach ($this->storageTiers?->all() ?? [] as $tier) {
@@ -1154,6 +1179,194 @@ final class S3Server
         }
     }
 
+    /** @param list<StorageTierRegistry> $registries */
+    private function assertAwsOperationalGraph(array $registries): void
+    {
+        $aws = $this->awsOperationalRegistrations($registries);
+
+        if ($aws === []) {
+            $hasAwsProbePool = array_any(
+                $this->workerPools,
+                static fn(array $entry): bool => $entry['name'] === 'aws_provider_probe',
+            );
+            if ($this->awsOperationalState !== null || $this->awsObjectIntentCollector !== null
+                || $this->awsBackgroundWriter !== null || $this->awsAccessLogWriter !== null || $hasAwsProbePool) {
+                throw new \LogicException('AWS runtime components are configured without an exposed AWS backend.');
+            }
+            return;
+        }
+        if ($this->awsOperationalState === null || $this->metadata === null) {
+            $backend = array_values($aws)[0]['backend'];
+            throw new AwsS3ProviderStartupException($backend->awsS3ProviderAdmission());
+        }
+        if (count($aws) !== 1) {
+            throw new \LogicException('The qualified AWS runtime requires one exact exposed backend graph.');
+        }
+        foreach ($aws as $registration) {
+            $backend = $registration['backend'];
+            if ($backend->operationalState() !== $this->awsOperationalState) {
+                throw new AwsS3ProviderStartupException($backend->awsS3ProviderAdmission());
+            }
+            $binding = $backend->validatedBinding()
+                ?? throw new AwsS3ProviderStartupException($backend->awsS3ProviderAdmission());
+            $this->awsOperationalState->assertQualifiedExecutionBinding(
+                $binding,
+                $registration['tier'],
+                $this->metadata,
+            );
+            $profile = $binding->profile
+                ?? throw new \LogicException('Exposed AWS backend lost its admitted profile.');
+            if (! $this->metadata instanceof ObjectWriteIntentStore
+                || $this->awsBackgroundWriter?->isBoundToGraph(
+                    $backend,
+                    $profile,
+                    $this->metadata,
+                    $registration['tier'],
+                    $this->awsOperationalState,
+                ) !== true) {
+                throw new \LogicException('The AWS background writer does not match the exposed graph.');
+            }
+            if ($this->awsObjectIntentCollector?->isBoundTo(
+                $this->metadata,
+                $registration['tier'],
+                $this->awsOperationalState,
+                $binding,
+            ) !== true) {
+                throw new \LogicException('The AWS object-intent collector does not match the exposed graph.');
+            }
+            $defaultTier = $this->storageTiers?->defaultTier();
+            $defaultBackend = $defaultTier?->backend;
+            while ($defaultBackend instanceof ObservedStorageBackend) {
+                $defaultBackend = $defaultBackend->innerBackend();
+            }
+            $implicitDefaultBackend = $this->storageTiers === null ? $this->storage : null;
+            while ($implicitDefaultBackend instanceof ObservedStorageBackend) {
+                $implicitDefaultBackend = $implicitDefaultBackend->innerBackend();
+            }
+            $isPrimaryDefaultAwsTier = ($defaultTier !== null
+                    && $defaultBackend === $backend
+                    && $defaultTier->name === $registration['tier'])
+                || ($defaultTier === null && $implicitDefaultBackend === $backend);
+            $foregroundWriter = $this->awsBackgroundWriter->foregroundWriter();
+            if ($isPrimaryDefaultAwsTier) {
+                $accessLogWriter = $this->awsAccessLogWriter
+                    ?? throw new \LogicException('The default AWS tier requires its exact foreground/access-log writer.');
+                if ($accessLogWriter !== $foregroundWriter
+                    || ! $accessLogWriter->isBoundToOperationalGraph(
+                        $backend,
+                        $profile,
+                        $this->metadata,
+                        $this->awsOperationalState,
+                    )
+                    || ! hash_equals($accessLogWriter->storageTierName(), $registration['tier'])
+                    || $this->accessLogs?->usesAwsS3ForegroundObjectWriter($accessLogWriter) !== true) {
+                    throw new \LogicException('The AWS foreground and access-log writers do not match the exposed graph.');
+                }
+            }
+            $isHandlerDefaultAwsTier = false;
+            foreach ($this->handlerRegistry->storageRegistrations() as $handlerRegistration) {
+                $handlerDefault = $handlerRegistration['tiers']->defaultTier();
+                $handlerBackend = $handlerDefault->backend;
+                while ($handlerBackend instanceof ObservedStorageBackend) {
+                    $handlerBackend = $handlerBackend->innerBackend();
+                }
+                if ($handlerBackend === $backend && $handlerDefault->name === $registration['tier']) {
+                    $isHandlerDefaultAwsTier = true;
+                    break;
+                }
+            }
+            if ($isPrimaryDefaultAwsTier || $isHandlerDefaultAwsTier) {
+                $this->handlerRegistry->assertAwsS3ForegroundWriterCoverage($foregroundWriter);
+            }
+            $boundProbePools = array_filter(
+                $this->workerPools,
+                fn(array $entry): bool => $this->awsOperationalState->usesProviderProbePool($entry['pool']),
+            );
+            $probeEntry = array_values($boundProbePools)[0] ?? null;
+            if (count($boundProbePools) !== 1 || $probeEntry === null
+                || $probeEntry['name'] !== 'aws_provider_probe'
+                || ! $probeEntry['forceKillOnShutdown']) {
+                throw new \LogicException('The AWS provider probe worker is not exactly owned by this runtime.');
+            }
+        }
+    }
+
+    /**
+     * @param list<StorageTierRegistry> $registries
+     * @return array<int, array{backend: AwsS3StorageBackend, tier: string}>
+     */
+    private function awsOperationalRegistrations(array $registries): array
+    {
+        $aws = [];
+        foreach ($registries as $registry) {
+            foreach ($registry->all() as $tier) {
+                $backend = $tier->backend;
+                while ($backend instanceof ObservedStorageBackend) {
+                    $backend = $backend->innerBackend();
+                }
+                if (! $backend instanceof AwsS3StorageBackend) {
+                    continue;
+                }
+                $id = spl_object_id($backend);
+                if (isset($aws[$id]) && ! hash_equals($aws[$id]['tier'], $tier->name)) {
+                    throw new \LogicException('One AWS backend cannot be registered under multiple operational tiers.');
+                }
+                $aws[$id] = ['backend' => $backend, 'tier' => $tier->name];
+            }
+        }
+
+        return $aws;
+    }
+
+    private function commitAwsOperationalAttachments(): void
+    {
+        if ($this->awsOperationalState === null || $this->metadata === null) {
+            return;
+        }
+        foreach ($this->awsOperationalRegistrations($this->configuredTierRegistries()) as $registration) {
+            $registration['backend']->commitOperationalStateAttachment(
+                $this->awsOperationalState,
+                $registration['tier'],
+                $this->metadata,
+            );
+        }
+    }
+
+    private function rollbackUncommittedAwsOperationalAttachments(): void
+    {
+        if ($this->awsOperationalState === null || $this->metadata === null) {
+            return;
+        }
+        foreach ($this->awsOperationalRegistrations($this->configuredTierRegistries()) as $registration) {
+            if ($registration['backend']->operationalAttachmentCommitted()) {
+                continue;
+            }
+            $registration['backend']->rollbackOperationalStateAttachment(
+                $this->awsOperationalState,
+                $registration['tier'],
+                $this->metadata,
+            );
+        }
+    }
+
+    /** @return list<StorageTierRegistry> */
+    private function configuredTierRegistries(): array
+    {
+        $registries = $this->storageTiers !== null ? [$this->storageTiers] : [];
+        if ($this->storage !== null
+            && ($this->storageTiers === null || $this->storage !== $this->storageTiers->defaultBackend())) {
+            $registries[] = StorageTierRegistry::single($this->storage);
+        }
+        foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+            $registries[] = $registration['tiers'];
+            if ($registration['storage'] !== $registration['tiers']->defaultBackend()) {
+                $registries[] = StorageTierRegistry::single($registration['storage']);
+            }
+        }
+
+        return $registries;
+    }
+
     public function __destruct()
     {
         if ($this->ownsLocalStorageRootLockRelease) {
@@ -1170,7 +1383,7 @@ final class S3Server
             }
             try {
                 if (! isset($this->terminatedWorkerPools[$id])) {
-                    if (isset($this->failedWorkerPoolShutdowns[$id])) {
+                    if ($entry['forceKillOnShutdown'] || isset($this->failedWorkerPoolShutdowns[$id])) {
                         $entry['pool']->kill();
                     } else {
                         $entry['pool']->shutdown();
@@ -1322,16 +1535,28 @@ final class S3Server
      *
      * A later stop retry force-kills the pool if its graceful shutdown fails.
      */
-    public function addWorkerPool(WorkerPool $pool, string $name = 'registered', ?int $configuredWorkers = null): void
-    {
+    public function addWorkerPool(
+        WorkerPool $pool,
+        string $name = 'registered',
+        ?int $configuredWorkers = null,
+        bool $forceKillOnShutdown = false,
+    ): void {
         $this->assertConfigurationMutable('Worker pools');
-        $this->registerWorkerPool($pool, $name, $configuredWorkers);
+        $this->registerWorkerPool($pool, $name, $configuredWorkers, $forceKillOnShutdown);
     }
 
-    private function registerWorkerPool(WorkerPool $pool, string $name, ?int $configuredWorkers): void
-    {
+    private function registerWorkerPool(
+        WorkerPool $pool,
+        string $name,
+        ?int $configuredWorkers,
+        bool $forceKillOnShutdown = false,
+    ): void {
         $name = $name !== '' ? $name : 'registered';
-        $this->workerPools[] = ['pool' => $pool, 'name' => $name];
+        $this->workerPools[] = [
+            'pool' => $pool,
+            'name' => $name,
+            'forceKillOnShutdown' => $forceKillOnShutdown,
+        ];
         if ($configuredWorkers !== null) {
             $this->metrics->registerWorkerPool($name, $configuredWorkers);
         }
@@ -1519,9 +1744,19 @@ final class S3Server
                 awsFencedWriter: $this->awsBackgroundWriter,
             );
             $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
-            $storageGc = new StorageGarbageCollector($this->metadata, $tiers, $this->logger);
+            $storageGc = new StorageGarbageCollector(
+                $this->metadata,
+                $tiers,
+                $this->logger,
+                awsOperationalState: $this->awsOperationalState,
+            );
             $multipartIntentGc = $this->metadata instanceof MultipartWriteIntentStore
-                ? new MultipartWriteIntentCollector($this->metadata, $tiers, $this->logger)
+                ? new MultipartWriteIntentCollector(
+                    $this->metadata,
+                    $tiers,
+                    $this->logger,
+                    awsOperationalState: $this->awsOperationalState,
+                )
                 : null;
         }
         if ($this->metadata !== null && $this->config->notificationWorkerEnabled) {

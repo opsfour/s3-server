@@ -110,7 +110,12 @@ final class HealthCheckHandler implements RequestHandler
             }
 
             if ($this->readinessGeneration === $generation) {
-                ++$this->readinessGeneration;
+                // Timing out the HTTP probe must not discard the single
+                // dependency check that is still running. Its late result is
+                // the only authoritative result until another generation is
+                // actually started, and keeping it avoids an endless 503
+                // loop when a healthy dependency routinely needs slightly
+                // longer than the probe response deadline.
                 $readinessCheck->ignore();
             }
             $this->readinessHealthy = false;
@@ -295,8 +300,11 @@ final class HealthCheckHandler implements RequestHandler
     {
         if ($this->awsOperationalState !== null) {
             $snapshot = $this->awsOperationalState->snapshot();
+            $ready = $this->readinessHealthy
+                && $snapshot['mutation_ready'] === true
+                && $snapshot['reason'] === AwsS3OperationalState::REASON_HEALTHY;
             $body = json_encode([
-                'status' => $this->readinessHealthy ? 'ok' : 'degraded',
+                'status' => $ready ? 'ok' : 'degraded',
                 'aws' => [
                     'provider_type' => $snapshot['provider_type'],
                     'fingerprint' => $snapshot['fingerprint'],
@@ -315,11 +323,12 @@ final class HealthCheckHandler implements RequestHandler
                 ],
             ], JSON_THROW_ON_ERROR);
         } else {
+            $ready = $this->readinessHealthy;
             $body = $this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}';
         }
 
         return new Response(
-            status: $this->readinessHealthy ? 200 : 503,
+            status: $ready ? 200 : 503,
             headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
             body: $body,
         );

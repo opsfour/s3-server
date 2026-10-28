@@ -28,6 +28,7 @@ final readonly class MultipartWriteIntentCollector
         LoggerInterface $logger = new NullLogger(),
         private float $claimLeaseSeconds = 300.0,
         private float $renewIntervalSeconds = 100.0,
+        private ?AwsS3OperationalState $awsOperationalState = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0
@@ -46,6 +47,10 @@ final readonly class MultipartWriteIntentCollector
         $claims = $this->metadata;
         $cleaned = 0;
         $processed = 0;
+        $awsFailure = false;
+        $awsObserved = false;
+        $queueExhausted = false;
+        $hasAwsTier = $this->hasAwsTier();
         $limit = max(1, $limit);
         foreach ($this->tiers->all() as $tier) {
             $backend = $tier->backend;
@@ -58,10 +63,19 @@ final readonly class MultipartWriteIntentCollector
             if (! $this->metadata instanceof LocalMultipartCompletionIntentStore) {
                 throw new \LogicException('Local multipart collection requires fenced local intent retirement.');
             }
-            $retired = $this->metadata->retireDueUndispatchedLocalMultipartWriteIntents(
-                $tier->name,
-                $limit - $processed,
-            );
+            try {
+                $retired = $this->metadata->retireDueUndispatchedLocalMultipartWriteIntents(
+                    $tier->name,
+                    $limit - $processed,
+                );
+            } catch (CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                if ($hasAwsTier) {
+                    $this->awsOperationalState?->markCollectorFailure('multipart');
+                }
+                throw $error;
+            }
             $processed += $retired;
             $cleaned += $retired;
             if ($processed >= $limit) {
@@ -72,8 +86,18 @@ final readonly class MultipartWriteIntentCollector
         for (; $processed < $limit; $processed++) {
             $cancellation?->throwIfRequested();
             $now = $this->metadata->multipartWriteIntentNow();
-            $claimed = $this->metadata->claimDueMultipartWriteIntents(1, $now, $now + $this->claimLeaseSeconds);
+            try {
+                $claimed = $this->metadata->claimDueMultipartWriteIntents(1, $now, $now + $this->claimLeaseSeconds);
+            } catch (CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                if ($hasAwsTier) {
+                    $this->awsOperationalState?->markCollectorFailure('multipart');
+                }
+                throw $error;
+            }
             if ($claimed === []) {
+                $queueExhausted = true;
                 break;
             }
             $intent = $claimed[0];
@@ -110,7 +134,21 @@ final readonly class MultipartWriteIntentCollector
                         $localBackend->sealFencedMultipartPath($path, $intent->attemptId);
                     }
                 } elseif ($localBackend instanceof AwsS3StorageBackend) {
-                    throw new \RuntimeException('AWS multipart maintenance requires an explicitly registered recovery capability.');
+                    $awsObserved = true;
+                    $binding = $localBackend->validatedBinding()
+                        ?? throw new \LogicException('AWS multipart collector lost its validated binding.');
+                    if ($localBackend->operationalState() !== $this->awsOperationalState
+                        || $this->awsOperationalState === null) {
+                        throw new \LogicException('AWS multipart collector requires the shared operational state.');
+                    }
+                    $this->awsOperationalState->assertExecutionBinding(
+                        $binding,
+                        $intent->storageTier,
+                        $this->metadata,
+                    );
+                    // No proof-safe AWS completion-path retirement capability is
+                    // registered yet. Retain the tombstone as visible backlog;
+                    // expected retention is not a transient collector failure.
                 } else {
                     foreach (array_unique([$intent->assemblyPath, $intent->finalPath]) as $path) {
                         $backend->deleteObjectByPath($path, $intent->bucket);
@@ -136,6 +174,10 @@ final readonly class MultipartWriteIntentCollector
             try {
                 $heartbeat->stop();
             } catch (\Throwable $error) {
+                if ($localBackend instanceof AwsS3StorageBackend) {
+                    $awsFailure = true;
+                    $this->awsOperationalState?->markCollectorFailure('multipart');
+                }
                 $this->logger->warning('Multipart completion claim was lost during physical cleanup.', [
                     'component' => 'multipart_intent_gc',
                     'attempt_id' => $intent->attemptId,
@@ -159,6 +201,9 @@ final readonly class MultipartWriteIntentCollector
                     $cleaned++;
                 }
             } elseif ($retained) {
+                if ($localBackend instanceof AwsS3StorageBackend) {
+                    $awsFailure = true;
+                }
                 $this->logger->warning('Multipart completion path reconciliation failed.', [
                     'component' => 'multipart_intent_gc',
                     'attempt_id' => $intent->attemptId,
@@ -169,7 +214,28 @@ final readonly class MultipartWriteIntentCollector
             }
         }
 
+        if ($awsFailure) {
+            $this->awsOperationalState?->markCollectorFailure('multipart');
+        } elseif ($awsObserved || ($hasAwsTier && $queueExhausted)) {
+            $this->awsOperationalState?->markCollectorHealthy('multipart');
+        }
+
         return $cleaned;
+    }
+
+    private function hasAwsTier(): bool
+    {
+        foreach ($this->tiers->all() as $tier) {
+            $backend = $tier->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if ($backend instanceof AwsS3StorageBackend) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function assertLocalCompletionPaths(FilesystemBackend $backend, \OpsFour\S3Server\Metadata\MultipartWriteIntent $intent): void

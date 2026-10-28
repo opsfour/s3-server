@@ -20,7 +20,13 @@ interface AwsS3OperationalSummaryReader
      *   oldest_age_seconds: float,
      *   max_owner_open: int,
      *   max_owner_sealed: int,
-     *   max_owner_part: int
+     *   max_owner_multipart: int,
+     *   max_owner_part: int,
+     *   global_open: int,
+     *   global_seal_reserved: int,
+     *   global_multipart: int,
+     *   global_part: int,
+     *   global_cleanup: int
      * }
      */
     public function getAwsS3OperationalSummary(string $storageTier): array;

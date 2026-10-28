@@ -170,12 +170,33 @@ final class S3ServerLifecycleTest extends TestCase
                 self::fail('Expected the occupied HTTP port to reject startup.');
             } catch (\Amp\Socket\SocketException) {
                 self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
-                self::assertSame([['pool' => $callerPool, 'name' => 'caller']], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
+                self::assertSame([[
+                    'pool' => $callerPool,
+                    'name' => 'caller',
+                    'forceKillOnShutdown' => false,
+                ]], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
             }
         } finally {
             fclose($occupied);
             $server->stop();
         }
+    }
+
+    public function test_dedicated_blocking_pool_is_force_killed_while_other_pools_remain_graceful(): void
+    {
+        $probePool = $this->createMock(WorkerPool::class);
+        $probePool->expects(self::once())->method('kill');
+        $probePool->expects(self::never())->method('shutdown');
+        $probePool->method('isRunning')->willReturn(false);
+        $regularPool = $this->createMock(WorkerPool::class);
+        $regularPool->expects(self::never())->method('kill');
+        $regularPool->expects(self::once())->method('shutdown');
+        $regularPool->method('isRunning')->willReturn(false);
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()));
+        $server->addWorkerPool($probePool, 'aws_provider_probe', 1, forceKillOnShutdown: true);
+        $server->addWorkerPool($regularPool, 'regular', 1);
+
+        $server->stop();
     }
 
     public function test_storage_shutdown_error_does_not_log_backend_secret(): void

@@ -17,8 +17,11 @@ use GuzzleHttp\Psr7\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
+use OpsFour\S3Server\Handler\MetricsHandler;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
@@ -43,6 +46,9 @@ final class AwsS3OperationalStateTest extends TestCase
         ]);
         $summary = new AwsS3OperationalSummaryFixture();
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
 
         $state->assertStartupReady();
         $snapshot = $state->snapshot();
@@ -62,8 +68,6 @@ final class AwsS3OperationalStateTest extends TestCase
         self::assertStringNotContainsString('profile-private', json_encode($snapshot, JSON_THROW_ON_ERROR));
         self::assertStringNotContainsString('123456789012', json_encode($snapshot, JSON_THROW_ON_ERROR));
 
-        $backend = new AwsS3StorageBackend($binding->admission, $binding);
-        $backend->attachOperationalState($state);
         self::assertTrue($backend->awsS3ProviderAdmission()->fenceComplete());
         self::assertFalse($backend->awsS3ProviderAdmission()->productionQualified());
     }
@@ -77,8 +81,12 @@ final class AwsS3OperationalStateTest extends TestCase
         $summary = new AwsS3OperationalSummaryFixture();
         $summary->values['open'] = 7;
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 0.0);
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
 
-        $snapshot = $state->snapshot(true);
+        $state->refresh(true);
+        $snapshot = $state->snapshot();
 
         self::assertFalse($snapshot['provider_admitted']);
         self::assertFalse($snapshot['mutation_ready']);
@@ -87,6 +95,37 @@ final class AwsS3OperationalStateTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('credentials');
         $state->assertMutationReady();
+    }
+
+    public function test_failed_startup_probe_remains_retryable_until_provider_admission_succeeds(): void
+    {
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            new Response(403, [], '<Error><Code>ExpiredToken</Code></Error>'),
+            ...self::healthyResponses(),
+        ]);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $state = new AwsS3OperationalState(
+            $binding,
+            $validator,
+            self::inventory(),
+            $summary,
+            'AWS',
+            30.0,
+        );
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
+
+        try {
+            $state->assertStartupReady();
+            self::fail('A failed startup probe was admitted.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('not fence-complete', $error->getMessage());
+        }
+
+        $state->assertStartupReady();
+        self::assertTrue($state->snapshot()['provider_admitted']);
     }
 
     public function test_stale_recovery_backlog_and_integrity_conflict_use_fixed_closed_reasons(): void
@@ -100,11 +139,13 @@ final class AwsS3OperationalStateTest extends TestCase
         $summary->values['oldest_age_seconds'] = 900.0;
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
 
-        self::assertSame('collector', $state->snapshot(true)['reason']);
+        $state->refresh(true);
+        self::assertSame('collector', $state->snapshot()['reason']);
         self::assertFalse($state->mutationReady());
+        self::assertTrue($state->recoveryReady());
 
         $state->markIntegrityConflict();
-        self::assertSame('integrity', $state->snapshot(true)['reason']);
+        self::assertSame('integrity', $state->snapshot()['reason']);
         self::assertFalse($state->mutationReady());
         self::assertTrue($state->recoveryReady());
         $state->assertRecoveryReady();
@@ -119,14 +160,15 @@ final class AwsS3OperationalStateTest extends TestCase
         ]);
         $summary = new AwsS3OperationalSummaryFixture();
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 0.0);
-        self::assertSame('provider', $state->snapshot(true)['reason']);
+        $state->refresh(true);
+        self::assertSame('provider', $state->snapshot()['reason']);
         self::assertFalse($state->mutationReady());
 
         [$capacityBinding, $capacityValidator] = self::binding([
             ...self::healthyResponses(),
             ...self::healthyResponses(),
         ]);
-        $summary->values['open'] = 1_000_000;
+        $summary->values['global_open'] = 1_000_000;
         $capacityState = new AwsS3OperationalState(
             $capacityBinding,
             $capacityValidator,
@@ -135,7 +177,8 @@ final class AwsS3OperationalStateTest extends TestCase
             'AWS',
             0.0,
         );
-        self::assertSame('capacity', $capacityState->snapshot(true)['reason']);
+        $capacityState->refresh(true);
+        self::assertSame('capacity', $capacityState->snapshot()['reason']);
         self::assertFalse($capacityState->mutationReady());
         self::assertTrue($capacityState->recoveryReady());
     }
@@ -146,22 +189,144 @@ final class AwsS3OperationalStateTest extends TestCase
             ...self::healthyResponses(),
             ...self::healthyResponses(),
         ]);
+        $summary = new AwsS3OperationalSummaryFixture();
         $state = new AwsS3OperationalState(
             $binding,
             $validator,
             self::inventory(),
-            new AwsS3OperationalSummaryFixture(),
+            $summary,
             'AWS',
             0.0,
         );
         $state->markCollectorFailure();
+        $state->markCollectorFailure('storage_garbage');
 
-        $snapshot = $state->snapshot(true);
+        $state->refresh(true);
+        $snapshot = $state->snapshot();
 
         self::assertSame('collector', $snapshot['reason']);
         self::assertSame('failed', $snapshot['reconciliation_state']);
         self::assertFalse($snapshot['mutation_ready']);
         self::assertTrue($snapshot['recovery_ready']);
+        $state->markCollectorHealthy();
+        self::assertSame('collector', $state->snapshot()['reason']);
+        $state->markCollectorHealthy('storage_garbage');
+        self::assertSame('healthy', $state->snapshot()['reason']);
+    }
+
+    public function test_durable_ambiguous_or_failed_rows_close_publication_after_restart(): void
+    {
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $summary->values['ambiguous'] = 1;
+        $firstProcess = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
+        $firstProcess->assertStartupReady();
+        self::assertSame('integrity', $firstProcess->snapshot()['reason']);
+        self::assertFalse($firstProcess->snapshot()['mutation_ready']);
+
+        [$restartedBinding, $restartedValidator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $restarted = new AwsS3OperationalState(
+            $restartedBinding,
+            $restartedValidator,
+            self::inventory(),
+            $summary,
+            'AWS',
+            30.0,
+        );
+        $restarted->assertStartupReady();
+        self::assertSame('integrity', $restarted->snapshot()['reason']);
+        self::assertFalse($restarted->snapshot()['mutation_ready']);
+
+        $summary->values['ambiguous'] = 0;
+        $summary->values['failures'] = 1;
+        $restarted->refresh(true);
+        self::assertSame('collector', $restarted->snapshot()['reason']);
+        self::assertFalse($restarted->snapshot()['mutation_ready']);
+        self::assertTrue($restarted->snapshot()['recovery_ready']);
+    }
+
+    public function test_retained_multipart_backlog_without_actionable_age_or_failure_stays_ready(): void
+    {
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $summary->values['multipart'] = 1;
+        $summary->values['global_multipart'] = 1;
+        $summary->values['max_owner_multipart'] = 1;
+        $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 0.0);
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
+
+        $state->refresh(true);
+
+        self::assertSame(1, $state->snapshot()['multipart']);
+        self::assertSame(0.0, $state->snapshot()['oldest_age_seconds']);
+        self::assertSame('healthy', $state->snapshot()['reason']);
+        self::assertTrue($state->mutationReady());
+    }
+
+    public function test_operational_state_rejects_equal_profile_values_from_another_binding_or_tier(): void
+    {
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $state = new AwsS3OperationalState(
+            $binding,
+            $validator,
+            self::inventory(),
+            $summary,
+            'AWS',
+        );
+        [$otherBinding] = self::binding(self::healthyResponses());
+
+        self::assertFalse($state->isBoundTo($otherBinding, 'AWS', $summary));
+        self::assertFalse($state->isBoundTo($binding, 'ARCHIVE', $summary));
+        self::assertFalse($state->isBoundTo($binding, 'AWS', new AwsS3OperationalSummaryFixture()));
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('another validated client');
+        $state->assertExecutionBinding($otherBinding, 'AWS', $summary);
+    }
+
+    public function test_cached_readiness_status_cannot_stay_200_after_mutation_closes(): void
+    {
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $state = new AwsS3OperationalState(
+            $binding,
+            $validator,
+            self::inventory(),
+            $summary,
+            'AWS',
+            30.0,
+        );
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
+        $handler = new HealthCheckHandler(
+            readinessCheckIntervalSeconds: 30,
+            awsOperationalState: $state,
+        );
+        self::assertSame(200, $handler->handleRequest(self::healthRequest())->getStatus());
+
+        $state->markCollectorFailure();
+        $response = $handler->handleRequest(self::healthRequest());
+        self::assertSame(503, $response->getStatus());
+        self::assertStringContainsString('"mutation_ready":false', (string) $response->getBody()->read());
     }
 
     public function test_health_handler_accepts_healthy_aws_and_skips_closed_generic_backend_probe(): void
@@ -170,16 +335,18 @@ final class AwsS3OperationalStateTest extends TestCase
             ...self::healthyResponses(),
             ...self::healthyResponses(),
         ]);
+        $summary = new AwsS3OperationalSummaryFixture();
         $state = new AwsS3OperationalState(
             $binding,
             $validator,
             self::inventory(),
-            new AwsS3OperationalSummaryFixture(),
+            $summary,
             'AWS',
             30.0,
         );
         $backend = new AwsS3StorageBackend($binding->admission, $binding);
-        $backend->attachOperationalState($state);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
         $handler = new HealthCheckHandler(
             storageTiers: StorageTierRegistry::single($backend, 'AWS'),
             readinessCheckIntervalSeconds: 0,
@@ -207,16 +374,18 @@ final class AwsS3OperationalStateTest extends TestCase
             new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
             new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'),
         ]);
+        $summary = new AwsS3OperationalSummaryFixture();
         $state = new AwsS3OperationalState(
             $binding,
             $validator,
             self::inventory(),
-            new AwsS3OperationalSummaryFixture(),
+            $summary,
             'AWS',
             30.0,
         );
         $backend = new AwsS3StorageBackend($binding->admission, $binding);
-        $backend->attachOperationalState($state);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
         $response = (new HealthCheckHandler(
             storageTiers: StorageTierRegistry::single($backend, 'AWS'),
             readinessCheckIntervalSeconds: 0,
@@ -234,7 +403,7 @@ final class AwsS3OperationalStateTest extends TestCase
         self::assertFalse($body['aws']['recovery_ready']);
     }
 
-    public function test_closed_mutation_admission_stops_reservation_before_body_or_provider_dispatch(): void
+    public function test_authorized_metrics_scrape_bridges_cached_shared_snapshot_without_provider_io(): void
     {
         $requests = [];
         [$binding, $validator] = self::binding([
@@ -242,17 +411,53 @@ final class AwsS3OperationalStateTest extends TestCase
             ...self::healthyResponses(),
         ], $requests);
         $summary = new AwsS3OperationalSummaryFixture();
-        $summary->values['oldest_age_seconds'] = 900.0;
+        $summary->values['global_multipart'] = 12;
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
-        self::assertFalse($state->snapshot(true)['mutation_ready']);
-        $backend = new AwsS3StorageBackend($binding->admission, $binding);
-        $backend->attachOperationalState($state);
+        $state->assertStartupReady();
+        $providerRequests = count($requests);
+
+        $response = (new MetricsHandler(
+            new MetricsCollector(),
+            bearerToken: 'token',
+            awsOperationalState: $state,
+        ))->handleRequest(new Request(
+            new AwsS3OperationalStateTestClient(),
+            'GET',
+            Http::new('http://127.0.0.1/.metrics'),
+            ['authorization' => 'Bearer token'],
+        ));
+        $rendered = $response->getBody()->read();
+
+        self::assertIsString($rendered);
+        self::assertSame(200, $response->getStatus());
+        self::assertSame($providerRequests, count($requests));
+        self::assertStringContainsString(
+            's3_server_aws_recovery_global_capacity_items{kind="multipart"} 12',
+            $rendered,
+        );
+    }
+
+    public function test_closed_mutation_admission_stops_reservation_before_body_or_provider_dispatch(): void
+    {
         $base = sys_get_temp_dir() . '/s3-aws-admission-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($base, 0700));
         self::assertTrue(mkdir($base . '/scratch', 0700));
         $metadata = new SqliteMetadataStore($base . '/metadata.sqlite');
         $metadata->initialize();
-        $writer = $backend->createForegroundObjectWriter($metadata, $base . '/scratch', 'AWS');
+        $operationalMetadata = new AwsS3OperationalObjectIntentStoreFixture($metadata);
+        $operationalMetadata->values['global_open'] = 1_000_000;
+        $requests = [];
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ], $requests);
+        $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $operationalMetadata, 'AWS', 30.0);
+        $state->refresh(true);
+        self::assertFalse($state->snapshot()['mutation_ready']);
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $operationalMetadata);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $operationalMetadata);
+        $writer = $backend->createForegroundObjectWriter($operationalMetadata, $base . '/scratch', 'AWS');
         self::assertIsArray($requests);
         $providerRequests = count($requests);
         try {
@@ -260,7 +465,7 @@ final class AwsS3OperationalStateTest extends TestCase
                 $writer->reserve(new BucketInfo('bucket', 'owner', 'us-east-1', generation: 'generation'), 'key', 'owner');
                 self::fail('Closed mutation admission accepted a reservation.');
             } catch (\RuntimeException $error) {
-                self::assertStringContainsString('collector', $error->getMessage());
+                self::assertStringContainsString('capacity', $error->getMessage());
             }
             self::assertSame($providerRequests, count($requests));
             self::assertSame(['object' => 0, 'object_seal' => 0, 'part' => 0], $metadata->getWriteIntentCapacityCounts());
@@ -274,46 +479,68 @@ final class AwsS3OperationalStateTest extends TestCase
         }
     }
 
-    public function test_precondition_conflict_records_bounded_outcome_and_closes_integrity(): void
+    public function test_ambiguous_provider_outcome_records_bounded_outcome_and_closes_until_recovery(): void
     {
-        [$binding, $validator] = self::binding([
-            ...self::healthyResponses(),
-            ...self::healthyResponses(),
-            new Response(412, [], '<Error><Code>PreconditionFailed</Code></Error>'),
-        ]);
-        $state = new AwsS3OperationalState(
-            $binding,
-            $validator,
-            self::inventory(),
-            new AwsS3OperationalSummaryFixture(),
-            'AWS',
-            30.0,
-        );
-        $backend = new AwsS3StorageBackend($binding->admission, $binding);
-        $backend->attachOperationalState($state);
         $base = sys_get_temp_dir() . '/s3-aws-conflict-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($base, 0700));
         self::assertTrue(mkdir($base . '/scratch', 0700));
         $metadata = new SqliteMetadataStore($base . '/metadata.sqlite');
         $metadata->initialize();
+        $operationalMetadata = new AwsS3OperationalObjectIntentStoreFixture($metadata);
+        [$binding, $validator] = self::binding([
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+            new Response(503, [], '<Error><Code>ServiceUnavailable</Code></Error>'),
+            ...self::healthyResponses(),
+            ...self::healthyResponses(),
+        ]);
+        $state = new AwsS3OperationalState(
+            $binding,
+            $validator,
+            self::inventory(),
+            $operationalMetadata,
+            'AWS',
+            30.0,
+        );
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $operationalMetadata);
+        $backend->commitOperationalStateAttachment($state, 'AWS', $operationalMetadata);
         $metadata->createBucket('owner', 'bucket', 'us-east-1');
         $bucket = $metadata->getBucket('bucket');
         self::assertNotNull($bucket);
         $metrics = new MetricsCollector();
-        $writer = $backend->createForegroundObjectWriter($metadata, $base . '/scratch', 'AWS', metrics: $metrics);
+        $writer = $backend->createForegroundObjectWriter($operationalMetadata, $base . '/scratch', 'AWS', metrics: $metrics);
         $stage = null;
         try {
             $reservation = $writer->reserve($bucket, 'key', 'owner');
             $stage = $writer->stage($reservation, new ReadableBuffer('body'));
             try {
                 $writer->dispatch($reservation, 'key', $stage);
-                self::fail('AWS precondition conflict was accepted.');
+                self::fail('An ambiguous AWS provider outcome was accepted.');
             } catch (\OpsFour\S3Server\Exception\InternalErrorException) {
             }
             self::assertSame('integrity', $state->snapshot()['reason']);
             self::assertSame('integrity_conflict', $state->snapshot()['reconciliation_state']);
+            $intent = (new \ReflectionProperty($reservation, 'intent'))->getValue($reservation);
+            self::assertInstanceOf(ObjectWriteIntent::class, $intent);
+            $current = $metadata->getObjectWriteIntent($intent->attemptId);
+            self::assertNotNull($current);
+            self::assertNotNull($current->dispatchId);
+            $otherAttempt = str_repeat('f', 32);
+            $otherDispatch = str_repeat('e', 32);
+            $state->markObjectRecoveryPending($otherAttempt, $otherDispatch);
+            $state->refresh(true);
+            self::assertSame('integrity', $state->snapshot()['reason'], 'A summary refresh must not erase exact in-process pending tokens.');
+            $claim = $operationalMetadata->claimDueObjectWriteIntents('AWS', 1, 300.0)[0] ?? null;
+            self::assertNotNull($claim);
+            self::assertSame($current->attemptId, $claim->attemptId);
+            self::assertTrue($operationalMetadata->sealObjectWriteIntent($claim->attemptId, $claim->claimGeneration));
+            $state->refresh(true);
+            self::assertSame('integrity', $state->snapshot()['reason'], 'A remote terminal seal may clear only its exact local token.');
+            $state->resolveObjectRecoveryPending($otherAttempt, $otherDispatch);
+            self::assertSame('healthy', $state->snapshot()['reason']);
             self::assertStringContainsString(
-                's3_server_aws_publication_outcomes_total{status="precondition_conflict"} 1',
+                's3_server_aws_publication_outcomes_total{status="ambiguous"} 1',
                 $metrics->renderPrometheus(),
             );
         } finally {
@@ -381,13 +608,14 @@ final class AwsS3OperationalStateTest extends TestCase
     }
 }
 
-final class AwsS3OperationalSummaryFixture implements AwsS3OperationalSummaryReader
+class AwsS3OperationalSummaryFixture implements AwsS3OperationalSummaryReader
 {
     /**
      * @var array{
      *   open: int, ambiguous: int, seal_reserved: int, sealed: int, multipart: int, part: int,
      *   cleanup: int, failures: int, oldest_age_seconds: float,
-     *   max_owner_open: int, max_owner_sealed: int, max_owner_part: int
+     *   max_owner_open: int, max_owner_sealed: int, max_owner_multipart: int, max_owner_part: int,
+     *   global_open: int, global_seal_reserved: int, global_multipart: int, global_part: int, global_cleanup: int
      * }
      */
     public array $values = [
@@ -402,7 +630,13 @@ final class AwsS3OperationalSummaryFixture implements AwsS3OperationalSummaryRea
         'oldest_age_seconds' => 0.0,
         'max_owner_open' => 0,
         'max_owner_sealed' => 0,
+        'max_owner_multipart' => 0,
         'max_owner_part' => 0,
+        'global_open' => 0,
+        'global_seal_reserved' => 0,
+        'global_multipart' => 0,
+        'global_part' => 0,
+        'global_cleanup' => 0,
     ];
 
     public function getAwsS3OperationalSummary(string $storageTier): array
@@ -411,6 +645,87 @@ final class AwsS3OperationalSummaryFixture implements AwsS3OperationalSummaryRea
             throw new \RuntimeException('Unexpected AWS tier.');
         }
         return $this->values;
+    }
+}
+
+/** Exact operational metadata identity with a real SQLite object-intent implementation. */
+final class AwsS3OperationalObjectIntentStoreFixture extends AwsS3OperationalSummaryFixture implements ObjectWriteIntentStore
+{
+    public function __construct(private readonly ObjectWriteIntentStore $inner) {}
+
+    public function reserveObjectWriteIntent(ObjectWriteIntent $intent, float $leaseSeconds): ObjectWriteIntent
+    {
+        return $this->inner->reserveObjectWriteIntent($intent, $leaseSeconds);
+    }
+
+    public function getObjectWriteIntent(string $attemptId): ?ObjectWriteIntent
+    {
+        return $this->inner->getObjectWriteIntent($attemptId);
+    }
+
+    public function renewObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->inner->renewObjectWriteIntent($attemptId, $expectedLeaseUntil, $leaseSeconds);
+    }
+
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
+    {
+        return $this->inner->armObjectWriteIntent($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds, $expectedSize, $expectedSha256);
+    }
+
+    public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->inner->renewArmedObjectWriteIntent($attemptId, $dispatchId, $expectedLeaseUntil, $leaseSeconds);
+    }
+
+    public function expireArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->inner->expireArmedObjectWriteIntent($attemptId, $dispatchId);
+    }
+
+    public function retireUndispatchedObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->inner->retireUndispatchedObjectWriteIntent($attemptId);
+    }
+
+    public function retireTerminalPreLinkObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->inner->retireTerminalPreLinkObjectWriteIntent($attemptId, $dispatchId);
+    }
+
+    public function consumeObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->inner->consumeObjectWriteIntent($attemptId);
+    }
+
+    public function consumeArmedObjectWriteIntent(string $attemptId, string $dispatchId): bool
+    {
+        return $this->inner->consumeArmedObjectWriteIntent($attemptId, $dispatchId);
+    }
+
+    public function abandonObjectWriteIntent(string $attemptId): bool
+    {
+        return $this->inner->abandonObjectWriteIntent($attemptId);
+    }
+
+    public function claimDueObjectWriteIntents(string $storageTier, int $limit, float $leaseSeconds): array
+    {
+        return $this->inner->claimDueObjectWriteIntents($storageTier, $limit, $leaseSeconds);
+    }
+
+    public function retireExpiredUndispatchedObjectWriteIntents(string $storageTier, int $limit): int
+    {
+        return $this->inner->retireExpiredUndispatchedObjectWriteIntents($storageTier, $limit);
+    }
+
+    public function renewObjectWriteClaim(string $attemptId, int $claimGeneration, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent
+    {
+        return $this->inner->renewObjectWriteClaim($attemptId, $claimGeneration, $expectedLeaseUntil, $leaseSeconds);
+    }
+
+    public function sealObjectWriteIntent(string $attemptId, int $claimGeneration): bool
+    {
+        return $this->inner->sealObjectWriteIntent($attemptId, $claimGeneration);
     }
 }
 

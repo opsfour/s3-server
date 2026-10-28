@@ -70,6 +70,16 @@ final readonly class AwsS3ObjectWriteIntentReconciler
         }
     }
 
+    public function isBoundTo(
+        ObjectWriteIntentStore $metadata,
+        string $tierName,
+        AwsS3ProviderValidatedBinding $binding,
+    ): bool {
+        return $this->metadata === $metadata
+            && hash_equals($this->tierName, $tierName)
+            && $this->seals->isBoundTo($binding);
+    }
+
     private static function sameClaim(ObjectWriteIntent $expected, ObjectWriteIntent $actual): bool
     {
         return $actual->state === 'reconciling'

@@ -235,8 +235,9 @@ whole-object scratch or in-memory assembly. SSE-S3 and SSE-C completion authenti
 each part within `maxEncryptedObjectSize`, re-encrypt once, and stage only final
 ciphertext. The upload intent, final provider dispatch, object/version metadata,
 and immutable placement commit atomically. Abort and post-completion part cleanup
-only persist exact garbage paths; generic collectors and request handlers do not
-mutate qualified AWS keys.
+only persist exact garbage paths. Request paths and generic collectors do not
+mutate qualified AWS keys; the qualified, lease-fenced claimed-garbage collector
+is the sole deletion path for exact AWS garbage claims.
 
 Lifecycle transitions and temporary restore copies may use one exact admitted
 AWS tier binding. They reserve capacity before opening any source stream, copy
