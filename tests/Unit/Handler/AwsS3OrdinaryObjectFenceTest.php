@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Handler;
 
 use Amp\ByteStream\ReadableStream;
 use Amp\ByteStream\ReadableStreamIteratorAggregate;
+use Amp\ByteStream\ReadableBuffer;
 use Amp\Cancellation;
 use Amp\Http\Server\Driver\Client as ServerClient;
 use Amp\Http\Server\Request;
@@ -27,6 +28,7 @@ use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
+use OpsFour\S3Server\Exception\QuotaExceededException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PostObjectHandler;
@@ -35,6 +37,9 @@ use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
+use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Quota\QuotaManager;
+use OpsFour\S3Server\Quota\QuotaProvider;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\BufferedWorkLimiter;
@@ -44,9 +49,12 @@ use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3WriteAttemptPath;
+use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuard;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
+use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -142,6 +150,67 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertSame('123456789012', $this->requests[2]->getHeaderLine('x-amz-expected-bucket-owner'));
     }
 
+    public function test_put_immediately_discards_replaced_non_aws_tier_data(): void
+    {
+        $warm = new InMemoryBackend();
+        $old = $warm->putObject('bucket', 'key', new ReadableBuffer('old payload'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'key',
+            'owner',
+            strlen('old payload'),
+            '"' . md5('old payload') . '"',
+            'text/plain',
+            $old->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'key', null, 'STANDARD', 'WARM', $old->path);
+        $tiers = new StorageTierRegistry([
+            new StorageTier('STANDARD', $this->backend, defaultWriteTier: true),
+            new StorageTier('WARM', $warm),
+        ]);
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+
+        $response = (new PutObjectHandler(
+            $this->metadata,
+            $this->backend,
+            storageTiers: $tiers,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->putRequest('new payload'));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertStringStartsWith(
+            '.opsfour/write-attempts/bucket/',
+            $this->metadata->getObjectMetadata('bucket', 'key')?->systemMetadata['storagePath'] ?? '',
+        );
+        try {
+            $warm->getObjectByPath($old->path);
+            self::fail('The replaced non-AWS path was not immediately discarded.');
+        } catch (\OpsFour\S3Server\Exception\NoSuchKeyException) {
+        }
+    }
+
+    public function test_put_preserves_primary_validation_failure_when_scratch_release_fails(): void
+    {
+        $payload = str_repeat('p', 65_536);
+        $body = new AwsS3TestReadableStream([$payload], function (int $read): void {
+            if ($read === 2) {
+                $this->corruptScratchBudgetState();
+            }
+        });
+        $request = $this->putRequestWithBody($body, strlen($payload));
+        $request->setHeader('x-amz-checksum-sha256', base64_encode(str_repeat("\0", 32)));
+
+        try {
+            $this->put()->handleRequest($request);
+            self::fail('The invalid client checksum was accepted.');
+        } catch (BadDigestException $error) {
+            self::assertStringStartsWith('Checksum mismatch:', $error->getMessage());
+        }
+
+        self::assertCount(2, $this->requests);
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+    }
+
     public function test_versioned_put_consumes_exact_dispatch_and_stores_immutable_attempt_path(): void
     {
         $this->metadata->setBucketVersioning('bucket', 'Enabled');
@@ -205,6 +274,102 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $copied = $this->metadata->getObjectMetadata('target', 'copied');
         self::assertNotNull($copied);
         self::assertNull($this->metadata->getObjectWriteIntent(basename($copied->systemMetadata['storagePath'])));
+    }
+
+    public function test_copy_from_non_aws_source_tier_publishes_selected_bytes_and_discards_replaced_tier_data(): void
+    {
+        $warm = new InMemoryBackend();
+        $payload = 'warm source payload';
+        $source = $warm->putObject('bucket', 'key', new ReadableBuffer($payload));
+        $old = $warm->putObject('target', 'copied', new ReadableBuffer('old destination'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'key',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/plain',
+            $source->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'key', null, 'STANDARD', 'WARM', $source->path);
+        $this->metadata->putObjectMetadata(
+            'target',
+            'copied',
+            'owner',
+            strlen('old destination'),
+            '"' . md5('old destination') . '"',
+            'text/plain',
+            $old->path,
+        );
+        $this->metadata->updateObjectPlacement('target', 'copied', null, 'STANDARD', 'WARM', $old->path);
+        $tiers = new StorageTierRegistry([
+            new StorageTier('STANDARD', $this->backend, defaultWriteTier: true),
+            new StorageTier('WARM', $warm),
+        ]);
+        $this->mock->append(new Response(200, ['ETag' => '"copy-etag"']));
+
+        $response = (new CopyObjectHandler(
+            $this->metadata,
+            $this->backend,
+            storageTiers: $tiers,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->copyRequest());
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame($payload, end($this->providerBodies));
+        $copied = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($copied);
+        self::assertSame('STANDARD', $copied->storageTier);
+        self::assertStringStartsWith('.opsfour/write-attempts/target/', $copied->systemMetadata['storagePath']);
+        self::assertSame($payload, $warm->getObjectByPath($source->path)->read());
+        try {
+            $warm->getObjectByPath($old->path);
+            self::fail('The replaced non-AWS Copy destination was not immediately discarded.');
+        } catch (\OpsFour\S3Server\Exception\NoSuchKeyException) {
+        }
+    }
+
+    public function test_copy_preserves_primary_source_failure_when_scratch_release_fails(): void
+    {
+        $payload = str_repeat('c', 65_536);
+        $sourceBackend = $this->createMock(StorageBackend::class);
+        $sourceBackend->expects(self::once())->method('getObjectByPath')->willReturn(
+            new AwsS3TestReadableStream([$payload], function (int $read): void {
+                if ($read === 2) {
+                    $this->corruptScratchBudgetState();
+                }
+            }),
+        );
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'key',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/plain',
+            'mock://bucket/key',
+            checksumSha256: base64_encode(str_repeat("\0", 32)),
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'key', null, 'STANDARD', 'WARM', 'mock://bucket/key');
+        $tiers = new StorageTierRegistry([
+            new StorageTier('STANDARD', $this->backend, defaultWriteTier: true),
+            new StorageTier('WARM', $sourceBackend),
+        ]);
+
+        try {
+            (new CopyObjectHandler(
+                $this->metadata,
+                $this->backend,
+                storageTiers: $tiers,
+                awsObjectWriter: $this->writer,
+            ))->handleRequest($this->copyRequest());
+            self::fail('The invalid source checksum was accepted.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Copy source checksum does not match its payload.', $error->getMessage());
+        }
+
+        self::assertCount(2, $this->requests);
+        self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
     }
 
     public function test_runtime_factory_propagates_its_writer_through_the_registrar_without_reusing_post_budget(): void
@@ -434,6 +599,80 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         }
     }
 
+    public function test_shared_yielding_transform_boundary_reports_lost_renewal_authority(): void
+    {
+        self::assertTrue(mkdir($this->base . '/transform-authority-scratch', 0700));
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $this->base . '/transform-authority-scratch',
+            'STANDARD',
+            1_048_576,
+            36.0,
+            0.01,
+        );
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $reservation = $writer->reserve($bucket, 'lost-transform', 'owner');
+        try {
+            try {
+                $writer->transform($reservation, function (): void {
+                    $pdo = new \PDO('sqlite:' . $this->base . '/metadata.sqlite');
+                    self::assertSame(1, $pdo->exec('UPDATE s3_object_write_intents SET lease_until = 0'));
+                    \Amp\delay(0.03);
+                });
+                self::fail('A yielding transform retained authority after its renewal CAS was lost.');
+            } catch (\OpsFour\S3Server\Storage\AwsS3WriteAttemptArmException) {
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'lost-transform'));
+            }
+        } finally {
+            $writer->retireBeforeDispatch($reservation);
+            $writer->shutdown();
+        }
+        self::assertCount(2, $this->requests);
+        self::assertSame(0, $this->outstandingIntentCount());
+    }
+
+    public function test_yielding_put_transform_authority_loss_prevents_provider_dispatch_and_visibility(): void
+    {
+        self::assertTrue(mkdir($this->base . '/put-transform-authority-scratch', 0700));
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $this->base . '/put-transform-authority-scratch',
+            'STANDARD',
+            1_048_576,
+            36.0,
+            0.01,
+        );
+        $encryption = new AwsS3YieldingEncryptionService(
+            new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32)))),
+            function (): void {
+                $pdo = new \PDO('sqlite:' . $this->base . '/metadata.sqlite');
+                self::assertSame(1, $pdo->exec('UPDATE s3_object_write_intents SET lease_until = 0'));
+                \Amp\delay(0.03);
+            },
+        );
+        try {
+            try {
+                (new PutObjectHandler(
+                    $this->metadata,
+                    $this->backend,
+                    encryption: $encryption,
+                    awsObjectWriter: $writer,
+                ))->handleRequest($this->putRequest('secret', [
+                    'x-amz-server-side-encryption' => 'AES256',
+                ]));
+                self::fail('Lost transform-renewal authority reached provider dispatch.');
+            } catch (\OpsFour\S3Server\Storage\AwsS3WriteAttemptArmException) {
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+            }
+            self::assertCount(2, $this->requests);
+            self::assertSame(0, $this->outstandingIntentCount());
+            self::assertSame([], glob($this->base . '/put-transform-authority-scratch/s3fw-put-*'));
+        } finally {
+            $writer->shutdown();
+        }
+    }
+
     public function test_sse_buffer_capacity_is_released_before_provider_dispatch(): void
     {
         $capacityReleased = false;
@@ -642,6 +881,29 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertSame([], glob($this->base . '/scratch/s3fw-put-*'));
     }
 
+    public function test_unknown_length_uses_exact_staged_size_for_quota_before_provider_dispatch(): void
+    {
+        $provider = $this->createMock(QuotaProvider::class);
+        $provider->method('quotaForOwner')->willReturn(new QuotaConfig(maxBytesPerBucket: 6));
+        $provider->method('hasQuotaForOwner')->willReturn(true);
+        $handler = new PutObjectHandler(
+            $this->metadata,
+            $this->backend,
+            quotas: new QuotaManager($this->metadata, $provider),
+            awsObjectWriter: $this->writer,
+        );
+
+        try {
+            $handler->handleRequest($this->putRequestWithoutLength('payload'));
+            self::fail('An unknown request length exceeded quota after staging.');
+        } catch (QuotaExceededException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+        }
+        self::assertCount(2, $this->requests);
+        self::assertSame(0, $this->outstandingIntentCount());
+        self::assertSame([], glob($this->base . '/scratch/s3fw-put-*'));
+    }
+
     public function test_post_commit_scratch_cleanup_failure_does_not_replace_success(): void
     {
         $corrupted = false;
@@ -664,6 +926,11 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $object = $this->metadata->getObjectMetadata('bucket', 'key');
         self::assertNotNull($object);
         self::assertNull($this->metadata->getObjectWriteIntent(basename($object->systemMetadata['storagePath'])));
+
+        $this->beforeProviderRequest = null;
+        $this->mock->append(new Response(200, ['ETag' => '"next-provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest('next payload'))->getStatus());
+        self::assertSame('"' . md5('next payload') . '"', $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
     }
 
     public function test_handlers_reject_simultaneous_local_and_aws_coordinators(): void
@@ -1115,6 +1382,74 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         }
     }
 
+    public function test_sse_s3_to_sse_c_copy_commits_verified_encrypted_destination(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $payload = 'encrypted source and destination';
+        $this->mock->append(new Response(200, ['ETag' => '"source"']));
+        self::assertSame(200, (new PutObjectHandler(
+            $this->metadata,
+            $this->backend,
+            encryption: $encryption,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->putRequest($payload, [
+            'x-amz-server-side-encryption' => 'AES256',
+        ]))->getStatus());
+        $source = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($source);
+        $sourceCiphertext = end($this->providerBodies);
+        self::assertIsString($sourceCiphertext);
+        $this->mock->append(new Response(200, [
+            'Content-Length' => (string) strlen($sourceCiphertext),
+            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-attempt-id' => basename($source->systemMetadata['storagePath']),
+        ], $sourceCiphertext));
+        $this->mock->append(new Response(200, ['ETag' => '"destination"']));
+
+        $capacityReleased = false;
+        $this->beforeProviderRequest = function (RequestInterface $request) use (&$capacityReleased): void {
+            if ($request->getMethod() !== 'PUT'
+                || ! str_contains(rawurldecode($request->getUri()->getPath()), '/target/')) {
+                return;
+            }
+            $lock = BufferedWorkLimiter::acquire();
+            $capacityReleased = true;
+            $lock->release();
+        };
+        $customerKey = random_bytes(32);
+        $customerKeyMd5 = base64_encode(md5($customerKey, true));
+        $response = (new CopyObjectHandler(
+            $this->metadata,
+            $this->backend,
+            encryption: $encryption,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->copyRequest([
+            'x-amz-server-side-encryption-customer-algorithm' => 'AES256',
+            'x-amz-server-side-encryption-customer-key' => base64_encode($customerKey),
+            'x-amz-server-side-encryption-customer-key-MD5' => $customerKeyMd5,
+        ]));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertTrue($capacityReleased);
+        $destination = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($destination);
+        self::assertSame('"' . md5($payload) . '"', $destination->etag);
+        self::assertSame('SSE-C', $destination->userMetadata['__sse-algorithm']);
+        self::assertSame($customerKeyMd5, $destination->userMetadata['__sse-customer-key-md5']);
+        $destinationCiphertext = end($this->providerBodies);
+        self::assertIsString($destinationCiphertext);
+        self::assertNotSame($payload, $destinationCiphertext);
+        self::assertSame(
+            $payload,
+            $encryption->decryptSseC(
+                $destinationCiphertext,
+                $customerKey,
+                $destination->userMetadata['__sse-iv'],
+                $destination->userMetadata['__sse-tag'],
+            ),
+        );
+    }
+
     public function test_encrypted_copy_preprocessing_renews_the_same_destination_reservation(): void
     {
         $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
@@ -1420,6 +1755,33 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $request->setAttribute('ownerId', 'owner');
         $request->setAttribute('s3.operation', S3Operation::PutObject);
         return $request;
+    }
+
+    private function putRequestWithoutLength(string $payload): Request
+    {
+        $request = new Request(
+            $this->createMock(ServerClient::class),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/key'),
+            [],
+            $payload,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.operation', S3Operation::PutObject);
+
+        return $request;
+    }
+
+    private function corruptScratchBudgetState(): void
+    {
+        $states = array_values(array_filter(
+            glob($this->base . '/scratch/.opsfour-s3-storage-budget/state-*') ?: [],
+            static fn(string $path): bool => ! str_ends_with($path, '.tmp'),
+        ));
+        self::assertCount(1, $states);
+        self::assertNotFalse(file_put_contents($states[0], 'corrupt'));
     }
 
     private function onlyOutstandingIntent(): \OpsFour\S3Server\Metadata\ObjectWriteIntent

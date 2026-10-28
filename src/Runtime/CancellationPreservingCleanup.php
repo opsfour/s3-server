@@ -7,7 +7,7 @@ namespace OpsFour\S3Server\Runtime;
 use Amp\CancelledException;
 
 /**
- * Runs best-effort cleanup without replacing an in-flight request cancellation.
+ * Runs best-effort cleanup without replacing an in-flight request failure.
  *
  * @internal
  */
@@ -25,10 +25,10 @@ final class CancellationPreservingCleanup
     }
 
     /** @param callable(): void ...$cleanups */
-    public static function inFinally(?CancelledException $cancellation, callable ...$cleanups): void
+    public static function inFinally(?\Throwable $failure, callable ...$cleanups): void
     {
         $cleanupError = self::runAll(array_values($cleanups));
-        if ($cleanupError !== null && $cancellation === null) {
+        if ($cleanupError !== null && $failure === null) {
             throw $cleanupError;
         }
     }

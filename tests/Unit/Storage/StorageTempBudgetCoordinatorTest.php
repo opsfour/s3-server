@@ -180,6 +180,60 @@ final class StorageTempBudgetCoordinatorTest extends TestCase
         }
     }
 
+    public function test_corrupt_abandoned_state_holds_budget_until_its_unknown_temp_file_is_removed(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-storage-budget-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $corruptPath = $tempDir . '/s3fw-put-corrupt';
+        $validPath = $tempDir . '/s3fw-put-valid';
+        $nextPath = $tempDir . '/s3fw-put-next';
+        file_put_contents($corruptPath, 'abcd');
+        file_put_contents($validPath, 'efgh');
+        file_put_contents($nextPath, 'next');
+        $coordinator = new StorageTempBudgetCoordinator($tempDir, 8);
+        $corrupt = $coordinator->start($corruptPath);
+        $valid = $coordinator->start($validPath);
+        $next = null;
+        try {
+            $coordinator->reserve($corrupt, 4);
+            $coordinator->reserve($valid, 4);
+            $corrupt->close();
+            $valid->close();
+            $corruptState = dirname($corrupt->leasePath) . '/state-' . substr(basename($corrupt->leasePath), 6);
+            self::assertSame(7, file_put_contents($corruptState, '{broken'));
+
+            $next = (new StorageTempBudgetCoordinator($tempDir, 8))->start($nextPath);
+            try {
+                $coordinator->reserve($next, 4);
+                self::fail('Corrupt state released budget while its unknown temp file still existed.');
+            } catch (SlowDownException) {
+                self::assertFileExists($corruptPath);
+            }
+
+            self::assertFileDoesNotExist($corrupt->leasePath);
+            self::assertFileDoesNotExist($corruptState);
+            self::assertFileDoesNotExist($validPath);
+            self::assertFileDoesNotExist($valid->leasePath);
+            self::assertCount(1, glob($tempDir . '/.opsfour-s3-storage-budget/quarantine-*') ?: []);
+
+            self::assertTrue(unlink($corruptPath));
+            $coordinator->reserve($next, 4);
+            self::assertSame([], glob($tempDir . '/.opsfour-s3-storage-budget/quarantine-*') ?: []);
+        } finally {
+            @unlink($nextPath);
+            if ($next !== null) {
+                $coordinator->release($next);
+            }
+            @unlink($corruptPath);
+            @unlink($validPath);
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_active_other_process_blocks_capacity_and_crash_reclaims_its_file(): void
     {
         if (!function_exists('proc_open') || !function_exists('proc_terminate')) {

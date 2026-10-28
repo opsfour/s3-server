@@ -6,12 +6,44 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
+use GuzzleHttp\Psr7\Utils;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Storage\AwsS3CopySourceStream;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\StreamInterface;
 
 final class AwsS3CopySourceStreamTest extends TestCase
 {
+    public function test_zero_byte_provider_body_closes_at_eof(): void
+    {
+        $stream = new AwsS3CopySourceStream(Utils::streamFor(''));
+
+        self::assertNull($stream->read());
+        self::assertTrue($stream->isClosed());
+    }
+
+    public function test_exact_64_kib_multiple_closes_after_the_terminal_empty_read(): void
+    {
+        $payload = str_repeat('x', 65_536);
+        $stream = new AwsS3CopySourceStream(Utils::streamFor($payload));
+
+        self::assertSame($payload, $stream->read());
+        self::assertNull($stream->read());
+        self::assertTrue($stream->isClosed());
+    }
+
+    public function test_empty_non_eof_provider_read_remains_an_error(): void
+    {
+        $body = $this->createMock(StreamInterface::class);
+        $body->method('eof')->willReturn(false);
+        $body->expects(self::once())->method('read')->willReturn('');
+        $body->expects(self::once())->method('close');
+        $stream = new AwsS3CopySourceStream($body);
+
+        $this->expectException(InternalErrorException::class);
+        $stream->read();
+    }
+
     public function test_already_requested_cancellation_closes_the_provider_body_and_notifies_subscribers(): void
     {
         $body = $this->createMock(StreamInterface::class);

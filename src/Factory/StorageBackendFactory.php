@@ -54,9 +54,10 @@ final class StorageBackendFactory
             return $backend;
         }
 
-        // The admission-only AWS backend intentionally exposes no operational
-        // capability. Generic observability would falsely add recoverable
-        // write, multipart, and bounded-copy interfaces.
+        // Generic observability is intentionally not applied to this narrow
+        // provider-specific capability because it would falsely add recoverable
+        // write, multipart, and bounded-copy interfaces. Provider admission
+        // above remains fail-closed during startup.
         return $backend instanceof AwsS3StorageBackend
             ? $backend
             : new ObservedStorageBackend($backend, $metrics, $metricsDriver ?? $driver);

@@ -109,6 +109,43 @@ final class LocalScratchStagerTest extends TestCase
         }
     }
 
+    public function test_heartbeats_between_blocks_from_one_large_source_chunk(): void
+    {
+        $blockBytes = 65_536;
+        $payload = str_repeat('x', $blockBytes * 3);
+        $reads = 0;
+        $body = $this->createMock(ReadableStream::class);
+        $body->method('read')->willReturnCallback(static function () use (&$reads, $payload): ?string {
+            return $reads++ === 0 ? $payload : null;
+        });
+        $heartbeats = 0;
+        $stager = new LocalScratchStager($this->scratch, strlen($payload));
+
+        try {
+            $stage = $stager->stage(
+                str_repeat('4', 32),
+                $body,
+                heartbeat: static function () use (&$heartbeats): void {
+                    ++$heartbeats;
+                },
+                // One nanosecond makes every boundary eligible without
+                // sleeping or coupling the test to filesystem speed.
+                heartbeatIntervalSeconds: 0.000_000_001,
+            );
+
+            self::assertSame(2, $reads);
+            self::assertGreaterThanOrEqual(
+                6,
+                $heartbeats,
+                'One large source chunk must renew between its 64 KiB staging writes.',
+            );
+            self::assertSame($payload, file_get_contents($stage->path));
+            $stager->cleanup($stage);
+        } finally {
+            $stager->shutdown();
+        }
+    }
+
     public function test_tiny_chunk_budget_boundary_rejects_without_extra_reservations(): void
     {
         $pool = new CountingScratchBudgetPool(new ContextWorkerPool(1));

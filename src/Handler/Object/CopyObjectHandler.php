@@ -144,7 +144,7 @@ final class CopyObjectHandler implements RequestHandler
         $expectedPhysicalPayload = null;
         $body = null;
         $bufferLock = null;
-        $copyCancellation = null;
+        $copyFailure = null;
         $awsStage = null;
         $awsReserved = null;
         try {
@@ -275,6 +275,13 @@ final class CopyObjectHandler implements RequestHandler
                     $plaintextChecksums,
                     $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX,
                 );
+                if ($requiresBufferedTransform) {
+                    $bufferLock?->release();
+                    $bufferLock = null;
+                    $body->close();
+                    $body = null;
+                    unset($sourceBytes, $plaintext, $expectedPhysicalPayload, $encrypted);
+                }
                 // Only validated staged source evidence may cross the sole
                 // provider-dispatch boundary.
                 $outcome = $this->awsObjectWriter->dispatch($awsReserved, $destinationKey, $awsStage);
@@ -321,15 +328,15 @@ final class CopyObjectHandler implements RequestHandler
                     $lease->close(...),
                 );
             }
-        } catch (\Amp\CancelledException $error) {
-            $copyCancellation = $error;
+        } catch (\Throwable $error) {
+            $copyFailure = $error;
             throw $error;
         } finally {
             if ($awsReserved !== null) {
                 $this->awsObjectWriter?->retireBeforeDispatch($awsReserved);
             }
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
-                $copyCancellation,
+                $copyFailure,
                 function () use ($awsStage): void {
                     if ($awsStage !== null) {
                         $this->awsObjectWriter?->release($awsStage);
@@ -398,7 +405,9 @@ final class CopyObjectHandler implements RequestHandler
         }
         if (! $this->metadata instanceof ObjectWriteIntentStore
             || ! $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId)) {
-            throw new \OpsFour\S3Server\Exception\OperationAbortedException('The local copy write lost its publication lease.');
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'The object write lost its publication authority before metadata publication.',
+            );
         }
     }
 
@@ -1408,10 +1417,10 @@ final class CopyObjectHandler implements RequestHandler
 
     private function deleteStoredData(ObjectInfo $object, string $preservePath): void
     {
-        if ($this->awsObjectWriter !== null) {
-            return;
-        }
         foreach ($this->oldObjectPathsToClean($object, $preservePath) as [$tier, $path]) {
+            if ($this->awsObjectWriter?->isImmutableAttemptPath($tier, $path) === true) {
+                continue;
+            }
             try {
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
                     $this->metadata,

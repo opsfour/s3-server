@@ -44,6 +44,12 @@ final readonly class AwsS3ForegroundObjectWriter
         return $this->profile;
     }
 
+    public function isImmutableAttemptPath(string $storageTier, string $path): bool
+    {
+        return hash_equals($this->storageTier, $storageTier)
+            && str_starts_with($path, $this->profile->reservedPrefix . '/');
+    }
+
     public function isBoundTo(
         AwsS3StorageBackend $backend,
         AwsS3ProviderProfile $profile,

@@ -43,7 +43,7 @@ final class StorageTempBudgetCoordinator
             if ($stored === (string) $this->budgetBytes) {
                 return;
             }
-            if ($stored !== false && $this->hasActiveLeases()) {
+            if ($stored !== false && ($this->hasActiveLeases() || self::quarantinePaths($this->leaseDir) !== [])) {
                 throw new \RuntimeException('Processes sharing a storage staging directory must use the same budget.');
             }
             $payload = (string) $this->budgetBytes;
@@ -65,6 +65,7 @@ final class StorageTempBudgetCoordinator
                 $this->reapUnleasedStale();
                 $this->lastUnleasedSweepAt = time();
             }
+            $this->reapQuarantines();
             $this->writeTotal($this->sumLeases());
             $leasePath = $this->leaseDir . DIRECTORY_SEPARATOR . 'lease-' . bin2hex(random_bytes(16));
             $handle = @fopen($leasePath, 'x+');
@@ -116,6 +117,7 @@ final class StorageTempBudgetCoordinator
             $total = $this->readTotal();
             if ($bytes > $this->budgetBytes - $total) {
                 $this->reapAbandoned();
+                $this->reapQuarantines();
                 $total = $this->sumLeases();
                 $this->writeTotal($total);
             }
@@ -175,7 +177,19 @@ final class StorageTempBudgetCoordinator
                     @unlink($leasePath);
                     continue;
                 }
-                $state = $this->readState($leasePath);
+                try {
+                    $state = $this->readState($leasePath);
+                } catch (\Throwable) {
+                    // The exclusive lease lock proves no process still owns
+                    // this reservation, but corrupt state cannot identify its
+                    // path or byte count. Charge the full bounded budget until
+                    // every unleased staging file is safely gone.
+                    $this->quarantineCorruptLease($leasePath);
+                    @unlink($this->statePath($leasePath));
+                    @unlink($this->statePath($leasePath) . '.tmp');
+                    @unlink($leasePath);
+                    continue;
+                }
                 if (is_file($state['tempPath'])) {
                     @unlink($state['tempPath']);
                 }
@@ -229,7 +243,59 @@ final class StorageTempBudgetCoordinator
             $total += $this->readState($leasePath)['bytes'];
         }
 
-        return $total;
+        return self::quarantinePaths($this->leaseDir) === [] ? $total : $this->budgetBytes;
+    }
+
+    private function quarantineCorruptLease(string $leasePath): void
+    {
+        $path = $this->quarantinePath($leasePath);
+        if (is_file($path)) {
+            return;
+        }
+        $payload = (string) time();
+        if (file_put_contents($path . '.tmp', $payload) !== strlen($payload)
+            || !@rename($path . '.tmp', $path)) {
+            @unlink($path . '.tmp');
+            throw new \RuntimeException('Cannot quarantine corrupt storage staging reservation.');
+        }
+    }
+
+    private function reapQuarantines(): void
+    {
+        $quarantines = self::quarantinePaths($this->leaseDir);
+        if ($quarantines === []) {
+            return;
+        }
+        $leasedPaths = [];
+        foreach ($this->leasePaths() as $leasePath) {
+            try {
+                $leasedPaths[$this->readState($leasePath)['tempPath']] = true;
+            } catch (\Throwable) {
+                return;
+            }
+        }
+        foreach (['s3fw-put-', 's3fw-part-', 's3fw-get-', 's3fw-mpu-'] as $prefix) {
+            foreach (glob($this->tempDir . DIRECTORY_SEPARATOR . $prefix . '*') ?: [] as $path) {
+                if (!isset($leasedPaths[$path]) && !is_link($path) && is_file($path)) {
+                    return;
+                }
+            }
+        }
+        foreach ($quarantines as $path) {
+            @unlink($path);
+            @unlink($path . '.tmp');
+        }
+    }
+
+    /** @return list<string> */
+    private static function quarantinePaths(string $leaseDir): array
+    {
+        $paths = glob($leaseDir . DIRECTORY_SEPARATOR . 'quarantine-*');
+        if ($paths === false) {
+            throw new \RuntimeException('Cannot scan quarantined storage staging reservations.');
+        }
+
+        return array_values(array_filter($paths, static fn(string $path): bool => !str_ends_with($path, '.tmp')));
     }
 
     private function hasActiveLeases(): bool
@@ -340,6 +406,11 @@ final class StorageTempBudgetCoordinator
     private function statePath(string $leasePath): string
     {
         return $this->leaseDir . DIRECTORY_SEPARATOR . 'state-' . substr(basename($leasePath), 6);
+    }
+
+    private function quarantinePath(string $leasePath): string
+    {
+        return $this->leaseDir . DIRECTORY_SEPARATOR . 'quarantine-' . substr(basename($leasePath), 6);
     }
 
     /**

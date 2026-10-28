@@ -189,7 +189,7 @@ final class PutObjectHandler implements RequestHandler
         $awsStage = null;
         $awsDispatchToken = null;
         $bufferedWorkLock = null;
-        $requestCancellation = null;
+        $requestFailure = null;
         $publicationCommitted = false;
         try {
             $declaredLength = self::declaredObjectLength($request);
@@ -339,6 +339,16 @@ final class PutObjectHandler implements RequestHandler
                 $this->deleteUncommittedPath($bucket, $result->path);
                 throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
                     'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $result->size,
+                );
+            }
+
+            if ($awsStage !== null && $declaredLength === null) {
+                $this->assertDeclaredLengthWithinQuota(
+                    $request,
+                    $bucketInfo,
+                    $key,
+                    $ownershipDecision,
+                    $result->size,
                 );
             }
 
@@ -704,15 +714,15 @@ final class PutObjectHandler implements RequestHandler
                 status: 200,
                 headers: $headers,
             );
-        } catch (\Amp\CancelledException $error) {
-            $requestCancellation = $error;
+        } catch (\Throwable $error) {
+            $requestFailure = $error;
             throw $error;
         } finally {
             if ($awsReserved !== null) {
                 $this->awsObjectWriter?->retireBeforeDispatch($awsReserved);
             }
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
-                $requestCancellation,
+                $requestFailure,
                 function () use ($awsStage, $publicationCommitted): void {
                     if ($awsStage !== null) {
                         try {
@@ -769,10 +779,10 @@ final class PutObjectHandler implements RequestHandler
     /** @param list<array{tier: string, path: string}> $paths */
     private function deleteStagedData(string $bucket, array $paths): void
     {
-        if ($this->awsObjectWriter !== null) {
-            return;
-        }
         foreach ($paths as $entry) {
+            if ($this->awsObjectWriter?->isImmutableAttemptPath($entry['tier'], $entry['path']) === true) {
+                continue;
+            }
             try {
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
                     $this->metadata,
@@ -1019,7 +1029,7 @@ final class PutObjectHandler implements RequestHandler
         if (! $this->metadata instanceof ObjectWriteIntentStore
             || ! $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId)) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(
-                'Local object write lease was lost before metadata publication.',
+                'The object write lost its publication authority before metadata publication.',
             );
         }
     }

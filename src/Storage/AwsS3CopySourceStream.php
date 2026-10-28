@@ -31,13 +31,13 @@ final class AwsS3CopySourceStream implements \IteratorAggregate, ReadableStream
         }
         try {
             $cancellation?->throwIfRequested();
-            if ($this->body->eof()) {
-                $this->close();
-                return null;
-            }
             $chunk = $this->body->read(65_536);
             $cancellation?->throwIfRequested();
             if ($chunk === '') {
+                if ($this->body->eof()) {
+                    $this->close();
+                    return null;
+                }
                 throw new \RuntimeException('Empty provider read.');
             }
             return $chunk;

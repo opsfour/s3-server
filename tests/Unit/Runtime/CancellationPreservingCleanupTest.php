@@ -53,6 +53,25 @@ final class CancellationPreservingCleanupTest extends TestCase
         self::assertSame(['first', 'second'], $calls);
     }
 
+    public function test_finally_cleanup_keeps_original_non_cancellation_failure_and_runs_every_cleanup(): void
+    {
+        $failure = new \RuntimeException('request failed');
+        $calls = [];
+
+        CancellationPreservingCleanup::inFinally(
+            $failure,
+            static function () use (&$calls): void {
+                $calls[] = 'first';
+                throw new \RuntimeException('cleanup failed');
+            },
+            static function () use (&$calls): void {
+                $calls[] = 'second';
+            },
+        );
+
+        self::assertSame(['first', 'second'], $calls);
+    }
+
     public function test_cleanup_failure_still_propagates_without_primary_cancellation(): void
     {
         $cleanupError = new \RuntimeException('cleanup failed');
