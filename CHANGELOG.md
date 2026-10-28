@@ -44,6 +44,15 @@ The project follows [Semantic Versioning](https://semver.org/).
   completion remains bounded, and both dispatches commit with object metadata.
   Replacement, abort, and completion cleanup queue exact paths without generic
   AWS deletion. Generic operations and API startup remain fail closed.
+- Fence lifecycle tier transitions and temporary restore copies through one
+  exact admitted AWS tier binding. Workers reserve attempt and seal capacity
+  before reading a source, stage stored ciphertext byte-for-byte, consume the
+  exact provider dispatch in the queue/placement transaction, and retain every
+  ambiguous or confirmed-but-unlinked target without delete or replay. AWS
+  transition, restore, CopyObject, and multipart source reads now require exact
+  current-v2 path, owner-digest, size, and bounded-stream evidence. Mixed local
+  and AWS tiers own independent reconcilers; multiple admitted AWS bindings fail
+  closed. Generic AWS operations and production startup remain disabled.
 
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
   MySQL, including completion-order boundaries, original upload part numbers,

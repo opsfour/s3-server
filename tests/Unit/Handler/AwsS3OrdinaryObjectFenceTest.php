@@ -110,7 +110,19 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
                 $this->providerBodies[] = (string) $request->getBody();
             }
             $this->requests[] = $request;
-            return $handler($request, $options);
+            return $handler($request, $options)->then(static function ($response) use ($request) {
+                if ($request->getMethod() !== 'GET' || $response->getStatusCode() >= 300
+                    || ! $response->hasHeader('x-amz-meta-opsfour-write-attempt')) {
+                    return $response;
+                }
+                $range = $response->getHeaderLine('Content-Range');
+                $contentSize = preg_match('/\/(\d+)$/D', $range, $matches) === 1
+                    ? $matches[1] : $response->getHeaderLine('Content-Length');
+
+                return $response
+                    ->withHeader('x-amz-meta-opsfour-owner-digest', hash('sha256', 'owner'))
+                    ->withHeader('x-amz-meta-opsfour-content-size', $contentSize);
+            });
         }));
         self::assertTrue($binding->admission->providerAdmitted);
         $this->backend = new AwsS3StorageBackend($binding->admission, $binding);
@@ -264,7 +276,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $attempt = basename($object->systemMetadata['storagePath']);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen('observed AWS payload'),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $attempt,
         ], 'observed AWS payload'));
         $this->mock->append(new Response(200, ['ETag' => '"copy-etag"']));
@@ -426,7 +438,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
             $sourceAttempt = basename($object->systemMetadata['storagePath']);
             $this->mock->append(new Response(200, [
                 'Content-Length' => (string) strlen($sourcePayload),
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
             ], $sourcePayload));
             $this->mock->append(new Response(200, ['ETag' => '"copy-etag"']));
@@ -1005,7 +1017,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $sourceAttempt = basename($source->systemMetadata['storagePath']);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
         ], $payload));
         $this->mock->append(new Response(200, ['ETag' => '"provider-destination"']));
@@ -1039,7 +1051,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $this->metadata->setBucketVersioning('target', 'Enabled');
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
         ], $payload));
         $this->mock->append(new Response(200, ['ETag' => '"provider-destination"']));
@@ -1193,7 +1205,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
     {
         $this->mock->append(new Response(200, ['ETag' => '"provider-source"']));
         self::assertSame(200, $this->put()->handleRequest($this->putRequest('payload'))->getStatus());
-        $this->mock->append(new Response(200, ['Content-Length' => '7', 'x-amz-meta-opsfour-write-attempt' => 'v1'], 'payload'));
+        $this->mock->append(new Response(200, ['Content-Length' => '7', 'x-amz-meta-opsfour-write-attempt' => 'v2'], 'payload'));
         try {
             $this->copy()->handleRequest($this->copyRequest());
             self::fail('Missing attempt marker must reject copy.');
@@ -1292,22 +1304,22 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $response = match ($kind) {
             'length' => new Response(200, [
                 'Content-Length' => '9',
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $attempt,
             ], $payload),
             'short' => new Response(200, [
                 'Content-Length' => '8',
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $attempt,
             ], 'short'),
             'excess' => new Response(200, [
                 'Content-Length' => '8',
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $attempt,
             ], $payload . 'extra'),
             'attempt' => new Response(200, [
                 'Content-Length' => '8',
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => str_repeat('f', 32),
             ], $payload),
             'get' => new Response(503, [], '<Error><Code>ServiceUnavailable</Code></Error>'),
@@ -1335,7 +1347,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $attempt = basename($source->systemMetadata['storagePath']);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $attempt,
         ], 'corrupt!'));
 
@@ -1381,7 +1393,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
             $sourceAttempt = basename($source->systemMetadata['storagePath']);
             $this->mock->append(new Response(200, [
                 'Content-Length' => (string) strlen($ciphertext),
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
             ], $ciphertext));
             $this->mock->append(new Response(200, ['ETag' => '"copy"']));
@@ -1418,7 +1430,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertIsString($sourceCiphertext);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($sourceCiphertext),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => basename($source->systemMetadata['storagePath']),
         ], $sourceCiphertext));
         $this->mock->append(new Response(200, ['ETag' => '"destination"']));
@@ -1483,7 +1495,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $sourceAttempt = basename($source->systemMetadata['storagePath']);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($ciphertext),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
         ], $ciphertext));
         $this->mock->append(new Response(200, ['ETag' => '"destination"']));
@@ -1537,7 +1549,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertIsString($ciphertext);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($ciphertext),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => basename($source->systemMetadata['storagePath']),
         ], $ciphertext));
         $this->mock->append(new Response(200, ['ETag' => '"destination"']));
@@ -1648,7 +1660,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         ] as $index => $headers) {
             $this->mock->append(new Response(200, [
                 'Content-Length' => (string) strlen($payload),
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
             ], $payload));
             $this->mock->append(new Response(200, ['ETag' => '"copy"']));
@@ -1712,7 +1724,19 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
                         $this->providerBodies[] = (string) $request->getBody();
                     }
                     $this->requests[] = $request;
-                    return $handler($request, $options);
+                    return $handler($request, $options)->then(static function ($response) use ($request) {
+                        if ($request->getMethod() !== 'GET' || $response->getStatusCode() >= 300
+                            || ! $response->hasHeader('x-amz-meta-opsfour-write-attempt')) {
+                            return $response;
+                        }
+                        $range = $response->getHeaderLine('Content-Range');
+                        $contentSize = preg_match('/\/(\d+)$/D', $range, $matches) === 1
+                            ? $matches[1] : $response->getHeaderLine('Content-Length');
+
+                        return $response
+                            ->withHeader('x-amz-meta-opsfour-owner-digest', hash('sha256', 'owner'))
+                            ->withHeader('x-amz-meta-opsfour-content-size', $contentSize);
+                    });
                 },
             ),
         );
@@ -1822,7 +1846,7 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $attempt = basename($source->systemMetadata['storagePath']);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $attempt,
         ], $payload));
         $this->mock->append(new Response(200, ['ETag' => '"destination"']));

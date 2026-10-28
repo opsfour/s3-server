@@ -47,7 +47,10 @@ fail-closed until its writer fence is complete. A package-internal AWS primitive
 can now durably arm an exact create-only attempt and return a closed provider
 outcome. Ordinary PUT, browser POST, CopyObject destinations, multipart parts,
 and completed multipart objects now use the exact dispatch fence internally,
-including narrow verified CopyObject and multipart-part source reads. The same
+and lifecycle transitions and temporary restore copies use the same exact
+tier-bound capability. Narrow source reads now require the current v2 marker,
+attempt identity, logical-owner digest, committed size, exact bucket generation,
+and bounded EOF. The same
 exact undispatched reservation is renewed across staging, SSE
 preprocessing, and encrypted Copy transforms; complete staged evidence is
 validated before the sole provider dispatch, with an independent heartbeat while
@@ -60,8 +63,8 @@ Ambiguous armed attempts are reclaimed by a tier-bound, generation-fenced
 collector that verifies immutable v2 size/SHA-256 evidence and installs or
 adopts a permanent same-key seal. AWS admission reserves both the open-attempt
 and seal pools before ingestion; only verified sealing releases the open charge.
-API startup still refuses this profile while the remaining writers and
-recovery paths are incomplete. Memory storage is test-only. Flysystem, remote and shared
+API startup still refuses this profile while access logs, garbage deletion,
+remaining internal writers, and release qualification are incomplete. Memory storage is test-only. Flysystem, remote and shared
 filesystems, NFS/EFS, multiple API processes, and multiple hosts remain
 experimental until each exact profile completes its own qualification gates. See the
 [roadmap and status definitions](docs/production-feature-roadmap.md).

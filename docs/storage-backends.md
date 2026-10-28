@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission plus ordinary-object and multipart write fences implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy/UploadPart/UploadPartCopy/completion fences, exact Copy and multipart-part reads; API startup always fails closed |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission plus ordinary-object, multipart, lifecycle-transition, and restore-copy fences implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy/UploadPart/UploadPartCopy/completion/transition/restore fences, exact current-v2 source reads; API startup always fails closed |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -238,8 +238,20 @@ and immutable placement commit atomically. Abort and post-completion part cleanu
 only persist exact garbage paths; generic collectors and request handlers do not
 mutate qualified AWS keys.
 
-Generic `StorageBackend` AWS operations, provider-side copy, and background
-writers remain unavailable. API startup refuses the profile even when the
+Lifecycle transitions and temporary restore copies may use one exact admitted
+AWS tier binding. They reserve capacity before opening any source stream, copy
+stored ciphertext without transformation, and consume the confirmed dispatch in
+the same transaction as queue completion and placement or restore metadata. A
+stale claim, changed bucket generation, ambiguous provider result, or uncertain
+commit acknowledgement never authorizes AWS deletion. A later logical retry
+allocates a fresh immutable attempt while prior armed evidence remains available
+to reconciliation. AWS sources are read only through exact current-v2 path,
+owner-digest, size, expected-owner, and bounded-EOF verification. Multiple
+admitted AWS tier bindings fail closed; only a default-tier binding is exposed
+to foreground request handlers.
+
+Generic `StorageBackend` AWS operations, provider-side copy, garbage deletion,
+and remaining internal writers remain unavailable. API startup refuses the profile even when the
 unsafe Flysystem test override is enabled.
 
 Every AWS reservation charges fixed open-attempt and permanent-seal capacity
@@ -253,7 +265,7 @@ seal capacity remains charged permanently. Generic 404/409/412 responses,
 timeouts, malformed bodies, and foreign markers never retire uncertainty.
 This release exposes no seal deletion or break-glass removal operation.
 
-Later qualification stories must connect and cover every remaining writer and
+Later qualification stories must connect access logs, garbage cleanup, and every remaining internal writer and
 complete cleanup, health, and release gates before this profile
 can be described as fence-complete or production-qualified.
 

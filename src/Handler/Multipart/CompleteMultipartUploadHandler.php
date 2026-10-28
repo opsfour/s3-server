@@ -516,6 +516,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $bucketInfo,
                     $key,
                     $uploadId,
+                    (string) $upload['owner_id'],
                     $validatedParts,
                 );
                 $verifiedSize = 0;
@@ -537,6 +538,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                     $bucketInfo,
                     $key,
                     $uploadId,
+                    (string) $upload['owner_id'],
                     $validatedParts,
                 );
                 $providerBody = new AwsS3MultipartPsrStream(
@@ -1100,6 +1102,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         $stage = null;
         $dispatch = null;
         $writer = $this->awsObjectWriter;
+        $expectedOwnerId = (string) $request->getAttribute('ownerId');
         try {
             BufferedSsePayload::assertMemoryHeadroom($expectedSize);
             [$ciphertext, $encMeta] = $writer->transform($reservation, function () use (
@@ -1113,6 +1116,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                 $customerKey,
                 $request,
                 $reservation,
+                $expectedOwnerId,
             ): array {
                 $plaintext = '';
                 foreach ($parts as $part) {
@@ -1121,6 +1125,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
                         $key,
                         $uploadId,
                         $part['partNumber'],
+                        $expectedOwnerId,
                         $part['storagePath'],
                         $part['size'],
                         $part['size'] + EncryptedMultipartPartCodec::MAX_OVERHEAD,

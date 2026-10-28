@@ -34,6 +34,7 @@ final class TierTransitionExecutor
         private readonly bool $deleteSourceAfterCommit = true,
         private readonly float $leaseRenewalIntervalSeconds = 100.0,
         private readonly ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
+        private readonly ?AwsS3FencedBackgroundObjectWriter $awsFencedWriter = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($this->leaseRenewalIntervalSeconds)
@@ -41,7 +42,8 @@ final class TierTransitionExecutor
             || $this->leaseRenewalIntervalSeconds >= QueueLease::DURATION_SECONDS / 2) {
             throw new \InvalidArgumentException('Tier transition lease renewal interval must fit within its lease.');
         }
-        if ($this->localFencedWriter !== null && ! $this->metadata instanceof ObjectWriteIntentStore) {
+        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null)
+            && ! $this->metadata instanceof ObjectWriteIntentStore) {
             throw new \InvalidArgumentException('Fenced tier transition requires an object write intent metadata store.');
         }
     }
@@ -95,6 +97,8 @@ final class TierTransitionExecutor
         $fencedTarget = false;
         $dispatchToken = null;
         $targetBucket = null;
+        $awsReservation = null;
+        $awsSource = false;
         $leaseExpiresAt = (float) ($job['nextAttemptAt'] ?? 0);
 
         try {
@@ -127,21 +131,54 @@ final class TierTransitionExecutor
             );
             $sourceBackend = $this->tiers->tier($sourceTier)->backend;
             $targetBackend = $this->tiers->tier($targetTier)->backend;
+            $awsSource = $this->awsFencedWriter?->isBoundTier($sourceBackend, $sourceTier) ?? false;
+            $awsTarget = $this->awsFencedWriter?->isBoundTier($targetBackend, $targetTier) ?? false;
+            if ($awsSource || $awsTarget) {
+                $targetBucket = $this->metadata->getBucket($object->bucket);
+                if ($targetBucket === null) {
+                    throw new \RuntimeException('Transition bucket disappeared before AWS publication or source read.');
+                }
+            }
+            if ($awsTarget) {
+                $fencedTarget = true;
+                $awsReservation = $this->awsFencedWriter?->reserve(
+                    $object,
+                    $targetBucket ?? throw new \LogicException('AWS target bucket snapshot is unavailable.'),
+                    $targetBackend,
+                    $targetTier,
+                    'tier_transition',
+                );
+            }
             $sourceSize = 0;
             $sourceMd5 = hash_init('md5');
             $sourceChecksums = StoredObjectChecksumVerifier::shouldVerify($object) ? new ChecksumCalculator() : null;
             $sourceStream = null;
             $writeFailure = null;
             try {
+                $rawSource = $awsSource
+                    ? $this->awsFencedWriter?->readCommittedSource(
+                        $targetBucket ?? throw new \LogicException('AWS source bucket snapshot is unavailable.'),
+                        $object,
+                        $sourceBackend,
+                        $sourceTier,
+                        $sourcePath,
+                    ) ?? throw new \LogicException('AWS source reader disappeared.')
+                    : $sourceBackend->getObjectByPath($sourcePath);
                 $sourceStream = new TeeReadableStream(
-                    $sourceBackend->getObjectByPath($sourcePath),
+                    $rawSource,
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
                         $sourceChecksums?->update($chunk);
                     },
                 );
-                if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
+                if ($awsReservation !== null) {
+                    [$writeResult, $dispatchToken] = $this->awsFencedWriter?->publishReserved(
+                        $awsReservation,
+                        $object,
+                        $sourceStream,
+                    ) ?? throw new \LogicException('AWS background writer disappeared.');
+                } elseif ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
                     $fencedTarget = true;
                     $targetBucket = $this->metadata->getBucket($object->bucket);
                     if ($targetBucket === null) {
@@ -177,6 +214,13 @@ final class TierTransitionExecutor
                 }
             }
             if ($writeFailure !== null) {
+                if ($awsReservation !== null && $dispatchToken === null) {
+                    try {
+                        $this->awsFencedWriter?->retireBeforeDispatch($awsReservation);
+                    } catch (\Throwable) {
+                        // Armed or uncertain attempts remain durable for reconciliation.
+                    }
+                }
                 throw $writeFailure;
             }
 
@@ -281,6 +325,7 @@ final class TierTransitionExecutor
 
             if (
                 $this->deleteSourceAfterCommit
+                && ! $awsSource
                 && ($this->stringJobValue($job, 'sourceTier') !== $targetTier || $sourcePath !== $writeResult->path)
             ) {
                 try {
@@ -309,7 +354,7 @@ final class TierTransitionExecutor
             return 'completed';
         } catch (CancelledException $e) {
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $writeResult !== null
-                && (! $publicationCallbackCompleted || $targetTier === null || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
+                && (! $publicationCallbackCompleted || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
                 $this->cleanTarget($job, $targetBackend, $writeResult->path);
             }
 

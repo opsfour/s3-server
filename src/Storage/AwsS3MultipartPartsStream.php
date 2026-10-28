@@ -40,6 +40,7 @@ final class AwsS3MultipartPartsStream implements \IteratorAggregate, ReadableStr
         private readonly BucketInfo $bucket,
         private readonly string $key,
         private readonly string $uploadId,
+        private readonly string $expectedOwnerId,
         private readonly array $parts,
     ) {
         if ($parts === []) {
@@ -67,6 +68,7 @@ final class AwsS3MultipartPartsStream implements \IteratorAggregate, ReadableStr
                         $this->key,
                         $this->uploadId,
                         $part['partNumber'],
+                        $this->expectedOwnerId,
                         $part['storagePath'],
                         $part['size'],
                         $part['size'],

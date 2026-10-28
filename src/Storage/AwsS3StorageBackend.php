@@ -149,8 +149,10 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             if (! $body instanceof StreamInterface || ! is_int($responseLength) || $responseLength !== $expectedLength
                 || ($expectedContentRange !== null && $contentRange !== $expectedContentRange)
                 || ! is_array($markers)
-                || ($markers['opsfour-write-attempt'] ?? null) !== 'v1'
-                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId) {
+                || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
+                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId
+                || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $source->ownerId)
+                || ($markers['opsfour-content-size'] ?? null) !== (string) $source->size) {
                 throw new \RuntimeException('Unverified AWS copy source response.');
             }
             return new LimitedReadableStream(
@@ -176,6 +178,7 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
         string $logicalScope,
         string $path,
         string $storageTier,
+        string $expectedOwnerId,
         int $expectedSize,
         int $maximumSize,
     ): ReadableStream {
@@ -209,8 +212,10 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             if (! $body instanceof StreamInterface || ! is_int($length)
                 || $length < $expectedSize || $length > $maximumSize
                 || ! is_array($markers)
-                || ($markers['opsfour-write-attempt'] ?? null) !== 'v1'
-                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId) {
+                || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
+                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId
+                || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $expectedOwnerId)
+                || ($markers['opsfour-content-size'] ?? null) !== (string) $length) {
                 throw new \RuntimeException('Unverified AWS multipart part response.');
             }
 
@@ -229,6 +234,21 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             }
             throw new InternalErrorException('AWS multipart part could not be verified.');
         }
+    }
+
+    /** Exact owner-bound read of one committed current-v2 object attempt. */
+    public function readCommittedObject(
+        BucketInfo $bucket,
+        ObjectInfo $object,
+        string $path,
+        string $storageTier,
+    ): ReadableStream {
+        if ($object->bucket !== $bucket->name || $object->key === '' || $object->ownerId === ''
+            || $storageTier === '' || $object->storageTier !== $storageTier || $object->size < 0) {
+            throw new InternalErrorException('AWS committed source scope is invalid.');
+        }
+
+        return $this->readCopySource($bucket, $object, $object->key, $path);
     }
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult

@@ -34,6 +34,8 @@ use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
@@ -193,23 +195,29 @@ final readonly class S3ServerRuntimeFactory
                 $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory);
             }
 
-            $awsStorage = $storageTiers->defaultBackend();
-            while ($awsStorage instanceof ObservedStorageBackend) {
-                $awsStorage = $awsStorage->innerBackend();
-            }
-            if ($awsStorage instanceof AwsS3StorageBackend && $awsStorage->awsS3ProviderAdmission()->providerAdmitted) {
-                $awsObjectWriter = $awsStorage->createForegroundObjectWriter(
+            $awsBinding = $this->admittedAwsTier($storageTiers);
+            if ($awsBinding !== null) {
+                [$awsTier, $awsStorage] = $awsBinding;
+                $awsTierWriter = $awsStorage->createForegroundObjectWriter(
                     $metadata,
                     $this->awsObjectScratchPath(),
-                    $storageTiers->defaultTier()->name,
+                    $awsTier->name,
                 );
                 $server->setAwsObjectWriteIntentCollector($awsStorage->createObjectWriteIntentCollector(
                     $metadata,
-                    $storageTiers->defaultTier()->name,
+                    $awsTier->name,
                     $logger,
                     $metrics,
                 ));
-                $runtime->attachAwsObjectWriter($awsObjectWriter);
+                $server->setAwsBackgroundObjectWriter(new AwsS3FencedBackgroundObjectWriter(
+                    $awsTierWriter,
+                    $awsStorage,
+                    $awsTier->name,
+                ));
+                $runtime->attachAwsObjectWriter($awsTierWriter);
+                if ($awsTier->name === $storageTiers->defaultTier()->name) {
+                    $awsObjectWriter = $awsTierWriter;
+                }
             }
 
             foreach ($notificationListeners as $listenerConfig) {
@@ -394,6 +402,27 @@ final readonly class S3ServerRuntimeFactory
         return $backend instanceof FilesystemBackend && realpath($backend->getBasePath()) !== false
             ? $backend
             : null;
+    }
+
+    /** @return array{StorageTier, AwsS3StorageBackend}|null */
+    private function admittedAwsTier(StorageTierRegistry $tiers): ?array
+    {
+        $bindings = [];
+        foreach ($tiers->all() as $tier) {
+            $backend = $tier->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if ($backend instanceof AwsS3StorageBackend
+                && $backend->awsS3ProviderAdmission()->providerAdmitted) {
+                $bindings[] = [$tier, $backend];
+            }
+        }
+        if (count($bindings) > 1) {
+            throw new \RuntimeException('Multiple admitted AWS S3 tier bindings are unsupported.');
+        }
+
+        return $bindings[0] ?? null;
     }
 
     private function productionScratchPath(StorageTierRegistry $tiers): string

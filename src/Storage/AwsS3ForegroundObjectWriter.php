@@ -60,6 +60,12 @@ final readonly class AwsS3ForegroundObjectWriter
             && $this->intents === $intents;
     }
 
+    /** Exact backend/tier binding used by the background publication adapter. */
+    public function isBoundToBackend(AwsS3StorageBackend $backend, string $storageTier): bool
+    {
+        return $this->backend === $backend && hash_equals($this->storageTier, $storageTier);
+    }
+
     public function shutdown(): void
     {
         $this->stager->shutdown();
@@ -71,7 +77,7 @@ final readonly class AwsS3ForegroundObjectWriter
         string $ownerId,
         string $purpose = 'put_object',
     ): AwsS3ForegroundObjectReservation {
-        if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart'], true)) {
+        if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart', 'tier_transition', 'restore_copy'], true)) {
             throw new \InvalidArgumentException('AWS foreground publication purpose is unsupported.');
         }
         $attemptId = bin2hex(random_bytes(16));
@@ -198,6 +204,7 @@ final readonly class AwsS3ForegroundObjectWriter
         string $key,
         string $uploadId,
         int $partNumber,
+        string $expectedOwnerId,
         string $path,
         int $expectedSize,
         int $maximumSize,
@@ -207,6 +214,7 @@ final readonly class AwsS3ForegroundObjectWriter
             self::multipartPartLogicalKey($key, $uploadId, $partNumber),
             $path,
             $this->storageTier,
+            $expectedOwnerId,
             $expectedSize,
             $maximumSize,
         );

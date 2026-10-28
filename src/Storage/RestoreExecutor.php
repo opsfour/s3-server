@@ -35,6 +35,7 @@ final class RestoreExecutor
         private readonly ?NotificationDispatcher $notifications = null,
         private readonly float $leaseRenewalIntervalSeconds = 100.0,
         private readonly ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
+        private readonly ?AwsS3FencedBackgroundObjectWriter $awsFencedWriter = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($this->leaseRenewalIntervalSeconds)
@@ -42,7 +43,8 @@ final class RestoreExecutor
             || $this->leaseRenewalIntervalSeconds >= QueueLease::DURATION_SECONDS / 2) {
             throw new \InvalidArgumentException('Restore lease renewal interval must fit within its lease.');
         }
-        if ($this->localFencedWriter !== null && ! $this->metadata instanceof ObjectWriteIntentStore) {
+        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null)
+            && ! $this->metadata instanceof ObjectWriteIntentStore) {
             throw new \InvalidArgumentException('Fenced restore requires an object write intent metadata store.');
         }
     }
@@ -89,6 +91,7 @@ final class RestoreExecutor
         $fencedTarget = false;
         $dispatchToken = null;
         $targetBucket = null;
+        $awsReservation = null;
         $leaseExpiresAt = (float) ($job['nextAttemptAt'] ?? 0);
 
         try {
@@ -127,6 +130,18 @@ final class RestoreExecutor
             if (! $this->metadata instanceof RestoredCopyTierStore) {
                 throw new \RuntimeException('Restore requires tier-aware metadata persistence.');
             }
+            $awsSource = $this->awsFencedWriter?->isBoundTier($sourceBackend, $sourceTier) ?? false;
+            $awsTarget = $this->awsFencedWriter?->isBoundTier($targetBackend, $targetTierName) ?? false;
+            if ($awsTarget) {
+                $fencedTarget = true;
+                $awsReservation = $this->awsFencedWriter?->reserve(
+                    $object,
+                    $targetBucket,
+                    $targetBackend,
+                    $targetTierName,
+                    'restore_copy',
+                );
+            }
             $tierStore = $this->metadata;
             $sourceSize = 0;
             $sourceMd5 = hash_init('md5');
@@ -134,15 +149,30 @@ final class RestoreExecutor
             $sourceStream = null;
             $writeFailure = null;
             try {
+                $rawSource = $awsSource
+                    ? $this->awsFencedWriter?->readCommittedSource(
+                        $targetBucket,
+                        $object,
+                        $sourceBackend,
+                        $sourceTier,
+                        $sourceStoragePath,
+                    ) ?? throw new \LogicException('AWS source reader disappeared.')
+                    : $sourceBackend->getObjectByPath($sourceStoragePath);
                 $sourceStream = new TeeReadableStream(
-                    $sourceBackend->getObjectByPath($sourceStoragePath),
+                    $rawSource,
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
                         $sourceChecksums?->update($chunk);
                     },
                 );
-                if ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
+                if ($awsReservation !== null) {
+                    [$write, $dispatchToken] = $this->awsFencedWriter?->publishReserved(
+                        $awsReservation,
+                        $object,
+                        $sourceStream,
+                    ) ?? throw new \LogicException('AWS background writer disappeared.');
+                } elseif ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
                     $fencedTarget = true;
                     [$write, $dispatchToken] = $this->localFencedWriter->publish(
                         $object,
@@ -174,6 +204,13 @@ final class RestoreExecutor
                 }
             }
             if ($writeFailure !== null) {
+                if ($awsReservation !== null && $dispatchToken === null) {
+                    try {
+                        $this->awsFencedWriter?->retireBeforeDispatch($awsReservation);
+                    } catch (\Throwable) {
+                        // Armed or uncertain attempts remain durable for reconciliation.
+                    }
+                }
                 throw $writeFailure;
             }
 
@@ -310,6 +347,7 @@ final class RestoreExecutor
 
             return 'completed';
         } catch (CancelledException $e) {
+            // @phpstan-ignore-next-line Cancellation can race a committed transaction acknowledgement.
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $write !== null) {
                 $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
             }

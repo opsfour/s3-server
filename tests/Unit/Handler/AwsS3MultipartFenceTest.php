@@ -55,6 +55,8 @@ final class AwsS3MultipartFenceTest extends TestCase
 
     private ?\Closure $beforeProviderRequest = null;
 
+    private bool $decorateProviderReadMetadata = true;
+
     /** @var array<string, string|false> */
     private array $oldEnvironment = [];
 
@@ -88,7 +90,19 @@ final class AwsS3MultipartFenceTest extends TestCase
             }
             $this->providerRequests[] = $request;
 
-            return $handler($request, $options);
+            return $handler($request, $options)->then(function ($response) use ($request) {
+                if (! $this->decorateProviderReadMetadata || $request->getMethod() !== 'GET' || $response->getStatusCode() >= 300
+                    || ! $response->hasHeader('x-amz-meta-opsfour-write-attempt')) {
+                    return $response;
+                }
+                $range = $response->getHeaderLine('Content-Range');
+                $contentSize = preg_match('/\/(\d+)$/D', $range, $matches) === 1
+                    ? $matches[1] : $response->getHeaderLine('Content-Length');
+
+                return $response
+                    ->withHeader('x-amz-meta-opsfour-owner-digest', hash('sha256', 'owner'))
+                    ->withHeader('x-amz-meta-opsfour-content-size', $contentSize);
+            });
         }));
         self::assertTrue($binding->admission->providerAdmitted);
         $this->backend = new AwsS3StorageBackend($binding->admission, $binding);
@@ -124,12 +138,12 @@ final class AwsS3MultipartFenceTest extends TestCase
 
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $attemptId,
         ], $payload));
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $attemptId,
         ], $payload));
         $this->mock->append(new Response(200, ['ETag' => '"provider-final"']));
@@ -266,7 +280,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($sourcePayload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
         ], $sourcePayload));
         $this->mock->append(new Response(200, ['ETag' => '"provider-part-copy"']));
@@ -314,7 +328,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         $this->mock->append(new Response(206, [
             'Content-Length' => (string) strlen($range),
             'Content-Range' => 'bytes 1-16/' . strlen($sourcePayload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
         ], $range));
         $this->mock->append(new Response(200, ['ETag' => '"provider-range-part"']));
@@ -371,7 +385,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         $partAttempt = substr($partPath, -32);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($partCiphertext),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $partAttempt,
         ], $partCiphertext));
         $this->mock->append(new Response(200, ['ETag' => '"provider-encrypted-final"']));
@@ -402,7 +416,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         foreach ([1, 2] as $_) {
             $this->mock->append(new Response(200, [
                 'Content-Length' => (string) strlen($payload),
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $attemptId,
             ], $payload));
         }
@@ -456,7 +470,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         foreach ([1, 2] as $_) {
             $this->mock->append(new Response(200, [
                 'Content-Length' => (string) strlen($payload),
-                'x-amz-meta-opsfour-write-attempt' => 'v1',
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
                 'x-amz-meta-opsfour-attempt-id' => $attemptId,
             ], $payload));
         }
@@ -513,7 +527,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         $partAttempt = substr($partPath, -32);
         $this->mock->append(new Response(200, [
             'Content-Length' => (string) strlen($partCiphertext),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => $partAttempt,
         ], $partCiphertext));
         $this->mock->append(new Response(200, ['ETag' => '"provider-encrypted-final"']));
@@ -632,7 +646,7 @@ final class AwsS3MultipartFenceTest extends TestCase
         $this->mock->append(new Response(206, [
             'Content-Length' => (string) strlen($range),
             'Content-Range' => 'bytes 2-17/' . strlen($sourcePayload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => basename($source->systemMetadata['storagePath']),
         ], $range));
         $before = count($this->providerRequests);
@@ -688,6 +702,52 @@ final class AwsS3MultipartFenceTest extends TestCase
             self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
         }
         self::assertSame($beforePath, count($this->providerRequests));
+    }
+
+    public function test_part_provenance_rejects_missing_or_foreign_owner_and_content_size_before_final_dispatch(): void
+    {
+        [$uploadId, $etag, $partPath, $payload] = $this->uploadPart('invalid provenance evidence');
+        $attemptId = basename($partPath);
+        $ownerDigest = hash('sha256', 'owner');
+        $base = [
+            'Content-Length' => (string) strlen($payload),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+        ];
+        $invalidEvidence = [
+            'missing owner digest' => $base + [
+                'x-amz-meta-opsfour-content-size' => (string) strlen($payload),
+            ],
+            'foreign owner digest' => $base + [
+                'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'foreign-owner'),
+                'x-amz-meta-opsfour-content-size' => (string) strlen($payload),
+            ],
+            'missing content size' => $base + [
+                'x-amz-meta-opsfour-owner-digest' => $ownerDigest,
+            ],
+            'foreign content size' => $base + [
+                'x-amz-meta-opsfour-owner-digest' => $ownerDigest,
+                'x-amz-meta-opsfour-content-size' => (string) (strlen($payload) + 1),
+            ],
+        ];
+        $this->decorateProviderReadMetadata = false;
+
+        foreach ($invalidEvidence as $case => $headers) {
+            $this->mock->append(new Response(200, $headers, $payload));
+            $before = count($this->providerRequests);
+            try {
+                $this->complete()->handleRequest($this->request(
+                    'POST',
+                    '/bucket/key?uploadId=' . $uploadId,
+                    $this->completionBody($etag),
+                ));
+                self::fail($case . ' reached final dispatch.');
+            } catch (\OpsFour\S3Server\Exception\InternalErrorException) {
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'), $case);
+            }
+            self::assertSame($before + 1, count($this->providerRequests), $case);
+            self::assertSame('GET', $this->providerRequests[$before]->getMethod(), $case);
+        }
     }
 
     public function test_encrypted_upload_part_copy_decrypts_and_reencrypts_the_source(): void
@@ -936,7 +996,7 @@ final class AwsS3MultipartFenceTest extends TestCase
     {
         $this->mock->append(new Response(200, array_merge([
             'Content-Length' => (string) strlen($payload),
-            'x-amz-meta-opsfour-write-attempt' => 'v1',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
             'x-amz-meta-opsfour-attempt-id' => basename($path),
         ], $headers), $payload));
     }

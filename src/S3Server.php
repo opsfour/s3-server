@@ -70,6 +70,7 @@ use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
+use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
@@ -151,13 +152,17 @@ final class S3Server
 
     private bool $localObjectCollectionRunning = false;
 
-    private LocalObjectWriteIntentCollector|AwsS3ObjectWriteIntentCollector|null $localObjectIntentCollector = null;
+    private ?LocalObjectWriteIntentCollector $localObjectIntentCollector = null;
+
+    private ?AwsS3ObjectWriteIntentCollector $awsObjectIntentCollector = null;
 
     private ?LocalFencedObjectWriter $localObjectWriter = null;
 
     private ?LocalObjectWriteLeaseGuardFactory $localObjectLeaseFactory = null;
 
     private ?LocalFencedBackgroundObjectWriter $localBackgroundWriter = null;
+
+    private ?AwsS3FencedBackgroundObjectWriter $awsBackgroundWriter = null;
 
     private ?DeferredCancellation $backgroundCancellation = null;
 
@@ -521,7 +526,7 @@ final class S3Server
                 $background = $this->prepareBackgroundComponents();
                 $preparedLifecycleRunner = $background['lifecycleRunner'];
                 $preparedNotificationProcessor = $background['notificationProcessor'];
-                $objectCollector = $background['objectCollector'];
+                $objectCollectors = $background['objectCollectors'];
                 $transitionExecutor = $background['transitionExecutor'];
                 $restoreExecutor = $background['restoreExecutor'];
                 $restoreGc = $background['restoreGarbageCollector'];
@@ -696,31 +701,32 @@ final class S3Server
                 });
             }
 
-            if ($objectCollector !== null) {
-                $collector = $objectCollector;
+            if ($objectCollectors !== []) {
                 $this->localObjectCollectionRunning = true;
                 // Keep attempt recovery independent of Lifecycle,
                 // Restore and other garbage I/O, which may block for longer
                 // than one object's claim lease.
-                $this->backgroundFutures[] = \Amp\async(function () use ($collector, $backgroundCancellation): void {
-                    try {
-                        while ($this->localObjectCollectionRunning) {
-                            try {
-                                $collector->collect(100, $backgroundCancellation);
-                            } catch (\Amp\CancelledException $error) {
-                                throw $error;
-                            } catch (\Throwable $error) {
-                                $this->logger->warning('Object intent collection failed.', [
-                                    'component' => 'object_intent_reconciler',
-                                    'exception' => $error::class,
-                                ]);
+                foreach ($objectCollectors as $collector) {
+                    $this->backgroundFutures[] = \Amp\async(function () use ($collector, $backgroundCancellation): void {
+                        try {
+                            while ($this->localObjectCollectionRunning) {
+                                try {
+                                    $collector->collect(100, $backgroundCancellation);
+                                } catch (\Amp\CancelledException $error) {
+                                    throw $error;
+                                } catch (\Throwable $error) {
+                                    $this->logger->warning('Object intent collection failed.', [
+                                        'component' => 'object_intent_reconciler',
+                                        'exception' => $error::class,
+                                    ]);
+                                }
+                                \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
                             }
-                            \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
+                        } catch (\Amp\CancelledException) {
+                            // Normal shutdown; unresolved attempts remain in SQL.
                         }
-                    } catch (\Amp\CancelledException) {
-                        // Normal shutdown; unresolved attempts remain in SQL.
-                    }
-                });
+                    });
+                }
             }
 
             // 10. Start physical tier transition / restore background processing.
@@ -829,10 +835,19 @@ final class S3Server
     public function setAwsObjectWriteIntentCollector(AwsS3ObjectWriteIntentCollector $collector): void
     {
         $this->assertConfigurationMutable('AWS object intent collector');
-        if ($this->localObjectIntentCollector !== null) {
-            throw new \LogicException('Object intent collector is already configured.');
+        if ($this->awsObjectIntentCollector !== null) {
+            throw new \LogicException('AWS object intent collector is already configured.');
         }
-        $this->localObjectIntentCollector = $collector;
+        $this->awsObjectIntentCollector = $collector;
+    }
+
+    public function setAwsBackgroundObjectWriter(AwsS3FencedBackgroundObjectWriter $writer): void
+    {
+        $this->assertConfigurationMutable('AWS background object writer');
+        if ($this->awsBackgroundWriter !== null) {
+            throw new \LogicException('AWS background object writer is already configured.');
+        }
+        $this->awsBackgroundWriter = $writer;
     }
 
     /** Attach the local object write fencing to internal access-log delivery. */
@@ -982,6 +997,13 @@ final class S3Server
             $this->abortIncompleteShutdown();
         }
         $this->localObjectIntentCollector = null;
+        try {
+            $this->awsObjectIntentCollector?->shutdown();
+        } catch (\Throwable $e) {
+            $this->logShutdown('warning', 'AWS object intent collector shutdown failed.', ['exception' => $e::class]);
+            $this->abortIncompleteShutdown();
+        }
+        $this->awsObjectIntentCollector = null;
         try {
             $this->flushAccessLogsIfAdmitted();
         } catch (\Throwable $e) {
@@ -1404,7 +1426,7 @@ final class S3Server
      * @return array{
      *     lifecycleRunner: ?LifecycleRunner,
      *     notificationProcessor: ?NotificationProcessor,
-     *     objectCollector: LocalObjectWriteIntentCollector|AwsS3ObjectWriteIntentCollector|null,
+     *     objectCollectors: list<LocalObjectWriteIntentCollector|AwsS3ObjectWriteIntentCollector>,
      *     transitionExecutor: ?TierTransitionExecutor,
      *     restoreExecutor: ?RestoreExecutor,
      *     restoreGarbageCollector: ?RestoreGarbageCollector,
@@ -1442,6 +1464,7 @@ final class S3Server
                 $tiers,
                 $this->logger,
                 localFencedWriter: $this->localBackgroundWriter,
+                awsFencedWriter: $this->awsBackgroundWriter,
             );
             $restoreExecutor = new RestoreExecutor(
                 $this->metadata,
@@ -1449,6 +1472,7 @@ final class S3Server
                 $this->logger,
                 $this->notifications,
                 localFencedWriter: $this->localBackgroundWriter,
+                awsFencedWriter: $this->awsBackgroundWriter,
             );
             $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
             $storageGc = new StorageGarbageCollector($this->metadata, $tiers, $this->logger);
@@ -1468,7 +1492,10 @@ final class S3Server
         return [
             'lifecycleRunner' => $lifecycleRunner,
             'notificationProcessor' => $notificationProcessor,
-            'objectCollector' => $this->localObjectIntentCollector,
+            'objectCollectors' => array_values(array_filter([
+                $this->localObjectIntentCollector,
+                $this->awsObjectIntentCollector,
+            ])),
             'transitionExecutor' => $transitionExecutor,
             'restoreExecutor' => $restoreExecutor,
             'restoreGarbageCollector' => $restoreGc,

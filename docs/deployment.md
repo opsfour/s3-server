@@ -17,9 +17,12 @@ preserve the signed `Host` header exactly. Additional processes, remote storage,
 shared filesystems, and multiple hosts are separate experimental profiles; see
 the [roadmap](production-feature-roadmap.md).
 
-The explicit `aws-s3` driver now includes ordinary and multipart publication
-fences plus ambiguous-write same-key sealing, but it always refuses API startup
-because total writer coverage and release qualification remain incomplete. Do
+The explicit `aws-s3` driver now includes ordinary, multipart,
+lifecycle-transition, and restore-copy publication fences plus ambiguous-write
+same-key sealing. It supports exactly one admitted tier binding and fails closed
+if multiple bindings are present, but it always refuses API startup because
+access-log, garbage-deletion, remaining internal-writer, and release
+qualification coverage remains incomplete. Do
 not use an admitted report or a healthy reconciler as production qualification.
 
 ## Current One-Process Deployment
