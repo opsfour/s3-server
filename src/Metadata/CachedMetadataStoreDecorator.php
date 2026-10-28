@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -1085,17 +1085,17 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         $this->inner->cleanupOldNotifications($maxAgeSeconds);
     }
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
-        $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath);
+        $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath, $ownerId);
     }
 
-    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         if (! $this->inner instanceof RecoveryStorageGarbageStore) {
             throw new \RuntimeException('Protected storage cleanup recovery admission is unavailable.');
         }
-        $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath);
+        $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath, $ownerId);
     }
 
     public function createMultipartPartWriteIntent(
@@ -1244,6 +1244,34 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         }
 
         return $this->inner->renewStorageGarbageLease($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration);
+    }
+
+    public function deleteAwsGarbageClaim(
+        int $id,
+        string $bucket,
+        string $tier,
+        string $path,
+        string $ownerId,
+        int $generation,
+        \Closure $currentLeaseUntil,
+        \Closure $stopRenewal,
+        \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+    ): bool {
+        if (! $this->inner instanceof AwsS3GarbageClaimStore) {
+            throw new \LogicException('Wrapped metadata store does not support AWS garbage claims.');
+        }
+
+        return $this->inner->deleteAwsGarbageClaim(
+            $id,
+            $bucket,
+            $tier,
+            $path,
+            $ownerId,
+            $generation,
+            $currentLeaseUntil,
+            $stopRenewal,
+            $deletion,
+        );
     }
 
     private function fencedQueueStore(): FencedQueueStore

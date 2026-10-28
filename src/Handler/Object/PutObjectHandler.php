@@ -256,7 +256,7 @@ final class PutObjectHandler implements RequestHandler
                     $encryptedWrite = $this->writeObject($bucketInfo, $key, $objectOwnerId, new \Amp\ByteStream\ReadableBuffer($ciphertext), $localLease, $awsReserved, $awsStage, $awsDispatchToken);
                     if ($encryptedWrite->size !== strlen($ciphertext)
                         || ! hash_equals(md5($ciphertext), strtolower($encryptedWrite->md5Hex))) {
-                        $this->deleteUncommittedPath($bucket, $encryptedWrite->path);
+                        $this->deleteUncommittedPath($bucket, $encryptedWrite->path, $objectOwnerId);
                         throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted object write does not match its payload.');
                     }
                     if ($awsReserved !== null) {
@@ -302,14 +302,14 @@ final class PutObjectHandler implements RequestHandler
                 $computedValue = MultipartPartLogicalValidator::checksum($result, $algo);
 
                 if ($computedValue === null) {
-                    $this->deleteUncommittedPath($bucket, $result->path);
+                    $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId);
                     throw new \OpsFour\S3Server\Exception\InternalErrorException(
                         "Storage backend did not compute checksum for algorithm: {$algo}",
                     );
                 }
 
                 if (!hash_equals($computedValue, $clientValue)) {
-                    $this->deleteUncommittedPath($bucket, $result->path);
+                    $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId);
                     throw new BadDigestException(
                         "Checksum mismatch: client sent {$clientValue}, computed {$computedValue}",
                     );
@@ -331,12 +331,12 @@ final class PutObjectHandler implements RequestHandler
             // For chunked SigV4 uploads, Content-Length reflects the encoded body size (with
             // chunk framing). The actual payload size is in x-amz-decoded-content-length.
             if ($result->size > MultipartPartSize::MAX_BYTES) {
-                $this->deleteUncommittedPath($bucket, $result->path);
+                $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId);
                 throw new EntityTooLargeException('PutObject exceeds the 5 GiB maximum.');
             }
 
             if ($declaredLength !== null && $declaredLength !== $result->size) {
-                $this->deleteUncommittedPath($bucket, $result->path);
+                $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId);
                 throw new \OpsFour\S3Server\Exception\IncompleteBodyException(
                     'Content-Length mismatch: declared ' . $declaredLength . ', received ' . $result->size,
                 );
@@ -657,10 +657,10 @@ final class PutObjectHandler implements RequestHandler
                 // has set this by-reference safety flag.
                 \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                     $e,
-                    function () use ($publicationCallbackCompleted, $bucket, $key, $result, $versionId, $versioning, $metadataWriteAttempted): void {
+                    function () use ($publicationCallbackCompleted, $bucket, $key, $result, $versionId, $versioning, $metadataWriteAttempted, $objectOwnerId): void {
                         if (! $publicationCallbackCompleted
                             && ! $this->mayBePublishedAfterCommitFailure($bucket, $key, $result->path, $versionId, $versioning, $metadataWriteAttempted)) {
-                            $this->deleteUncommittedPath($bucket, $result->path);
+                            $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId);
                         }
                     },
                 );
@@ -770,7 +770,7 @@ final class PutObjectHandler implements RequestHandler
             }
         }
         foreach ($paths as $entry) {
-            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path']);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path'], $object->ownerId);
         }
 
         return $paths;
@@ -885,7 +885,7 @@ final class PutObjectHandler implements RequestHandler
         ], $encrypted['ciphertext']];
     }
 
-    private function deleteUncommittedPath(string $bucket, string $path): void
+    private function deleteUncommittedPath(string $bucket, string $path, ?string $ownerId = null): void
     {
         if ($this->localFencedWriter !== null || $this->awsObjectWriter !== null) {
             // An armed worker may still link this path after the request ends.
@@ -899,6 +899,7 @@ final class PutObjectHandler implements RequestHandler
             $this->storageTiers->defaultTier()->name,
             $path,
             'put_object_uncommitted_path',
+            $ownerId,
         );
     }
 

@@ -1118,7 +1118,7 @@ interface MetadataStore
     // Storage garbage queue
     // ---------------------------------------------------------------
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void;
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void;
 
     /** Stage incomplete uploads for durable abort in the same transaction that deletes the bucket. */
     public function stageBucketMultipartCleanup(string $bucket, string $storageTier): void;
@@ -1129,7 +1129,7 @@ interface MetadataStore
      * Claim 1..1000 rows in a dedicated committed transaction. Calling this
      * inside an existing transaction is unsupported.
      *
-     * @return list<array{id: int, bucket: string, storage_tier: string, storage_path: string, operation: string, key_name: ?string, upload_id: ?string, attempts: int, lease_expires_at: float, lease_generation?: int, dispatch_id?: ?string}>
+     * @return list<array{id: int, bucket: string, storage_tier: string, storage_path: string, operation: string, key_name: ?string, upload_id: ?string, owner_id?: ?string, attempts: int, lease_expires_at: float, lease_generation?: int, dispatch_id?: ?string}>
      */
     public function dequeueStorageGarbage(int $limit): array;
 

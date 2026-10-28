@@ -119,6 +119,7 @@ final class RestoreObjectHandler implements RequestHandler
                     $current->bucket,
                     $restoredTier->name,
                     $current->restoredStoragePath,
+                    $current->ownerId,
                 );
             }
 

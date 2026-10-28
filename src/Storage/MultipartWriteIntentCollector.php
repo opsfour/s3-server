@@ -43,6 +43,7 @@ final readonly class MultipartWriteIntentCollector
         if (! $this->metadata instanceof FencedMultipartWriteIntentStore) {
             throw new \LogicException('Multipart collection requires generation-fenced claim renewal.');
         }
+        $claims = $this->metadata;
         $cleaned = 0;
         $processed = 0;
         $limit = max(1, $limit);
@@ -78,9 +79,9 @@ final readonly class MultipartWriteIntentCollector
             $intent = $claimed[0];
             // A watcher trip during SQL claim leaves its lease for recovery.
             $leaseUntil = $intent->nextAttemptAt;
-            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$leaseUntil): bool {
+            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$leaseUntil, $claims): bool {
                 $next = $this->metadata->multipartWriteIntentNow() + $this->claimLeaseSeconds;
-                if (! $this->metadata->renewMultipartCollectorClaim(
+                if (! $claims->renewMultipartCollectorClaim(
                     $intent->attemptId,
                     $next,
                     $leaseUntil,
@@ -93,6 +94,7 @@ final readonly class MultipartWriteIntentCollector
                 return true;
             }, $this->renewIntervalSeconds);
             $failed = null;
+            $localBackend = null;
             try {
                 $backend = $this->tiers->tier($intent->storageTier)->backend;
                 $localBackend = $backend;
@@ -107,6 +109,8 @@ final readonly class MultipartWriteIntentCollector
                     foreach ([$intent->assemblyPath, $intent->finalPath] as $path) {
                         $localBackend->sealFencedMultipartPath($path, $intent->attemptId);
                     }
+                } elseif ($localBackend instanceof AwsS3StorageBackend) {
+                    throw new \RuntimeException('AWS multipart maintenance requires an explicitly registered recovery capability.');
                 } else {
                     foreach (array_unique([$intent->assemblyPath, $intent->finalPath]) as $path) {
                         $backend->deleteObjectByPath($path, $intent->bucket);

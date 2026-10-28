@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Storage;
 
 use Amp\ByteStream\ReadableStream;
+use Aws\Exception\AwsException;
+use Aws\ResultInterface;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use Psr\Log\LoggerInterface;
 use Psr\Http\Message\StreamInterface;
@@ -16,10 +19,13 @@ use Psr\Http\Message\StreamInterface;
 /** Provider identity plus narrowly scoped ordinary-object fence capabilities. */
 final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissionCapability
 {
+    private object $garbageDeletionAuthority;
+
     public function __construct(
         private AwsS3ProviderAdmission $admission,
         private ?AwsS3ProviderValidatedBinding $binding = null,
     ) {
+        $this->garbageDeletionAuthority = new \stdClass();
         if ($binding !== null && ($binding->admission !== $admission
             || ! $admission->providerAdmitted
             || $binding->profile === null || $binding->client === null
@@ -249,6 +255,185 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
         }
 
         return $this->readCopySource($bucket, $object, $object->key, $path);
+    }
+
+    /**
+     * Delete one proven v2 attempt only while the metadata store owns the
+     * reference lock, then atomically acknowledge the live claim.
+     *
+     * @param \Closure(): float $currentLeaseUntil
+     * @param \Closure(): void $stopRenewal
+     */
+    public function deleteClaimedGarbage(
+        AwsS3GarbageClaimStore $claims,
+        int $claimId,
+        string $bucket,
+        string $tier,
+        string $path,
+        string $ownerId,
+        int $leaseGeneration,
+        \Closure $currentLeaseUntil,
+        \Closure $stopRenewal,
+    ): bool {
+        $deletion = new AwsS3GarbageDeletion(
+            $this,
+            $this->garbageDeletionAuthority,
+            $bucket,
+            $tier,
+            $path,
+            $ownerId,
+        );
+
+        try {
+            return $claims->deleteAwsGarbageClaim(
+                $claimId,
+                $bucket,
+                $tier,
+                $path,
+                $ownerId,
+                $leaseGeneration,
+                $currentLeaseUntil,
+                $stopRenewal,
+                $deletion,
+            );
+        } finally {
+            $deletion->revoke();
+        }
+    }
+
+    /** @internal Invoked only by a provider-bound AwsS3GarbageDeletion. */
+    public function executeGarbageDeletion(
+        object $authority,
+        string $bucket,
+        string $tier,
+        string $path,
+        string $ownerId,
+    ): void {
+        if ($authority !== $this->garbageDeletionAuthority) {
+            throw new \LogicException('AWS garbage deletion authority is invalid.');
+        }
+        $this->deleteClaimedGarbagePath($path, $bucket, $tier, $ownerId);
+    }
+
+    /** Provider mutation is private so it cannot run outside claim coordination. */
+    private function deleteClaimedGarbagePath(string $path, string $bucket, string $tier, string $ownerId): void
+    {
+        $profile = $this->binding?->profile;
+        $client = $this->binding?->client;
+        if ($profile === null || $client === null || ! $this->admission->providerAdmitted || $ownerId === '') {
+            throw $this->unavailable();
+        }
+        $identity = AwsS3WriteAttemptPath::parseGarbagePath($path, $bucket, $tier, $profile->reservedPrefix);
+        $request = [
+            'Bucket' => $profile->bucket,
+            'Key' => $path,
+            'ExpectedBucketOwner' => $profile->expectedOwnerId,
+            '@retries' => 0,
+        ];
+        try {
+            $head = $client->headObject($request);
+        } catch (AwsException $error) {
+            if (! $error->isConnectionError() && $error->getStatusCode() === 404
+                && in_array($error->getAwsErrorCode(), ['NoSuchKey', 'NotFound'], true)
+                && $this->garbageAbsent($request)) {
+                return;
+            }
+            throw $error;
+        }
+        if (self::headStatus($head) === 404) {
+            if ($this->confirmGarbageAbsentWithGet($request)) {
+                return;
+            }
+            throw new \RuntimeException('AWS garbage absence is not confirmed.');
+        }
+        if (self::headStatus($head) !== 200) {
+            throw new \RuntimeException('AWS garbage HEAD response is not conclusive.');
+        }
+        $markers = $head->get('Metadata');
+        $contentLength = $head->get('ContentLength');
+        if (! is_array($markers)
+            || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
+            || ($markers['opsfour-attempt-id'] ?? null) !== $identity['attemptId']
+            || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $ownerId)
+            || ! isset($markers['opsfour-content-size'])
+            || ! ctype_digit((string) $markers['opsfour-content-size'])
+            || ! is_int($contentLength)
+            || (string) $contentLength !== (string) $markers['opsfour-content-size']
+            || isset($markers['opsfour-write-seal'])) {
+            throw new \RuntimeException('AWS garbage path has conflicting provider evidence.');
+        }
+        $client->deleteObject($request);
+        $this->assertGarbageAbsent($request);
+    }
+
+    /** @param array{Bucket: string, Key: string, ExpectedBucketOwner: string, '@retries': int} $request */
+    private function assertGarbageAbsent(array $request): void
+    {
+        if (! $this->garbageAbsent($request)) {
+            throw new \RuntimeException('AWS garbage path is still present after deletion.');
+        }
+    }
+
+    /** @param array{Bucket: string, Key: string, ExpectedBucketOwner: string, '@retries': int} $request */
+    private function garbageAbsent(array $request): bool
+    {
+        $binding = $this->binding;
+        if ($binding === null || $binding->client === null) {
+            throw $this->unavailable();
+        }
+        $client = $binding->client;
+        try {
+            $head = $client->headObject($request);
+            if (self::headStatus($head) === 404) {
+                return $this->confirmGarbageAbsentWithGet($request);
+            }
+            if (self::headStatus($head) !== 200) {
+                throw new \RuntimeException('AWS garbage HEAD response is not conclusive.');
+            }
+            return false;
+        } catch (AwsException $error) {
+            if ($error->isConnectionError() || $error->getStatusCode() !== 404) {
+                throw $error;
+            }
+            if ($error->getAwsErrorCode() === 'NoSuchKey') {
+                return true;
+            }
+            if ($error->getAwsErrorCode() !== 'NotFound') {
+                throw $error;
+            }
+        }
+        return $this->confirmGarbageAbsentWithGet($request);
+    }
+
+    /** @param array{Bucket: string, Key: string, ExpectedBucketOwner: string, '@retries': int} $request */
+    private function confirmGarbageAbsentWithGet(array $request): bool
+    {
+        $binding = $this->binding;
+        if ($binding === null || $binding->client === null) {
+            throw $this->unavailable();
+        }
+        $client = $binding->client;
+        try {
+            $result = $client->getObject($request + ['Range' => 'bytes=0-0']);
+            $body = $result->get('Body');
+            $notFound = self::headStatus($result) === 404;
+            if ($body instanceof StreamInterface) {
+                $body->close();
+            }
+            return $notFound;
+        } catch (AwsException $error) {
+            if (! $error->isConnectionError() && $error->getStatusCode() === 404 && $error->getAwsErrorCode() === 'NoSuchKey') {
+                return true;
+            }
+            throw $error;
+        }
+    }
+
+    private static function headStatus(ResultInterface $head): ?int
+    {
+        $metadata = $head->get('@metadata');
+        return is_array($metadata) && isset($metadata['statusCode']) && is_int($metadata['statusCode'])
+            ? $metadata['statusCode'] : null;
     }
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult

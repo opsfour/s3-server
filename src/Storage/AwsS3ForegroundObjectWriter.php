@@ -77,7 +77,7 @@ final readonly class AwsS3ForegroundObjectWriter
         string $ownerId,
         string $purpose = 'put_object',
     ): AwsS3ForegroundObjectReservation {
-        if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart', 'tier_transition', 'restore_copy'], true)) {
+        if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart', 'tier_transition', 'restore_copy', 'access_log'], true)) {
             throw new \InvalidArgumentException('AWS foreground publication purpose is unsupported.');
         }
         $attemptId = bin2hex(random_bytes(16));

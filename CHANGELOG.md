@@ -53,6 +53,12 @@ The project follows [Semantic Versioning](https://semver.org/).
   current-v2 path, owner-digest, size, and bounded-stream evidence. Mixed local
   and AWS tiers own independent reconcilers; multiple admitted AWS bindings fail
   closed. Generic AWS operations and production startup remain disabled.
+- Close remaining internal AWS mutation bypasses with an independently
+  registered mutator inventory, durable create-only access-log publication,
+  and provider-bound garbage collection. PostgreSQL cleanup now requires an
+  owner-scoped DB-time lease, final-reference proof, exact expected-owner
+  provider requests, confirmed absence, and atomic claim completion. Generic
+  AWS mutations and production startup remain fail closed.
 
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
   MySQL, including completion-order boundaries, original upload part numbers,

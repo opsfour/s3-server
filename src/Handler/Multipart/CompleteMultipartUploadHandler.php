@@ -1364,7 +1364,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             }
         }
         foreach ($paths as $entry) {
-            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path']);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $entry['tier'], $entry['path'], $object->ownerId);
         }
 
         return $paths;
@@ -1393,7 +1393,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         }
     }
 
-    private function deleteUncommittedPath(string $bucket, string $storageTier, string $path): void
+    private function deleteUncommittedPath(string $bucket, string $storageTier, string $path, ?string $ownerId = null): void
     {
         \OpsFour\S3Server\Storage\DurableStorageDelete::run(
             $this->metadata,
@@ -1402,6 +1402,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
             $storageTier,
             $path,
             'complete_multipart_uncommitted_path',
+            $ownerId,
         );
     }
 
@@ -1426,7 +1427,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler
         // The durable tombstone remains for later reconciliation, including
         // remote writes that may finish after this inline delete.
         foreach (array_unique([$intent->assemblyPath, $intent->finalPath]) as $path) {
-            $this->deleteUncommittedPath($intent->bucket, $intent->storageTier, $path);
+            $this->deleteUncommittedPath($intent->bucket, $intent->storageTier, $path, $intent->ownerId);
         }
     }
 

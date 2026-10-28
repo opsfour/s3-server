@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission plus ordinary-object, multipart, lifecycle-transition, and restore-copy fences implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy/UploadPart/UploadPartCopy/completion/transition/restore fences, exact current-v2 source reads; API startup always fails closed |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission and fenced foreground, background, access-log, and exact garbage paths implemented; full writer fence incomplete / not production-qualified | Read-only admission and internal attempt/garbage capabilities; API startup always fails closed |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -250,9 +250,38 @@ owner-digest, size, expected-owner, and bounded-EOF verification. Multiple
 admitted AWS tier bindings fail closed; only a default-tier binding is exposed
 to foreground request handlers.
 
-Generic `StorageBackend` AWS operations, provider-side copy, garbage deletion,
-and remaining internal writers remain unavailable. API startup refuses the profile even when the
-unsafe Flysystem test override is enabled.
+Access logs now reserve a durable attempt before publication, use a create-only
+provider write, and consume the armed dispatch in the same metadata transaction
+as the log object. Unconfirmed logs are never reported as delivered. Exact AWS
+`delete_path` garbage is claimed with a database-time lease and monotonically
+increasing generation. PostgreSQL checks the owner-bound queue row and final
+object, restore, part, attempt, seal, and active job references before provider
+deletion and again before claim completion. The provider operation checks v2
+attempt markers and expected bucket owner, deletes only the exact key, then
+confirms absence. The original reference owner is stored when the candidate is
+enqueued, so bucket deletion or name reuse cannot reattribute it. Runtime
+metadata decorators forward the atomic claim capability, and lease renewal is
+stopped only after confirmed provider absence so the final acknowledgement uses
+the current deadline. There is no separate AWS claim-completion or direct
+provider-delete entry point. Ambiguous responses retain the claim for retry. SQLite and
+MySQL do not implement this AWS cleanup proof and are not qualified for it.
+
+The mutator inventory in `StorageMutatorInventory` validates registrations
+supplied independently by the enabled API registrar, server-owned workers, and
+same-key reconciler; it does not populate itself from its expected list. It
+assigns stable operation IDs to foreground API writers, background workers,
+and generic integration paths.
+Foreground object, copy, multipart part/completion, transition, restore, and
+access-log publications require `aws-attempt`; same-key seal reconciliation
+requires `aws-same-key-seal`; logical deletions, restore
+expiry, and physical garbage require `aws-garbage`. Multipart abort, legacy
+multipart recovery, physical bucket creation, and generic backend/Flysystem mutation are explicitly
+`aws-unsupported`. The `storage:inventory`, `storage:audit`, and
+`multipart:part-intents` commands only inspect metadata or local storage; they
+have no physical AWS mutator registration. Unknown or unsupported registrations
+fail the inventory's AWS capability check. Generic `StorageBackend` AWS write,
+copy, move, multipart abort, and delete methods remain closed. API startup
+refuses the profile even when the unsafe Flysystem test override is enabled.
 
 Every AWS reservation charges fixed open-attempt and permanent-seal capacity
 before body ingestion: 4,096 of each per owner and 1,000,000 of each globally.
@@ -265,8 +294,8 @@ seal capacity remains charged permanently. Generic 404/409/412 responses,
 timeouts, malformed bodies, and foreign markers never retire uncertainty.
 This release exposes no seal deletion or break-glass removal operation.
 
-Later qualification stories must connect access logs, garbage cleanup, and every remaining internal writer and
-complete cleanup, health, and release gates before this profile
+Later qualification stories must close the unsupported maintenance paths and
+complete health and release gates before this profile
 can be described as fence-complete or production-qualified.
 
 ## Flysystem

@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -3855,26 +3855,26 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     }
 
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         try {
             $this->conn()->execute(
-                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
-                 VALUES ($1, $2, $3, $4)',
-                [$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()],
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, owner_id, next_attempt_at)
+                 VALUES ($1, $2, $3, $4, $5)',
+                [$bucket, $storageTier, $storagePath, $ownerId, $this->multipartWriteIntentNow()],
             );
         } catch (\Throwable $error) {
             $this->translateStorageCleanupCapacity($error);
         }
     }
 
-    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         try {
             $this->conn()->execute(
-                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, recovery_admission, next_attempt_at)
-                 VALUES ($1, $2, $3, TRUE, $4)',
-                [$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()],
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, owner_id, recovery_admission, next_attempt_at)
+                 VALUES ($1, $2, $3, $4, TRUE, $5)',
+                [$bucket, $storageTier, $storagePath, $ownerId, $this->multipartWriteIntentNow()],
             );
         } catch (\Throwable $error) {
             $this->translateStorageCleanupCapacity($error);
@@ -4165,7 +4165,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 [$now],
             );
             $result = $this->conn()->execute(
-                "SELECT id, bucket, storage_tier, storage_path, operation, key_name, upload_id, attempts, lease_generation, dispatch_id
+                "SELECT id, bucket, storage_tier, storage_path, operation, key_name, upload_id, owner_id, attempts, lease_generation, dispatch_id
                  FROM s3_storage_garbage
                  WHERE status = 'pending' AND next_attempt_at <= $1
                    AND NOT (operation = 'part_write_intent' AND dispatch_id IS NULL)
@@ -4181,12 +4181,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 $operation = $row['operation'] ?? null;
                 $keyName = $row['key_name'] ?? null;
                 $uploadId = $row['upload_id'] ?? null;
+                $ownerId = $row['owner_id'] ?? null;
                 $attempts = $row['attempts'] ?? null;
                 $leaseGeneration = $row['lease_generation'] ?? null;
                 $dispatchId = $row['dispatch_id'] ?? null;
                 if (! is_scalar($id) || ! is_scalar($bucket) || ! is_scalar($storageTier) || ! is_scalar($storagePath)
                     || ! is_scalar($operation) || ($keyName !== null && ! is_scalar($keyName))
-                    || ($uploadId !== null && ! is_scalar($uploadId)) || ! is_scalar($attempts) || ! is_scalar($leaseGeneration)
+                    || ($uploadId !== null && ! is_scalar($uploadId)) || ($ownerId !== null && ! is_scalar($ownerId)) || ! is_scalar($attempts) || ! is_scalar($leaseGeneration)
                     || ($dispatchId !== null && ! is_scalar($dispatchId))) {
                     throw new \RuntimeException('Storage garbage queue returned an invalid row.');
                 }
@@ -4198,6 +4199,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     'operation' => (string) $operation,
                     'key_name' => $keyName === null ? null : (string) $keyName,
                     'upload_id' => $uploadId === null ? null : (string) $uploadId,
+                    'owner_id' => $ownerId === null ? null : (string) $ownerId,
                     'attempts' => (int) $attempts,
                     'lease_expires_at' => $leaseExpiresAt,
                     'lease_generation' => (int) $leaseGeneration + 1,
@@ -4240,6 +4242,72 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
              AND next_attempt_at = $2 AND lease_generation = $3",
             [$id, $leaseExpiresAt, $leaseGeneration],
         )->getRowCount() ?? 0) === 1;
+    }
+
+    private function canDeleteAwsGarbageClaim(int $id, string $bucket, string $tier, string $path, string $ownerId, int $generation): bool
+    {
+        if ($ownerId === '' || $path === '' || $generation < 1) {
+            return false;
+        }
+        $row = $this->conn()->execute(
+            "SELECT 1 FROM s3_storage_garbage AS g
+             WHERE g.id = $1 AND g.bucket = $2 AND g.storage_tier = $3
+               AND g.storage_path = $4 AND g.owner_id = $5
+               AND g.operation = 'delete_path' AND g.status = 'processing'
+               AND g.lease_generation = $6
+               AND g.next_attempt_at > EXTRACT(EPOCH FROM clock_timestamp())
+               AND NOT EXISTS (SELECT 1 FROM s3_objects AS o WHERE o.storage_path = g.storage_path OR o.restored_storage_path = g.storage_path)
+               AND NOT EXISTS (SELECT 1 FROM s3_parts AS p WHERE p.storage_path = g.storage_path)
+               AND NOT EXISTS (
+                   SELECT 1 FROM s3_storage_garbage AS part_intent
+                   WHERE part_intent.id != g.id
+                     AND part_intent.operation = 'part_write_intent'
+                     AND part_intent.storage_path = g.storage_path
+               )
+               AND NOT EXISTS (SELECT 1 FROM s3_object_write_intents AS i WHERE i.storage_path = g.storage_path)
+               AND NOT EXISTS (SELECT 1 FROM s3_multipart_write_intents AS m WHERE m.assembly_path = g.storage_path OR m.final_path = g.storage_path)
+               AND NOT EXISTS (SELECT 1 FROM s3_tier_transition_jobs AS t WHERE (t.source_storage_path = g.storage_path OR t.target_storage_path = g.storage_path) AND t.status IN ('pending', 'processing'))
+               AND NOT EXISTS (SELECT 1 FROM s3_restore_jobs AS r WHERE (r.source_storage_path = g.storage_path OR r.restored_storage_path = g.storage_path) AND r.status IN ('pending', 'processing'))
+             LIMIT 1",
+            [$id, $bucket, $tier, $path, $ownerId, $generation],
+        )->fetchRow();
+
+        return $row !== null;
+    }
+
+    public function deleteAwsGarbageClaim(
+        int $id,
+        string $bucket,
+        string $tier,
+        string $path,
+        string $ownerId,
+        int $generation,
+        \Closure $currentLeaseUntil,
+        \Closure $stopRenewal,
+        \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+    ): bool {
+        if ($ownerId === '' || ! $deletion->matches($bucket, $tier, $path, $ownerId)) {
+            return false;
+        }
+        return $this->transaction(function () use ($id, $bucket, $tier, $path, $ownerId, $generation, $currentLeaseUntil, $stopRenewal, $deletion): bool {
+            // Every supported publication and reference mutation takes this
+            // owner lock before writing metadata. Retain it until provider
+            // absence and the final queue acknowledgement are durable.
+            $this->lockOwnerForUpdate($ownerId);
+            if (! $this->canDeleteAwsGarbageClaim($id, $bucket, $tier, $path, $ownerId, $generation)) {
+                return false;
+            }
+            $deletion->execute();
+            // Provider I/O yields to the heartbeat. Stop it before reading the
+            // final deadline so no renewal can invalidate the acknowledgement.
+            $stopRenewal();
+            $leaseUntil = $currentLeaseUntil();
+            if (! $this->canDeleteAwsGarbageClaim($id, $bucket, $tier, $path, $ownerId, $generation)) {
+                return false;
+            }
+
+            return $this->completeStorageGarbageLease($id, $leaseUntil, $generation);
+        });
     }
 
     public function renewStorageGarbageLease(int $id, float $newLeaseExpiresAt, float $expectedLeaseExpiresAt, int $leaseGeneration): bool

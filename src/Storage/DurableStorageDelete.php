@@ -10,6 +10,7 @@ use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
 final class DurableStorageDelete
 {
@@ -20,21 +21,33 @@ final class DurableStorageDelete
         string $storageTier,
         string $storagePath,
         string $origin = 'unspecified',
+        ?string $ownerId = null,
     ): bool {
+        $physical = $storage;
+        while ($physical instanceof ObservedStorageBackend) {
+            $physical = $physical->innerBackend();
+        }
+        if ($physical instanceof AwsS3StorageBackend) {
+            if ($ownerId === null || $ownerId === '') {
+                throw new \LogicException('AWS recovery cleanup requires the original owner.');
+            }
+            self::enqueueForRetry($metadata, $bucket, $storageTier, $storagePath, new \RuntimeException('AWS cleanup requires a claimed path.'), $origin, $ownerId);
+            return false;
+        }
         try {
             $storage->deleteObjectByPath($storagePath, $bucket);
 
             return true;
         } catch (CancelledException $deleteError) {
             try {
-                self::enqueueForRetry($metadata, $bucket, $storageTier, $storagePath, $deleteError, $origin);
+                self::enqueueForRetry($metadata, $bucket, $storageTier, $storagePath, $deleteError, $origin, $ownerId);
             } catch (\Throwable) {
                 // The delete cancellation describes the uncertain physical
                 // outcome and therefore remains the primary request failure.
             }
             throw $deleteError;
         } catch (\Throwable $deleteError) {
-            self::enqueueForRetry($metadata, $bucket, $storageTier, $storagePath, $deleteError, $origin);
+            self::enqueueForRetry($metadata, $bucket, $storageTier, $storagePath, $deleteError, $origin, $ownerId);
 
             return false;
         }
@@ -47,12 +60,17 @@ final class DurableStorageDelete
         string $storagePath,
         \Throwable $deleteError,
         string $origin,
+        ?string $ownerId,
     ): void {
         try {
             if (! $metadata instanceof RecoveryStorageGarbageStore) {
                 throw new \RuntimeException('Protected storage cleanup recovery admission is unavailable.');
             }
-            $metadata->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath);
+            if ($ownerId === null) {
+                $metadata->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath);
+            } else {
+                $metadata->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath, $ownerId);
+            }
         } catch (CancelledException $queueError) {
             throw $queueError;
         } catch (StorageCleanupCapacityException $queueError) {
@@ -86,8 +104,9 @@ final class DurableStorageDelete
         string $storageTier,
         string $storagePath,
         string $origin = 'unspecified',
+        ?string $ownerId = null,
     ): void {
-        if (!self::run($metadata, $storage, $bucket, $storageTier, $storagePath, $origin)) {
+        if (!self::run($metadata, $storage, $bucket, $storageTier, $storagePath, $origin, $ownerId)) {
             throw new \RuntimeException('Unencrypted staging object could not be physically deleted.');
         }
     }

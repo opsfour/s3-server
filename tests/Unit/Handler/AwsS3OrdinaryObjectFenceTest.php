@@ -470,6 +470,13 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $runtimeWriterProperty = new \ReflectionProperty($runtime, 'awsObjectWriter');
         $runtimeWriter = $runtimeWriterProperty->getValue($runtime);
         self::assertInstanceOf(AwsS3ForegroundObjectWriter::class, $runtimeWriter);
+        $accessLogs = (new \ReflectionProperty($runtime->server, 'accessLogs'))->getValue($runtime->server);
+        self::assertInstanceOf(\OpsFour\S3Server\Logging\AccessLogWriter::class, $accessLogs);
+        self::assertSame(
+            $runtimeWriter,
+            (new \ReflectionProperty($accessLogs, 'awsWriter'))->getValue($accessLogs),
+            'The factory-created server must wire its exact owned AWS writer into access-log delivery.',
+        );
         $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
         self::assertInstanceOf(PutObjectHandler::class, $put);
         $handlerWriter = (new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put);

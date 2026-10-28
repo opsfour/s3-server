@@ -100,6 +100,7 @@ final class TierTransitionExecutor
         $awsReservation = null;
         $awsSource = false;
         $leaseExpiresAt = (float) ($job['nextAttemptAt'] ?? 0);
+        $cleanupOwnerId = null;
 
         try {
             $targetTier = $this->stringJobValue($job, 'targetTier');
@@ -110,6 +111,7 @@ final class TierTransitionExecutor
             if ($object === null) {
                 return 'completed';
             }
+            $cleanupOwnerId = $object->ownerId;
 
             $sourceTier = $this->stringJobValue($job, 'sourceTier');
             if (! $this->tiers->has($sourceTier) || ! $this->tiers->has($targetTier)) {
@@ -304,7 +306,7 @@ final class TierTransitionExecutor
                 if ($this->deleteSourceAfterCommit && ($sourceTier !== $targetTier || $sourcePath !== $writeResult->path)) {
                     // Keep a durable exact-path reference if the process dies
                     // after this placement commits but before source deletion.
-                    $this->metadata->enqueueStorageGarbage($current->bucket, $sourceTier, $sourcePath);
+                    $this->metadata->enqueueStorageGarbage($current->bucket, $sourceTier, $sourcePath, $current->ownerId);
                 }
                 if ($dispatchToken !== null && (! $this->metadata instanceof ObjectWriteIntentStore
                     || ! $this->metadata->consumeArmedObjectWriteIntent($dispatchToken->attemptId, $dispatchToken->dispatchId))) {
@@ -317,7 +319,7 @@ final class TierTransitionExecutor
 
             if (! $metadataCommitted) {
                 if (! $fencedTarget) {
-                    $this->cleanTarget($job, $targetBackend, $writeResult->path);
+                    $this->cleanTarget($job, $targetBackend, $writeResult->path, $cleanupOwnerId);
                 }
 
                 return 'completed';
@@ -355,7 +357,7 @@ final class TierTransitionExecutor
         } catch (CancelledException $e) {
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $writeResult !== null
                 && (! $publicationCallbackCompleted || ! $this->targetMayBePublished($job, $targetTier, $writeResult->path))) {
-                $this->cleanTarget($job, $targetBackend, $writeResult->path);
+                $this->cleanTarget($job, $targetBackend, $writeResult->path, $cleanupOwnerId);
             }
 
             throw $e;
@@ -366,7 +368,7 @@ final class TierTransitionExecutor
                     // of a path that metadata may already reference.
                     return 'completed';
                 }
-                $this->cleanTarget($job, $targetBackend, $writeResult->path);
+                $this->cleanTarget($job, $targetBackend, $writeResult->path, $cleanupOwnerId);
             }
 
             return $this->retryOrDeadLetter($job, $e, $leaseExpiresAt);
@@ -622,7 +624,7 @@ final class TierTransitionExecutor
     /**
      * @param  array<string, mixed>  $job
      */
-    private function cleanTarget(array $job, StorageBackend $targetBackend, string $path): void
+    private function cleanTarget(array $job, StorageBackend $targetBackend, string $path, ?string $ownerId): void
     {
         try {
             DurableStorageDelete::run(
@@ -632,6 +634,7 @@ final class TierTransitionExecutor
                 $this->stringJobValue($job, 'targetTier'),
                 $path,
                 'tier_transition_target_cleanup',
+                $ownerId,
             );
         } catch (\Throwable $cleanupError) {
             $this->logger->critical('Tier transition target cleanup could not be persisted.', [

@@ -1056,7 +1056,7 @@ final class LifecycleExecutor
     private function enqueueStoredDataCleanup(ObjectInfo $object): void
     {
         foreach ($this->storedDataLocations($object) as [, $tier, $path]) {
-            $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path, $object->ownerId);
         }
     }
 

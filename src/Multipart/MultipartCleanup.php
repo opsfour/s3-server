@@ -58,7 +58,7 @@ final class MultipartCleanup
 
         $parts = $metadata->getParts($uploadId);
         foreach ($parts as $part) {
-            $metadata->enqueueStorageGarbage($bucket, $storageTier, $part['storage_path']);
+            $metadata->enqueueStorageGarbage($bucket, $storageTier, $part['storage_path'], $ownerId);
         }
         $metadata->deleteMultipartUpload($uploadId);
 

@@ -93,6 +93,7 @@ final class RestoreExecutor
         $targetBucket = null;
         $awsReservation = null;
         $leaseExpiresAt = (float) ($job['nextAttemptAt'] ?? 0);
+        $cleanupOwnerId = null;
 
         try {
             $restoreDays = $job['restoreDays'] ?? null;
@@ -105,6 +106,7 @@ final class RestoreExecutor
                 return 'completed';
             }
             [$object, $targetBucket] = $prepared;
+            $cleanupOwnerId = $object->ownerId;
 
             $sourceTier = (string) $job['sourceTier'];
             if (! $this->tiers->has($sourceTier)) {
@@ -337,7 +339,7 @@ final class RestoreExecutor
 
             if (! $metadataCommitted) {
                 if (! $fencedTarget) {
-                    $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
+                    $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path, $cleanupOwnerId);
                 }
 
                 return 'completed';
@@ -347,15 +349,14 @@ final class RestoreExecutor
 
             return 'completed';
         } catch (CancelledException $e) {
-            // @phpstan-ignore-next-line Cancellation can race a committed transaction acknowledgement.
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $write !== null) {
-                $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
+                $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path, $cleanupOwnerId);
             }
 
             throw $e;
         } catch (\Throwable $e) {
             if (! $fencedTarget && ! $metadataCommitted && $targetBackend !== null && $write !== null) {
-                $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path);
+                $this->cleanTargetIfUnreferenced($job, $targetBackend, $targetTierName, $write->path, $cleanupOwnerId);
             }
 
             return $this->retryOrDeadLetter($job, $e, $leaseExpiresAt);
@@ -423,7 +424,7 @@ final class RestoreExecutor
     /**
      * @param  array<string, mixed>  $job
      */
-    private function cleanTargetIfUnreferenced(array $job, StorageBackend $targetBackend, string $targetTierName, string $path): void
+    private function cleanTargetIfUnreferenced(array $job, StorageBackend $targetBackend, string $targetTierName, string $path, ?string $ownerId): void
     {
         try {
             $mayBeReferenced = $this->metadata->transaction(function () use ($job, $targetTierName, $path): bool {
@@ -466,14 +467,14 @@ final class RestoreExecutor
         }
 
         if (! $mayBeReferenced) {
-            $this->cleanTarget($job, $targetBackend, $targetTierName, $path);
+            $this->cleanTarget($job, $targetBackend, $targetTierName, $path, $ownerId);
         }
     }
 
     /**
      * @param  array<string, mixed>  $job
      */
-    private function cleanTarget(array $job, StorageBackend $targetBackend, string $targetTierName, string $path): void
+    private function cleanTarget(array $job, StorageBackend $targetBackend, string $targetTierName, string $path, ?string $ownerId): void
     {
         try {
             DurableStorageDelete::run(
@@ -483,6 +484,7 @@ final class RestoreExecutor
                 $targetTierName,
                 $path,
                 'restore_target_cleanup',
+                $ownerId,
             );
         } catch (\Throwable $cleanupError) {
             $this->logger->critical('Restore target cleanup could not be persisted.', [

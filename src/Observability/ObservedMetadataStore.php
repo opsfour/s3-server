@@ -35,8 +35,9 @@ use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
+use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore
 {
     public function __construct(
         private MetadataStore $inner,
@@ -993,23 +994,23 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         $this->observe(__FUNCTION__, fn() => $this->inner->cleanupOldNotifications($maxAgeSeconds));
     }
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         try {
-            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath));
+            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueStorageGarbage($bucket, $storageTier, $storagePath, $ownerId));
         } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
             $this->recordStorageCleanupAdmissionRejection($error, 'normal');
             throw $error;
         }
     }
 
-    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         if (! $this->inner instanceof RecoveryStorageGarbageStore) {
             throw new \RuntimeException('Protected storage cleanup recovery admission is unavailable.');
         }
         try {
-            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath));
+            $this->observe(__FUNCTION__, fn() => $this->inner->enqueueRecoveryStorageGarbage($bucket, $storageTier, $storagePath, $ownerId));
         } catch (\OpsFour\S3Server\Exception\StorageCleanupCapacityException $error) {
             $this->recordStorageCleanupAdmissionRejection($error, 'recovery');
             throw $error;
@@ -1188,6 +1189,34 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         }
 
         return $this->observe(__FUNCTION__, fn() => $this->inner->renewStorageGarbageLease($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration));
+    }
+
+    public function deleteAwsGarbageClaim(
+        int $id,
+        string $bucket,
+        string $tier,
+        string $path,
+        string $ownerId,
+        int $generation,
+        \Closure $currentLeaseUntil,
+        \Closure $stopRenewal,
+        \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+    ): bool {
+        if (! $this->inner instanceof AwsS3GarbageClaimStore) {
+            throw new \LogicException('Wrapped metadata store does not support AWS garbage claims.');
+        }
+
+        return $this->observe(__FUNCTION__, fn(): bool => $this->inner->deleteAwsGarbageClaim(
+            $id,
+            $bucket,
+            $tier,
+            $path,
+            $ownerId,
+            $generation,
+            $currentLeaseUntil,
+            $stopRenewal,
+            $deletion,
+        ));
     }
 
     private function fencedQueueStore(): FencedQueueStore

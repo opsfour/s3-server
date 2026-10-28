@@ -108,5 +108,19 @@ final class AwsS3WriteAttemptPath
         self::assertIntentPath($intent, $key, $profile->reservedPrefix);
     }
 
+    /** @return array{generation: string, attemptId: string} */
+    public static function parseGarbagePath(string $path, string $bucket, string $tier, string $reservedPrefix): array
+    {
+        self::forObject($bucket, 'scope', str_repeat('0', 32), $tier, str_repeat('0', 32), $reservedPrefix);
+        $prefix = preg_quote($reservedPrefix . '/' . $bucket . '/', '~');
+        $tierHex = preg_quote(bin2hex($tier), '~');
+        if (strlen($path) > self::MAX_S3_KEY_BYTES
+            || preg_match('~^' . $prefix . '([a-f0-9]{32})/' . $tierHex . '/[a-f0-9]{64}/([a-f0-9]{32})$~D', $path, $matches) !== 1) {
+            throw new \InvalidArgumentException('AWS garbage path is not an exact immutable attempt key.');
+        }
+
+        return ['generation' => $matches[1], 'attemptId' => $matches[2]];
+    }
+
     private function __construct() {}
 }

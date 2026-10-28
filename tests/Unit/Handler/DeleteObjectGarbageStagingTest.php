@@ -60,6 +60,7 @@ final class DeleteObjectGarbageStagingTest extends TestCase
         self::assertSame(204, $response->getStatus());
         self::assertNull($this->metadata->getObjectMetadata('bucket', 'one'));
         self::assertSame('old-data', \Amp\ByteStream\buffer($this->storage->getObjectByPath($written->path)));
+        $this->assertQueuedOwner('STANDARD', $written->path);
         self::assertSame(1, (new StorageGarbageCollector($this->metadata, StorageTierRegistry::single($this->storage)))->collect(1));
         $this->expectException(NoSuchKeyException::class);
         $this->storage->getObjectByPath($written->path);
@@ -67,29 +68,53 @@ final class DeleteObjectGarbageStagingTest extends TestCase
 
     public function test_batch_delete_keeps_every_old_path_queued_when_inline_deletes_fail(): void
     {
+        $hot = new InMemoryBackend();
+        $hot->createBucket('bucket');
         $paths = [];
         foreach (['one', 'two'] as $key) {
             $written = $this->storage->putObject('bucket', $key, new ReadableBuffer($key));
-            $paths[] = $written->path;
+            $paths[] = [$this->storage, 'STANDARD', $written->path, $key];
             $this->metadata->putObjectMetadata('bucket', $key, 'owner', $written->size, '"' . $written->md5Hex . '"', 'text/plain', $written->path);
+            $restored = $hot->putObject('bucket', $key, new ReadableBuffer('restored-' . $key));
+            $paths[] = [$hot, 'HOT', $restored->path, 'restored-' . $key];
+            $this->metadata->updateObjectRestoreStateWithTier(
+                'bucket',
+                $key,
+                null,
+                'restored',
+                $restored->path,
+                new \DateTimeImmutable('+1 day'),
+                'HOT',
+            );
         }
         $failing = new CallbackStorageBackend($this->storage, beforeDelete: static function (): never {
             throw new \RuntimeException('injected physical delete failure');
         });
+        $failingHot = new CallbackStorageBackend($hot, beforeDelete: static function (): never {
+            throw new \RuntimeException('injected physical delete failure');
+        });
         $body = '<Delete><Object><Key>one</Key></Object><Object><Key>two</Key></Object></Delete>';
 
-        $response = (new DeleteObjectsHandler($this->metadata, StorageTierRegistry::single($failing)))
+        $response = (new DeleteObjectsHandler($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $failing, defaultWriteTier: true),
+            new StorageTier('HOT', $failingHot),
+        ])))
             ->handleRequest($this->request('POST', '/bucket?delete', $body));
 
         self::assertSame(200, $response->getStatus());
         self::assertNull($this->metadata->getObjectMetadata('bucket', 'one'));
         self::assertNull($this->metadata->getObjectMetadata('bucket', 'two'));
-        self::assertSame('one', \Amp\ByteStream\buffer($this->storage->getObjectByPath($paths[0])));
-        self::assertSame('two', \Amp\ByteStream\buffer($this->storage->getObjectByPath($paths[1])));
-        self::assertSame(2, (new StorageGarbageCollector($this->metadata, StorageTierRegistry::single($this->storage)))->collect(2));
-        foreach ($paths as $path) {
+        foreach ($paths as [$backend, $tier, $path, $payload]) {
+            self::assertSame($payload, \Amp\ByteStream\buffer($backend->getObjectByPath($path)));
+            $this->assertQueuedOwner($tier, $path);
+        }
+        self::assertSame(4, (new StorageGarbageCollector($this->metadata, new StorageTierRegistry([
+            new StorageTier('STANDARD', $this->storage, defaultWriteTier: true),
+            new StorageTier('HOT', $hot),
+        ])))->collect(4));
+        foreach ($paths as [$backend, , $path]) {
             try {
-                $this->storage->getObjectByPath($path);
+                $backend->getObjectByPath($path);
                 self::fail('Batch delete left an old physical path behind.');
             } catch (NoSuchKeyException) {
                 // Expected after durable garbage collection.
@@ -123,6 +148,7 @@ final class DeleteObjectGarbageStagingTest extends TestCase
 
         self::assertNull($this->metadata->getObjectMetadata('bucket', 'crash'));
         self::assertSame('old-data', \Amp\ByteStream\buffer($this->storage->getObjectByPath($written->path)));
+        $this->assertQueuedOwner('STANDARD', $written->path);
         self::assertSame(1, (new StorageGarbageCollector($this->metadata, StorageTierRegistry::single($this->storage)))->collect(1));
         $this->expectException(NoSuchKeyException::class);
         $this->storage->getObjectByPath($written->path);
@@ -160,6 +186,8 @@ final class DeleteObjectGarbageStagingTest extends TestCase
         self::assertNull($this->metadata->getObjectMetadataByVersion('bucket', 'versioned', $version));
         self::assertSame('primary', \Amp\ByteStream\buffer($this->storage->getObjectByPath($primary->path)));
         self::assertSame('restored', \Amp\ByteStream\buffer($hot->getObjectByPath($restored->path)));
+        $this->assertQueuedOwner('STANDARD', $primary->path);
+        $this->assertQueuedOwner('HOT', $restored->path);
         $cleanTiers = new StorageTierRegistry([
             new StorageTier('STANDARD', $this->storage, defaultWriteTier: true),
             new StorageTier('HOT', $hot),
@@ -173,6 +201,16 @@ final class DeleteObjectGarbageStagingTest extends TestCase
                 // Expected after durable garbage collection.
             }
         }
+    }
+
+    private function assertQueuedOwner(string $tier, string $path): void
+    {
+        $pdo = new \PDO('sqlite:' . $this->path);
+        $statement = $pdo->prepare(
+            'SELECT owner_id FROM s3_storage_garbage WHERE bucket = ? AND storage_tier = ? AND storage_path = ?',
+        );
+        self::assertTrue($statement->execute(['bucket', $tier, $path]));
+        self::assertSame(['owner'], $statement->fetchAll(\PDO::FETCH_COLUMN));
     }
 
     /** @param non-empty-string $method */

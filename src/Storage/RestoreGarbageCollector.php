@@ -80,6 +80,7 @@ final class RestoreGarbageCollector
                         $current->bucket,
                         $restoreTier->name,
                         $path,
+                        $current->ownerId,
                     );
                     $this->metadata->updateObjectRestoreState(
                         bucket: $current->bucket,

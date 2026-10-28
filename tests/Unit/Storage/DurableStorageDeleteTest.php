@@ -11,6 +11,8 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\RecoveryStorageGarbageStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Storage\DurableStorageDelete;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmission;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -112,6 +114,44 @@ final class DurableStorageDeleteTest extends TestCase
             self::assertSame(hash('sha256', '/private/storage/object'), $error->storagePathHash);
             self::assertStringNotContainsString('/private/storage/object', (string) $error);
         }
+    }
+
+    public function test_aws_recovery_cleanup_requires_and_persists_the_original_owner(): void
+    {
+        $metadata = $this->recoveryMetadataMock();
+        $metadata->expects(self::once())->method('enqueueRecoveryStorageGarbage')
+            ->with('bucket', 'STANDARD', 'path', 'original-owner');
+
+        self::assertFalse(DurableStorageDelete::run(
+            $metadata,
+            self::closedAwsBackend(),
+            'bucket',
+            'STANDARD',
+            'path',
+            'aws_owner_test',
+            'original-owner',
+        ));
+    }
+
+    public function test_aws_recovery_cleanup_without_owner_fails_before_queue_admission(): void
+    {
+        $metadata = $this->recoveryMetadataMock();
+        $metadata->expects(self::never())->method('enqueueRecoveryStorageGarbage');
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('original owner');
+        DurableStorageDelete::run($metadata, self::closedAwsBackend(), 'bucket', 'STANDARD', 'path');
+    }
+
+    private static function closedAwsBackend(): AwsS3StorageBackend
+    {
+        return new AwsS3StorageBackend(AwsS3ProviderAdmission::denied(
+            'us-east-1',
+            true,
+            true,
+            AwsS3ProviderAdmission::VERSIONING_UNKNOWN,
+            AwsS3ProviderAdmission::REASON_VERSIONING_CHECK_FAILED,
+        ));
     }
 
     private function recoveryMetadataMock(): MetadataStore&RecoveryStorageGarbageStore&MockObject

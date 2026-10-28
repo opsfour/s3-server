@@ -10,6 +10,9 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Handler\HandlerRegistrar;
+use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler;
 
 /**
  * Reject remote storage without a verified provider write fence and volatile
@@ -33,6 +36,11 @@ final class StorageWriteFenceStartupGuard
             }
 
             if ($backend instanceof AwsS3ProviderAdmissionCapability) {
+                StorageMutatorInventory::forEnabledRuntime([
+                    ...HandlerRegistrar::storageMutatorRegistrations(),
+                    ...S3Server::storageMutatorRegistrations(),
+                    ...AwsS3ObjectWriteIntentReconciler::storageMutatorRegistrations(),
+                ]);
                 $admission = $backend->awsS3ProviderAdmission();
                 throw new AwsS3ProviderStartupException($admission);
             }

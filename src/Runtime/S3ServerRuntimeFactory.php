@@ -217,6 +217,7 @@ final readonly class S3ServerRuntimeFactory
                 $runtime->attachAwsObjectWriter($awsTierWriter);
                 if ($awsTier->name === $storageTiers->defaultTier()->name) {
                     $awsObjectWriter = $awsTierWriter;
+                    $server->setAwsAccessLogWriter($awsTierWriter);
                 }
             }
 

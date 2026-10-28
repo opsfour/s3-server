@@ -1147,14 +1147,14 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         $this->submit('cleanupOldNotifications', [$maxAgeSeconds]);
     }
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
-        $this->submit('enqueueStorageGarbage', [$bucket, $storageTier, $storagePath]);
+        $this->submit('enqueueStorageGarbage', [$bucket, $storageTier, $storagePath, $ownerId]);
     }
 
-    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
-        $this->submit('enqueueRecoveryStorageGarbage', [$bucket, $storageTier, $storagePath]);
+        $this->submit('enqueueRecoveryStorageGarbage', [$bucket, $storageTier, $storagePath, $ownerId]);
     }
 
     public function createMultipartPartWriteIntent(

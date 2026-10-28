@@ -9,21 +9,34 @@ use Amp\Mysql\MysqlConfig;
 use Amp\Mysql\MysqlConnectionPool;
 use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\Psr7\Response;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
 use OpsFour\S3Server\Metadata\FencedQueueStore;
+use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmission;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
+use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3WriteAttemptPath;
 use OpsFour\S3Server\Storage\RestoreGarbageCollector;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\RequestInterface;
 use Symfony\Component\Process\Process;
 
 final class ExternalGarbageAtomicityTest extends TestCase
@@ -33,6 +46,388 @@ final class ExternalGarbageAtomicityTest extends TestCase
     {
         yield 'postgres' => ['postgres', 'S3_TEST_POSTGRES_METADATA_DSN'];
         yield 'mysql' => ['mysql', 'S3_TEST_MYSQL_METADATA_DSN'];
+    }
+
+    public function test_postgres_aws_garbage_success_executes_provider_and_completes_exact_current_lease(): void
+    {
+        $dsn = getenv('S3_TEST_POSTGRES_METADATA_DSN');
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped('Set S3_TEST_POSTGRES_METADATA_DSN for the AWS garbage success gate.');
+        }
+
+        $oldAccessKey = getenv('AWS_ACCESS_KEY_ID');
+        $oldSecretKey = getenv('AWS_SECRET_ACCESS_KEY');
+        putenv('AWS_ACCESS_KEY_ID=test');
+        putenv('AWS_SECRET_ACCESS_KEY=test');
+        $metadata = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(AwsS3GarbageClaimStore::class, $metadata);
+        $pool = new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'aws-garbage-success-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $providerExecuted = false;
+
+        try {
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            $bucketInfo = $metadata->getBucket($bucket);
+            self::assertNotNull($bucketInfo);
+            $attemptId = bin2hex(random_bytes(16));
+            $mock = new MockHandler([
+                new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+                new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+                new Response(200, [
+                    'Content-Length' => '4',
+                    'x-amz-meta-opsfour-write-attempt' => 'v2',
+                    'x-amz-meta-opsfour-attempt-id' => $attemptId,
+                    'x-amz-meta-opsfour-owner-digest' => hash('sha256', $owner),
+                    'x-amz-meta-opsfour-content-size' => '4',
+                ]),
+                new Response(204),
+                new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>'),
+                new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>'),
+            ]);
+            $binding = AwsS3ProviderValidatedBinding::fromConfiguration([
+                'bucket' => 'backing-private',
+                'region' => 'us-east-1',
+                'expected_owner_id' => '123456789012',
+                'data_prefix' => 'objects',
+                'reserved_prefix' => '.opsfour/write-attempts',
+            ], new AwsS3ProviderValidator(static function (RequestInterface $request, array $options) use ($mock, &$providerExecuted) {
+                if ($request->getMethod() === 'DELETE') {
+                    $providerExecuted = true;
+                }
+
+                return $mock($request, $options);
+            }));
+            self::assertTrue($binding->admission->providerAdmitted);
+            self::assertNotNull($binding->profile);
+            $path = AwsS3WriteAttemptPath::forProfileObject(
+                $binding->profile,
+                $bucket,
+                'key',
+                $bucketInfo->generation,
+                'STANDARD',
+                $attemptId,
+            );
+            $metadata->enqueueStorageGarbage($bucket, 'STANDARD', $path, $owner);
+            $claim = $metadata->dequeueStorageGarbage(1)[0] ?? null;
+            self::assertIsArray($claim);
+            $generation = $claim['lease_generation'] ?? null;
+            self::assertIsInt($generation);
+            $claimedDeadline = $claim['lease_expires_at'];
+            $currentDeadline = $claimedDeadline + 60.0;
+            self::assertTrue($metadata->renewStorageGarbageLease(
+                $claim['id'],
+                $currentDeadline,
+                $claimedDeadline,
+                $generation,
+            ));
+            $renewalStopped = false;
+
+            $completed = (new AwsS3StorageBackend($binding->admission, $binding))->deleteClaimedGarbage(
+                $metadata,
+                $claim['id'],
+                $bucket,
+                'STANDARD',
+                $path,
+                $owner,
+                $generation,
+                static fn(): float => $currentDeadline,
+                static function () use (&$renewalStopped): void {
+                    $renewalStopped = true;
+                },
+            );
+
+            self::assertTrue($providerExecuted);
+            self::assertTrue($renewalStopped);
+            self::assertTrue($completed);
+            self::assertNull($pool->execute(
+                'SELECT id FROM s3_storage_garbage WHERE id = $1 AND bucket = $2 AND storage_tier = $3 AND storage_path = $4 AND owner_id = $5',
+                [$claim['id'], $bucket, 'STANDARD', $path, $owner],
+            )->fetchRow());
+        } finally {
+            $pool->execute('DELETE FROM s3_storage_garbage WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_buckets WHERE name = $1', [$bucket]);
+            $pool->close();
+            putenv($oldAccessKey === false ? 'AWS_ACCESS_KEY_ID' : 'AWS_ACCESS_KEY_ID=' . $oldAccessKey);
+            putenv($oldSecretKey === false ? 'AWS_SECRET_ACCESS_KEY' : 'AWS_SECRET_ACCESS_KEY=' . $oldSecretKey);
+        }
+    }
+
+    public function test_postgres_aws_garbage_claim_rejects_stale_leases_and_every_durable_path_reference(): void
+    {
+        $dsn = getenv('S3_TEST_POSTGRES_METADATA_DSN');
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped('Set S3_TEST_POSTGRES_METADATA_DSN for the disposable AWS garbage reference gate.');
+        }
+
+        $metadata = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(AwsS3GarbageClaimStore::class, $metadata);
+        self::assertInstanceOf(ObjectWriteIntentStore::class, $metadata);
+        self::assertInstanceOf(RestoredCopyTierStore::class, $metadata);
+        self::assertInstanceOf(MultipartPartWriteIntentStore::class, $metadata);
+        self::assertInstanceOf(MultipartWriteIntentStore::class, $metadata);
+        $pool = new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'aws-garbage-proof-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $path = '.opsfour/write-attempts/' . $bucket . '/' . str_repeat('a', 32)
+            . '/5354414e44415244/' . str_repeat('b', 64) . '/' . str_repeat('c', 32);
+        $uploadId = 'upload-' . $suffix;
+        $openAttemptId = bin2hex(random_bytes(16));
+        $sealAttemptId = bin2hex(random_bytes(16));
+
+        try {
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            $bucketInfo = $metadata->getBucket($bucket);
+            self::assertNotNull($bucketInfo);
+            $metadata->enqueueStorageGarbage($bucket, 'STANDARD', $path, $owner);
+            $claim = $metadata->dequeueStorageGarbage(1)[0] ?? null;
+            self::assertIsArray($claim);
+            self::assertSame($owner, $claim['owner_id'] ?? null);
+            $generation = $claim['lease_generation'] ?? null;
+            self::assertIsInt($generation);
+            $leaseUntil = $claim['lease_expires_at'];
+            $awsGarbage = self::closedAwsGarbageBackend();
+            $attemptDelete = function (int $claimGeneration) use ($awsGarbage, $metadata, $claim, $bucket, $path, $owner, $leaseUntil): bool {
+                return $awsGarbage->deleteClaimedGarbage(
+                    $metadata,
+                    $claim['id'],
+                    $bucket,
+                    'STANDARD',
+                    $path,
+                    $owner,
+                    $claimGeneration,
+                    static fn(): float => $leaseUntil,
+                    static function (): void {},
+                );
+            };
+
+            self::assertFalse($attemptDelete($generation + 1), 'A stale lease generation must not authorize deletion.');
+
+            $metadata->putObjectMetadata($bucket, 'current', $owner, 4, 'etag', 'application/octet-stream', $path);
+            self::assertFalse($attemptDelete($generation), 'A current placement must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_objects WHERE bucket = $1', [$bucket]);
+
+            $metadata->putObjectMetadata($bucket, 'restored', $owner, 4, 'etag', 'application/octet-stream', 'different-base-path');
+            $metadata->updateObjectRestoreStateWithTier(
+                $bucket,
+                'restored',
+                null,
+                'restored',
+                $path,
+                new \DateTimeImmutable('+1 day'),
+                'STANDARD',
+            );
+            self::assertFalse($attemptDelete($generation), 'A restored-copy placement must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_objects WHERE bucket = $1', [$bucket]);
+
+            $metadata->createMultipartUpload($uploadId, $bucket, 'multipart', $owner);
+            $metadata->putPart($uploadId, 1, 'etag', 4, $path);
+            self::assertFalse($attemptDelete($generation), 'A committed multipart part must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_multipart_uploads WHERE upload_id = $1', [$uploadId]);
+
+            $open = $metadata->reserveObjectWriteIntent(new ObjectWriteIntent(
+                $openAttemptId,
+                $bucket,
+                $bucketInfo->generation,
+                $owner,
+                'STANDARD',
+                $path,
+                'put_object',
+            ), 60.0);
+            self::assertFalse($attemptDelete($generation), 'An open publication attempt must protect its exact physical path.');
+            self::assertTrue($metadata->retireUndispatchedObjectWriteIntent($open->attemptId));
+
+            $seal = $metadata->reserveObjectWriteIntent(new ObjectWriteIntent(
+                $sealAttemptId,
+                $bucket,
+                $bucketInfo->generation,
+                $owner,
+                'STANDARD',
+                $path,
+                'put_object',
+                sealReserved: true,
+            ), 60.0);
+            $seal = $metadata->armObjectWriteIntent(
+                $seal->attemptId,
+                $seal->leaseUntil,
+                bin2hex(random_bytes(16)),
+                60.0,
+                4,
+                hash('sha256', 'body'),
+            );
+            self::assertNotNull($seal);
+            $pool->execute('UPDATE s3_object_write_intents SET lease_until = 0 WHERE attempt_id = $1', [$sealAttemptId]);
+            $sealedClaim = $metadata->claimDueObjectWriteIntents('STANDARD', 1, 60.0)[0] ?? null;
+            self::assertNotNull($sealedClaim);
+            self::assertTrue($metadata->sealObjectWriteIntent($sealedClaim->attemptId, $sealedClaim->claimGeneration));
+            self::assertFalse($attemptDelete($generation), 'A permanent same-key seal must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_object_write_intents WHERE attempt_id = $1', [$sealAttemptId]);
+
+            $metadata->createMultipartUpload($uploadId, $bucket, 'multipart', $owner);
+            $metadata->createMultipartPartWriteIntent(
+                $bucket,
+                $bucketInfo->generation,
+                'STANDARD',
+                $uploadId,
+                $path,
+            );
+            self::assertFalse($attemptDelete($generation), 'An active multipart part attempt must protect its exact physical path.');
+            $pool->execute("DELETE FROM s3_storage_garbage WHERE bucket = $1 AND operation = 'part_write_intent'", [$bucket]);
+            $pool->execute('DELETE FROM s3_multipart_uploads WHERE upload_id = $1', [$uploadId]);
+
+            $completionUpload = 'completion-' . $suffix;
+            $metadata->createMultipartUpload($completionUpload, $bucket, 'completion', $owner);
+            $completion = new MultipartWriteIntent(
+                attemptId: bin2hex(random_bytes(16)),
+                uploadId: $completionUpload,
+                bucket: $bucket,
+                bucketGeneration: $bucketInfo->generation,
+                ownerId: $owner,
+                storageTier: 'STANDARD',
+                assemblyPath: $path,
+                finalPath: 'other-final-path',
+                partDigest: str_repeat('d', 64),
+                sseMode: null,
+                leaseUntil: $metadata->multipartWriteIntentNow() + 600,
+                nextAttemptAt: $metadata->multipartWriteIntentNow() + 600,
+            );
+            $metadata->createMultipartWriteIntent($completion);
+            self::assertFalse($attemptDelete($generation), 'A multipart assembly path must protect its exact physical path.');
+            $pool->execute('UPDATE s3_multipart_write_intents SET assembly_path = $1, final_path = $2 WHERE attempt_id = $3', ['other-assembly-path', $path, $completion->attemptId]);
+            self::assertFalse($attemptDelete($generation), 'A multipart final path must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_multipart_write_intents WHERE attempt_id = $1', [$completion->attemptId]);
+            $pool->execute('DELETE FROM s3_multipart_uploads WHERE upload_id = $1', [$completionUpload]);
+
+            $transitionId = $metadata->enqueueTierTransitionJob($bucket, 'transition', null, 'STANDARD', 'ARCHIVE', 'GLACIER', $path);
+            self::assertFalse($attemptDelete($generation), 'An active transition source must protect its exact physical path.');
+            $pool->execute('UPDATE s3_tier_transition_jobs SET source_storage_path = $1, target_storage_path = $2 WHERE id = $3', ['other-transition-source', $path, $transitionId]);
+            self::assertFalse($attemptDelete($generation), 'An active transition target must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_tier_transition_jobs WHERE id = $1', [$transitionId]);
+
+            $restoreId = $metadata->enqueueRestoreJob($bucket, 'restore-job', null, 'ARCHIVE', $path, 1);
+            self::assertFalse($attemptDelete($generation), 'An active restore source must protect its exact physical path.');
+            $pool->execute('UPDATE s3_restore_jobs SET source_storage_path = $1, restored_storage_path = $2 WHERE id = $3', ['other-restore-source', $path, $restoreId]);
+            self::assertFalse($attemptDelete($generation), 'An active restore target must protect its exact physical path.');
+            $pool->execute('DELETE FROM s3_restore_jobs WHERE id = $1', [$restoreId]);
+
+        } finally {
+            $pool->execute('DELETE FROM s3_object_write_intents WHERE attempt_id = $1 OR attempt_id = $2', [$openAttemptId, $sealAttemptId]);
+            $pool->execute('DELETE FROM s3_storage_garbage WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_multipart_uploads WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_objects WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_buckets WHERE name = $1', [$bucket]);
+            $pool->close();
+        }
+    }
+
+    public function test_postgres_aws_garbage_preserves_original_owner_across_bucket_name_reuse(): void
+    {
+        $dsn = getenv('S3_TEST_POSTGRES_METADATA_DSN');
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped('Set S3_TEST_POSTGRES_METADATA_DSN for the AWS garbage owner gate.');
+        }
+
+        $metadata = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'aws-garbage-owner-' . $suffix;
+        $originalOwner = 'original-' . $suffix;
+        $replacementOwner = 'replacement-' . $suffix;
+
+        try {
+            $metadata->createBucket($originalOwner, $bucket, 'us-east-1');
+            $metadata->enqueueStorageGarbage($bucket, 'STANDARD', 'owner-bound-path', $originalOwner);
+            $metadata->deleteBucket($originalOwner, $bucket);
+            $metadata->createBucket($replacementOwner, $bucket, 'us-east-1');
+
+            $claim = $metadata->dequeueStorageGarbage(1)[0] ?? null;
+            self::assertIsArray($claim);
+            self::assertSame($originalOwner, $claim['owner_id'] ?? null);
+        } finally {
+            $pool = new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+            $pool->execute('DELETE FROM s3_storage_garbage WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_buckets WHERE name = $1', [$bucket]);
+            $pool->close();
+        }
+    }
+
+    public function test_postgres_aws_garbage_owner_lock_serializes_final_reference_race(): void
+    {
+        $dsn = getenv('S3_TEST_POSTGRES_METADATA_DSN');
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped('Set S3_TEST_POSTGRES_METADATA_DSN for the AWS garbage owner-lock race.');
+        }
+
+        $writer = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
+        $collector = MetadataStoreFactory::create('postgres', ['dsn' => trim($dsn)]);
+        self::assertInstanceOf(AwsS3GarbageClaimStore::class, $collector);
+        $suffix = bin2hex(random_bytes(6));
+        $bucket = 'aws-garbage-race-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $path = 'race-path-' . $suffix;
+        $lockHeld = new \Amp\DeferredFuture();
+        $releaseWriter = new \Amp\DeferredFuture();
+        $awsGarbage = self::closedAwsGarbageBackend();
+
+        try {
+            $writer->createBucket($owner, $bucket, 'us-east-1');
+            $collector->enqueueStorageGarbage($bucket, 'STANDARD', $path, $owner);
+            $claim = $collector->dequeueStorageGarbage(1)[0] ?? null;
+            self::assertIsArray($claim);
+            $generation = $claim['lease_generation'] ?? null;
+            self::assertIsInt($generation);
+
+            $referenceWriter = \Amp\async(function () use ($writer, $owner, $bucket, $path, $lockHeld, $releaseWriter): void {
+                $writer->transaction(function () use ($writer, $owner, $bucket, $path, $lockHeld, $releaseWriter): void {
+                    $writer->lockOwnerForUpdate($owner);
+                    $lockHeld->complete();
+                    $releaseWriter->getFuture()->await();
+                    $writer->putObjectMetadata($bucket, 'racing-reference', $owner, 1, 'etag', 'application/octet-stream', $path);
+                });
+            });
+            $lockHeld->getFuture()->await();
+
+            $deletion = \Amp\async(function () use ($awsGarbage, $collector, $claim, $bucket, $path, $owner, $generation): bool {
+                return $awsGarbage->deleteClaimedGarbage(
+                    $collector,
+                    $claim['id'],
+                    $bucket,
+                    'STANDARD',
+                    $path,
+                    $owner,
+                    $generation,
+                    static fn(): float => $claim['lease_expires_at'],
+                    static function (): void {},
+                );
+            });
+            \Amp\delay(0.05);
+            self::assertFalse($deletion->isComplete(), 'Provider deletion must wait behind the owner reference-write lock.');
+
+            $releaseWriter->complete();
+            $referenceWriter->await();
+            self::assertFalse($deletion->await());
+        } finally {
+            if (! $releaseWriter->isComplete()) {
+                $releaseWriter->complete();
+            }
+            $pool = new PostgresConnectionPool(PostgresConfig::fromString($dsn));
+            $pool->execute('DELETE FROM s3_storage_garbage WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_objects WHERE bucket = $1', [$bucket]);
+            $pool->execute('DELETE FROM s3_buckets WHERE name = $1', [$bucket]);
+            $pool->close();
+        }
+    }
+
+    private static function closedAwsGarbageBackend(): AwsS3StorageBackend
+    {
+        return new AwsS3StorageBackend(AwsS3ProviderAdmission::denied(
+            'us-east-1',
+            true,
+            true,
+            AwsS3ProviderAdmission::VERSIONING_UNKNOWN,
+            AwsS3ProviderAdmission::REASON_VERSIONING_CHECK_FAILED,
+        ));
     }
 
     #[DataProvider('databases')]

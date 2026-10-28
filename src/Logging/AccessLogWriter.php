@@ -23,6 +23,11 @@ use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuard;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\LocalObjectWriteOutcome;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectStage;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
 use OpsFour\S3Server\Storage\StoragePath;
 use OpsFour\S3Server\Storage\RecoverableObjectWriteBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
@@ -70,6 +75,7 @@ final class AccessLogWriter
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         private readonly int $maxBufferBytes = self::MAX_BUFFER_BYTES,
+        private readonly ?AwsS3ForegroundObjectWriter $awsWriter = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if ($maxBufferBytes < 1 || $maxBufferBytes > self::MAX_BUFFER_BYTES) {
@@ -90,6 +96,18 @@ final class AccessLogWriter
             if (! $backend instanceof FilesystemBackend
                 || realpath($backend->getBasePath()) !== $localFencedWriter->storageRoot()) {
                 throw new \InvalidArgumentException('Access log local writer requires the matching filesystem root.');
+            }
+        }
+        if ($awsWriter !== null) {
+            if (! $metadata instanceof ObjectWriteIntentStore || $localFencedWriter !== null) {
+                throw new \InvalidArgumentException('AWS access log writer requires durable attempts and a single publication capability.');
+            }
+            $backend = $storage;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if (! $backend instanceof AwsS3StorageBackend || ! $awsWriter->isBoundToBackend($backend, $storageTier)) {
+                throw new \InvalidArgumentException('AWS access log writer requires the exact backend and tier binding.');
             }
         }
     }
@@ -320,6 +338,12 @@ final class AccessLogWriter
                 public ?string $publishedVersionId = null;
 
                 public ?LocalObjectWriteLeaseGuard $lease = null;
+
+                public ?AwsS3ForegroundObjectReservation $awsReservation = null;
+
+                public ?AwsS3ForegroundObjectStage $awsStage = null;
+
+                public ?LocalObjectWriteDispatchToken $awsDispatch = null;
             };
             try {
                 $sourceAtWrite = $this->metadata->getBucket($sourceBucket);
@@ -392,7 +416,14 @@ final class AccessLogWriter
                     ];
                 }
                 $attempt->targetBucket = $targetBucket;
-                if ($this->localFencedWriter !== null && $this->localLeaseFactory !== null) {
+                if ($this->awsWriter !== null) {
+                    $attempt->awsReservation = $this->awsWriter->reserve($targetAtWrite, $logKey, $sourceOwner, 'access_log');
+                    $attempt->plannedPath = $this->awsWriter->plannedPath($attempt->awsReservation);
+                    $attempt->awsStage = $this->awsWriter->stage($attempt->awsReservation, new ReadableBuffer($payload));
+                    $awsOutcome = $this->awsWriter->dispatch($attempt->awsReservation, $logKey, $attempt->awsStage);
+                    $attempt->writeResult = $awsOutcome->result;
+                    $attempt->awsDispatch = $awsOutcome->dispatch;
+                } elseif ($this->localFencedWriter !== null && $this->localLeaseFactory !== null) {
                     $attemptId = bin2hex(random_bytes(16));
                     $planned = new ObjectWriteIntent(
                         attemptId: $attemptId,
@@ -458,7 +489,7 @@ final class AccessLogWriter
                 }
                 $attempt->writeResultValidated = true;
 
-                $dispatchToken = $attempt->lease?->stopForCommit();
+                $dispatchToken = $attempt->awsDispatch ?? $attempt->lease?->stopForCommit();
 
                 $this->metadata->transaction(function () use ($sourceBucket, $sourceOwner, $sourceGeneration, $targetBucket, $targetGeneration, $logKey, $logContent, $bucketEncryption, $userMetadata, $attempt, $dispatchToken, $partLayouts): void {
                     // External metadata stores share this owner lock with bucket
@@ -496,7 +527,7 @@ final class AccessLogWriter
                     );
                     if ($dispatchToken !== null && (! $this->metadata instanceof ObjectWriteIntentStore
                         || ! $this->metadata->consumeArmedObjectWriteIntent($dispatchToken->attemptId, $dispatchToken->dispatchId))) {
-                        throw new \RuntimeException('Access log local write lease was lost before metadata publication.');
+                        throw new \RuntimeException('Access log write attempt was lost before metadata publication.');
                     }
                     $etag = '"' . md5($logContent) . '"';
                     $versionId = $versioning === 'Enabled'
@@ -560,6 +591,9 @@ final class AccessLogWriter
                     $attempt->committed = true;
 
                 });
+                if (! $attempt->committed && $this->awsWriter !== null) {
+                    throw new \RuntimeException('Access log metadata publication was not confirmed.');
+                }
                 if (!$attempt->committed && $this->localFencedWriter === null) {
                     $attempt->cleanupAttempted = true;
                     DurableStorageDelete::run(
@@ -569,6 +603,7 @@ final class AccessLogWriter
                         $this->storageTier,
                         $attempt->plannedPath ?? $attempt->writeResult->path,
                         'access_log_uncommitted_path',
+                        $sourceOwner,
                     );
                     continue;
                 }
@@ -610,7 +645,7 @@ final class AccessLogWriter
                     }
                     $cleanupPath = null;
                 }
-                if ($this->localFencedWriter === null && !$attempt->cleanupAttempted
+                if ($this->localFencedWriter === null && $this->awsWriter === null && !$attempt->cleanupAttempted
                     && $attempt->targetBucket !== null && $cleanupPath !== null) {
                     try {
                         DurableStorageDelete::run(
@@ -620,6 +655,7 @@ final class AccessLogWriter
                             $this->storageTier,
                             $cleanupPath,
                             'access_log_failed_attempt',
+                            $sourceOwner,
                         );
                     } catch (\Throwable $cleanupError) {
                         $this->logger->critical(
@@ -642,6 +678,20 @@ final class AccessLogWriter
                 continue;
             } finally {
                 $attempt->lease?->close();
+                if ($attempt->awsStage !== null) {
+                    try {
+                        $this->awsWriter?->release($attempt->awsStage);
+                    } catch (\Throwable $cleanupError) {
+                        $this->logger->warning('Access log AWS scratch cleanup failed.', ['exception' => $cleanupError::class]);
+                    }
+                }
+                if ($attempt->awsReservation !== null && $attempt->awsDispatch === null) {
+                    try {
+                        $this->awsWriter?->retireBeforeDispatch($attempt->awsReservation);
+                    } catch (\Throwable) {
+                        // Armed and ambiguous attempts remain durable for reconciliation.
+                    }
+                }
             }
 
             if ($attempt->event !== null) {

@@ -68,9 +68,11 @@ use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
+use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
@@ -97,6 +99,23 @@ use Psr\Log\NullLogger;
  */
 final class S3Server
 {
+    /** @return list<array{id: string, capability: string}> */
+    public static function storageMutatorRegistrations(): array
+    {
+        return [
+            ['id' => 'worker.access-log', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'worker.tier-transition', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'worker.restore-copy', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'worker.restore-expiry', 'capability' => StorageMutatorInventory::GARBAGE],
+            ['id' => 'worker.storage-garbage', 'capability' => StorageMutatorInventory::GARBAGE],
+            ['id' => 'worker.multipart-part-recovery', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'worker.multipart-completion-recovery', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'worker.lifecycle-multipart-abort', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'integration.generic-storage-mutation', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'integration.flysystem-worker-mutation', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+        ];
+    }
+
     private ?SocketHttpServer $server = null;
 
     private bool $shutdown = false;
@@ -163,6 +182,8 @@ final class S3Server
     private ?LocalFencedBackgroundObjectWriter $localBackgroundWriter = null;
 
     private ?AwsS3FencedBackgroundObjectWriter $awsBackgroundWriter = null;
+
+    private ?AwsS3ForegroundObjectWriter $awsAccessLogWriter = null;
 
     private ?DeferredCancellation $backgroundCancellation = null;
 
@@ -344,9 +365,6 @@ final class S3Server
             }
 
             if ($this->localObjectWriter !== null) {
-                if ($this->localObjectIntentCollector === null) {
-                    throw new \RuntimeException('Local object write fencing requires its intent collector.');
-                }
                 if ($this->metadata === null) {
                     throw new \RuntimeException('Local object write fencing requires metadata.');
                 }
@@ -361,7 +379,7 @@ final class S3Server
                     );
                 }
                 if (! $this->localObjectIntentCollector instanceof LocalObjectWriteIntentCollector) {
-                    throw new \RuntimeException('Local object write fencing requires its local intent collector.');
+                    throw new \RuntimeException('Local object write fencing requires its intent collector.');
                 }
                 $this->localObjectIntentCollector->assertBoundTo($this->metadata, $this->localObjectWriter);
                 if ($configuredTiers === null
@@ -818,6 +836,7 @@ final class S3Server
                 $this->notifications,
                 $this->localObjectWriter,
                 $this->localObjectLeaseFactory,
+                awsWriter: $this->awsAccessLogWriter,
             );
         }
     }
@@ -848,6 +867,16 @@ final class S3Server
             throw new \LogicException('AWS background object writer is already configured.');
         }
         $this->awsBackgroundWriter = $writer;
+    }
+
+    public function setAwsAccessLogWriter(AwsS3ForegroundObjectWriter $writer): void
+    {
+        $this->assertConfigurationMutable('AWS access log writer');
+        if ($this->awsAccessLogWriter !== null) {
+            throw new \LogicException('AWS access log writer is already configured.');
+        }
+        $this->awsAccessLogWriter = $writer;
+        $this->setEncryptionService($this->encryption);
     }
 
     /** Attach the local object write fencing to internal access-log delivery. */
@@ -882,6 +911,7 @@ final class S3Server
                 $this->notifications,
                 $this->localObjectWriter,
                 $this->localObjectLeaseFactory,
+                awsWriter: $this->awsAccessLogWriter,
             );
         }
     }

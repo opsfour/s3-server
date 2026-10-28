@@ -8,6 +8,7 @@ use Amp\Cancellation;
 use Amp\CancelledException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
+use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
 use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
@@ -41,6 +42,7 @@ final readonly class StorageGarbageCollector
         if (! $this->metadata instanceof FencedStorageGarbageStore || ! $this->metadata instanceof StorageGarbageLeaseStore) {
             throw new \LogicException('Storage garbage collection requires generation-fenced lease renewal.');
         }
+        $leases = $this->metadata;
         $completed = 0;
         $processed = 0;
         $limit = max(1, $limit);
@@ -78,11 +80,11 @@ final readonly class StorageGarbageCollector
                 throw new \LogicException('Storage garbage claim has no generation.');
             }
             $leaseUntil = $item['lease_expires_at'];
-            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($item, &$leaseUntil): bool {
+            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($item, &$leaseUntil, $leases): bool {
                 $now = $this->metadata instanceof MultipartWriteIntentStore
                     ? $this->metadata->multipartWriteIntentNow() : microtime(true);
                 $next = $now + 300;
-                if (! $this->metadata->renewStorageGarbageLease($item['id'], $next, $leaseUntil, $item['lease_generation'])) {
+                if (! $leases->renewStorageGarbageLease($item['id'], $next, $leaseUntil, $item['lease_generation'])) {
                     return false;
                 }
                 $leaseUntil = $next;
@@ -92,15 +94,53 @@ final readonly class StorageGarbageCollector
             $failed = null;
             $retainedPartIntent = false;
             $localBackend = null;
+            $awsCleanup = false;
+            $awsClaimCompleted = false;
+            $awsBackend = false;
             try {
                 $backend = $this->tiers->tier($item['storage_tier'])->backend;
+                $physicalBackend = $backend;
+                while ($physicalBackend instanceof ObservedStorageBackend) {
+                    $physicalBackend = $physicalBackend->innerBackend();
+                }
+                $awsBackend = $physicalBackend instanceof AwsS3StorageBackend;
+                if ($awsBackend && $item['operation'] !== 'delete_path') {
+                    throw new \RuntimeException('AWS garbage operation has no registered cleanup capability.');
+                }
                 if ($item['operation'] === 'abort_multipart') {
                     if ($item['key_name'] === null || $item['upload_id'] === null) {
                         throw new \RuntimeException('Multipart cleanup item is missing its key or upload ID.');
                     }
                     $backend->abortMultipartUpload($item['bucket'], $item['key_name'], $item['upload_id']);
                 } elseif ($item['operation'] === 'delete_path') {
-                    $backend->deleteObjectByPath($item['storage_path'], $item['bucket']);
+                    if ($physicalBackend instanceof AwsS3StorageBackend) {
+                        $ownerId = $item['owner_id'] ?? null;
+                        if (! $this->metadata instanceof AwsS3GarbageClaimStore || ! is_string($ownerId) || $ownerId === '') {
+                            throw new \RuntimeException('AWS garbage claim lacks current lease or final reference proof.');
+                        }
+                        $awsClaims = $this->metadata;
+                        $awsClaimCompleted = $physicalBackend->deleteClaimedGarbage(
+                            $awsClaims,
+                            $item['id'],
+                            $item['bucket'],
+                            $item['storage_tier'],
+                            $item['storage_path'],
+                            $ownerId,
+                            $item['lease_generation'],
+                            static function () use (&$leaseUntil): float {
+                                return $leaseUntil;
+                            },
+                            static function () use ($heartbeat): void {
+                                $heartbeat->stop();
+                            },
+                        );
+                        if (! $awsClaimCompleted) {
+                            throw new \RuntimeException('AWS garbage claim lost its serial deletion proof.');
+                        }
+                        $awsCleanup = true;
+                    } else {
+                        $backend->deleteObjectByPath($item['storage_path'], $item['bucket']);
+                    }
                 } elseif ($item['operation'] === 'part_write_intent') {
                     $localBackend = $backend;
                     while ($localBackend instanceof ObservedStorageBackend) {
@@ -172,16 +212,19 @@ final readonly class StorageGarbageCollector
                         + min(300, 2 ** min($attempts, 8)),
                 );
                 if ($retryScheduled) {
-                    $this->logger->warning('Physical storage garbage deletion failed and will be retried.', [
+                    $context = [
                         'component' => 'storage_gc',
                         'garbage_id' => $item['id'],
-                        'bucket' => $item['bucket'],
-                        'storage_tier' => $item['storage_tier'],
                         'operation' => $item['operation'],
-                        'storage_path_hash' => hash('sha256', $item['storage_path']),
                         'attempts' => $attempts,
                         'exception' => $failed::class,
-                    ]);
+                    ];
+                    if (! $awsBackend) {
+                        $context['bucket'] = $item['bucket'];
+                        $context['storage_tier'] = $item['storage_tier'];
+                        $context['storage_path_hash'] = hash('sha256', $item['storage_path']);
+                    }
+                    $this->logger->warning('Physical storage garbage deletion failed and will be retried.', $context);
                 }
             } elseif ($retainedPartIntent) {
                 if ($this->retryClaim(
@@ -195,7 +238,10 @@ final readonly class StorageGarbageCollector
                     $completed++;
                 }
             } else {
-                if ($this->completeClaim($item)) {
+                $claimCompleted = $awsCleanup
+                    ? $awsClaimCompleted
+                    : $this->completeClaim($item);
+                if ($claimCompleted) {
                     $completed++;
                 }
             }

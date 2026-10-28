@@ -85,6 +85,7 @@ use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 
 /**
  * Registers all handler classes with the HandlerRegistry.
@@ -100,6 +101,24 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
  */
 final class HandlerRegistrar
 {
+    /** @return list<array{id: string, capability: string}> */
+    public static function storageMutatorRegistrations(): array
+    {
+        return [
+            ['id' => 'api.create-bucket', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'api.put-object', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.post-object', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.copy-object', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.upload-part', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.upload-part-copy', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.complete-multipart', 'capability' => StorageMutatorInventory::ATTEMPT],
+            ['id' => 'api.delete-object', 'capability' => StorageMutatorInventory::GARBAGE],
+            ['id' => 'api.delete-objects', 'capability' => StorageMutatorInventory::GARBAGE],
+            ['id' => 'api.abort-multipart', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'api.delete-bucket', 'capability' => StorageMutatorInventory::GARBAGE],
+        ];
+    }
+
     /**
      * Register all handlers with the given registry.
      *

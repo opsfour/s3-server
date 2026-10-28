@@ -286,7 +286,7 @@ final class UploadPartHandler implements RequestHandler
                     } catch (\Throwable $e) {
                         \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                             $e,
-                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath),
+                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, ownerId: $ownerId),
                         );
                         throw $e;
                     }
@@ -294,7 +294,7 @@ final class UploadPartHandler implements RequestHandler
                 if ($physical->path !== $plannedPartPath
                     || $physical->size !== strlen($ciphertext)
                     || ! hash_equals(md5($ciphertext), strtolower($physical->md5Hex))) {
-                    $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId);
+                    $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId, $ownerId);
                     throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart part write does not match its payload.');
                 }
                 $writeResult = new StorageWriteResult(
@@ -399,12 +399,12 @@ final class UploadPartHandler implements RequestHandler
                     } catch (\Throwable $e) {
                         \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                             $e,
-                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath),
+                            fn() => $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, ownerId: $ownerId),
                         );
                         throw $e;
                     }
                     if ($writeResult->path !== $plannedPartPath) {
-                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath);
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $plannedPartPath, ownerId: $ownerId);
                         throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart part write did not use its planned path.');
                     }
                 } else {
@@ -442,9 +442,9 @@ final class UploadPartHandler implements RequestHandler
         } catch (\Throwable $e) {
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
-                function () use ($writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId): void {
+                function () use ($writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath, $uploadId, $ownerId): void {
                     if ($writeResult->path !== '') {
-                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null, $ownerId);
                     }
                 },
             );
@@ -545,7 +545,7 @@ final class UploadPartHandler implements RequestHandler
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart part write intent expired.');
                 }
                 if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
-                    $this->metadata->enqueueStorageGarbage($bucket, $storageTier, $previousPartPath);
+                    $this->metadata->enqueueStorageGarbage($bucket, $storageTier, $previousPartPath, $ownerId);
                 }
                 $commitCallbackCompleted = true;
             });
@@ -554,9 +554,9 @@ final class UploadPartHandler implements RequestHandler
             // may still publish this part after an acknowledgment failure.
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
-                function () use ($commitCallbackCompleted, $uploadId, $partNumber, $writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath): void {
+                function () use ($commitCallbackCompleted, $uploadId, $partNumber, $writeResult, $uploadStorage, $storageTier, $bucket, $plannedPartPath, $ownerId): void {
                     if (FailedPartCommitCleanup::shouldDelete($commitCallbackCompleted, $this->metadata, $uploadId, $partNumber, $writeResult->path)) {
-                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null);
+                        $this->deleteUncommittedPart($uploadStorage, $storageTier, $bucket, $writeResult->path, $plannedPartPath !== null ? $uploadId : null, $ownerId);
                     }
                 },
             );
@@ -639,7 +639,7 @@ final class UploadPartHandler implements RequestHandler
         }
     }
 
-    private function deleteUncommittedPart(StorageBackend $storage, string $storageTier, string $bucket, string $path, ?string $confirmedUploadId = null): void
+    private function deleteUncommittedPart(StorageBackend $storage, string $storageTier, string $bucket, string $path, ?string $confirmedUploadId = null, ?string $ownerId = null): void
     {
         if ($this->awsObjectWriter?->isImmutableAttemptPath($storageTier, $path) === true) {
             return;
@@ -656,6 +656,7 @@ final class UploadPartHandler implements RequestHandler
             $storageTier,
             $path,
             'upload_part_uncommitted_path',
+            $ownerId,
         );
         if ($confirmedUploadId === null || ! $this->metadata instanceof MultipartPartWriteIntentStore) {
             return;

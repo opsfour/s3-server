@@ -737,6 +737,7 @@ final class CopyObjectHandler implements RequestHandler
                 $dstBucket,
                 $dstKey,
                 $destinationEncryptionMode,
+                $objectOwnerId,
             );
         } elseif ($sourceStorage === $destinationStorage && $destinationStorage instanceof BoundedCopyStorageBackend) {
             $writeResult = $destinationStorage->copyObjectBounded($srcPath, $dstBucket, $dstKey, $readLimit);
@@ -839,6 +840,7 @@ final class CopyObjectHandler implements RequestHandler
                         $writeResult,
                         $plaintext,
                         $sourceStorage === $destinationStorage ? $srcPath : null,
+                        $objectOwnerId,
                     );
                 }
 
@@ -863,9 +865,9 @@ final class CopyObjectHandler implements RequestHandler
             }
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
-                function () use ($localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $sourceStorage, $srcPath): void {
+                function () use ($localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $sourceStorage, $srcPath, $objectOwnerId): void {
                     if ($localDispatchToken === null && $this->awsObjectWriter === null) {
-                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, protectedPath: $sourceStorage === $destinationStorage ? $srcPath : null);
+                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $objectOwnerId, protectedPath: $sourceStorage === $destinationStorage ? $srcPath : null);
                     }
                 },
             );
@@ -1166,9 +1168,9 @@ final class CopyObjectHandler implements RequestHandler
             // has set this by-reference safety flag.
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
-                function () use ($metadataCallbackCompleted, $localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $versionId): void {
+                function () use ($metadataCallbackCompleted, $localDispatchToken, $destinationStorage, $dstBucket, $dstKey, $writeResult, $versionId, $objectOwnerId): void {
                     if (! $metadataCallbackCompleted && $localDispatchToken === null && $this->awsObjectWriter === null) {
-                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $versionId);
+                        $this->cleanupFailedCopy($destinationStorage, $dstBucket, $dstKey, $writeResult->path, $objectOwnerId, $versionId);
                     }
                 },
             );
@@ -1236,6 +1238,7 @@ final class CopyObjectHandler implements RequestHandler
         string $destinationBucket,
         string $destinationKey,
         string $destinationEncryptionMode,
+        string $objectOwnerId,
     ): array {
         EncryptionRequestResolver::requireEncryptionService($this->encryption, $destinationEncryptionMode);
         \assert($this->encryption !== null);
@@ -1316,7 +1319,7 @@ final class CopyObjectHandler implements RequestHandler
             if ($write->size !== strlen($encrypted['ciphertext'])
                 || ! hash_equals(md5($encrypted['ciphertext']), strtolower($write->md5Hex))) {
                 if ($sourceStorage !== $destinationStorage || $write->path !== $sourcePath) {
-                    $this->cleanupFailedCopy($destinationStorage, $destinationBucket, $destinationKey, $write->path);
+                    $this->cleanupFailedCopy($destinationStorage, $destinationBucket, $destinationKey, $write->path, $objectOwnerId);
                 }
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted copy write does not match its payload.');
             }
@@ -1411,7 +1414,7 @@ final class CopyObjectHandler implements RequestHandler
     private function queueOldObjectCleanup(ObjectInfo $object, string $preservePath): void
     {
         foreach ($this->oldObjectPathsToClean($object, $preservePath) as [$tier, $path]) {
-            $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $tier, $path, $object->ownerId);
         }
     }
 
@@ -1463,6 +1466,7 @@ final class CopyObjectHandler implements RequestHandler
         \OpsFour\S3Server\Storage\StorageWriteResult $original,
         string $payload,
         ?string $protectedSourcePath,
+        string $ownerId,
     ): \OpsFour\S3Server\Storage\StorageWriteResult {
         $replacement = $storage->putObject(
             $bucket,
@@ -1483,12 +1487,13 @@ final class CopyObjectHandler implements RequestHandler
                     $this->storageTiers->defaultTier()->name,
                     $original->path,
                     'copy_object_staging_replacement',
+                    $ownerId,
                 );
             }
         } catch (\Throwable $e) {
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                 $e,
-                fn() => $this->cleanupFailedCopy($storage, $bucket, $key, $replacement->path, protectedPath: $protectedSourcePath),
+                fn() => $this->cleanupFailedCopy($storage, $bucket, $key, $replacement->path, $ownerId, protectedPath: $protectedSourcePath),
             );
             throw $e;
         }
@@ -1506,6 +1511,7 @@ final class CopyObjectHandler implements RequestHandler
         string $bucket,
         string $key,
         string $path,
+        string $ownerId,
         ?string $versionId = null,
         ?string $protectedPath = null,
     ): void {
@@ -1540,6 +1546,7 @@ final class CopyObjectHandler implements RequestHandler
             $this->storageTiers->defaultTier()->name,
             $path,
             'copy_object_uncommitted_path',
+            $ownerId,
         );
     }
 

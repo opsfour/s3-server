@@ -4246,25 +4246,25 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         return $this->renewRestoreJobLease($id, $newLeaseExpiresAt, $expectedLeaseExpiresAt, $leaseGeneration);
     }
 
-    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         try {
             $this->prepare(
-                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, next_attempt_at)
-                 VALUES (?, ?, ?, ?)',
-            )->execute([$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()]);
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, owner_id, next_attempt_at)
+                 VALUES (?, ?, ?, ?, ?)',
+            )->execute([$bucket, $storageTier, $storagePath, $ownerId, $this->multipartWriteIntentNow()]);
         } catch (\Throwable $error) {
             $this->translateStorageCleanupCapacity($error);
         }
     }
 
-    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath): void
+    public function enqueueRecoveryStorageGarbage(string $bucket, string $storageTier, string $storagePath, ?string $ownerId = null): void
     {
         try {
             $this->prepare(
-                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, recovery_admission, next_attempt_at)
-                 VALUES (?, ?, ?, 1, ?)',
-            )->execute([$bucket, $storageTier, $storagePath, $this->multipartWriteIntentNow()]);
+                'INSERT INTO s3_storage_garbage (bucket, storage_tier, storage_path, owner_id, recovery_admission, next_attempt_at)
+                 VALUES (?, ?, ?, ?, 1, ?)',
+            )->execute([$bucket, $storageTier, $storagePath, $ownerId, $this->multipartWriteIntentNow()]);
         } catch (\Throwable $error) {
             $this->translateStorageCleanupCapacity($error);
         }

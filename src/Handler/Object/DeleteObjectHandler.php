@@ -282,11 +282,11 @@ final class DeleteObjectHandler implements RequestHandler
     {
         $path = $object->systemMetadata['storagePath'] ?? null;
         if ($path !== null && $path !== '') {
-            $this->metadata->enqueueStorageGarbage($object->bucket, $object->storageTier, $path);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $object->storageTier, $path, $object->ownerId);
         }
         if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== '') {
             $restoreTier = RestoredCopyTierResolver::resolve($object, $this->storageTiers);
-            $this->metadata->enqueueStorageGarbage($object->bucket, $restoreTier->name, $object->restoredStoragePath);
+            $this->metadata->enqueueStorageGarbage($object->bucket, $restoreTier->name, $object->restoredStoragePath, $object->ownerId);
         }
     }
 

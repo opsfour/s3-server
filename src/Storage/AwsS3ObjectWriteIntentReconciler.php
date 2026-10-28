@@ -7,10 +7,20 @@ namespace OpsFour\S3Server\Storage;
 use Amp\Cancellation;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 
 /** Reconciles one current generation-fenced AWS SQL claim. */
 final readonly class AwsS3ObjectWriteIntentReconciler
 {
+    /** @return list<array{id: string, capability: string}> */
+    public static function storageMutatorRegistrations(): array
+    {
+        return [[
+            'id' => 'worker.same-key-seal-reconciliation',
+            'capability' => StorageMutatorInventory::SEAL,
+        ]];
+    }
+
     public function __construct(
         private ObjectWriteIntentStore $metadata,
         private string $tierName,

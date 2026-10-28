@@ -9,8 +9,15 @@ use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
+use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
+use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
+use OpsFour\S3Server\Metadata\FencedStorageGarbageStore;
+use OpsFour\S3Server\Metadata\StorageGarbageLeaseStore;
 use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
@@ -21,6 +28,7 @@ use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
@@ -42,6 +50,9 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     /** @var list<RequestInterface> */
     private array $requests = [];
+
+    /** @var list<string> */
+    private array $putBodies = [];
 
     /** @var array<string, string|false> */
     private array $oldEnvironment = [];
@@ -70,6 +81,11 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             'reserved_prefix' => '.opsfour/write-attempts',
         ], new AwsS3ProviderValidator(function (RequestInterface $request, array $options) {
             $this->requests[] = $request;
+            if ($request->getMethod() === 'PUT') {
+                $body = $request->getBody();
+                $this->putBodies[] = (string) $body;
+                $body->rewind();
+            }
 
             return ($this->mock)($request, $options);
         }));
@@ -93,6 +109,338 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             $entry->isDir() ? @rmdir($entry->getPathname()) : @unlink($entry->getPathname());
         }
         @rmdir($this->base);
+    }
+
+    public function test_access_log_uses_one_create_only_attempt_and_consumes_it_with_metadata(): void
+    {
+        $this->metadata->createBucket('owner', 'log-target', 'us-east-1');
+        $this->metadata->putBucketLogging('bucket', 'log-target', 'access/');
+        $this->bind('STANDARD');
+        $this->mock->append(new Response(200, ['ETag' => '"log"']));
+
+        $logs = new AccessLogWriter($this->metadata, $this->aws, storageTier: 'STANDARD', awsWriter: $this->writer);
+        $logs->log('bucket', 'private-key', 'GetObject', 200, 12);
+        $logs->flush();
+        $logs->flush(); // Delivery itself must not recursively enqueue another access log.
+
+        $objects = $this->metadata->listObjects('log-target')->objects;
+        self::assertCount(1, $objects);
+        self::assertSame([], $this->activeAttemptIds());
+        self::assertSame(['PUT'], $this->mutationMethods());
+        $put = array_values(array_filter(array_slice($this->requests, 2), static fn(RequestInterface $request): bool => $request->getMethod() === 'PUT'))[0];
+        self::assertSame('*', $put->getHeaderLine('If-None-Match'));
+        self::assertStringContainsString('/.opsfour/write-attempts/log-target/', $put->getUri()->getPath());
+    }
+
+    public function test_access_log_rechecks_target_ownership_before_aws_publication(): void
+    {
+        $this->metadata->createBucket('owner', 'log-target', 'us-east-1');
+        $this->metadata->putBucketLogging('bucket', 'log-target', 'access/');
+        $this->bind('STANDARD');
+
+        $logs = new AccessLogWriter($this->metadata, $this->aws, storageTier: 'STANDARD', awsWriter: $this->writer);
+        $logs->log('bucket', 'private-key', 'GetObject', 200, 12);
+        $this->metadata->deleteBucket('owner', 'log-target');
+        $this->metadata->createBucket('foreign-owner', 'log-target', 'us-east-1');
+        $logs->flush();
+
+        self::assertSame([], $this->metadata->listObjects('log-target')->objects);
+        self::assertSame([], $this->activeAttemptIds());
+        self::assertSame([], $this->mutationMethods());
+    }
+
+    public function test_access_log_encrypts_body_before_create_only_aws_publication(): void
+    {
+        $this->metadata->createBucket('owner', 'log-target', 'us-east-1');
+        $this->metadata->putBucketLogging('bucket', 'log-target', 'access/');
+        $this->metadata->putBucketEncryption('log-target', 'AES256');
+        $this->bind('STANDARD');
+        $this->mock->append(new Response(200, ['ETag' => '"encrypted-log"']));
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+
+        $logs = new AccessLogWriter(
+            $this->metadata,
+            $this->aws,
+            storageTier: 'STANDARD',
+            encryption: $encryption,
+            awsWriter: $this->writer,
+        );
+        $logs->log('bucket', 'private-key', 'GetObject', 200, 12);
+        $logs->flush();
+
+        $objects = $this->metadata->listObjects('log-target')->objects;
+        self::assertCount(1, $objects);
+        $object = $objects[0];
+        self::assertSame('AES256', $object->userMetadata['__sse-algorithm'] ?? null);
+        $puts = array_values(array_filter(
+            array_slice($this->requests, 2),
+            static fn(RequestInterface $request): bool => $request->getMethod() === 'PUT',
+        ));
+        self::assertCount(1, $puts);
+        self::assertCount(1, $this->putBodies);
+        $ciphertext = $this->putBodies[0];
+        self::assertStringNotContainsString('private-key', $ciphertext);
+        self::assertStringContainsString('private-key', $encryption->decryptSseS3(
+            $ciphertext,
+            $object->userMetadata['__sse-key'],
+            $object->userMetadata['__sse-iv'],
+            $object->userMetadata['__sse-tag'],
+        ));
+    }
+
+    public function test_ambiguous_access_log_stays_in_attempt_metadata_without_log_visibility(): void
+    {
+        $this->metadata->createBucket('owner', 'log-target', 'us-east-1');
+        $this->metadata->putBucketLogging('bucket', 'log-target', 'access/');
+        $this->bind('STANDARD');
+        $this->mock->append(new ConnectException('lost response', new Request('PUT', 'https://backing-private.s3.us-east-1.amazonaws.com')));
+
+        $logs = new AccessLogWriter($this->metadata, $this->aws, storageTier: 'STANDARD', awsWriter: $this->writer);
+        $logs->log('bucket', 'private-key', 'GetObject', 200, 12);
+        $logs->flush();
+
+        self::assertCount(0, $this->metadata->listObjects('log-target')->objects);
+        self::assertCount(1, $this->activeAttemptIds());
+        self::assertSame(['PUT'], $this->mutationMethods());
+    }
+
+    public function test_exact_owner_bound_aws_garbage_delete_confirms_absence(): void
+    {
+        $profile = $this->aws->admittedProfile();
+        self::assertNotNull($profile);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attemptId = bin2hex(random_bytes(16));
+        $path = AwsS3WriteAttemptPath::forProfileObject($profile, 'bucket', 'key', $bucket->generation, 'STANDARD', $attemptId);
+        $this->mock->append(new Response(200, [
+            'Content-Length' => '4',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+            'x-amz-meta-opsfour-content-size' => '4',
+        ]));
+        $this->mock->append(new Response(204));
+        $this->mock->append(new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>'));
+        $this->mock->append(new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>'));
+
+        $this->deleteClaimedGarbage($path);
+        self::assertSame(['DELETE'], $this->mutationMethods());
+        $providerRequests = array_values(array_filter(
+            array_slice($this->requests, 2),
+            static fn(RequestInterface $request): bool => in_array($request->getMethod(), ['HEAD', 'GET', 'DELETE'], true),
+        ));
+        self::assertSame(['HEAD', 'DELETE', 'HEAD', 'GET'], array_map(
+            static fn(RequestInterface $request): string => $request->getMethod(),
+            $providerRequests,
+        ));
+        $encodedKey = '/' . implode('/', array_map('rawurlencode', explode('/', $path)));
+        foreach ($providerRequests as $request) {
+            self::assertSame($encodedKey, $request->getUri()->getPath());
+            self::assertSame('123456789012', $request->getHeaderLine('x-amz-expected-bucket-owner'));
+        }
+    }
+
+    public function test_aws_garbage_rejects_foreign_owner_marker_before_delete(): void
+    {
+        $profile = $this->aws->admittedProfile();
+        self::assertNotNull($profile);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attemptId = bin2hex(random_bytes(16));
+        $path = AwsS3WriteAttemptPath::forProfileObject($profile, 'bucket', 'key', $bucket->generation, 'STANDARD', $attemptId);
+        $headers = [
+            'Content-Length' => '4',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'other'),
+            'x-amz-meta-opsfour-content-size' => '4',
+        ];
+        $this->mock->append(new Response(200, $headers));
+
+        $this->expectException(\RuntimeException::class);
+        try {
+            $this->deleteClaimedGarbage($path);
+        } finally {
+            self::assertSame([], $this->mutationMethods());
+        }
+    }
+
+    public function test_stale_or_referenced_aws_garbage_claim_never_contacts_provider(): void
+    {
+        $claims = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            FencedStorageGarbageStore::class,
+            StorageGarbageLeaseStore::class,
+            AwsS3GarbageClaimStore::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $claims);
+        $path = '.opsfour/write-attempts/bucket/' . str_repeat('a', 32) . '/5354414e44415244/' . str_repeat('b', 64) . '/' . str_repeat('c', 32);
+        $claims->expects(self::once())->method('dequeueStorageGarbage')->willReturn([[
+            'id' => 7,
+            'bucket' => 'bucket',
+            'storage_tier' => 'STANDARD',
+            'storage_path' => $path,
+            'operation' => 'delete_path',
+            'key_name' => null,
+            'upload_id' => null,
+            'owner_id' => 'owner',
+            'attempts' => 0,
+            'lease_expires_at' => microtime(true) + 300,
+            'lease_generation' => 2,
+            'dispatch_id' => null,
+        ]]);
+        $claims->expects(self::once())->method('deleteAwsGarbageClaim')->willReturn(false);
+        $claims->expects(self::once())->method('retryStorageGarbageLease')->willReturn(true);
+
+        self::assertSame(0, (new StorageGarbageCollector(
+            $claims,
+            StorageTierRegistry::single($this->aws),
+        ))->collect(1));
+        self::assertSame([], $this->mutationMethods());
+    }
+
+    public function test_aws_garbage_operation_cannot_be_issued_outside_the_real_backend(): void
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('authority is invalid');
+        (new \OpsFour\S3Server\Storage\AwsS3GarbageDeletion(
+            $this->aws,
+            new \stdClass(),
+            'bucket',
+            'STANDARD',
+            'path',
+            'owner',
+        ))->execute();
+    }
+
+    public function test_aws_garbage_collector_completes_only_after_provider_absence(): void
+    {
+        $profile = $this->aws->admittedProfile();
+        self::assertNotNull($profile);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attemptId = bin2hex(random_bytes(16));
+        $path = AwsS3WriteAttemptPath::forProfileObject($profile, 'bucket', 'key', $bucket->generation, 'STANDARD', $attemptId);
+        $claims = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            FencedStorageGarbageStore::class,
+            StorageGarbageLeaseStore::class,
+            AwsS3GarbageClaimStore::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $claims);
+        $claims->method('dequeueStorageGarbage')->willReturn([[
+            'id' => 8,
+            'bucket' => 'bucket',
+            'storage_tier' => 'STANDARD',
+            'storage_path' => $path,
+            'operation' => 'delete_path',
+            'key_name' => null,
+            'upload_id' => null,
+            'owner_id' => 'owner',
+            'attempts' => 0,
+            'lease_expires_at' => microtime(true) + 300,
+            'lease_generation' => 3,
+            'dispatch_id' => null,
+        ]]);
+        $claims->expects(self::once())->method('deleteAwsGarbageClaim')->willReturnCallback(
+            function (int $id, string $bucket, string $tier, string $claimedPath, string $ownerId, int $generation, \Closure $currentLeaseUntil, \Closure $stopRenewal, \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion): bool {
+                self::assertTrue($deletion->matches($bucket, $tier, $claimedPath, $ownerId));
+                $deletion->execute();
+                try {
+                    $deletion->execute();
+                    self::fail('A provider-bound garbage deletion operation was executed twice.');
+                } catch (\LogicException $error) {
+                    self::assertSame('AWS garbage deletion operation is no longer active.', $error->getMessage());
+                }
+                $stopRenewal();
+                self::assertGreaterThan(microtime(true), $currentLeaseUntil());
+                self::assertSame(['DELETE'], $this->mutationMethods());
+
+                return true;
+            },
+        );
+        $this->mock->append(new Response(200, [
+            'Content-Length' => '4',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+            'x-amz-meta-opsfour-content-size' => '4',
+        ]));
+        $this->mock->append(new Response(204));
+        $missing = new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>');
+        $this->mock->append($missing);
+        $this->mock->append($missing);
+
+        self::assertSame(1, (new StorageGarbageCollector($claims, StorageTierRegistry::single($this->aws)))->collect(1));
+    }
+
+    public function test_aws_garbage_operation_is_revoked_when_claim_coordination_returns(): void
+    {
+        $captured = null;
+        $claims = $this->createMock(AwsS3GarbageClaimStore::class);
+        $claims->method('deleteAwsGarbageClaim')->willReturnCallback(
+            static function (int $id, string $bucket, string $tier, string $path, string $ownerId, int $generation, \Closure $currentLeaseUntil, \Closure $stopRenewal, \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion) use (&$captured): bool {
+                $captured = $deletion;
+
+                return false;
+            },
+        );
+
+        self::assertFalse($this->aws->deleteClaimedGarbage(
+            $claims,
+            1,
+            'bucket',
+            'STANDARD',
+            'path',
+            'owner',
+            1,
+            static fn(): float => microtime(true) + 300,
+            static function (): void {},
+        ));
+        self::assertInstanceOf(\OpsFour\S3Server\Storage\AwsS3GarbageDeletion::class, $captured);
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('AWS garbage deletion operation is no longer active.');
+        $captured->execute();
+    }
+
+    public function test_aws_garbage_not_found_confirms_absence_without_delete(): void
+    {
+        $profile = $this->aws->admittedProfile();
+        self::assertNotNull($profile);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $path = AwsS3WriteAttemptPath::forProfileObject($profile, 'bucket', 'key', $bucket->generation, 'STANDARD', bin2hex(random_bytes(16)));
+        $missing = new Response(404, ['content-type' => 'application/xml'], '<Error><Code>NoSuchKey</Code></Error>');
+        $this->mock->append($missing);
+        $this->mock->append($missing);
+
+        $this->deleteClaimedGarbage($path);
+        self::assertSame([], $this->mutationMethods());
+    }
+
+    public function test_lost_aws_delete_response_remains_ambiguous(): void
+    {
+        $profile = $this->aws->admittedProfile();
+        self::assertNotNull($profile);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attemptId = bin2hex(random_bytes(16));
+        $path = AwsS3WriteAttemptPath::forProfileObject($profile, 'bucket', 'key', $bucket->generation, 'STANDARD', $attemptId);
+        $this->mock->append(new Response(200, [
+            'Content-Length' => '4',
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+            'x-amz-meta-opsfour-content-size' => '4',
+        ]));
+        $this->mock->append(new ConnectException('lost response', new Request('DELETE', 'https://backing-private.s3.us-east-1.amazonaws.com')));
+
+        $this->expectException(\Throwable::class);
+        try {
+            $this->deleteClaimedGarbage($path);
+        } finally {
+            self::assertSame(['DELETE'], $this->mutationMethods());
+        }
     }
 
     public function test_transition_reserves_before_source_read_and_consumes_dispatch_with_placement(): void
@@ -495,7 +843,6 @@ final class AwsS3BackgroundExecutorTest extends TestCase
                 ));
                 self::fail('Invalid AWS committed-source evidence was accepted.');
             } catch (InternalErrorException) {
-                self::assertTrue(true);
             }
         }
     }
@@ -509,6 +856,31 @@ final class AwsS3BackgroundExecutorTest extends TestCase
             16 * 1024 * 1024,
         );
         $this->background = new AwsS3FencedBackgroundObjectWriter($this->writer, $this->aws, $tier);
+    }
+
+    private function deleteClaimedGarbage(string $path): void
+    {
+        $claims = $this->createMock(AwsS3GarbageClaimStore::class);
+        $claims->method('deleteAwsGarbageClaim')->willReturnCallback(
+            static function (int $id, string $bucket, string $tier, string $claimedPath, string $ownerId, int $generation, \Closure $currentLeaseUntil, \Closure $stopRenewal, \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion): bool {
+                self::assertTrue($deletion->matches($bucket, $tier, $claimedPath, $ownerId));
+                $deletion->execute();
+                $stopRenewal();
+
+                return true;
+            },
+        );
+        $this->aws->deleteClaimedGarbage(
+            $claims,
+            1,
+            'bucket',
+            'STANDARD',
+            $path,
+            'owner',
+            1,
+            static fn(): float => microtime(true) + 300,
+            static function (): void {},
+        );
     }
 
     private function putObject(string $key, string $tier, string $path, string $payload): void
