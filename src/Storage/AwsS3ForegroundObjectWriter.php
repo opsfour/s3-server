@@ -71,7 +71,7 @@ final readonly class AwsS3ForegroundObjectWriter
         string $ownerId,
         string $purpose = 'put_object',
     ): AwsS3ForegroundObjectReservation {
-        if (! in_array($purpose, ['put_object', 'copy_object'], true)) {
+        if (! in_array($purpose, ['put_object', 'copy_object', 'upload_part', 'upload_part_copy', 'complete_multipart'], true)) {
             throw new \InvalidArgumentException('AWS foreground publication purpose is unsupported.');
         }
         $attemptId = bin2hex(random_bytes(16));
@@ -99,9 +99,135 @@ final readonly class AwsS3ForegroundObjectWriter
         );
     }
 
+    public function reserveMultipartPart(
+        BucketInfo $bucket,
+        string $key,
+        string $ownerId,
+        string $uploadId,
+        int $partNumber,
+        bool $copy = false,
+    ): AwsS3ForegroundObjectReservation {
+        return $this->reserve(
+            $bucket,
+            self::multipartPartLogicalKey($key, $uploadId, $partNumber),
+            $ownerId,
+            $copy ? 'upload_part_copy' : 'upload_part',
+        );
+    }
+
+    public function dispatchMultipartPart(
+        AwsS3ForegroundObjectReservation $reservation,
+        string $key,
+        string $uploadId,
+        int $partNumber,
+        AwsS3ForegroundObjectStage $stage,
+    ): AwsS3ForegroundObjectOutcome {
+        return $this->dispatch(
+            $reservation,
+            self::multipartPartLogicalKey($key, $uploadId, $partNumber),
+            $stage,
+        );
+    }
+
+    public function reserveMultipartCompletion(
+        BucketInfo $bucket,
+        string $key,
+        string $ownerId,
+        string $uploadId,
+    ): AwsS3ForegroundObjectReservation {
+        self::assertMultipartCompletionScope($key, $uploadId);
+
+        return $this->reserve(
+            $bucket,
+            $key,
+            $ownerId,
+            'complete_multipart',
+        );
+    }
+
+    public function dispatchMultipartCompletion(
+        AwsS3ForegroundObjectReservation $reservation,
+        string $key,
+        string $uploadId,
+        AwsS3ForegroundObjectStage $stage,
+    ): AwsS3ForegroundObjectOutcome {
+        self::assertMultipartCompletionScope($key, $uploadId);
+
+        return $this->dispatch(
+            $reservation,
+            $key,
+            $stage,
+        );
+    }
+
+    public function dispatchMultipartCompletionStream(
+        AwsS3ForegroundObjectReservation $reservation,
+        string $key,
+        string $uploadId,
+        \Psr\Http\Message\StreamInterface $body,
+        StorageWriteResult $result,
+    ): AwsS3ForegroundObjectOutcome {
+        self::assertMultipartCompletionScope($key, $uploadId);
+        $this->heartbeat($reservation, true);
+        $current = $reservation->current($this->authority);
+        if (! hash_equals($current->storagePath, $result->path)) {
+            throw new \InvalidArgumentException('AWS multipart completion result does not match its reservation.');
+        }
+        $outcome = $this->publisher->dispatch($current, $key, $body);
+        if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
+            $this->publisher->retireConfirmedRejection($outcome);
+            throw new InternalErrorException('AWS multipart completion publication was not confirmed.');
+        }
+
+        return new AwsS3ForegroundObjectOutcome(
+            $result,
+            new LocalObjectWriteDispatchToken($outcome->attemptId, $outcome->dispatchId),
+        );
+    }
+
+    public function readMultipartPart(
+        BucketInfo $bucket,
+        string $key,
+        string $uploadId,
+        int $partNumber,
+        string $path,
+        int $expectedSize,
+        int $maximumSize,
+    ): ReadableStream {
+        return $this->backend->readMultipartPart(
+            $bucket,
+            self::multipartPartLogicalKey($key, $uploadId, $partNumber),
+            $path,
+            $this->storageTier,
+            $expectedSize,
+            $maximumSize,
+        );
+    }
+
+    private static function multipartPartLogicalKey(string $key, string $uploadId, int $partNumber): string
+    {
+        if ($key === '' || $uploadId === '' || $partNumber < 1 || $partNumber > 10000) {
+            throw new \InvalidArgumentException('Invalid AWS multipart part scope.');
+        }
+
+        return '@multipart-part/' . hash('sha256', $key) . '/' . hash('sha256', $uploadId) . '/' . $partNumber;
+    }
+
+    private static function assertMultipartCompletionScope(string $key, string $uploadId): void
+    {
+        if ($key === '' || $uploadId === '') {
+            throw new \InvalidArgumentException('Invalid AWS multipart completion scope.');
+        }
+    }
+
     public function retireBeforeDispatch(AwsS3ForegroundObjectReservation $reservation): void
     {
         $this->publisher->retireUndispatched($reservation->current($this->authority));
+    }
+
+    public function plannedPath(AwsS3ForegroundObjectReservation $reservation): string
+    {
+        return $reservation->current($this->authority)->storagePath;
     }
 
     public function heartbeat(AwsS3ForegroundObjectReservation $reservation, bool $force = false): void

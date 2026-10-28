@@ -8,6 +8,8 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchUploadException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
 final class MultipartCleanup
 {
@@ -75,6 +77,15 @@ final class MultipartCleanup
         string $storageTier,
         array $parts,
     ): void {
+        $physical = $storage;
+        while ($physical instanceof ObservedStorageBackend) {
+            $physical = $physical->innerBackend();
+        }
+        if ($physical instanceof AwsS3StorageBackend) {
+            // Exact paths are already durable queue entries. Generic cleanup is
+            // deliberately incapable of mutating qualified AWS keys.
+            return;
+        }
         foreach ($parts as $part) {
             try {
                 // Only committed parts were staged above. Other files in this

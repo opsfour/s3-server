@@ -9,7 +9,7 @@ canonical storage support matrix:
 | Backend | Status | Current use |
 |---------|--------|-------------|
 | Persistent local filesystem on Linux | Implemented and Supported; exact Linux/XFS/SQLite reference profile Qualified | v2.0.0 one-host, one-process release baseline; other metadata, filesystem, mount, device, and host combinations require their applicable gates |
-| Explicit AWS S3 provider (`aws-s3`) | Provider admission and ordinary-object write fence implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy destination fence, exact Copy source read; API startup always fails closed |
+| Explicit AWS S3 provider (`aws-s3`) | Provider admission plus ordinary-object and multipart write fences implemented; full writer fence incomplete / not production-qualified | Read-only admission, internal PUT/POST/Copy/UploadPart/UploadPartCopy/completion fences, exact Copy and multipart-part reads; API startup always fails closed |
 | Flysystem | Implemented; Experimental / test-only | Provider-specific integration and fault testing |
 | Memory | Implemented; Experimental / test-only | Unit tests, integration tests, and disposable development |
 | NFS, EFS, SMB/CIFS, FUSE, or another shared filesystem | Experimental / test-only | Requires qualification of the exact filesystem, mount, kernel, and topology |
@@ -219,6 +219,24 @@ ambiguity, post-dispatch cancellation, and failed or uncertain commits retain
 recovery evidence. Exact safely-undispatched cancellation may retire its reservation.
 Request handlers never delete an AWS attempt path, and scratch-cleanup failure after
 metadata commit cannot replace the successful response.
+
+Multipart PUT and UploadPartCopy use one object-write attempt for every immutable
+part. Capacity is reserved before request or source ingestion, SSE parts stage
+only their authenticated ciphertext, and Copy sources on the same AWS tier use
+the same expected-owner and marker verification as ordinary CopyObject, including
+bounded ranged reads. Part metadata and the exact armed dispatch are consumed in
+one transaction; replacement queues the previous exact path and never performs
+an inline AWS delete.
+
+Completion retains the existing upload-level intent as the selected-part fence
+and adds one exact final-object attempt. Plain completion preflights the immutable
+parts, then streams them sequentially into the final provider attempt without
+whole-object scratch or in-memory assembly. SSE-S3 and SSE-C completion authenticate
+each part within `maxEncryptedObjectSize`, re-encrypt once, and stage only final
+ciphertext. The upload intent, final provider dispatch, object/version metadata,
+and immutable placement commit atomically. Abort and post-completion part cleanup
+only persist exact garbage paths; generic collectors and request handlers do not
+mutate qualified AWS keys.
 
 Generic `StorageBackend` AWS operations, provider-side copy, and background
 writers remain unavailable. API startup refuses the profile even when the

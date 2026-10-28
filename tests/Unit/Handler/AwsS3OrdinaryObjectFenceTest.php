@@ -30,6 +30,10 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\QuotaExceededException;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
+use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
+use OpsFour\S3Server\Handler\Multipart\UploadPartCopyHandler;
+use OpsFour\S3Server\Handler\Multipart\UploadPartHandler;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PostObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
@@ -458,6 +462,19 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertInstanceOf(PutObjectHandler::class, $put);
         $handlerWriter = (new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put);
         self::assertSame($runtimeWriter, $handlerWriter);
+        foreach ([
+            [S3Operation::CreateMultipartUpload, CreateMultipartUploadHandler::class],
+            [S3Operation::UploadPart, UploadPartHandler::class],
+            [S3Operation::UploadPartCopy, UploadPartCopyHandler::class],
+            [S3Operation::CompleteMultipartUpload, CompleteMultipartUploadHandler::class],
+        ] as [$operation, $handlerClass]) {
+            $multipart = $runtime->server->getHandlerRegistry()->get($operation);
+            self::assertInstanceOf($handlerClass, $multipart);
+            self::assertSame(
+                $runtimeWriter,
+                (new \ReflectionProperty($multipart, 'awsObjectWriter'))->getValue($multipart),
+            );
+        }
         $stager = (new \ReflectionProperty($runtimeWriter, 'stager'))->getValue($runtimeWriter);
         self::assertFalse((new \ReflectionProperty($stager, 'shuttingDown'))->getValue($stager));
 

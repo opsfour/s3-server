@@ -85,11 +85,19 @@ final readonly class AwsS3CreateOnlyWriter
             $current = $renewed;
         };
         try {
-            $renewAuthoritative();
+            if ($body instanceof AwsS3MultipartPsrStream) {
+                $body->beginArmedDispatch(
+                    $renewAuthoritative,
+                    min(60.0, max(1.0, $this->leaseSeconds / 4.0)),
+                );
+            } else {
+                $renewAuthoritative();
+            }
             // S3 binds object metadata at PutObject or multipart initiation;
             // CompleteMultipartUpload does not accept metadata itself.
             $result = (new ObjectUploader($this->client, $this->profile->bucket, $key, $body, 'private', [
                 'mup_threshold' => $this->multipartThreshold,
+                'request_checksum_calculation' => 'when_required',
                 'before_initiate' => static function (CommandInterface $command) use ($owner, $metadata, $renewAuthoritative, &$providerCommandStarted): void {
                     $renewAuthoritative();
                     $providerCommandStarted = true;
@@ -103,11 +111,18 @@ final readonly class AwsS3CreateOnlyWriter
                     $providerCommandStarted = true;
                     $command['ExpectedBucketOwner'] = $owner;
                     $command['@retries'] = 0;
+                    $context = $command['@context'] ?: [];
+                    $context['request_checksum_calculation'] = 'when_required';
+                    $command['@context'] = $context;
                     if ($command->getName() === 'PutObject') {
                         $singlePutWasIssued = true;
                         unset($command['ACL']);
                         $command['Metadata'] = $metadata;
                         $command['IfNoneMatch'] = '*';
+                        $commandBody = $command['Body'];
+                        if ($commandBody instanceof AwsS3MultipartPsrStream) {
+                            $command['ContentSHA256'] = $commandBody->sha256Hex();
+                        }
                     }
                 },
                 'before_complete' => function (CommandInterface $command) use (&$multipartCompleteWasIssued, &$multipartCompletionEvidence, $owner, $renewAuthoritative, &$providerCommandStarted): void {

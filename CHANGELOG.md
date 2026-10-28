@@ -27,6 +27,15 @@ The project follows [Semantic Versioning](https://semver.org/).
   staging budget independent of the browser POST spool setting.
   Generic AWS storage operations and API startup remain disabled pending later
   writer-coverage and reconciliation stories.
+- Fence AWS multipart PUT and UploadPartCopy destinations with one durable
+  create-only attempt per immutable part, exact owner/marker-bound source reads,
+  ciphertext-only SSE staging, and atomic dispatch consumption with part
+  metadata. Fence plain and SSE multipart completion with the existing
+  upload-level selected-part intent plus one final provider attempt; plain
+  completion streams verified parts directly without whole-object scratch, encrypted
+  completion remains bounded, and both dispatches commit with object metadata.
+  Replacement, abort, and completion cleanup queue exact paths without generic
+  AWS deletion. Generic operations and API startup remain fail closed.
 
 - Persist immutable logical object-part layouts on SQLite, PostgreSQL, and
   MySQL, including completion-order boundaries, original upload part numbers,

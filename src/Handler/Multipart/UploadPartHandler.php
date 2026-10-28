@@ -29,6 +29,11 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 
 final class UploadPartHandler implements RequestHandler
 {
@@ -43,8 +48,27 @@ final class UploadPartHandler implements RequestHandler
         private readonly int $maxEncryptedObjectSize = 268_435_456,
         private readonly bool $requireLocalFencedParts = false,
         private readonly ?LocalFencedMultipartPartWriter $localPartWriter = null,
+        private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
+        if ($localPartWriter !== null && $awsObjectWriter !== null) {
+            throw new \InvalidArgumentException('Local and AWS multipart part coordinators are mutually exclusive.');
+        }
+        if ($awsObjectWriter !== null) {
+            $default = $this->storageTiers->defaultTier();
+            $backend = $default->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if (! $metadata instanceof ObjectWriteIntentStore
+                || ! $backend instanceof AwsS3StorageBackend
+                || $storage !== $default->backend
+                || $awsObjectWriter->storageTierName() !== $default->name
+                || ($profile = $backend->admittedProfile()) === null
+                || ! $awsObjectWriter->isBoundTo($backend, $profile, $metadata)) {
+                throw new \InvalidArgumentException('AWS multipart part writer must match the intent-capable default AWS tier.');
+            }
+        }
     }
 
     public function handleRequest(Request $request): Response
@@ -96,6 +120,10 @@ final class UploadPartHandler implements RequestHandler
         $uploadTier = MultipartUploadTierResolver::resolve($upload, $this->storageTiers);
         $uploadStorage = $uploadTier->backend;
         $storageTier = $uploadTier->name;
+        $activeAwsObjectWriter = $this->awsObjectWriter !== null
+            && $this->awsObjectWriter->storageTierName() === $storageTier
+                ? $this->awsObjectWriter
+                : null;
         $uploadSseAlgorithm = $upload['user_metadata']['__sse-algorithm'] ?? null;
         $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
         $customerKey = EncryptionRequestResolver::resolveCustomerKey(
@@ -142,6 +170,9 @@ final class UploadPartHandler implements RequestHandler
         }
         $plannedPartPath = null;
         $dispatchId = null;
+        $awsReservation = null;
+        $awsDispatchToken = null;
+        $awsStage = null;
         if ($encryptedV2) {
             EncryptionRequestResolver::requireEncryptionService($this->encryption, $uploadSseAlgorithm);
             if ($uploadSseAlgorithm === null || $this->encryption === null) {
@@ -154,17 +185,28 @@ final class UploadPartHandler implements RequestHandler
                     'Guarded SSE-S3 multipart parts require the injected worker-compatible Config keyring.',
                 );
             }
-            if ($partIntentStore === null || $plannedPartStorage === null) {
+            if ($activeAwsObjectWriter === null && ($partIntentStore === null || $plannedPartStorage === null)) {
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted multipart parts require durable planned-path backends.');
             }
-            $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
             $body = MultipartPartSize::boundedBody($request->getBody(), min(MultipartPartSize::MAX_BYTES, $this->maxEncryptedObjectSize));
+            $lock = null;
             $writeCancellation = null;
             try {
+                $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
+                $awsReservation = $activeAwsObjectWriter?->reserveMultipartPart(
+                    $bucketInfo,
+                    $key,
+                    $ownerId,
+                    $uploadId,
+                    $partNumber,
+                );
+                if ($awsReservation !== null) {
+                    $body = $activeAwsObjectWriter->renewingStream($awsReservation, $body);
+                }
                 [$plaintext, $checksums] = BufferedSsePayload::read($body, $this->maxEncryptedObjectSize);
                 $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
                 MultipartPartLogicalValidator::assertValid($clientChecksums, $checksums, $declaredLength);
-                $ciphertext = EncryptedMultipartPartCodec::encode(
+                $encode = fn(): string => EncryptedMultipartPartCodec::encode(
                     $this->encryption,
                     $uploadSseAlgorithm,
                     $plaintext,
@@ -174,7 +216,23 @@ final class UploadPartHandler implements RequestHandler
                     $uploadId,
                     $partNumber,
                 );
-                if ($activeLocalPartWriter !== null) {
+                $ciphertext = $awsReservation !== null
+                    ? ($activeAwsObjectWriter ?? throw new \LogicException('AWS multipart writer disappeared.'))->transform($awsReservation, $encode)
+                    : $encode();
+                if ($awsReservation !== null && is_string($ciphertext)) {
+                    $awsWriter = $activeAwsObjectWriter ?? throw new \LogicException('AWS multipart writer disappeared.');
+                    $awsStage = $awsWriter->stage($awsReservation, new \Amp\ByteStream\ReadableBuffer($ciphertext));
+                    if ($awsStage->result->size !== strlen($ciphertext)
+                        || ! hash_equals(md5($ciphertext), strtolower($awsStage->result->md5Hex))) {
+                        throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                            'Encrypted AWS multipart stage does not match its ciphertext.',
+                        );
+                    }
+                    $outcome = $awsWriter->dispatchMultipartPart($awsReservation, $key, $uploadId, $partNumber, $awsStage);
+                    $plannedPartPath = $outcome->result->path;
+                    $awsDispatchToken = $outcome->dispatch;
+                    $physical = $outcome->result;
+                } elseif ($activeLocalPartWriter !== null) {
                     $validatedPhysical = null;
                     $outcome = $activeLocalPartWriter->publish(
                         $bucket,
@@ -197,6 +255,9 @@ final class UploadPartHandler implements RequestHandler
                     $dispatchId = $outcome->dispatchId;
                     $physical = $outcome->result;
                 } else {
+                    if ($plannedPartStorage === null || $partIntentStore === null) {
+                        throw new \LogicException('Multipart planned-part capability disappeared.');
+                    }
                     $plannedPartPath = $plannedPartStorage->planMultipartPartPath(
                         $bucket,
                         $bucketInfo->generation,
@@ -247,19 +308,55 @@ final class UploadPartHandler implements RequestHandler
                 );
             } catch (\Amp\CancelledException $error) {
                 $writeCancellation = $error;
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                    $error,
+                    fn() => self::retireAwsReservation($activeAwsObjectWriter, $awsReservation),
+                );
+                throw $error;
+            } catch (\Throwable $error) {
+                if ($awsReservation !== null && $awsDispatchToken === null) {
+                    self::retireAwsReservation($activeAwsObjectWriter, $awsReservation);
+                }
                 throw $error;
             } finally {
                 \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                     $writeCancellation,
                     $body->close(...),
-                    $lock->release(...),
+                    function () use (&$awsStage, $activeAwsObjectWriter): void {
+                        if ($awsStage !== null) {
+                            $activeAwsObjectWriter?->release($awsStage);
+                            $awsStage = null;
+                        }
+                    },
+                    static function () use ($lock): void {
+                        $lock?->release();
+                    },
                 );
             }
         } else {
             $body = MultipartPartSize::boundedBody($request->getBody());
             $writeCancellation = null;
             try {
-                if ($activeLocalPartWriter !== null) {
+                $awsReservation = $activeAwsObjectWriter?->reserveMultipartPart(
+                    $bucketInfo,
+                    $key,
+                    $ownerId,
+                    $uploadId,
+                    $partNumber,
+                );
+                if ($awsReservation !== null) {
+                    $awsWriter = $activeAwsObjectWriter ?? throw new \LogicException('AWS multipart writer disappeared.');
+                    $awsStage = $awsWriter->stage(
+                        $awsReservation,
+                        $awsWriter->renewingStream($awsReservation, $body),
+                    );
+                    $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
+                    MultipartPartLogicalValidator::assertValid($clientChecksums, $awsStage->result, $declaredLength);
+                    $outcome = $awsWriter->dispatchMultipartPart($awsReservation, $key, $uploadId, $partNumber, $awsStage);
+                    $plannedPartPath = $outcome->result->path;
+                    $awsDispatchToken = $outcome->dispatch;
+                    $writeResult = $outcome->result;
+                } elseif ($activeLocalPartWriter !== null) {
                     $validated = null;
                     $outcome = $activeLocalPartWriter->publish(
                         $bucket,
@@ -315,11 +412,26 @@ final class UploadPartHandler implements RequestHandler
                 }
             } catch (\Amp\CancelledException $error) {
                 $writeCancellation = $error;
+                \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                    $error,
+                    fn() => self::retireAwsReservation($activeAwsObjectWriter, $awsReservation),
+                );
+                throw $error;
+            } catch (\Throwable $error) {
+                if ($awsReservation !== null && $awsDispatchToken === null) {
+                    $activeAwsObjectWriter?->retireBeforeDispatch($awsReservation);
+                }
                 throw $error;
             } finally {
                 \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                     $writeCancellation,
                     $body->close(...),
+                    function () use (&$awsStage, $activeAwsObjectWriter): void {
+                        if ($awsStage !== null) {
+                            $activeAwsObjectWriter?->release($awsStage);
+                            $awsStage = null;
+                        }
+                    },
                 );
             }
         }
@@ -359,7 +471,7 @@ final class UploadPartHandler implements RequestHandler
         $previousPartPath = null;
         $commitCallbackCompleted = false;
         try {
-            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $checksumAlgorithm, $checksumValue, $plannedPartPath, $dispatchId, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
+            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $checksumAlgorithm, $checksumValue, $plannedPartPath, $dispatchId, $awsDispatchToken, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
                 \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
                 \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                 $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
@@ -427,7 +539,9 @@ final class UploadPartHandler implements RequestHandler
                 }
                 if ($plannedPartPath !== null && ($dispatchId !== null
                     ? ! $this->consumeFencedIntent($bucket, $uploadId, $plannedPartPath, $dispatchId)
-                    : ! $this->consumePlannedIntent($bucket, $uploadId, $plannedPartPath))) {
+                    : ($awsDispatchToken !== null
+                        ? ! $this->consumeAwsIntent($awsDispatchToken)
+                        : ! $this->consumePlannedIntent($bucket, $uploadId, $plannedPartPath)))) {
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart part write intent expired.');
                 }
                 if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
@@ -449,7 +563,8 @@ final class UploadPartHandler implements RequestHandler
             throw $e;
         }
 
-        if ($previousPartPath !== null && $previousPartPath !== $writeResult->path) {
+        if ($previousPartPath !== null && $previousPartPath !== $writeResult->path
+            && $this->awsObjectWriter?->isImmutableAttemptPath($storageTier, $previousPartPath) !== true) {
             try {
                 \OpsFour\S3Server\Storage\StorageGarbageDiscard::afterDelete(
                     $this->metadata,
@@ -509,8 +624,26 @@ final class UploadPartHandler implements RequestHandler
             && $this->metadata->consumeMultipartPartWriteIntent($bucket, $uploadId, $path);
     }
 
+    private function consumeAwsIntent(LocalObjectWriteDispatchToken $token): bool
+    {
+        return $this->metadata instanceof ObjectWriteIntentStore
+            && $this->metadata->consumeArmedObjectWriteIntent($token->attemptId, $token->dispatchId);
+    }
+
+    private static function retireAwsReservation(
+        ?AwsS3ForegroundObjectWriter $writer,
+        ?\OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation $reservation,
+    ): void {
+        if ($writer !== null && $reservation !== null) {
+            $writer->retireBeforeDispatch($reservation);
+        }
+    }
+
     private function deleteUncommittedPart(StorageBackend $storage, string $storageTier, string $bucket, string $path, ?string $confirmedUploadId = null): void
     {
+        if ($this->awsObjectWriter?->isImmutableAttemptPath($storageTier, $path) === true) {
+            return;
+        }
         if (MultipartPartWriteCapabilities::localFilesystem($storage)) {
             // An accepted worker link can arrive after an ambiguous response.
             // The armed SQL row must survive until its path is sealed.

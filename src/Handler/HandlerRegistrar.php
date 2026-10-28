@@ -282,17 +282,18 @@ final class HandlerRegistrar
                 $quotas,
                 $storage,
                 $storageTiers,
+                awsObjectWriter: $awsObjectWriter,
             ),
         );
 
         $registry->register(
             S3Operation::UploadPart,
-            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, localPartWriter: $localPartWriter),
+            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter),
         );
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, localPartWriter: $localPartWriter),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter),
         );
 
         $registry->register(
@@ -308,6 +309,7 @@ final class HandlerRegistrar
                 $storageTiers,
                 requireLocalFencedCompletion: $requireLocalFencedCompletion,
                 localFencedCompletionTier: $localFencedCompletionTier,
+                awsObjectWriter: $awsObjectWriter,
             ),
         );
 

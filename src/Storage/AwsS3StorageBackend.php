@@ -74,8 +74,14 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
     }
 
     /** Exact, owner-bound read used only by CopyObject source transformation. */
-    public function readCopySource(BucketInfo $bucket, ObjectInfo $source, string $key, string $path): ReadableStream
-    {
+    public function readCopySource(
+        BucketInfo $bucket,
+        ObjectInfo $source,
+        string $key,
+        string $path,
+        ?int $offset = null,
+        ?int $length = null,
+    ): ReadableStream {
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
@@ -94,16 +100,30 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
                 $attemptId,
                 $profile->reservedPrefix,
             );
-            $result = $client->getObject([
+            $request = [
                 'Bucket' => $profile->bucket,
                 'Key' => $path,
                 'ExpectedBucketOwner' => $profile->expectedOwnerId,
                 '@retries' => 0,
-            ]);
+            ];
+            $expectedLength = $source->size;
+            $expectedContentRange = null;
+            if ($offset !== null || $length !== null) {
+                if ($offset === null || $length === null || $offset < 0 || $length < 1
+                    || $offset > PHP_INT_MAX - $length) {
+                    throw new \InvalidArgumentException('Invalid AWS copy source range.');
+                }
+                $request['Range'] = 'bytes=' . $offset . '-' . ($offset + $length - 1);
+                $expectedLength = $length;
+                $expectedContentRange = 'bytes ' . $offset . '-' . ($offset + $length - 1) . '/' . $source->size;
+            }
+            $result = $client->getObject($request);
             $body = $result->get('Body');
-            $length = $result->get('ContentLength');
+            $responseLength = $result->get('ContentLength');
+            $contentRange = $result->get('ContentRange');
             $markers = $result->get('Metadata');
-            if (! $body instanceof StreamInterface || ! is_int($length) || $length !== $source->size
+            if (! $body instanceof StreamInterface || ! is_int($responseLength) || $responseLength !== $expectedLength
+                || ($expectedContentRange !== null && $contentRange !== $expectedContentRange)
                 || ! is_array($markers)
                 || ($markers['opsfour-write-attempt'] ?? null) !== 'v1'
                 || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId) {
@@ -111,7 +131,7 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             }
             return new LimitedReadableStream(
                 new AwsS3CopySourceStream($body),
-                $source->size,
+                $expectedLength,
                 requireExactLength: true,
                 rejectExcess: true,
             );
@@ -123,6 +143,67 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             } catch (\Throwable) {
             }
             throw new InternalErrorException('AWS copy source could not be verified.');
+        }
+    }
+
+    /** Exact owner- and marker-bound read of one immutable multipart part attempt. */
+    public function readMultipartPart(
+        BucketInfo $bucket,
+        string $logicalScope,
+        string $path,
+        string $storageTier,
+        int $expectedSize,
+        int $maximumSize,
+    ): ReadableStream {
+        $profile = $this->binding?->profile;
+        $client = $this->binding?->client;
+        if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
+            throw $this->unavailable();
+        }
+        $body = null;
+        try {
+            $lastSeparator = strrpos($path, '/');
+            $attemptId = substr($path, $lastSeparator === false ? 0 : $lastSeparator + 1);
+            AwsS3WriteAttemptPath::assertExactPath(
+                $path,
+                $bucket->name,
+                $logicalScope,
+                $bucket->generation,
+                $storageTier,
+                $attemptId,
+                $profile->reservedPrefix,
+            );
+            $result = $client->getObject([
+                'Bucket' => $profile->bucket,
+                'Key' => $path,
+                'ExpectedBucketOwner' => $profile->expectedOwnerId,
+                '@retries' => 0,
+            ]);
+            $body = $result->get('Body');
+            $length = $result->get('ContentLength');
+            $markers = $result->get('Metadata');
+            if (! $body instanceof StreamInterface || ! is_int($length)
+                || $length < $expectedSize || $length > $maximumSize
+                || ! is_array($markers)
+                || ($markers['opsfour-write-attempt'] ?? null) !== 'v1'
+                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId) {
+                throw new \RuntimeException('Unverified AWS multipart part response.');
+            }
+
+            return new LimitedReadableStream(
+                new AwsS3CopySourceStream($body),
+                $length,
+                requireExactLength: true,
+                rejectExcess: true,
+            );
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            try {
+                $body?->close();
+            } catch (\Throwable) {
+            }
+            throw new InternalErrorException('AWS multipart part could not be verified.');
         }
     }
 

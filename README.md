@@ -45,14 +45,17 @@ deployment gates. The explicit `aws-s3` profile validates AWS identity, region,
 ownership, General Purpose Bucket evidence, and disabled versioning, but remains
 fail-closed until its writer fence is complete. A package-internal AWS primitive
 can now durably arm an exact create-only attempt and return a closed provider
-outcome. Ordinary PUT, browser POST, and CopyObject destinations now use the
-exact dispatch fence internally, including a narrow verified CopyObject source
-read. The same exact undispatched reservation is renewed across staging, SSE
+outcome. Ordinary PUT, browser POST, CopyObject destinations, multipart parts,
+and completed multipart objects now use the exact dispatch fence internally,
+including narrow verified CopyObject and multipart-part source reads. The same
+exact undispatched reservation is renewed across staging, SSE
 preprocessing, and encrypted Copy transforms; complete staged evidence is
 validated before the sole provider dispatch, with an independent heartbeat while
 a yielding encryption worker is active. Handler wiring accepts only the exact
-admitted backend/profile binding, and post-commit scratch cleanup cannot replace
-a successful response.
+admitted backend/profile binding. Multipart completion retains its upload-level
+selected-part intent and consumes it together with the final provider dispatch;
+abort and replacement queue exact AWS paths without request-path deletion.
+Post-commit scratch cleanup cannot replace a successful response.
 API startup still refuses this profile while the remaining writers and
 recovery paths are incomplete. Memory storage is test-only. Flysystem, remote and shared
 filesystems, NFS/EFS, multiple API processes, and multiple hosts remain

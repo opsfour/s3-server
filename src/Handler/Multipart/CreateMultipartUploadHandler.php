@@ -24,6 +24,10 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
@@ -42,8 +46,25 @@ final class CreateMultipartUploadHandler implements RequestHandler
         private readonly ?StorageBackend $storage = null,
         ?StorageTierRegistry $storageTiers = null,
         private readonly bool $requireWorkerCompatibleSseS3 = false,
+        private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
     ) {
         $this->storageTiers = $storageTiers ?? ($storage === null ? null : StorageTierRegistry::single($storage));
+        if ($awsObjectWriter !== null) {
+            $default = $this->storageTiers?->defaultTier()
+                ?? throw new \InvalidArgumentException('AWS multipart creation requires a storage registry.');
+            $backend = $default->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if (! $metadata instanceof ObjectWriteIntentStore
+                || ! $backend instanceof AwsS3StorageBackend
+                || $storage !== $default->backend
+                || $awsObjectWriter->storageTierName() !== $default->name
+                || ($profile = $backend->admittedProfile()) === null
+                || ! $awsObjectWriter->isBoundTo($backend, $profile, $metadata)) {
+                throw new \InvalidArgumentException('AWS multipart creation must match the exact default AWS tier.');
+            }
+        }
     }
 
     public function handleRequest(Request $request): Response
@@ -79,7 +100,7 @@ final class CreateMultipartUploadHandler implements RequestHandler
             );
         }
         $writeStorage = $this->storageTiers?->defaultBackend() ?? $this->storage;
-        if ($encryptionMode !== null && $writeStorage !== null
+        if ($encryptionMode !== null && $writeStorage !== null && $this->awsObjectWriter === null
             && (MultipartPartWriteCapabilities::storage($writeStorage) === null
                 || MultipartPartWriteCapabilities::metadata($this->metadata) === null)) {
             throw new \OpsFour\S3Server\Exception\NotImplementedException(
