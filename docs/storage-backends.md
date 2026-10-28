@@ -240,9 +240,21 @@ mutate qualified AWS keys.
 
 Generic `StorageBackend` AWS operations, provider-side copy, and background
 writers remain unavailable. API startup refuses the profile even when the
-unsafe Flysystem test override is enabled. Later
-qualification stories must connect and cover every writer, add reconciliation
-and sealing, and complete cleanup, health, and release gates before this profile
+unsafe Flysystem test override is enabled.
+
+Every AWS reservation charges fixed open-attempt and permanent-seal capacity
+before body ingestion: 4,096 of each per owner and 1,000,000 of each globally.
+Confirmed publication or rejection releases both charges. Ambiguity retains
+both until a tier-bound collector proves the exact v2 attempt or a conclusive
+absence, installs or adopts the deterministic same-key seal, verifies its
+metadata, ETag, exact bounded body and EOF with `ExpectedBucketOwner`, and wins
+the current SQL claim generation. A verified seal releases open capacity once;
+seal capacity remains charged permanently. Generic 404/409/412 responses,
+timeouts, malformed bodies, and foreign markers never retire uncertainty.
+This release exposes no seal deletion or break-glass removal operation.
+
+Later qualification stories must connect and cover every remaining writer and
+complete cleanup, health, and release gates before this profile
 can be described as fence-complete or production-qualified.
 
 ## Flysystem

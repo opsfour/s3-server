@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 49;
+    public const int VERSION = 50;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -599,11 +599,15 @@ final class MysqlSchema
                 lease_until DOUBLE NOT NULL,
                 claim_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 dispatch_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT '00000000000000000000000000000000',
+                expected_size BIGINT UNSIGNED NULL,
+                expected_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+                seal_reserved TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uk_s3_object_write_intents_path (storage_tier, path_digest),
                 KEY idx_s3_object_write_intents_owner (owner_id),
                 KEY idx_s3_object_write_intents_due (state, lease_until),
-                KEY idx_s3_object_write_intents_tier (storage_tier)
+                KEY idx_s3_object_write_intents_tier (storage_tier),
+                KEY idx_s3_object_write_intents_owner_seal (owner_id, seal_reserved)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
 
@@ -1108,6 +1112,18 @@ final class MysqlSchema
             $statements[] = 'CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, last_object_id BIGINT UNSIGNED NOT NULL, target_object_id BIGINT UNSIGNED NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
             $statements[] = 'ALTER TABLE s3_migration_checkpoints ADD COLUMN target_object_id BIGINT UNSIGNED NULL';
         }
+        if ($fromVersion < 50) {
+            // Keep table creation/backfill first so an interrupted MySQL DDL
+            // migration can be resumed before the new evidence columns exist.
+            array_push($statements, ...array_slice(self::writeIntentCapacityStatements(), 0, 3));
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN expected_size BIGINT UNSIGNED NULL';
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN expected_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL';
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN seal_reserved TINYINT(1) NOT NULL DEFAULT 0';
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD INDEX idx_s3_object_write_intents_owner_seal (owner_id, seal_reserved)';
+            $statements[] = 'ALTER TABLE s3_write_intent_capacity DROP CHECK chk_s3_write_intent_capacity';
+            $statements[] = "ALTER TABLE s3_write_intent_capacity ADD CONSTRAINT chk_s3_write_intent_capacity CHECK (kind IN ('object', 'object_seal', 'part') AND retained_count BETWEEN 0 AND 1000000)";
+            array_push($statements, ...self::writeIntentCapacityStatements());
+        }
 
         return $statements;
     }
@@ -1157,7 +1173,7 @@ final class MysqlSchema
             CREATE TABLE IF NOT EXISTS s3_write_intent_capacity (
                 kind VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
                 retained_count BIGINT NOT NULL,
-                CONSTRAINT chk_s3_write_intent_capacity CHECK (kind IN ('object', 'part') AND retained_count BETWEEN 0 AND 1000000)
+                CONSTRAINT chk_s3_write_intent_capacity CHECK (kind IN ('object', 'object_seal', 'part') AND retained_count BETWEEN 0 AND 1000000)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             SQL,
             "INSERT INTO s3_write_intent_capacity (kind, retained_count)
@@ -1166,14 +1182,27 @@ final class MysqlSchema
             "INSERT INTO s3_write_intent_capacity (kind, retained_count)
              SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation = BINARY 'part_write_intent')
              WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')",
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'object_seal', (SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 1)
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object_seal')",
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_insert',
             <<<'SQL'
             CREATE TRIGGER s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents
             FOR EACH ROW BEGIN
+                IF NEW.seal_reserved = 1 AND BINARY NEW.state <> BINARY 'active' THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object seal state transition is invalid.';
+                END IF;
                 UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
                 WHERE kind = 'object' AND retained_count < 1000000;
                 IF ROW_COUNT() <> 1 THEN
                     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is exhausted or unavailable.';
+                END IF;
+                IF NEW.seal_reserved = 1 THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                    WHERE kind = 'object_seal' AND retained_count < 1000000;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object seal capacity is exhausted or unavailable.';
+                    END IF;
                 END IF;
             END
             SQL,
@@ -1181,10 +1210,44 @@ final class MysqlSchema
             <<<'SQL'
             CREATE TRIGGER s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents
             FOR EACH ROW BEGIN
-                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
-                WHERE kind = 'object' AND retained_count > 0;
-                IF ROW_COUNT() <> 1 THEN
-                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is inconsistent.';
+                IF OLD.seal_reserved = 0 OR BINARY OLD.state <> BINARY 'sealed' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'object' AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is inconsistent.';
+                    END IF;
+                END IF;
+                IF OLD.seal_reserved = 1 THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'object_seal' AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object seal capacity is inconsistent.';
+                    END IF;
+                END IF;
+            END
+            SQL,
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_update',
+            <<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_update BEFORE UPDATE ON s3_object_write_intents
+            FOR EACH ROW BEGIN
+                IF OLD.seal_reserved <> NEW.seal_reserved
+                   OR (OLD.expected_size IS NOT NULL AND NOT (OLD.expected_size <=> NEW.expected_size))
+                   OR (OLD.expected_sha256 IS NOT NULL AND NOT (BINARY OLD.expected_sha256 <=> BINARY NEW.expected_sha256)) THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write evidence is immutable.';
+                END IF;
+                IF OLD.seal_reserved = 1 AND NOT (
+                    BINARY OLD.state = BINARY NEW.state
+                    OR (BINARY OLD.state = BINARY 'active' AND BINARY NEW.state = BINARY 'reconciling')
+                    OR (BINARY OLD.state = BINARY 'reconciling' AND BINARY NEW.state = BINARY 'sealed')
+                ) THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object seal state transition is invalid.';
+                END IF;
+                IF OLD.seal_reserved = 1 AND BINARY OLD.state = BINARY 'reconciling' AND BINARY NEW.state = BINARY 'sealed' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'object' AND retained_count > 0;
+                    IF ROW_COUNT() <> 1 THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Object write recovery capacity is inconsistent.';
+                    END IF;
                 END IF;
             END
             SQL,
@@ -1322,6 +1385,9 @@ final class MysqlSchema
                       OR (TRIGGER_NAME = 's3_write_intent_capacity_object_delete'
                           AND EVENT_OBJECT_TABLE = 's3_object_write_intents'
                           AND EVENT_MANIPULATION = 'DELETE' AND ACTION_TIMING = 'BEFORE')
+                      OR (TRIGGER_NAME = 's3_write_intent_capacity_object_update'
+                          AND EVENT_OBJECT_TABLE = 's3_object_write_intents'
+                          AND EVENT_MANIPULATION = 'UPDATE' AND ACTION_TIMING = 'BEFORE')
                       OR (TRIGGER_NAME = 's3_write_intent_capacity_part_insert'
                           AND EVENT_OBJECT_TABLE = 's3_storage_garbage'
                           AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE')

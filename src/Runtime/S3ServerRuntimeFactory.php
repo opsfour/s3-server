@@ -203,6 +203,12 @@ final readonly class S3ServerRuntimeFactory
                     $this->awsObjectScratchPath(),
                     $storageTiers->defaultTier()->name,
                 );
+                $server->setAwsObjectWriteIntentCollector($awsStorage->createObjectWriteIntentCollector(
+                    $metadata,
+                    $storageTiers->defaultTier()->name,
+                    $logger,
+                    $metrics,
+                ));
                 $runtime->attachAwsObjectWriter($awsObjectWriter);
             }
 

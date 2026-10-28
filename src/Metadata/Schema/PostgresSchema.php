@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 44;
+    public const int VERSION = 45;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -579,6 +579,9 @@ final class PostgresSchema
                 lease_until DOUBLE PRECISION NOT NULL,
                 claim_generation BIGINT NOT NULL DEFAULT 0,
                 dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
+                expected_size BIGINT,
+                expected_sha256 TEXT,
+                seal_reserved BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(storage_tier, path_digest)
             )
@@ -586,6 +589,7 @@ final class PostgresSchema
             'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner ON s3_object_write_intents(owner_id)',
             'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_due ON s3_object_write_intents(state, lease_until)',
             'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_tier ON s3_object_write_intents(storage_tier)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner_seal ON s3_object_write_intents(owner_id, seal_reserved)',
 
             ...self::completionCapacityStatements(),
             ...self::writeIntentCapacityStatements(),
@@ -989,6 +993,19 @@ final class PostgresSchema
             $statements[] = 'CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name TEXT PRIMARY KEY, last_object_id BIGINT NOT NULL, target_object_id BIGINT)';
             $statements[] = 'ALTER TABLE s3_migration_checkpoints ADD COLUMN IF NOT EXISTS target_object_id BIGINT';
         }
+        if ($fromVersion < 45) {
+            // Bootstrap the capacity table before touching its constraint. This
+            // also makes a retry safe when the previous capacity migration was
+            // interrupted after version publication or manually repaired.
+            array_push($statements, ...array_slice(self::writeIntentCapacityStatements(), 0, 3));
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS expected_size BIGINT';
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS expected_sha256 TEXT';
+            $statements[] = 'ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS seal_reserved BOOLEAN NOT NULL DEFAULT FALSE';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner_seal ON s3_object_write_intents(owner_id, seal_reserved)';
+            $statements[] = 'ALTER TABLE s3_write_intent_capacity DROP CONSTRAINT IF EXISTS s3_write_intent_capacity_kind_check';
+            $statements[] = "ALTER TABLE s3_write_intent_capacity ADD CONSTRAINT s3_write_intent_capacity_kind_check CHECK (kind IN ('object', 'object_seal', 'part'))";
+            array_push($statements, ...self::writeIntentCapacityStatements());
+        }
 
         return $statements;
     }
@@ -1041,7 +1058,7 @@ final class PostgresSchema
         return [
             <<<'SQL'
             CREATE TABLE IF NOT EXISTS s3_write_intent_capacity (
-                kind TEXT PRIMARY KEY CHECK (kind IN ('object', 'part')),
+                kind TEXT PRIMARY KEY CHECK (kind IN ('object', 'object_seal', 'part')),
                 retained_count BIGINT NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
             )
             SQL,
@@ -1051,18 +1068,56 @@ final class PostgresSchema
             "INSERT INTO s3_write_intent_capacity (kind, retained_count)
              SELECT 'part', (SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent')
              WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'part')",
+            "INSERT INTO s3_write_intent_capacity (kind, retained_count)
+             SELECT 'object_seal', (SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved)
+             WHERE NOT EXISTS (SELECT 1 FROM s3_write_intent_capacity WHERE kind = 'object_seal')",
             <<<'SQL'
             CREATE OR REPLACE FUNCTION s3_write_intent_capacity_object_fn() RETURNS trigger AS $$
             BEGIN
                 IF TG_OP = 'INSERT' THEN
+                    IF NEW.seal_reserved AND NEW.state <> 'active' THEN
+                        RAISE EXCEPTION 'Object seal state transition is invalid.';
+                    END IF;
                     UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
                     WHERE kind = 'object' AND retained_count < 1000000;
                     IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is exhausted or unavailable.'; END IF;
+                    IF NEW.seal_reserved THEN
+                        UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                        WHERE kind = 'object_seal' AND retained_count < 1000000;
+                        IF NOT FOUND THEN RAISE EXCEPTION 'Object seal capacity is exhausted or unavailable.'; END IF;
+                    END IF;
                     RETURN NEW;
                 END IF;
-                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
-                WHERE kind = 'object' AND retained_count > 0;
-                IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is inconsistent.'; END IF;
+                IF TG_OP = 'UPDATE' THEN
+                    IF OLD.seal_reserved <> NEW.seal_reserved
+                       OR (OLD.expected_size IS NOT NULL AND OLD.expected_size IS DISTINCT FROM NEW.expected_size)
+                       OR (OLD.expected_sha256 IS NOT NULL AND OLD.expected_sha256 IS DISTINCT FROM NEW.expected_sha256) THEN
+                        RAISE EXCEPTION 'Object write evidence is immutable.';
+                    END IF;
+                    IF OLD.seal_reserved AND NOT (
+                        OLD.state = NEW.state
+                        OR (OLD.state = 'active' AND NEW.state = 'reconciling')
+                        OR (OLD.state = 'reconciling' AND NEW.state = 'sealed')
+                    ) THEN
+                        RAISE EXCEPTION 'Object seal state transition is invalid.';
+                    END IF;
+                    IF OLD.seal_reserved AND OLD.state = 'reconciling' AND NEW.state = 'sealed' THEN
+                        UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                        WHERE kind = 'object' AND retained_count > 0;
+                        IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is inconsistent.'; END IF;
+                    END IF;
+                    RETURN NEW;
+                END IF;
+                IF NOT OLD.seal_reserved OR OLD.state <> 'sealed' THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'object' AND retained_count > 0;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Object write recovery capacity is inconsistent.'; END IF;
+                END IF;
+                IF OLD.seal_reserved THEN
+                    UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                    WHERE kind = 'object_seal' AND retained_count > 0;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Object seal capacity is inconsistent.'; END IF;
+                END IF;
                 RETURN OLD;
             END
             $$ LANGUAGE plpgsql
@@ -1094,6 +1149,8 @@ final class PostgresSchema
             'CREATE TRIGGER s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_object_fn()',
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_delete ON s3_object_write_intents',
             'CREATE TRIGGER s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_object_fn()',
+            'DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_update ON s3_object_write_intents',
+            'CREATE TRIGGER s3_write_intent_capacity_object_update BEFORE UPDATE OF state, expected_size, expected_sha256, seal_reserved ON s3_object_write_intents FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_object_fn()',
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_insert ON s3_storage_garbage',
             'CREATE TRIGGER s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage FOR EACH ROW EXECUTE FUNCTION s3_write_intent_capacity_part_fn()',
             'DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_delete ON s3_storage_garbage',

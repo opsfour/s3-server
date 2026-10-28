@@ -41,7 +41,7 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(49, MysqlSchema::VERSION);
+        self::assertSame(50, MysqlSchema::VERSION);
         $layoutMigration = implode("\n", MysqlSchema::getMigrationStatements(48));
         self::assertStringContainsString('s3_object_parts', $layoutMigration);
         self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);
@@ -173,7 +173,7 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(44, PostgresSchema::VERSION);
+        self::assertSame(45, PostgresSchema::VERSION);
         $layoutMigration = implode("\n", PostgresSchema::getMigrationStatements(43));
         self::assertStringContainsString('s3_object_parts', $layoutMigration);
         self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);

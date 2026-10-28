@@ -91,7 +91,7 @@ final class MultipartWriteIntentSchemaTest extends TestCase
 
                 $reset = $database->prepare('UPDATE s3_write_intent_capacity SET retained_count = 0 WHERE kind = ?');
                 $reset->execute([$kind]);
-                self::assertSame(['object' => 0, 'part' => 0], $store->getWriteIntentCapacityCounts());
+                self::assertSame(['object' => 0, 'object_seal' => 0, 'part' => 0], $store->getWriteIntentCapacityCounts());
             }
             $store->initialize();
         } finally {

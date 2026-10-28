@@ -513,9 +513,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         return $this->objectIntentStore()->renewObjectWriteIntent($attemptId, $expectedLeaseUntil, $leaseSeconds);
     }
 
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
     {
-        return $this->objectIntentStore()->armObjectWriteIntent($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds);
+        return $this->objectIntentStore()->armObjectWriteIntent($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds, $expectedSize, $expectedSha256);
     }
 
     public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent

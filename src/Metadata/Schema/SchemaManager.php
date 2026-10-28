@@ -1093,12 +1093,140 @@ final class SchemaManager
         }
     }
 
+    private function applyVersion42(): void
+    {
+        if (! $this->columnExists('s3_object_write_intents', 'expected_size')) {
+            $this->pdo->exec('ALTER TABLE s3_object_write_intents ADD COLUMN expected_size INTEGER');
+        }
+        if (! $this->columnExists('s3_object_write_intents', 'expected_sha256')) {
+            $this->pdo->exec('ALTER TABLE s3_object_write_intents ADD COLUMN expected_sha256 TEXT');
+        }
+        if (! $this->columnExists('s3_object_write_intents', 'seal_reserved')) {
+            $this->pdo->exec('ALTER TABLE s3_object_write_intents ADD COLUMN seal_reserved INTEGER NOT NULL DEFAULT 0 CHECK (seal_reserved IN (0, 1))');
+        }
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner_seal ON s3_object_write_intents(owner_id, seal_reserved)');
+
+        $this->pdo->exec('DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_insert');
+        $this->pdo->exec('DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_delete');
+        $this->pdo->exec('DROP TRIGGER IF EXISTS s3_write_intent_capacity_object_seal');
+        $this->pdo->exec('DROP TRIGGER IF EXISTS s3_object_write_seal_state_guard');
+        $this->pdo->exec('DROP TRIGGER IF EXISTS s3_object_write_evidence_immutable');
+        foreach (['insert', 'delete', 'enter', 'leave'] as $suffix) {
+            $this->pdo->exec("DROP TRIGGER IF EXISTS s3_write_intent_capacity_part_{$suffix}");
+        }
+        $this->pdo->exec('ALTER TABLE s3_write_intent_capacity RENAME TO s3_write_intent_capacity_v41');
+        $this->pdo->exec(<<<'SQL'
+            CREATE TABLE s3_write_intent_capacity (
+                kind TEXT PRIMARY KEY CHECK (kind IN ('object', 'object_seal', 'part')),
+                retained_count INTEGER NOT NULL CHECK (retained_count BETWEEN 0 AND 1000000)
+            )
+            SQL);
+        $this->pdo->exec("INSERT INTO s3_write_intent_capacity (kind, retained_count) SELECT 'object', COUNT(*) FROM s3_object_write_intents");
+        $this->pdo->exec("INSERT INTO s3_write_intent_capacity (kind, retained_count) SELECT 'object_seal', COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 1");
+        $this->pdo->exec("INSERT INTO s3_write_intent_capacity (kind, retained_count) SELECT 'part', retained_count FROM s3_write_intent_capacity_v41 WHERE kind = 'part'");
+        $this->pdo->exec('DROP TABLE s3_write_intent_capacity_v41');
+
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_insert BEFORE INSERT ON s3_object_write_intents
+            BEGIN
+                SELECT CASE WHEN NEW.seal_reserved = 1 AND NEW.state != 'active'
+                    THEN RAISE(ABORT, 'Object seal state transition is invalid.') END;
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'object' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Object write recovery capacity is exhausted.') END;
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1
+                WHERE kind = 'object_seal' AND NEW.seal_reserved = 1 AND retained_count < 1000000;
+                SELECT CASE WHEN NEW.seal_reserved = 1 AND changes() != 1 THEN RAISE(ABORT, 'Object seal capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_delete BEFORE DELETE ON s3_object_write_intents
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object' AND (OLD.seal_reserved = 0 OR OLD.state != 'sealed') AND retained_count > 0;
+                SELECT CASE WHEN (OLD.seal_reserved = 0 OR OLD.state != 'sealed') AND changes() != 1 THEN RAISE(ABORT, 'Object write recovery capacity is inconsistent.') END;
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object_seal' AND OLD.seal_reserved = 1 AND retained_count > 0;
+                SELECT CASE WHEN OLD.seal_reserved = 1 AND changes() != 1 THEN RAISE(ABORT, 'Object seal capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_object_write_seal_state_guard BEFORE UPDATE OF state ON s3_object_write_intents
+            WHEN OLD.seal_reserved = 1 AND NOT (
+                OLD.state = NEW.state
+                OR (OLD.state = 'active' AND NEW.state = 'reconciling')
+                OR (OLD.state = 'reconciling' AND NEW.state = 'sealed')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'Object seal state transition is invalid.');
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_object_seal BEFORE UPDATE OF state ON s3_object_write_intents
+            WHEN OLD.seal_reserved = 1 AND OLD.state = 'reconciling' AND NEW.state = 'sealed'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1
+                WHERE kind = 'object' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Object write recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_object_write_evidence_immutable BEFORE UPDATE OF expected_size, expected_sha256, seal_reserved ON s3_object_write_intents
+            WHEN OLD.seal_reserved != NEW.seal_reserved
+              OR (OLD.expected_size IS NOT NULL AND (NEW.expected_size IS NULL OR OLD.expected_size != NEW.expected_size))
+              OR (OLD.expected_sha256 IS NOT NULL AND (NEW.expected_sha256 IS NULL OR OLD.expected_sha256 != NEW.expected_sha256))
+            BEGIN
+                SELECT RAISE(ABORT, 'Object write evidence is immutable.');
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_insert BEFORE INSERT ON s3_storage_garbage
+            WHEN NEW.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1 WHERE kind = 'part' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_delete BEFORE DELETE ON s3_storage_garbage
+            WHEN OLD.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1 WHERE kind = 'part' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_enter BEFORE UPDATE OF operation ON s3_storage_garbage
+            WHEN OLD.operation != 'part_write_intent' AND NEW.operation = 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count + 1 WHERE kind = 'part' AND retained_count < 1000000;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is exhausted.') END;
+            END
+            SQL);
+        $this->pdo->exec(<<<'SQL'
+            CREATE TRIGGER s3_write_intent_capacity_part_leave BEFORE UPDATE OF operation ON s3_storage_garbage
+            WHEN OLD.operation = 'part_write_intent' AND NEW.operation != 'part_write_intent'
+            BEGIN
+                UPDATE s3_write_intent_capacity SET retained_count = retained_count - 1 WHERE kind = 'part' AND retained_count > 0;
+                SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'Multipart part recovery capacity is inconsistent.') END;
+            END
+            SQL);
+        $this->assertWriteIntentCapacityConsistent();
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (42, 'Reserve AWS seal capacity and immutable content evidence')");
+    }
+
     public function assertWriteIntentCapacityConsistent(): void
     {
-        foreach ([
-            'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
+        $counts = [
+            'object' => $this->columnExists('s3_object_write_intents', 'seal_reserved')
+                ? "SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 0 OR state != 'sealed'"
+                : 'SELECT COUNT(*) FROM s3_object_write_intents',
             'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
-        ] as $kind => $countSql) {
+        ];
+        if ($this->columnExists('s3_object_write_intents', 'seal_reserved')) {
+            $counts['object_seal'] = 'SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 1';
+        }
+        foreach ($counts as $kind => $countSql) {
             try {
                 $statement = $this->pdo->prepare("SELECT retained_count, typeof(retained_count) AS count_type, ({$countSql}) AS actual_count FROM s3_write_intent_capacity WHERE kind = ?");
                 $statement->execute([$kind]);

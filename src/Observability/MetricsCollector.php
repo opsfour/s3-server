@@ -76,13 +76,16 @@ final class MetricsCollector
 
     private ?int $multipartCompletionIntentCount = null;
 
-    /** @var array{object: int, part: int}|null */
+    /** @var array{object: int, object_seal: int, part: int}|null */
     private ?array $writeIntentCapacityCounts = null;
 
     private ?int $storageCleanupCount = null;
 
     /** @var array<string, int> */
     private array $storageCleanupAdmissionRejections = [];
+
+    /** @var array<string, int> */
+    private array $awsWriteReconciliations = [];
 
     /** @var array<string, int> */
     private array $notificationDeliveryTotals = [];
@@ -262,16 +265,29 @@ final class MetricsCollector
         $this->multipartCompletionIntentCount = $count;
     }
 
-    /** @param array{object: int, part: int}|null $counts */
+    /** @param array<string, mixed>|null $counts */
     public function setWriteIntentCapacityCounts(?array $counts): void
     {
         if ($counts !== null && (
+            count($counts) !== 3
+            || ! array_key_exists('object', $counts)
+            || ! array_key_exists('object_seal', $counts)
+            || ! array_key_exists('part', $counts)
+            || ! is_int($counts['object'])
+            || ! is_int($counts['object_seal'])
+            || ! is_int($counts['part'])
+        )) {
+            throw new \UnexpectedValueException('Write intent recovery capacity sample is incomplete.');
+        }
+        if ($counts !== null && (
             $counts['object'] < 0 || $counts['object'] > ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL
+            || $counts['object_seal'] < 0 || $counts['object_seal'] > ObjectWriteIntentStore::MAX_SEALS_GLOBAL
             || $counts['part'] < 0 || $counts['part'] > MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS
         )) {
             throw new \UnexpectedValueException('Write intent recovery capacity counter is out of range.');
         }
 
+        /** @var array{object: int, object_seal: int, part: int}|null $counts */
         $this->writeIntentCapacityCounts = $counts;
     }
 
@@ -290,6 +306,15 @@ final class MetricsCollector
         }
         $key = $this->key(['admission' => $admission]);
         $this->storageCleanupAdmissionRejections[$key] = ($this->storageCleanupAdmissionRejections[$key] ?? 0) + 1;
+    }
+
+    public function recordAwsWriteReconciliation(string $status): void
+    {
+        if (! in_array($status, ['sealed', 'retry', 'integrity_conflict'], true)) {
+            throw new \InvalidArgumentException('Unknown AWS write reconciliation status.');
+        }
+        $key = $this->key(['status' => $status]);
+        $this->awsWriteReconciliations[$key] = ($this->awsWriteReconciliations[$key] ?? 0) + 1;
     }
 
     public function recordNotificationDelivery(string $status, int $count = 1): void
@@ -518,6 +543,10 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_object_write_intents gauge';
         $lines[] = '# HELP s3_server_object_write_capacity_remaining Unreserved global object write recovery slots.';
         $lines[] = '# TYPE s3_server_object_write_capacity_remaining gauge';
+        $lines[] = '# HELP s3_server_aws_write_seals Permanently retained AWS same-key seals.';
+        $lines[] = '# TYPE s3_server_aws_write_seals gauge';
+        $lines[] = '# HELP s3_server_aws_write_seal_capacity_remaining Unreserved global permanent AWS seal slots.';
+        $lines[] = '# TYPE s3_server_aws_write_seal_capacity_remaining gauge';
         $lines[] = '# HELP s3_server_multipart_part_write_intents Retained multipart part write recovery intents across all owners.';
         $lines[] = '# TYPE s3_server_multipart_part_write_intents gauge';
         $lines[] = '# HELP s3_server_multipart_part_write_capacity_remaining Unreserved global multipart part write recovery slots.';
@@ -526,6 +555,9 @@ final class MetricsCollector
             $lines[] = 's3_server_object_write_intents ' . $this->writeIntentCapacityCounts['object'];
             $lines[] = 's3_server_object_write_capacity_remaining '
                 . (ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL - $this->writeIntentCapacityCounts['object']);
+            $lines[] = 's3_server_aws_write_seals ' . $this->writeIntentCapacityCounts['object_seal'];
+            $lines[] = 's3_server_aws_write_seal_capacity_remaining '
+                . (ObjectWriteIntentStore::MAX_SEALS_GLOBAL - $this->writeIntentCapacityCounts['object_seal']);
             $lines[] = 's3_server_multipart_part_write_intents ' . $this->writeIntentCapacityCounts['part'];
             $lines[] = 's3_server_multipart_part_write_capacity_remaining '
                 . (MultipartPartWriteIntentStore::MAX_OUTSTANDING_GLOBAL_PART_INTENTS - $this->writeIntentCapacityCounts['part']);
@@ -546,6 +578,11 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_storage_cleanup_admission_rejections_total counter';
         foreach ($this->storageCleanupAdmissionRejections as $key => $value) {
             $lines[] = 's3_server_storage_cleanup_admission_rejections_total{' . $key . '} ' . $value;
+        }
+        $lines[] = '# HELP s3_server_aws_write_reconciliations_total Bounded AWS ambiguous-write reconciliation outcomes.';
+        $lines[] = '# TYPE s3_server_aws_write_reconciliations_total counter';
+        foreach ($this->awsWriteReconciliations as $key => $value) {
+            $lines[] = 's3_server_aws_write_reconciliations_total{' . $key . '} ' . $value;
         }
 
         $lines[] = '# HELP s3_server_notification_deliveries_total Total notification delivery outcomes by status.';

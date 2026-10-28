@@ -43,8 +43,9 @@ final class AwsS3CreateOnlyWriterTest extends TestCase
         self::assertSame('/backing/' . self::intent()->storagePath, $requests[0]->getUri()->getPath());
         self::assertSame('*', $requests[0]->getHeaderLine('If-None-Match'));
         self::assertSame('123456789012', $requests[0]->getHeaderLine('x-amz-expected-bucket-owner'));
-        self::assertSame('v1', $requests[0]->getHeaderLine('x-amz-meta-opsfour-write-attempt'));
+        self::assertSame('v2', $requests[0]->getHeaderLine('x-amz-meta-opsfour-write-attempt'));
         self::assertSame(self::ATTEMPT_ID, $requests[0]->getHeaderLine('x-amz-meta-opsfour-attempt-id'));
+        self::assertAttemptEvidenceHeaders($requests[0]);
         self::assertFalse($requests[0]->hasHeader('x-amz-acl'));
     }
 
@@ -64,8 +65,9 @@ final class AwsS3CreateOnlyWriterTest extends TestCase
             self::assertSame('123456789012', $request->getHeaderLine('x-amz-expected-bucket-owner'));
             self::assertNotSame('DELETE', $request->getMethod());
         }
-        self::assertSame('v1', $requests[0]->getHeaderLine('x-amz-meta-opsfour-write-attempt'));
+        self::assertSame('v2', $requests[0]->getHeaderLine('x-amz-meta-opsfour-write-attempt'));
         self::assertSame(self::ATTEMPT_ID, $requests[0]->getHeaderLine('x-amz-meta-opsfour-attempt-id'));
+        self::assertAttemptEvidenceHeaders($requests[0]);
         self::assertFalse($requests[0]->hasHeader('x-amz-acl'));
     }
 
@@ -341,6 +343,15 @@ final class AwsS3CreateOnlyWriterTest extends TestCase
         return new AwsS3ProviderProfile('backing', 'us-east-1', '123456789012', 'objects', '.opsfour/write-attempts');
     }
 
+    private static function assertAttemptEvidenceHeaders(RequestInterface $request): void
+    {
+        $intent = self::intent();
+        self::assertSame($intent->dispatchId, $request->getHeaderLine('x-amz-meta-opsfour-dispatch-id'));
+        self::assertSame(hash('sha256', $intent->ownerId), $request->getHeaderLine('x-amz-meta-opsfour-owner-digest'));
+        self::assertSame((string) $intent->expectedSize, $request->getHeaderLine('x-amz-meta-opsfour-content-size'));
+        self::assertSame($intent->expectedSha256, $request->getHeaderLine('x-amz-meta-opsfour-content-sha256'));
+    }
+
     private static function intent(bool $armed = true, ?string $dispatchId = null): ObjectWriteIntent
     {
         return new ObjectWriteIntent(
@@ -360,6 +371,9 @@ final class AwsS3CreateOnlyWriterTest extends TestCase
             purpose: 'put_object',
             leaseUntil: $armed ? 100.0 : 0.0,
             dispatchId: $armed ? ($dispatchId ?? str_repeat('d', 32)) : null,
+            expectedSize: $armed ? 4 : null,
+            expectedSha256: $armed ? hash('sha256', 'body') : null,
+            sealReserved: $armed,
         );
     }
 
@@ -411,7 +425,7 @@ final class WriterObjectWriteIntentStore implements ObjectWriteIntentStore
     {
         throw new \LogicException('Not supported.');
     }
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
     {
         throw new \LogicException('Not supported.');
     }
@@ -440,6 +454,9 @@ final class WriterObjectWriteIntentStore implements ObjectWriteIntentStore
             leaseUntil: $this->intent->leaseUntil + max(1.0, $leaseSeconds),
             claimGeneration: $this->intent->claimGeneration,
             dispatchId: $this->intent->dispatchId,
+            expectedSize: $this->intent->expectedSize,
+            expectedSha256: $this->intent->expectedSha256,
+            sealReserved: $this->intent->sealReserved,
         );
 
         return $this->intent;

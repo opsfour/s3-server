@@ -17,10 +17,10 @@ preserve the signed `Host` header exactly. Additional processes, remote storage,
 shared filesystems, and multiple hosts are separate experimental profiles; see
 the [roadmap](production-feature-roadmap.md).
 
-The explicit `aws-s3` driver is currently an admission-only rollout slice. It
-can prove its immutable configuration and read-only provider state, but it
-always refuses API startup because writer coverage is incomplete. Do not use an
-admitted report as evidence of a write fence or production qualification.
+The explicit `aws-s3` driver now includes ordinary and multipart publication
+fences plus ambiguous-write same-key sealing, but it always refuses API startup
+because total writer coverage and release qualification remain incomplete. Do
+not use an admitted report or a healthy reconciler as production qualification.
 
 ## Current One-Process Deployment
 
@@ -395,11 +395,12 @@ admission deadline, because it could still commit to backing storage.
   `s3_server_object_write_capacity_remaining`; also
   `s3_server_multipart_part_write_intents` and
   `s3_server_multipart_part_write_capacity_remaining`. These report retained
-  object and multipart-part recovery intents and free slots from the two
-  shared `s3_write_intent_capacity` rows. Each kind has a one-million global
-  limit. The authorized scrape reads both rows in one O(1) database query;
+  object, permanent AWS seal, and multipart-part recovery capacity from the
+  three shared `s3_write_intent_capacity` rows. Each kind has a one-million
+  global limit. The authorized scrape reads all rows in one O(1) database query;
   unsupported metadata stores omit the samples, and a missing row fails the
-  scrape.
+  scrape. Exhausting either global object-attempt or AWS-seal pool also fails
+  readiness closed until capacity is available.
 - `s3_server_multipart_completion_intents` and
   `s3_server_multipart_completion_capacity_remaining`. These report the
   shared metadata database's retained completion attempts and free slots
@@ -414,6 +415,12 @@ admission deadline, because it could still commit to backing storage.
 - `s3_server_storage_cleanup_admission_rejections_total{admission="normal|recovery"}`.
   A recovery rejection means an exact failed-delete path could not be retained
   and a physical orphan may exist.
+- `s3_server_aws_write_seals` and
+  `s3_server_aws_write_seal_capacity_remaining`. These expose the permanent
+  same-key seal pool; verified reconciliation never decrements the retained seal
+  count.
+- `s3_server_aws_write_reconciliations_total{status="sealed|retry|integrity_conflict"}`.
+  Labels are fixed and never contain owners, logical keys, or physical paths.
 - `s3_server_notification_deliveries_total{status}`
 - `s3_server_worker_pool_tasks_total{pool,operation,status}`
 - `s3_server_flysystem_read_first_byte_seconds_bucket{le,result}` and its

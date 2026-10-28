@@ -15,6 +15,8 @@ use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MetadataWriteReadinessProbe;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\WriteIntentCapacityReader;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -133,6 +135,14 @@ final class HealthCheckHandler implements RequestHandler
                 }
                 if ($writeProbe instanceof MetadataWriteReadinessProbe) {
                     $writeProbe->assertMetadataWritable();
+                }
+                if ($writeProbe instanceof WriteIntentCapacityReader) {
+                    $capacity = $writeProbe->getWriteIntentCapacityCounts();
+                    if ($capacity !== null
+                        && ($capacity['object'] >= ObjectWriteIntentStore::MAX_OUTSTANDING_GLOBAL
+                            || $capacity['object_seal'] >= ObjectWriteIntentStore::MAX_SEALS_GLOBAL)) {
+                        throw new \RuntimeException('Global object write recovery capacity is exhausted.');
+                    }
                 }
             } catch (\Amp\CancelledException $e) {
                 throw $e;

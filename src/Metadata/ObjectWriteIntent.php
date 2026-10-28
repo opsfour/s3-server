@@ -22,5 +22,8 @@ final readonly class ObjectWriteIntent
         public float $leaseUntil = 0.0,
         public int $claimGeneration = 0,
         public ?string $dispatchId = null,
+        public ?int $expectedSize = null,
+        public ?string $expectedSha256 = null,
+        public bool $sealReserved = false,
     ) {}
 }

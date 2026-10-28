@@ -69,6 +69,7 @@ use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
@@ -150,7 +151,7 @@ final class S3Server
 
     private bool $localObjectCollectionRunning = false;
 
-    private ?LocalObjectWriteIntentCollector $localObjectIntentCollector = null;
+    private LocalObjectWriteIntentCollector|AwsS3ObjectWriteIntentCollector|null $localObjectIntentCollector = null;
 
     private ?LocalFencedObjectWriter $localObjectWriter = null;
 
@@ -353,6 +354,9 @@ final class S3Server
                         $this->config->metadataDriver,
                         $this->config->metadataDsn,
                     );
+                }
+                if (! $this->localObjectIntentCollector instanceof LocalObjectWriteIntentCollector) {
+                    throw new \RuntimeException('Local object write fencing requires its local intent collector.');
                 }
                 $this->localObjectIntentCollector->assertBoundTo($this->metadata, $this->localObjectWriter);
                 if ($configuredTiers === null
@@ -695,7 +699,7 @@ final class S3Server
             if ($objectCollector !== null) {
                 $collector = $objectCollector;
                 $this->localObjectCollectionRunning = true;
-                // Keep local attempt recovery independent of Lifecycle,
+                // Keep attempt recovery independent of Lifecycle,
                 // Restore and other garbage I/O, which may block for longer
                 // than one object's claim lease.
                 $this->backgroundFutures[] = \Amp\async(function () use ($collector, $backgroundCancellation): void {
@@ -706,8 +710,8 @@ final class S3Server
                             } catch (\Amp\CancelledException $error) {
                                 throw $error;
                             } catch (\Throwable $error) {
-                                $this->logger->warning('Local object intent collection failed.', [
-                                    'component' => 'local_object_intent_gc',
+                                $this->logger->warning('Object intent collection failed.', [
+                                    'component' => 'object_intent_reconciler',
                                     'exception' => $error::class,
                                 ]);
                             }
@@ -818,6 +822,15 @@ final class S3Server
         $this->assertConfigurationMutable('Local object intent collector');
         if ($this->localObjectIntentCollector !== null) {
             throw new \LogicException('Local object intent collector is already configured.');
+        }
+        $this->localObjectIntentCollector = $collector;
+    }
+
+    public function setAwsObjectWriteIntentCollector(AwsS3ObjectWriteIntentCollector $collector): void
+    {
+        $this->assertConfigurationMutable('AWS object intent collector');
+        if ($this->localObjectIntentCollector !== null) {
+            throw new \LogicException('Object intent collector is already configured.');
         }
         $this->localObjectIntentCollector = $collector;
     }
@@ -1391,7 +1404,7 @@ final class S3Server
      * @return array{
      *     lifecycleRunner: ?LifecycleRunner,
      *     notificationProcessor: ?NotificationProcessor,
-     *     objectCollector: ?LocalObjectWriteIntentCollector,
+     *     objectCollector: LocalObjectWriteIntentCollector|AwsS3ObjectWriteIntentCollector|null,
      *     transitionExecutor: ?TierTransitionExecutor,
      *     restoreExecutor: ?RestoreExecutor,
      *     restoreGarbageCollector: ?RestoreGarbageCollector,

@@ -214,9 +214,10 @@ The DML-only serving role does not need trigger-creation rights.
 | 47 (MySQL) | Expose the expected capacity-trigger count through a narrow definer-security function so DML-only serving nodes fail closed after trigger removal. |
 | 40 (SQLite) / 43 (PostgreSQL) / 48 (MySQL) | Add immutable cleanup admission classes, an exact singleton cleanup counter, and trigger-enforced 900,000 normal / 1,000,000 recovery boundaries. |
 | 41 (SQLite) / 44 (PostgreSQL) / 49 (MySQL) | Persist incarnation-bound object layout summaries and FK-cascaded logical parts; classify legacy rows in durable 10,000-row keyset batches without inferring multipart boundaries. |
+| 42 (SQLite) / 45 (PostgreSQL) / 50 (MySQL) | Add nullable legacy-safe object size/SHA-256 evidence, immutable AWS seal reservations, separate open-attempt and permanent-seal counters, and trigger-enforced atomic open-to-seal transitions. |
 
-SQLite currently uses schema version `41`; PostgreSQL uses `44`, and MySQL
-uses `49`. SQLite normally applies each migration version in a transaction. The
+SQLite currently uses schema version `42`; PostgreSQL uses `45`, and MySQL
+uses `50`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
 schema version only after the final batch. Rows beyond that target abort schema

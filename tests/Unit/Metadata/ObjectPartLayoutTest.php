@@ -312,7 +312,7 @@ final class ObjectPartLayoutTest extends TestCase
         $pdo = new \PDO('sqlite::memory:');
         $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $schema = new SchemaManager($pdo);
-        $schema->migrate(SqliteSchema::VERSION - 1);
+        $schema->migrate(40);
         $pdo->exec("INSERT INTO s3_objects (id, bucket, key_name, version_id, owner_id, etag, size, storage_path) VALUES (10001, 'bucket', 'simple', 'null', 'owner', 'd41d8cd98f00b204e9800998ecf8427e', 9, 'legacy/simple')");
         $pdo->exec("INSERT INTO s3_objects (id, bucket, key_name, version_id, owner_id, etag, size, storage_path) VALUES (10002, 'bucket', 'multipart', 'null', 'owner', 'd41d8cd98f00b204e9800998ecf8427e-7', 9, 'legacy/multipart')");
         $pdo->exec("INSERT INTO s3_objects (id, bucket, key_name, version_id, owner_id, etag, size, storage_path) VALUES (10003, 'bucket', 'opaque', 'null', 'owner', 'opaque-value', 9, 'legacy/opaque')");
@@ -348,7 +348,7 @@ final class ObjectPartLayoutTest extends TestCase
         $pdo = new \PDO('sqlite::memory:');
         $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $schema = new SchemaManager($pdo);
-        $schema->migrate(SqliteSchema::VERSION - 1);
+        $schema->migrate(40);
         $pdo->exec("INSERT INTO s3_objects (id, bucket, key_name, version_id, owner_id, etag, size, storage_path) VALUES (10001, 'bucket', 'late', 'null', 'owner', 'opaque-value', 9, 'legacy/late')");
         $pdo->exec('CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name TEXT PRIMARY KEY, last_object_id INTEGER NOT NULL, target_object_id INTEGER)');
         $pdo->exec("INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', 10000, 10000)");
@@ -359,7 +359,7 @@ final class ObjectPartLayoutTest extends TestCase
         } catch (\RuntimeException $error) {
             self::assertSame('Object rows were created beyond the fixed object-layout migration target.', $error->getMessage());
         }
-        self::assertSame(SqliteSchema::VERSION - 1, $schema->getCurrentVersion());
+        self::assertSame(40, $schema->getCurrentVersion());
     }
 
     public function test_sqlite_migration_rejects_checkpoint_beyond_fixed_target_without_publishing_version(): void
@@ -367,7 +367,7 @@ final class ObjectPartLayoutTest extends TestCase
         $pdo = new \PDO('sqlite::memory:');
         $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $schema = new SchemaManager($pdo);
-        $schema->migrate(SqliteSchema::VERSION - 1);
+        $schema->migrate(40);
         $pdo->exec('CREATE TABLE IF NOT EXISTS s3_migration_checkpoints (migration_name TEXT PRIMARY KEY, last_object_id INTEGER NOT NULL, target_object_id INTEGER)');
         $pdo->exec("INSERT INTO s3_migration_checkpoints (migration_name, last_object_id, target_object_id) VALUES ('object_part_layouts', 2, 1)");
 
@@ -377,7 +377,7 @@ final class ObjectPartLayoutTest extends TestCase
         } catch (\RuntimeException $error) {
             self::assertSame('Object part layout migration checkpoint exceeds its fixed target.', $error->getMessage());
         }
-        self::assertSame(SqliteSchema::VERSION - 1, $schema->getCurrentVersion());
+        self::assertSame(40, $schema->getCurrentVersion());
     }
 
     public function test_sqlite_layout_migration_rejects_versioned_schema_without_objects_table(): void
@@ -385,7 +385,7 @@ final class ObjectPartLayoutTest extends TestCase
         $pdo = new \PDO('sqlite::memory:');
         $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $schema = new SchemaManager($pdo);
-        $schema->migrate(SqliteSchema::VERSION - 1);
+        $schema->migrate(40);
         $pdo->exec('PRAGMA foreign_keys = OFF');
         $pdo->exec('DROP TABLE s3_objects');
 
@@ -395,7 +395,7 @@ final class ObjectPartLayoutTest extends TestCase
         } catch (\RuntimeException $error) {
             self::assertSame('SQLite metadata schema is corrupted: s3_objects is missing before object part layout migration.', $error->getMessage());
         }
-        self::assertSame(SqliteSchema::VERSION - 1, $schema->getCurrentVersion());
+        self::assertSame(40, $schema->getCurrentVersion());
     }
 
     public function test_layout_publication_rolls_back_with_parent_and_deletion_cascades_children(): void

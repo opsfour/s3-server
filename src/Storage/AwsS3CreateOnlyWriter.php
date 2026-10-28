@@ -21,7 +21,7 @@ final readonly class AwsS3CreateOnlyWriter
     private const float MIN_LEASE_MARGIN_SECONDS = 5.0;
     private const string MARKER_KEY = 'opsfour-write-attempt';
     private const string ATTEMPT_KEY = 'opsfour-attempt-id';
-    private const string MARKER_VALUE = 'v1';
+    private const string MARKER_VALUE = 'v2';
 
     public function __construct(
         private S3Client $client,
@@ -49,7 +49,12 @@ final readonly class AwsS3CreateOnlyWriter
             || $armed->claimGeneration !== 0
             || $armed->dispatchId === null
             || preg_match('/^[a-f0-9]{32}$/D', $armed->dispatchId) !== 1
-            || $armed->dispatchId === ObjectWriteIntent::LEGACY_UNKNOWN_DISPATCH) {
+            || $armed->dispatchId === ObjectWriteIntent::LEGACY_UNKNOWN_DISPATCH
+            || $armed->expectedSize === null
+            || $armed->expectedSize < 0
+            || $armed->expectedSha256 === null
+            || preg_match('/^[0-9a-f]{64}$/D', $armed->expectedSha256) !== 1
+            || ! $armed->sealReserved) {
             throw new \InvalidArgumentException('A durably armed exact AWS write attempt is required.');
         }
         $key = $armed->storagePath;
@@ -61,7 +66,14 @@ final readonly class AwsS3CreateOnlyWriter
         $multipartCompletionEvidence = null;
         $providerCommandStarted = false;
         $owner = $this->profile->expectedOwnerId;
-        $metadata = [self::MARKER_KEY => self::MARKER_VALUE, self::ATTEMPT_KEY => $attemptId];
+        $metadata = [
+            self::MARKER_KEY => self::MARKER_VALUE,
+            self::ATTEMPT_KEY => $attemptId,
+            'opsfour-dispatch-id' => $armed->dispatchId,
+            'opsfour-owner-digest' => hash('sha256', $armed->ownerId),
+            'opsfour-content-size' => (string) $armed->expectedSize,
+            'opsfour-content-sha256' => $armed->expectedSha256,
+        ];
 
         // The caller's snapshot is not authority. Commit a DB-clock renewal
         // before creating the uploader and before every provider command.
@@ -200,6 +212,9 @@ final readonly class AwsS3CreateOnlyWriter
             && $expected->purpose === $actual->purpose
             && $expected->state === $actual->state
             && $expected->claimGeneration === $actual->claimGeneration
+            && $expected->expectedSize === $actual->expectedSize
+            && $expected->expectedSha256 === $actual->expectedSha256
+            && $expected->sealReserved === $actual->sealReserved
             && $expected->dispatchId !== null
             && $actual->dispatchId !== null
             && hash_equals($expected->dispatchId, $actual->dispatchId);

@@ -470,6 +470,134 @@ final class ObjectWriteIntentStoreTest extends TestCase
         }
     }
 
+    public function test_aws_reservation_charges_both_pools_and_verified_seal_releases_open_once(): void
+    {
+        $store = $this->store();
+        $planned = new ObjectWriteIntent(
+            attemptId: str_repeat('e', 32),
+            bucket: 'bucket',
+            bucketGeneration: str_repeat('f', 32),
+            ownerId: 'owner',
+            storageTier: 'AWS',
+            storagePath: 'aws/attempt',
+            purpose: 'object',
+            sealReserved: true,
+        );
+        $reserved = $store->reserveObjectWriteIntent($planned, 60.0);
+        self::assertSame(['object' => 1, 'object_seal' => 1, 'part' => 0], $store->getWriteIntentCapacityCounts());
+        $armed = $store->armObjectWriteIntent(
+            $reserved->attemptId,
+            $reserved->leaseUntil,
+            str_repeat('d', 32),
+            60.0,
+            4,
+            hash('sha256', 'body'),
+        );
+        self::assertNotNull($armed);
+        self::assertSame(4, $armed->expectedSize);
+        self::assertSame(hash('sha256', 'body'), $armed->expectedSha256);
+        self::assertTrue($store->abandonObjectWriteIntent($armed->attemptId));
+        $claimed = $store->claimDueObjectWriteIntents('AWS', 1, 60.0)[0];
+        self::assertTrue($store->sealObjectWriteIntent($claimed->attemptId, $claimed->claimGeneration));
+        self::assertSame(['object' => 0, 'object_seal' => 1, 'part' => 0], $store->getWriteIntentCapacityCounts());
+        self::assertFalse($store->sealObjectWriteIntent($claimed->attemptId, $claimed->claimGeneration));
+        self::assertSame(['object' => 0, 'object_seal' => 1, 'part' => 0], $store->getWriteIntentCapacityCounts());
+    }
+
+    public function test_seal_reserved_state_machine_rejects_bypass_and_reentry(): void
+    {
+        $store = $this->store();
+        $planned = new ObjectWriteIntent(
+            attemptId: str_repeat('a', 32),
+            bucket: 'bucket',
+            bucketGeneration: str_repeat('f', 32),
+            ownerId: 'owner',
+            storageTier: 'AWS',
+            storagePath: 'aws/state-guard',
+            purpose: 'object',
+            sealReserved: true,
+        );
+        $reserved = $store->reserveObjectWriteIntent($planned, 60.0);
+        $pdo = $this->pdo();
+        try {
+            $pdo->exec("UPDATE s3_object_write_intents SET state = 'sealed' WHERE attempt_id = '{$reserved->attemptId}'");
+            self::fail('An active AWS intent bypassed reconciliation.');
+        } catch (\PDOException $error) {
+            self::assertStringContainsString('state transition is invalid', $error->getMessage());
+        }
+
+        $armed = $store->armObjectWriteIntent(
+            $reserved->attemptId,
+            $reserved->leaseUntil,
+            str_repeat('d', 32),
+            60.0,
+            4,
+            hash('sha256', 'body'),
+        );
+        self::assertNotNull($armed);
+        self::assertTrue($store->abandonObjectWriteIntent($armed->attemptId));
+        $claimed = $store->claimDueObjectWriteIntents('AWS', 1, 60.0)[0];
+        self::assertTrue($store->sealObjectWriteIntent($claimed->attemptId, $claimed->claimGeneration));
+        try {
+            $pdo->exec("UPDATE s3_object_write_intents SET state = 'reconciling' WHERE attempt_id = '{$reserved->attemptId}'");
+            self::fail('A permanent AWS seal re-entered reconciliation.');
+        } catch (\PDOException $error) {
+            self::assertStringContainsString('state transition is invalid', $error->getMessage());
+        }
+    }
+
+    public function test_full_owner_seal_pool_rejects_only_that_owner(): void
+    {
+        $store = $this->store();
+        $pdo = $this->pdo();
+        $insert = $pdo->prepare("INSERT INTO s3_object_write_intents
+            (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
+             path_digest, purpose, state, lease_until, seal_reserved)
+            VALUES (?, 'bucket', ?, 'seal-full-owner', 'AWS', ?, ?, 'object', 'active', 0, 1)");
+        self::assertInstanceOf(\PDOStatement::class, $insert);
+        $pdo->beginTransaction();
+        for ($i = 0; $i < ObjectWriteIntentStore::MAX_SEALS_PER_OWNER; ++$i) {
+            $attemptId = str_pad(dechex($i + 1), 32, '0', STR_PAD_LEFT);
+            $path = 'aws/seal-cap/' . $attemptId;
+            $insert->execute([$attemptId, str_repeat('f', 32), $path, hash('sha256', $path)]);
+        }
+        $pdo->exec("UPDATE s3_object_write_intents SET state = 'reconciling' WHERE owner_id = 'seal-full-owner'");
+        $pdo->exec("UPDATE s3_object_write_intents SET state = 'sealed' WHERE owner_id = 'seal-full-owner'");
+        $pdo->commit();
+        self::assertSame(
+            ['object' => 0, 'object_seal' => ObjectWriteIntentStore::MAX_SEALS_PER_OWNER, 'part' => 0],
+            $store->getWriteIntentCapacityCounts(),
+        );
+
+        try {
+            $store->reserveObjectWriteIntent(new ObjectWriteIntent(
+                attemptId: str_repeat('e', 32),
+                bucket: 'bucket',
+                bucketGeneration: str_repeat('f', 32),
+                ownerId: 'seal-full-owner',
+                storageTier: 'AWS',
+                storagePath: 'aws/seal-cap/rejected',
+                purpose: 'object',
+                sealReserved: true,
+            ), 60.0);
+            self::fail('The next seal reservation for a full owner was accepted.');
+        } catch (SlowDownException) {
+        }
+
+        $other = $store->reserveObjectWriteIntent(new ObjectWriteIntent(
+            attemptId: str_repeat('d', 32),
+            bucket: 'bucket',
+            bucketGeneration: str_repeat('f', 32),
+            ownerId: 'another-owner',
+            storageTier: 'AWS',
+            storagePath: 'aws/seal-cap/other-owner',
+            purpose: 'object',
+            sealReserved: true,
+        ), 60.0);
+        self::assertSame('another-owner', $other->ownerId);
+        self::assertTrue($store->retireUndispatchedObjectWriteIntent($other->attemptId));
+    }
+
     private function arm(SqliteMetadataStore $store, ObjectWriteIntent $reserved): ObjectWriteIntent
     {
         return $store->armObjectWriteIntent($reserved->attemptId, $reserved->leaseUntil, bin2hex(random_bytes(16)), 60.0)

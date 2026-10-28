@@ -289,7 +289,8 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     private function assertWriteIntentCapacityConsistent(): void
     {
         foreach ([
-            'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
+            'object' => "SELECT COUNT(*) FROM s3_object_write_intents WHERE NOT seal_reserved OR state <> 'sealed'",
+            'object_seal' => 'SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved',
             'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
         ] as $kind => $countSql) {
             try {
@@ -1325,24 +1326,34 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 throw new SlowDownException('Physical write recovery capacity is exhausted.');
             }
             $owner = $this->conn()->execute(
-                'SELECT COUNT(*) AS intent_count FROM s3_object_write_intents WHERE owner_id = $1',
+                "SELECT COUNT(*) AS intent_count FROM s3_object_write_intents WHERE owner_id = $1 AND (NOT seal_reserved OR state <> 'sealed')",
                 [$intent->ownerId],
             )->fetchRow();
             if ((int) ($owner['intent_count'] ?? 0) >= self::MAX_OUTSTANDING_PER_OWNER) {
                 throw new SlowDownException('Physical write recovery capacity is exhausted.');
             }
+            if ($intent->sealReserved) {
+                $sealGlobal = $this->conn()->query("SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'object_seal' FOR UPDATE")->fetchRow();
+                if ($sealGlobal === null || (int) $sealGlobal['retained_count'] >= self::MAX_SEALS_GLOBAL) {
+                    throw new SlowDownException('Physical write seal capacity is exhausted.');
+                }
+                $sealOwner = $this->conn()->execute('SELECT COUNT(*) AS intent_count FROM s3_object_write_intents WHERE owner_id = $1 AND seal_reserved', [$intent->ownerId])->fetchRow();
+                if ((int) ($sealOwner['intent_count'] ?? 0) >= self::MAX_SEALS_PER_OWNER) {
+                    throw new SlowDownException('Physical write seal capacity is exhausted.');
+                }
+            }
 
             $row = $this->conn()->execute(<<<'SQL'
                 INSERT INTO s3_object_write_intents
                     (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
-                     path_digest, purpose, state, lease_until, dispatch_id)
+                     path_digest, purpose, state, lease_until, dispatch_id, expected_size, expected_sha256, seal_reserved)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active',
-                    EXTRACT(EPOCH FROM clock_timestamp()) + $9::double precision, NULL)
+                    EXTRACT(EPOCH FROM clock_timestamp()) + $9::double precision, NULL, NULL, NULL, $10)
                 RETURNING *
                 SQL, [
                 $intent->attemptId, $intent->bucket, $intent->bucketGeneration, $intent->ownerId,
                 $intent->storageTier, $intent->storagePath, hash('sha256', $intent->storagePath),
-                $intent->purpose, $leaseSeconds,
+                $intent->purpose, $leaseSeconds, $intent->sealReserved,
             ])->fetchRow();
 
             return $row === null
@@ -1373,24 +1384,27 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return $row === null ? null : self::objectWriteIntentFromRow($row);
     }
 
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
     {
         self::validateObjectWriteDispatchId($dispatchId);
         self::validateObjectWriteLease($leaseSeconds);
+        self::validateObjectWriteEvidence($expectedSize, $expectedSha256);
         if ($this->fiberTransaction() !== null) {
             throw new \LogicException('Physical write dispatch requires its own committed transaction.');
         }
 
-        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds): ?ObjectWriteIntent {
+        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds, $expectedSize, $expectedSha256): ?ObjectWriteIntent {
             $row = $this->conn()->execute(<<<'SQL'
                 UPDATE s3_object_write_intents
-                SET dispatch_id = $1,
-                    lease_until = GREATEST(lease_until, EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision)
-                WHERE attempt_id = $3 AND state = 'active' AND dispatch_id IS NULL
-                  AND lease_until = $4::double precision
+                SET dispatch_id = $1, expected_size = $2, expected_sha256 = $3,
+                    lease_until = GREATEST(lease_until, EXTRACT(EPOCH FROM clock_timestamp()) + $4::double precision)
+                WHERE attempt_id = $5 AND state = 'active' AND dispatch_id IS NULL
+                  AND ((NOT seal_reserved AND $2::bigint IS NULL AND $3::text IS NULL)
+                    OR (seal_reserved AND $2::bigint IS NOT NULL AND $3::text IS NOT NULL))
+                  AND lease_until = $6::double precision
                   AND lease_until > EXTRACT(EPOCH FROM clock_timestamp())
                 RETURNING *
-                SQL, [$dispatchId, $leaseSeconds, $attemptId, sprintf('%.17F', $expectedLeaseUntil)])->fetchRow();
+                SQL, [$dispatchId, $expectedSize, $expectedSha256, $leaseSeconds, $attemptId, sprintf('%.17F', $expectedLeaseUntil)])->fetchRow();
 
             return $row === null ? null : self::objectWriteIntentFromRow($row);
         });
@@ -1581,7 +1595,19 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             leaseUntil: (float) $row['lease_until'],
             claimGeneration: (int) $row['claim_generation'],
             dispatchId: $row['dispatch_id'] === null ? null : self::str($row['dispatch_id']),
+            expectedSize: $row['expected_size'] === null ? null : (int) $row['expected_size'],
+            expectedSha256: $row['expected_sha256'] === null ? null : self::str($row['expected_sha256']),
+            sealReserved: (bool) $row['seal_reserved'],
         );
+    }
+
+    private static function validateObjectWriteEvidence(?int $expectedSize, ?string $expectedSha256): void
+    {
+        if (($expectedSize === null) !== ($expectedSha256 === null)
+            || ($expectedSize !== null && $expectedSize < 0)
+            || ($expectedSha256 !== null && preg_match('/^[0-9a-f]{64}$/D', $expectedSha256) !== 1)) {
+            throw new \InvalidArgumentException('Physical write evidence must be a complete size and SHA-256 pair.');
+        }
     }
 
     private static function validateObjectWriteIntent(ObjectWriteIntent $intent): void
@@ -1596,7 +1622,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             || preg_match('~(?:^|/)\.{1,2}(?:/|$)|//|/$~', preg_replace('~^[a-z][a-z0-9+.-]*://~i', '', $intent->storagePath) ?? '')
             || $intent->purpose === '' || strlen($intent->purpose) > 32
             || $intent->state !== 'active' || $intent->leaseUntil !== 0.0 || $intent->claimGeneration !== 0
-            || $intent->dispatchId !== null) {
+            || $intent->dispatchId !== null || $intent->expectedSize !== null || $intent->expectedSha256 !== null) {
             throw new \InvalidArgumentException('Invalid physical write intent.');
         }
     }
@@ -3738,10 +3764,10 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return (int) $row['retained_count'];
     }
 
-    /** @return array{object: int, part: int} */
+    /** @return array{object: int, object_seal: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
-        $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'part')");
+        $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'object_seal', 'part')");
         $counts = [];
         while (($row = $result->fetchRow()) !== null) {
             if (! is_numeric($row['retained_count'] ?? null)) {
@@ -3749,11 +3775,11 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             }
             $counts[self::str($row['kind'])] = (int) $row['retained_count'];
         }
-        if (! isset($counts['object'], $counts['part']) || count($counts) !== 2) {
+        if (! isset($counts['object'], $counts['object_seal'], $counts['part']) || count($counts) !== 3) {
             throw new \RuntimeException('Write intent recovery capacity counter is unavailable.');
         }
 
-        return ['object' => $counts['object'], 'part' => $counts['part']];
+        return ['object' => $counts['object'], 'object_seal' => $counts['object_seal'], 'part' => $counts['part']];
     }
 
     public function getStorageCleanupCount(): int

@@ -9,6 +9,8 @@ use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Observability\MetricsCollector;
+use Psr\Log\LoggerInterface;
 use Psr\Http\Message\StreamInterface;
 
 /** Provider identity plus narrowly scoped ordinary-object fence capabilities. */
@@ -70,6 +72,28 @@ final readonly class AwsS3StorageBackend implements StorageBackend, AwsS3Provide
             new LocalScratchStager($scratch, $budgetBytes),
             $storageTier,
             $renewIntervalSeconds,
+        );
+    }
+
+    public function createObjectWriteIntentCollector(
+        ObjectWriteIntentStore $intents,
+        string $storageTier,
+        LoggerInterface $logger,
+        MetricsCollector $metrics,
+        float $claimLeaseSeconds = 300.0,
+    ): AwsS3ObjectWriteIntentCollector {
+        $profile = $this->binding?->profile;
+        $client = $this->binding?->client;
+        if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
+            throw $this->unavailable();
+        }
+        return new AwsS3ObjectWriteIntentCollector(
+            $intents,
+            $storageTier,
+            new AwsS3SameKeySealWriter($client, $profile->bucket, $profile->expectedOwnerId),
+            $logger,
+            $metrics,
+            $claimLeaseSeconds,
         );
     }
 

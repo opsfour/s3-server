@@ -173,7 +173,15 @@ final readonly class AwsS3ForegroundObjectWriter
         if (! hash_equals($current->storagePath, $result->path)) {
             throw new \InvalidArgumentException('AWS multipart completion result does not match its reservation.');
         }
-        $outcome = $this->publisher->dispatch($current, $key, $body);
+        $outcome = $this->publisher->dispatch(
+            $current,
+            $key,
+            $body,
+            $result->size,
+            $body instanceof AwsS3MultipartPsrStream
+                ? $body->sha256Hex()
+                : self::sha256Hex($result),
+        );
         if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
             $this->publisher->retireConfirmedRejection($outcome);
             throw new InternalErrorException('AWS multipart completion publication was not confirmed.');
@@ -366,7 +374,13 @@ final readonly class AwsS3ForegroundObjectWriter
             if ($input === false) {
                 throw new InternalErrorException('AWS object staging could not be opened.');
             }
-            $outcome = $this->publisher->dispatch($current, $key, $input);
+            $outcome = $this->publisher->dispatch(
+                $current,
+                $key,
+                $input,
+                $stage->result->size,
+                self::sha256Hex($stage->result),
+            );
             if ($outcome->state !== AwsS3CreateOnlyWriteOutcome::CONFIRMED_SUCCESS) {
                 $this->publisher->retireConfirmedRejection($outcome);
                 throw new InternalErrorException('AWS object publication was not confirmed.');
@@ -403,5 +417,14 @@ final readonly class AwsS3ForegroundObjectWriter
         if ($scratch !== null) {
             $this->stager->cleanup($scratch);
         }
+    }
+
+    private static function sha256Hex(StorageWriteResult $result): string
+    {
+        $raw = $result->sha256Base64 === null ? false : base64_decode($result->sha256Base64, true);
+        if ($raw === false || strlen($raw) !== 32) {
+            throw new InternalErrorException('AWS object staging produced invalid SHA-256 evidence.');
+        }
+        return bin2hex($raw);
     }
 }

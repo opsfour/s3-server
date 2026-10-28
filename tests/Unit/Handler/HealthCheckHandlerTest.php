@@ -15,6 +15,7 @@ use League\Uri\Http;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
@@ -155,6 +156,29 @@ final class HealthCheckHandlerTest extends TestCase
                 static fn(\OpsFour\S3Server\Dto\BucketInfo $bucket): string => $bucket->name,
                 $writable->listAllBuckets(),
             ));
+        } finally {
+            @unlink($path);
+            @unlink($path . '-wal');
+            @unlink($path . '-shm');
+        }
+    }
+
+    public function test_readiness_fails_closed_at_global_aws_seal_capacity(): void
+    {
+        $path = sys_get_temp_dir() . '/s3-health-seal-capacity-' . bin2hex(random_bytes(8)) . '.sqlite';
+        try {
+            $metadata = new SqliteMetadataStore($path);
+            $metadata->initialize();
+            $handler = new HealthCheckHandler(metadata: $metadata, readinessCheckIntervalSeconds: 0);
+            self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
+
+            $pdo = new \PDO('sqlite:' . $path);
+            $setCapacity = $pdo->prepare("UPDATE s3_write_intent_capacity SET retained_count = ? WHERE kind = 'object_seal'");
+            $setCapacity->execute([ObjectWriteIntentStore::MAX_SEALS_GLOBAL]);
+            self::assertSame(503, $handler->handleRequest($this->request())->getStatus());
+
+            $setCapacity->execute([ObjectWriteIntentStore::MAX_SEALS_GLOBAL - 1]);
+            self::assertSame(200, $handler->handleRequest($this->request())->getStatus());
         } finally {
             @unlink($path);
             @unlink($path . '-wal');

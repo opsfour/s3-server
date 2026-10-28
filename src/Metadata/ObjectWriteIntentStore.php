@@ -17,6 +17,10 @@ interface ObjectWriteIntentStore
 
     public const int MAX_OUTSTANDING_GLOBAL = 1_000_000;
 
+    public const int MAX_SEALS_PER_OWNER = 4096;
+
+    public const int MAX_SEALS_GLOBAL = 1_000_000;
+
     public function reserveObjectWriteIntent(ObjectWriteIntent $intent, float $leaseSeconds): ObjectWriteIntent;
 
     public function getObjectWriteIntent(string $attemptId): ?ObjectWriteIntent;
@@ -24,7 +28,14 @@ interface ObjectWriteIntentStore
     public function renewObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent;
 
     /** Commit a one-shot physical dispatch before submitting any provider task. */
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent;
+    public function armObjectWriteIntent(
+        string $attemptId,
+        float $expectedLeaseUntil,
+        string $dispatchId,
+        float $leaseSeconds,
+        ?int $expectedSize = null,
+        ?string $expectedSha256 = null,
+    ): ?ObjectWriteIntent;
 
     /** Commit a DB-clock lease refresh for one exact armed dispatch. */
     public function renewArmedObjectWriteIntent(string $attemptId, string $dispatchId, float $expectedLeaseUntil, float $leaseSeconds): ?ObjectWriteIntent;

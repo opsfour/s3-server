@@ -71,7 +71,7 @@ final class ExternalWriteIntentCapacityTest extends TestCase
             self::assertSame($beforeObject + 1, self::capacity($pool, 'object'));
             self::assertSame($beforePart + 1, self::capacity($pool, 'part'));
             self::assertSame(
-                ['object' => $beforeObject + 1, 'part' => $beforePart + 1],
+                ['object' => $beforeObject + 1, 'object_seal' => self::capacity($pool, 'object_seal'), 'part' => $beforePart + 1],
                 $reader->getWriteIntentCapacityCounts(),
             );
             $pool->execute("UPDATE s3_storage_garbage SET operation = 'delete_path' WHERE storage_path = '{$path}'");
@@ -116,6 +116,106 @@ final class ExternalWriteIntentCapacityTest extends TestCase
     }
 
     #[DataProvider('databases')]
+    public function test_permanent_seal_releases_only_open_capacity_and_passes_restart_guard(string $driver, string $dsnEnv): void
+    {
+        [$dsn, $pool] = self::database($driver, $dsnEnv);
+        MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        $suffix = bin2hex(random_bytes(8));
+        $attemptId = str_pad($suffix, 32, '0');
+        $seal = $driver === 'postgres' ? 'TRUE' : '1';
+        $beforeObject = self::capacity($pool, 'object');
+        $beforeSeal = self::capacity($pool, 'object_seal');
+        try {
+            $pool->execute("INSERT INTO s3_object_write_intents
+                (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
+                 path_digest, purpose, state, lease_until, dispatch_id, expected_size, expected_sha256, seal_reserved)
+                VALUES ('{$attemptId}', 'bucket', 'generation', 'owner', 'AWS', '{$attemptId}',
+                        '{$suffix}', 'put', 'active', 1, 'dddddddddddddddddddddddddddddddd',
+                        4, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', {$seal})");
+            self::assertSame($beforeObject + 1, self::capacity($pool, 'object'));
+            self::assertSame($beforeSeal + 1, self::capacity($pool, 'object_seal'));
+
+            self::rejects(static fn() => $pool->execute("UPDATE s3_object_write_intents SET state = 'sealed' WHERE attempt_id = '{$attemptId}'"), 'state transition');
+            $pool->execute("UPDATE s3_object_write_intents SET state = 'reconciling' WHERE attempt_id = '{$attemptId}'");
+            $pool->execute("UPDATE s3_object_write_intents SET state = 'sealed' WHERE attempt_id = '{$attemptId}'");
+            self::assertSame($beforeObject, self::capacity($pool, 'object'));
+            self::assertSame($beforeSeal + 1, self::capacity($pool, 'object_seal'));
+            self::rejects(static fn() => $pool->execute("UPDATE s3_object_write_intents SET state = 'reconciling' WHERE attempt_id = '{$attemptId}'"), 'state transition');
+            MetadataStoreFactory::create($driver, ['dsn' => $dsn], migrate: false);
+
+            $pool->execute("DELETE FROM s3_object_write_intents WHERE attempt_id = '{$attemptId}'");
+            self::assertSame($beforeObject, self::capacity($pool, 'object'));
+            self::assertSame($beforeSeal, self::capacity($pool, 'object_seal'));
+        } finally {
+            $pool->execute("DELETE FROM s3_object_write_intents WHERE attempt_id = '{$attemptId}'");
+            $pool->close();
+        }
+    }
+
+    #[DataProvider('databases')]
+    public function test_full_owner_seal_pool_rejects_only_that_owner(string $driver, string $dsnEnv): void
+    {
+        [$dsn, $pool] = self::database($driver, $dsnEnv);
+        $store = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        self::assertInstanceOf(ObjectWriteIntentStore::class, $store);
+        $suffix = bin2hex(random_bytes(6));
+        $owner = 'seal-full-' . $suffix;
+        $seal = $driver === 'postgres' ? 'TRUE' : '1';
+        $transaction = $pool->beginTransaction();
+        $committed = false;
+        try {
+            for ($i = 0; $i < ObjectWriteIntentStore::MAX_SEALS_PER_OWNER; ++$i) {
+                $attemptId = str_pad(dechex($i + 1), 20, '0', STR_PAD_LEFT) . $suffix;
+                $path = 'seal-cap-' . $attemptId;
+                $transaction->execute("INSERT INTO s3_object_write_intents
+                    (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
+                     path_digest, purpose, state, lease_until, seal_reserved)
+                    VALUES ('{$attemptId}', 'bucket', 'generation', '{$owner}', 'AWS', '{$path}',
+                            '{$attemptId}', 'put', 'active', 0, {$seal})");
+            }
+            $transaction->execute("UPDATE s3_object_write_intents SET state = 'reconciling' WHERE owner_id = '{$owner}'");
+            $transaction->execute("UPDATE s3_object_write_intents SET state = 'sealed' WHERE owner_id = '{$owner}'");
+            $transaction->commit();
+            $committed = true;
+
+            try {
+                $store->reserveObjectWriteIntent(new ObjectWriteIntent(
+                    attemptId: str_repeat('e', 20) . $suffix,
+                    bucket: 'bucket',
+                    bucketGeneration: str_repeat('f', 32),
+                    ownerId: $owner,
+                    storageTier: 'AWS',
+                    storagePath: 'seal-cap-rejected-' . $suffix,
+                    purpose: 'put',
+                    sealReserved: true,
+                ), 60.0);
+                self::fail('The next seal reservation for a full owner was accepted.');
+            } catch (SlowDownException) {
+            }
+
+            $other = $store->reserveObjectWriteIntent(new ObjectWriteIntent(
+                attemptId: str_repeat('d', 20) . $suffix,
+                bucket: 'bucket',
+                bucketGeneration: str_repeat('f', 32),
+                ownerId: 'other-' . $suffix,
+                storageTier: 'AWS',
+                storagePath: 'seal-cap-other-' . $suffix,
+                purpose: 'put',
+                sealReserved: true,
+            ), 60.0);
+            self::assertTrue($store->retireUndispatchedObjectWriteIntent($other->attemptId));
+        } catch (\Throwable $error) {
+            if (! $committed) {
+                $transaction->rollback();
+            }
+            throw $error;
+        } finally {
+            $pool->execute("DELETE FROM s3_object_write_intents WHERE owner_id IN ('{$owner}', 'other-{$suffix}')");
+            $pool->close();
+        }
+    }
+
+    #[DataProvider('databases')]
     public function test_partial_migration_retry_backfills_and_rejects_drift(string $driver, string $dsnEnv): void
     {
         [$dsn, $pool] = self::database($driver, $dsnEnv);
@@ -127,8 +227,14 @@ final class ExternalWriteIntentCapacityTest extends TestCase
             ? PostgresSchema::getMigrationStatements($previous)
             : MysqlSchema::getMigrationStatements($previous);
         try {
-            foreach (['object_insert' => 's3_object_write_intents', 'object_delete' => 's3_object_write_intents', 'part_insert' => 's3_storage_garbage', 'part_delete' => 's3_storage_garbage', 'part_update' => 's3_storage_garbage'] as $trigger => $table) {
+            foreach (['object_insert' => 's3_object_write_intents', 'object_delete' => 's3_object_write_intents', 'object_update' => 's3_object_write_intents', 'part_insert' => 's3_storage_garbage', 'part_delete' => 's3_storage_garbage', 'part_update' => 's3_storage_garbage'] as $trigger => $table) {
                 $pool->query('DROP TRIGGER IF EXISTS s3_write_intent_capacity_' . $trigger . ($driver === 'postgres' ? ' ON ' . $table : ''));
+            }
+            if ($driver === 'mysql') {
+                $pool->query('ALTER TABLE s3_object_write_intents DROP INDEX idx_s3_object_write_intents_owner_seal');
+                $pool->query('ALTER TABLE s3_object_write_intents DROP COLUMN expected_size');
+                $pool->query('ALTER TABLE s3_object_write_intents DROP COLUMN expected_sha256');
+                $pool->query('ALTER TABLE s3_object_write_intents DROP COLUMN seal_reserved');
             }
             $pool->query('DROP TABLE s3_write_intent_capacity');
             $pool->execute($driver === 'postgres'
@@ -142,8 +248,15 @@ final class ExternalWriteIntentCapacityTest extends TestCase
                 VALUES ('bucket', 'STANDARD', '{$suffix}', 'part_write_intent', 0)");
 
             if ($driver === 'mysql') {
-                // MySQL DDL auto-commits: simulate interruption after table/backfill, before triggers.
-                foreach (array_slice($statements, 0, 3) as $sql) {
+                // MySQL DDL auto-commits: simulate interruption after the v50
+                // columns/index are added and the old CHECK has been dropped.
+                $dropCheck = array_search(
+                    'ALTER TABLE s3_write_intent_capacity DROP CHECK chk_s3_write_intent_capacity',
+                    $statements,
+                    true,
+                );
+                self::assertIsInt($dropCheck);
+                foreach (array_slice($statements, 0, $dropCheck + 1) as $sql) {
                     $pool->query($sql);
                 }
                 self::assertSame($previous, self::schemaVersion($pool));
@@ -553,16 +666,16 @@ final class ExternalWriteIntentCapacityTest extends TestCase
     }
 
     /** @param \Closure(): mixed $write */
-    private static function rejects(\Closure $write): void
+    private static function rejects(\Closure $write, string $message = 'capacity'): void
     {
         try {
             $write();
         } catch (\Throwable $error) {
-            self::assertStringContainsString('capacity', strtolower($error->getMessage()));
+            self::assertStringContainsString($message, strtolower($error->getMessage()));
 
             return;
         }
 
-        self::fail('The database accepted a write without recovery capacity.');
+        self::fail('The database accepted a rejected write.');
     }
 }

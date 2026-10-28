@@ -173,15 +173,18 @@ final class MetricsHandlerTest extends TestCase
         self::assertInstanceOf(MetadataStore::class, $metadata);
         $metadata->method('getNotificationQueueStats')->willReturn([]);
         $metadata->expects(self::exactly(2))->method('getWriteIntentCapacityCounts')
-            ->willReturnOnConsecutiveCalls(['object' => 7, 'part' => 9], null);
+            ->willReturnOnConsecutiveCalls(['object' => 7, 'object_seal' => 3, 'part' => 9], null);
         $handler = new MetricsHandler(new MetricsCollector(), $metadata);
 
         $first = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
         self::assertStringContainsString('s3_server_object_write_intents 7', $first);
+        self::assertStringContainsString('s3_server_aws_write_seals 3', $first);
         self::assertStringContainsString('s3_server_multipart_part_write_intents 9', $first);
         $second = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
         self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $second);
         self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_capacity_remaining /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_seals /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_seal_capacity_remaining /m', $second);
         self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_part_write_intents /m', $second);
         self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_part_write_capacity_remaining /m', $second);
     }

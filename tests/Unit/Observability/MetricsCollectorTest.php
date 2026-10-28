@@ -47,17 +47,41 @@ final class MetricsCollectorTest extends TestCase
     {
         $metrics = new MetricsCollector();
         self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $metrics->renderPrometheus());
-        $metrics->setWriteIntentCapacityCounts(['object' => 1_000_000, 'part' => 17]);
+        $metrics->setWriteIntentCapacityCounts(['object' => 42, 'object_seal' => 7, 'part' => 17]);
         $rendered = $metrics->renderPrometheus();
-        self::assertStringContainsString('s3_server_object_write_intents 1000000', $rendered);
-        self::assertStringContainsString('s3_server_object_write_capacity_remaining 0', $rendered);
+        self::assertStringContainsString('s3_server_object_write_intents 42', $rendered);
+        self::assertStringContainsString('s3_server_object_write_capacity_remaining 999958', $rendered);
+        self::assertStringContainsString('s3_server_aws_write_seals 7', $rendered);
+        self::assertStringContainsString('s3_server_aws_write_seal_capacity_remaining 999993', $rendered);
         self::assertStringContainsString('s3_server_multipart_part_write_intents 17', $rendered);
         self::assertStringContainsString('s3_server_multipart_part_write_capacity_remaining 999983', $rendered);
         $metrics->setWriteIntentCapacityCounts(null);
         self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $metrics->renderPrometheus());
         self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_part_write_intents /m', $metrics->renderPrometheus());
         $this->expectException(\UnexpectedValueException::class);
-        $metrics->setWriteIntentCapacityCounts(['object' => 0, 'part' => 1_000_001]);
+        $metrics->setWriteIntentCapacityCounts(['object' => 0, 'object_seal' => 0, 'part' => 1_000_001]);
+    }
+
+    public function test_write_intent_capacity_sample_requires_permanent_seal_count(): void
+    {
+        $this->expectException(\UnexpectedValueException::class);
+        (new MetricsCollector())->setWriteIntentCapacityCounts(['object' => 0, 'part' => 0]);
+    }
+
+    public function test_aws_reconciliation_metrics_have_only_fixed_status_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        $metrics->recordAwsWriteReconciliation('sealed');
+        $metrics->recordAwsWriteReconciliation('retry');
+        $metrics->recordAwsWriteReconciliation('integrity_conflict');
+        $rendered = $metrics->renderPrometheus();
+        foreach (['sealed', 'retry', 'integrity_conflict'] as $status) {
+            self::assertStringContainsString(
+                's3_server_aws_write_reconciliations_total{status="' . $status . '"} 1',
+                $rendered,
+            );
+        }
+        self::assertDoesNotMatchRegularExpression('/^s3_server_aws_write_reconciliations_total\{[^}]*,(?:owner|key|path)=/m', $rendered);
     }
 
     public function test_request_histogram_and_backend_metrics_render(): void

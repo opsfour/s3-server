@@ -30,8 +30,18 @@ final readonly class AwsS3WriteAttemptPublisher
     public function publish(ObjectWriteIntent $planned, string $logicalKey, mixed $body): AwsS3WriteAttemptOutcome
     {
         self::assertBody($body);
+        $reserved = $this->reserve($planned, $logicalKey);
+        try {
+            [$expectedSize, $expectedSha256] = self::bodyEvidence($body);
+        } catch (\Throwable $error) {
+            try {
+                $this->intents->retireUndispatchedObjectWriteIntent($reserved->attemptId);
+            } catch (\Throwable) {
+            }
+            throw $error;
+        }
 
-        return $this->dispatch($this->reserve($planned, $logicalKey), $logicalKey, $body);
+        return $this->dispatch($reserved, $logicalKey, $body, $expectedSize, $expectedSha256);
     }
 
     /** Reserve capacity before the foreground caller reads its body. */
@@ -39,6 +49,16 @@ final readonly class AwsS3WriteAttemptPublisher
     {
         AwsS3WriteAttemptPath::assertProfileIntentPath($this->profile, $planned, $logicalKey);
         self::assertPlanned($planned);
+        $planned = new ObjectWriteIntent(
+            attemptId: $planned->attemptId,
+            bucket: $planned->bucket,
+            bucketGeneration: $planned->bucketGeneration,
+            ownerId: $planned->ownerId,
+            storageTier: $planned->storageTier,
+            storagePath: $planned->storagePath,
+            purpose: $planned->purpose,
+            sealReserved: true,
+        );
 
         try {
             $reserved = $this->intents->reserveObjectWriteIntent($planned, $this->leaseSeconds);
@@ -59,13 +79,21 @@ final readonly class AwsS3WriteAttemptPublisher
     }
 
     /** @param resource|string|\Psr\Http\Message\StreamInterface $body */
-    public function dispatch(ObjectWriteIntent $reserved, string $logicalKey, mixed $body): AwsS3WriteAttemptOutcome
-    {
+    public function dispatch(
+        ObjectWriteIntent $reserved,
+        string $logicalKey,
+        mixed $body,
+        ?int $expectedSize = null,
+        ?string $expectedSha256 = null,
+    ): AwsS3WriteAttemptOutcome {
         AwsS3WriteAttemptPath::assertProfileIntentPath($this->profile, $reserved, $logicalKey);
         self::assertBody($body);
         if ($reserved->state !== 'active' || $reserved->leaseUntil <= 0.0
-            || $reserved->claimGeneration !== 0 || $reserved->dispatchId !== null) {
+            || $reserved->claimGeneration !== 0 || $reserved->dispatchId !== null || ! $reserved->sealReserved) {
             throw new AwsS3WriteAttemptArmException();
+        }
+        if ($expectedSize === null || $expectedSha256 === null) {
+            [$expectedSize, $expectedSha256] = self::bodyEvidence($body);
         }
 
         try {
@@ -79,6 +107,8 @@ final readonly class AwsS3WriteAttemptPublisher
                 $reserved->leaseUntil,
                 $dispatchId,
                 $this->leaseSeconds,
+                $expectedSize,
+                $expectedSha256,
             );
         } catch (\Throwable) {
             throw new AwsS3WriteAttemptArmException();
@@ -88,7 +118,10 @@ final readonly class AwsS3WriteAttemptPublisher
             || $armed->state !== 'active'
             || $armed->leaseUntil < $reserved->leaseUntil
             || $armed->claimGeneration !== 0
-            || $armed->dispatchId !== $dispatchId) {
+            || $armed->dispatchId !== $dispatchId
+            || $armed->expectedSize !== $expectedSize
+            || $armed->expectedSha256 !== $expectedSha256
+            || ! $armed->sealReserved) {
             throw new AwsS3WriteAttemptArmException();
         }
 
@@ -167,7 +200,9 @@ final readonly class AwsS3WriteAttemptPublisher
         if ($intent->state !== 'active'
             || $intent->leaseUntil !== 0.0
             || $intent->claimGeneration !== 0
-            || $intent->dispatchId !== null) {
+            || $intent->dispatchId !== null
+            || $intent->expectedSize !== null
+            || $intent->expectedSha256 !== null) {
             throw new \InvalidArgumentException('AWS write attempt must be an unreserved exact plan.');
         }
     }
@@ -187,6 +222,43 @@ final readonly class AwsS3WriteAttemptPublisher
             && $expected->ownerId === $actual->ownerId
             && $expected->storageTier === $actual->storageTier
             && hash_equals($expected->storagePath, $actual->storagePath)
-            && $expected->purpose === $actual->purpose;
+            && $expected->purpose === $actual->purpose
+            && $expected->sealReserved === $actual->sealReserved;
+    }
+
+    /** @return array{int, string} */
+    private static function bodyEvidence(mixed $body): array
+    {
+        if (is_string($body)) {
+            return [strlen($body), hash('sha256', $body)];
+        }
+        if (is_resource($body)) {
+            $position = ftell($body);
+            if ($position === false) {
+                throw new \InvalidArgumentException('AWS write-attempt body must be seekable for durable evidence.');
+            }
+            $context = hash_init('sha256');
+            $size = hash_update_stream($context, $body);
+            if (fseek($body, $position) !== 0) {
+                throw new \InvalidArgumentException('AWS write-attempt body could not produce durable evidence.');
+            }
+            return [$size, hash_final($context)];
+        }
+        if ($body instanceof StreamInterface && $body->isSeekable()) {
+            $position = $body->tell();
+            $context = hash_init('sha256');
+            $size = 0;
+            while (! $body->eof()) {
+                $chunk = $body->read(8192);
+                if ($chunk === '') {
+                    throw new \InvalidArgumentException('AWS write-attempt body made no progress while producing durable evidence.');
+                }
+                $size += strlen($chunk);
+                hash_update($context, $chunk);
+            }
+            $body->seek($position);
+            return [$size, hash_final($context)];
+        }
+        throw new \InvalidArgumentException('AWS write-attempt body requires precomputed size and SHA-256 evidence.');
     }
 }

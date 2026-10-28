@@ -1153,23 +1153,37 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                         throw new SlowDownException('Physical write recovery capacity is exhausted.');
                     }
 
-                    $ownerCount = $this->prepare('SELECT COUNT(*) FROM s3_object_write_intents WHERE owner_id = ?');
+                    $ownerCount = $this->prepare("SELECT COUNT(*) FROM s3_object_write_intents WHERE owner_id = ? AND (seal_reserved = 0 OR state != 'sealed')");
                     $ownerCount->execute([$intent->ownerId]);
                     if ((int) $ownerCount->fetchColumn() >= ObjectWriteIntentStore::MAX_OUTSTANDING_PER_OWNER) {
                         throw new SlowDownException('Physical write recovery capacity is exhausted.');
                     }
 
+                    if ($intent->sealReserved) {
+                        $sealGlobal = $this->prepare("SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'object_seal'");
+                        $sealGlobal->execute();
+                        if ((int) $sealGlobal->fetchColumn() >= ObjectWriteIntentStore::MAX_SEALS_GLOBAL) {
+                            throw new SlowDownException('Physical write seal capacity is exhausted.');
+                        }
+                        $sealOwner = $this->prepare('SELECT COUNT(*) FROM s3_object_write_intents WHERE owner_id = ? AND seal_reserved = 1');
+                        $sealOwner->execute([$intent->ownerId]);
+                        if ((int) $sealOwner->fetchColumn() >= ObjectWriteIntentStore::MAX_SEALS_PER_OWNER) {
+                            throw new SlowDownException('Physical write seal capacity is exhausted.');
+                        }
+                    }
+
                     $stmt = $this->prepare(<<<'SQL'
                         INSERT INTO s3_object_write_intents
                             (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
-                             path_digest, purpose, state, lease_until, dispatch_id)
+                             path_digest, purpose, state, lease_until, dispatch_id,
+                             expected_size, expected_sha256, seal_reserved)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active',
-                            (julianday('now') - 2440587.5) * 86400.0 + ?, NULL)
+                            (julianday('now') - 2440587.5) * 86400.0 + ?, NULL, NULL, NULL, ?)
                     SQL);
                     $stmt->execute([
                         $intent->attemptId, $intent->bucket, $intent->bucketGeneration, $intent->ownerId,
                         $intent->storageTier, $intent->storagePath, hash('sha256', $intent->storagePath),
-                        $intent->purpose, $leaseSeconds,
+                        $intent->purpose, $leaseSeconds, $intent->sealReserved ? 1 : 0,
                     ]);
 
                     $reserved = $this->getObjectWriteIntent($intent->attemptId)
@@ -1184,7 +1198,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 // a COMMIT error may have succeeded and must never be retried.
                 // The transaction can throw while committing after the callback
                 // has returned and changed this by-reference safety flag.
-                if ($callbackCompleted || ! self::isSqliteBusy($e) || $retries >= 5) {
+                if (/* @phpstan-ignore booleanOr.leftAlwaysFalse */ $callbackCompleted || ! self::isSqliteBusy($e) || $retries >= 5) {
                     throw $e;
                 }
 
@@ -1220,23 +1234,37 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         });
     }
 
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
-    {
+    public function armObjectWriteIntent(
+        string $attemptId,
+        float $expectedLeaseUntil,
+        string $dispatchId,
+        float $leaseSeconds,
+        ?int $expectedSize = null,
+        ?string $expectedSha256 = null,
+    ): ?ObjectWriteIntent {
         self::validateObjectWriteDispatchId($dispatchId);
         self::validateObjectWriteLease($leaseSeconds);
+        self::validateObjectWriteEvidence($expectedSize, $expectedSha256);
         if ($this->connection()->inTransaction()) {
             throw new \LogicException('Physical write dispatch requires its own committed transaction.');
         }
 
-        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds): ?ObjectWriteIntent {
+        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds, $expectedSize, $expectedSha256): ?ObjectWriteIntent {
             $stmt = $this->prepare(<<<'SQL'
                 UPDATE s3_object_write_intents
-                SET dispatch_id = ?, lease_until = MAX(lease_until, (julianday('now') - 2440587.5) * 86400.0 + ?)
+                SET dispatch_id = ?, expected_size = ?, expected_sha256 = ?,
+                    lease_until = MAX(lease_until, (julianday('now') - 2440587.5) * 86400.0 + ?)
                 WHERE attempt_id = ? AND state = 'active' AND dispatch_id IS NULL
+                  AND ((seal_reserved = 0 AND ? IS NULL AND ? IS NULL)
+                    OR (seal_reserved = 1 AND ? IS NOT NULL AND ? IS NOT NULL))
                   AND lease_until = CAST(? AS REAL)
                   AND lease_until > (julianday('now') - 2440587.5) * 86400.0
                 SQL);
-            $stmt->execute([$dispatchId, $leaseSeconds, $attemptId, sprintf('%.17F', $expectedLeaseUntil)]);
+            $stmt->execute([
+                $dispatchId, $expectedSize, $expectedSha256, $leaseSeconds, $attemptId,
+                $expectedSize, $expectedSha256, $expectedSize, $expectedSha256,
+                sprintf('%.17F', $expectedLeaseUntil),
+            ]);
 
             return $stmt->rowCount() === 1 ? $this->getObjectWriteIntent($attemptId) : null;
         });
@@ -1451,7 +1479,19 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             leaseUntil: (float) $row['lease_until'],
             claimGeneration: (int) $row['claim_generation'],
             dispatchId: $row['dispatch_id'] === null ? null : (string) $row['dispatch_id'],
+            expectedSize: $row['expected_size'] === null ? null : (int) $row['expected_size'],
+            expectedSha256: $row['expected_sha256'] === null ? null : (string) $row['expected_sha256'],
+            sealReserved: (int) $row['seal_reserved'] === 1,
         );
+    }
+
+    private static function validateObjectWriteEvidence(?int $expectedSize, ?string $expectedSha256): void
+    {
+        if (($expectedSize === null) !== ($expectedSha256 === null)
+            || ($expectedSize !== null && $expectedSize < 0)
+            || ($expectedSha256 !== null && preg_match('/^[0-9a-f]{64}$/D', $expectedSha256) !== 1)) {
+            throw new \InvalidArgumentException('Physical write evidence must be a complete size and SHA-256 pair.');
+        }
     }
 
     private static function validateObjectWriteIntent(ObjectWriteIntent $intent): void
@@ -1466,7 +1506,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             || preg_match('~(?:^|/)\.{1,2}(?:/|$)|//|/$~', preg_replace('~^[a-z][a-z0-9+.-]*://~i', '', $intent->storagePath) ?? '')
             || $intent->purpose === '' || strlen($intent->purpose) > 32
             || $intent->state !== 'active' || $intent->leaseUntil !== 0.0 || $intent->claimGeneration !== 0
-            || $intent->dispatchId !== null) {
+            || $intent->dispatchId !== null || $intent->expectedSize !== null || $intent->expectedSha256 !== null) {
             throw new \InvalidArgumentException('Invalid physical write intent.');
         }
     }
@@ -4110,10 +4150,10 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         return (int) $row['retained_count'];
     }
 
-    /** @return array{object: int, part: int} */
+    /** @return array{object: int, object_seal: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
-        $statement = $this->prepare('SELECT kind, retained_count, typeof(retained_count) AS count_type FROM s3_write_intent_capacity WHERE kind IN (\'object\', \'part\')');
+        $statement = $this->prepare('SELECT kind, retained_count, typeof(retained_count) AS count_type FROM s3_write_intent_capacity WHERE kind IN (\'object\', \'object_seal\', \'part\')');
         $statement->execute();
         $counts = [];
         foreach ($statement->fetchAll(\PDO::FETCH_ASSOC) as $row) {
@@ -4122,11 +4162,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             }
             $counts[(string) $row['kind']] = (int) $row['retained_count'];
         }
-        if (! isset($counts['object'], $counts['part']) || count($counts) !== 2) {
+        if (! isset($counts['object'], $counts['object_seal'], $counts['part']) || count($counts) !== 3) {
             throw new \RuntimeException('Write intent recovery capacity counter is unavailable.');
         }
 
-        return ['object' => $counts['object'], 'part' => $counts['part']];
+        return ['object' => $counts['object'], 'object_seal' => $counts['object_seal'], 'part' => $counts['part']];
     }
 
     public function getStorageCleanupCount(): int

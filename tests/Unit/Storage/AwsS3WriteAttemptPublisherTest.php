@@ -148,6 +148,67 @@ final class AwsS3WriteAttemptPublisherTest extends TestCase
         }
     }
 
+    public function test_capacity_rejection_precedes_seekable_body_evidence_reads(): void
+    {
+        $inner = $this->store();
+        $store = new PublisherObjectWriteIntentStore($inner, true);
+        $requests = [];
+        $publisher = new AwsS3WriteAttemptPublisher(
+            self::profile(),
+            $store,
+            $this->writer([new Response(200, ['ETag' => '"unexpected"'])], $requests, $store),
+        );
+        $body = fopen('php://temp', 'w+b');
+        self::assertIsResource($body);
+        fwrite($body, 'prefix-body');
+        self::assertSame(0, fseek($body, 3));
+
+        try {
+            $publisher->publish(self::planned(), 'logical/key', $body);
+            self::fail('Capacity exhaustion must reject before reading staged body evidence.');
+        } catch (SlowDownException) {
+            self::assertSame(3, ftell($body));
+            self::assertSame([], $requests);
+            self::assertNull($inner->getObjectWriteIntent(self::planned()->attemptId));
+        } finally {
+            fclose($body);
+        }
+    }
+
+    public function test_definite_psr_evidence_failures_retire_the_exact_undispatched_reservation(): void
+    {
+        foreach (['zero_progress', 'rewind'] as $failure) {
+            $store = $this->store();
+            $requests = [];
+            $publisher = new AwsS3WriteAttemptPublisher(
+                self::profile(),
+                $store,
+                $this->writer([new Response(200, ['ETag' => '"unexpected"'])], $requests, $store),
+            );
+            $planned = self::planned(bin2hex(random_bytes(16)));
+            $body = $this->createMock(\Psr\Http\Message\StreamInterface::class);
+            $body->method('isSeekable')->willReturn(true);
+            $body->method('tell')->willReturn(3);
+            if ($failure === 'zero_progress') {
+                $body->method('eof')->willReturn(false);
+                $body->expects(self::once())->method('read')->willReturn('');
+            } else {
+                $body->method('eof')->willReturnOnConsecutiveCalls(false, true);
+                $body->expects(self::once())->method('read')->willReturn('body');
+                $body->expects(self::once())->method('seek')->with(3)->willThrowException(new \RuntimeException('rewind failed'));
+            }
+
+            try {
+                $publisher->publish($planned, 'logical/key', $body);
+                self::fail('Definite evidence failure must prevent dispatch.');
+            } catch (\Throwable $error) {
+                self::assertStringContainsString($failure === 'zero_progress' ? 'made no progress' : 'rewind failed', $error->getMessage());
+            }
+            self::assertNull($store->getObjectWriteIntent($planned->attemptId));
+            self::assertSame([], $requests);
+        }
+    }
+
     public function test_unexpected_metadata_failures_are_sanitized_before_provider_io(): void
     {
         foreach (['reserve', 'arm'] as $throwAt) {
@@ -184,12 +245,7 @@ final class AwsS3WriteAttemptPublisherTest extends TestCase
         );
 
         try {
-            (new \ReflectionMethod($publisher, 'publish'))->invoke(
-                $publisher,
-                $planned,
-                'logical/key',
-                ['unsupported'],
-            );
+            $publisher->publish($planned, 'logical/key', self::unsupportedBody());
             self::fail('Unsupported body was reserved.');
         } catch (\InvalidArgumentException $error) {
             self::assertSame('AWS write-attempt body must be a string, resource, or PSR-7 stream.', $error->getMessage());
@@ -369,6 +425,11 @@ final class AwsS3WriteAttemptPublisherTest extends TestCase
         return new AwsS3ProviderProfile('backing', 'us-east-1', '123456789012', 'objects', '.opsfour/write-attempts');
     }
 
+    private static function unsupportedBody(): mixed
+    {
+        return ['unsupported'];
+    }
+
     private static function errorXml(string $code): string
     {
         return '<?xml version="1.0"?><Error><Code>' . $code . '</Code><Message>secret</Message></Error>';
@@ -404,7 +465,7 @@ final readonly class PublisherObjectWriteIntentStore implements ObjectWriteInten
     {
         return $this->inner->renewObjectWriteIntent($attemptId, $expectedLeaseUntil, $leaseSeconds);
     }
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
     {
         if ($this->throwAt === 'arm') {
             throw new \RuntimeException('secret metadata diagnostic');

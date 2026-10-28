@@ -360,7 +360,8 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
     private function assertWriteIntentCapacityConsistent(): void
     {
         foreach ([
-            'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
+            'object' => "SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 0 OR BINARY state <> BINARY 'sealed'",
+            'object_seal' => 'SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = 1',
             'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation = BINARY 'part_write_intent'",
         ] as $kind => $countSql) {
             try {
@@ -1359,22 +1360,32 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             }
 
             $owner = $this->conn()->execute(
-                'SELECT COUNT(*) AS n FROM s3_object_write_intents WHERE owner_id = ?',
+                "SELECT COUNT(*) AS n FROM s3_object_write_intents WHERE owner_id = ? AND (seal_reserved = 0 OR BINARY state <> BINARY 'sealed')",
                 [$intent->ownerId],
             )->fetchRow();
             if ((int) ($owner['n'] ?? 0) >= ObjectWriteIntentStore::MAX_OUTSTANDING_PER_OWNER) {
                 throw new \OpsFour\S3Server\Exception\SlowDownException('Physical write recovery capacity is exhausted.');
             }
+            if ($intent->sealReserved) {
+                $sealGlobal = $this->conn()->query("SELECT retained_count FROM s3_write_intent_capacity WHERE kind = 'object_seal' FOR UPDATE")->fetchRow();
+                if ($sealGlobal === null || (int) $sealGlobal['retained_count'] >= ObjectWriteIntentStore::MAX_SEALS_GLOBAL) {
+                    throw new \OpsFour\S3Server\Exception\SlowDownException('Physical write seal capacity is exhausted.');
+                }
+                $sealOwner = $this->conn()->execute('SELECT COUNT(*) AS n FROM s3_object_write_intents WHERE owner_id = ? AND seal_reserved = 1', [$intent->ownerId])->fetchRow();
+                if ((int) ($sealOwner['n'] ?? 0) >= ObjectWriteIntentStore::MAX_SEALS_PER_OWNER) {
+                    throw new \OpsFour\S3Server\Exception\SlowDownException('Physical write seal capacity is exhausted.');
+                }
+            }
 
             $this->conn()->execute(<<<'SQL'
                 INSERT INTO s3_object_write_intents
                     (attempt_id, bucket, bucket_generation, owner_id, storage_tier, storage_path,
-                     path_digest, purpose, state, lease_until, dispatch_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) + ?, NULL)
+                     path_digest, purpose, state, lease_until, dispatch_id, expected_size, expected_sha256, seal_reserved)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) + ?, NULL, NULL, NULL, ?)
                 SQL, [
                 $intent->attemptId, $intent->bucket, $intent->bucketGeneration, $intent->ownerId,
                 $intent->storageTier, $intent->storagePath, hash('sha256', $intent->storagePath),
-                $intent->purpose, $leaseSeconds,
+                $intent->purpose, $leaseSeconds, $intent->sealReserved ? 1 : 0,
             ]);
 
             return $this->getObjectWriteIntent($intent->attemptId)
@@ -1408,21 +1419,26 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         });
     }
 
-    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds): ?ObjectWriteIntent
+    public function armObjectWriteIntent(string $attemptId, float $expectedLeaseUntil, string $dispatchId, float $leaseSeconds, ?int $expectedSize = null, ?string $expectedSha256 = null): ?ObjectWriteIntent
     {
         self::validateObjectWriteDispatchId($dispatchId);
         self::validateObjectWriteLease($leaseSeconds);
+        self::validateObjectWriteEvidence($expectedSize, $expectedSha256);
         if ($this->fiberTransaction() !== null) {
             throw new \LogicException('Physical write dispatch requires its own committed transaction.');
         }
 
-        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds): ?ObjectWriteIntent {
+        return $this->transaction(function () use ($attemptId, $expectedLeaseUntil, $dispatchId, $leaseSeconds, $expectedSize, $expectedSha256): ?ObjectWriteIntent {
             $updated = $this->conn()->execute(<<<'SQL'
                 UPDATE s3_object_write_intents
-                SET dispatch_id = ?, lease_until = GREATEST(lease_until, UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) + ?)
+                SET dispatch_id = ?, expected_size = ?, expected_sha256 = ?,
+                    lease_until = GREATEST(lease_until, UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) + ?)
                 WHERE attempt_id = ? AND state = 'active' AND dispatch_id IS NULL
+                  AND ((seal_reserved = 0 AND ? IS NULL AND ? IS NULL)
+                    OR (seal_reserved = 1 AND ? IS NOT NULL AND ? IS NOT NULL))
                   AND lease_until = ? AND lease_until > UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))
-                SQL, [$dispatchId, $leaseSeconds, $attemptId, $expectedLeaseUntil]);
+                SQL, [$dispatchId, $expectedSize, $expectedSha256, $leaseSeconds, $attemptId,
+                $expectedSize, $expectedSha256, $expectedSize, $expectedSha256, $expectedLeaseUntil]);
 
             return $updated->getRowCount() === 1 ? $this->getObjectWriteIntent($attemptId) : null;
         });
@@ -1639,7 +1655,19 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             leaseUntil: (float) $row['lease_until'],
             claimGeneration: (int) $row['claim_generation'],
             dispatchId: $row['dispatch_id'] === null ? null : (string) $row['dispatch_id'],
+            expectedSize: $row['expected_size'] === null ? null : (int) $row['expected_size'],
+            expectedSha256: $row['expected_sha256'] === null ? null : (string) $row['expected_sha256'],
+            sealReserved: (int) $row['seal_reserved'] === 1,
         );
+    }
+
+    private static function validateObjectWriteEvidence(?int $expectedSize, ?string $expectedSha256): void
+    {
+        if (($expectedSize === null) !== ($expectedSha256 === null)
+            || ($expectedSize !== null && $expectedSize < 0)
+            || ($expectedSha256 !== null && preg_match('/^[0-9a-f]{64}$/D', $expectedSha256) !== 1)) {
+            throw new \InvalidArgumentException('Physical write evidence must be a complete size and SHA-256 pair.');
+        }
     }
 
     private static function validateObjectWriteIntent(ObjectWriteIntent $intent): void
@@ -1654,7 +1682,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             || preg_match('~(?:^|/)\.{1,2}(?:/|$)|//|/$~', preg_replace('~^[a-z][a-z0-9+.-]*://~i', '', $intent->storagePath) ?? '')
             || $intent->purpose === '' || strlen($intent->purpose) > 32
             || $intent->state !== 'active' || $intent->leaseUntil !== 0.0 || $intent->claimGeneration !== 0
-            || $intent->dispatchId !== null) {
+            || $intent->dispatchId !== null || $intent->expectedSize !== null || $intent->expectedSha256 !== null) {
             throw new \InvalidArgumentException('Invalid physical write intent.');
         }
     }
@@ -3729,10 +3757,10 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         return (int) $row['retained_count'];
     }
 
-    /** @return array{object: int, part: int} */
+    /** @return array{object: int, object_seal: int, part: int} */
     public function getWriteIntentCapacityCounts(): array
     {
-        $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'part')");
+        $result = $this->conn()->query("SELECT kind, retained_count FROM s3_write_intent_capacity WHERE kind IN ('object', 'object_seal', 'part')");
         $counts = [];
         while (($row = $result->fetchRow()) !== null) {
             if (! is_numeric($row['retained_count'] ?? null)) {
@@ -3740,11 +3768,11 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             }
             $counts[(string) $row['kind']] = (int) $row['retained_count'];
         }
-        if (! isset($counts['object'], $counts['part']) || count($counts) !== 2) {
+        if (! isset($counts['object'], $counts['object_seal'], $counts['part']) || count($counts) !== 3) {
             throw new \RuntimeException('Write intent recovery capacity counter is unavailable.');
         }
 
-        return ['object' => $counts['object'], 'part' => $counts['part']];
+        return ['object' => $counts['object'], 'object_seal' => $counts['object_seal'], 'part' => $counts['part']];
     }
 
     public function getStorageCleanupCount(): int
@@ -4442,22 +4470,43 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
     private static function isIgnorableSchemaMigrationError(string $sql, \Throwable $error): bool
     {
         $message = strtolower($error->getMessage());
+        $normalizedSql = preg_replace('/\s+/', ' ', trim($sql)) ?? trim($sql);
 
-        return str_contains($message, 'duplicate key name')
-            || str_contains($message, 'duplicate column name')
-            || str_contains($message, 'already exists')
+        return (
+            preg_match('/^ALTER TABLE [a-z0-9_]+ ADD COLUMN /i', $normalizedSql) === 1
+            && str_contains($message, 'mysql error (1060):')
+            && str_contains($message, 'duplicate column name')
+        ) || (
+            (preg_match('/^ALTER TABLE [a-z0-9_]+ ADD INDEX /i', $normalizedSql) === 1
+                || preg_match('/^CREATE (?:UNIQUE )?INDEX /i', $normalizedSql) === 1)
+            && str_contains($message, 'mysql error (1061):')
+            && str_contains($message, 'duplicate key name')
+        )
             || (
                 str_contains($sql, 'ADD CONSTRAINT chk_s3_encryption_configs_supported')
+                && str_contains($message, 'mysql error (3822):')
                 && str_contains($message, 'duplicate check constraint name')
             )
             || (
                 str_contains($sql, 'ADD CONSTRAINT chk_s3_storage_garbage_operation')
+                && str_contains($message, 'mysql error (3822):')
+                && str_contains($message, 'duplicate check constraint name')
+            )
+            || (
+                str_contains($sql, 'ADD CONSTRAINT chk_s3_write_intent_capacity')
+                && str_contains($message, 'mysql error (3822):')
                 && str_contains($message, 'duplicate check constraint name')
             )
             || (
                 str_contains($sql, ' DROP INDEX ')
                 && str_starts_with($sql, 'ALTER TABLE ')
                 && str_contains($message, 'mysql error (1091):')
+            )
+            || (
+                $normalizedSql === 'ALTER TABLE s3_write_intent_capacity DROP CHECK chk_s3_write_intent_capacity'
+                && (str_contains($message, 'mysql error (1091):')
+                    || (str_contains($message, 'mysql error (3821):')
+                        && str_contains($message, "check constraint 'chk_s3_write_intent_capacity' is not found")))
             );
     }
 

@@ -10,7 +10,7 @@ interface WriteIntentCapacityReader
     /**
      * Null means the wrapped metadata store does not support this metric.
      *
-     * @return array{object: int, part: int}|null
+     * @return array{object: int, object_seal: int, part: int}|null
      */
     public function getWriteIntentCapacityCounts(): ?array;
 }

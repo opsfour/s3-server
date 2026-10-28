@@ -26,7 +26,15 @@ The project follows [Semantic Versioning](https://semver.org/).
   wiring is bound to the exact admitted backend/profile and uses a private
   staging budget independent of the browser POST spool setting.
   Generic AWS storage operations and API startup remain disabled pending later
-  writer-coverage and reconciliation stories.
+  writer-coverage and qualification stories.
+- Reconcile ambiguous AWS attempts with immutable v2 dispatch, owner-digest,
+  size, and SHA-256 evidence; exact-owner inspection; create-only or exact-ETag
+  same-key sealing; bounded GET body/EOF verification; idempotent seal adoption;
+  DB-time generation-CAS claims and heartbeat renewal; and no delete or blind
+  mutation retry. AWS admission atomically reserves separate open-attempt and
+  permanent-seal pools (4,096 per owner, 1,000,000 globally); verified sealing
+  releases open capacity once while the seal charge remains permanent. Schema
+  versions are now SQLite 42, PostgreSQL 45, and MySQL 50.
 - Fence AWS multipart PUT and UploadPartCopy destinations with one durable
   create-only attempt per immutable part, exact owner/marker-bound source reads,
   ciphertext-only SSE staging, and atomic dispatch consumption with part

@@ -41,7 +41,8 @@ final class MetadataSchemaGuard
                 self::assertMysqlStorageCleanupTriggerBehavior($pool);
             }
             foreach ([
-                'object' => 'SELECT COUNT(*) FROM s3_object_write_intents',
+                'object' => "SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = FALSE OR state <> 'sealed'",
+                'object_seal' => 'SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = TRUE',
                 'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
             ] as $kind => $countSql) {
                 $sql = "SELECT retained_count, ({$countSql}) AS actual_count FROM s3_write_intent_capacity WHERE kind = "
@@ -244,6 +245,7 @@ final class MetadataSchemaGuard
         return [
             's3_write_intent_capacity_object_insert' => ['s3_object_write_intents', 'INSERT', 's3_write_intent_capacity_object_fn'],
             's3_write_intent_capacity_object_delete' => ['s3_object_write_intents', 'DELETE', 's3_write_intent_capacity_object_fn'],
+            's3_write_intent_capacity_object_update' => ['s3_object_write_intents', 'UPDATE', 's3_write_intent_capacity_object_fn'],
             's3_write_intent_capacity_part_insert' => ['s3_storage_garbage', 'INSERT', 's3_write_intent_capacity_part_fn'],
             's3_write_intent_capacity_part_delete' => ['s3_storage_garbage', 'DELETE', 's3_write_intent_capacity_part_fn'],
             's3_write_intent_capacity_part_update' => ['s3_storage_garbage', 'UPDATE', 's3_write_intent_capacity_part_fn'],
