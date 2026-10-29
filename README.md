@@ -38,6 +38,15 @@ persistent local filesystem storage, and SQLite, PostgreSQL, or MySQL metadata.
 It supports the standalone CLI, Laravel, and Symfony, either directly or behind
 a reverse proxy that preserves the signed `Host` header exactly.
 
+The serving runtime has a provider-neutral drain contract for compatible
+load balancers: SIGTERM/SIGINT closes readiness and new API/admin admission,
+keeps liveness and authenticated metrics reachable for a propagation delay,
+then drains accepted requests before releasing dependencies. Proxies must
+preserve the exact received Host (including port), path, query encoding, and
+signed headers; only configured peers may supply `X-Forwarded-For` and
+`X-Forwarded-Proto`. This lifecycle does not by itself qualify a storage,
+database, or multi-host topology.
+
 The qualified v2.0.0 reference profile uses PHP 8.4, SQLite metadata, and one
 API process on a Linux host with its exact local XFS mount. Other metadata,
 filesystem, mount, device, and host combinations require the applicable

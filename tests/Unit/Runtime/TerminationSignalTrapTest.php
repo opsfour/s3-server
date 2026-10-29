@@ -9,7 +9,15 @@ use PHPUnit\Framework\TestCase;
 
 final class TerminationSignalTrapTest extends TestCase
 {
-    public function test_sigterm_sent_at_start_boundary_is_caught(): void
+    /** @return iterable<string, array{int}> */
+    public static function terminationSignals(): iterable
+    {
+        yield 'SIGTERM' => [SIGTERM];
+        yield 'SIGINT' => [SIGINT];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('terminationSignals')]
+    public function test_termination_signal_sent_at_start_boundary_is_caught(int $terminationSignal): void
     {
         if (! function_exists('posix_kill')) {
             self::markTestSkipped('The POSIX extension is required.');
@@ -19,16 +27,16 @@ final class TerminationSignalTrapTest extends TestCase
         $pid = getmypid();
         self::assertIsInt($pid);
         $signal = (new TerminationSignalTrap())->startAndWait(
-            static function () use (&$started, $pid): void {
+            static function () use (&$started, $pid, $terminationSignal): void {
                 $started = true;
-                if (! posix_kill($pid, SIGTERM)) {
-                    throw new \RuntimeException('Could not send SIGTERM to the test process.');
+                if (! posix_kill($pid, $terminationSignal)) {
+                    throw new \RuntimeException('Could not send the termination signal to the test process.');
                 }
             },
         );
 
         self::assertTrue($started);
-        self::assertSame(SIGTERM, $signal);
+        self::assertSame($terminationSignal, $signal);
     }
 
     public function test_startup_failure_cancels_signal_watchers(): void

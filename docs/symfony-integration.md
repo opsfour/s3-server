@@ -206,6 +206,7 @@ opsfour_s3_server:
     read_timeout: 300
     write_timeout: 300
     shutdown_drain_timeout: 30
+    shutdown_readiness_delay: 5
     strict_bucket_naming: true
 
   storage:

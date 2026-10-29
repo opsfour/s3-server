@@ -19,6 +19,7 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
+use OpsFour\S3Server\Runtime\NodeDrainController;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
@@ -36,6 +37,20 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame(200, $response->getStatus());
         self::assertSame('no-store', $response->getHeader('cache-control'));
         self::assertSame('{"status":"ok"}', $response->getBody()->read());
+    }
+
+    public function test_drain_short_circuits_readiness_without_touching_dependencies(): void
+    {
+        $drain = new NodeDrainController();
+        $drain->beginDrain();
+        $probe = new HealthCheckCredentialProbe();
+
+        $response = (new HealthCheckHandler(credentialHealthProbe: $probe, drain: $drain))
+            ->handleRequest($this->request());
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame(0, $probe->checks);
+        self::assertSame('{"status":"degraded","drain":"draining"}', $response->getBody()->read());
     }
 
     public function test_readiness_probes_storage_without_writing(): void

@@ -46,6 +46,7 @@ use OpsFour\S3Server\Middleware\ClusterRoleAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
+use OpsFour\S3Server\Middleware\DrainAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ErrorHandlingMiddleware;
 use OpsFour\S3Server\Middleware\ExpectContinueMiddleware;
 use OpsFour\S3Server\Middleware\LoggingMiddleware;
@@ -74,6 +75,7 @@ use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\ClusterRoleSet;
 use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
+use OpsFour\S3Server\Runtime\NodeDrainController;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Runtime\AwsS3ProviderStartupException;
@@ -216,6 +218,8 @@ final class S3Server
 
     private ?ClusterRoleController $clusterRoles = null;
 
+    private readonly NodeDrainController $drain;
+
     private ?ClusterWorkFencingStore $clusterWorkFencing = null;
 
     private ?ClusterWorkerIdentity $clusterWorkerIdentity = null;
@@ -255,6 +259,7 @@ final class S3Server
         $this->startupCancellation = new DeferredCancellation();
         $this->handlerRegistry = new HandlerRegistry();
         $this->metrics = $metrics ?? new MetricsCollector();
+        $this->drain = new NodeDrainController();
         $this->localStorageRootLocks = LocalStorageRootLocks::create();
         $this->accessLogs = $metadata !== null && $storage !== null
             ? new AccessLogWriter(
@@ -293,6 +298,10 @@ final class S3Server
 
         if ($this->starting) {
             throw new \LogicException('S3 server startup is already in progress.');
+        }
+
+        if (! $this->drain->acceptsNewWork()) {
+            throw new \LogicException('S3 server cannot start after drain begins.');
         }
 
         if (! $this->authenticationConfigured) {
@@ -578,6 +587,7 @@ final class S3Server
                         awsOperationalState: $this->awsOperationalState,
                         clusterAdmission: $this->clusterAdmission,
                         clusterRoles: $this->clusterRoles,
+                        drain: $this->drain,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
@@ -587,11 +597,12 @@ final class S3Server
                     $this->metadata,
                     $this->config->metricsBearerToken,
                     $this->awsOperationalState,
-                )));
+                ), rateLimited: false));
                 if (in_array('admin', $httpSurfaces, true) && $this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler(
                         $this->adminCredentialApiHandler,
                         clusterGated: true,
+                        drainGated: true,
                     );
                     $router->addRoute('POST', '/.admin/credentials', $adminCredentials);
                     $router->addRoute('DELETE', '/.admin/credentials/{accessKeyId}', $adminCredentials);
@@ -600,6 +611,7 @@ final class S3Server
                     $adminQuotas = $this->managementHandler(
                         $this->adminQuotaApiHandler,
                         clusterGated: true,
+                        drainGated: true,
                     );
                     $router->addRoute('GET', '/.admin/quotas', $adminQuotas);
                     $router->addRoute('GET', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
@@ -1220,11 +1232,46 @@ final class S3Server
         }
         $this->stopInProgress = true;
         try {
+            $this->beginDrain();
             $this->stopOwnedResources();
             $this->shutdownComplete = true;
         } finally {
             $this->stopInProgress = false;
         }
+    }
+
+    /** Make readiness and request admission close before transport shutdown. */
+    public function beginDrain(): void
+    {
+        if (! $this->drain->beginDrain()) {
+            return;
+        }
+
+        try {
+            $this->clusterRoles?->beginDrain();
+        } catch (\Throwable $e) {
+            $this->logShutdown('warning', 'Cluster membership demotion failed during drain.', [
+                'exception' => $e::class,
+            ]);
+        } finally {
+            $this->drain->startPropagationWindow();
+        }
+    }
+
+    /** @internal Runtime shutdown waits this phase while probes remain reachable. */
+    public function awaitReadinessPropagation(): void
+    {
+        if ($this->server === null) {
+            return;
+        }
+        $remaining = $this->drain->remainingPropagationDelay($this->config->shutdownReadinessDelay);
+        if ($remaining <= 0.0) {
+            return;
+        }
+        $this->logShutdown('info', 'Waiting {delay}s for drain readiness to propagate...', [
+            'delay' => round($remaining, 3),
+        ]);
+        \Amp\delay($remaining);
     }
 
     private function stopOwnedResources(): void
@@ -1279,6 +1326,7 @@ final class S3Server
             $this->httpDrainTimedOut = false;
             $this->server = null;
         }
+        $this->drain->stop();
 
         try {
             $this->notificationProcessor?->stop($timeout);
@@ -1871,6 +1919,7 @@ final class S3Server
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware(logger: $this->logger),
+            new DrainAdmissionMiddleware($this->drain),
         ];
         if ($this->clusterAdmission !== null) {
             $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission, $this->clusterRoles);
@@ -2154,12 +2203,16 @@ final class S3Server
         bool $rateLimited = true,
         bool $bypassForwardedForValidation = false,
         bool $clusterGated = false,
+        bool $drainGated = false,
     ): RequestHandler {
         $middlewares = [
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware($this->logger),
         ];
+        if ($drainGated) {
+            $middlewares[] = new DrainAdmissionMiddleware($this->drain, managementRequest: true);
+        }
         if ($clusterGated && $this->clusterAdmission !== null) {
             $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission, $this->clusterRoles);
         }

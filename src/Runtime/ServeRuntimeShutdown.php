@@ -12,6 +12,7 @@ final class ServeRuntimeShutdown
     public static function stop(S3ServerRuntime $runtime, LoggerInterface $logger): ?string
     {
         try {
+            $runtime->beginDrain();
             $runtime->stop();
 
             return null;
@@ -20,6 +21,7 @@ final class ServeRuntimeShutdown
         }
 
         try {
+            $runtime->beginDrain();
             $runtime->stop();
 
             return null;

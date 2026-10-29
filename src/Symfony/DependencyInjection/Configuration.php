@@ -46,6 +46,7 @@ final class Configuration implements ConfigurationInterface
                         ->integerNode('max_encrypted_object_size')->defaultValue(268_435_456)->min(1)->end()
                         ->integerNode('max_select_object_size')->defaultValue(67_108_864)->min(1)->end()
                         ->integerNode('shutdown_drain_timeout')->defaultValue(30)->min(1)->end()
+                        ->integerNode('shutdown_readiness_delay')->defaultValue(5)->min(0)->max(300)->end()
                         ->booleanNode('allow_unfenced_storage_for_tests')->defaultFalse()->end()
                         ->scalarNode('metrics_bearer_token')->defaultNull()->end()
                     ->end()

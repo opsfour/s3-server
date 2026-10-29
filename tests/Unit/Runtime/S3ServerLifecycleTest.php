@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
+use Amp\ByteStream\Pipe;
 use Amp\DeferredFuture;
 use Amp\Http\Client\HttpClientBuilder;
 use Amp\Http\Client\Request as ClientRequest;
@@ -22,6 +23,9 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
+use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\NodeDrainController;
 use OpsFour\S3Server\Runtime\S3ServerRuntime;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
@@ -39,6 +43,117 @@ use Revolt\EventLoop;
 
 final class S3ServerLifecycleTest extends TestCase
 {
+    public function test_server_cannot_start_after_programmatic_drain_begins(): void
+    {
+        $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()));
+        $server->beginDrain();
+
+        try {
+            $server->start();
+            self::fail('A drained server reopened request admission.');
+        } catch (\LogicException $error) {
+            self::assertSame('S3 server cannot start after drain begins.', $error->getMessage());
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function test_server_drain_demotes_membership_before_listener_close_and_then_starts_propagation(): void
+    {
+        $port = $this->unusedPort();
+        $listenerOpenWhenDemoted = false;
+        $store = new class (function () use ($port, &$listenerOpenWhenDemoted): void {
+            $listenerOpenWhenDemoted = $this->canConnect($port);
+            \Amp\delay(0.05);
+        }) implements ClusterMembershipStore {
+            /** @var list<bool> */
+            public array $readyUpdates = [];
+            private bool $ready = false;
+
+            public function __construct(private readonly \Closure $onDemotion) {}
+
+            public function registerClusterMember(
+                string $clusterId,
+                string $nodeId,
+                string $incarnationId,
+                array $roles,
+                bool $ready,
+                float $ttlSeconds,
+            ): void {
+                $this->ready = $ready;
+            }
+
+            public function heartbeatClusterMember(
+                string $clusterId,
+                string $nodeId,
+                string $incarnationId,
+                bool $ready,
+                float $ttlSeconds,
+            ): bool {
+                $this->readyUpdates[] = $ready;
+                if (! $ready) {
+                    ($this->onDemotion)();
+                }
+                $this->ready = $ready;
+
+                return true;
+            }
+
+            public function withdrawClusterMember(string $clusterId, string $nodeId, string $incarnationId): void
+            {
+                $this->ready = false;
+            }
+
+            public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
+            {
+                return $this->ready;
+            }
+
+            public function liveClusterRoles(string $clusterId): array
+            {
+                return $this->ready ? ['api', 'reconcile'] : [];
+            }
+        };
+        $clusterConfig = new S3ServerConfig(
+            storagePath: sys_get_temp_dir(),
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
+        );
+        $roles = new ClusterRoleController($store, $clusterConfig);
+        $roles->registerReady();
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+            shutdownReadinessDelay: 1,
+            notificationWorkerEnabled: false,
+        ));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->start();
+        (new \ReflectionProperty($server, 'clusterRoles'))->setValue($server, $roles);
+
+        try {
+            $server->beginDrain();
+
+            self::assertSame([false], $store->readyUpdates);
+            self::assertTrue($listenerOpenWhenDemoted);
+            self::assertTrue($this->canConnect($port));
+            $drain = (new \ReflectionProperty($server, 'drain'))->getValue($server);
+            self::assertInstanceOf(NodeDrainController::class, $drain);
+            self::assertGreaterThan(0.9, $drain->remainingPropagationDelay(1));
+        } finally {
+            $server->stop();
+        }
+
+        self::assertFalse($this->canConnect($port));
+    }
+
     /** @return iterable<string, array{bool}> */
     public static function objectPartLayoutCapabilityStates(): iterable
     {
@@ -821,6 +936,161 @@ final class S3ServerLifecycleTest extends TestCase
         self::assertSame('finished', \Amp\ByteStream\buffer($response->getBody()));
         $server->stop();
         self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+    }
+
+    public function test_runtime_drain_keeps_probes_open_rejects_new_work_then_closes_listener(): void
+    {
+        $port = $this->unusedPort();
+        $adminCalls = 0;
+        $quotaCalls = 0;
+        $admin = new class ($adminCalls) implements RequestHandler {
+            public function __construct(private int &$calls) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ++$this->calls;
+
+                return new Response(204);
+            }
+        };
+        $quota = new class ($quotaCalls) implements RequestHandler {
+            public function __construct(private int &$calls) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ++$this->calls;
+
+                return new Response(204);
+            }
+        };
+        $config = new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+            shutdownDrainTimeout: 2,
+            shutdownReadinessDelay: 1,
+            notificationWorkerEnabled: false,
+        );
+        $server = new S3Server($config);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->setAdminCredentialApiHandler($admin);
+        $server->setAdminQuotaApiHandler($quota);
+        $notificationMetadata = new SqliteMetadataStore(':memory:');
+        $notificationMetadata->initialize();
+        $runtime = new S3ServerRuntime($server, new NotificationDispatcher($notificationMetadata));
+        $server->start();
+        $client = HttpClientBuilder::buildDefault();
+
+        $stop = \Amp\async($runtime->stop(...));
+        \Amp\delay(0.05);
+
+        self::assertFalse($stop->isComplete());
+        self::assertTrue($this->canConnect($port));
+        self::assertSame(200, $client->request(new ClientRequest("http://127.0.0.1:{$port}/.live"))->getStatus());
+        self::assertSame(503, $client->request(new ClientRequest("http://127.0.0.1:{$port}/.health"))->getStatus());
+        self::assertSame(200, $client->request(new ClientRequest("http://127.0.0.1:{$port}/.metrics"))->getStatus());
+
+        $s3 = $client->request(new ClientRequest("http://127.0.0.1:{$port}/bucket/key"));
+        self::assertSame(503, $s3->getStatus());
+        self::assertStringContainsString('<Code>SlowDown</Code>', \Amp\ByteStream\buffer($s3->getBody()));
+        $adminResponse = $client->request(new ClientRequest(
+            "http://127.0.0.1:{$port}/.admin/credentials",
+            'POST',
+        ));
+        self::assertSame(503, $adminResponse->getStatus());
+        self::assertSame('application/json', $adminResponse->getHeader('content-type'));
+        self::assertSame(0, $adminCalls);
+        $quotaResponse = $client->request(new ClientRequest(
+            "http://127.0.0.1:{$port}/.admin/quotas",
+        ));
+        self::assertSame(503, $quotaResponse->getStatus());
+        self::assertSame('application/json', $quotaResponse->getHeader('content-type'));
+        self::assertLessThan(128, strlen(\Amp\ByteStream\buffer($quotaResponse->getBody())));
+        self::assertSame(0, $quotaCalls);
+
+        $stop->await(new \Amp\TimeoutCancellation(3));
+        self::assertFalse($this->canConnect($port));
+    }
+
+    public function test_stream_admitted_before_drain_finishes_while_new_work_is_rejected(): void
+    {
+        $port = $this->unusedPort();
+        $pipe = new Pipe(1024);
+        $requestStarted = new DeferredFuture();
+        $releaseStream = new DeferredFuture();
+        $handlerCalls = 0;
+        $handler = new class ($pipe, $requestStarted, $handlerCalls) implements RequestHandler {
+            /** @param DeferredFuture<void> $requestStarted */
+            public function __construct(
+                private readonly Pipe $pipe,
+                private readonly DeferredFuture $requestStarted,
+                private int &$handlerCalls,
+            ) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ++$this->handlerCalls;
+                $this->requestStarted->complete();
+
+                return new Response(200, body: $this->pipe->getSource());
+            }
+        };
+        $config = new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: sys_get_temp_dir(),
+            perClientRateLimit: 0,
+            shutdownDrainTimeout: 2,
+            shutdownReadinessDelay: 0,
+            notificationWorkerEnabled: false,
+        );
+        $server = new S3Server($config);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->setAdminCredentialApiHandler($handler);
+        $notificationMetadata = new SqliteMetadataStore(':memory:');
+        $notificationMetadata->initialize();
+        $runtime = new S3ServerRuntime($server, new NotificationDispatcher($notificationMetadata));
+        $server->start();
+        $client = HttpClientBuilder::buildDefault();
+        $writer = \Amp\async(static function () use ($pipe, $releaseStream): void {
+            $pipe->getSink()->write('accepted-');
+            $releaseStream->getFuture()->await();
+            $pipe->getSink()->write('stream');
+            $pipe->getSink()->end();
+        });
+
+        $response = $client->request(new ClientRequest(
+            "http://127.0.0.1:{$port}/.admin/credentials",
+            'POST',
+        ));
+        $requestStarted->getFuture()->await(new \Amp\TimeoutCancellation(2));
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('accepted-', $response->getBody()->read());
+
+        $runtime->beginDrain();
+        $rejected = $client->request(new ClientRequest(
+            "http://127.0.0.1:{$port}/.admin/credentials",
+            'POST',
+        ));
+        self::assertSame(503, $rejected->getStatus());
+        self::assertSame(1, $handlerCalls);
+
+        $stop = \Amp\async($runtime->stop(...));
+        \Amp\delay(0.02);
+        self::assertFalse($stop->isComplete());
+
+        $releaseStream->complete();
+        self::assertSame('stream', \Amp\ByteStream\buffer($response->getBody()));
+        $writer->await(new \Amp\TimeoutCancellation(2));
+        $stop->await(new \Amp\TimeoutCancellation(2));
+        self::assertFalse($this->canConnect($port));
     }
 
     private function unusedPort(): int

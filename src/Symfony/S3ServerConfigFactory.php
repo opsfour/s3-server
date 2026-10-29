@@ -65,6 +65,7 @@ final class S3ServerConfigFactory
             maxEncryptedObjectSize: $server['max_encrypted_object_size'],
             maxSelectObjectSize: $server['max_select_object_size'],
             shutdownDrainTimeout: $server['shutdown_drain_timeout'],
+            shutdownReadinessDelay: $server['shutdown_readiness_delay'],
             metricsBearerToken: $server['metrics_bearer_token'],
             notificationRequireHttps: $notifications['require_https'],
             notificationWorkerEnabled: $notifications['worker_enabled'],

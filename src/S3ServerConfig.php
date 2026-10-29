@@ -90,6 +90,8 @@ final readonly class S3ServerConfig
 
     public int $shutdownDrainTimeout;
 
+    public int $shutdownReadinessDelay;
+
     public bool $notificationRequireHttps;
 
     public bool $notificationWorkerEnabled;
@@ -145,6 +147,7 @@ final readonly class S3ServerConfig
      * @param  int  $maxEncryptedObjectSize  Maximum size in bytes for objects encrypted with SSE (default 256 MiB).
      * @param  int  $maxSelectObjectSize  Maximum size in bytes for buffered S3 Select queries (default 64 MiB).
      * @param  int  $shutdownDrainTimeout  Maximum seconds to drain in-flight shutdown work (default 30).
+     * @param  int  $shutdownReadinessDelay  Seconds to keep probes reachable after readiness closes (default 5).
      * @param  bool  $notificationRequireHttps  Reject non-HTTPS webhook destinations.
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
      * @param  int  $encryptionWorkerPoolSize  Number of amphp/parallel workers for encryption (0 = disable).
@@ -186,6 +189,7 @@ final readonly class S3ServerConfig
         int $maxEncryptedObjectSize = 268_435_456,
         int $maxSelectObjectSize = 67_108_864,
         int $shutdownDrainTimeout = 30,
+        int $shutdownReadinessDelay = 5,
         bool $notificationRequireHttps = true,
         int $sqliteWorkerPoolSize = 4,
         int $encryptionWorkerPoolSize = 0,
@@ -322,6 +326,12 @@ final readonly class S3ServerConfig
             );
         }
 
+        if ($shutdownReadinessDelay < 0 || $shutdownReadinessDelay > 300) {
+            throw new \InvalidArgumentException(
+                "shutdownReadinessDelay must be between 0 and 300, got {$shutdownReadinessDelay}.",
+            );
+        }
+
         if ($requestBodySpoolWorkerPoolSize < 1) {
             throw new \InvalidArgumentException(
                 "requestBodySpoolWorkerPoolSize must be >= 1, got {$requestBodySpoolWorkerPoolSize}.",
@@ -444,6 +454,7 @@ final readonly class S3ServerConfig
         $this->maxEncryptedObjectSize = $maxEncryptedObjectSize;
         $this->maxSelectObjectSize = $maxSelectObjectSize;
         $this->shutdownDrainTimeout = $shutdownDrainTimeout;
+        $this->shutdownReadinessDelay = $shutdownReadinessDelay;
         $this->notificationRequireHttps = $notificationRequireHttps;
         $this->notificationWorkerEnabled = $notificationWorkerEnabled;
         $this->sqliteWorkerPoolSize = $sqliteWorkerPoolSize;
@@ -523,6 +534,7 @@ final readonly class S3ServerConfig
             'maxEncryptedObjectSize' => $this->maxEncryptedObjectSize,
             'maxSelectObjectSize' => $this->maxSelectObjectSize,
             'shutdownDrainTimeout' => $this->shutdownDrainTimeout,
+            'shutdownReadinessDelay' => $this->shutdownReadinessDelay,
             'notificationRequireHttps' => $this->notificationRequireHttps,
             'sqliteWorkerPoolSize' => $this->sqliteWorkerPoolSize,
             'encryptionWorkerPoolSize' => $this->encryptionWorkerPoolSize,

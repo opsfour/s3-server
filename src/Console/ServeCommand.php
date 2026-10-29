@@ -89,6 +89,7 @@ final class ServeCommand extends Command
             ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', self::envOption('S3_READ_TIMEOUT', '300'))
             ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', self::envOption('S3_WRITE_TIMEOUT', '300'))
             ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to drain in-flight requests during graceful shutdown', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
+            ->addOption('shutdown-readiness-delay', null, InputOption::VALUE_REQUIRED, 'Seconds to publish unready before listeners close', self::envOption('S3_SHUTDOWN_READINESS_DELAY', '5'))
             ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', self::envOption('S3_REQUEST_BODY_SPOOL_WORKERS', '8'))
             ->addOption('sqlite-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for SQLite metadata operations', self::envOption('S3_SQLITE_WORKERS', '4'))
             ->addOption('encryption-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for encryption', self::envOption('S3_ENCRYPTION_WORKERS', '0'))
@@ -321,6 +322,7 @@ final class ServeCommand extends Command
             maxEncryptedObjectSize: $this->integerOption($input, 'max-encrypted-object-size'),
             maxSelectObjectSize: $this->integerOption($input, 'max-select-object-size'),
             shutdownDrainTimeout: $this->integerOption($input, 'shutdown-drain-timeout'),
+            shutdownReadinessDelay: $this->integerOption($input, 'shutdown-readiness-delay'),
             notificationRequireHttps: $this->booleanOption($input, 'notification-require-https'),
             notificationWorkerEnabled: $this->booleanOption($input, 'notification-worker'),
             sqliteWorkerPoolSize: $this->sqliteWorkerPoolSize($input),

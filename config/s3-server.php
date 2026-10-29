@@ -71,6 +71,9 @@ return [
     // Maximum seconds to drain active work before shutdown fails safely.
     'shutdown_drain_timeout' => EnvironmentNumber::integer('S3_SHUTDOWN_DRAIN_TIMEOUT', 30),
 
+    // Seconds for load balancers to observe unready before listeners close.
+    'shutdown_readiness_delay' => EnvironmentNumber::integer('S3_SHUTDOWN_READINESS_DELAY', 5),
+
     // Connection idle timeout in seconds (0 = no timeout).
     'connection_idle_timeout' => EnvironmentNumber::integer('S3_CONNECTION_IDLE_TIMEOUT', 60),
 

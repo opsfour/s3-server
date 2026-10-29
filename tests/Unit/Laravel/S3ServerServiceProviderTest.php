@@ -363,6 +363,7 @@ final class S3ServerServiceProviderTest extends TestCase
             'local_write_worker_timeout_seconds' => 12.5,
             'enforce_min_part_size' => false,
             'allow_unfenced_storage_for_tests' => true,
+            'shutdown_readiness_delay' => 17,
             'notifications' => ['worker_enabled' => false],
             'parallel' => [
                 'select_workers' => 4,
@@ -382,6 +383,7 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
+        self::assertSame(17, $config->shutdownReadinessDelay);
         self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(0, $config->sqliteWorkerPoolSize);
         self::assertSame(4, $config->selectWorkerPoolSize);

@@ -144,6 +144,69 @@ final class ClusterRoleTest extends TestCase
         self::assertTrue($controller->hasLiveRole(ClusterRoleSet::RECONCILE));
     }
 
+    public function test_drain_publishes_not_ready_before_final_withdrawal_and_never_reopens(): void
+    {
+        $store = new ClusterRoleMemoryStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile'));
+        $controller->registerReady();
+
+        $controller->beginDrain();
+        $controller->beginDrain();
+
+        self::assertSame(0, $store->withdrawals);
+        self::assertFalse($controller->hasLiveRole(ClusterRoleSet::API));
+        self::assertFalse($controller->canClaim(ClusterRoleSet::RECONCILE));
+        self::assertTrue($controller->maintainReady());
+        self::assertFalse($controller->hasLiveRole(ClusterRoleSet::API));
+        self::assertSame(2, $store->heartbeats);
+
+        $controller->withdraw();
+        self::assertSame(1, $store->withdrawals);
+    }
+
+    public function test_drain_fails_closed_without_throwing_when_demotion_fails_or_row_is_absent(): void
+    {
+        $unavailable = new ClusterRoleMemoryStore();
+        $unavailableController = new ClusterRoleController($unavailable, $this->config('reconcile'));
+        $unavailableController->registerReady();
+        $unavailable->unavailable = true;
+
+        $unavailableController->beginDrain();
+
+        self::assertFalse($unavailableController->canClaim(ClusterRoleSet::RECONCILE));
+
+        $absent = new ClusterRoleMemoryStore();
+        $absentController = new ClusterRoleController($absent, $this->config('reconcile'));
+        $absentController->registerReady();
+        $absent->heartbeatResult = false;
+
+        $absentController->beginDrain();
+
+        self::assertFalse($absentController->canClaim(ClusterRoleSet::RECONCILE));
+        self::assertSame(1, $absent->heartbeats);
+    }
+
+    public function test_claim_waiting_behind_drain_cannot_republish_ready_membership(): void
+    {
+        $store = new ClusterRoleMemoryStore();
+        $controller = new ClusterRoleController($store, $this->config('reconcile'));
+        $controller->registerReady();
+        $store->heartbeatStarted = new DeferredFuture();
+        $store->releaseHeartbeat = new DeferredFuture();
+
+        $heartbeat = \Amp\async($controller->heartbeat(...));
+        $store->heartbeatStarted->getFuture()->await();
+        $drain = \Amp\async($controller->beginDrain(...));
+        $claim = \Amp\async(static fn(): bool => $controller->canClaim(ClusterRoleSet::RECONCILE));
+        $store->releaseHeartbeat->complete();
+
+        self::assertTrue($heartbeat->await());
+        $drain->await();
+        self::assertFalse($claim->await());
+        self::assertFalse($controller->hasLiveRole(ClusterRoleSet::RECONCILE));
+        self::assertSame(2, $store->heartbeats);
+    }
+
     /** @return iterable<string, array{S3Operation}> */
     public static function reconciliationDependentOperations(): iterable
     {
@@ -385,6 +448,7 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
     /** @var list<string>|null */
     public ?array $liveRoles = null;
     public bool $unavailable = false;
+    public bool $heartbeatResult = true;
     public int $withdrawals = 0;
     public int $heartbeats = 0;
     public int $liveMemberChecks = 0;
@@ -406,8 +470,15 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
         if ($this->unavailable) {
             throw new \RuntimeException('database unavailable');
         }
-        $this->heartbeatStarted?->complete();
+        if ($this->heartbeatStarted !== null) {
+            $started = $this->heartbeatStarted;
+            $this->heartbeatStarted = null;
+            $started->complete();
+        }
         $this->releaseHeartbeat?->getFuture()->await();
+        if (! $this->heartbeatResult) {
+            return false;
+        }
         $this->ready = $ready;
         return true;
     }

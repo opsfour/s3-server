@@ -192,6 +192,13 @@ Configure the proxy to preserve `Host`, including any port. Set
 proxy overwrite `X-Forwarded-For` and `X-Forwarded-Proto` with authoritative
 client values; see [Network Hardening](#network-hardening) below.
 
+Do not enable affinity to compensate for node-local application state: every
+ready compatible API node must be able to serve every request. The proxy must
+forward the exact externally signed Host (including port), path, query encoding,
+and signed headers. It must not reconstruct Host from forwarded fields or
+normalize a signed target. Such changes fail normal SigV4 validation; the
+server has no proxy-specific signature bypass.
+
 ## Health Checks
 
 ```bash
@@ -235,11 +242,19 @@ readinessProbe:
 
 The server handles `SIGTERM` and `SIGINT` signals:
 
-1. Cancels and drains background processors.
-2. Stops accepting new connections and drains in-flight requests.
-3. Waits up to `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds for active HTTP requests.
-4. Shuts down storage and worker pools after the requests and background work stop.
-5. Fails the shutdown attempt without releasing dependencies if the deadline is exceeded.
+1. Marks the local node draining, publishes its cluster membership
+   `ready=false`, makes `/.health` return 503, and rejects new S3/website/admin
+   work with bounded protocol-appropriate 503 responses.
+2. Keeps `/.live` and authenticated `/.metrics` reachable for
+   `S3_SHUTDOWN_READINESS_DELAY` seconds (default 5) so a compatible load
+   balancer can observe readiness removal.
+3. Cancels new background claims, stops accepting new connections, and lets
+   requests admitted before drain finish.
+4. Waits up to `S3_SHUTDOWN_DRAIN_TIMEOUT` seconds for active HTTP requests and
+   then drains the stopped background processors.
+5. Shuts down storage and worker pools only after request/background ownership
+   is clear.
+6. Fails the shutdown attempt without releasing dependencies if a deadline is exceeded.
 
 `S3_SHUTDOWN_DRAIN_TIMEOUT` applies separately to each sequential bounded
 shutdown phase; it is not a total process-stop deadline. Set the process
@@ -250,6 +265,7 @@ the supervisor terminate a callback or backend operation that never returns.
 
 ```bash
 S3_SHUTDOWN_DRAIN_TIMEOUT=30   # seconds
+S3_SHUTDOWN_READINESS_DELAY=5  # seconds before listeners close (0-300)
 ```
 
 ## Systemd Service
@@ -898,7 +914,10 @@ For production deployments:
 Cluster nodes may overlap only when their complete admission fingerprints
 match. Compatible application-only restarts can roll behind a load balancer;
 each replacement must report `cluster.admission=matched` before receiving S3
-traffic. Schema changes, protocol changes, storage/fence changes, tier-map
+traffic. Drain each old API node one at a time and wait for the load balancer to
+remove it before proceeding; accepted work may finish on that node, while later
+requests may use any other ready node without affinity or process-local history.
+Schema changes, protocol changes, storage/fence changes, tier-map
 changes, encryption-identity changes, and incompatible feature changes require
 a maintenance window. Startup never replaces the established contract.
 
@@ -971,7 +990,12 @@ credential providers and custom external-identity providers are rejected in
 cluster mode. When external IAM is enabled, every node must use the same
 normalized issuer and audience sets, RSA public keys, claim names, owner prefix,
 and clock skew. The database credential-cache TTL must also match. Admin bearer
-tokens and database credentials are not fingerprinted.
+tokens and database credentials are not fingerprinted. Every ready API node
+behind one generic load balancer must nevertheless expose the same admin
+surfaces and be provisioned with the same corresponding bearer tokens. Cluster
+admission does not verify this secret configuration and never fingerprints or
+exposes those token values; operators must keep the nodes aligned and the admin
+routes private.
 
 The built-in AWS backend remains unqualified for cluster operation until its
 internal production qualification evidence is present, and local filesystem
@@ -1050,6 +1074,7 @@ pre-migration backup or roll forward with a hotfix.
 - [ ] Database credentials use least-privilege access
 - [ ] Credential file permissions restricted (`chmod 600`)
 - [ ] Graceful shutdown timeout set (`S3_SHUTDOWN_DRAIN_TIMEOUT`)
+- [ ] Readiness propagation delay set for the load balancer (`S3_SHUTDOWN_READINESS_DELAY`)
 - [ ] Health check endpoint accessible to load balancer only
 - [ ] Metrics and admin endpoints restricted to trusted networks
 - [ ] Metrics bearer token configured (`S3_METRICS_BEARER_TOKEN`) unless an

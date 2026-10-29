@@ -26,6 +26,7 @@ use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\ClusterRoleSet;
+use OpsFour\S3Server\Runtime\NodeDrainController;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -75,6 +76,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly ?AwsS3OperationalState $awsOperationalState = null,
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
         private readonly ?ClusterRoleController $clusterRoles = null,
+        private readonly ?NodeDrainController $drain = null,
     ) {
         if ($readinessCheckIntervalSeconds < 0) {
             throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
@@ -87,6 +89,13 @@ final class HealthCheckHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        if ($this->drain !== null && ! $this->drain->acceptsNewWork()) {
+            return new Response(
+                status: 503,
+                headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
+                body: '{"status":"degraded","drain":"draining"}',
+            );
+        }
         if ($this->clusterAdmission !== null && ! $this->clusterAdmission->revalidate()) {
             return $this->clusterClosedResponse();
         }

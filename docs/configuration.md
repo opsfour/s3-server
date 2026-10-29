@@ -333,6 +333,7 @@ destinations remain blocked by the notification SSRF policy.
 | `S3_READ_TIMEOUT` | `300` | Request stream inactivity timeout (seconds) |
 | `S3_WRITE_TIMEOUT` | `300` | Response stream inactivity timeout (seconds) |
 | `S3_SHUTDOWN_DRAIN_TIMEOUT` | `30` | Maximum seconds for each bounded HTTP, background, or in-process listener drain before shutdown fails safely with its dependencies still owned |
+| `S3_SHUTDOWN_READINESS_DELAY` | `5` | Seconds (0-300) to publish readiness 503 and reject new work while liveness and authenticated metrics remain reachable before listeners close |
 
 Amp's HTTP/1 driver currently uses one inactivity timeout for keep-alive,
 request reads, and response writes. The package sets that value to the larger
@@ -451,4 +452,5 @@ S3_TRUSTED_PROXY_CIDRS=10.0.1.10/32
 
 # Timeouts
 S3_SHUTDOWN_DRAIN_TIMEOUT=30
+S3_SHUTDOWN_READINESS_DELAY=5
 ```

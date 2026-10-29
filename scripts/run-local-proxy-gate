@@ -142,12 +142,14 @@ S3_TEST_PROXY_PORT="$(free_port)"
 S3_TEST_REWRITE_PROXY_PORT="$(free_port)"
 S3_TEST_MISSING_XFF_PROXY_PORT="$(free_port)"
 S3_TEST_AMBIGUOUS_XFP_PROXY_PORT="$(free_port)"
+S3_TEST_METRICS_TOKEN="local-proxy-gate-${S3_TEST_ORIGIN_PORT}-${S3_TEST_PROXY_PORT}"
 S3_TEST_HTTPD_ROOT="$gate_root"
 S3_TEST_HTTPD_MODULE_DIR="$module_dir"
 S3_TEST_HTTPD_USER="$(id -un)"
 S3_TEST_HTTPD_GROUP="$(id -gn)"
 export S3_TEST_ORIGIN_PORT S3_TEST_PROXY_PORT S3_TEST_REWRITE_PROXY_PORT
 export S3_TEST_MISSING_XFF_PROXY_PORT S3_TEST_AMBIGUOUS_XFP_PROXY_PORT
+export S3_TEST_METRICS_TOKEN
 export S3_TEST_HTTPD_ROOT S3_TEST_HTTPD_MODULE_DIR S3_TEST_HTTPD_USER S3_TEST_HTTPD_GROUP
 
 runtime_httpd_config="${gate_root}/httpd.conf"
@@ -178,9 +180,13 @@ php bin/s3-server serve \
     --base-domain=s3.localhost \
     --access-key=testAccessKey \
     --secret-key=testSecretKey \
+    --metrics-bearer-token="$S3_TEST_METRICS_TOKEN" \
     --notification-worker=false \
+    --shutdown-readiness-delay=2 \
+    --shutdown-drain-timeout=10 \
     >"${gate_root}/server.stdout" 2>"${gate_root}/server.stderr" &
-gate_pids+=("$!")
+origin_pid="$!"
+gate_pids+=("$origin_pid")
 
 "$httpd_bin" -f "$runtime_httpd_config" -DFOREGROUND \
     >"${gate_root}/httpd.stdout" 2>"${gate_root}/httpd.stderr" &
@@ -213,6 +219,14 @@ done
 
 if ! php tests/Functional/local-proxy-gate.php; then
     echo "The local proxy assertions failed." >&2
+    sed -n '1,120p' "${gate_root}/server.stdout" >&2 || true
+    sed -n '1,120p' "${gate_root}/server.stderr" >&2 || true
+    sed -n '1,120p' "${gate_root}/httpd-error.log" >&2 || true
+    exit 1
+fi
+
+if ! S3_TEST_ORIGIN_PID="$origin_pid" php tests/Functional/local-proxy-gate.php drain; then
+    echo "The local proxy drain assertions failed." >&2
     sed -n '1,120p' "${gate_root}/server.stdout" >&2 || true
     sed -n '1,120p' "${gate_root}/server.stderr" >&2 || true
     sed -n '1,120p' "${gate_root}/httpd-error.log" >&2 || true

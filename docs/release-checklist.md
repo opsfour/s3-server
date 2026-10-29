@@ -59,7 +59,18 @@ The initial production profile adds these gates:
 - [ ] Run the standalone, Laravel, and Symfony entry-point profiles.
 - [ ] Exercise signed path-style and virtual-hosted requests directly and
   through a generic reverse proxy or load balancer. Preserve `Host` exactly,
-  including the port, and validate trusted-proxy CIDRs.
+  including the port, preserve path/query encoding and signed headers, and
+  validate trusted-proxy CIDRs. Prove Host/path/query mutation fails through
+  normal SigV4 validation.
+- [ ] Send SIGTERM and SIGINT behind the generic load balancer. Require
+  readiness and cluster routing eligibility to disappear before listener
+  closure, keep liveness and authenticated metrics reachable during the
+  configured propagation delay, reject raced S3/admin work with bounded 503s,
+  and prove an already admitted streaming response completes.
+- [ ] For a qualified compatible cluster profile, roll API nodes one at a time
+  without affinity and require uninterrupted signed traffic. Treat schema,
+  protocol, storage/fence, tier-map, and encryption-identity changes as
+  maintenance operations rather than rolling application deploys.
 - [ ] Run bounded large-object, multipart, concurrent request, and S3 Select
   expansion profiles, then one uninterrupted 12-hour local-filesystem soak on
   Linux with one API process and the metadata backend selected for the release

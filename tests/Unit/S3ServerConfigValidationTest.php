@@ -19,6 +19,16 @@ final class S3ServerConfigValidationTest extends TestCase
         self::assertFalse($config->isVirtualHostedStyle());
         self::assertFalse($config->allowUnfencedStorageForTests);
         self::assertSame(300.0, $config->localWriteWorkerTimeoutSeconds);
+        self::assertSame(5, $config->shutdownReadinessDelay);
+    }
+
+    public function test_shutdown_readiness_delay_is_bounded_and_survives_clone(): void
+    {
+        $config = new S3ServerConfig(storagePath: '/', shutdownReadinessDelay: 0);
+        self::assertSame(0, $config->with(['port' => 9001])->shutdownReadinessDelay);
+
+        $this->expectException(\InvalidArgumentException::class);
+        new S3ServerConfig(storagePath: '/', shutdownReadinessDelay: 301);
     }
 
     public function test_unsafe_storage_override_survives_config_clone(): void

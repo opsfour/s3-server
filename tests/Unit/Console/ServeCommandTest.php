@@ -72,6 +72,7 @@ final class ServeCommandTest extends TestCase
             '--request-body-spool-workers' => '5',
             '--encryption-threshold' => '8192',
             '--metrics-bearer-token' => 'metrics-secret',
+            '--shutdown-readiness-delay' => '17',
         ]);
 
         $config = $this->invoke($command, 'configFromInput', [$input, null]);
@@ -93,6 +94,7 @@ final class ServeCommandTest extends TestCase
         self::assertSame(5, $config->requestBodySpoolWorkerPoolSize);
         self::assertSame(8192, $config->encryptionParallelThreshold);
         self::assertSame('metrics-secret', $config->metricsBearerToken);
+        self::assertSame(17, $config->shutdownReadinessDelay);
     }
 
     public function test_cluster_identity_options_are_forwarded_without_blank_normalization(): void
@@ -421,6 +423,7 @@ final class ServeCommandTest extends TestCase
             'S3_READ_TIMEOUT' => 'read-timeout',
             'S3_WRITE_TIMEOUT' => 'write-timeout',
             'S3_SHUTDOWN_DRAIN_TIMEOUT' => 'shutdown-drain-timeout',
+            'S3_SHUTDOWN_READINESS_DELAY' => 'shutdown-readiness-delay',
             'S3_REQUEST_BODY_SPOOL_WORKERS' => 'request-body-spool-workers',
             'S3_SQLITE_WORKERS' => 'sqlite-workers',
             'S3_ENCRYPTION_WORKERS' => 'encryption-workers',

@@ -90,11 +90,22 @@ final class S3ServerRuntime
         $this->stopInProgress = true;
 
         try {
+            $this->beginDrain();
+            $this->server->awaitReadinessPropagation();
             $this->stopOwnedResources();
             $this->stopped = true;
         } finally {
             $this->stopInProgress = false;
         }
+    }
+
+    /** Idempotently close readiness and new-work admission while listeners remain open. */
+    public function beginDrain(): void
+    {
+        if ($this->stopped) {
+            return;
+        }
+        $this->server->beginDrain();
     }
 
     private function stopOwnedResources(): void

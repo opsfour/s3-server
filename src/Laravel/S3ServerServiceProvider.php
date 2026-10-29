@@ -72,6 +72,7 @@ class S3ServerServiceProvider extends ServiceProvider
                 maxEncryptedObjectSize: $config['max_encrypted_object_size'] ?? 268_435_456,
                 maxSelectObjectSize: $config['max_select_object_size'] ?? 67_108_864,
                 shutdownDrainTimeout: $config['shutdown_drain_timeout'] ?? 30,
+                shutdownReadinessDelay: $config['shutdown_readiness_delay'] ?? 5,
                 notificationRequireHttps: $config['notifications']['require_https'] ?? true,
                 notificationWorkerEnabled: $config['notifications']['worker_enabled'] ?? true,
                 sqliteWorkerPoolSize: self::sqliteWorkerPoolSize($config),

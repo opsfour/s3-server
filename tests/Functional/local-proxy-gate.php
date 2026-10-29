@@ -26,6 +26,21 @@ function gatePort(string $name): int
     return (int) $value;
 }
 
+function gateProcessId(string $name): int
+{
+    return gatePort($name);
+}
+
+function gateSecret(string $name): string
+{
+    $value = getenv($name);
+    if ($value === false || $value === '') {
+        throw new RuntimeException("Missing {$name}.");
+    }
+
+    return $value;
+}
+
 function gateAssert(bool $condition, string $message): void
 {
     if (! $condition) {
@@ -179,6 +194,42 @@ $missingXffPort = gatePort('S3_TEST_MISSING_XFF_PROXY_PORT');
 $ambiguousXfpPort = gatePort('S3_TEST_AMBIGUOUS_XFP_PROXY_PORT');
 $pathClient = gateS3($proxyPort);
 
+if (($argv[1] ?? '') === 'drain') {
+    $originPid = gateProcessId('S3_TEST_ORIGIN_PID');
+    gateAssert(posix_kill($originPid, SIGTERM), 'Could not signal the API process for drain.');
+
+    $deadline = microtime(true) + 1.5;
+    do {
+        $health = $http->get("http://127.0.0.1:{$proxyPort}/.health", ['http_errors' => false]);
+        if ($health->getStatusCode() === 503) {
+            break;
+        }
+        usleep(20_000);
+    } while (microtime(true) < $deadline);
+    gateAssert($health->getStatusCode() === 503, 'Drain did not remove readiness before listener shutdown.');
+    gateAssert(
+        $http->get("http://127.0.0.1:{$proxyPort}/.live", ['http_errors' => false])->getStatusCode() === 200,
+        'Liveness was not reachable during drain propagation.',
+    );
+    gateAssert(
+        $http->get("http://127.0.0.1:{$proxyPort}/.metrics", ['http_errors' => false])->getStatusCode() === 401,
+        'Metrics bearer authentication was bypassed during drain propagation.',
+    );
+    gateAssert(
+        $http->get("http://127.0.0.1:{$proxyPort}/.metrics", [
+            'headers' => ['Authorization' => 'Bearer ' . gateSecret('S3_TEST_METRICS_TOKEN')],
+            'http_errors' => false,
+        ])->getStatusCode() === 200,
+        'Authenticated metrics were not reachable during drain propagation.',
+    );
+    $raced = gateSignedGet($http, $proxyPort, $bucket, 'signed');
+    gateAssert($raced->getStatusCode() === 503, 'New S3 work was admitted after drain began.');
+    gateAssert(str_contains((string) $raced->getBody(), '<Code>SlowDown</Code>'), 'Drain rejection was not a bounded S3 response.');
+
+    echo "Local proxy drain passed: readiness closed before listener shutdown; liveness, metrics, and bounded admission remained available.\n";
+    exit(0);
+}
+
 $health = $http->get("http://127.0.0.1:{$missingXffPort}/.health");
 gateAssert($health->getStatusCode() === 200, 'Health through a trusted proxy without XFF was rejected.');
 
@@ -194,6 +245,35 @@ foreach ([false, true] as $virtualHosted) {
     gateAssert($response->getStatusCode() === 200, "Signed {$style} GET failed: " . (string) $response->getBody());
     gateAssert((string) $response->getBody() === 'proxy-gate-content', "Signed {$style} GET returned the wrong body.");
 }
+
+$signedPath = (new S3SignatureV4('s3', 'us-east-1'))->signRequest(
+    new Request(
+        'GET',
+        "http://127.0.0.1:{$proxyPort}/{$bucket}/signed",
+        ['Host' => "127.0.0.1:{$proxyPort}"],
+    ),
+    new Credentials('testAccessKey', 'testSecretKey'),
+);
+$mutatedPath = $signedPath->withUri($signedPath->getUri()->withPath("/{$bucket}/signed-mutated"));
+$pathMutation = $http->send($mutatedPath, ['http_errors' => false, 'timeout' => 15]);
+gateAssert($pathMutation->getStatusCode() === 403, 'A signed path mutation did not invalidate the signature.');
+gateAssert(str_contains((string) $pathMutation->getBody(), '<Code>SignatureDoesNotMatch</Code>'), 'Path mutation failed outside SigV4 validation.');
+
+$presignedMutation = $pathClient->createPresignedRequest(
+    $pathClient->getCommand('GetObject', ['Bucket' => $bucket, 'Key' => 'signed']),
+    '+5 minutes',
+);
+$mutationUri = $presignedMutation->getUri();
+$query = $mutationUri->getQuery();
+$mutatedQuery = preg_replace('/X-Amz-Expires=[0-9]+/', 'X-Amz-Expires=301', $query, 1, $count);
+gateAssert(is_string($mutatedQuery) && $count === 1, 'Could not prepare the signed query mutation.');
+$queryMutation = $http->send(new Request(
+    $presignedMutation->getMethod(),
+    "http://127.0.0.1:{$proxyPort}{$mutationUri->getPath()}?{$mutatedQuery}",
+    ['Host' => $mutationUri->getAuthority()],
+), ['http_errors' => false, 'timeout' => 15]);
+gateAssert($queryMutation->getStatusCode() === 403, 'A presigned query mutation did not invalidate the signature.');
+gateAssert(str_contains((string) $queryMutation->getBody(), '<Code>SignatureDoesNotMatch</Code>'), 'Query mutation failed outside SigV4 validation.');
 
 foreach ([false, true] as $virtualHosted) {
     $client = gateS3($proxyPort, $virtualHosted);
@@ -235,4 +315,4 @@ gateAssert($ambiguousXfp->getStatusCode() === 403, 'Ambiguous trusted-proxy XFP 
 $directMissing = gateSignedGet($http, $originPort, $bucket, 'signed');
 gateAssert($directMissing->getStatusCode() === 403, 'A direct S3 request from a trusted peer without XFF was accepted.');
 
-echo "Local single-process proxy gate passed: signed path and virtual hosts, presigned PUT/GET, exact Host, trusted XFF/XFP, policy context, and health.\n";
+echo "Local single-process proxy gate passed: signed path and virtual hosts, presigned PUT/GET, exact Host/path/query failures, trusted XFF/XFP, policy context, and health.\n";

@@ -12,6 +12,10 @@ final class ClusterRoleController
 {
     private bool $registered = false;
 
+    private bool $draining = false;
+
+    private bool $drainPublished = false;
+
     private readonly LocalMutex $membershipMutex;
 
     public function __construct(
@@ -33,6 +37,9 @@ final class ClusterRoleController
     {
         $lock = $this->membershipMutex->acquire();
         try {
+            if ($this->draining) {
+                throw new \RuntimeException('Cluster membership cannot become ready while the node is draining.');
+            }
             if (! $this->publishReadyLocked()) {
                 throw new \RuntimeException('Cluster API startup requires live reconcile role coverage.');
             }
@@ -46,6 +53,9 @@ final class ClusterRoleController
     {
         $lock = $this->membershipMutex->acquire();
         try {
+            if ($this->draining) {
+                return $this->maintainNotReadyLocked();
+            }
             return $this->registered ? $this->renewLocked() : $this->publishReadyLocked();
         } catch (\Throwable) {
             $this->withdrawLocked();
@@ -91,6 +101,10 @@ final class ClusterRoleController
 
         $lock = $this->membershipMutex->acquire();
         try {
+            if ($this->draining) {
+                return false;
+            }
+
             return $this->renewLocked();
         } catch (\Throwable) {
             $this->registered = false;
@@ -105,6 +119,9 @@ final class ClusterRoleController
     {
         $lock = $this->membershipMutex->acquire();
         try {
+            if ($this->draining) {
+                return $this->maintainNotReadyLocked();
+            }
             return $this->renewLocked();
         } catch (\Throwable) {
             $this->registered = false;
@@ -170,6 +187,41 @@ final class ClusterRoleController
         }
     }
 
+    /** Publish ready=false while retaining the row until final withdrawal. */
+    public function beginDrain(): void
+    {
+        $lock = $this->membershipMutex->acquire();
+        try {
+            $this->draining = true;
+            if ($this->drainPublished) {
+                return;
+            }
+            if (! $this->registered) {
+                $this->drainPublished = true;
+                return;
+            }
+            try {
+                $published = $this->store->heartbeatClusterMember(
+                    $this->clusterId(),
+                    $this->nodeId(),
+                    $this->incarnationId(),
+                    false,
+                    $this->ttlSeconds,
+                );
+            } catch (\Throwable) {
+                $this->registered = false;
+
+                return;
+            }
+            if (! $published) {
+                $this->registered = false;
+            }
+            $this->drainPublished = true;
+        } finally {
+            $lock->release();
+        }
+    }
+
     private function publishReadyLocked(): bool
     {
         $this->store->registerClusterMember(
@@ -202,6 +254,25 @@ final class ClusterRoleController
             $this->nodeId(),
             $this->incarnationId(),
             true,
+            $this->ttlSeconds,
+        );
+        if (! $renewed) {
+            $this->registered = false;
+        }
+
+        return $renewed;
+    }
+
+    private function maintainNotReadyLocked(): bool
+    {
+        if (! $this->registered) {
+            return false;
+        }
+        $renewed = $this->store->heartbeatClusterMember(
+            $this->clusterId(),
+            $this->nodeId(),
+            $this->incarnationId(),
+            false,
             $this->ttlSeconds,
         );
         if (! $renewed) {
