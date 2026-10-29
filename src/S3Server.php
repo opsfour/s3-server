@@ -34,6 +34,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
@@ -68,6 +69,7 @@ use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
@@ -206,6 +208,10 @@ final class S3Server
 
     private ?ClusterAdmissionController $clusterAdmission = null;
 
+    private ?ClusterWorkFencingStore $clusterWorkFencing = null;
+
+    private ?ClusterWorkerIdentity $clusterWorkerIdentity = null;
+
     /** @var list<array{pool: WorkerPool, name: string, forceKillOnShutdown: bool}> Worker pools to shut down on stop. */
     private array $workerPools = [];
 
@@ -294,6 +300,10 @@ final class S3Server
         if ($this->config->clusterEnabled()
             && ! $this->authenticationCredentialProvider instanceof ClusterAuthenticationIdentityProvider) {
             throw new \LogicException('Refusing to start cluster mode without an authentication credential provider that exposes an explicit cluster identity.');
+        }
+        if ($this->config->clusterEnabled()
+            && ($this->clusterWorkFencing === null || $this->clusterWorkerIdentity === null)) {
+            throw new \LogicException('Refusing to start cluster mode without PostgreSQL work fencing.');
         }
 
         if ($this->config->perClientRateLimit > 0 && $this->metadata === null) {
@@ -971,6 +981,9 @@ final class S3Server
             throw new \LogicException('Local object intent collector is already configured.');
         }
         $this->localObjectIntentCollector = $collector;
+        if ($this->clusterWorkFencing !== null && $this->clusterWorkerIdentity !== null) {
+            $collector->enableClusterFencing($this->clusterWorkFencing, $this->clusterWorkerIdentity->forKind('object-local'));
+        }
     }
 
     public function setAwsObjectWriteIntentCollector(AwsS3ObjectWriteIntentCollector $collector): void
@@ -980,6 +993,9 @@ final class S3Server
             throw new \LogicException('AWS object intent collector is already configured.');
         }
         $this->awsObjectIntentCollector = $collector;
+        if ($this->clusterWorkFencing !== null && $this->clusterWorkerIdentity !== null) {
+            $collector->enableClusterFencing($this->clusterWorkFencing, $this->clusterWorkerIdentity->forKind('object-aws'));
+        }
     }
 
     public function setAwsOperationalState(AwsS3OperationalState $state): void
@@ -1054,6 +1070,30 @@ final class S3Server
             $admission->assertBoundToConfig($this->config);
         }
         $this->clusterAdmission = $admission;
+    }
+
+    public function setClusterWorkFencing(ClusterWorkFencingStore $fencing, ClusterWorkerIdentity $identity): void
+    {
+        $this->assertConfigurationMutable('Cluster work fencing');
+        if (! $this->config->clusterEnabled()) {
+            throw new \LogicException('Cluster work fencing requires enabled cluster mode.');
+        }
+        if ($this->clusterWorkFencing !== null || $this->clusterWorkerIdentity !== null) {
+            throw new \LogicException('Cluster work fencing is already configured.');
+        }
+        $resolved = MetadataDriverStartupGuard::clusterPostgresStore(
+            $this->metadata,
+            $this->config->metadataDriver,
+            $this->config->metadataDsn,
+        );
+        if ($fencing !== $resolved) {
+            throw new \LogicException('Cluster work fencing must use this server\'s exact configured PostgreSQL metadata store.');
+        }
+        $identity->assertBoundToConfig($this->config);
+        $this->localObjectIntentCollector?->enableClusterFencing($fencing, $identity->forKind('object-local'));
+        $this->awsObjectIntentCollector?->enableClusterFencing($fencing, $identity->forKind('object-aws'));
+        $this->clusterWorkFencing = $fencing;
+        $this->clusterWorkerIdentity = $identity;
     }
 
     public function setAdminCredentialApiHandler(RequestHandler $handler): void
@@ -1839,6 +1879,8 @@ final class S3Server
                 storageTiers: $tiers,
                 multipartMaxAgeSeconds: $this->config->multipartMaxAgeSeconds,
                 clusterAdmission: $this->clusterAdmission,
+                clusterFencing: $this->clusterWorkFencing,
+                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('lifecycle'),
             );
             $lifecycleRunner = new LifecycleRunner(
                 $executor,
@@ -1852,6 +1894,8 @@ final class S3Server
                 $this->logger,
                 localFencedWriter: $this->localBackgroundWriter,
                 awsFencedWriter: $this->awsBackgroundWriter,
+                clusterFencing: $this->clusterWorkFencing,
+                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('transition'),
             );
             $restoreExecutor = new RestoreExecutor(
                 $this->metadata,
@@ -1860,6 +1904,8 @@ final class S3Server
                 $this->notifications,
                 localFencedWriter: $this->localBackgroundWriter,
                 awsFencedWriter: $this->awsBackgroundWriter,
+                clusterFencing: $this->clusterWorkFencing,
+                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('restore'),
             );
             $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
             $storageGc = new StorageGarbageCollector(
@@ -1867,6 +1913,8 @@ final class S3Server
                 $tiers,
                 $this->logger,
                 awsOperationalState: $this->awsOperationalState,
+                clusterFencing: $this->clusterWorkFencing,
+                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('garbage'),
             );
             $multipartIntentGc = $this->metadata instanceof MultipartWriteIntentStore
                 ? new MultipartWriteIntentCollector(
@@ -1874,6 +1922,8 @@ final class S3Server
                     $tiers,
                     $this->logger,
                     awsOperationalState: $this->awsOperationalState,
+                    clusterFencing: $this->clusterWorkFencing,
+                    clusterWorkerId: $this->clusterWorkerIdentity?->forKind('multipart'),
                 )
                 : null;
         }
@@ -1884,6 +1934,8 @@ final class S3Server
                 metrics: $this->metrics,
                 requireHttps: $this->config->notificationRequireHttps,
                 clusterAdmission: $this->clusterAdmission,
+                clusterFencing: $this->clusterWorkFencing,
+                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('notification'),
             );
         }
 

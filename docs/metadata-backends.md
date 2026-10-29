@@ -216,8 +216,9 @@ The DML-only serving role does not need trigger-creation rights.
 | 41 (SQLite) / 44 (PostgreSQL) / 49 (MySQL) | Persist incarnation-bound object layout summaries and FK-cascaded logical parts; classify legacy rows in durable 10,000-row keyset batches without inferring multipart boundaries. |
 | 42 (SQLite) / 45 (PostgreSQL) / 50 (MySQL) | Add nullable legacy-safe object size/SHA-256 evidence, immutable AWS seal reservations, separate open-attempt and permanent-seal counters, and trigger-enforced atomic open-to-seal transitions. |
 | 46 (PostgreSQL) | Add a stable singleton database identity plus the separately replaceable immutable cluster-admission contract with secret-free per-category digests. |
+| 47 (PostgreSQL) | Bind lifecycle, notification, transition, restore, storage-garbage, multipart-intent, and object-intent claims to a process-derived worker ID, database-time heartbeat/expiry, and monotonically increasing generation. The migration expires and increments every pre-owner active generation. |
 
-SQLite currently uses schema version `42`; PostgreSQL uses `46`, and MySQL
+SQLite currently uses schema version `42`; PostgreSQL uses `47`, and MySQL
 uses `50`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
@@ -239,6 +240,15 @@ maintenance operation performed by the DDL-capable role. The credential
 migrator similarly creates `s3_credential_store_identity`; serving reads it but
 never changes it, while normal credential CRUD retains its existing grants on
 `s3_credentials`.
+
+PostgreSQL v47 is a stopped-cluster migration. It atomically invalidates every
+active pre-v47 durable claim because old workers cannot satisfy the new worker
+predicate. Claims and heartbeats use `clock_timestamp()` exclusively, select
+due rows with `FOR UPDATE SKIP LOCKED`, and commit before provider work starts.
+Completion, retry, and cleanup require the same work ID, worker ID, and
+generation; zero affected rows means ownership was lost. Metadata-only claim
+and renewal transactions retry SQLSTATE `40001` and `40P01` at most three times
+from fresh transactions. Provider I/O is never included in that retry loop.
 MySQL v31 changes three indexed identifier columns and may wait for metadata
 locks or rebuild their indexes on a populated database. The v32 dispatch-token
 column also needs a migration-time and lock check on a representative copy.

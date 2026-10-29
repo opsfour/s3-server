@@ -930,6 +930,18 @@ admission state, plus one category only for a persisted mismatch, and reopens
 only after a full comparison succeeds; never repair this by editing
 `s3_cluster_admission` while nodes are serving.
 
+Cluster workers derive one non-secret process identity from
+`S3_CLUSTER_NODE_ID` and the runtime-generated incarnation, then suffix a
+bounded worker kind. PostgreSQL database time is authoritative for claim,
+heartbeat, expiry, retry eligibility, and takeover; host time is never a
+fallback. A takeover increments the generation, so a paused predecessor can no
+longer complete, retry, or clean up its work. Owner IDs are locked in bytewise
+order before resource rows, and the worker token is asserted inside the same
+transaction as every authoritative shared-state mutation. A failed heartbeat
+or zero-row compare-and-set stops further effects. Webhook delivery remains at
+least once, and ambiguous provider outcomes remain in their durable intent for
+reconciliation rather than being retried without a fence.
+
 Cluster bootstrap is maintenance-only. Run `metadata:migrate` with its
 DDL-capable role and record the printed `Cluster database identity` as
 `S3_CLUSTER_DATABASE_ID` on every node. Run `credentials:migrate` against one
@@ -955,7 +967,7 @@ same storage root. Drain traffic, stop the existing process, deploy the new
 package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
-For a **schema upgrade** to the current SQLite v42, PostgreSQL v46, or MySQL
+For a **schema upgrade** to the current SQLite v42, PostgreSQL v47, or MySQL
 v50 schema, drain and stop the
 API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a
@@ -984,6 +996,13 @@ Simple 32-hex legacy ETags become known single-part layouts; strict multipart
 ETags retain only their compatibility count; every other non-marker object is
 explicitly unknown. Do not run old API nodes or workers during this maintenance
 migration, and do not attempt a rolling-schema deployment.
+
+The PostgreSQL v47 upgrade also expires every active lifecycle and durable
+queue generation while adding worker and heartbeat ownership. Stop all old API
+and worker processes before migration and do not restart a pre-v47 binary: it
+cannot satisfy v47 ownership predicates. After migration, verify that no
+`processing`, `reconciling`, or `abandoned` row retains a pre-v47 active lease;
+new workers reclaim eligible rows with a higher generation.
 
 Capacity planning must include `s3_object_parts`: every legacy object classified
 as known single-part adds one child row, while unknown layouts and delete markers

@@ -8,15 +8,18 @@ use Amp\Cancellation;
 use Amp\CancelledException;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
 /** Bounded tier-scoped AWS ambiguous-write collector. */
-final readonly class AwsS3ObjectWriteIntentCollector
+final class AwsS3ObjectWriteIntentCollector
 {
     private AwsS3ObjectWriteIntentReconciler $reconciler;
     private LoggerInterface $logger;
+    private ?ClusterWorkFencingStore $clusterFencing = null;
+    private ?string $clusterWorkerId = null;
 
     public function __construct(
         private ObjectWriteIntentStore $metadata,
@@ -55,7 +58,13 @@ final readonly class AwsS3ObjectWriteIntentCollector
         for ($i = $retired; $i < $limit; ++$i) {
             $cancellation?->throwIfRequested();
             try {
-                $claims = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+                if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                    $clusterClaim = $this->clusterFencing->claimClusterObjectIntent($this->tierName, $this->clusterWorkerId, $this->claimLeaseSeconds);
+                    $claims = $clusterClaim === null ? [] : [$clusterClaim->work];
+                } else {
+                    $clusterClaim = null;
+                    $claims = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+                }
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
@@ -66,8 +75,17 @@ final readonly class AwsS3ObjectWriteIntentCollector
             if ($claims === []) {
                 break;
             }
+            if (! $claims[0] instanceof \OpsFour\S3Server\Metadata\ObjectWriteIntent) {
+                throw new \LogicException('AWS object cluster claim returned an invalid payload.');
+            }
             try {
-                $this->reconciler->reconcile($claims[0], $cancellation, $this->claimLeaseSeconds);
+                $this->reconciler->reconcile(
+                    $claims[0],
+                    $cancellation,
+                    $this->claimLeaseSeconds,
+                    $clusterClaim?->token,
+                    $this->clusterFencing,
+                );
                 if ($claims[0]->dispatchId !== null) {
                     $this->operationalState?->resolveObjectRecoveryPending(
                         $claims[0]->attemptId,
@@ -113,6 +131,15 @@ final readonly class AwsS3ObjectWriteIntentCollector
     public function shutdown(): void
     {
         // The admitted SDK client is owned by the storage backend.
+    }
+
+    public function enableClusterFencing(ClusterWorkFencingStore $fencing, string $workerId): void
+    {
+        if ($this->clusterFencing !== null) {
+            throw new \LogicException('AWS object collector cluster fencing is already configured.');
+        }
+        $this->clusterFencing = $fencing;
+        $this->clusterWorkerId = $workerId;
     }
 
     public function isBoundTo(

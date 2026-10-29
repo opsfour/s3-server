@@ -15,6 +15,8 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\FencedMultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\LocalMultipartPartSealGuard;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
@@ -31,7 +33,12 @@ final readonly class StorageGarbageCollector
         LoggerInterface $logger = new NullLogger(),
         private float $renewIntervalSeconds = 100.0,
         private ?AwsS3OperationalState $awsOperationalState = null,
+        private ?ClusterWorkFencingStore $clusterFencing = null,
+        private ?string $clusterWorkerId = null,
     ) {
+        if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
+            throw new \InvalidArgumentException('Cluster garbage fencing requires both store and worker identity.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0 || $renewIntervalSeconds >= 150) {
             throw new \InvalidArgumentException('Storage garbage renewal interval must fit within its lease.');
@@ -84,7 +91,12 @@ final readonly class StorageGarbageCollector
         while ($processed < $limit) {
             $cancellation?->throwIfRequested();
             try {
-                $items = $this->metadata->dequeueStorageGarbage(1);
+                if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                    $claim = $this->clusterFencing->claimClusterStorageGarbage($this->clusterWorkerId, 300.0);
+                    $items = $claim === null ? [] : [(array) $claim->work + ['cluster_work_token' => $claim->token]];
+                } else {
+                    $items = $this->metadata->dequeueStorageGarbage(1);
+                }
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
@@ -105,6 +117,16 @@ final readonly class StorageGarbageCollector
             }
             $leaseUntil = $item['lease_expires_at'];
             $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($item, &$leaseUntil, $leases): bool {
+                $token = $item['cluster_work_token'] ?? null;
+                if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+                    $renewed = $this->clusterFencing->renewClusterWork($token, 300.0);
+                    if ($renewed === null) {
+                        return false;
+                    }
+                    $leaseUntil = $renewed->leaseExpiresAt;
+
+                    return true;
+                }
                 $now = $this->metadata instanceof MultipartWriteIntentStore
                     ? $this->metadata->multipartWriteIntentNow() : microtime(true);
                 $next = $now + 300;
@@ -158,6 +180,8 @@ final readonly class StorageGarbageCollector
                             static function () use ($heartbeat): void {
                                 $heartbeat->stop();
                             },
+                            ($item['cluster_work_token'] ?? null) instanceof ClusterWorkToken
+                                ? $item['cluster_work_token'] : null,
                         );
                         if (! $awsClaimCompleted) {
                             throw new \RuntimeException('AWS garbage claim lost its serial deletion proof.');
@@ -321,9 +345,20 @@ final readonly class StorageGarbageCollector
         $backend->sealFencedMultipartPath($path, $matches[2]);
     }
 
-    /** @param array{id: int, lease_expires_at: float, lease_generation?: int} $item */
+    /** @param array<string, mixed> $item */
     private function completeClaim(array $item): bool
     {
+        $token = $item['cluster_work_token'] ?? null;
+        if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+            try {
+                return $this->clusterFencing->transactionWithClusterWork(
+                    $token,
+                    fn(): bool => $this->metadata->completeStorageGarbage($item['id']),
+                );
+            } catch (\RuntimeException) {
+                return false;
+            }
+        }
         if ($this->metadata instanceof FencedStorageGarbageStore && isset($item['lease_generation'])) {
             return $this->metadata->completeStorageGarbageLease($item['id'], $item['lease_expires_at'], $item['lease_generation']);
         }
@@ -331,9 +366,20 @@ final readonly class StorageGarbageCollector
         return $this->metadata->completeStorageGarbage($item['id'], $item['lease_expires_at']);
     }
 
-    /** @param array{id: int, lease_expires_at: float, lease_generation?: int} $item */
+    /** @param array<string, mixed> $item */
     private function retryClaim(array $item, string $error, float $nextAttemptAt): bool
     {
+        $token = $item['cluster_work_token'] ?? null;
+        if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+            try {
+                return $this->clusterFencing->transactionWithClusterWork(
+                    $token,
+                    fn(): bool => $this->metadata->retryStorageGarbage($item['id'], $error, $nextAttemptAt),
+                );
+            } catch (\RuntimeException) {
+                return false;
+            }
+        }
         if ($this->metadata instanceof FencedStorageGarbageStore && isset($item['lease_generation'])) {
             return $this->metadata->retryStorageGarbageLease($item['id'], $error, $nextAttemptAt, $item['lease_expires_at'], $item['lease_generation']);
         }

@@ -110,12 +110,12 @@ final class PostgresClusterAdmissionTest extends TestCase
             },
         );
         $live->admitInitial();
-        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES (47, $1)', ['drift-test']);
+        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES (48, $1)', ['drift-test']);
         try {
             self::assertFalse($live->revalidate(true));
             self::assertFalse($live->isAdmitted());
         } finally {
-            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = 47');
+            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = 48');
         }
         self::assertTrue($live->revalidate(true));
     }

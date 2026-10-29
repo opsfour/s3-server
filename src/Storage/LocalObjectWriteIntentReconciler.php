@@ -10,6 +10,8 @@ use Amp\DeferredCancellation;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Parallel\LocalObjectSealTask;
 
@@ -60,6 +62,8 @@ final readonly class LocalObjectWriteIntentReconciler
         ObjectWriteIntent $claimed,
         ?Cancellation $cancellation = null,
         float $claimLeaseSeconds = 300.0,
+        ?ClusterWorkToken $clusterToken = null,
+        ?ClusterWorkFencingStore $clusterFencing = null,
     ): void {
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0.0 || $claimLeaseSeconds > 86400.0) {
             throw new \InvalidArgumentException('Local object claim lease must be between 0 and 86400 seconds.');
@@ -88,32 +92,41 @@ final readonly class LocalObjectWriteIntentReconciler
             $this->fence->seal($persisted);
         } else {
             $cancellation?->throwIfRequested();
-            $this->submitAndAwaitSealWithHeartbeat($this->sealPool, $persisted, $claimLeaseSeconds);
+            $this->submitAndAwaitSealWithHeartbeat($this->sealPool, $persisted, $claimLeaseSeconds, $clusterToken, $clusterFencing);
         }
         $cancellation?->throwIfRequested();
-        if (! $this->metadata->sealObjectWriteIntent($persisted->attemptId, $persisted->claimGeneration)) {
+        $sealed = $clusterToken !== null && $clusterFencing !== null
+            ? $clusterFencing->transactionWithClusterWork(
+                $clusterToken,
+                fn(): bool => $this->metadata->sealObjectWriteIntent($persisted->attemptId, $persisted->claimGeneration),
+            )
+            : $this->metadata->sealObjectWriteIntent($persisted->attemptId, $persisted->claimGeneration);
+        if (! $sealed) {
             throw new \RuntimeException('Object write seal could not be committed in SQL.');
         }
     }
 
-    private function submitAndAwaitSealWithHeartbeat(WorkerPool $pool, ObjectWriteIntent $claimed, float $leaseSeconds): void
+    private function submitAndAwaitSealWithHeartbeat(WorkerPool $pool, ObjectWriteIntent $claimed, float $leaseSeconds, ?ClusterWorkToken $clusterToken, ?ClusterWorkFencingStore $clusterFencing): void
     {
         $stop = new DeferredCancellation();
         $interval = min(60.0, max(0.001, $leaseSeconds / 3.0));
-        $heartbeat = async(function () use ($claimed, $leaseSeconds, $interval, $stop): void {
+        $heartbeat = async(function () use ($claimed, $leaseSeconds, $interval, $stop, $clusterToken, $clusterFencing): void {
             $current = $claimed;
+            $token = $clusterToken;
             while (true) {
                 try {
                     delay($interval, cancellation: $stop->getCancellation());
                 } catch (CancelledException) {
                     return;
                 }
-                $renewed = $this->metadata->renewObjectWriteClaim(
-                    $current->attemptId,
-                    $current->claimGeneration,
-                    $current->leaseUntil,
-                    $leaseSeconds,
-                );
+                if ($token !== null && $clusterFencing !== null) {
+                    $token = $clusterFencing->renewClusterWork($token, $leaseSeconds);
+                    if ($token === null) {
+                        throw new \RuntimeException('Object write claim was lost while its seal worker was running.');
+                    }
+                    continue;
+                }
+                $renewed = $this->metadata->renewObjectWriteClaim($current->attemptId, $current->claimGeneration, $current->leaseUntil, $leaseSeconds);
                 if ($renewed === null) {
                     throw new \RuntimeException('Object write claim was lost while its seal worker was running.');
                 }

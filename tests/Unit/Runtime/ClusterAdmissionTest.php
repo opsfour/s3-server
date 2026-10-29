@@ -29,6 +29,7 @@ use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
 use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
+use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -620,6 +621,58 @@ final class ClusterAdmissionTest extends TestCase
                 self::assertStringContainsString('not bound to this server configuration', $error->getMessage());
             }
         }
+    }
+
+    public function test_programmatic_cluster_fencing_is_exact_config_bound_and_cannot_be_replaced(): void
+    {
+        $dsn = 'host=127.0.0.1 user=test db=cluster_fencing';
+        $config = new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+            metadataDriver: 'postgres',
+            metadataDsn: $dsn,
+            perClientRateLimit: 0,
+        );
+        $metadata = PostgresMetadataStore::fromDsn($dsn);
+        $server = new S3Server($config, $metadata);
+        try {
+            $server->setClusterWorkFencing(
+                PostgresMetadataStore::fromDsn('host=127.0.0.1 user=test db=other_cluster'),
+                ClusterWorkerIdentity::fromConfig($config),
+            );
+            self::fail('A fencing store for another database was accepted.');
+        } catch (\LogicException $error) {
+            self::assertStringContainsString('exact configured PostgreSQL metadata store', $error->getMessage());
+        }
+
+        $otherIdentityConfig = new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-b',
+            clusterDatabaseId: str_repeat('d', 32),
+            metadataDriver: 'postgres',
+            metadataDsn: $dsn,
+            perClientRateLimit: 0,
+        );
+        try {
+            $server->setClusterWorkFencing($metadata, ClusterWorkerIdentity::fromConfig($otherIdentityConfig));
+            self::fail('A worker identity from another node configuration was accepted.');
+        } catch (\LogicException $error) {
+            self::assertStringContainsString('not bound to this server configuration', $error->getMessage());
+        }
+
+        $identity = ClusterWorkerIdentity::fromConfig($config);
+        $server->setClusterWorkFencing($metadata, $identity);
+        try {
+            $server->setClusterWorkFencing($metadata, ClusterWorkerIdentity::fromConfig($config));
+            self::fail('A second fencing configuration replaced live server state.');
+        } catch (\LogicException $error) {
+            self::assertStringContainsString('already configured', $error->getMessage());
+        }
+        self::assertSame($metadata, (new \ReflectionProperty($server, 'clusterWorkFencing'))->getValue($server));
+        self::assertSame($identity, (new \ReflectionProperty($server, 'clusterWorkerIdentity'))->getValue($server));
     }
 
     public function test_cluster_handler_storage_must_use_the_exact_fingerprinted_registry(): void

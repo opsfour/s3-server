@@ -17,6 +17,8 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
 use OpsFour\S3Server\Metadata\QueueLease;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -35,7 +37,12 @@ final class TierTransitionExecutor
         private readonly float $leaseRenewalIntervalSeconds = 100.0,
         private readonly ?LocalFencedBackgroundObjectWriter $localFencedWriter = null,
         private readonly ?AwsS3FencedBackgroundObjectWriter $awsFencedWriter = null,
+        private readonly ?ClusterWorkFencingStore $clusterFencing = null,
+        private readonly ?string $clusterWorkerId = null,
     ) {
+        if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
+            throw new \InvalidArgumentException('Cluster transition fencing requires both store and worker identity.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($this->leaseRenewalIntervalSeconds)
             || $this->leaseRenewalIntervalSeconds <= 0.0
@@ -67,7 +74,12 @@ final class TierTransitionExecutor
         $limit = max(1, $limit);
         while ($stats['processed'] < $limit) {
             $cancellation?->throwIfRequested();
-            $jobs = $this->metadata->dequeueTierTransitionJobs(1);
+            if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                $claim = $this->clusterFencing->claimClusterTierTransition($this->clusterWorkerId, QueueLease::DURATION_SECONDS);
+                $jobs = $claim === null ? [] : [(array) $claim->work + ['cluster_work_token' => $claim->token]];
+            } else {
+                $jobs = $this->metadata->dequeueTierTransitionJobs(1);
+            }
             if ($jobs === []) {
                 break;
             }
@@ -239,7 +251,7 @@ final class TierTransitionExecutor
                 if ($bucketOwner !== null) {
                     OwnerWriteLock::acquire($this->metadata, $bucketOwner);
                 }
-                if (! $this->renewOwnedLease($job, $leaseExpiresAt)) {
+                if (! $this->renewOwnedLease($job, $leaseExpiresAt, inTransaction: true)) {
                     return false;
                 }
                 $currentJob = $this->metadata->getTierTransitionJob($id);
@@ -412,7 +424,7 @@ final class TierTransitionExecutor
             if ($bucketOwner !== null) {
                 OwnerWriteLock::acquire($this->metadata, $bucketOwner);
             }
-            if (! $this->renewOwnedLease($job, $leaseExpiresAt)) {
+            if (! $this->renewOwnedLease($job, $leaseExpiresAt, inTransaction: true)) {
                 return null;
             }
 
@@ -657,6 +669,9 @@ final class TierTransitionExecutor
                 if ($owner !== null) {
                     OwnerWriteLock::acquire($this->metadata, $owner);
                 }
+                if (! $this->assertClusterWorkInTransaction($job)) {
+                    return true;
+                }
                 $versionId = $job['versionId'] ?? null;
                 $objects = is_string($versionId) && $versionId !== ''
                     ? [$this->metadata->getObjectMetadataByVersion(
@@ -779,7 +794,7 @@ final class TierTransitionExecutor
                     OwnerWriteLock::acquire($this->metadata, $bucketOwner);
                 }
 
-                if (! $this->renewOwnedLease($job, $leaseExpiresAt)) {
+                if (! $this->renewOwnedLease($job, $leaseExpiresAt, inTransaction: true)) {
                     return false;
                 }
 
@@ -858,8 +873,21 @@ final class TierTransitionExecutor
     }
 
     /** @param array<string, mixed> $job */
-    private function renewOwnedLease(array $job, float &$currentLease, ?float $newLease = null): bool
+    private function renewOwnedLease(array $job, float &$currentLease, ?float $newLease = null, bool $inTransaction = false): bool
     {
+        $token = $job['cluster_work_token'] ?? null;
+        if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+            if ($inTransaction) {
+                return $this->assertClusterWorkInTransaction($job);
+            }
+            $renewedToken = $this->clusterFencing->renewClusterWork($token, QueueLease::DURATION_SECONDS);
+            if ($renewedToken === null) {
+                return false;
+            }
+            $currentLease = $renewedToken->leaseExpiresAt;
+
+            return true;
+        }
         $id = (int) $job['id'];
         // An immediate renewal must change the stored value even on drivers
         // that round floating-point timestamps before reporting affected rows.
@@ -884,6 +912,22 @@ final class TierTransitionExecutor
     }
 
     /** @param array<string, mixed> $job */
+    private function assertClusterWorkInTransaction(array $job): bool
+    {
+        $token = $job['cluster_work_token'] ?? null;
+        if (! $token instanceof ClusterWorkToken || $this->clusterFencing === null) {
+            return true;
+        }
+        try {
+            $this->clusterFencing->assertClusterWorkToken($token);
+
+            return true;
+        } catch (\RuntimeException) {
+            return false;
+        }
+    }
+
+    /** @param array<string, mixed> $job */
     private function updateOwnedJobStatus(
         array $job,
         string $status,
@@ -894,6 +938,24 @@ final class TierTransitionExecutor
         ?float $expectedLeaseExpiresAt = null,
     ): bool {
         $id = (int) $job['id'];
+        $token = $job['cluster_work_token'] ?? null;
+        if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+            try {
+                return $this->clusterFencing->transactionWithClusterWork(
+                    $token,
+                    fn(): bool => $this->metadata->updateTierTransitionJobStatus(
+                        $id,
+                        $status,
+                        $error,
+                        $nextAttemptAt,
+                        $incrementAttempts,
+                        $targetStoragePath,
+                    ),
+                );
+            } catch (\RuntimeException) {
+                return false;
+            }
+        }
         if ($expectedLeaseExpiresAt !== null && $this->metadata instanceof FencedQueueStore && isset($job['leaseGeneration'])) {
             return $this->metadata->updateTierTransitionJobStatusLease(
                 $id,

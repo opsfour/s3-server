@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 46;
+    public const int VERSION = 47;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -130,6 +130,8 @@ final class PostgresSchema
                 lock_name TEXT PRIMARY KEY,
                 owner_id TEXT NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
+                heartbeat_at DOUBLE PRECISION,
+                lease_generation BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -167,6 +169,8 @@ final class PostgresSchema
                 target_storage_path TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 lease_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -191,6 +195,8 @@ final class PostgresSchema
                 restore_days INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 lease_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -529,6 +535,8 @@ final class PostgresSchema
                 payload_json TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 lease_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 10,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
@@ -552,6 +560,8 @@ final class PostgresSchema
                 upload_id TEXT,
                 owner_id TEXT,
                 lease_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -581,6 +591,8 @@ final class PostgresSchema
                 lease_until DOUBLE PRECISION NOT NULL,
                 next_attempt_at DOUBLE PRECISION NOT NULL,
                 claim_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -603,6 +615,8 @@ final class PostgresSchema
                 state TEXT NOT NULL DEFAULT 'active',
                 lease_until DOUBLE PRECISION NOT NULL,
                 claim_generation BIGINT NOT NULL DEFAULT 0,
+                claim_worker_id TEXT,
+                claim_heartbeat_at DOUBLE PRECISION,
                 dispatch_id TEXT DEFAULT '00000000000000000000000000000000',
                 expected_size BIGINT,
                 expected_sha256 TEXT,
@@ -1054,6 +1068,60 @@ final class PostgresSchema
                     roles_digest TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+                SQL;
+        }
+        if ($fromVersion < 47) {
+            // The DDL and invalidation share one PostgreSQL statement so no
+            // v47 process can observe a pre-owner active generation.
+            $statements[] = <<<'SQL'
+                DO $$
+                BEGIN
+                    ALTER TABLE s3_locks ADD COLUMN IF NOT EXISTS heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_locks ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0;
+                    ALTER TABLE s3_notification_queue ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_notification_queue ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_tier_transition_jobs ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_tier_transition_jobs ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_restore_jobs ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_restore_jobs ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_storage_garbage ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_multipart_write_intents ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_multipart_write_intents ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+                    ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS claim_worker_id TEXT;
+                    ALTER TABLE s3_object_write_intents ADD COLUMN IF NOT EXISTS claim_heartbeat_at DOUBLE PRECISION;
+
+                    UPDATE s3_locks
+                    SET expires_at = clock_timestamp(), heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                        lease_generation = lease_generation + 1;
+                    UPDATE s3_notification_queue
+                    SET status = 'pending', next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                        lease_generation = lease_generation + 1, claim_worker_id = NULL, claim_heartbeat_at = NULL
+                    WHERE status = 'processing';
+                    UPDATE s3_tier_transition_jobs
+                    SET status = 'pending', next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                        lease_generation = lease_generation + 1, claim_worker_id = NULL, claim_heartbeat_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE status = 'processing';
+                    UPDATE s3_restore_jobs
+                    SET status = 'pending', next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                        lease_generation = lease_generation + 1, claim_worker_id = NULL, claim_heartbeat_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE status = 'processing';
+                    UPDATE s3_storage_garbage
+                    SET status = 'pending', next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                        lease_generation = lease_generation + 1, claim_worker_id = NULL, claim_heartbeat_at = NULL
+                    WHERE status = 'processing';
+                    UPDATE s3_multipart_write_intents
+                    SET next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()), claim_generation = claim_generation + 1,
+                        claim_worker_id = NULL, claim_heartbeat_at = NULL
+                    WHERE state = 'abandoned' AND next_attempt_at < 1.0e300;
+                    UPDATE s3_object_write_intents
+                    SET lease_until = EXTRACT(EPOCH FROM clock_timestamp()), claim_generation = claim_generation + 1,
+                        claim_worker_id = NULL, claim_heartbeat_at = NULL
+                    WHERE state = 'reconciling';
+                END
+                $$
                 SQL;
         }
 

@@ -14,6 +14,8 @@ use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\OwnerWriteLock;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\ObjectLock\ObjectLockChecker;
@@ -61,6 +63,8 @@ final class LifecycleExecutor
 
     private bool $runnerStopRequested = false;
 
+    private ?ClusterWorkToken $clusterLease = null;
+
     public function __construct(
         private readonly MetadataStore $metadata,
         private readonly StorageBackend $storage,
@@ -74,7 +78,12 @@ final class LifecycleExecutor
         ?StorageTierRegistry $storageTiers = null,
         private readonly int $multipartMaxAgeSeconds = 604_800,
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
+        private readonly ?ClusterWorkFencingStore $clusterFencing = null,
+        private readonly ?string $clusterWorkerId = null,
     ) {
+        if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
+            throw new \InvalidArgumentException('Cluster lifecycle fencing requires both store and worker identity.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
         if ($this->batchSize < 1) {
             throw new \InvalidArgumentException('Lifecycle batch size must be >= 1.');
@@ -118,7 +127,13 @@ final class LifecycleExecutor
         // This requires iterating all buckets. We'll use a simple approach.
         try {
             $this->renewLeaseIfNeeded();
-            $lockAcquired = $this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds);
+            if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                $claim = $this->clusterFencing->claimClusterLifecycle($this->clusterWorkerId, $this->lockTtlSeconds);
+                $this->clusterLease = $claim?->token;
+                $lockAcquired = $claim !== null;
+            } else {
+                $lockAcquired = $this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds);
+            }
             if (! $lockAcquired) {
                 $status = 'skipped_lock';
                 $this->logger->info('Lifecycle sweep skipped because another node holds the lifecycle lock.', $this->lifecycleContext([
@@ -151,7 +166,11 @@ final class LifecycleExecutor
             $this->leaseHeld = false;
             if ($lockAcquired) {
                 try {
-                    $this->metadata->releaseLock('lifecycle:global', $this->lockOwnerId);
+                    if ($this->clusterLease !== null && $this->clusterFencing !== null) {
+                        $this->clusterFencing->releaseClusterWork($this->clusterLease);
+                    } else {
+                        $this->metadata->releaseLock('lifecycle:global', $this->lockOwnerId);
+                    }
                 } catch (\Throwable $e) {
                     $this->logger->warning('Lifecycle lock release failed.', $this->lifecycleContext([
                         'event' => 'lock_release_failed',
@@ -160,6 +179,7 @@ final class LifecycleExecutor
                     ]));
                 }
             }
+            $this->clusterLease = null;
 
             $this->metrics?->finishLifecycleSweep($status, hrtime(true) - $startedAt);
             $this->logger->info('Lifecycle sweep finished.', $this->lifecycleContext([
@@ -764,6 +784,7 @@ final class LifecycleExecutor
 
         return $this->metadata->transaction(function () use ($observedBucket, $object, $targetStorageClass, $targetTier, $bucketOwner, $expectedLatest, $ruleId): bool {
             OwnerWriteLock::acquire($this->metadata, $bucketOwner);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $current = $object->versionId !== null || ! $expectedLatest
                 ? $this->metadata->getObjectMetadataByVersion($object->bucket, $object->key, $object->versionId ?? 'null')
@@ -843,6 +864,7 @@ final class LifecycleExecutor
                 $obj->ownerId,
                 $observedNullOwnerId,
             );
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
                 return false;
@@ -916,6 +938,7 @@ final class LifecycleExecutor
 
         $deleted = $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $object, $rule, $versionId): ObjectInfo|false|null {
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $object->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
                 return false;
@@ -973,6 +996,7 @@ final class LifecycleExecutor
 
         return $this->metadata->transaction(function () use ($observedBucket, $bucketOwner, $bucket, $marker, $rule, $versionId): bool {
             OwnerWriteLock::acquire($this->metadata, $bucketOwner, $marker->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             if (! $this->ruleStillCurrent($bucket, $rule)) {
                 return false;
@@ -1154,6 +1178,7 @@ final class LifecycleExecutor
         $this->renewLeaseIfNeeded();
         $this->metadata->transaction(function () use ($observedBucket, $rule, $action, $object): void {
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $this->metadata->putLifecycleCheckpoint(
                 $observedBucket->name,
@@ -1178,6 +1203,7 @@ final class LifecycleExecutor
         $this->renewLeaseIfNeeded();
         $this->metadata->transaction(function () use ($observedBucket, $rule, $action, $key, $uploadId): void {
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $this->metadata->putLifecycleCheckpoint(
                 $observedBucket->name,
@@ -1198,6 +1224,7 @@ final class LifecycleExecutor
         if ($checkpoint !== null) {
             $this->metadata->transaction(function () use ($observedBucket, $rule, $action): void {
                 OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+                $this->assertClusterLeaseInTransaction();
                 BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
                 $this->metadata->deleteLifecycleCheckpoint($observedBucket->name, $this->ruleId($rule), $action);
             });
@@ -1299,20 +1326,23 @@ final class LifecycleExecutor
             }
         }
 
-        if ($nextBucketName !== null) {
-            $this->metadata->putLifecycleCheckpoint(
-                self::SWEEP_CURSOR_BUCKET,
-                self::SWEEP_CURSOR_RULE,
-                self::SWEEP_CURSOR_ACTION,
-                $nextBucketName,
-            );
-        } else {
-            $this->metadata->deleteLifecycleCheckpoint(
-                self::SWEEP_CURSOR_BUCKET,
-                self::SWEEP_CURSOR_RULE,
-                self::SWEEP_CURSOR_ACTION,
-            );
-        }
+        $this->metadata->transaction(function () use ($nextBucketName): void {
+            $this->assertClusterLeaseInTransaction();
+            if ($nextBucketName !== null) {
+                $this->metadata->putLifecycleCheckpoint(
+                    self::SWEEP_CURSOR_BUCKET,
+                    self::SWEEP_CURSOR_RULE,
+                    self::SWEEP_CURSOR_ACTION,
+                    $nextBucketName,
+                );
+            } else {
+                $this->metadata->deleteLifecycleCheckpoint(
+                    self::SWEEP_CURSOR_BUCKET,
+                    self::SWEEP_CURSOR_RULE,
+                    self::SWEEP_CURSOR_ACTION,
+                );
+            }
+        });
 
         $this->logger->debug('Lifecycle bucket sweep completed.', $this->lifecycleContext([
             'event' => 'bucket_sweep_completed',
@@ -1365,13 +1395,30 @@ final class LifecycleExecutor
             return;
         }
 
-        if (! $this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds)) {
-            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
-                'Lifecycle lease was lost while processing.',
-            );
+        if ($this->clusterLease !== null && $this->clusterFencing !== null) {
+            $renewed = $this->clusterFencing->renewClusterWork($this->clusterLease, $this->lockTtlSeconds);
+            if ($renewed !== null) {
+                $this->clusterLease = $renewed;
+                $this->lastLeaseRenewal = $now;
+
+                return;
+            }
+        } elseif ($this->metadata->acquireLock('lifecycle:global', $this->lockOwnerId, $this->lockTtlSeconds)) {
+            $this->lastLeaseRenewal = $now;
+
+            return;
         }
 
-        $this->lastLeaseRenewal = $now;
+        throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+            'Lifecycle lease was lost while processing.',
+        );
+    }
+
+    private function assertClusterLeaseInTransaction(): void
+    {
+        if ($this->clusterLease !== null && $this->clusterFencing !== null) {
+            $this->clusterFencing->assertClusterWorkToken($this->clusterLease);
+        }
     }
 
     private function assertNotStopping(): void
@@ -1493,6 +1540,7 @@ final class LifecycleExecutor
         $this->renewLeaseIfNeeded();
         $this->metadata->transaction(function () use ($observedBucket, $key, $uploadId): void {
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $this->metadata->putLifecycleCheckpoint(
                 $observedBucket->name,
@@ -1513,6 +1561,7 @@ final class LifecycleExecutor
 
         $this->metadata->transaction(function () use ($observedBucket): void {
             OwnerWriteLock::acquire($this->metadata, $observedBucket->ownerId);
+            $this->assertClusterLeaseInTransaction();
             BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
             $this->metadata->deleteLifecycleCheckpoint(
                 $observedBucket->name,
@@ -1552,6 +1601,7 @@ final class LifecycleExecutor
                     $bucketOwner ?? '',
                     $upload['owner_id'],
                 );
+                $this->assertClusterLeaseInTransaction();
                 if ($observedBucket !== null) {
                     BucketGenerationGuard::assertCurrent($this->metadata, $observedBucket);
                 }

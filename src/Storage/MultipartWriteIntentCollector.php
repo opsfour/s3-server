@@ -13,6 +13,9 @@ use OpsFour\S3Server\Metadata\LocalMultipartCompletionIntentStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
+use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -29,7 +32,12 @@ final readonly class MultipartWriteIntentCollector
         private float $claimLeaseSeconds = 300.0,
         private float $renewIntervalSeconds = 100.0,
         private ?AwsS3OperationalState $awsOperationalState = null,
+        private ?ClusterWorkFencingStore $clusterFencing = null,
+        private ?string $clusterWorkerId = null,
     ) {
+        if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
+            throw new \InvalidArgumentException('Cluster multipart fencing requires both store and worker identity.');
+        }
         $this->logger = new FailureIsolatingLogger($logger);
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0
             || ! is_finite($renewIntervalSeconds) || $renewIntervalSeconds <= 0
@@ -87,7 +95,13 @@ final readonly class MultipartWriteIntentCollector
             $cancellation?->throwIfRequested();
             $now = $this->metadata->multipartWriteIntentNow();
             try {
-                $claimed = $this->metadata->claimDueMultipartWriteIntents(1, $now, $now + $this->claimLeaseSeconds);
+                if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                    $clusterClaim = $this->clusterFencing->claimClusterMultipartIntent($this->clusterWorkerId, $this->claimLeaseSeconds);
+                    $claimed = $clusterClaim === null ? [] : [$clusterClaim->work];
+                } else {
+                    $clusterClaim = null;
+                    $claimed = $this->metadata->claimDueMultipartWriteIntents(1, $now, $now + $this->claimLeaseSeconds);
+                }
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
@@ -101,9 +115,22 @@ final readonly class MultipartWriteIntentCollector
                 break;
             }
             $intent = $claimed[0];
+            if (! $intent instanceof MultipartWriteIntent) {
+                throw new \LogicException('Multipart cluster claim returned an invalid payload.');
+            }
+            $clusterToken = $clusterClaim?->token;
             // A watcher trip during SQL claim leaves its lease for recovery.
             $leaseUntil = $intent->nextAttemptAt;
-            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$leaseUntil, $claims): bool {
+            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use ($intent, &$leaseUntil, $claims, $clusterToken): bool {
+                if ($clusterToken instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+                    $renewed = $this->clusterFencing->renewClusterWork($clusterToken, $this->claimLeaseSeconds);
+                    if ($renewed === null) {
+                        return false;
+                    }
+                    $leaseUntil = $renewed->leaseExpiresAt;
+
+                    return true;
+                }
                 $next = $this->metadata->multipartWriteIntentNow() + $this->claimLeaseSeconds;
                 if (! $claims->renewMultipartCollectorClaim(
                     $intent->attemptId,
@@ -190,12 +217,28 @@ final readonly class MultipartWriteIntentCollector
             $nextAttemptAt = $failed === null && $localBackend instanceof FilesystemBackend
                 ? 1.0e300
                 : $this->metadata->multipartWriteIntentNow() + ($failed === null ? 3600 : 60);
-            $retained = $this->metadata->retryMultipartCollectorClaim(
-                $intent->attemptId,
-                $nextAttemptAt,
-                $leaseUntil,
-                $intent->claimGeneration,
-            );
+            if ($clusterToken instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+                try {
+                    $retained = $this->clusterFencing->transactionWithClusterWork(
+                        $clusterToken,
+                        fn(): bool => $this->metadata->retryMultipartCollectorClaim(
+                            $intent->attemptId,
+                            $nextAttemptAt,
+                            $leaseUntil,
+                            $intent->claimGeneration,
+                        ),
+                    );
+                } catch (\RuntimeException) {
+                    $retained = false;
+                }
+            } else {
+                $retained = $this->metadata->retryMultipartCollectorClaim(
+                    $intent->attemptId,
+                    $nextAttemptAt,
+                    $leaseUntil,
+                    $intent->claimGeneration,
+                );
+            }
             if ($failed === null) {
                 if ($retained) {
                     $cleaned++;

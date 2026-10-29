@@ -1270,6 +1270,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
         \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+        ?ClusterWorkToken $clusterToken = null,
     ): bool {
         if (! $this->inner instanceof AwsS3GarbageClaimStore) {
             throw new \LogicException('Wrapped metadata store does not support AWS garbage claims.');
@@ -1285,6 +1286,7 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
             $currentLeaseUntil,
             $stopRenewal,
             $deletion,
+            $clusterToken,
         );
     }
 

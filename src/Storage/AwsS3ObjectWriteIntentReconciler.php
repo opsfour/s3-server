@@ -7,6 +7,8 @@ namespace OpsFour\S3Server\Storage;
 use Amp\Cancellation;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 
 /** Reconciles one current generation-fenced AWS SQL claim. */
@@ -35,6 +37,8 @@ final readonly class AwsS3ObjectWriteIntentReconciler
         ObjectWriteIntent $claimed,
         ?Cancellation $cancellation = null,
         float $claimLeaseSeconds = 300.0,
+        ?ClusterWorkToken $clusterToken = null,
+        ?ClusterWorkFencingStore $clusterFencing = null,
     ): void {
         if (! is_finite($claimLeaseSeconds) || $claimLeaseSeconds <= 0.0 || $claimLeaseSeconds > 86390.0
             || $claimed->storageTier !== $this->tierName || ! $claimed->sealReserved) {
@@ -45,12 +49,20 @@ final readonly class AwsS3ObjectWriteIntentReconciler
             throw new \RuntimeException('AWS object write claim is no longer current in SQL.');
         }
         $heartbeatCount = 0;
-        $heartbeat = function () use (&$current, &$heartbeatCount, $claimLeaseSeconds, $cancellation): void {
+        $token = $clusterToken;
+        $heartbeat = function () use (&$current, &$heartbeatCount, $claimLeaseSeconds, $cancellation, &$token, $clusterFencing): void {
             $cancellation?->throwIfRequested();
             // Provider commands can begin within one database clock tick. An
             // increasing duration guarantees every heartbeat extends rather
             // than accidentally reproducing the just-claimed deadline.
             ++$heartbeatCount;
+            if ($token !== null && $clusterFencing !== null) {
+                $token = $clusterFencing->renewClusterWork($token, $claimLeaseSeconds + $heartbeatCount);
+                if ($token === null) {
+                    throw new \RuntimeException('AWS object write claim was lost during reconciliation.');
+                }
+                return;
+            }
             $renewed = $this->metadata->renewObjectWriteClaim(
                 $current->attemptId,
                 $current->claimGeneration,
@@ -65,7 +77,13 @@ final readonly class AwsS3ObjectWriteIntentReconciler
 
         $this->seals->reconcile($current, $heartbeat);
         $cancellation?->throwIfRequested();
-        if (! $this->metadata->sealObjectWriteIntent($current->attemptId, $current->claimGeneration)) {
+        $sealed = $clusterToken !== null && $clusterFencing !== null
+            ? $clusterFencing->transactionWithClusterWork(
+                $clusterToken,
+                fn(): bool => $this->metadata->sealObjectWriteIntent($current->attemptId, $current->claimGeneration),
+            )
+            : $this->metadata->sealObjectWriteIntent($current->attemptId, $current->claimGeneration);
+        if (! $sealed) {
             throw new \RuntimeException('Verified AWS object seal could not be committed in SQL.');
         }
     }

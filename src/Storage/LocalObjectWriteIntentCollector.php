@@ -11,6 +11,7 @@ use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -28,6 +29,10 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
     private readonly LocalObjectWriteIntentReconciler $reconciler;
 
     private readonly LoggerInterface $logger;
+
+    private ?ClusterWorkFencingStore $clusterFencing = null;
+
+    private ?string $clusterWorkerId = null;
 
     public function __construct(
         private readonly ObjectWriteIntentStore $metadata,
@@ -63,6 +68,15 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
         }
     }
 
+    public function enableClusterFencing(ClusterWorkFencingStore $fencing, string $workerId): void
+    {
+        if ($this->clusterFencing !== null) {
+            throw new \LogicException('Local object collector cluster fencing is already configured.');
+        }
+        $this->clusterFencing = $fencing;
+        $this->clusterWorkerId = $workerId;
+    }
+
     /** Return completed retirements plus seals; the limit bounds their total per pass. */
     public function collect(int $limit = 100, ?Cancellation $cancellation = null): int
     {
@@ -78,13 +92,28 @@ final class LocalObjectWriteIntentCollector implements ShutdownAwareStorageBacke
         $sealed = 0;
         for ($i = $retired; $i < $limit; $i++) {
             $cancellation?->throwIfRequested();
-            $claimed = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+            if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                $clusterClaim = $this->clusterFencing->claimClusterObjectIntent($this->tierName, $this->clusterWorkerId, $this->claimLeaseSeconds);
+                $claimed = $clusterClaim === null ? [] : [$clusterClaim->work];
+            } else {
+                $clusterClaim = null;
+                $claimed = $this->metadata->claimDueObjectWriteIntents($this->tierName, 1, $this->claimLeaseSeconds);
+            }
             if ($claimed === []) {
                 break;
             }
             $intent = $claimed[0];
+            if (! $intent instanceof \OpsFour\S3Server\Metadata\ObjectWriteIntent) {
+                throw new \LogicException('Object cluster claim returned an invalid payload.');
+            }
             try {
-                $this->reconciler->reconcile($intent, $cancellation, $this->claimLeaseSeconds);
+                $this->reconciler->reconcile(
+                    $intent,
+                    $cancellation,
+                    $this->claimLeaseSeconds,
+                    $clusterClaim?->token,
+                    $this->clusterFencing,
+                );
                 $sealed++;
             } catch (CancelledException $error) {
                 throw $error;

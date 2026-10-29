@@ -346,6 +346,10 @@ final readonly class S3ServerRuntimeFactory
                 );
                 $clusterAdmission->admitInitial();
                 $server->setClusterAdmissionController($clusterAdmission);
+                $server->setClusterWorkFencing(
+                    $clusterStore,
+                    ClusterWorkerIdentity::fromConfig($config),
+                );
             }
 
             return $runtime;

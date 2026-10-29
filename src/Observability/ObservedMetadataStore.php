@@ -1216,6 +1216,7 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
         \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+        ?\OpsFour\S3Server\Metadata\ClusterWorkToken $clusterToken = null,
     ): bool {
         if (! $this->inner instanceof AwsS3GarbageClaimStore) {
             throw new \LogicException('Wrapped metadata store does not support AWS garbage claims.');
@@ -1231,6 +1232,7 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
             $currentLeaseUntil,
             $stopRenewal,
             $deletion,
+            $clusterToken,
         ));
     }
 

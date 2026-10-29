@@ -423,6 +423,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         int $leaseGeneration,
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
+        ?\OpsFour\S3Server\Metadata\ClusterWorkToken $clusterToken = null,
     ): bool {
         $this->assertOperationalBinding($tier, $claims);
         $deletion = new AwsS3GarbageDeletion(
@@ -445,6 +446,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 $currentLeaseUntil,
                 $stopRenewal,
                 $deletion,
+                $clusterToken,
             );
         } finally {
             $deletion->revoke();

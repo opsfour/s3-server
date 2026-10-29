@@ -26,5 +26,6 @@ interface AwsS3GarbageClaimStore
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
         AwsS3GarbageDeletion $deletion,
+        ?ClusterWorkToken $clusterToken = null,
     ): bool;
 }

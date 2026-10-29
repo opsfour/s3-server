@@ -32,7 +32,7 @@ use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -4486,22 +4486,39 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         \Closure $currentLeaseUntil,
         \Closure $stopRenewal,
         \OpsFour\S3Server\Storage\AwsS3GarbageDeletion $deletion,
+        ?ClusterWorkToken $clusterToken = null,
     ): bool {
         if ($ownerId === '' || ! $deletion->matches($bucket, $tier, $path, $ownerId)) {
             return false;
         }
-        return $this->transaction(function () use ($id, $bucket, $tier, $path, $ownerId, $generation, $currentLeaseUntil, $stopRenewal, $deletion): bool {
+        if ($clusterToken !== null) {
+            // The guarded transaction locks the claim row before provider I/O.
+            // Stop the separate renewal fiber first so it cannot block on that
+            // row while this transaction waits for the fiber during cleanup.
+            $stopRenewal();
+        }
+        return $this->transaction(function () use ($id, $bucket, $tier, $path, $ownerId, $generation, $currentLeaseUntil, $stopRenewal, $deletion, $clusterToken): bool {
             // Every supported publication and reference mutation takes this
             // owner lock before writing metadata. Retain it until provider
             // absence and the final queue acknowledgement are durable.
             $this->lockOwnerForUpdate($ownerId);
+            if ($clusterToken !== null) {
+                if ($clusterToken->kind !== ClusterWorkToken::STORAGE_GARBAGE
+                    || $clusterToken->workId !== (string) $id
+                    || $clusterToken->generation !== $generation) {
+                    return false;
+                }
+                $this->assertClusterWorkToken($clusterToken);
+            }
             if (! $this->canDeleteAwsGarbageClaim($id, $bucket, $tier, $path, $ownerId, $generation)) {
                 return false;
             }
             $deletion->execute();
             // Provider I/O yields to the heartbeat. Stop it before reading the
             // final deadline so no renewal can invalidate the acknowledgement.
-            $stopRenewal();
+            if ($clusterToken === null) {
+                $stopRenewal();
+            }
             $leaseUntil = $currentLeaseUntil();
             if (! $this->canDeleteAwsGarbageClaim($id, $bucket, $tier, $path, $ownerId, $generation)) {
                 return false;
@@ -4544,6 +4561,378 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
              WHERE id = $3 AND status = 'processing' AND next_attempt_at = $4 AND lease_generation = $5",
             [$error, $nextAttemptAt, $id, $leaseExpiresAt, $leaseGeneration],
         )->getRowCount() ?? 0) === 1;
+    }
+
+    public function claimClusterLifecycle(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        self::validateClusterClaim($workerId, $leaseSeconds);
+
+        return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(<<<'SQL'
+                INSERT INTO s3_locks (lock_name, owner_id, expires_at, heartbeat_at, lease_generation)
+                VALUES ('lifecycle:global', $1, clock_timestamp() + ($2::double precision * INTERVAL '1 second'),
+                        EXTRACT(EPOCH FROM clock_timestamp()), 1)
+                ON CONFLICT (lock_name) DO UPDATE
+                SET owner_id = EXCLUDED.owner_id,
+                    expires_at = EXCLUDED.expires_at,
+                    heartbeat_at = EXCLUDED.heartbeat_at,
+                    lease_generation = s3_locks.lease_generation + 1,
+                    updated_at = clock_timestamp()
+                WHERE s3_locks.expires_at <= clock_timestamp()
+                RETURNING owner_id, lease_generation, heartbeat_at,
+                          EXTRACT(EPOCH FROM expires_at) AS lease_expires_at
+                SQL, [$workerId, $leaseSeconds])->fetchRow();
+
+            return $row === null ? null : new ClusterWorkClaim(
+                self::clusterToken(ClusterWorkToken::LIFECYCLE, 'lifecycle:global', $row),
+                null,
+            );
+        });
+    }
+
+    public function claimClusterNotification(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        self::validateClusterClaim($workerId, $leaseSeconds);
+
+        return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(<<<'SQL'
+                WITH due AS (
+                    SELECT id FROM s3_notification_queue
+                    WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
+                       OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
+                    ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE s3_notification_queue AS queue
+                SET status = 'processing', lease_generation = queue.lease_generation + 1,
+                    claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                    next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
+                FROM due WHERE queue.id = due.id
+                RETURNING queue.*
+                SQL, [$workerId, $leaseSeconds])->fetchRow();
+            if ($row === null) {
+                return null;
+            }
+            $work = [
+                'id' => (int) $row['id'],
+                'bucket' => self::str($row['bucket']),
+                'key_name' => self::str($row['key_name']),
+                'event_name' => self::str($row['event_name']),
+                'destination_url' => self::str($row['destination_url']),
+                'payload_json' => self::str($row['payload_json']),
+                'attempts' => (int) $row['attempts'],
+                'max_attempts' => (int) $row['max_attempts'],
+                'lease_expires_at' => (float) $row['next_attempt_at'],
+                'lease_generation' => (int) $row['lease_generation'],
+            ];
+
+            return new ClusterWorkClaim(
+                self::clusterToken(ClusterWorkToken::NOTIFICATION, (string) $work['id'], $row, 'next_attempt_at'),
+                $work,
+            );
+        });
+    }
+
+    public function claimClusterTierTransition(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        return $this->claimClusterQueueRow(
+            ClusterWorkToken::TIER_TRANSITION,
+            's3_tier_transition_jobs',
+            $workerId,
+            $leaseSeconds,
+            $this->rowToTierTransitionJob(...),
+        );
+    }
+
+    public function claimClusterRestore(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        return $this->claimClusterQueueRow(
+            ClusterWorkToken::RESTORE,
+            's3_restore_jobs',
+            $workerId,
+            $leaseSeconds,
+            $this->rowToRestoreJob(...),
+        );
+    }
+
+    public function claimClusterStorageGarbage(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        self::validateClusterClaim($workerId, $leaseSeconds);
+
+        return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(<<<'SQL'
+                WITH due AS (
+                    SELECT id FROM s3_storage_garbage
+                    WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
+                       OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
+                    ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE s3_storage_garbage AS garbage
+                SET status = 'processing', lease_generation = garbage.lease_generation + 1,
+                    claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                    next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
+                FROM due WHERE garbage.id = due.id
+                RETURNING garbage.*
+                SQL, [$workerId, $leaseSeconds])->fetchRow();
+            if ($row === null) {
+                return null;
+            }
+            $work = [
+                'id' => (int) $row['id'],
+                'bucket' => self::str($row['bucket']),
+                'storage_tier' => self::str($row['storage_tier']),
+                'storage_path' => self::str($row['storage_path']),
+                'operation' => self::str($row['operation']),
+                'key_name' => $row['key_name'] === null ? null : self::str($row['key_name']),
+                'upload_id' => $row['upload_id'] === null ? null : self::str($row['upload_id']),
+                'owner_id' => $row['owner_id'] === null ? null : self::str($row['owner_id']),
+                'attempts' => (int) $row['attempts'],
+                'lease_expires_at' => (float) $row['next_attempt_at'],
+                'lease_generation' => (int) $row['lease_generation'],
+                'dispatch_id' => $row['dispatch_id'] === null ? null : self::str($row['dispatch_id']),
+            ];
+
+            return new ClusterWorkClaim(
+                self::clusterToken(ClusterWorkToken::STORAGE_GARBAGE, (string) $work['id'], $row, 'next_attempt_at'),
+                $work,
+            );
+        });
+    }
+
+    public function claimClusterMultipartIntent(string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        self::validateClusterClaim($workerId, $leaseSeconds);
+
+        return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(<<<'SQL'
+                WITH due AS (
+                    SELECT attempt_id FROM s3_multipart_write_intents
+                    WHERE dispatch_id IS NOT NULL
+                      AND ((state = 'active' AND lease_until <= EXTRACT(EPOCH FROM clock_timestamp()))
+                       OR (state = 'abandoned' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())))
+                    ORDER BY next_attempt_at, attempt_id LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE s3_multipart_write_intents AS intent
+                SET state = 'abandoned', active_upload_id = NULL,
+                    claim_generation = intent.claim_generation + 1,
+                    claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                    next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
+                FROM due WHERE intent.attempt_id = due.attempt_id
+                RETURNING intent.*
+                SQL, [$workerId, $leaseSeconds])->fetchRow();
+            if ($row === null) {
+                return null;
+            }
+
+            return new ClusterWorkClaim(
+                self::clusterToken(ClusterWorkToken::MULTIPART_INTENT, self::str($row['attempt_id']), $row, 'next_attempt_at', 'claim_generation'),
+                self::multipartWriteIntentFromRow($row),
+            );
+        });
+    }
+
+    public function claimClusterObjectIntent(string $storageTier, string $workerId, float $leaseSeconds): ?ClusterWorkClaim
+    {
+        self::validateObjectWriteLease($leaseSeconds);
+        self::validateClusterClaim($workerId, $leaseSeconds);
+        if ($storageTier === '' || strlen($storageTier) > 64) {
+            throw new \InvalidArgumentException('Physical write claim storage tier is invalid.');
+        }
+
+        return $this->clusterMetadataRetry(function () use ($storageTier, $workerId, $leaseSeconds): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(<<<'SQL'
+                WITH due AS (
+                    SELECT attempt_id FROM s3_object_write_intents
+                    WHERE storage_tier = $1 AND state IN ('active', 'reconciling') AND dispatch_id IS NOT NULL
+                      AND lease_until <= EXTRACT(EPOCH FROM clock_timestamp())
+                    ORDER BY lease_until, attempt_id LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE s3_object_write_intents AS intent
+                SET state = 'reconciling', claim_generation = intent.claim_generation + 1,
+                    claim_worker_id = $2, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
+                    lease_until = EXTRACT(EPOCH FROM clock_timestamp()) + $3::double precision
+                FROM due WHERE intent.attempt_id = due.attempt_id AND intent.storage_tier = $1
+                RETURNING intent.*
+                SQL, [$storageTier, $workerId, $leaseSeconds])->fetchRow();
+            if ($row === null) {
+                return null;
+            }
+
+            return new ClusterWorkClaim(
+                self::clusterToken(ClusterWorkToken::OBJECT_INTENT, self::str($row['attempt_id']), $row, 'lease_until', 'claim_generation'),
+                self::objectWriteIntentFromRow($row),
+            );
+        });
+    }
+
+    public function renewClusterWork(ClusterWorkToken $token, float $leaseSeconds): ?ClusterWorkToken
+    {
+        self::validateClusterClaim($token->workerId, $leaseSeconds);
+
+        return $this->clusterMetadataRetry(function () use ($token, $leaseSeconds): ?ClusterWorkToken {
+            [$sql, $params] = $this->clusterRenewalSql($token, $leaseSeconds);
+            $row = $this->conn()->execute($sql, $params)->fetchRow();
+
+            return $row === null ? null : new ClusterWorkToken(
+                $token->kind,
+                $token->workId,
+                $token->workerId,
+                $token->generation,
+                (float) $row['heartbeat_at'],
+                (float) $row['lease_expires_at'],
+            );
+        });
+    }
+
+    public function assertClusterWorkToken(ClusterWorkToken $token): void
+    {
+        if ($this->fiberTransaction() === null) {
+            throw new \LogicException('Cluster work assertions require the guarded metadata transaction.');
+        }
+        [$sql, $params] = $this->clusterAssertionSql($token);
+        if ($this->conn()->execute($sql, $params)->fetchRow() === null) {
+            throw new \RuntimeException('Cluster work ownership was lost.');
+        }
+    }
+
+    public function transactionWithClusterWork(ClusterWorkToken $token, callable $callback): mixed
+    {
+        return $this->transaction(function () use ($token, $callback): mixed {
+            $this->assertClusterWorkToken($token);
+
+            return $callback();
+        });
+    }
+
+    public function releaseClusterWork(ClusterWorkToken $token): bool
+    {
+        if ($token->kind !== ClusterWorkToken::LIFECYCLE) {
+            throw new \InvalidArgumentException('Only the lifecycle lease supports explicit release.');
+        }
+
+        return $this->clusterMetadataRetry(fn(): bool => ($this->conn()->execute(
+            'UPDATE s3_locks SET expires_at = clock_timestamp(), heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), '
+            . 'updated_at = clock_timestamp() WHERE lock_name = $1 AND owner_id = $2 AND lease_generation = $3 '
+            . 'AND expires_at > clock_timestamp()',
+            [$token->workId, $token->workerId, $token->generation],
+        )->getRowCount() ?? 0) === 1);
+    }
+
+    /**
+     * @param callable(array<string, mixed>): array<string, mixed> $mapper
+     */
+    private function claimClusterQueueRow(string $kind, string $table, string $workerId, float $leaseSeconds, callable $mapper): ?ClusterWorkClaim
+    {
+        self::validateClusterClaim($workerId, $leaseSeconds);
+        if (! in_array($table, ['s3_tier_transition_jobs', 's3_restore_jobs'], true)) {
+            throw new \LogicException('Unsupported cluster queue table.');
+        }
+
+        return $this->clusterMetadataRetry(function () use ($kind, $table, $workerId, $leaseSeconds, $mapper): ?ClusterWorkClaim {
+            $row = $this->conn()->execute(
+                "WITH due AS (SELECT id FROM {$table} WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) "
+                . "UPDATE {$table} AS queue SET status = 'processing', lease_generation = queue.lease_generation + 1, claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision, updated_at = clock_timestamp() FROM due WHERE queue.id = due.id RETURNING queue.*",
+                [$workerId, $leaseSeconds],
+            )->fetchRow();
+            if ($row === null) {
+                return null;
+            }
+
+            return new ClusterWorkClaim(
+                self::clusterToken($kind, (string) self::int($row['id']), $row, 'next_attempt_at'),
+                $mapper($row),
+            );
+        });
+    }
+
+    /** @param array<string, mixed> $row */
+    private static function clusterToken(string $kind, string $workId, array $row, string $leaseColumn = 'lease_expires_at', string $generationColumn = 'lease_generation'): ClusterWorkToken
+    {
+        return new ClusterWorkToken(
+            $kind,
+            $workId,
+            self::str($row['claim_worker_id'] ?? $row['owner_id']),
+            (int) $row[$generationColumn],
+            (float) ($row['claim_heartbeat_at'] ?? $row['heartbeat_at']),
+            (float) $row[$leaseColumn],
+        );
+    }
+
+    private static function validateClusterClaim(string $workerId, float $leaseSeconds): void
+    {
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9._:-]{0,191}\z/D', $workerId) !== 1) {
+            throw new \InvalidArgumentException('Cluster worker identity is invalid.');
+        }
+        if (! is_finite($leaseSeconds) || $leaseSeconds < 0.001 || $leaseSeconds > 86400.0) {
+            throw new \InvalidArgumentException('Cluster work lease must be between 0.001 and 86400 seconds.');
+        }
+    }
+
+    private function clusterMetadataRetry(callable $callback): mixed
+    {
+        if ($this->fiberTransaction() !== null) {
+            throw new \LogicException('Cluster claim and lease work requires a fresh committed transaction.');
+        }
+        for ($attempt = 1; ; ++$attempt) {
+            try {
+                return $this->transaction($callback);
+            } catch (\Throwable $error) {
+                if ($attempt >= 3 || ! self::isRetryableClusterMetadataError($error)) {
+                    throw $error;
+                }
+            }
+        }
+    }
+
+    private static function isRetryableClusterMetadataError(\Throwable $error): bool
+    {
+        do {
+            if ($error instanceof PostgresQueryError
+                && in_array($error->getDiagnostics()['sqlstate'] ?? null, ['40001', '40P01'], true)) {
+                return true;
+            }
+            $error = $error->getPrevious();
+        } while ($error !== null);
+
+        return false;
+    }
+
+    /** @return array{string, list<int|float|string>} */
+    private function clusterRenewalSql(ClusterWorkToken $token, float $leaseSeconds): array
+    {
+        $params = [$leaseSeconds, $token->workId, $token->workerId, $token->generation];
+        if ($token->kind === ClusterWorkToken::LIFECYCLE) {
+            return ["UPDATE s3_locks SET heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), expires_at = clock_timestamp() + ($1::double precision * INTERVAL '1 second'), updated_at = clock_timestamp() WHERE lock_name = $2 AND owner_id = $3 AND lease_generation = $4 AND expires_at > clock_timestamp() RETURNING heartbeat_at, EXTRACT(EPOCH FROM expires_at) AS lease_expires_at", $params];
+        }
+        [$table, $idColumn, $generationColumn, $leaseColumn, $state] = self::clusterWorkTable($token->kind);
+        $params[1] = $idColumn === 'id' ? (int) $token->workId : $token->workId;
+
+        return ["UPDATE {$table} SET claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), {$leaseColumn} = EXTRACT(EPOCH FROM clock_timestamp()) + $1::double precision WHERE {$idColumn} = $2 AND claim_worker_id = $3 AND {$generationColumn} = $4 AND {$state} AND {$leaseColumn} > EXTRACT(EPOCH FROM clock_timestamp()) RETURNING claim_heartbeat_at AS heartbeat_at, {$leaseColumn} AS lease_expires_at", $params];
+    }
+
+    /** @return array{string, list<int|string>} */
+    private function clusterAssertionSql(ClusterWorkToken $token): array
+    {
+        if ($token->kind === ClusterWorkToken::LIFECYCLE) {
+            return ['SELECT 1 FROM s3_locks WHERE lock_name = $1 AND owner_id = $2 AND lease_generation = $3 AND expires_at > clock_timestamp() FOR UPDATE', [$token->workId, $token->workerId, $token->generation]];
+        }
+        [$table, $idColumn, $generationColumn, $leaseColumn, $state] = self::clusterWorkTable($token->kind);
+        $id = $idColumn === 'id' ? (int) $token->workId : $token->workId;
+
+        return ["SELECT 1 FROM {$table} WHERE {$idColumn} = $1 AND claim_worker_id = $2 AND {$generationColumn} = $3 AND {$state} AND {$leaseColumn} > EXTRACT(EPOCH FROM clock_timestamp()) FOR UPDATE", [$id, $token->workerId, $token->generation]];
+    }
+
+    /** @return array{string, string, string, string, string} */
+    private static function clusterWorkTable(string $kind): array
+    {
+        return match ($kind) {
+            ClusterWorkToken::NOTIFICATION => ['s3_notification_queue', 'id', 'lease_generation', 'next_attempt_at', "status = 'processing'"],
+            ClusterWorkToken::TIER_TRANSITION => ['s3_tier_transition_jobs', 'id', 'lease_generation', 'next_attempt_at', "status = 'processing'"],
+            ClusterWorkToken::RESTORE => ['s3_restore_jobs', 'id', 'lease_generation', 'next_attempt_at', "status = 'processing'"],
+            ClusterWorkToken::STORAGE_GARBAGE => ['s3_storage_garbage', 'id', 'lease_generation', 'next_attempt_at', "status = 'processing'"],
+            ClusterWorkToken::MULTIPART_INTENT => ['s3_multipart_write_intents', 'attempt_id', 'claim_generation', 'next_attempt_at', "state = 'abandoned'"],
+            ClusterWorkToken::OBJECT_INTENT => ['s3_object_write_intents', 'attempt_id', 'claim_generation', 'lease_until', "state = 'reconciling'"],
+            default => throw new \InvalidArgumentException('Cluster work token kind is invalid.'),
+        };
     }
 
     // ===============================================================

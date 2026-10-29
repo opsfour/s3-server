@@ -17,6 +17,9 @@ use Amp\Socket\StaticSocketConnector;
 use League\Uri\BaseUri;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\FencedQueueStore;
+use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
+use OpsFour\S3Server\Metadata\QueueLeaseHeartbeat;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -64,7 +67,12 @@ final class NotificationProcessor
         private readonly ?MetricsCollector $metrics = null,
         private readonly bool $requireHttps = true,
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
+        private readonly ?ClusterWorkFencingStore $clusterFencing = null,
+        private readonly ?string $clusterWorkerId = null,
     ) {
+        if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
+            throw new \InvalidArgumentException('Cluster notification fencing requires both store and worker identity.');
+        }
         $this->httpClient = $httpClient;
         $this->logger = new FailureIsolatingLogger($logger);
     }
@@ -154,9 +162,14 @@ final class NotificationProcessor
                     // Cluster mode claims exactly one row so admission is
                     // revalidated before every subsequent shared claim. Keep
                     // the established standalone batch concurrency unchanged.
-                    $items = $this->metadata->dequeueNotifications(
-                        $this->clusterAdmission === null ? 50 : 1,
-                    );
+                    if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
+                        $claim = $this->clusterFencing->claimClusterNotification($this->clusterWorkerId, 300.0);
+                        $items = $claim === null ? [] : [(array) $claim->work + ['cluster_work_token' => $claim->token]];
+                    } else {
+                        $items = $this->metadata->dequeueNotifications(
+                            $this->clusterAdmission === null ? 50 : 1,
+                        );
+                    }
                 } catch (\Throwable $e) {
                     $this->metrics?->recordNotificationEvent('dequeue', 'failed');
                     $this->logger->error('Notification dequeue failed.', $this->logContext([
@@ -200,7 +213,7 @@ final class NotificationProcessor
         }
     }
 
-    /** @param array{id: int, bucket: string, key_name: string, event_name: string, destination_url: string, payload_json: string, attempts: int, max_attempts: int, lease_expires_at: float} $item */
+    /** @param array<string, mixed> $item */
     private function process(array $item, ?Cancellation $cancellation = null): void
     {
         $id = (int) $item['id'];
@@ -208,6 +221,9 @@ final class NotificationProcessor
         $attempts = (int) $item['attempts'];
         $maxAttempts = (int) $item['max_attempts'];
         $leaseExpiresAt = $item['lease_expires_at'];
+        $token = ($item['cluster_work_token'] ?? null) instanceof ClusterWorkToken
+            ? $item['cluster_work_token'] : null;
+        $heartbeat = null;
 
         // Check circuit breaker.
         if ($this->isCircuitOpen($destination)) {
@@ -227,8 +243,27 @@ final class NotificationProcessor
             return;
         }
 
+        if ($token !== null && $this->clusterFencing !== null) {
+            $heartbeat = new QueueLeaseHeartbeat(function (float $_) use (&$token): bool {
+                if ($this->clusterFencing === null) {
+                    return false;
+                }
+                $renewed = $this->clusterFencing->renewClusterWork($token, 300.0);
+                if ($renewed === null) {
+                    return false;
+                }
+                $token = $renewed;
+
+                return true;
+            });
+        }
+
         try {
             $success = $this->sendWebhook($destination, $item['payload_json'], cancellation: $cancellation);
+            $heartbeat?->stop();
+            if ($token !== null) {
+                $item['cluster_work_token'] = $token;
+            }
 
             if ($success) {
                 if (! $this->updateClaimStatus($id, $item, 'sent', expectedLeaseExpiresAt: $leaseExpiresAt)) {
@@ -283,6 +318,11 @@ final class NotificationProcessor
                 }
             }
         } catch (\Amp\CancelledException) {
+            try {
+                $heartbeat?->stop();
+            } catch (\Throwable) {
+                return;
+            }
             // Shutdown can interrupt an in-flight request without telling us
             // whether the receiver accepted it. Keep the message retriable
             // without exhausting its delivery budget.
@@ -299,6 +339,11 @@ final class NotificationProcessor
 
             return;
         } catch (UnsafeNotificationDestination $e) {
+            try {
+                $heartbeat?->stop();
+            } catch (\Throwable) {
+                return;
+            }
             $this->recordFailure($destination);
             if (! $this->updateClaimStatus($id, $item, 'dead_letter', $e->getMessage(), expectedLeaseExpiresAt: $leaseExpiresAt)) {
                 return;
@@ -312,6 +357,11 @@ final class NotificationProcessor
                 'error' => $e->getMessage(),
             ]));
         } catch (\Throwable $e) {
+            try {
+                $heartbeat?->stop();
+            } catch (\Throwable) {
+                return;
+            }
             $nextAttempts = $attempts + 1;
             if ($nextAttempts >= $maxAttempts) {
                 if (! $this->updateClaimStatus($id, $item, 'dead_letter', 'Notification processing failed.', expectedLeaseExpiresAt: $leaseExpiresAt)) {
@@ -629,6 +679,23 @@ final class NotificationProcessor
         bool $incrementAttempts = true,
         ?float $expectedLeaseExpiresAt = null,
     ): bool {
+        $token = $item['cluster_work_token'] ?? null;
+        if ($token instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+            try {
+                return $this->clusterFencing->transactionWithClusterWork(
+                    $token,
+                    fn(): bool => $this->metadata->updateNotificationStatus(
+                        $id,
+                        $status,
+                        $error,
+                        $nextAttemptAt,
+                        $incrementAttempts,
+                    ),
+                );
+            } catch (\RuntimeException) {
+                return false;
+            }
+        }
         if ($expectedLeaseExpiresAt !== null && $this->metadata instanceof FencedQueueStore && isset($item['lease_generation'])) {
             return $this->metadata->updateNotificationStatusLease(
                 $id,
