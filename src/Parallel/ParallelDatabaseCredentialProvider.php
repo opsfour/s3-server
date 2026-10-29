@@ -10,6 +10,7 @@ use Amp\Parallel\Worker\TaskFailureThrowable;
 use Amp\Parallel\Worker\WorkerPool;
 use Amp\TimeoutException;
 use OpsFour\S3Server\Auth\Credential;
+use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Contracts\AtomicCredentialCreator;
 use OpsFour\S3Server\Contracts\AtomicCredentialDeleter;
 use OpsFour\S3Server\Contracts\AtomicCredentialStatusUpdater;
@@ -20,7 +21,7 @@ use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
 use Revolt\EventLoop;
 
 /** Offload the synchronous PDO credential store from the API event loop. */
-final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, CredentialWorkerPoolOwner, AtomicExpiredCredentialPruner
+final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, CredentialWorkerPoolOwner, AtomicExpiredCredentialPruner, ClusterAuthenticationIdentityProvider
 {
     private readonly WorkerPool $pool;
 
@@ -37,6 +38,9 @@ final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreato
     ) {
         if ($workerLimit < 1) {
             throw new \InvalidArgumentException('Credential database worker limit must be >= 1.');
+        }
+        if (! is_finite($cacheTtlSeconds) || $cacheTtlSeconds < 0.0) {
+            throw new \InvalidArgumentException('Credential cache TTL must be finite and non-negative.');
         }
         if (! is_finite($operationTimeoutSeconds) || $operationTimeoutSeconds <= 0.0) {
             throw new \InvalidArgumentException('Credential database operation timeout must be finite and > 0.');
@@ -84,6 +88,23 @@ final class ParallelDatabaseCredentialProvider implements AtomicCredentialCreato
     public function assertCredentialStoreAvailable(): void
     {
         $this->submit('assertCredentialStoreAvailable');
+    }
+
+    public function clusterAuthenticationIdentity(): string
+    {
+        $identity = $this->submit('credentialStoreIdentity');
+        if (! is_string($identity)) {
+            throw new \RuntimeException('Credential database returned an invalid cluster identity.');
+        }
+
+        $separator = strpos($this->dsn, ':');
+        $driver = $separator === false ? '' : strtolower(substr($this->dsn, 0, $separator));
+
+        return \OpsFour\S3Server\Auth\DatabaseCredentialProvider::formatClusterAuthenticationIdentity(
+            $driver,
+            $identity,
+            $this->cacheTtlSeconds,
+        );
     }
 
     public function listCredentials(): array

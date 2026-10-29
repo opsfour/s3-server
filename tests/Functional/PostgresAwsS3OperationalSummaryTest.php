@@ -14,6 +14,8 @@ use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
+use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Routing\S3Operation;
@@ -184,7 +186,8 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
             $state = $backend->operationalState();
             self::assertInstanceOf(AwsS3OperationalState::class, $state);
             $runtimeMetadata = (new \ReflectionProperty(S3Server::class, 'metadata'))->getValue($runtime->server);
-            self::assertIsObject($runtimeMetadata);
+            self::assertInstanceOf(MetadataStore::class, $runtimeMetadata);
+            self::assertInstanceOf(AwsS3OperationalSummaryReader::class, $runtimeMetadata);
             self::assertTrue($state->isBoundTo($binding, 'STANDARD', $runtimeMetadata));
             $graphCheck = new \ReflectionMethod(S3Server::class, 'assertAwsOperationalGraph');
             $registry = StorageTierRegistry::single($backend);

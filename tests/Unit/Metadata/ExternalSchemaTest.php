@@ -173,7 +173,21 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(45, PostgresSchema::VERSION);
+        self::assertSame(46, PostgresSchema::VERSION);
+        $clusterStatements = PostgresSchema::getMigrationStatements(45);
+        $clusterAdmissionMigration = implode("\n", $clusterStatements);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_database_identity', $clusterAdmissionMigration);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_admission', $clusterAdmissionMigration);
+        self::assertStringContainsString('singleton_id SMALLINT PRIMARY KEY', $clusterAdmissionMigration);
+        self::assertStringNotContainsString('dsn', $clusterAdmissionMigration);
+        $admissionStatement = '';
+        foreach ($clusterStatements as $statement) {
+            if (str_contains($statement, 'CREATE TABLE IF NOT EXISTS s3_cluster_admission')) {
+                $admissionStatement = $statement;
+            }
+        }
+        self::assertNotSame('', $admissionStatement);
+        self::assertStringNotContainsString('database_identity', $admissionStatement);
         $layoutMigration = implode("\n", PostgresSchema::getMigrationStatements(43));
         self::assertStringContainsString('s3_object_parts', $layoutMigration);
         self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);
@@ -253,5 +267,40 @@ final class ExternalSchemaTest extends TestCase
             's3_storage_garbage',
             implode("\n", PostgresSchema::getMigrationStatements(14)),
         );
+    }
+
+    public function test_postgres_cluster_identity_migration_orders_one_insert_after_its_table(): void
+    {
+        foreach ([24, 45] as $fromVersion) {
+            $statements = PostgresSchema::getMigrationStatements($fromVersion);
+            $identityCreate = [];
+            $identityInsert = [];
+            $admissionCreate = [];
+            foreach ($statements as $index => $statement) {
+                if (str_contains($statement, 'CREATE TABLE IF NOT EXISTS s3_cluster_database_identity')) {
+                    $identityCreate[] = $index;
+                }
+                if (str_contains($statement, 'INSERT INTO s3_cluster_database_identity')) {
+                    $identityInsert[] = $index;
+                }
+                if (str_contains($statement, 'CREATE TABLE IF NOT EXISTS s3_cluster_admission')) {
+                    $admissionCreate[] = $index;
+                }
+            }
+
+            self::assertCount(1, $identityCreate, "Migration from v{$fromVersion} must create the identity table once.");
+            self::assertCount(1, $identityInsert, "Migration from v{$fromVersion} must insert the identity once.");
+            self::assertCount(1, $admissionCreate, "Migration from v{$fromVersion} must create the admission table once.");
+            self::assertSame(
+                $identityCreate[0] + 1,
+                $identityInsert[0],
+                "Migration from v{$fromVersion} must insert immediately after creating the identity table.",
+            );
+            self::assertLessThan(
+                $admissionCreate[0],
+                $identityInsert[0],
+                "Migration from v{$fromVersion} must initialize the identity before creating admission.",
+            );
+        }
     }
 }

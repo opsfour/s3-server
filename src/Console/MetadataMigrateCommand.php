@@ -65,7 +65,7 @@ final class MetadataMigrateCommand extends Command
         }
 
         try {
-            MetadataStoreFactory::create($driver, $config, migrate: true);
+            $metadata = MetadataStoreFactory::create($driver, $config, migrate: true);
         } catch (\Throwable $error) {
             $io->error(sprintf('Metadata migration failed (%s).', $error::class));
 
@@ -73,6 +73,9 @@ final class MetadataMigrateCommand extends Command
         }
 
         $io->success('Metadata schema is current.');
+        if ($metadata instanceof \OpsFour\S3Server\Runtime\ClusterAdmissionStore) {
+            $io->writeln('Cluster database identity: ' . $metadata->clusterDatabaseIdentity());
+        }
 
         return Command::SUCCESS;
     }

@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Auth\External;
 
+use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
+
 /**
  * Validates RS256 JWT access tokens from OIDC providers such as Keycloak.
  *
  * Keys can be configured as PEM strings or RSA JWKs containing `n` and `e`.
  */
-final readonly class JwtExternalIdentityProvider implements ExternalIdentityProvider
+final readonly class JwtExternalIdentityProvider implements ExternalIdentityProvider, ClusterAuthenticationIdentityProvider
 {
     /**
      * @param array<string, string|array<string, mixed>> $keys
@@ -72,12 +74,12 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
 
     /**
      * @param array<string, string|array<string, mixed>> $keys
-     * @return list<string>
+     * @return array<string, string>
      */
     private function keyFingerprints(array $keys, string $label): array
     {
         $fingerprints = [];
-        foreach ($keys as $keyMaterial) {
+        foreach ($keys as $keyId => $keyMaterial) {
             if (! is_string($keyMaterial) && ! is_array($keyMaterial)) {
                 throw new \InvalidArgumentException("{$label} is invalid.");
             }
@@ -102,7 +104,7 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
             ) {
                 throw new \InvalidArgumentException("{$label} must be a valid RSA public key with at least 2048 bits.");
             }
-            $fingerprints[] = hash('sha256', $details['key']);
+            $fingerprints[$keyId] = hash('sha256', $details['key']);
         }
 
         return $fingerprints;
@@ -151,6 +153,37 @@ final readonly class JwtExternalIdentityProvider implements ExternalIdentityProv
         $this->validateClaims($claims);
 
         return $this->mapper->map($claims, scopeOwnerByIssuer: $this->multipleIssuers());
+    }
+
+    public function clusterAuthenticationIdentity(): string
+    {
+        $issuers = array_values(array_unique($this->allowedIssuers));
+        $audiences = array_values(array_unique($this->allowedAudiences));
+        sort($issuers, SORT_STRING);
+        sort($audiences, SORT_STRING);
+        $keys = [];
+        if ($this->multipleIssuers()) {
+            foreach ($this->keysByIssuer as $issuer => $issuerKeys) {
+                $fingerprints = $this->keyFingerprints($issuerKeys, 'JWT issuer key material');
+                ksort($fingerprints, SORT_STRING);
+                $keys[$issuer] = $fingerprints;
+            }
+            ksort($keys, SORT_STRING);
+        } else {
+            $fingerprints = $this->keyFingerprints($this->keys, 'JWT verification key material');
+            ksort($fingerprints, SORT_STRING);
+            $keys = $fingerprints;
+        }
+        $identity = json_encode([
+            'protocol' => 'oidc-rs256-owner-mapping-v1',
+            'issuers' => $issuers,
+            'audiences' => $audiences,
+            'clock_skew_seconds' => $this->clockSkewSeconds,
+            'public_keys' => $keys,
+            'mapping' => $this->mapper->clusterOwnerMapping(),
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+
+        return 'oidc-v1:' . hash('sha256', $identity);
     }
 
     private function normalizeBearerToken(string $bearerToken): string

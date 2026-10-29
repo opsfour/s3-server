@@ -19,6 +19,11 @@ return [
     // AWS region identifier.
     'region' => env('S3_REGION', 'us-east-1'),
 
+    // Setting a cluster ID enables PostgreSQL shared-capability admission.
+    'cluster_id' => env('S3_CLUSTER_ID'),
+    'cluster_node_id' => env('S3_CLUSTER_NODE_ID'),
+    'cluster_database_id' => env('S3_CLUSTER_DATABASE_ID'),
+
     // UNSAFE TEST ONLY: bypass the storage late-write fence startup gate.
     'allow_unfenced_storage_for_tests' => EnvironmentBoolean::boolean('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', false),
 

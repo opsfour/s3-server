@@ -29,19 +29,28 @@ final class RestoreGarbageCollector
     }
 
     /**
+     * @param (\Closure(): bool)|null $beforeEach
      * @return array{scanned: int, expired: int, failed: int}
      */
-    public function collect(int $limit = 1000, ?\DateTimeImmutable $now = null): array
-    {
+    public function collect(
+        int $limit = 1000,
+        ?\DateTimeImmutable $now = null,
+        ?\Closure $beforeEach = null,
+    ): array {
         $now ??= new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $objects = $this->metadata->listExpiredRestoredObjects($now, $limit);
-        $stats = ['scanned' => count($objects), 'expired' => 0, 'failed' => 0];
+        $stats = ['scanned' => 0, 'expired' => 0, 'failed' => 0];
 
         foreach ($objects as $object) {
             $path = $object->restoredStoragePath;
             if ($path === null || $path === '') {
+                ++$stats['scanned'];
                 continue;
             }
+            if ($beforeEach !== null && ! $beforeEach()) {
+                break;
+            }
+            ++$stats['scanned'];
 
             try {
                 $restoreTier = RestoredCopyTierResolver::resolve($object, $this->tiers);

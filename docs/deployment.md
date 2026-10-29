@@ -895,13 +895,68 @@ For production deployments:
 
 ## Rollout and Rollback
 
+Cluster nodes may overlap only when their complete admission fingerprints
+match. Compatible application-only restarts can roll behind a load balancer;
+each replacement must report `cluster.admission=matched` before receiving S3
+traffic. Schema changes, protocol changes, storage/fence changes, tier-map
+changes, encryption-identity changes, and incompatible feature changes require
+a maintenance window. Startup never replaces the established contract.
+
+To replace the contract, remove all S3 traffic, stop every API and worker
+process, take a metadata backup, and run the required migration exactly once
+with the matching artifact. After verifying the new schema, use the same
+DDL-capable maintenance role to run this transaction before starting any node:
+
+```sql
+BEGIN;
+DELETE FROM s3_cluster_admission WHERE singleton_id = 1;
+COMMIT;
+```
+
+Do not delete or modify `s3_cluster_database_identity`; it permanently binds
+the metadata database to every replacement admission contract.
+
+Start one node and wait for `cluster.admission=matched`; that node uses the
+preserved database identity and atomically creates the new admission contract.
+Only then start the remaining matching nodes and restore traffic. Never delete
+or update the row while any API or worker process is running. Restoring the
+pre-change package also requires restoring the matching metadata backup and its
+admission contract.
+
+If runtime drift or PostgreSQL loss closes admission, keep the process running
+for bounded `/.live` and `/.health` diagnostics, but do not route S3 traffic or
+run background claims. Readiness returns bounded node/cluster identity and
+admission state, plus one category only for a persisted mismatch, and reopens
+only after a full comparison succeeds; never repair this by editing
+`s3_cluster_admission` while nodes are serving.
+
+Cluster bootstrap is maintenance-only. Run `metadata:migrate` with its
+DDL-capable role and record the printed `Cluster database identity` as
+`S3_CLUSTER_DATABASE_ID` on every node. Run `credentials:migrate` against one
+shared PostgreSQL or MySQL credential database and record its printed
+credential-store identity for audit. Serving startup only reads these identity
+rows; it never creates or replaces them. Memory, file, chain, SQLite, custom
+credential providers and custom external-identity providers are rejected in
+cluster mode. When external IAM is enabled, every node must use the same
+normalized issuer and audience sets, RSA public keys, claim names, owner prefix,
+and clock skew. The database credential-cache TTL must also match. Admin bearer
+tokens and database credentials are not fingerprinted.
+
+The built-in AWS backend remains unqualified for cluster operation until its
+internal production qualification evidence is present, and local filesystem
+storage is not cluster-safe. Consequently the public CLI configuration does
+not currently provide an operator bypass or a built-in production cluster
+example. Framework integrations may supply an explicitly qualified custom
+storage capability; that capability, not its provider class or filesystem
+type, is what admission evaluates.
+
 The current local-filesystem profile does not support a rolling overlap on the
 same storage root. Drain traffic, stop the existing process, deploy the new
 package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
-For a **schema upgrade** such as the object-layout migration to SQLite v41,
-PostgreSQL v44, or MySQL v49, drain and stop the
+For a **schema upgrade** to the current SQLite v42, PostgreSQL v46, or MySQL
+v50 schema, drain and stop the
 API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a
 DDL-capable role and the matching package version. If

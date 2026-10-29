@@ -135,4 +135,73 @@ final class CredentialHealthProbeTest extends TestCase
             pool: $pool,
         );
     }
+
+    public function test_cluster_identity_includes_cache_ttl_for_direct_and_parallel_providers_without_secrets(): void
+    {
+        $storeIdentity = str_repeat('a', 32);
+        $pdo = new class ('sqlite::memory:') extends \PDO {
+            public function getAttribute(int $attribute): mixed
+            {
+                return $attribute === \PDO::ATTR_DRIVER_NAME ? 'pgsql' : parent::getAttribute($attribute);
+            }
+        };
+        $pdo->exec('CREATE TABLE s3_credential_store_identity (singleton_id SMALLINT PRIMARY KEY, credential_store_identity VARCHAR(32) NOT NULL)');
+        $insert = $pdo->prepare('INSERT INTO s3_credential_store_identity (singleton_id, credential_store_identity) VALUES (1, ?)');
+        $insert->execute([$storeIdentity]);
+
+        $direct = new DatabaseCredentialProvider($pdo, 30.0);
+        $directEquivalent = new DatabaseCredentialProvider($pdo, 30.0);
+        $directDifferent = new DatabaseCredentialProvider($pdo, 31.0);
+        $dsn = 'pgsql:host=secret.internal;password=hidden';
+        $parallel = new ParallelDatabaseCredentialProvider(
+            $dsn,
+            password: 'parallel-secret',
+            cacheTtlSeconds: 30.0,
+            workerLimit: 1,
+            pool: $this->credentialIdentityPool($storeIdentity),
+        );
+        $parallelEquivalent = new ParallelDatabaseCredentialProvider(
+            $dsn,
+            password: 'different-secret',
+            cacheTtlSeconds: 30.0,
+            workerLimit: 1,
+            pool: $this->credentialIdentityPool($storeIdentity),
+        );
+        $parallelDifferent = new ParallelDatabaseCredentialProvider(
+            $dsn,
+            cacheTtlSeconds: 31.0,
+            workerLimit: 1,
+            pool: $this->credentialIdentityPool($storeIdentity),
+        );
+
+        $identity = $direct->clusterAuthenticationIdentity();
+        self::assertSame($identity, $directEquivalent->clusterAuthenticationIdentity());
+        self::assertNotSame($identity, $directDifferent->clusterAuthenticationIdentity());
+        self::assertSame($identity, $parallel->clusterAuthenticationIdentity());
+        self::assertSame($identity, $parallelEquivalent->clusterAuthenticationIdentity());
+        self::assertNotSame($identity, $parallelDifferent->clusterAuthenticationIdentity());
+        self::assertStringNotContainsString('secret.internal', $identity);
+        self::assertStringNotContainsString('parallel-secret', $identity);
+        self::assertStringNotContainsString('different-secret', $identity);
+    }
+
+    private function credentialIdentityPool(string $storeIdentity): WorkerPool
+    {
+        $worker = $this->createStub(Worker::class);
+        $worker->method('submit')->willReturnCallback(function (\Amp\Parallel\Worker\Task $task) use ($storeIdentity): Execution {
+            $method = (new \ReflectionProperty($task, 'method'))->getValue($task);
+            $result = $method === 'credentialStoreIdentity' ? $storeIdentity : null;
+
+            return new Execution(
+                $task,
+                $this->createStub(\Amp\Sync\Channel::class),
+                \Amp\Future::complete($result),
+            );
+        });
+        $pool = $this->createStub(WorkerPool::class);
+        $pool->method('isIdle')->willReturn(true);
+        $pool->method('getWorker')->willReturn($worker);
+
+        return $pool;
+    }
 }

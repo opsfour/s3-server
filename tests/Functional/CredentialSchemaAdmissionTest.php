@@ -90,10 +90,12 @@ final class CredentialSchemaAdmissionTest extends TestCase
             $admin->exec("GRANT CONNECT ON DATABASE s3audit_credentials_migration TO {$user}");
             $admin->exec("GRANT USAGE ON SCHEMA public TO {$user}");
             $admin->exec("GRANT SELECT, INSERT, UPDATE, DELETE ON s3_credentials TO {$user}");
+            $admin->exec("GRANT SELECT ON s3_credential_store_identity TO {$user}");
         } else {
             $admin->exec("DROP USER IF EXISTS '{$user}'@'%'");
             $admin->exec("CREATE USER '{$user}'@'%' IDENTIFIED BY 's3audit'");
             $admin->exec("GRANT SELECT, INSERT, UPDATE, DELETE ON s3audit_credentials_migration.s3_credentials TO '{$user}'@'%'");
+            $admin->exec("GRANT SELECT ON s3audit_credentials_migration.s3_credential_store_identity TO '{$user}'@'%'");
         }
 
         try {
@@ -117,6 +119,7 @@ final class CredentialSchemaAdmissionTest extends TestCase
             $dml = null;
             if ($driver === 'pgsql') {
                 $admin->exec("REVOKE ALL PRIVILEGES ON s3_credentials FROM {$user}");
+                $admin->exec("REVOKE ALL PRIVILEGES ON s3_credential_store_identity FROM {$user}");
                 $admin->exec("REVOKE USAGE ON SCHEMA public FROM {$user}");
                 $admin->exec("REVOKE CONNECT ON DATABASE s3audit_credentials_migration FROM {$user}");
                 $admin->exec("DROP ROLE {$user}");

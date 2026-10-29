@@ -188,6 +188,12 @@ The immutable admission report contains only provider type, configured region,
 owner-check result, versioning state, and a stable reason; it never includes the
 bucket, account ID, credentials, request material, or SDK exception text.
 
+Provider admission and fence-complete checks do not qualify cluster operation.
+There is no operator switch that can assert qualification. Until the supported
+qualification and attestation workflow supplies authoritative internal
+`productionQualified()` evidence, AWS cluster admission fails closed before
+the listener opens.
+
 The package also contains an internal AWS publication primitive. It validates
 one exact profile-scoped physical attempt path, commits its metadata reservation
 and one-shot dispatch identity before network I/O, and issues a create-only PUT

@@ -116,8 +116,27 @@ YAML, because each tier needs a named backend and optional service references.
 | `S3_METADATA_DSN` | - | Connection string for postgres/mysql |
 | `S3_METADATA_PATH` | `{storagePath}/.opsfour/metadata.sqlite` | Explicit standalone SQLite database path; an existing legacy `{storagePath}/metadata.sqlite` file remains the automatic default, while the presence of both files requires an explicit choice. When configured, an explicitly empty value is rejected rather than replaced with a storage-derived path. |
 | `S3_METADATA_CACHE_TTL` | `5.0` | Finite, non-negative CORS metadata cache TTL in seconds (0 to disable); ownership, policies, Public Access Block, encryption, and versioning are always read from the shared store |
+| `S3_CLUSTER_ID` | - | Enables cluster mode and names the shared admission contract. Requires PostgreSQL, qualified storage, `S3_CLUSTER_NODE_ID`, and `S3_CLUSTER_DATABASE_ID`. |
+| `S3_CLUSTER_NODE_ID` | - | Stable operator-assigned node identity. It is diagnostic only and is excluded from shared equivalence. |
+| `S3_CLUSTER_DATABASE_ID` | - | Exact 32-character identity printed by `metadata:migrate`; pins the process to the intended PostgreSQL metadata database and is never inferred from its DSN. |
 
 See [Metadata Backends](metadata-backends.md) for driver-specific configuration.
+
+Cluster mode creates one random process incarnation and admits a canonical,
+secret-free fingerprint covering protocol, stable database identity/schema,
+qualified storage and fence, a canonical name-sorted tier map, encryption, the database credential
+store and credential-cache TTL, normalized OIDC public-key/issuer/audience,
+owner mapping and clock skew, compatibility settings,
+and the fixed `all-in-one-v1` role set. Cluster/node/incarnation IDs, connection strings,
+credentials, host/port, timeouts, worker counts, and customer identifiers do
+not enter the shared category digests. Cluster health exposes only the
+configured cluster/node identity, random process incarnation, protocol, fixed
+roles, admission state, and at most one bounded mismatch category. A persisted
+category mismatch keeps `/.live` at 200, makes `/.health` unready, rejects S3
+work before body ingestion, blocks credential/quota admin APIs, and pauses background
+claims until a complete authoritative comparison matches again. Database
+unavailability is reported as `admission=unavailable`, not as a persisted
+mismatch.
 
 ### DSN Formats
 

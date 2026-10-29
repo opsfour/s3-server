@@ -62,6 +62,21 @@ final class S3ServerBundleTest extends TestCase
         self::assertInstanceOf(S3ServerExtension::class, (new S3ServerBundle())->getContainerExtension());
     }
 
+    public function test_symfony_forwards_all_cluster_identity_fields(): void
+    {
+        $config = $this->service($this->container([
+            'server' => [
+                'cluster_id' => 'cluster-a',
+                'cluster_node_id' => 'node-a',
+                'cluster_database_id' => str_repeat('d', 32),
+            ],
+        ]), S3ServerConfig::class);
+
+        self::assertSame('cluster-a', $config->clusterId);
+        self::assertSame('node-a', $config->clusterNodeId);
+        self::assertSame(str_repeat('d', 32), $config->clusterDatabaseId);
+    }
+
     public function test_file_backed_sqlite_defaults_to_four_workers(): void
     {
         $container = new ContainerBuilder();

@@ -64,6 +64,19 @@ final readonly class OidcClaimMapper
         }
     }
 
+    /** @return array<string, string|null> */
+    public function clusterOwnerMapping(): array
+    {
+        return [
+            'owner_claim' => $this->ownerClaim,
+            'display_name_claim' => $this->displayNameClaim,
+            'groups_claim' => $this->groupsClaim,
+            'policy_names_claim' => $this->policyNamesClaim,
+            'allowed_prefixes_claim' => $this->allowedPrefixesClaim,
+            'owner_prefix' => $this->ownerPrefix,
+        ];
+    }
+
     /**
      * @param array<string, mixed> $claims
      */

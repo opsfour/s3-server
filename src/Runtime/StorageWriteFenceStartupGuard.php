@@ -9,6 +9,7 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
+use OpsFour\S3Server\Storage\ClusterSafeStorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
 /**
@@ -44,6 +45,16 @@ final class StorageWriteFenceStartupGuard
                 }
                 $backend->operationalState()->assertQualifiedExecutionBinding($binding, $tier->name, $metadata);
                 $backend->operationalState()->assertStartupReady();
+                continue;
+            }
+
+            if ($backend instanceof ClusterSafeStorageBackend) {
+                // The explicit capability owns its provider-specific structural
+                // proof. AWS remains on the stricter branch above.
+                ClusterCapabilityFingerprint::validateCapabilityIdentity(
+                    $backend->clusterStorageIdentity(),
+                    'storage',
+                );
                 continue;
             }
 

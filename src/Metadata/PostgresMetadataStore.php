@@ -22,6 +22,9 @@ use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use OpsFour\S3Server\Metadata\Schema\MetadataSchemaAdmission;
 use OpsFour\S3Server\Metadata\Schema\MetadataSchemaGuard;
 use OpsFour\S3Server\Quota\QuotaConfig;
+use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
+use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
+use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
 
 /**
  * PostgreSQL-backed implementation of the S3 metadata store.
@@ -29,7 +32,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -86,6 +89,96 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         MetadataSchemaGuard::assertStorageCleanupCapacityConsistent($this->pool);
         MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
         MetadataSchemaGuard::assertPostgresSequenceUsage($this->pool);
+    }
+
+    public function clusterDatabaseSchema(): string
+    {
+        $row = $this->pool->query('SELECT current_schema() AS schema_name')->fetchRow();
+        $schema = $row['schema_name'] ?? null;
+        if (! is_string($schema) || $schema === '') {
+            throw new \RuntimeException('PostgreSQL cluster schema identity is unavailable.');
+        }
+
+        return $schema;
+    }
+
+    public function clusterDatabaseIdentity(): string
+    {
+        $row = $this->conn()->query(
+            'SELECT database_identity FROM s3_cluster_database_identity WHERE singleton_id = 1',
+        )->fetchRow();
+        $identity = $row['database_identity'] ?? null;
+        if (! is_string($identity) || preg_match('/\A[a-f0-9]{32}\z/D', $identity) !== 1) {
+            throw new \RuntimeException('PostgreSQL cluster database identity is missing or invalid. Run metadata:migrate.');
+        }
+
+        return $identity;
+    }
+
+    public function initializeOrCompareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        return $this->transaction(function () use ($fingerprint): ClusterAdmissionResult {
+            $digests = $fingerprint->digests();
+            $this->conn()->execute(
+                <<<'SQL'
+                INSERT INTO s3_cluster_admission (
+                    singleton_id, cluster_id, protocol_digest,
+                    database_digest, authentication_digest, storage_digest, tiers_digest, encryption_digest,
+                    compatibility_digest, roles_digest
+                ) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (singleton_id) DO NOTHING
+                SQL,
+                [
+                    $fingerprint->clusterId,
+                    $digests['protocol'],
+                    $digests['database'],
+                    $digests['authentication'],
+                    $digests['storage'],
+                    $digests['tiers'],
+                    $digests['encryption'],
+                    $digests['compatibility'],
+                    $digests['roles'],
+                ],
+            );
+
+            return $this->compareClusterAdmissionRow($fingerprint);
+        });
+    }
+
+    public function compareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        return $this->compareClusterAdmissionRow($fingerprint);
+    }
+
+    private function compareClusterAdmissionRow(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        $identityRow = $this->conn()->query(
+            'SELECT database_identity FROM s3_cluster_database_identity WHERE singleton_id = 1',
+        )->fetchRow();
+        $databaseIdentity = $identityRow['database_identity'] ?? null;
+        if (! is_string($databaseIdentity) || ! hash_equals($fingerprint->databaseIdentity, $databaseIdentity)) {
+            return ClusterAdmissionResult::mismatch('database', $fingerprint->databaseIdentity);
+        }
+
+        $row = $this->conn()->query(
+            'SELECT cluster_id, protocol_digest, database_digest, authentication_digest, storage_digest, tiers_digest, encryption_digest, compatibility_digest, roles_digest '
+            . 'FROM s3_cluster_admission WHERE singleton_id = 1',
+        )->fetchRow();
+        if ($row === null) {
+            return ClusterAdmissionResult::mismatch('database', '');
+        }
+
+        if (! is_string($row['cluster_id'] ?? null) || ! hash_equals($row['cluster_id'], $fingerprint->clusterId)) {
+            return ClusterAdmissionResult::mismatch('cluster', $fingerprint->databaseIdentity);
+        }
+        foreach ($fingerprint->digests() as $category => $digest) {
+            $column = $category . '_digest';
+            if (! is_string($row[$column] ?? null) || ! hash_equals($row[$column], $digest)) {
+                return ClusterAdmissionResult::mismatch($category, $fingerprint->databaseIdentity);
+            }
+        }
+
+        return ClusterAdmissionResult::matched($fingerprint->databaseIdentity);
     }
 
     public function initialize(): void

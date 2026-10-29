@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Runtime;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use OpsFour\S3Server\Admin\AdminQuotaApiHandler;
 use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Auth\External\AdminCredentialApiFactory;
 use OpsFour\S3Server\Contracts\CredentialProvider;
 use OpsFour\S3Server\Contracts\CredentialWorkerPoolOwner;
@@ -290,6 +291,62 @@ final readonly class S3ServerRuntimeFactory
                 localPartWriter: $localPartWriter,
                 awsObjectWriter: $awsObjectWriter,
             );
+
+            if ($config->clusterEnabled()) {
+                if ($config->allowUnfencedStorageForTests) {
+                    throw new \RuntimeException('Cluster mode rejects unsafe storage test overrides.');
+                }
+                $clusterStore = MetadataDriverStartupGuard::clusterPostgresStore(
+                    $rawMetadata,
+                    $config->metadataDriver,
+                    $config->metadataDsn,
+                );
+                // Structural storage validation must complete before the first
+                // node can create the immutable PostgreSQL admission singleton.
+                StorageWriteFenceStartupGuard::assertReady(
+                    $storageTiers,
+                    false,
+                    $config->metadataDriver,
+                    $metadata,
+                );
+                if (! $credentialProvider instanceof ClusterAuthenticationIdentityProvider) {
+                    throw new \RuntimeException('Cluster mode requires one PostgreSQL/MySQL database credential store with a stable identity.');
+                }
+                $externalAuthenticationIdentity = $adminCredentialApi?->clusterAuthenticationIdentity();
+                $fingerprintFactory = function () use (
+                    $clusterStore,
+                    $config,
+                    $storageTiers,
+                    $encryption,
+                    $credentialProvider,
+                    $externalAuthenticationIdentity,
+                ): ClusterCapabilityFingerprint {
+                    $clusterStore->assertCurrentSchema();
+                    $databaseIdentity = $clusterStore->clusterDatabaseIdentity();
+                    if ($config->clusterDatabaseId === null
+                        || ! hash_equals($config->clusterDatabaseId, $databaseIdentity)) {
+                        throw new \RuntimeException('Configured cluster database identity does not match the migrated PostgreSQL metadata database.');
+                    }
+
+                    return ClusterCapabilityFingerprint::fromRuntime(
+                        $config,
+                        $storageTiers,
+                        $encryption,
+                        $clusterStore->clusterDatabaseSchema(),
+                        $databaseIdentity,
+                        $credentialProvider,
+                        $externalAuthenticationIdentity,
+                    );
+                };
+                $fingerprint = $fingerprintFactory();
+                $clusterAdmission = new ClusterAdmissionController(
+                    $clusterStore,
+                    $fingerprint,
+                    fingerprintFactory: $fingerprintFactory,
+                );
+                $clusterAdmission->admitInitial();
+                $server->setClusterAdmissionController($clusterAdmission);
+            }
 
             return $runtime;
         } catch (\Throwable $e) {

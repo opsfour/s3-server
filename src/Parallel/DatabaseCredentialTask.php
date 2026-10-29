@@ -45,6 +45,8 @@ final class DatabaseCredentialTask implements Task
         return match ($this->method) {
             'getCredential' => $provider->getCredential($this->stringArg(0)),
             'assertCredentialStoreAvailable' => $provider->assertCredentialStoreAvailable(),
+            'clusterAuthenticationIdentity' => $provider->clusterAuthenticationIdentity(),
+            'credentialStoreIdentity' => $provider->credentialStoreIdentity(),
             'listCredentials' => $provider->listCredentials(),
             'putCredential' => $provider->putCredential($this->credentialArg(0)),
             'createCredentialIfAbsent' => $provider->createCredentialIfAbsent($this->credentialArg(0)),

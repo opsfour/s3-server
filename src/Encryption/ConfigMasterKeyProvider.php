@@ -13,7 +13,7 @@ namespace OpsFour\S3Server\Encryption;
  * - Legacy single-key: S3_ENCRYPTION_MASTER_KEY=base64...
  *   Stored internally with key ID "default".
  */
-final class ConfigMasterKeyProvider implements MasterKeyProvider
+final class ConfigMasterKeyProvider implements MasterKeyProvider, ClusterEncryptionIdentityProvider
 {
     /** @var array<string, string> Key ID → raw 32-byte key */
     private readonly array $keys;
@@ -86,6 +86,11 @@ final class ConfigMasterKeyProvider implements MasterKeyProvider
     public function getMasterKeyById(string $keyId): string
     {
         return $this->keys[$keyId] ?? throw new \RuntimeException("Unknown key ID: {$keyId}");
+    }
+
+    public function clusterEncryptionProviderIdentity(): string
+    {
+        return EncryptionKeyringIdentity::create('config', $this->activeKeyId, $this->keys);
     }
 
     /** @internal Compare worker keyrings without sending master keys over IPC. */

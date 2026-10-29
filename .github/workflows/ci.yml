@@ -251,6 +251,11 @@ jobs:
         env:
           S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
 
+      - name: PostgreSQL cluster admission
+        run: vendor/bin/phpunit --fail-on-skipped tests/Functional/PostgresClusterAdmissionTest.php
+        env:
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
+
       - name: Stored identity policy inventory on external backends
         run: |
           S3_POLICY_AUDIT_DSN='mysql:host=127.0.0.1;port=3306;dbname=s3server' \

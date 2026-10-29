@@ -197,6 +197,79 @@ final class AdminCredentialApiFactoryTest extends TestCase
         self::assertInstanceOf(AdminCredentialApiHandler::class, $handler);
     }
 
+    public function test_cluster_identity_is_secret_free_normalized_and_owner_mapping_sensitive(): void
+    {
+        $issuerAKey = $this->generatedPublicKey();
+        $issuerBKey = $this->generatedPublicKey();
+        $base = [
+            'enabled' => true,
+            'admin_token' => 'first-admin-secret',
+            'allowed_issuers' => ['https://issuer-b.example.test', 'https://issuer-a.example.test'],
+            'allowed_audiences' => ['s3-admin-b', 's3-admin-a'],
+            'keys_by_issuer' => [
+                'https://issuer-b.example.test' => ['b' => $issuerBKey],
+                'https://issuer-a.example.test' => ['a' => $issuerAKey],
+            ],
+            'owner_claim' => 'tenant',
+        ];
+        $first = AdminCredentialApiFactory::create($base, $this->credentialProvider());
+        $equivalent = AdminCredentialApiFactory::create([
+            ...$base,
+            'admin_token' => 'different-admin-secret',
+            'allowed_issuers' => array_reverse($base['allowed_issuers']),
+            'allowed_audiences' => array_reverse($base['allowed_audiences']),
+            'keys_by_issuer' => array_reverse($base['keys_by_issuer'], true),
+        ], $this->credentialProvider());
+        $differentMapping = AdminCredentialApiFactory::create([
+            ...$base,
+            'owner_claim' => 'sub',
+        ], $this->credentialProvider());
+        $differentClockSkew = AdminCredentialApiFactory::create([
+            ...$base,
+            'clock_skew_seconds' => 61,
+        ], $this->credentialProvider());
+
+        self::assertNotNull($first);
+        self::assertNotNull($equivalent);
+        self::assertNotNull($differentMapping);
+        self::assertNotNull($differentClockSkew);
+        self::assertSame($first->clusterAuthenticationIdentity(), $equivalent->clusterAuthenticationIdentity());
+        self::assertNotSame($first->clusterAuthenticationIdentity(), $differentMapping->clusterAuthenticationIdentity());
+        self::assertNotSame($first->clusterAuthenticationIdentity(), $differentClockSkew->clusterAuthenticationIdentity());
+        self::assertStringNotContainsString('admin-secret', $first->clusterAuthenticationIdentity());
+        self::assertStringNotContainsString($issuerAKey, $first->clusterAuthenticationIdentity());
+    }
+
+    public function test_cluster_identity_preserves_the_key_id_to_public_key_mapping(): void
+    {
+        $keyA = $this->generatedPublicKey();
+        $keyB = $this->generatedPublicKey();
+        $base = [
+            'enabled' => true,
+            'admin_token' => 'admin-secret',
+            'issuer' => 'https://issuer.example.test',
+            'audience' => 's3-admin',
+        ];
+        $first = AdminCredentialApiFactory::create([
+            ...$base,
+            'keys' => ['kid-a' => $keyA, 'kid-b' => $keyB],
+        ], $this->credentialProvider());
+        $equivalent = AdminCredentialApiFactory::create([
+            ...$base,
+            'keys' => ['kid-b' => $keyB, 'kid-a' => $keyA],
+        ], $this->credentialProvider());
+        $swapped = AdminCredentialApiFactory::create([
+            ...$base,
+            'keys' => ['kid-a' => $keyB, 'kid-b' => $keyA],
+        ], $this->credentialProvider());
+
+        self::assertNotNull($first);
+        self::assertNotNull($equivalent);
+        self::assertNotNull($swapped);
+        self::assertSame($first->clusterAuthenticationIdentity(), $equivalent->clusterAuthenticationIdentity());
+        self::assertNotSame($first->clusterAuthenticationIdentity(), $swapped->clusterAuthenticationIdentity());
+    }
+
     public function test_requires_verification_key_when_enabled(): void
     {
         $this->expectException(\InvalidArgumentException::class);

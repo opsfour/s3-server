@@ -18,6 +18,7 @@ use Amp\Socket\BindContext;
 use Amp\Socket\Certificate;
 use Amp\Socket\ServerTlsContext;
 use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Contracts\AuthenticationMiddleware;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
@@ -39,6 +40,7 @@ use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
+use OpsFour\S3Server\Middleware\ClusterAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
@@ -65,6 +67,7 @@ use OpsFour\S3Server\Routing\S3AttributeMiddleware;
 use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
+use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
@@ -201,6 +204,8 @@ final class S3Server
 
     private ?StorageTierRegistry $storageTiers = null;
 
+    private ?ClusterAdmissionController $clusterAdmission = null;
+
     /** @var list<array{pool: WorkerPool, name: string, forceKillOnShutdown: bool}> Worker pools to shut down on stop. */
     private array $workerPools = [];
 
@@ -280,6 +285,17 @@ final class S3Server
             throw new \LogicException('Refusing to start without authentication middleware.');
         }
 
+        if ($this->config->clusterEnabled() && $this->clusterAdmission === null) {
+            throw new \LogicException('Refusing to start cluster mode without an admitted cluster controller.');
+        }
+        if ($this->config->clusterEnabled()) {
+            $this->clusterAdmission?->assertBoundToConfig($this->config);
+        }
+        if ($this->config->clusterEnabled()
+            && ! $this->authenticationCredentialProvider instanceof ClusterAuthenticationIdentityProvider) {
+            throw new \LogicException('Refusing to start cluster mode without an authentication credential provider that exposes an explicit cluster identity.');
+        }
+
         if ($this->config->perClientRateLimit > 0 && $this->metadata === null) {
             throw new \RuntimeException(
                 'Refusing to start with rate limiting enabled but no metadata store; set perClientRateLimit to 0 to disable rate limiting.',
@@ -306,6 +322,7 @@ final class S3Server
             if ($directStorage !== null && ($configuredTiers === null || $directStorage !== $configuredTiers->defaultBackend())) {
                 $startupTierRegistries[] = StorageTierRegistry::single($directStorage);
             }
+            $this->assertClusterHandlerStorageBindings($configuredTiers);
             foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
                 $startupTierRegistries[] = $registration['tiers'];
                 if ($registration['storage'] !== $registration['tiers']->defaultBackend()) {
@@ -531,6 +548,7 @@ final class S3Server
                             ? $this->authenticationCredentialProvider
                             : null,
                         awsOperationalState: $this->awsOperationalState,
+                        clusterAdmission: $this->clusterAdmission,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
@@ -542,12 +560,18 @@ final class S3Server
                     $this->awsOperationalState,
                 )));
                 if ($this->adminCredentialApiHandler !== null) {
-                    $adminCredentials = $this->managementHandler($this->adminCredentialApiHandler);
+                    $adminCredentials = $this->managementHandler(
+                        $this->adminCredentialApiHandler,
+                        clusterGated: true,
+                    );
                     $router->addRoute('POST', '/.admin/credentials', $adminCredentials);
                     $router->addRoute('DELETE', '/.admin/credentials/{accessKeyId}', $adminCredentials);
                 }
                 if ($this->adminQuotaApiHandler !== null) {
-                    $adminQuotas = $this->managementHandler($this->adminQuotaApiHandler);
+                    $adminQuotas = $this->managementHandler(
+                        $this->adminQuotaApiHandler,
+                        clusterGated: true,
+                    );
                     $router->addRoute('GET', '/.admin/quotas', $adminQuotas);
                     $router->addRoute('GET', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
                     $router->addRoute('PUT', '/.admin/quotas/{ownerId:.+}', $adminQuotas);
@@ -726,8 +750,12 @@ final class S3Server
                             }
                             if ($metadata !== null) {
                                 try {
-                                    $metadata->rateLimitCleanup(3600);
-                                    $metadata->cleanupOldNotifications(86400);
+                                    if ($this->backgroundWorkAdmitted()) {
+                                        $metadata->rateLimitCleanup(3600);
+                                    }
+                                    if ($this->backgroundWorkAdmitted()) {
+                                        $metadata->cleanupOldNotifications(86400);
+                                    }
                                     $this->flushAccessLogsIfAdmitted();
                                 } catch (\Throwable $e) {
                                     $this->logger->warning('Background cleanup failed.', [
@@ -753,7 +781,23 @@ final class S3Server
                         try {
                             while ($this->localObjectCollectionRunning) {
                                 try {
-                                    $collector->collect(100, $backgroundCancellation);
+                                    if ($this->clusterAdmission === null) {
+                                        $collector->collect(100, $backgroundCancellation);
+                                        \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
+                                        continue;
+                                    }
+                                    if (! $this->backgroundWorkAdmitted()) {
+                                        \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
+                                        continue;
+                                    }
+                                    for ($claim = 0; $claim < 100; ++$claim) {
+                                        if (! $this->backgroundWorkAdmitted()) {
+                                            break;
+                                        }
+                                        if ($collector->collect(1, $backgroundCancellation) === 0) {
+                                            break;
+                                        }
+                                    }
                                 } catch (\Amp\CancelledException $error) {
                                     throw $error;
                                 } catch (\Throwable $error) {
@@ -785,11 +829,63 @@ final class S3Server
                     try {
                         while ($this->tieringRunning) {
                             try {
-                                $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
-                                $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
-                                $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
-                                $storageGc->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
-                                $multipartIntentGc?->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                if ($this->clusterAdmission === null) {
+                                    $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                    $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                    $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
+                                    $storageGc->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                    $multipartIntentGc?->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                } else {
+                                    if (! $this->backgroundWorkAdmitted()) {
+                                        \Amp\delay($this->config->lifecycleIntervalSeconds, cancellation: $backgroundCancellation);
+                                        continue;
+                                    }
+                                    $transitionStats = ['processed' => 0, 'completed' => 0, 'retried' => 0, 'deadLetter' => 0];
+                                    $restoreStats = ['processed' => 0, 'completed' => 0, 'retried' => 0, 'deadLetter' => 0];
+                                    $gcStats = ['scanned' => 0, 'expired' => 0, 'failed' => 0];
+                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                        if (! $this->backgroundWorkAdmitted()) {
+                                            break;
+                                        }
+                                        $result = $transitionExecutor->processNext(1, $backgroundCancellation);
+                                        foreach ($result as $name => $count) {
+                                            $transitionStats[$name] += $count;
+                                        }
+                                        if ($result['processed'] === 0) {
+                                            break;
+                                        }
+                                    }
+                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                        if (! $this->backgroundWorkAdmitted()) {
+                                            break;
+                                        }
+                                        $result = $restoreExecutor->processNext(1, $backgroundCancellation);
+                                        foreach ($result as $name => $count) {
+                                            $restoreStats[$name] += $count;
+                                        }
+                                        if ($result['processed'] === 0) {
+                                            break;
+                                        }
+                                    }
+                                    $gcStats = $restoreGc->collect(
+                                        $this->config->lifecycleBatchSize,
+                                        beforeEach: fn(): bool => $this->backgroundWorkAdmitted(),
+                                    );
+                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                        if (! $this->backgroundWorkAdmitted()
+                                            || $storageGc->collect(1, $backgroundCancellation) === 0) {
+                                            break;
+                                        }
+                                    }
+                                    if ($multipartIntentGc !== null) {
+                                        for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                            if (! $this->backgroundWorkAdmitted()
+                                                || $multipartIntentGc->collect(1, $backgroundCancellation) === 0) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 $this->recordTieringWorkerStats('transition', $transitionStats);
                                 $this->recordTieringWorkerStats('restore', $restoreStats);
@@ -949,6 +1045,15 @@ final class S3Server
                 awsWriter: $this->awsAccessLogWriter,
             );
         }
+    }
+
+    public function setClusterAdmissionController(ClusterAdmissionController $admission): void
+    {
+        $this->assertConfigurationMutable('Cluster admission');
+        if ($this->config->clusterEnabled()) {
+            $admission->assertBoundToConfig($this->config);
+        }
+        $this->clusterAdmission = $admission;
     }
 
     public function setAdminCredentialApiHandler(RequestHandler $handler): void
@@ -1427,10 +1532,11 @@ final class S3Server
 
     private function flushAccessLogsIfAdmitted(): void
     {
-        if ($this->accessLogs === null) {
+        $accessLogs = $this->accessLogs;
+        if ($accessLogs === null || ! $this->backgroundWorkAdmitted()) {
             return;
         }
-        $this->accessLogs->flush();
+        $accessLogs->flush();
     }
 
     /** @param array<string, mixed> $context */
@@ -1621,12 +1727,18 @@ final class S3Server
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware(logger: $this->logger),
+        ];
+        if ($this->clusterAdmission !== null) {
+            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission);
+        }
+        array_push(
+            $middlewares,
             new TrustedProxyMiddleware($this->config->trustedProxyCidrs),
             new LoggingMiddleware(logger: $this->logger, accessLogs: $this->accessLogs),
             new RequestHeaderContractMiddleware(),
             new ExpectContinueMiddleware(),
             new RateLimitMiddleware($this->metadata, $this->config->perClientRateLimit, $this->logger),
-        ];
+        );
 
         // Website hosting resolves its bucket from Host and handles public
         // GET/HEAD before API route resolution or credential auth.
@@ -1726,8 +1838,14 @@ final class S3Server
                 notifications: $this->notifications,
                 storageTiers: $tiers,
                 multipartMaxAgeSeconds: $this->config->multipartMaxAgeSeconds,
+                clusterAdmission: $this->clusterAdmission,
             );
-            $lifecycleRunner = new LifecycleRunner($executor, $this->config->lifecycleIntervalSeconds, $this->logger);
+            $lifecycleRunner = new LifecycleRunner(
+                $executor,
+                $this->config->lifecycleIntervalSeconds,
+                $this->logger,
+                $this->clusterAdmission,
+            );
             $transitionExecutor = new TierTransitionExecutor(
                 $this->metadata,
                 $tiers,
@@ -1765,6 +1883,7 @@ final class S3Server
                 $this->logger,
                 metrics: $this->metrics,
                 requireHttps: $this->config->notificationRequireHttps,
+                clusterAdmission: $this->clusterAdmission,
             );
         }
 
@@ -1783,17 +1902,46 @@ final class S3Server
         ];
     }
 
+    /** @phpstan-impure Revalidates live shared state and may change between claims. */
+    private function backgroundWorkAdmitted(): bool
+    {
+        return $this->clusterAdmission?->admitNewClaim() ?? true;
+    }
+
+    private function assertClusterHandlerStorageBindings(?StorageTierRegistry $configuredTiers): void
+    {
+        if (! $this->config->clusterEnabled()) {
+            return;
+        }
+        if ($configuredTiers === null) {
+            throw new \LogicException('Cluster mode requires one configured storage tier registry.');
+        }
+        foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+            if ($registration['tiers'] !== $configuredTiers
+                || $registration['storage'] !== $configuredTiers->defaultBackend()) {
+                throw new \LogicException('Cluster handlers must use the server configured storage tier registry and default backend.');
+            }
+        }
+    }
+
     private function managementHandler(
         RequestHandler $handler,
         bool $rateLimited = true,
         bool $bypassForwardedForValidation = false,
+        bool $clusterGated = false,
     ): RequestHandler {
         $middlewares = [
             new RequestIdMiddleware(),
             new MetricsMiddleware($this->metrics),
             new ErrorHandlingMiddleware($this->logger),
-            new TrustedProxyMiddleware($this->config->trustedProxyCidrs, enforceForwardedFor: ! $bypassForwardedForValidation),
         ];
+        if ($clusterGated && $this->clusterAdmission !== null) {
+            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission);
+        }
+        $middlewares[] = new TrustedProxyMiddleware(
+            $this->config->trustedProxyCidrs,
+            enforceForwardedFor: ! $bypassForwardedForValidation,
+        );
         if ($rateLimited) {
             $middlewares[] = new RateLimitMiddleware($this->metadata, $this->config->perClientRateLimit, $this->logger);
         }

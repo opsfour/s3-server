@@ -39,6 +39,21 @@ use Psr\Http\Message\RequestInterface;
 
 final class AwsS3OperationalStateTest extends TestCase
 {
+    public function test_cluster_identity_remains_closed_without_authoritative_production_qualification(): void
+    {
+        [$binding] = self::binding(self::healthyResponses());
+        $unqualified = new AwsS3StorageBackend($binding->admission, $binding);
+
+        try {
+            $unqualified->clusterStorageIdentity();
+            self::fail('Unqualified AWS profile must not participate in cluster admission.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('not cluster-qualified', $error->getMessage());
+        }
+
+        self::assertFalse($unqualified->awsS3ProviderAdmission()->productionQualified());
+    }
+
     public function test_create_bucket_handler_publishes_only_after_committed_attachment_without_provider_mutation(): void
     {
         $requests = [];

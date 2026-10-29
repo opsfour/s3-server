@@ -8,6 +8,8 @@ use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Parallel\Worker\TaskFailureThrowable;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
+use OpsFour\S3Server\Encryption\ClusterEncryptionIdentity;
+use OpsFour\S3Server\Encryption\ClusterEncryptionIdentityProvider;
 use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
@@ -22,7 +24,7 @@ use OpsFour\S3Server\Observability\MetricsCollector;
  * Below the size threshold, operations run inline (no IPC overhead).
  * Above the threshold, operations are submitted to a worker pool.
  */
-final class ParallelEncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability
+final class ParallelEncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability, ClusterEncryptionIdentity
 {
     private readonly WorkerPool $pool;
 
@@ -31,6 +33,8 @@ final class ParallelEncryptionService implements EncryptionServiceInterface, Con
     private readonly ?string $keyringFingerprint;
 
     private readonly bool $sseS3Supported;
+
+    private readonly ?string $clusterIdentity;
 
     /**
      * @param  MasterKeyProvider|null  $masterKeyProvider  For inline (below-threshold) operations.
@@ -51,6 +55,11 @@ final class ParallelEncryptionService implements EncryptionServiceInterface, Con
             && $masterKeyProvider->matchesCurrentEnvironmentKeyring()
                 ? $masterKeyProvider->keyringFingerprint()
                 : null;
+        $this->clusterIdentity = match (true) {
+            $masterKeyProvider === null => 'disabled-v1',
+            $masterKeyProvider instanceof ClusterEncryptionIdentityProvider => $masterKeyProvider->clusterEncryptionProviderIdentity(),
+            default => null,
+        };
         $this->pool = new ContextWorkerPool($workerLimit);
         $this->localService = new EncryptionService($masterKeyProvider);
         $this->metrics?->registerWorkerPool($this->poolName, $workerLimit);
@@ -82,6 +91,12 @@ final class ParallelEncryptionService implements EncryptionServiceInterface, Con
         }
 
         return hash_equals($this->keyringFingerprint, $current) ? $this->keyringFingerprint : null;
+    }
+
+    public function clusterEncryptionIdentity(): string
+    {
+        return $this->clusterIdentity
+            ?? throw new \RuntimeException('Cluster mode requires an explicit master-key identity capability.');
     }
 
     public function decryptSseS3(string $ciphertext, string $encryptedDataKeyB64, string $ivB64, string $tagB64): string

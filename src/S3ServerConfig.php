@@ -33,6 +33,14 @@ final readonly class S3ServerConfig
     /** Explicit, isolated PUT/Copy fence wiring exercise; not a cluster admission. */
     public ?string $localObjectWriteTestScratchPath;
 
+    public ?string $clusterId;
+
+    public ?string $clusterNodeId;
+
+    public ?string $clusterDatabaseId;
+
+    public ?string $clusterIncarnationId;
+
 
     public string $metadataDriver;
 
@@ -190,6 +198,9 @@ final readonly class S3ServerConfig
         bool $allowUnfencedStorageForTests = false,
         ?string $localObjectWriteTestScratchPath = null,
         float $localWriteWorkerTimeoutSeconds = 300.0,
+        ?string $clusterId = null,
+        ?string $clusterNodeId = null,
+        ?string $clusterDatabaseId = null,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
@@ -250,6 +261,24 @@ final readonly class S3ServerConfig
             trim($localObjectWriteTestScratchPath) === '' || ! $allowUnfencedStorageForTests
         )) {
             throw new \InvalidArgumentException('Local object write fencing is an isolated test profile and requires the unsafe test-only storage override plus a scratch path.');
+        }
+
+        $clusterId = self::clusterIdentity($clusterId, 'clusterId');
+        $clusterNodeId = self::clusterIdentity($clusterNodeId, 'clusterNodeId');
+        if ($clusterId === null && $clusterNodeId !== null) {
+            throw new \InvalidArgumentException('clusterNodeId requires clusterId.');
+        }
+        if ($clusterId !== null && $clusterNodeId === null) {
+            throw new \InvalidArgumentException('clusterNodeId is required when clusterId enables cluster mode.');
+        }
+        if ($clusterDatabaseId !== null && preg_match('/\A[a-f0-9]{32}\z/D', $clusterDatabaseId) !== 1) {
+            throw new \InvalidArgumentException('clusterDatabaseId must be the 32-character lowercase identity printed by metadata:migrate.');
+        }
+        if ($clusterId !== null && $clusterDatabaseId === null) {
+            throw new \InvalidArgumentException('clusterDatabaseId is required when clusterId enables cluster mode.');
+        }
+        if ($clusterId === null && $clusterDatabaseId !== null) {
+            throw new \InvalidArgumentException('clusterDatabaseId requires clusterId.');
         }
 
 
@@ -368,6 +397,12 @@ final readonly class S3ServerConfig
         $this->storageTiers = $storageTiers;
         $this->allowUnfencedStorageForTests = $allowUnfencedStorageForTests;
         $this->localObjectWriteTestScratchPath = $localObjectWriteTestScratchPath;
+        $this->clusterId = $clusterId;
+        $this->clusterNodeId = $clusterNodeId;
+        $this->clusterDatabaseId = $clusterDatabaseId;
+        $this->clusterIncarnationId = $clusterId === null
+            ? null
+            : self::processIncarnationId($clusterId, $clusterNodeId ?? throw new \LogicException('Cluster node identity is missing.'));
         $this->metadataDriver = $metadataDriver;
         $this->metadataDsn = $metadataDsn;
         $this->tlsCertPath = $tlsCertPath;
@@ -421,6 +456,11 @@ final readonly class S3ServerConfig
         return $this->baseDomain !== null;
     }
 
+    public function clusterEnabled(): bool
+    {
+        return $this->clusterId !== null;
+    }
+
     /**
      * Create a new config with overridden values.
      *
@@ -437,6 +477,9 @@ final readonly class S3ServerConfig
             'storageTiers' => $this->storageTiers,
             'allowUnfencedStorageForTests' => $this->allowUnfencedStorageForTests,
             'localObjectWriteTestScratchPath' => $this->localObjectWriteTestScratchPath,
+            'clusterId' => $this->clusterId,
+            'clusterNodeId' => $this->clusterNodeId,
+            'clusterDatabaseId' => $this->clusterDatabaseId,
             'metadataDriver' => $this->metadataDriver,
             'metadataDsn' => $this->metadataDsn,
             'tlsCertPath' => $this->tlsCertPath,
@@ -477,5 +520,26 @@ final readonly class S3ServerConfig
         $merged = array_merge($defaults, $overrides);
 
         return new self(...$merged);
+    }
+
+    private static function clusterIdentity(?string $value, string $name): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\z/D', $value) !== 1) {
+            throw new \InvalidArgumentException("{$name} must be 1-128 ASCII identifier characters.");
+        }
+
+        return $value;
+    }
+
+    private static function processIncarnationId(string $clusterId, string $nodeId): string
+    {
+        /** @var array<string, string> $incarnations */
+        static $incarnations = [];
+        $key = $clusterId . "\0" . $nodeId;
+
+        return $incarnations[$key] ??= bin2hex(random_bytes(16));
     }
 }

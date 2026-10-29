@@ -17,7 +17,7 @@ namespace OpsFour\S3Server\Encryption;
  *
  * For SSE-C: uses the customer-provided key directly.
  */
-final class EncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability
+final class EncryptionService implements EncryptionServiceInterface, ConfigWorkerKeyringCompatible, SseS3Capability, ClusterEncryptionIdentity
 {
     private const string CIPHER = 'aes-256-gcm';
     private const int IV_LENGTH = 12; // GCM standard
@@ -36,6 +36,18 @@ final class EncryptionService implements EncryptionServiceInterface, ConfigWorke
             && $this->masterKeyProvider->matchesCurrentEnvironmentKeyring()
                 ? $this->masterKeyProvider->keyringFingerprint()
                 : null;
+    }
+
+    public function clusterEncryptionIdentity(): string
+    {
+        if ($this->masterKeyProvider === null) {
+            return 'disabled-v1';
+        }
+        if (! $this->masterKeyProvider instanceof ClusterEncryptionIdentityProvider) {
+            throw new \RuntimeException('Cluster mode requires an explicit master-key identity capability.');
+        }
+
+        return $this->masterKeyProvider->clusterEncryptionProviderIdentity();
     }
 
     public function supportsSseS3(): bool

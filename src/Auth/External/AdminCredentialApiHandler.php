@@ -24,6 +24,15 @@ final readonly class AdminCredentialApiHandler implements RequestHandler
         }
     }
 
+    public function clusterAuthenticationIdentity(): string
+    {
+        if (! $this->identityProvider instanceof \OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider) {
+            throw new \RuntimeException('Cluster mode requires external IAM with an explicit owner-mapping identity.');
+        }
+
+        return $this->identityProvider->clusterAuthenticationIdentity();
+    }
+
     public function handleRequest(Request $request): Response
     {
         if (!$this->isAuthorized($request)) {

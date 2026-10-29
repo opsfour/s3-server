@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 45;
+    public const int VERSION = 46;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -30,6 +30,31 @@ final class PostgresSchema
                 version INTEGER NOT NULL,
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 description TEXT NOT NULL DEFAULT ''
+            )
+            SQL,
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_cluster_database_identity (
+                singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+                database_identity TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            SQL,
+            "INSERT INTO s3_cluster_database_identity (singleton_id, database_identity) VALUES (1, md5(random()::text || clock_timestamp()::text)) ON CONFLICT (singleton_id) DO NOTHING",
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_cluster_admission (
+                singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+                cluster_id TEXT NOT NULL,
+                protocol_digest TEXT NOT NULL,
+                database_digest TEXT NOT NULL,
+                authentication_digest TEXT NOT NULL,
+                storage_digest TEXT NOT NULL,
+                tiers_digest TEXT NOT NULL,
+                encryption_digest TEXT NOT NULL,
+                compatibility_digest TEXT NOT NULL,
+                roles_digest TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
 
@@ -1005,6 +1030,31 @@ final class PostgresSchema
             $statements[] = 'ALTER TABLE s3_write_intent_capacity DROP CONSTRAINT IF EXISTS s3_write_intent_capacity_kind_check';
             $statements[] = "ALTER TABLE s3_write_intent_capacity ADD CONSTRAINT s3_write_intent_capacity_kind_check CHECK (kind IN ('object', 'object_seal', 'part'))";
             array_push($statements, ...self::writeIntentCapacityStatements());
+        }
+        if ($fromVersion < 46) {
+            $statements[] = <<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_cluster_database_identity (
+                    singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+                    database_identity TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                SQL;
+            $statements[] = "INSERT INTO s3_cluster_database_identity (singleton_id, database_identity) VALUES (1, md5(random()::text || clock_timestamp()::text)) ON CONFLICT (singleton_id) DO NOTHING";
+            $statements[] = <<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_cluster_admission (
+                    singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+                    cluster_id TEXT NOT NULL,
+                    protocol_digest TEXT NOT NULL,
+                    database_digest TEXT NOT NULL,
+                    authentication_digest TEXT NOT NULL,
+                    storage_digest TEXT NOT NULL,
+                    tiers_digest TEXT NOT NULL,
+                    encryption_digest TEXT NOT NULL,
+                    compatibility_digest TEXT NOT NULL,
+                    roles_digest TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                SQL;
         }
 
         return $statements;

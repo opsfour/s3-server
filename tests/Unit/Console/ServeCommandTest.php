@@ -95,6 +95,31 @@ final class ServeCommandTest extends TestCase
         self::assertSame('metrics-secret', $config->metricsBearerToken);
     }
 
+    public function test_cluster_identity_options_are_forwarded_without_blank_normalization(): void
+    {
+        $command = new ServeCommand();
+        $input = $this->input($command, [
+            '--storage-temp-dir' => $this->tempDir,
+            '--cluster-id' => 'cluster-a',
+            '--cluster-node-id' => 'node-a',
+            '--cluster-database-id' => str_repeat('d', 32),
+        ]);
+        $config = $this->invoke($command, 'configFromInput', [$input, null]);
+
+        self::assertSame('cluster-a', $config->clusterId);
+        self::assertSame('node-a', $config->clusterNodeId);
+        self::assertSame(str_repeat('d', 32), $config->clusterDatabaseId);
+
+        $blank = $this->input($command, [
+            '--storage-temp-dir' => $this->tempDir,
+            '--cluster-id' => '   ',
+            '--cluster-node-id' => '   ',
+            '--cluster-database-id' => '   ',
+        ]);
+        $this->expectException(\InvalidArgumentException::class);
+        $this->invoke($command, 'configFromInput', [$blank, null]);
+    }
+
     public function test_sqlite_workers_default_to_four_and_zero_remains_an_explicit_opt_out(): void
     {
         $previous = getenv('S3_SQLITE_WORKERS');

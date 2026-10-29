@@ -52,6 +52,19 @@ final class S3ServerServiceProviderTest extends TestCase
         parent::tearDown();
     }
 
+    public function test_laravel_forwards_all_cluster_identity_fields(): void
+    {
+        $config = $this->application([
+            'cluster_id' => 'cluster-a',
+            'cluster_node_id' => 'node-a',
+            'cluster_database_id' => str_repeat('d', 32),
+        ])->make(S3ServerConfig::class);
+
+        self::assertSame('cluster-a', $config->clusterId);
+        self::assertSame('node-a', $config->clusterNodeId);
+        self::assertSame(str_repeat('d', 32), $config->clusterDatabaseId);
+    }
+
     public function test_artisan_serve_checks_postgres_driver_before_resolving_metadata(): void
     {
         if (extension_loaded('pq')) {

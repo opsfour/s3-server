@@ -22,6 +22,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -72,6 +73,7 @@ final class LifecycleExecutor
         private readonly ?NotificationDispatcher $notifications = null,
         ?StorageTierRegistry $storageTiers = null,
         private readonly int $multipartMaxAgeSeconds = 604_800,
+        private readonly ?ClusterAdmissionController $clusterAdmission = null,
     ) {
         $this->logger = new FailureIsolatingLogger($logger);
         if ($this->batchSize < 1) {
@@ -1348,6 +1350,11 @@ final class LifecycleExecutor
     private function renewLeaseIfNeeded(): void
     {
         $this->assertNotStopping();
+        if (! ($this->clusterAdmission?->admitNewClaim() ?? true)) {
+            throw new \OpsFour\S3Server\Exception\OperationAbortedException(
+                'Cluster admission closed during lifecycle processing.',
+            );
+        }
 
         if (! $this->leaseHeld) {
             return;

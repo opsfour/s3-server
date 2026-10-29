@@ -65,6 +65,25 @@ final class MetadataDriverStartupGuard
         self::fencedSqlStore($metadata, $driver, $dsn);
     }
 
+    public static function clusterPostgresStore(
+        ?MetadataStore $metadata,
+        string $configuredDriver,
+        string $configuredDsn,
+    ): PostgresMetadataStore {
+        if ($configuredDriver !== 'postgres') {
+            throw new \RuntimeException('Cluster mode requires PostgreSQL metadata.');
+        }
+        $metadata = self::unwrap($metadata);
+        if (! $metadata instanceof PostgresMetadataStore) {
+            throw new \RuntimeException('Cluster mode requires the real PostgreSQL metadata store, optionally wrapped only by built-in decorators.');
+        }
+        if (trim($configuredDsn) === '' || ! $metadata->matchesCreationDsn($configuredDsn)) {
+            throw new \RuntimeException('Cluster mode requires PostgreSQL metadata created from the exact configured DSN.');
+        }
+
+        return $metadata;
+    }
+
     public static function hasVolatileSqliteMetadata(?MetadataStore $metadata): bool
     {
         $metadata = self::unwrap($metadata);

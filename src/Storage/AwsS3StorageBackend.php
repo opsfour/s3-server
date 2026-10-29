@@ -17,7 +17,7 @@ use Psr\Log\LoggerInterface;
 use Psr\Http\Message\StreamInterface;
 
 /** Provider identity plus narrowly scoped ordinary-object fence capabilities. */
-final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissionCapability
+final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissionCapability, ClusterSafeStorageBackend
 {
     private object $garbageDeletionAuthority;
 
@@ -110,6 +110,23 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
     public function operationalAttachmentCommitted(): bool
     {
         return $this->operationalAttachmentCommitted;
+    }
+
+    public function clusterStorageIdentity(): string
+    {
+        $profile = $this->binding?->profile;
+        if (! $this->admission->productionQualified() || $profile === null) {
+            throw new \RuntimeException('AWS storage is not cluster-qualified for this profile.');
+        }
+
+        return 'aws-s3-v1:' . hash('sha256', json_encode([
+            'bucket' => $profile->bucket,
+            'region' => $profile->region,
+            'expected_owner' => $profile->expectedOwnerId,
+            'data_prefix' => $profile->dataPrefix,
+            'reserved_prefix' => $profile->reservedPrefix,
+            'fence' => 'provider-create-only-v1',
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
     }
 
     /**

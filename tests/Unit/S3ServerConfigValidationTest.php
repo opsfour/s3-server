@@ -40,6 +40,37 @@ final class S3ServerConfigValidationTest extends TestCase
         self::assertSame(9001, $updated->port);
     }
 
+    public function test_cluster_identity_requires_a_node_and_preserves_one_process_incarnation_across_with(): void
+    {
+        $config = new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+        );
+        $copy = $config->with(['port' => 9001]);
+
+        self::assertTrue($config->clusterEnabled());
+        self::assertMatchesRegularExpression('/^[a-f0-9]{32}$/D', (string) $config->clusterIncarnationId);
+        self::assertSame($config->clusterIncarnationId, $copy->clusterIncarnationId);
+    }
+
+    public function test_cluster_identity_without_node_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('clusterNodeId is required');
+
+        new S3ServerConfig(storagePath: '/', clusterId: 'cluster-a');
+    }
+
+    public function test_cluster_identity_requires_the_operator_pinned_database_identity(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('clusterDatabaseId is required');
+
+        new S3ServerConfig(storagePath: '/', clusterId: 'cluster-a', clusterNodeId: 'node-a');
+    }
+
     public function test_security_test_opt_in_cannot_be_enabled_after_construction(): void
     {
         $config = new S3ServerConfig(storagePath: '/tmp/s3');

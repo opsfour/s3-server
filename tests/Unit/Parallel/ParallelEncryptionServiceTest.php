@@ -300,4 +300,20 @@ final class ParallelEncryptionServiceTest extends TestCase
 
         $parallel->shutdown();
     }
+
+    public function test_parallel_cluster_identity_matches_direct_service_and_detects_keyring_divergence(): void
+    {
+        $provider = new ConfigMasterKeyProvider($this->masterKeyB64);
+        $parallel = new ParallelEncryptionService($provider, 1, 1024);
+        try {
+            self::assertSame(
+                (new EncryptionService($provider))->clusterEncryptionIdentity(),
+                $parallel->clusterEncryptionIdentity(),
+            );
+            $different = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(str_repeat('q', 32))));
+            self::assertNotSame($different->clusterEncryptionIdentity(), $parallel->clusterEncryptionIdentity());
+        } finally {
+            $parallel->shutdown();
+        }
+    }
 }

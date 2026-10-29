@@ -123,6 +123,96 @@ final class RestoreGarbageCollectorTest extends TestCase
         self::assertSame('restored-data', \Amp\ByteStream\buffer($hot->getObjectByPath($restored->path)));
     }
 
+    public function test_collect_revalidates_before_each_expired_restore_mutation(): void
+    {
+        $hot = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        foreach (['a.bin', 'b.bin'] as $key) {
+            $source = $hot->putObject('bucket', $key, new ReadableBuffer('source-' . $key));
+            $restored = $hot->putObject('bucket', $key, new ReadableBuffer('restored-' . $key));
+            $this->metadata->putObjectMetadata(
+                'bucket',
+                $key,
+                'owner',
+                $source->size,
+                '"' . $source->md5Hex . '"',
+                'application/octet-stream',
+                $source->path,
+            );
+            $this->metadata->updateObjectRestoreStateWithTier(
+                'bucket',
+                $key,
+                null,
+                'restored',
+                $restored->path,
+                new \DateTimeImmutable('2020-01-01T00:00:00Z'),
+                'STANDARD',
+            );
+        }
+
+        $checks = 0;
+        $stats = (new RestoreGarbageCollector($this->metadata, $hot))->collect(
+            limit: 2,
+            now: new \DateTimeImmutable('2020-01-02T00:00:00Z'),
+            beforeEach: static function () use (&$checks): bool {
+                return ++$checks === 1;
+            },
+        );
+
+        self::assertSame(['scanned' => 1, 'expired' => 1, 'failed' => 0], $stats);
+        self::assertSame(2, $checks);
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'a.bin')?->restoredStoragePath);
+        self::assertNotNull($this->metadata->getObjectMetadata('bucket', 'b.bin')?->restoredStoragePath);
+    }
+
+    public function test_batched_collect_continues_after_one_expired_restore_fails(): void
+    {
+        $hot = new InMemoryBackend();
+        $hot->createBucket('bucket');
+        foreach (['a.bin', 'b.bin'] as $key) {
+            $source = $hot->putObject('bucket', $key, new ReadableBuffer('source-' . $key));
+            $restored = $hot->putObject('bucket', $key, new ReadableBuffer('restored-' . $key));
+            $this->metadata->putObjectMetadata(
+                'bucket',
+                $key,
+                'owner',
+                $source->size,
+                '"' . $source->md5Hex . '"',
+                'application/octet-stream',
+                $source->path,
+            );
+            $this->metadata->updateObjectRestoreStateWithTier(
+                'bucket',
+                $key,
+                null,
+                'restored',
+                $restored->path,
+                new \DateTimeImmutable('2020-01-01T00:00:00Z'),
+                'STANDARD',
+            );
+        }
+        $deletes = 0;
+        $failFirstDelete = new CallbackStorageBackend(
+            $hot,
+            beforeDelete: static function () use (&$deletes): void {
+                if (++$deletes === 1) {
+                    throw new \RuntimeException('first restore cleanup failed');
+                }
+            },
+        );
+
+        $stats = (new RestoreGarbageCollector($this->metadata, $failFirstDelete))->collect(
+            limit: 2,
+            now: new \DateTimeImmutable('2020-01-02T00:00:00Z'),
+            beforeEach: static fn(): bool => true,
+        );
+
+        self::assertSame(['scanned' => 2, 'expired' => 1, 'failed' => 1], $stats);
+        self::assertSame(2, $deletes);
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'a.bin')?->restoredStoragePath);
+        self::assertNull($this->metadata->getObjectMetadata('bucket', 'b.bin')?->restoredStoragePath);
+    }
+
     public function test_recreated_bucket_generation_does_not_clear_expired_restore_snapshot(): void
     {
         $expired = new ObjectInfo(

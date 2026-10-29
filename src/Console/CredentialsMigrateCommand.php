@@ -34,7 +34,7 @@ final class CredentialsMigrateCommand extends Command
         }
 
         try {
-            CredentialProviderFactory::create('database', [
+            $provider = CredentialProviderFactory::create('database', [
                 'dsn' => $dsn,
                 'username' => $input->getOption('credentials-username'),
                 'password' => $input->getOption('credentials-password'),
@@ -46,6 +46,9 @@ final class CredentialsMigrateCommand extends Command
         }
 
         $io->success('Credential schema is current.');
+        if ($provider instanceof \OpsFour\S3Server\Auth\DatabaseCredentialProvider) {
+            $io->writeln('Credential-store identity: ' . $provider->credentialStoreIdentity());
+        }
 
         return Command::SUCCESS;
     }

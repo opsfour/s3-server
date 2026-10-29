@@ -51,6 +51,18 @@ final class RedisMasterKeyProviderTest extends TestCase
         self::assertSame('second', $provider->getKeyId());
         self::assertSame($second, $provider->getMasterKey());
         self::assertSame($first, $provider->getMasterKeyById('first'));
+        $equivalent = new RedisMasterKeyProvider(redisClient: self::client([
+            'HGETALL:s3:master-keys' => [
+                'second', base64_encode($second),
+                'first', base64_encode($first),
+            ],
+            'GET:s3:active-key-id' => 'second',
+        ]));
+        self::assertSame(
+            $provider->clusterEncryptionProviderIdentity(),
+            $equivalent->clusterEncryptionProviderIdentity(),
+        );
+        self::assertStringNotContainsString($second, $provider->clusterEncryptionProviderIdentity());
     }
 
     public function test_legacy_single_key_configuration_remains_supported(): void

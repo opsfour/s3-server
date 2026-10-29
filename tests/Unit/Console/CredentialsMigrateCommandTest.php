@@ -43,10 +43,26 @@ final class CredentialsMigrateCommandTest extends TestCase
 
             $migrator = new CommandTester(new CredentialsMigrateCommand());
             self::assertSame(Command::SUCCESS, $migrator->execute(['--credentials-dsn' => $dsn]));
+            self::assertSame(1, preg_match(
+                '/Credential-store identity: ([a-f0-9]{32})/',
+                $migrator->getDisplay(),
+                $firstIdentity,
+            ));
+            $identity = $firstIdentity[1] ?? null;
+            self::assertIsString($identity);
             $writer = CredentialProviderFactory::create('database', ['dsn' => $dsn]);
             $writer->putCredential(new Credential('AKIAEXISTING1234567', 'existing-secret', 'owner'));
             $retry = new CommandTester(new CredentialsMigrateCommand());
             self::assertSame(Command::SUCCESS, $retry->execute(['--credentials-dsn' => $dsn]));
+            self::assertStringContainsString(
+                'Credential-store identity: ' . $identity,
+                $retry->getDisplay(),
+            );
+            $identityRow = $pdo->query(
+                'SELECT credential_store_identity FROM s3_credential_store_identity WHERE singleton_id = 1',
+            );
+            self::assertNotFalse($identityRow);
+            self::assertSame($identity, $identityRow->fetchColumn());
             self::assertSame('existing-secret', CredentialProviderFactory::create('database', ['dsn' => $dsn])
                 ->getCredential('AKIAEXISTING1234567')?->secretAccessKey);
         } finally {

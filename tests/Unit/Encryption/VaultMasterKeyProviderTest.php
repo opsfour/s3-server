@@ -59,6 +59,9 @@ final class VaultMasterKeyProviderTest extends TestCase
         self::assertSame('second', $provider->getKeyId());
         self::assertSame($second, $provider->getMasterKey());
         self::assertSame($first, $provider->getMasterKeyById('first'));
+        self::assertStringStartsWith('vault:', $provider->clusterEncryptionProviderIdentity());
+        self::assertStringNotContainsString('secret-token', $provider->clusterEncryptionProviderIdentity());
+        self::assertStringNotContainsString($second, $provider->clusterEncryptionProviderIdentity());
     }
 
     public function test_legacy_single_key_configuration_remains_supported(): void

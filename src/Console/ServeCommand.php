@@ -71,6 +71,9 @@ final class ServeCommand extends Command
             ->addOption('region', null, InputOption::VALUE_REQUIRED, 'AWS region identifier', self::envOption('S3_REGION', 'us-east-1'))
             ->addOption('metadata-driver', null, InputOption::VALUE_REQUIRED, 'Metadata backend: sqlite|postgres|mysql', self::envOption('S3_METADATA_DRIVER', 'sqlite'))
             ->addOption('metadata-dsn', null, InputOption::VALUE_REQUIRED, 'DSN for metadata database', self::envOption('S3_METADATA_DSN', ''))
+            ->addOption('cluster-id', null, InputOption::VALUE_REQUIRED, 'Shared cluster identity (enables cluster mode)', self::envOption('S3_CLUSTER_ID'))
+            ->addOption('cluster-node-id', null, InputOption::VALUE_REQUIRED, 'Stable node identity required in cluster mode', self::envOption('S3_CLUSTER_NODE_ID'))
+            ->addOption('cluster-database-id', null, InputOption::VALUE_REQUIRED, 'Pinned identity printed by metadata:migrate', self::envOption('S3_CLUSTER_DATABASE_ID'))
             ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'SQLite metadata database path', self::envOption('S3_METADATA_PATH'))
             ->addOption('metadata-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Metadata read cache TTL in seconds (0 disables)', self::envOption('S3_METADATA_CACHE_TTL', '5'))
             ->addOption('tls-cert', null, InputOption::VALUE_REQUIRED, 'Path to TLS certificate file', self::envOption('S3_TLS_CERT'))
@@ -292,6 +295,9 @@ final class ServeCommand extends Command
             allowUnfencedStorageForTests: $this->booleanOption($input, 'allow-unfenced-storage-for-tests'),
             metadataDriver: (string) $input->getOption('metadata-driver'),
             metadataDsn: (string) $input->getOption('metadata-dsn'),
+            clusterId: $this->strictOptionalString($input->getOption('cluster-id'), 'cluster-id'),
+            clusterNodeId: $this->strictOptionalString($input->getOption('cluster-node-id'), 'cluster-node-id'),
+            clusterDatabaseId: $this->strictOptionalString($input->getOption('cluster-database-id'), 'cluster-database-id'),
             tlsCertPath: $this->nullableString($input->getOption('tls-cert')),
             tlsKeyPath: $this->nullableString($input->getOption('tls-key')),
             trustedProxyCidrs: TrustedProxyMiddleware::parseCidrs((string) $input->getOption('trusted-proxy-cidrs')),
@@ -502,6 +508,18 @@ final class ServeCommand extends Command
     private function nullableString(mixed $value): ?string
     {
         return is_string($value) && trim($value) !== '' ? trim($value) : null;
+    }
+
+    private function strictOptionalString(mixed $value, string $name): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (! is_string($value)) {
+            throw new \InvalidArgumentException("--{$name} must be a string.");
+        }
+
+        return $value;
     }
 
     private function optionalTokenOption(InputInterface $input, string $name): ?string

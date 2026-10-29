@@ -215,8 +215,9 @@ The DML-only serving role does not need trigger-creation rights.
 | 40 (SQLite) / 43 (PostgreSQL) / 48 (MySQL) | Add immutable cleanup admission classes, an exact singleton cleanup counter, and trigger-enforced 900,000 normal / 1,000,000 recovery boundaries. |
 | 41 (SQLite) / 44 (PostgreSQL) / 49 (MySQL) | Persist incarnation-bound object layout summaries and FK-cascaded logical parts; classify legacy rows in durable 10,000-row keyset batches without inferring multipart boundaries. |
 | 42 (SQLite) / 45 (PostgreSQL) / 50 (MySQL) | Add nullable legacy-safe object size/SHA-256 evidence, immutable AWS seal reservations, separate open-attempt and permanent-seal counters, and trigger-enforced atomic open-to-seal transitions. |
+| 46 (PostgreSQL) | Add a stable singleton database identity plus the separately replaceable immutable cluster-admission contract with secret-free per-category digests. |
 
-SQLite currently uses schema version `42`; PostgreSQL uses `45`, and MySQL
+SQLite currently uses schema version `42`; PostgreSQL uses `46`, and MySQL
 uses `50`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
@@ -228,6 +229,16 @@ MySQL DDL auto-commits, so partially applied migrations are retried
 idempotently; duplicate schema objects are tolerated, while every other error
 stops startup before the version is recorded. Schema upgrades may add tables,
 indexes, and columns with defaults, but do not delete application data.
+
+PostgreSQL v46 creates `s3_cluster_database_identity` and its singleton value
+only during `metadata:migrate`. The migrator prints that non-secret value for
+`S3_CLUSTER_DATABASE_ID`. A cluster serving role needs only `SELECT` on the
+identity row and `SELECT, INSERT` on `s3_cluster_admission`; it does not need
+`UPDATE` or `DELETE` on either table. Contract replacement is a stopped-cluster
+maintenance operation performed by the DDL-capable role. The credential
+migrator similarly creates `s3_credential_store_identity`; serving reads it but
+never changes it, while normal credential CRUD retains its existing grants on
+`s3_credentials`.
 MySQL v31 changes three indexed identifier columns and may wait for metadata
 locks or rebuild their indexes on a populated database. The v32 dispatch-token
 column also needs a migration-time and lock check on a representative copy.

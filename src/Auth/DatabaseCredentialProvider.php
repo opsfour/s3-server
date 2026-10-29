@@ -18,7 +18,7 @@ use OpsFour\S3Server\Contracts\AtomicExpiredCredentialPruner;
  * a short, configurable period. Expired entries are always re-read so
  * revocation and rotation performed by another server node become visible.
  */
-final class DatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, AtomicExpiredCredentialPruner
+final class DatabaseCredentialProvider implements AtomicCredentialCreator, AtomicCredentialDeleter, AtomicCredentialStatusUpdater, CredentialHealthProbe, CredentialProvider, AtomicExpiredCredentialPruner, ClusterAuthenticationIdentityProvider
 {
     private const int DEFAULT_MAX_CACHE_ENTRIES = 10_000;
 
@@ -181,6 +181,24 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
             SQL,
         );
 
+        $this->pdo->exec(
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_credential_store_identity (
+                singleton_id SMALLINT PRIMARY KEY,
+                credential_store_identity VARCHAR(32) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (singleton_id = 1)
+            )
+            SQL,
+        );
+        $identity = bin2hex(random_bytes(16));
+        $insert = match ($this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME)) {
+            'mysql' => 'INSERT IGNORE INTO s3_credential_store_identity (singleton_id, credential_store_identity) VALUES (1, ?)',
+            'pgsql', 'sqlite' => 'INSERT INTO s3_credential_store_identity (singleton_id, credential_store_identity) VALUES (1, ?) ON CONFLICT (singleton_id) DO NOTHING',
+            default => throw new \RuntimeException('Unsupported credential database driver.'),
+        };
+        $this->pdo->prepare($insert)->execute([$identity]);
+
         $this->addColumnIfMissing('session_token', 'TEXT NULL');
         $this->addColumnIfMissing('expires_at', 'TIMESTAMP NULL');
         $this->addColumnIfMissing('policy_names', 'TEXT NULL');
@@ -194,6 +212,54 @@ final class DatabaseCredentialProvider implements AtomicCredentialCreator, Atomi
         // unsupported partial schemas. Never report a successful migration
         // unless serving can read every required column.
         $this->assertSchemaReady();
+    }
+
+    public function clusterAuthenticationIdentity(): string
+    {
+        $driver = (string) $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+
+        return self::formatClusterAuthenticationIdentity(
+            $driver,
+            $this->credentialStoreIdentity(),
+            $this->cacheTtlSeconds,
+        );
+    }
+
+    /** @internal Shared with the parallel credential adapter. */
+    public static function formatClusterAuthenticationIdentity(
+        string $driver,
+        string $credentialStoreIdentity,
+        float $cacheTtlSeconds,
+    ): string {
+        if (! in_array($driver, ['pgsql', 'mysql'], true)) {
+            throw new \RuntimeException('Cluster mode requires a PostgreSQL or MySQL database credential store.');
+        }
+        if (preg_match('/\A[a-f0-9]{32}\z/D', $credentialStoreIdentity) !== 1) {
+            throw new \RuntimeException('Credential-store cluster identity is missing or invalid. Run credentials:migrate.');
+        }
+        if (! is_finite($cacheTtlSeconds) || $cacheTtlSeconds < 0.0) {
+            throw new \InvalidArgumentException('Credential cache TTL must be finite and non-negative.');
+        }
+        if ($cacheTtlSeconds === 0.0) {
+            $cacheTtlSeconds = 0.0;
+        }
+        $ttl = json_encode($cacheTtlSeconds, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+
+        return "database-credentials-v1:{$driver}:{$credentialStoreIdentity}:cache-ttl-seconds:{$ttl}";
+    }
+
+    public function credentialStoreIdentity(): string
+    {
+        $statement = $this->pdo->query(
+            'SELECT credential_store_identity FROM s3_credential_store_identity WHERE singleton_id = 1',
+        );
+        $row = $statement !== false ? $statement->fetch(\PDO::FETCH_ASSOC) : false;
+        $identity = is_array($row) ? ($row['credential_store_identity'] ?? null) : null;
+        if (! is_string($identity) || preg_match('/\A[a-f0-9]{32}\z/D', $identity) !== 1) {
+            throw new \RuntimeException('Credential-store cluster identity is missing or invalid. Run credentials:migrate.');
+        }
+
+        return $identity;
     }
 
     public function getCredential(string $accessKeyId): ?Credential

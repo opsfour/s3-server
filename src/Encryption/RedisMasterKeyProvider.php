@@ -22,7 +22,7 @@ use Amp\Redis\RedisClient;
  * - S3_REDIS_MASTER_KEY_DSN: Redis DSN (e.g., 'redis://localhost:6379')
  * - S3_REDIS_MASTER_KEY_NAME: Redis key name for legacy single-key (default: 's3:master-key')
  */
-final class RedisMasterKeyProvider implements MasterKeyProvider
+final class RedisMasterKeyProvider implements MasterKeyProvider, ClusterEncryptionIdentityProvider
 {
     /** @var array<string, string> Key ID → raw 32-byte key */
     private readonly array $keys;
@@ -141,6 +141,11 @@ final class RedisMasterKeyProvider implements MasterKeyProvider
     public function getMasterKey(): string
     {
         return $this->keys[$this->activeKeyId];
+    }
+
+    public function clusterEncryptionProviderIdentity(): string
+    {
+        return EncryptionKeyringIdentity::create('redis', $this->activeKeyId, $this->keys);
     }
 
     public function getKeyId(): string

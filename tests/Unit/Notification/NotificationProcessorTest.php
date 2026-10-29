@@ -4,16 +4,28 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Notification;
 
+use Amp\ByteStream\ReadableStream;
 use Amp\Cancellation;
 use Amp\Http\Client\DelegateHttpClient;
 use Amp\Http\Client\HttpClient;
 use Amp\Http\Client\Request;
 use Amp\Http\Client\Response;
+use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Notification\NotificationProcessor;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
+use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
+use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
+use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\Storage\ClusterSafeStorageBackend;
+use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageWriteResult;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 
@@ -216,6 +228,78 @@ final class NotificationProcessorTest extends TestCase
             ->query('SELECT attempts FROM s3_notification_queue');
         self::assertNotFalse($statement);
         self::assertSame(0, (int) $statement->fetchColumn());
+    }
+
+    public function test_standalone_processor_preserves_concurrent_batch_dequeue(): void
+    {
+        foreach (['first.txt', 'second.txt'] as $key) {
+            $this->metadata->enqueueNotification(
+                'bucket',
+                $key,
+                's3:ObjectCreated:Put',
+                'https://93.184.216.34/webhook',
+                '{}',
+            );
+        }
+        $delegate = new ConcurrentBlockingNotificationHttpClient(2);
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            pollInterval: 0.01,
+            httpClient: new HttpClient($delegate, []),
+        );
+        $processor->start();
+        try {
+            $delegate->batchStarted->getFuture()->await(new \Amp\TimeoutCancellation(2));
+            self::assertSame(2, $delegate->started);
+            $delegate->release->complete();
+            $deadline = microtime(true) + 2;
+            while ($this->metadata->getNotificationQueueStats() !== ['sent' => 2] && microtime(true) < $deadline) {
+                \Amp\delay(0.01);
+            }
+            self::assertSame(['sent' => 2], $this->metadata->getNotificationQueueStats());
+        } finally {
+            if (! $delegate->release->getFuture()->isComplete()) {
+                $delegate->release->complete();
+            }
+            $processor->stop();
+        }
+    }
+
+    public function test_cluster_processor_does_not_claim_while_closed_and_resumes_after_recovery(): void
+    {
+        $this->metadata->enqueueNotification(
+            'bucket',
+            'key.txt',
+            's3:ObjectCreated:Put',
+            'https://93.184.216.34/webhook',
+            '{}',
+        );
+        $store = new NotificationClusterAdmissionStore();
+        $controller = new ClusterAdmissionController(
+            $store,
+            NotificationClusterAdmissionStore::fingerprint(),
+            revalidationIntervalSeconds: 0.0,
+        );
+        $controller->admitInitial();
+        $store->available = false;
+        $client = new RecordingNotificationHttpClient(204);
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            pollInterval: 0.01,
+            httpClient: new HttpClient($client, []),
+            clusterAdmission: $controller,
+        );
+        $processor->start();
+        try {
+            \Amp\delay(0.05);
+            self::assertSame([], $client->requests);
+            self::assertSame(['pending' => 1], $this->metadata->getNotificationQueueStats());
+
+            $store->available = true;
+            $this->waitForNotificationState($this->metadata, 'sent', $client);
+        } finally {
+            $processor->stop();
+        }
     }
 
     public function test_start_and_second_stop_are_rejected_until_in_flight_delivery_has_stopped(): void
@@ -761,6 +845,152 @@ final class BlockingNotificationHttpClient implements DelegateHttpClient
         \Amp\delay(60, cancellation: $cancellation);
 
         return new Response('1.1', 204, null, [], '', $request);
+    }
+}
+
+final class ConcurrentBlockingNotificationHttpClient implements DelegateHttpClient
+{
+    public int $started = 0;
+
+    /** @var \Amp\DeferredFuture<void> */
+    public \Amp\DeferredFuture $batchStarted;
+
+    /** @var \Amp\DeferredFuture<void> */
+    public \Amp\DeferredFuture $release;
+
+    public function __construct(private readonly int $expected)
+    {
+        $this->batchStarted = new \Amp\DeferredFuture();
+        $this->release = new \Amp\DeferredFuture();
+    }
+
+    public function request(Request $request, Cancellation $cancellation): Response
+    {
+        if (++$this->started === $this->expected) {
+            $this->batchStarted->complete();
+        }
+        $this->release->getFuture()->await($cancellation);
+
+        return new Response('1.1', 204, null, [], '', $request);
+    }
+}
+
+final class NotificationClusterAdmissionStore implements ClusterAdmissionStore
+{
+    public bool $available = true;
+
+    public static function fingerprint(): ClusterCapabilityFingerprint
+    {
+        return ClusterCapabilityFingerprint::fromRuntime(
+            new S3ServerConfig(
+                storagePath: '/',
+                clusterId: 'notification-test-cluster',
+                clusterNodeId: 'notification-test-node',
+                clusterDatabaseId: str_repeat('d', 32),
+            ),
+            StorageTierRegistry::single(new NotificationClusterStorageBackend()),
+            null,
+            'public',
+            str_repeat('d', 32),
+            new NotificationClusterAuthenticationIdentity(),
+        );
+    }
+
+    public function clusterDatabaseSchema(): string
+    {
+        return 'public';
+    }
+
+    public function clusterDatabaseIdentity(): string
+    {
+        return str_repeat('d', 32);
+    }
+
+    public function initializeOrCompareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        return $this->compareClusterAdmission($fingerprint);
+    }
+
+    public function compareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        if (! $this->available) {
+            throw new \RuntimeException('database unavailable');
+        }
+
+        return ClusterAdmissionResult::matched(str_repeat('d', 32));
+    }
+}
+
+final readonly class NotificationClusterAuthenticationIdentity implements ClusterAuthenticationIdentityProvider
+{
+    public function clusterAuthenticationIdentity(): string
+    {
+        return 'notification-test-auth-v1';
+    }
+}
+
+final class NotificationClusterStorageBackend implements ClusterSafeStorageBackend, StorageBackend
+{
+    private InMemoryBackend $inner;
+
+    public function __construct()
+    {
+        $this->inner = new InMemoryBackend();
+    }
+
+    public function clusterStorageIdentity(): string
+    {
+        return 'notification-test-storage-v1';
+    }
+
+    public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
+    {
+        return $this->inner->putObject($bucket, $key, $body);
+    }
+
+    public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
+    {
+        return $this->inner->getObjectByPath($storagePath, $offset, $length);
+    }
+
+    public function deleteObjectByPath(string $storagePath, string $bucket): void
+    {
+        $this->inner->deleteObjectByPath($storagePath, $bucket);
+    }
+
+    public function createBucket(string $bucket): void
+    {
+        $this->inner->createBucket($bucket);
+    }
+
+    public function deleteBucket(string $bucket): void
+    {
+        $this->inner->deleteBucket($bucket);
+    }
+
+    public function bucketExists(string $bucket): bool
+    {
+        return $this->inner->bucketExists($bucket);
+    }
+
+    public function putPart(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data): StorageWriteResult
+    {
+        return $this->inner->putPart($bucket, $key, $uploadId, $partNumber, $data);
+    }
+
+    public function assembleMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): StorageWriteResult
+    {
+        return $this->inner->assembleMultipartUpload($bucket, $key, $uploadId, $parts);
+    }
+
+    public function abortMultipartUpload(string $bucket, string $key, string $uploadId): void
+    {
+        $this->inner->abortMultipartUpload($bucket, $key, $uploadId);
+    }
+
+    public function copyObject(string $srcPath, string $dstBucket, string $dstKey): StorageWriteResult
+    {
+        return $this->inner->copyObject($srcPath, $dstBucket, $dstKey);
     }
 }
 

@@ -98,7 +98,12 @@ Before starting the API process or running credential management, execute
 `php bin/s3-server credentials:migrate` once with a DDL-capable credential
 database role. Set `S3_CREDENTIALS_DSN`, `S3_CREDENTIALS_USERNAME`, and
 `S3_CREDENTIALS_PASSWORD` in that bootstrap environment; the migrator preserves
-existing credentials. Serving processes verify the table, required columns,
+or creates one stable, non-secret credential-store identity and prints it while
+preserving existing credentials. In
+cluster mode the identity participates in admission, so every process must use
+the same PostgreSQL/MySQL credential database. Runtime credential changes do
+not replace that identity. The identity row is read-only to serving roles.
+Serving processes verify the table, required columns,
 the `(expires_at, access_key_id)` expiration index, and a single byte-exact
 primary key on `access_key_id` without changing the schema. MySQL requires a
 full-length `VARBINARY(255)` primary key; SQLite
@@ -108,7 +113,25 @@ existing table that cannot meet these checks instead of reporting a successful
 partial migration. The explicit migrator replaces a package-named expiration
 index when its columns, access method, visibility, or predicate are invalid;
 serving processes never perform that DDL. Use a DML-only role for serving after
-the bootstrap. The
+the bootstrap. Existing PostgreSQL and MySQL serving roles also need read access
+to the identity singleton created by the migration. Grant and verify that access
+before restarting API nodes, replacing the example role/database identifiers as
+appropriate:
+
+```sql
+-- PostgreSQL
+GRANT SELECT ON TABLE s3_credential_store_identity TO s3_runtime;
+SELECT credential_store_identity
+FROM s3_credential_store_identity WHERE singleton_id = 1;
+
+-- MySQL
+GRANT SELECT ON s3server.s3_credential_store_identity TO 's3_runtime'@'%';
+SELECT credential_store_identity
+FROM s3server.s3_credential_store_identity WHERE singleton_id = 1;
+```
+
+Run the verification query as the serving role; it must return exactly one
+32-character identity. The
 DSN uses PDO syntax; credentials are passed separately so the
 same configuration works for PostgreSQL and MySQL. Positive lookups are cached
 for one second by default. Set

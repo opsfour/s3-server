@@ -23,6 +23,7 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -70,6 +71,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly int $readinessCheckIntervalSeconds = 30,
         private readonly float $readinessCheckTimeoutSeconds = 5.0,
         private readonly ?AwsS3OperationalState $awsOperationalState = null,
+        private readonly ?ClusterAdmissionController $clusterAdmission = null,
     ) {
         if ($readinessCheckIntervalSeconds < 0) {
             throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
@@ -82,6 +84,9 @@ final class HealthCheckHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        if ($this->clusterAdmission !== null && ! $this->clusterAdmission->revalidate()) {
+            return $this->clusterClosedResponse();
+        }
         $now = hrtime(true) / 1e9;
         if ($now - $this->lastReadinessCheckAt < $this->readinessCheckIntervalSeconds) {
             return $this->readinessResponse();
@@ -302,8 +307,9 @@ final class HealthCheckHandler implements RequestHandler
             $snapshot = $this->awsOperationalState->snapshot();
             $ready = $this->readinessHealthy
                 && $snapshot['mutation_ready'] === true
-                && $snapshot['reason'] === AwsS3OperationalState::REASON_HEALTHY;
-            $body = json_encode([
+                && $snapshot['reason'] === AwsS3OperationalState::REASON_HEALTHY
+                && ($this->clusterAdmission?->isAdmitted() ?? true);
+            $payload = [
                 'status' => $ready ? 'ok' : 'degraded',
                 'aws' => [
                     'provider_type' => $snapshot['provider_type'],
@@ -321,16 +327,37 @@ final class HealthCheckHandler implements RequestHandler
                     'reconciliation_state' => $snapshot['reconciliation_state'],
                     'reason' => $snapshot['reason'],
                 ],
-            ], JSON_THROW_ON_ERROR);
+            ];
+            if ($this->clusterAdmission !== null) {
+                $payload['cluster'] = $this->clusterAdmission->diagnostics();
+            }
+            $body = json_encode($payload, JSON_THROW_ON_ERROR);
         } else {
-            $ready = $this->readinessHealthy;
-            $body = $this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}';
+            $ready = $this->readinessHealthy && ($this->clusterAdmission?->isAdmitted() ?? true);
+            $body = $this->clusterAdmission === null
+                ? ($this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}')
+                : json_encode([
+                    'status' => $ready ? 'ok' : 'degraded',
+                    'cluster' => $this->clusterAdmission->diagnostics(),
+                ], JSON_THROW_ON_ERROR);
         }
 
         return new Response(
             status: $ready ? 200 : 503,
             headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
             body: $body,
+        );
+    }
+
+    private function clusterClosedResponse(): Response
+    {
+        return new Response(
+            status: 503,
+            headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
+            body: json_encode([
+                'status' => 'degraded',
+                'cluster' => $this->clusterAdmission?->diagnostics() ?? ['admission' => 'unavailable'],
+            ], JSON_THROW_ON_ERROR),
         );
     }
 }

@@ -20,6 +20,7 @@ use OpsFour\S3Server\Metadata\FencedQueueStore;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -62,6 +63,7 @@ final class NotificationProcessor
         ?HttpClient $httpClient = null,
         private readonly ?MetricsCollector $metrics = null,
         private readonly bool $requireHttps = true,
+        private readonly ?ClusterAdmissionController $clusterAdmission = null,
     ) {
         $this->httpClient = $httpClient;
         $this->logger = new FailureIsolatingLogger($logger);
@@ -144,8 +146,17 @@ final class NotificationProcessor
         try {
             while ($this->running) {
                 $cancellation->throwIfRequested();
+                if (! ($this->clusterAdmission?->admitNewClaim($cancellation) ?? true)) {
+                    \Amp\delay($this->pollInterval, cancellation: $cancellation);
+                    continue;
+                }
                 try {
-                    $items = $this->metadata->dequeueNotifications(50);
+                    // Cluster mode claims exactly one row so admission is
+                    // revalidated before every subsequent shared claim. Keep
+                    // the established standalone batch concurrency unchanged.
+                    $items = $this->metadata->dequeueNotifications(
+                        $this->clusterAdmission === null ? 50 : 1,
+                    );
                 } catch (\Throwable $e) {
                     $this->metrics?->recordNotificationEvent('dequeue', 'failed');
                     $this->logger->error('Notification dequeue failed.', $this->logContext([

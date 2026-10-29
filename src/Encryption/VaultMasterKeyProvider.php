@@ -22,7 +22,7 @@ use Amp\Http\Client\Request;
  * - S3_VAULT_PATH: Secret path (default: 'secret/data/s3-server/master-key')
  * - S3_VAULT_KEY_FIELD: Field name within the secret data (default: 'key')
  */
-final class VaultMasterKeyProvider implements MasterKeyProvider
+final class VaultMasterKeyProvider implements MasterKeyProvider, ClusterEncryptionIdentityProvider
 {
     /** @var array<string, string> Key ID → raw 32-byte key */
     private readonly array $keys;
@@ -153,6 +153,11 @@ final class VaultMasterKeyProvider implements MasterKeyProvider
     public function getMasterKey(): string
     {
         return $this->keys[$this->activeKeyId];
+    }
+
+    public function clusterEncryptionProviderIdentity(): string
+    {
+        return EncryptionKeyringIdentity::create('vault', $this->activeKeyId, $this->keys);
     }
 
     public function getKeyId(): string
