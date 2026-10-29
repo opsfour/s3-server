@@ -16,6 +16,7 @@ use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Psr7\Response;
 use League\Uri\Http;
 use OpsFour\S3Server\Dto\BucketInfo;
+use OpsFour\S3Server\Handler\Bucket\CreateBucketHandler;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
 use OpsFour\S3Server\Handler\MetricsHandler;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
@@ -26,6 +27,7 @@ use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
@@ -37,6 +39,57 @@ use Psr\Http\Message\RequestInterface;
 
 final class AwsS3OperationalStateTest extends TestCase
 {
+    public function test_create_bucket_handler_publishes_only_after_committed_attachment_without_provider_mutation(): void
+    {
+        $requests = [];
+        [$binding, $validator] = self::binding(self::healthyResponses(), $requests);
+        $summary = new AwsS3OperationalSummaryFixture();
+        $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
+        $backend = new AwsS3StorageBackend($binding->admission, $binding);
+        $backend->attachOperationalState($state, 'AWS', $summary);
+        $providerRequestCount = count($requests ?? []);
+        $databasePath = sys_get_temp_dir() . '/s3-aws-create-bucket-' . bin2hex(random_bytes(8)) . '.sqlite';
+        $metadata = new SqliteMetadataStore($databasePath);
+        $metadata->initialize();
+        $handler = new CreateBucketHandler(
+            $metadata,
+            $backend,
+            new S3ServerConfig(storagePath: sys_get_temp_dir()),
+        );
+        $request = static function (): Request {
+            $request = new Request(
+                new AwsS3OperationalStateTestClient(),
+                'PUT',
+                Http::new('http://127.0.0.1/logical-bucket'),
+            );
+            $request->setAttribute('s3.bucket', 'logical-bucket');
+            $request->setAttribute('ownerId', 'owner');
+
+            return $request;
+        };
+
+        try {
+            try {
+                $handler->handleRequest($request());
+                self::fail('A provisional AWS attachment must not publish a logical bucket.');
+            } catch (\LogicException $error) {
+                self::assertStringContainsString('write fence is complete', $error->getMessage());
+            }
+            self::assertNull($metadata->getBucketOwner('logical-bucket'));
+
+            $backend->commitOperationalStateAttachment($state, 'AWS', $summary);
+            self::assertSame(200, $handler->handleRequest($request())->getStatus());
+            self::assertSame('owner', $metadata->getBucketOwner('logical-bucket'));
+            self::assertSame(200, $handler->handleRequest($request())->getStatus());
+            self::assertSame('owner', $metadata->getBucketOwner('logical-bucket'));
+            self::assertCount($providerRequestCount, $requests ?? []);
+        } finally {
+            @unlink($databasePath);
+            @unlink($databasePath . '-shm');
+            @unlink($databasePath . '-wal');
+        }
+    }
+
     public function test_healthy_fence_complete_profile_remains_distinct_from_production_qualification(): void
     {
         [$binding, $validator] = self::binding([
@@ -414,7 +467,7 @@ final class AwsS3OperationalStateTest extends TestCase
         $summary->values['global_multipart'] = 12;
         $state = new AwsS3OperationalState($binding, $validator, self::inventory(), $summary, 'AWS', 30.0);
         $state->assertStartupReady();
-        $providerRequests = count($requests);
+        $providerRequests = count($requests ?? []);
 
         $response = (new MetricsHandler(
             new MetricsCollector(),
@@ -430,7 +483,7 @@ final class AwsS3OperationalStateTest extends TestCase
 
         self::assertIsString($rendered);
         self::assertSame(200, $response->getStatus());
-        self::assertSame($providerRequests, count($requests));
+        self::assertSame($providerRequests, count($requests ?? []));
         self::assertStringContainsString(
             's3_server_aws_recovery_global_capacity_items{kind="multipart"} 12',
             $rendered,

@@ -4,17 +4,18 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Runtime;
 
-/** Stable IDs for all enabled physical mutation entry points. */
+/** Stable IDs for all enabled storage-affecting entry points. */
 final class StorageMutatorInventory
 {
     public const string ATTEMPT = 'aws-attempt';
     public const string GARBAGE = 'aws-garbage';
+    public const string METADATA_ONLY = 'aws-metadata-only';
     public const string SEAL = 'aws-same-key-seal';
     public const string UNSUPPORTED = 'aws-unsupported';
 
     /** @var array<string, string> */
     public const array REQUIRED = [
-        'api.create-bucket' => self::UNSUPPORTED,
+        'api.create-bucket' => self::METADATA_ONLY,
         'api.put-object' => self::ATTEMPT,
         'api.post-object' => self::ATTEMPT,
         'api.copy-object' => self::ATTEMPT,

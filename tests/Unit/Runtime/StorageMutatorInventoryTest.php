@@ -12,9 +12,10 @@ use PHPUnit\Framework\TestCase;
 
 final class StorageMutatorInventoryTest extends TestCase
 {
-    public function test_registered_aws_attempt_and_garbage_capabilities_are_stable(): void
+    public function test_registered_aws_capabilities_are_stable(): void
     {
         $inventory = StorageMutatorInventory::forEnabledRuntime(self::liveRegistrations());
+        $inventory->assertAwsCapability('api.create-bucket');
         $inventory->assertAwsCapability('worker.access-log');
         $inventory->assertAwsCapability('worker.storage-garbage');
         $inventory->assertAwsCapability('worker.same-key-seal-reconciliation');
@@ -26,7 +27,7 @@ final class StorageMutatorInventoryTest extends TestCase
     {
         $inventory = StorageMutatorInventory::forEnabledRuntime(self::liveRegistrations());
         $rejections = 0;
-        foreach (['api.unknown', 'api.create-bucket', 'api.abort-multipart', 'integration.generic-storage-mutation'] as $id) {
+        foreach (['api.unknown', 'api.abort-multipart', 'integration.generic-storage-mutation'] as $id) {
             try {
                 $inventory->assertAwsCapability($id);
                 self::fail('AWS mutator unexpectedly admitted: ' . $id);
@@ -34,7 +35,7 @@ final class StorageMutatorInventoryTest extends TestCase
                 $rejections++;
             }
         }
-        self::assertSame(4, $rejections);
+        self::assertSame(3, $rejections);
 
         $unknown = new StorageMutatorInventory();
         $this->expectException(\LogicException::class);
@@ -53,7 +54,7 @@ final class StorageMutatorInventoryTest extends TestCase
         StorageMutatorInventory::forEnabledRuntime($registrations);
     }
 
-    public function test_unsupported_mutator_must_register_its_exact_rejection_disposition(): void
+    public function test_mutator_must_register_its_exact_capability(): void
     {
         $inventory = new StorageMutatorInventory();
         $this->expectException(\LogicException::class);

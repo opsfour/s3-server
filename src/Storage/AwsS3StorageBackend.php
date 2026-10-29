@@ -112,7 +112,10 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         return $this->operationalAttachmentCommitted;
     }
 
-    /** Narrow ordinary-write capability; StorageBackend operations remain closed. */
+    /**
+     * Narrow ordinary-write capability. Generic data-path operations remain
+     * closed; logical bucket namespace creation is a guarded no-op.
+     */
     public function createForegroundObjectWriter(
         ObjectWriteIntentStore $intents,
         string $scratch,
@@ -525,7 +528,16 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
 
     public function createBucket(string $bucket): void
     {
-        throw $this->unavailable();
+        if ($this->operationalState === null || ! $this->operationalAttachmentCommitted) {
+            throw $this->unavailable();
+        }
+
+        // One admitted physical provider bucket contains every logical S3
+        // bucket. The logical namespace is published by metadata only, so no
+        // provider CreateBucket or object mutation belongs here.
+        // Deliberately do not require mutation readiness: provider health,
+        // recovery pressure, and intent capacity do not protect this
+        // metadata-only operation.
     }
 
     public function deleteBucket(string $bucket): void

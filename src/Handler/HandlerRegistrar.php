@@ -105,7 +105,7 @@ final class HandlerRegistrar
     public static function storageMutatorRegistrations(): array
     {
         return [
-            ['id' => 'api.create-bucket', 'capability' => StorageMutatorInventory::UNSUPPORTED],
+            ['id' => 'api.create-bucket', 'capability' => StorageMutatorInventory::METADATA_ONLY],
             ['id' => 'api.put-object', 'capability' => StorageMutatorInventory::ATTEMPT],
             ['id' => 'api.post-object', 'capability' => StorageMutatorInventory::ATTEMPT],
             ['id' => 'api.copy-object', 'capability' => StorageMutatorInventory::ATTEMPT],

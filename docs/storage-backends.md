@@ -275,8 +275,11 @@ and generic integration paths.
 Foreground object, copy, multipart part/completion, transition, restore, and
 access-log publications require `aws-attempt`; same-key seal reconciliation
 requires `aws-same-key-seal`; logical deletions, restore
-expiry, and physical garbage require `aws-garbage`. Multipart abort, legacy
-multipart recovery, physical bucket creation, and generic backend/Flysystem mutation are explicitly
+expiry, and physical garbage require `aws-garbage`. API `CreateBucket` uses
+`aws-metadata-only`: it publishes a logical bucket in metadata after the exact
+AWS runtime attachment is committed and never creates or mutates the fixed
+physical provider bucket. Multipart abort, legacy multipart recovery, physical
+provider-bucket creation, and generic backend/Flysystem mutation are explicitly
 `aws-unsupported`. The `storage:inventory`, `storage:audit`, and
 `multipart:part-intents` commands only inspect metadata or local storage; they
 have no physical AWS mutator registration. Unknown or unsupported registrations
