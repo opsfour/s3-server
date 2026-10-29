@@ -26,6 +26,7 @@ use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\BucketGenerationGuard;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\CommittedObjectReader;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 
@@ -182,7 +183,7 @@ final class GetObjectHandler implements RequestHandler
         }
 
         // 5. Stream body from storage — handle decryption if encrypted.
-        [$readStorage, $storagePath] = $this->resolveReadableStorage($objectInfo);
+        [$readStorage, $storagePath, $physicalStorageTier] = $this->resolveReadableStorage($objectInfo);
         if ($storagePath === null || $storagePath === '') {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Object storage path missing.');
         }
@@ -217,7 +218,13 @@ final class GetObjectHandler implements RequestHandler
 
                 // Encrypted objects: read full ciphertext, decrypt, then apply range.
                 $ciphertext = self::bufferCiphertext(
-                    $readStorage->getObjectByPath($storagePath),
+                    CommittedObjectReader::read(
+                        $readStorage,
+                        $bucketInfo,
+                        $objectInfo,
+                        $storagePath,
+                        $physicalStorageTier,
+                    ),
                     $objectInfo->size,
                 );
 
@@ -275,7 +282,15 @@ final class GetObjectHandler implements RequestHandler
             // Content-Length derived from committed object metadata. A short
             // backend read must fail instead of reporting a clean response.
             $body = new LimitedReadableStream(
-                $readStorage->getObjectByPath($storagePath, $offset, $length ?? $objectInfo->size),
+                CommittedObjectReader::read(
+                    $readStorage,
+                    $bucketInfo,
+                    $objectInfo,
+                    $storagePath,
+                    $physicalStorageTier,
+                    $offset,
+                    $length ?? $objectInfo->size,
+                ),
                 $contentLength,
                 requireExactLength: true,
             );
@@ -490,7 +505,7 @@ final class GetObjectHandler implements RequestHandler
     }
 
     /**
-     * @return array{0: StorageBackend, 1: string|null}
+     * @return array{0: StorageBackend, 1: string|null, 2: string}
      */
     private function resolveReadableStorage(ObjectInfo $objectInfo): array
     {
@@ -501,11 +516,12 @@ final class GetObjectHandler implements RequestHandler
 
         $tier = $registry->tier($objectInfo->storageTier);
         if (! $tier->restoreRequired) {
-            return [$tier->backend, $objectInfo->systemMetadata['storagePath'] ?? null];
+            return [$tier->backend, $objectInfo->systemMetadata['storagePath'] ?? null, $tier->name];
         }
 
         if ($this->hasReadableRestore($objectInfo)) {
-            return [\OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($objectInfo, $registry)->backend, $objectInfo->restoredStoragePath];
+            $restoreTier = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($objectInfo, $registry);
+            return [$restoreTier->backend, $objectInfo->restoredStoragePath, $restoreTier->name];
         }
 
         throw new InvalidObjectStateException();

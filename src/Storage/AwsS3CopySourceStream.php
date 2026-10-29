@@ -52,7 +52,7 @@ final class AwsS3CopySourceStream implements \IteratorAggregate, ReadableStream
                 $this->close();
             } catch (\Throwable) {
             }
-            throw new InternalErrorException('AWS copy source read failed.');
+            throw new InternalErrorException('AWS committed-object read failed.');
         }
     }
 

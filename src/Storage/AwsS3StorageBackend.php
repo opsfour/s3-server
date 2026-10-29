@@ -183,7 +183,59 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         ?int $offset = null,
         ?int $length = null,
     ): ReadableStream {
-        $this->operationalState?->assertRecoveryReady();
+        $storageTier = $this->exactObjectReferenceTier($source, $path);
+
+        return $this->readExactCommittedObject(
+            $bucket,
+            $source,
+            $key,
+            $path,
+            $storageTier,
+            $offset,
+            $length,
+        );
+    }
+
+    /** Exact owner-bound read of one committed current-v2 object attempt. */
+    public function readCommittedObject(
+        BucketInfo $bucket,
+        ObjectInfo $object,
+        string $path,
+        string $storageTier,
+        ?int $offset = null,
+        ?int $length = null,
+    ): ReadableStream {
+        if ($object->bucket !== $bucket->name || $object->key === '' || $object->ownerId === ''
+            || $storageTier === '' || $object->size < 0
+            || $this->exactObjectReferenceTier($object, $path) !== $storageTier) {
+            throw new InternalErrorException('AWS committed source scope is invalid.');
+        }
+
+        return $this->readExactCommittedObject(
+            $bucket,
+            $object,
+            $object->key,
+            $path,
+            $storageTier,
+            $offset,
+            $length,
+        );
+    }
+
+    private function readExactCommittedObject(
+        BucketInfo $bucket,
+        ObjectInfo $source,
+        string $key,
+        string $path,
+        string $storageTier,
+        ?int $offset,
+        ?int $length,
+    ): ReadableStream {
+        $state = $this->operationalState;
+        if ($state === null || ! $this->operationalAttachmentCommitted) {
+            throw $this->unavailable();
+        }
+        $state->assertRecoveryReady();
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
         if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
@@ -198,7 +250,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 $bucket->name,
                 $key,
                 $bucket->generation,
-                $source->storageTier,
+                $storageTier,
                 $attemptId,
                 $profile->reservedPrefix,
             );
@@ -207,31 +259,38 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 'Key' => $path,
                 'ExpectedBucketOwner' => $profile->expectedOwnerId,
                 '@retries' => 0,
+                '@http' => ['stream' => true],
             ];
             $expectedLength = $source->size;
             $expectedContentRange = null;
+            $expectedStatusCode = 200;
             if ($offset !== null || $length !== null) {
                 if ($offset === null || $length === null || $offset < 0 || $length < 1
-                    || $offset > PHP_INT_MAX - $length) {
-                    throw new \InvalidArgumentException('Invalid AWS copy source range.');
+                    || $offset > PHP_INT_MAX - $length || $offset >= $source->size
+                    || $offset + $length > $source->size) {
+                    throw new \InvalidArgumentException('Invalid AWS committed-object range.');
                 }
                 $request['Range'] = 'bytes=' . $offset . '-' . ($offset + $length - 1);
                 $expectedLength = $length;
                 $expectedContentRange = 'bytes ' . $offset . '-' . ($offset + $length - 1) . '/' . $source->size;
+                $expectedStatusCode = 206;
             }
             $result = $client->getObject($request);
             $body = $result->get('Body');
             $responseLength = $result->get('ContentLength');
             $contentRange = $result->get('ContentRange');
             $markers = $result->get('Metadata');
+            $responseMetadata = $result->get('@metadata');
+            $statusCode = is_array($responseMetadata) ? ($responseMetadata['statusCode'] ?? null) : null;
             if (! $body instanceof StreamInterface || ! is_int($responseLength) || $responseLength !== $expectedLength
-                || ($expectedContentRange !== null && $contentRange !== $expectedContentRange)
+                || $statusCode !== $expectedStatusCode
+                || ($expectedContentRange === null ? $contentRange !== null : $contentRange !== $expectedContentRange)
                 || ! is_array($markers)
                 || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
                 || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId
                 || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $source->ownerId)
                 || ($markers['opsfour-content-size'] ?? null) !== (string) $source->size) {
-                throw new \RuntimeException('Unverified AWS copy source response.');
+                throw new \RuntimeException('Unverified AWS committed-object response.');
             }
             return new LimitedReadableStream(
                 new AwsS3CopySourceStream($body),
@@ -246,8 +305,23 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 $body?->close();
             } catch (\Throwable) {
             }
-            throw new InternalErrorException('AWS copy source could not be verified.');
+            throw new InternalErrorException('AWS committed object could not be verified.');
         }
+    }
+
+    private function exactObjectReferenceTier(ObjectInfo $object, string $path): string
+    {
+        $primaryPath = $object->systemMetadata['storagePath'] ?? null;
+        if ($primaryPath !== null && $primaryPath !== '' && hash_equals($primaryPath, $path)) {
+            return $object->storageTier;
+        }
+        if ($object->restoredStoragePath !== null && $object->restoredStoragePath !== ''
+            && hash_equals($object->restoredStoragePath, $path)
+            && $object->restoredStorageTier !== null && $object->restoredStorageTier !== '') {
+            return $object->restoredStorageTier;
+        }
+
+        throw new InternalErrorException('AWS committed source does not match an exact metadata reference.');
     }
 
     /** Exact owner- and marker-bound read of one immutable multipart part attempt. */
@@ -313,21 +387,6 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
             }
             throw new InternalErrorException('AWS multipart part could not be verified.');
         }
-    }
-
-    /** Exact owner-bound read of one committed current-v2 object attempt. */
-    public function readCommittedObject(
-        BucketInfo $bucket,
-        ObjectInfo $object,
-        string $path,
-        string $storageTier,
-    ): ReadableStream {
-        if ($object->bucket !== $bucket->name || $object->key === '' || $object->ownerId === ''
-            || $storageTier === '' || $object->storageTier !== $storageTier || $object->size < 0) {
-            throw new InternalErrorException('AWS committed source scope is invalid.');
-        }
-
-        return $this->readCopySource($bucket, $object, $object->key, $path);
     }
 
     /**

@@ -41,6 +41,7 @@ use OpsFour\S3Server\Select\SelectCsvException;
 use OpsFour\S3Server\Select\SelectRecordSizeException;
 use OpsFour\S3Server\Select\SelectSqlException;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\CommittedObjectReader;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Xml\S3XmlDocument;
@@ -152,6 +153,7 @@ final class SelectObjectContentHandler implements RequestHandler
         }
         $tier = $this->storageTiers->tier($objectInfo->storageTier);
         $readStorage = $tier->backend;
+        $physicalStorageTier = $tier->name;
         if ($tier->restoreRequired) {
             if (
                 $objectInfo->restoreStatus !== 'restored'
@@ -161,7 +163,9 @@ final class SelectObjectContentHandler implements RequestHandler
             ) {
                 throw new InvalidObjectStateException();
             }
-            $readStorage = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($objectInfo, $this->storageTiers)->backend;
+            $restoreTier = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($objectInfo, $this->storageTiers);
+            $readStorage = $restoreTier->backend;
+            $physicalStorageTier = $restoreTier->name;
             $storagePath = $objectInfo->restoredStoragePath;
         }
 
@@ -176,7 +180,13 @@ final class SelectObjectContentHandler implements RequestHandler
             $memoryGuard = SelectMemoryGuard::start();
             $memoryGuard->assertInputSize($objectInfo->size);
             $objectData = $this->bufferSelectObject(
-                new LimitedReadableStream($readStorage->getObjectByPath($storagePath), $objectInfo->size + 1),
+                new LimitedReadableStream(CommittedObjectReader::read(
+                    $readStorage,
+                    $bucketInfo,
+                    $objectInfo,
+                    $storagePath,
+                    $physicalStorageTier,
+                ), $objectInfo->size + 1),
                 $clientCancellation,
                 $memoryGuard,
                 $objectInfo->size,

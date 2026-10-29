@@ -31,8 +31,10 @@ use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\QuotaExceededException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
+use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\PostObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
+use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -162,6 +164,314 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertSame('PUT', $this->requests[2]->getMethod());
         self::assertSame('*', $this->requests[2]->getHeaderLine('If-None-Match'));
         self::assertSame('123456789012', $this->requests[2]->getHeaderLine('x-amz-expected-bucket-owner'));
+    }
+
+    public function test_get_uses_verified_aws_stream_for_full_and_range_reads_during_publication_closure(): void
+    {
+        $payload = 'ordinary AWS payload';
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $attempt = basename($object->systemMetadata['storagePath']);
+        $state = $this->backend->operationalState();
+        self::assertNotNull($state);
+        $state->markCollectorFailure('test-publication-closed');
+        self::assertFalse($state->mutationReady());
+        self::assertTrue($state->recoveryReady());
+
+        $this->mock->append($this->objectReadResponse($payload, $attempt));
+        $full = (new GetObjectHandler($this->metadata, $this->backend))
+            ->handleRequest($this->getRequest());
+        self::assertSame(200, $full->getStatus());
+        self::assertSame($payload, \Amp\ByteStream\buffer($full->getBody()));
+        self::assertSame('', $this->lastProviderRequest()->getHeaderLine('Range'));
+
+        $selection = substr($payload, 2, 7);
+        $this->mock->append($this->objectReadResponse(
+            $selection,
+            $attempt,
+            'bytes 2-8/' . strlen($payload),
+        ));
+        $range = (new GetObjectHandler($this->metadata, $this->backend))
+            ->handleRequest($this->getRequest(['Range' => 'bytes=2-8']));
+        self::assertSame(206, $range->getStatus());
+        self::assertSame($selection, \Amp\ByteStream\buffer($range->getBody()));
+        self::assertSame('bytes=2-8', $this->lastProviderRequest()->getHeaderLine('Range'));
+    }
+
+    public function test_encrypted_aws_get_reads_verified_full_ciphertext_then_applies_plaintext_range(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $plaintext = 'encrypted AWS payload';
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, (new PutObjectHandler(
+            $this->metadata,
+            $this->backend,
+            encryption: $encryption,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->putRequest($plaintext, [
+            'x-amz-server-side-encryption' => 'AES256',
+        ]))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $ciphertext = end($this->providerBodies);
+        self::assertIsString($ciphertext);
+        $this->mock->append($this->objectReadResponse(
+            $ciphertext,
+            basename($object->systemMetadata['storagePath']),
+        ));
+
+        $response = (new GetObjectHandler($this->metadata, $this->backend, $encryption))
+            ->handleRequest($this->getRequest(['Range' => 'bytes=1-4']));
+
+        self::assertSame(206, $response->getStatus());
+        self::assertSame(substr($plaintext, 1, 4), \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame('', $this->lastProviderRequest()->getHeaderLine('Range'));
+    }
+
+    public function test_sse_c_aws_get_reads_verified_full_ciphertext_with_customer_key(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $plaintext = 'customer encrypted AWS payload';
+        $customerKey = random_bytes(32);
+        $customerHeaders = [
+            'x-amz-server-side-encryption-customer-algorithm' => 'AES256',
+            'x-amz-server-side-encryption-customer-key' => base64_encode($customerKey),
+            'x-amz-server-side-encryption-customer-key-MD5' => base64_encode(md5($customerKey, true)),
+        ];
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, (new PutObjectHandler(
+            $this->metadata,
+            $this->backend,
+            encryption: $encryption,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->putRequest($plaintext, $customerHeaders))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $ciphertext = end($this->providerBodies);
+        self::assertIsString($ciphertext);
+        $this->mock->append($this->objectReadResponse(
+            $ciphertext,
+            basename($object->systemMetadata['storagePath']),
+        ));
+
+        $response = (new GetObjectHandler($this->metadata, $this->backend, $encryption))
+            ->handleRequest($this->getRequest(['Range' => 'bytes=2-6'] + $customerHeaders));
+
+        self::assertSame(substr($plaintext, 2, 5), \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame('', $this->lastProviderRequest()->getHeaderLine('Range'));
+    }
+
+    public function test_select_reads_only_verified_aws_object_evidence(): void
+    {
+        $payload = "name\nAlice\n";
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $this->mock->append($this->objectReadResponse(
+            $payload,
+            basename($object->systemMetadata['storagePath']),
+        ));
+
+        $response = (new SelectObjectContentHandler($this->metadata, $this->backend))
+            ->handleRequest($this->selectRequest());
+
+        self::assertSame(200, $response->getStatus());
+        self::assertNotSame('', \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame('GET', $this->lastProviderRequest()->getMethod());
+    }
+
+    public function test_get_rejects_invalid_provider_attempt_marker(): void
+    {
+        $payload = 'provider evidence';
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $this->mock->append($this->objectReadResponse($payload, str_repeat('f', 32)));
+
+        $this->expectException(InternalErrorException::class);
+        (new GetObjectHandler($this->metadata, $this->backend))->handleRequest($this->getRequest());
+    }
+
+    public function test_get_rejects_invalid_provider_response_framing(): void
+    {
+        $payload = 'provider framing';
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $attempt = basename($object->systemMetadata['storagePath']);
+        $contentRange = 'bytes 0-' . (strlen($payload) - 1) . '/' . strlen($payload);
+
+        $this->mock->append($this->objectReadResponse($payload, $attempt, $contentRange)->withStatus(200));
+        try {
+            (new GetObjectHandler($this->metadata, $this->backend))->handleRequest($this->getRequest());
+            self::fail('A full read must reject Content-Range framing.');
+        } catch (InternalErrorException) {
+        }
+
+        $this->mock->append($this->objectReadResponse($payload, $attempt)->withStatus(206));
+        try {
+            (new GetObjectHandler($this->metadata, $this->backend))->handleRequest($this->getRequest());
+            self::fail('A full read must require HTTP 200.');
+        } catch (InternalErrorException) {
+        }
+
+        $selection = substr($payload, 1, 4);
+        $this->mock->append($this->objectReadResponse(
+            $selection,
+            $attempt,
+            'bytes 1-4/' . strlen($payload),
+        )->withStatus(200));
+        try {
+            (new GetObjectHandler($this->metadata, $this->backend))
+                ->handleRequest($this->getRequest(['Range' => 'bytes=1-4']));
+            self::fail('A range read must require HTTP 206.');
+        } catch (InternalErrorException) {
+        }
+    }
+
+    public function test_committed_aws_reader_rejects_out_of_bounds_range_before_provider_dispatch(): void
+    {
+        $payload = 'bounded provider read';
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $bucket = $this->metadata->getBucket('bucket');
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($bucket);
+        self::assertNotNull($object);
+        $requestCount = count($this->requests);
+
+        try {
+            $this->backend->readCommittedObject(
+                $bucket,
+                $object,
+                $object->systemMetadata['storagePath'],
+                $object->storageTier,
+                strlen($payload) - 1,
+                2,
+            );
+            self::fail('An out-of-bounds committed-object range must be rejected.');
+        } catch (InternalErrorException) {
+        }
+
+        self::assertCount($requestCount, $this->requests);
+    }
+
+    public function test_zero_byte_aws_get_uses_a_full_request_without_an_invalid_range(): void
+    {
+        $this->mock->append(new Response(200, ['ETag' => '"provider-etag"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest(''))->getStatus());
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $this->mock->append($this->objectReadResponse(
+            '',
+            basename($object->systemMetadata['storagePath']),
+        ));
+
+        $response = (new GetObjectHandler($this->metadata, $this->backend))
+            ->handleRequest($this->getRequest());
+
+        self::assertSame('', \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame('', $this->lastProviderRequest()->getHeaderLine('Range'));
+    }
+
+    public function test_get_accepts_exact_restored_aws_tier_reference(): void
+    {
+        $payload = 'restored AWS payload';
+        $cold = new InMemoryBackend();
+        $coldWrite = $cold->putObject('bucket', 'restored', new ReadableBuffer('cold'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'restored',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/plain',
+            $coldWrite->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'restored', null, 'GLACIER', 'COLD', $coldWrite->path);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attempt = bin2hex(random_bytes(16));
+        $restoredPath = AwsS3WriteAttemptPath::forObject(
+            'bucket',
+            'restored',
+            $bucket->generation,
+            'STANDARD',
+            $attempt,
+            '.opsfour/write-attempts',
+        );
+        $this->metadata->updateObjectRestoreStateWithTier(
+            'bucket',
+            'restored',
+            null,
+            'restored',
+            $restoredPath,
+            new \DateTimeImmutable('+1 hour'),
+            'STANDARD',
+        );
+        $this->mock->append($this->objectReadResponse($payload, $attempt));
+        $tiers = new StorageTierRegistry([
+            new StorageTier('COLD', $cold, restoreRequired: true, defaultWriteTier: true),
+            new StorageTier('STANDARD', $this->backend),
+        ]);
+
+        $response = (new GetObjectHandler($this->metadata, $cold, storageTiers: $tiers))
+            ->handleRequest($this->getRequest(key: 'restored'));
+
+        self::assertSame($payload, \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame($restoredPath, ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
+    }
+
+    public function test_select_accepts_exact_restored_aws_tier_reference(): void
+    {
+        $payload = "name\nAlice\n";
+        $cold = new InMemoryBackend();
+        $coldWrite = $cold->putObject('bucket', 'restored-select', new ReadableBuffer('cold'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'restored-select',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/csv',
+            $coldWrite->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'restored-select', null, 'GLACIER', 'COLD', $coldWrite->path);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attempt = bin2hex(random_bytes(16));
+        $restoredPath = AwsS3WriteAttemptPath::forObject(
+            'bucket',
+            'restored-select',
+            $bucket->generation,
+            'STANDARD',
+            $attempt,
+            '.opsfour/write-attempts',
+        );
+        $this->metadata->updateObjectRestoreStateWithTier(
+            'bucket',
+            'restored-select',
+            null,
+            'restored',
+            $restoredPath,
+            new \DateTimeImmutable('+1 hour'),
+            'STANDARD',
+        );
+        $this->mock->append($this->objectReadResponse($payload, $attempt));
+        $tiers = new StorageTierRegistry([
+            new StorageTier('COLD', $cold, restoreRequired: true, defaultWriteTier: true),
+            new StorageTier('STANDARD', $this->backend),
+        ]);
+
+        $response = (new SelectObjectContentHandler($this->metadata, $cold, storageTiers: $tiers))
+            ->handleRequest($this->selectRequest('restored-select'));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertNotSame('', \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame($restoredPath, ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
     }
 
     public function test_put_immediately_discards_replaced_non_aws_tier_data(): void
@@ -1651,6 +1961,61 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
     private function copy(): CopyObjectHandler
     {
         return new CopyObjectHandler($this->metadata, $this->backend, awsObjectWriter: $this->writer);
+    }
+
+    /** @param array<non-empty-string, string> $headers */
+    private function getRequest(array $headers = [], string $key = 'key'): Request
+    {
+        $request = new Request(
+            $this->createMock(ServerClient::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/' . $key),
+            $headers,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', $key);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.operation', S3Operation::GetObject);
+        return $request;
+    }
+
+    private function selectRequest(string $key = 'key'): Request
+    {
+        $request = new Request(
+            $this->createMock(ServerClient::class),
+            'POST',
+            Http::new('http://127.0.0.1/bucket/' . $key . '?select&select-type=2'),
+            [],
+            '<SelectObjectContentRequest><Expression>SELECT * FROM s3object</Expression>'
+            . '<ExpressionType>SQL</ExpressionType><InputSerialization><CSV/></InputSerialization>'
+            . '<OutputSerialization><CSV/></OutputSerialization></SelectObjectContentRequest>',
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', $key);
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.operation', S3Operation::SelectObjectContent);
+        return $request;
+    }
+
+    private function objectReadResponse(string $body, string $attemptId, ?string $contentRange = null): Response
+    {
+        $headers = [
+            'Content-Length' => (string) strlen($body),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attemptId,
+        ];
+        if ($contentRange !== null) {
+            $headers['Content-Range'] = $contentRange;
+        }
+
+        return new Response($contentRange === null ? 200 : 206, $headers, $body);
+    }
+
+    private function lastProviderRequest(): RequestInterface
+    {
+        self::assertNotEmpty($this->requests);
+
+        return $this->requests[count($this->requests) - 1];
     }
 
     /** @param array<non-empty-string, string> $headers */
