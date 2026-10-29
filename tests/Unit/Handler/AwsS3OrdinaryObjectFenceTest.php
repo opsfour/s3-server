@@ -36,6 +36,8 @@ use OpsFour\S3Server\Handler\Object\PostObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Handler\Object\SelectObjectContentHandler;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
+use OpsFour\S3Server\Metadata\ObjectPart;
+use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
@@ -1571,6 +1573,56 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
             self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
         }
         self::assertCount(4, $this->requests);
+        self::assertSame(0, $this->outstandingIntentCount());
+    }
+
+    public function test_known_multipart_source_corruption_rejects_before_aws_destination_dispatch(): void
+    {
+        $payload = 'multipart source';
+        $parts = ['multipart ', 'source'];
+        $this->mock->append(new Response(200, ['ETag' => '"source"']));
+        self::assertSame(200, $this->put()->handleRequest($this->putRequest($payload))->getStatus());
+        $source = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($source);
+        $sourcePath = $source->systemMetadata['storagePath'];
+        $partMd5s = '';
+        $offset = 0;
+        $layoutParts = [];
+        foreach ($parts as $index => $part) {
+            $partMd5s .= md5($part, binary: true);
+            $layoutParts[] = new ObjectPart($index + 1, $index + 1, $offset, strlen($part));
+            $offset += strlen($part);
+        }
+        $etag = '"' . md5($partMd5s) . '-' . count($parts) . '"';
+        $layout = new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, strlen($payload), $layoutParts);
+        $this->metadata->transaction(function () use ($payload, $etag, $sourcePath, $layout): void {
+            $this->metadata->putObjectMetadata(
+                'bucket',
+                'key',
+                'owner',
+                strlen($payload),
+                $etag,
+                'application/octet-stream',
+                $sourcePath,
+            );
+            $this->metadata->putObjectPartLayout('bucket', 'key', 'null', $layout);
+        });
+        $this->mock->append(new Response(200, [
+            'Content-Length' => (string) strlen($payload),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => basename($sourcePath),
+        ], 'multipart xource'));
+
+        try {
+            $this->copy()->handleRequest($this->copyRequest());
+            self::fail('Corrupt known-multipart bytes reached AWS destination dispatch.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Copy source multipart integrity does not match object metadata.', $error->getMessage());
+            self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
+        }
+
+        self::assertCount(4, $this->requests);
+        self::assertSame('GET', $this->requests[3]->getMethod());
         self::assertSame(0, $this->outstandingIntentCount());
     }
 

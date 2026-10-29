@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableBuffer;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
+use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -110,8 +111,9 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
             new ObjectPart(1, 8, 0, 3),
             new ObjectPart(2, 3, 3, 4),
         ]);
-        $this->metadata->transaction(function () use ($write, $payload, $sourceLayout): void {
-            $this->metadata->putObjectMetadata('source', 'key', 'owner', strlen($payload), '"' . md5($payload) . '"', 'text/plain', $write->path);
+        $etag = '"' . md5(md5('pay', binary: true) . md5('load', binary: true)) . '-2"';
+        $this->metadata->transaction(function () use ($write, $payload, $sourceLayout, $etag): void {
+            $this->metadata->putObjectMetadata('source', 'key', 'owner', strlen($payload), $etag, 'text/plain', $write->path);
             $this->metadata->putObjectPartLayout('source', 'key', 'null', $sourceLayout);
         });
 
@@ -228,6 +230,28 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         self::assertNull($this->metadata->getObjectWriteIntent(substr($object->systemMetadata['storagePath'], -32)));
     }
 
+    public function test_known_multipart_sse_source_is_verified_before_plaintext_publication(): void
+    {
+        $payload = 'multipart encrypted source';
+        $parts = ['multipart ', 'encrypted source'];
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $encrypted = $encryption->encryptSseS3($payload);
+        $this->multipartSource($encrypted['ciphertext'], $parts, [
+            '__sse-algorithm' => 'AES256',
+            '__sse-key' => $encrypted['encryptedDataKey'],
+            '__sse-iv' => $encrypted['iv'],
+            '__sse-tag' => $encrypted['tag'],
+        ]);
+
+        $response = $this->handler($encryption)->handleRequest($this->request());
+
+        self::assertSame(200, $response->getStatus());
+        $object = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($object);
+        self::assertSame($payload, file_get_contents($object->systemMetadata['storagePath']));
+        self::assertArrayNotHasKey('__sse-algorithm', $object->userMetadata);
+    }
+
     public function test_sse_destination_publishes_ciphertext_once_with_plaintext_etag(): void
     {
         $this->source('payload');
@@ -252,6 +276,30 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
             $object->userMetadata['__sse-tag'],
         ));
         self::assertNull($this->metadata->getObjectWriteIntent(substr($object->systemMetadata['storagePath'], -32)));
+    }
+
+    public function test_known_multipart_plaintext_source_is_verified_before_encrypted_publication(): void
+    {
+        $payload = 'multipart encrypted destination';
+        $this->multipartSource($payload, ['multipart ', 'encrypted destination']);
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+
+        $response = $this->handler($encryption)->handleRequest($this->request([
+            'x-amz-server-side-encryption' => 'AES256',
+        ]));
+
+        self::assertSame(200, $response->getStatus());
+        $object = $this->metadata->getObjectMetadata('target', 'copied');
+        self::assertNotNull($object);
+        $ciphertext = file_get_contents($object->systemMetadata['storagePath']);
+        self::assertIsString($ciphertext);
+        self::assertNotSame($payload, $ciphertext);
+        self::assertSame($payload, $encryption->decryptSseS3(
+            $ciphertext,
+            $object->userMetadata['__sse-key'],
+            $object->userMetadata['__sse-iv'],
+            $object->userMetadata['__sse-tag'],
+        ));
     }
 
     public function test_sse_c_source_and_destination_use_distinct_keys_without_plaintext_staging(): void
@@ -320,6 +368,28 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
         self::assertNotNull($this->metadata->getObjectWriteIntent(substr($paths[0], -32)));
     }
 
+    public function test_known_multipart_part_checksum_corruption_never_publishes_local_destination(): void
+    {
+        $calculator = new ChecksumCalculator();
+        $calculator->update('pay');
+        $expectedPartChecksum = $calculator->finalize()->sha256Base64();
+        $this->multipartSource(
+            'corrupt',
+            ['cor', 'rupt'],
+            partChecksums: [0 => ['sha256', $expectedPartChecksum]],
+        );
+
+        try {
+            $this->handler()->handleRequest($this->request());
+            self::fail('A mismatching persisted multipart part checksum must reject the copy.');
+        } catch (InternalErrorException $error) {
+            self::assertSame('Copy source multipart integrity does not match object metadata.', $error->getMessage());
+            self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
+        }
+
+        self::assertSame([], glob($this->base . '/objects/target/*/*/*'));
+    }
+
     public function test_unknown_stored_source_encryption_mode_fails_before_copy_publication(): void
     {
         $this->source('opaque', ['__sse-algorithm' => 'unknown']);
@@ -369,6 +439,54 @@ final class CopyObjectLocalFenceIntegrationTest extends TestCase
             $write->path,
             userMetadata: $userMetadata,
         );
+    }
+
+    /**
+     * @param list<string> $plaintextParts
+     * @param array<string, string> $userMetadata
+     * @param array<int, array{string, string}> $partChecksums
+     */
+    private function multipartSource(
+        string $physicalBytes,
+        array $plaintextParts,
+        array $userMetadata = [],
+        array $partChecksums = [],
+    ): void {
+        $plaintext = implode('', $plaintextParts);
+        self::assertSame(strlen($plaintext), strlen($physicalBytes));
+        $write = $this->storage->putObject('source', 'key', new ReadableBuffer($physicalBytes));
+        $partMd5s = '';
+        $offset = 0;
+        $parts = [];
+        foreach ($plaintextParts as $index => $part) {
+            $partMd5s .= md5($part, binary: true);
+            [$checksumAlgorithm, $checksumValue] = $partChecksums[$index] ?? [null, null];
+            $parts[] = new ObjectPart(
+                $index + 1,
+                $index + 1,
+                $offset,
+                strlen($part),
+                $checksumAlgorithm,
+                $checksumValue,
+            );
+            $offset += strlen($part);
+        }
+        $etag = '"' . md5($partMd5s) . '-' . count($parts) . '"';
+        $layout = new ObjectPartLayout(ObjectPartLayout::KNOWN_MULTIPART, strlen($plaintext), $parts);
+
+        $this->metadata->transaction(function () use ($plaintext, $etag, $write, $userMetadata, $layout): void {
+            $this->metadata->putObjectMetadata(
+                'source',
+                'key',
+                'owner',
+                strlen($plaintext),
+                $etag,
+                'text/plain',
+                $write->path,
+                userMetadata: $userMetadata,
+            );
+            $this->metadata->putObjectPartLayout('source', 'key', 'null', $layout);
+        });
     }
 
     private function handler(?EncryptionService $encryption = null, ?LocalObjectWriteLeaseGuardFactory $factory = null): CopyObjectHandler

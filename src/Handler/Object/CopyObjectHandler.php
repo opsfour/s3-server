@@ -45,6 +45,7 @@ use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\BoundedCopyStorageBackend;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
+use OpsFour\S3Server\Storage\MultipartObjectIntegrityVerifier;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StoragePath;
@@ -55,6 +56,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\TeeReadableStream;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
 /**
@@ -139,6 +141,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         \OpsFour\S3Server\Dto\BucketInfo $sourceBucketInfo,
         string $sourceKey,
         \OpsFour\S3Server\Dto\BucketInfo $destinationBucketInfo,
+        ?MultipartObjectIntegrityVerifier $multipartVerifier,
     ): array {
         \assert(($this->localFencedWriter !== null && $this->localLeaseFactory !== null) || $this->awsObjectWriter !== null);
         \assert($this->metadata instanceof ObjectWriteIntentStore);
@@ -210,6 +213,11 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 if ($plaintextChecksums->size !== $source->size) {
                     throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source size does not match its metadata.');
                 }
+                if ($multipartVerifier !== null) {
+                    $multipartVerifier->update($plaintext);
+                    $multipartVerifier->finish();
+                    $multipartVerifier = null;
+                }
                 $etag = '"' . $plaintextChecksums->md5Hex . '"';
                 if ($destinationEncryptionMode === EncryptionRequestResolver::SSE_C) {
                     \assert($this->encryption !== null);
@@ -252,6 +260,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             } else {
                 $readLimit = $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX;
                 $body = new LimitedReadableStream($this->copySourceStream($sourceStorage, $sourceBucketInfo, $source, $sourceKey, $sourcePath, $awsReserved), $readLimit);
+                if ($multipartVerifier !== null) {
+                    $body = new TeeReadableStream($body, $multipartVerifier->update(...));
+                }
             }
 
             if ($awsReserved !== null) {
@@ -280,6 +291,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     $plaintextChecksums,
                     $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX,
                 );
+                if ($multipartVerifier !== null) {
+                    $multipartVerifier->finish();
+                    $multipartVerifier = null;
+                }
                 if ($requiresBufferedTransform) {
                     $bufferLock?->release();
                     $bufferLock = null;
@@ -320,6 +335,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     || ! hash_equals(md5($expectedPhysicalPayload), strtolower($write->md5Hex))
                 )) {
                     throw new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted copy write does not match its payload.');
+                }
+                if ($multipartVerifier !== null) {
+                    $multipartVerifier->finish();
+                    $multipartVerifier = null;
                 }
                 $token = $lease->stopForCommit();
 
@@ -690,6 +709,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             $srcPath = $srcObjectInfo->restoredStoragePath;
         }
         $destinationStorage = $this->storageTiers->defaultBackend();
+        $multipartVerifier = $this->multipartSourceVerifier($partLayouts, $srcObjectInfo);
         $priorDestinationReferences = [
             $this->metadata->getCurrentObjectVersion($dstBucket, $dstKey),
             $this->metadata->getObjectMetadataByVersion($dstBucket, $dstKey, 'null'),
@@ -729,7 +749,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 $srcBucketInfo,
                 $srcKey,
                 $dstBucketInfo,
+                $multipartVerifier,
             );
+            $multipartVerifier = null;
         } elseif ($preEncryptedDestination) {
             [$writeResult, $preEncryptedEtag, $preEncryptedObjectSize, $preEncryptedMeta, $sourcePlaintextChecksums] = $this->writeEncryptedCopy(
                 $request,
@@ -743,7 +765,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 $dstKey,
                 $destinationEncryptionMode,
                 $objectOwnerId,
+                $multipartVerifier,
             );
+            $multipartVerifier = null;
         } elseif ($sourceStorage === $destinationStorage && $destinationStorage instanceof BoundedCopyStorageBackend) {
             $writeResult = $destinationStorage->copyObjectBounded($srcPath, $dstBucket, $dstKey, $readLimit);
         } else {
@@ -752,6 +776,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             // One byte past the committed size is enough for the post-write
             // integrity check to reject an oversized physical source.
             $stream = new LimitedReadableStream($sourceStorage->getObjectByPath($srcPath), $readLimit);
+            if ($multipartVerifier !== null && $sourceEncryptionMode === null) {
+                $stream = new TeeReadableStream($stream, $multipartVerifier->update(...));
+            }
             $streamCancellation = null;
             try {
                 $writeResult = $destinationStorage->putObject($dstBucket, $dstKey, $stream);
@@ -836,6 +863,11 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     $sourcePlaintextChecksums = $calculator->finalize();
                     $etag = '"' . $sourcePlaintextChecksums->md5Hex . '"';
                     $objectSize = $sourcePlaintextChecksums->size;
+                    if ($multipartVerifier !== null) {
+                        $multipartVerifier->update($plaintext);
+                        $multipartVerifier->finish();
+                        $multipartVerifier = null;
+                    }
 
                     // Replace ciphertext through the backend, so remote paths remain opaque.
                     $writeResult = $this->replaceStoredPayload(
@@ -849,6 +881,20 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     );
                 }
 
+            }
+
+            if ($multipartVerifier !== null) {
+                if ($sourceStorage === $destinationStorage && $destinationStorage instanceof BoundedCopyStorageBackend) {
+                    $this->verifyMultipartDestinationCopy(
+                        $multipartVerifier,
+                        $destinationStorage,
+                        $writeResult,
+                        $srcObjectInfo->size,
+                    );
+                } else {
+                    $multipartVerifier->finish();
+                }
+                $multipartVerifier = null;
             }
 
             // Storage reads can succeed even when the source payload changed
@@ -1244,6 +1290,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         string $destinationKey,
         string $destinationEncryptionMode,
         string $objectOwnerId,
+        ?MultipartObjectIntegrityVerifier $multipartVerifier,
     ): array {
         EncryptionRequestResolver::requireEncryptionService($this->encryption, $destinationEncryptionMode);
         \assert($this->encryption !== null);
@@ -1291,6 +1338,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             if (preg_match('/\A"([0-9a-fA-F]{32})"\z/', $source->etag, $sourceMd5) === 1
                 && !hash_equals(strtolower($sourceMd5[1]), strtolower($checksums->md5Hex))) {
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source ETag does not match its payload.');
+            }
+            if ($multipartVerifier !== null) {
+                $multipartVerifier->update($plaintext);
+                $multipartVerifier->finish();
             }
 
             if ($destinationEncryptionMode === EncryptionRequestResolver::SSE_C) {
@@ -1413,6 +1464,60 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             if ($value !== null && ($actual[$algorithm] === null || ! hash_equals($value, $actual[$algorithm]))) {
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source checksum does not match its payload.');
             }
+        }
+    }
+
+    private function multipartSourceVerifier(
+        \OpsFour\S3Server\Metadata\ObjectPartLayoutStore $partLayouts,
+        ObjectInfo $source,
+    ): ?MultipartObjectIntegrityVerifier {
+        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-sha1', 'checksum-sha256'] as $checksum) {
+            if (isset($source->systemMetadata[$checksum])) {
+                return null;
+            }
+        }
+
+        $layout = $partLayouts->getObjectPartLayout($source);
+        if ($layout->kind === \OpsFour\S3Server\Metadata\ObjectPartLayout::UNKNOWN_MULTIPART) {
+            throw new \OpsFour\S3Server\Exception\InternalErrorException(
+                'Copy source multipart layout cannot be verified.',
+            );
+        }
+        if ($layout->kind !== \OpsFour\S3Server\Metadata\ObjectPartLayout::KNOWN_MULTIPART) {
+            return null;
+        }
+
+        return new MultipartObjectIntegrityVerifier($layout, $source->etag);
+    }
+
+    private function verifyMultipartDestinationCopy(
+        MultipartObjectIntegrityVerifier $verifier,
+        StorageBackend $storage,
+        StorageWriteResult $write,
+        int $expectedSize,
+    ): void {
+        $stream = new LimitedReadableStream(
+            $storage->getObjectByPath($write->path),
+            $expectedSize,
+            requireExactLength: true,
+            rejectExcess: true,
+        );
+        $cancellation = null;
+        try {
+            while (($chunk = $stream->read()) !== null) {
+                $verifier->update($chunk);
+            }
+            $verifier->finish();
+        } catch (\Throwable $error) {
+            if ($error instanceof \Amp\CancelledException) {
+                $cancellation = $error;
+            }
+            throw $error;
+        } finally {
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $cancellation,
+                $stream->close(...),
+            );
         }
     }
 
