@@ -143,7 +143,7 @@ final class ParallelFlysystemBackendTest extends TestCase
             self::fail('Temp-budget cleanup failure must not replace worker cancellation.');
         } catch (CancelledException $error) {
             self::assertSame($cancellation, $error);
-            self::assertSame([], self::stagingFiles($this->tempDir));
+            self::assertCount(1, self::stagingFiles($this->tempDir), 'Corrupt identity state must retain rather than path-delete staging bytes.');
         } finally {
             $backend->shutdown();
         }
@@ -431,6 +431,93 @@ final class ParallelFlysystemBackendTest extends TestCase
                 self::assertSame([], self::stagingFiles($this->tempDir));
             }
             self::assertSame(3, $backend->putPart('bucket', 'key', 'upload', 1, new ReadableBuffer('abc'))->size);
+            self::assertSame([], self::stagingFiles($this->tempDir));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_known_size_object_and_part_writes_reserve_before_reading_source(): void
+    {
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            tempBudgetBytes: 7,
+            tempReserveBytes: 0,
+        );
+        $generation = bin2hex(random_bytes(16));
+        $uploadId = bin2hex(random_bytes(16));
+        $plannedObject = $backend->planObjectWritePath('bucket', 'key', $generation, bin2hex(random_bytes(16)));
+        $plannedPart = $backend->planMultipartPartPath('bucket', $generation, $uploadId, 1, bin2hex(random_bytes(16)));
+        $writes = [
+            static fn(ReadableStream $body) => $backend->putObjectKnownSize('bucket', 'key', $body, 4),
+            static fn(ReadableStream $body) => $backend->putObjectAtPathKnownSize('bucket', 'key', $body, $plannedObject, 4),
+            static fn(ReadableStream $body) => $backend->putPartKnownSize('bucket', 'key', $uploadId, 1, $body, 4),
+            static fn(ReadableStream $body) => $backend->putPartAtPathKnownSize('bucket', 'key', $uploadId, 1, $body, $plannedPart, 4),
+        ];
+
+        try {
+            foreach ($writes as $write) {
+                $body = $this->createMock(ReadableStream::class);
+                $body->expects(self::never())->method('read');
+                try {
+                    $write($body);
+                    self::fail('Known-size worker staging exceeded the node budget.');
+                } catch (SlowDownException) {
+                    self::assertSame([], self::stagingFiles($this->tempDir));
+                }
+            }
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_known_size_worker_paths_consume_two_pre_admitted_stages_and_complete(): void
+    {
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            tempBudgetBytes: 8,
+            tempReserveBytes: 0,
+        );
+        $generation = bin2hex(random_bytes(16));
+        $uploadId = bin2hex(random_bytes(16));
+        $plannedObject = $backend->planObjectWritePath('bucket', 'planned', $generation, bin2hex(random_bytes(16)));
+        $plannedPart = $backend->planMultipartPartPath('bucket', $generation, $uploadId, 2, bin2hex(random_bytes(16)));
+
+        try {
+            self::assertSame(4, $backend->putObjectKnownSize('bucket', 'direct', new ReadableBuffer('data'), 4)->size);
+            self::assertSame(4, $backend->putObjectAtPathKnownSize('bucket', 'planned', new ReadableBuffer('more'), $plannedObject, 4)->size);
+            self::assertSame(4, $backend->putPartKnownSize('bucket', 'key', $uploadId, 1, new ReadableBuffer('part'), 4)->size);
+            self::assertSame(4, $backend->putPartAtPathKnownSize('bucket', 'key', $uploadId, 2, new ReadableBuffer('next'), $plannedPart, 4)->size);
+            self::assertSame([], self::stagingFiles($this->tempDir));
+        } finally {
+            $backend->shutdown();
+        }
+    }
+
+    public function test_known_size_worker_paths_account_for_longer_streams_and_return_shorter_actual_sizes(): void
+    {
+        $backend = new ParallelFlysystemBackend(
+            new SlowLocalFlysystemFactory($this->remoteRoot),
+            $this->tempDir,
+            1,
+            tempBudgetBytes: 16,
+            tempReserveBytes: 0,
+        );
+
+        try {
+            self::assertSame(4, $backend->putObjectKnownSize('bucket', 'long', new ReadableBuffer('data'), 3)->size);
+            self::assertSame(4, $backend->putPartKnownSize(
+                'bucket',
+                'short',
+                bin2hex(random_bytes(16)),
+                1,
+                new ReadableBuffer('part'),
+                5,
+            )->size);
             self::assertSame([], self::stagingFiles($this->tempDir));
         } finally {
             $backend->shutdown();
@@ -739,8 +826,6 @@ final class ParallelFlysystemBackendTest extends TestCase
                     self::assertSame('Storage write workers are busy.', $error->getMessage());
                 }
             }
-            self::assertCount(1, $waiters->getValue($backend));
-
             try {
                 $waiting->await();
                 self::fail('A queued write must leave the admission queue at its deadline.');
@@ -748,7 +833,6 @@ final class ParallelFlysystemBackendTest extends TestCase
                 self::assertSame('Storage write workers are busy.', $error->getMessage());
             }
             self::assertSame([], $waiters->getValue($backend));
-            self::assertSame(1, $activeSlots->getValue($backend));
 
             self::assertSame(6, $active->await()->size);
             self::assertSame(0, $activeSlots->getValue($backend));

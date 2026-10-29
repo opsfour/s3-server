@@ -22,6 +22,34 @@ final class S3ServerConfigValidationTest extends TestCase
         self::assertSame(5, $config->shutdownReadinessDelay);
     }
 
+    public function test_deprecated_post_budget_alone_supplies_the_canonical_node_budget(): void
+    {
+        $temp = sys_get_temp_dir() . '/s3-config-temp-' . bin2hex(random_bytes(8));
+        try {
+            $config = new S3ServerConfig(
+                storagePath: '/',
+                postSpoolBudgetBytes: 123_456,
+                storageTempDir: $temp,
+            );
+
+            self::assertSame(123_456, $config->postSpoolBudgetBytes);
+            self::assertSame(123_456, $config->storageTempBudgetBytes);
+        } finally {
+            @rmdir($temp);
+        }
+    }
+
+    public function test_explicit_deprecated_and_canonical_node_budgets_must_match(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('deprecated and must equal');
+        new S3ServerConfig(
+            storagePath: '/',
+            postSpoolBudgetBytes: 123_456,
+            storageTempBudgetBytes: 123_457,
+        );
+    }
+
     public function test_shutdown_readiness_delay_is_bounded_and_survives_clone(): void
     {
         $config = new S3ServerConfig(storagePath: '/', shutdownReadinessDelay: 0);

@@ -22,15 +22,20 @@ final readonly class LocalObjectWriteFence
 {
     private string $root;
 
+    private string $tempNamespace;
+
     public function __construct(
         string $basePath,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
+        private ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $resolved = realpath($basePath);
         if ($resolved === false || ! is_dir($resolved)) {
             throw new \InvalidArgumentException('Local object storage root must exist.');
         }
         $this->root = rtrim($resolved, '/');
+        $this->tempNamespace = 'filesystem_' . substr(hash('sha256', $this->root), 0, 24);
+        $this->tempBudget?->registerNamespace($this->tempNamespace, $this->root . '/.tmp');
     }
 
     public function planPath(string $bucket, string $key, string $bucketGeneration, string $attemptId): string
@@ -38,8 +43,13 @@ final readonly class LocalObjectWriteFence
         return StoragePath::forPlannedObject($this->root, $bucket, $key, $bucketGeneration, $attemptId);
     }
 
-    public function write(ObjectWriteIntent $intent, string $key, ReadableStream $body): StorageWriteResult
-    {
+    public function write(
+        ObjectWriteIntent $intent,
+        string $key,
+        ReadableStream $body,
+        ?int $knownSize = null,
+        ?StorageTempReservation $capacity = null,
+    ): StorageWriteResult {
         $this->assertWriteIntentPath($intent, $key);
         if ($intent->state !== 'active') {
             throw new \InvalidArgumentException('Object write intent must be active.');
@@ -50,21 +60,49 @@ final readonly class LocalObjectWriteFence
         $this->ensureDirectory($targetDirectory);
         $this->ensureDirectory($tempDirectory);
         $tempPath = $tempDirectory . '/' . $intent->attemptId . '-' . bin2hex(random_bytes(16));
-        $file = @fopen($tempPath, 'x+b');
-        if ($file === false) {
-            throw new \RuntimeException('Failed to create local object staging file.');
-        }
-
+        $file = null;
         $tempLease = null;
+        $reservation = null;
+        $ownedTemp = false;
         $calculator = new ChecksumCalculator();
         $size = 0;
         try {
-            if (! @chmod($tempPath, 0600) || ! @flock($file, LOCK_SH | LOCK_NB)) {
+            if ($capacity !== null) {
+                if ($this->tempBudget === null) {
+                    throw new \LogicException('Pre-reserved publication capacity requires the canonical temporary coordinator.');
+                }
+                $this->tempBudget->retarget($capacity, $tempPath, 'fenced_object');
+                $reservation = $capacity;
+            } else {
+                $reservation = $this->tempBudget?->start($tempPath, 'fenced_object');
+            }
+            $created = $reservation !== null ? @lstat($tempPath) : null;
+            $file = @fopen($tempPath, $reservation !== null ? 'r+b' : 'x+b');
+            $ownedTemp = $reservation !== null || is_resource($file);
+            $opened = is_resource($file) ? @fstat($file) : false;
+            if ($file === false || ($reservation !== null && ($created === false || $opened === false
+                || ! isset($created['dev'], $created['ino'], $opened['dev'], $opened['ino'])
+                || $opened['dev'] !== $created['dev'] || $opened['ino'] !== $created['ino']))
+                || ! @chmod($tempPath, 0600) || ! @flock($file, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Failed to protect local object staging file.');
             }
+            if ($knownSize !== null && $capacity === null) {
+                if ($knownSize < 0) {
+                    throw new \InvalidArgumentException('Known local object size must be non-negative.');
+                }
+                if ($reservation !== null) {
+                    $this->tempBudget?->reserve($reservation, $knownSize);
+                }
+            }
+            $reservedBytes = $knownSize ?? 0;
             while (($chunk = $body->read()) !== null) {
+                $nextSize = $size + strlen($chunk);
+                if ($reservation !== null && $nextSize > $reservedBytes) {
+                    $this->tempBudget?->reserve($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $calculator->update($chunk);
-                $size += strlen($chunk);
+                $size = $nextSize;
                 $this->writeAll($file, $chunk);
             }
             $checksums = $calculator->finalize();
@@ -132,7 +170,10 @@ final readonly class LocalObjectWriteFence
             }
             $this->syncDirectoryChain($targetDirectory);
 
-            if (! @unlink($tempPath)) {
+            $removed = $reservation !== null
+                ? ($this->tempBudget?->cleanup($reservation) ?? false)
+                : @unlink($tempPath);
+            if (! $removed) {
                 throw new \RuntimeException('Failed to remove local object staging link.');
             }
             $this->syncDirectoryChain($tempDirectory);
@@ -157,7 +198,14 @@ final readonly class LocalObjectWriteFence
             }
             // The final path is intentionally never removed here. A committed
             // collector claim must replace it with a permanent same-path seal.
-            @unlink($tempPath);
+            if ($reservation !== null) {
+                try {
+                    $this->tempBudget?->cleanup($reservation);
+                } catch (\Throwable) {
+                }
+            } elseif ($ownedTemp) {
+                @unlink($tempPath);
+            }
         }
     }
 

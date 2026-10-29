@@ -316,6 +316,24 @@ final class S3ServerServiceProviderTest extends TestCase
         }
     }
 
+    public function test_package_config_uses_legacy_post_budget_when_canonical_budget_is_absent(): void
+    {
+        $canonical = getenv('S3_STORAGE_TEMP_BUDGET');
+        $legacy = getenv('S3_POST_SPOOL_BUDGET');
+        putenv('S3_STORAGE_TEMP_BUDGET');
+        putenv('S3_POST_SPOOL_BUDGET=7654321');
+        new Application($this->basePath);
+
+        try {
+            $config = require __DIR__ . '/../../../config/s3-server.php';
+            self::assertSame(7_654_321, $config['post_spool_budget']);
+            self::assertSame(7_654_321, $config['storage']['temp_budget_bytes']);
+        } finally {
+            putenv($canonical === false ? 'S3_STORAGE_TEMP_BUDGET' : "S3_STORAGE_TEMP_BUDGET={$canonical}");
+            putenv($legacy === false ? 'S3_POST_SPOOL_BUDGET' : "S3_POST_SPOOL_BUDGET={$legacy}");
+        }
+    }
+
     public function test_package_config_preserves_invalid_external_iam_enabled_for_runtime_validation(): void
     {
         $name = 'S3_EXTERNAL_IAM_ENABLED';
@@ -360,6 +378,7 @@ final class S3ServerServiceProviderTest extends TestCase
             'body_size_limit' => 456_789,
             'trusted_proxy_cidrs' => '127.0.0.1/32, ::1/128',
             'post_spool_budget' => 987_654,
+            'storage' => ['temp_budget_bytes' => 987_654],
             'local_write_worker_timeout_seconds' => 12.5,
             'enforce_min_part_size' => false,
             'allow_unfenced_storage_for_tests' => true,
@@ -380,6 +399,7 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame(456_789, $config->requestBodySizeLimit);
         self::assertSame(['127.0.0.1/32', '::1/128'], $config->trustedProxyCidrs);
         self::assertSame(987_654, $config->postSpoolBudgetBytes);
+        self::assertSame(987_654, $config->storageTempBudgetBytes);
         self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
@@ -397,6 +417,28 @@ final class S3ServerServiceProviderTest extends TestCase
         self::assertSame($storage, $app->make(StorageBackend::class));
         self::assertInstanceOf(CachedMetadataStoreDecorator::class, $app->make(MetadataStore::class));
         self::assertInstanceOf(CredentialProvider::class, $app->make(CredentialProvider::class));
+    }
+
+    public function test_deprecated_post_budget_alone_becomes_the_canonical_laravel_node_budget(): void
+    {
+        $config = $this->application([
+            'post_spool_budget' => 654_321,
+        ])->make(S3ServerConfig::class);
+
+        self::assertSame(654_321, $config->postSpoolBudgetBytes);
+        self::assertSame(654_321, $config->storageTempBudgetBytes);
+    }
+
+    public function test_laravel_rejects_divergent_explicit_post_and_storage_budgets(): void
+    {
+        $app = $this->application([
+            'post_spool_budget' => 654_321,
+            'storage' => ['temp_budget_bytes' => 654_322],
+        ]);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('deprecated and must equal');
+        $app->make(S3ServerConfig::class);
     }
 
     public function test_provider_registers_all_documented_artisan_commands(): void

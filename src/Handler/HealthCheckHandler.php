@@ -21,6 +21,7 @@ use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
@@ -77,6 +78,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
         private readonly ?ClusterRoleController $clusterRoles = null,
         private readonly ?NodeDrainController $drain = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         if ($readinessCheckIntervalSeconds < 0) {
             throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
@@ -89,6 +91,22 @@ final class HealthCheckHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
+        if ($this->tempBudget !== null) {
+            try {
+                $tempCapacity = $this->tempBudget->snapshot();
+                if (! $tempCapacity->mutationReady()) {
+                    return $this->tempCapacityClosedResponse(
+                        $tempCapacity->unsafeEntries > 0 ? 'unsafe_state' : 'physical_reserve',
+                    );
+                }
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                $this->logDegraded('node_temp_capacity', $error);
+
+                return $this->tempCapacityClosedResponse('snapshot_error');
+            }
+        }
         if ($this->drain !== null && ! $this->drain->acceptsNewWork()) {
             return new Response(
                 status: 503,
@@ -384,6 +402,18 @@ final class HealthCheckHandler implements RequestHandler
             body: json_encode([
                 'status' => 'degraded',
                 'cluster' => $this->clusterAdmission?->diagnostics() ?? ['admission' => 'unavailable'],
+            ], JSON_THROW_ON_ERROR),
+        );
+    }
+
+    private function tempCapacityClosedResponse(string $reason): Response
+    {
+        return new Response(
+            status: 503,
+            headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
+            body: json_encode([
+                'status' => 'degraded',
+                'node_temp_capacity' => $reason,
             ], JSON_THROW_ON_ERROR),
         );
     }

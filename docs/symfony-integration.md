@@ -332,6 +332,7 @@ opsfour_s3_server:
     worker_pool_size: 8
     temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
     temp_budget_bytes: 10737418240
+    temp_reserve_bytes: 1073741824
 ```
 
 The same pattern works for physical tiers:
@@ -341,28 +342,29 @@ opsfour_s3_server:
   storage:
     driver: flysystem
     path: '%kernel.project_dir%/var/s3'
+    temp_dir: '%kernel.cache_dir%/opsfour-s3-temp'
+    temp_budget_bytes: 10737418240
+    temp_reserve_bytes: 1073741824
     tiers:
       STANDARD:
         driver: flysystem
         filesystem_factory_service: 'app.hot_filesystem_factory'
         worker_pool_size: 8
-        temp_dir: '%kernel.cache_dir%/opsfour-s3-hot'
         default: true
 
       GLACIER:
         driver: flysystem
         filesystem_factory_service: 'app.cold_filesystem_factory'
         worker_pool_size: 4
-        temp_dir: '%kernel.cache_dir%/opsfour-s3-cold'
         restore_required: true
 ```
 
 The server uses local temporary files for bounded-memory staging. Object data
 is persisted in the configured remote backend. `temp_budget_bytes` defaults
-to 10 GiB and counts both API and worker temporary files for transfers sharing
-one `temp_dir`; tiers can override it. A multipart assembly larger than the
-budget returns 503 until the budget is raised. Size and monitor each temporary
-volume, and apply a volume quota when browser POST or unrelated writers share it.
+to 10 GiB and is one node-local pool for request spools and every tier's API and
+worker staging. All Flysystem tiers inherit the top-level `temp_dir`, budget,
+and reserve; divergent tier values are rejected. A multipart assembly larger
+than the remaining budget returns 503 until capacity is released or raised.
 
 ## Symfony Event Listeners
 

@@ -21,6 +21,9 @@ final class TemporaryFileTask implements Task
         private readonly string $data = '',
         private readonly int $offset = 0,
         private readonly int $length = 0,
+        private readonly ?int $expectedDevice = null,
+        private readonly ?int $expectedInode = null,
+        private readonly ?int $expectedOwner = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): ?string
@@ -62,10 +65,7 @@ final class TemporaryFileTask implements Task
     {
         // An upload must never recreate a missing spool with umask-dependent
         // permissions after a cleanup or external deletion.
-        $handle = @fopen($this->path, 'r+b');
-        if ($handle === false) {
-            throw new \RuntimeException("Unable to open temporary file for append: {$this->path}.");
-        }
+        $handle = $this->openExpectedFile('r+b', 'append');
 
         try {
             if (fseek($handle, 0, SEEK_END) !== 0) {
@@ -94,10 +94,7 @@ final class TemporaryFileTask implements Task
             throw new \InvalidArgumentException('Temporary-file read offset and length are invalid.');
         }
 
-        $handle = @fopen($this->path, 'rb');
-        if ($handle === false) {
-            throw new \RuntimeException("Unable to open temporary file for reading: {$this->path}.");
-        }
+        $handle = $this->openExpectedFile('rb', 'reading');
 
         try {
             if ($this->offset > 0 && fseek($handle, $this->offset) !== 0) {
@@ -125,6 +122,39 @@ final class TemporaryFileTask implements Task
         return null;
     }
 
+    /** @return resource */
+    private function openExpectedFile(string $mode, string $operation)
+    {
+        if ($this->expectedDevice === null || $this->expectedInode === null || $this->expectedOwner === null) {
+            throw new \InvalidArgumentException("Temporary-file {$operation} requires expected inode identity.");
+        }
+        clearstatcache(true, $this->path);
+        $before = @lstat($this->path);
+        if ($before === false || ($before['mode'] & 0o170000) !== 0o100000
+            || ($before['mode'] & 0o077) !== 0
+            || $before['dev'] !== $this->expectedDevice
+            || $before['ino'] !== $this->expectedInode
+            || $before['uid'] !== $this->expectedOwner) {
+            throw new \RuntimeException("Temporary file identity changed before {$operation}: {$this->path}.");
+        }
+        $handle = @fopen($this->path, $mode);
+        if ($handle === false) {
+            throw new \RuntimeException("Unable to open temporary file for {$operation}: {$this->path}.");
+        }
+        $opened = @fstat($handle);
+        if ($opened === false || ($opened['mode'] & 0o170000) !== 0o100000
+            || ($opened['mode'] & 0o077) !== 0
+            || $opened['dev'] !== $this->expectedDevice
+            || $opened['ino'] !== $this->expectedInode
+            || $opened['uid'] !== $this->expectedOwner
+            || ! @flock($handle, LOCK_SH | LOCK_NB)) {
+            @fclose($handle);
+            throw new \RuntimeException("Unable to verify temporary file for {$operation}: {$this->path}.");
+        }
+
+        return $handle;
+    }
+
     private function sweep(Cancellation $cancellation): string
     {
         if ($this->offset <= 0 || $this->length <= 0) {
@@ -133,7 +163,6 @@ final class TemporaryFileTask implements Task
 
         $prefixes = array_values(array_filter(explode(',', $this->data)));
         $deleted = 0;
-        $activePostPaths = $this->activePostPaths();
 
         foreach (new \FilesystemIterator($this->path, \FilesystemIterator::SKIP_DOTS) as $file) {
             $cancellation->throwIfRequested();
@@ -160,12 +189,11 @@ final class TemporaryFileTask implements Task
             if (!$matchesPrefix || $file->getMTime() >= $this->offset) {
                 continue;
             }
-            if (str_starts_with($name, 's3-post-')) {
-                if ($activePostPaths !== null && !isset($activePostPaths[$file->getPathname()])
-                    && @unlink($file->getPathname())) {
-                    $deleted++;
-                }
-
+            if (str_starts_with($name, 's3-post-')
+                || str_starts_with($name, 's3-md5-')
+                || str_starts_with($name, 's3-sha256-')) {
+                // Unified coordinator recovery requires reservation identity;
+                // an old-looking unleased path is never sufficient evidence.
                 continue;
             }
 
@@ -185,41 +213,4 @@ final class TemporaryFileTask implements Task
         return (string) $deleted;
     }
 
-    /** @return array<string, true>|null Null means a lease could not be read safely. */
-    private function activePostPaths(): ?array
-    {
-        $leaseDir = $this->path . DIRECTORY_SEPARATOR . '.opsfour-s3-post-budget';
-        if (!is_dir($leaseDir)) {
-            return [];
-        }
-
-        $paths = glob($leaseDir . DIRECTORY_SEPARATOR . 'lease-*');
-        if ($paths === false) {
-            return null;
-        }
-
-        $active = [];
-        foreach ($paths as $path) {
-            $handle = @fopen($path, 'r');
-            if ($handle === false) {
-                return null;
-            }
-            try {
-                if (flock($handle, LOCK_EX | LOCK_NB)) {
-                    continue;
-                }
-                $statePath = $leaseDir . DIRECTORY_SEPARATOR . 'state-' . substr(basename($path), 6);
-                $contents = @file_get_contents($statePath);
-                $lease = $contents === false ? null : json_decode($contents, true);
-                if (!is_array($lease) || !isset($lease['tempPath']) || !is_string($lease['tempPath'])) {
-                    return null;
-                }
-                $active[$lease['tempPath']] = true;
-            } finally {
-                fclose($handle);
-            }
-        }
-
-        return $active;
-    }
 }

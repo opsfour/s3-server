@@ -10,9 +10,11 @@ use Amp\CancelledException;
 use Amp\File;
 use Amp\File\Driver\ParallelFilesystemDriver;
 use Amp\Parallel\Worker\ContextWorkerPool;
+use Amp\Parallel\Worker\TaskFailureThrowable;
 use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\WorkerPool;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Parallel\LocalStageBudgetReserveTask;
 
 /**
@@ -26,9 +28,13 @@ final class LocalScratchStager
 {
     private const int STAGE_BLOCK_BYTES = 65_536;
 
+    private const int RESERVATION_QUANTUM_BYTES = 4_194_304;
+
     private readonly string $scratch;
 
     private readonly StorageTempBudgetCoordinator $budget;
+
+    private readonly bool $ownsBudget;
 
     private readonly WorkerPool $stagePool;
 
@@ -47,6 +53,8 @@ final class LocalScratchStager
         string $scratchDirectory,
         private readonly int $budgetBytes = 10_737_418_240,
         ?WorkerPool $budgetPool = null,
+        private readonly int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $scratch = realpath($scratchDirectory);
         if ($scratch === false || ! is_dir($scratch) || ! is_writable($scratch)) {
@@ -58,7 +66,16 @@ final class LocalScratchStager
             throw new \InvalidArgumentException('Local scratch directory must be private and process-owned.');
         }
         $this->scratch = rtrim($scratch, '/');
-        $this->budget = new StorageTempBudgetCoordinator($this->scratch, $budgetBytes);
+        $this->ownsBudget = $tempBudget === null;
+        $this->budget = $tempBudget ?? new StorageTempBudgetCoordinator($this->scratch, $budgetBytes, $filesystemReserveBytes);
+        if ($this->budget->budgetBytes() !== $budgetBytes
+            || $this->budget->filesystemReserveBytes() !== $filesystemReserveBytes) {
+            throw new \InvalidArgumentException('Local scratch temporary capacity differs from the node contract.');
+        }
+        $namespace = 'scratch_' . substr(hash('sha256', $this->scratch), 0, 24);
+        if ($this->budget->tempDir() !== $this->scratch) {
+            $this->budget->registerNamespace($namespace, $this->scratch);
+        }
         $this->stagePool = new ContextWorkerPool(2);
         $this->ownsBudgetPool = $budgetPool === null;
         $this->budgetPool = $budgetPool ?? new ContextWorkerPool(2);
@@ -75,9 +92,13 @@ final class LocalScratchStager
         bool $fullChecksums = false,
         ?\Closure $heartbeat = null,
         float $heartbeatIntervalSeconds = 60.0,
+        ?int $knownSize = null,
+        ?StorageTempReservation $capacity = null,
     ): LocalScratchStage {
         if ($this->shuttingDown || ! preg_match('/^[a-f0-9]{32}$/D', $attemptId)
             || ! preg_match('/^s3fw-(?:put|part|get|mpu)-$/D', $prefix)
+            || ($knownSize !== null && $knownSize < 0)
+            || ($capacity !== null && $knownSize === null)
             || ($heartbeat !== null && (! is_finite($heartbeatIntervalSeconds)
                 || $heartbeatIntervalSeconds <= 0.0 || $heartbeatIntervalSeconds > 86400.0))) {
             throw new \InvalidArgumentException('Invalid local scratch staging request.');
@@ -85,13 +106,26 @@ final class LocalScratchStager
         $cancellation?->throwIfRequested();
         $path = $this->scratch . '/' . $prefix . $attemptId . bin2hex(random_bytes(16));
         $file = null;
+        $fileLease = null;
         $reservation = null;
         try {
-            $file = $this->stageFilesystem->openFile($path, 'x+b');
+            if ($capacity !== null) {
+                $this->budget->retarget($capacity, $path, 'storage');
+                $reservation = $capacity;
+            } else {
+                $reservation = $this->budget->start($path);
+            }
+            $fileLease = StorageTempFileLease::acquireExisting($path);
+            $file = $this->stageFilesystem->openFile($path, 'c+');
+            $fileLease->assertPath($path);
             if (! @chmod($path, 0600)) {
                 throw new \RuntimeException('Failed to protect local object staging file.');
             }
-            $reservation = $this->budget->start($path);
+            $reservedBytes = 0;
+            if ($knownSize !== null && $knownSize > 0 && $capacity === null) {
+                $this->reserveBytes($reservation, $knownSize, $cancellation);
+            }
+            $reservedBytes = $knownSize ?? 0;
             $hash = $fullChecksums ? new ChecksumCalculator() : hash_init('sha256');
             $size = 0;
             $pending = '';
@@ -119,7 +153,7 @@ final class LocalScratchStager
                     $cancellation?->throwIfRequested();
                     if ($pending === '' && $length - $offset >= self::STAGE_BLOCK_BYTES) {
                         $block = substr($chunk, $offset, self::STAGE_BLOCK_BYTES);
-                        $size += $this->writeBlock($file, $reservation, $hash, $block, $cancellation);
+                        $size += $this->writeBlock($file, $reservation, $hash, $block, $reservedBytes, $cancellation);
                         $offset += self::STAGE_BLOCK_BYTES;
                         continue;
                     }
@@ -127,19 +161,25 @@ final class LocalScratchStager
                     $pending .= substr($chunk, $offset, $take);
                     $offset += $take;
                     if (strlen($pending) === self::STAGE_BLOCK_BYTES) {
-                        $size += $this->writeBlock($file, $reservation, $hash, $pending, $cancellation);
+                        $size += $this->writeBlock($file, $reservation, $hash, $pending, $reservedBytes, $cancellation);
                         $pending = '';
                     }
                 }
             }
             if ($pending !== '') {
-                $size += $this->writeBlock($file, $reservation, $hash, $pending, $cancellation);
+                $size += $this->writeBlock($file, $reservation, $hash, $pending, $reservedBytes, $cancellation);
             }
             $file->close();
             $file = null;
+            $fileLease->release();
+            $fileLease = null;
             clearstatcache(true, $path);
             if (@filesize($path) !== $size) {
                 throw new \RuntimeException('Local object staging file is incomplete.');
+            }
+            if ($reservedBytes > 0) {
+                $this->budget->releaseUnused($reservation, $reservedBytes);
+                $reservedBytes = 0;
             }
             $cancellation?->throwIfRequested();
 
@@ -162,14 +202,13 @@ final class LocalScratchStager
             } catch (\Throwable) {
                 // The original staging failure determines the safe outcome.
             }
-            $this->deleteStage($path);
+            $fileLease?->release();
             if ($reservation !== null) {
                 try {
-                    $this->budget->release($reservation);
-                } catch (\Throwable $releaseError) {
-                    if (! $error instanceof CancelledException) {
-                        throw $releaseError;
-                    }
+                    $this->budget->cleanup($reservation);
+                } catch (\Throwable) {
+                    // Preserve the staging failure. An unreleased or corrupt
+                    // reservation remains charged and closes later admission.
                 }
             }
             throw $error;
@@ -184,9 +223,9 @@ final class LocalScratchStager
             throw new \InvalidArgumentException('Local scratch stage does not match its reservation.');
         }
         try {
-            $this->deleteStage($stage->path);
+            $this->budget->cleanup($stage->reservation);
         } finally {
-            $this->budget->release($stage->reservation);
+            $stage->reservation->close();
         }
         unset($this->issuedStages[$stage]);
     }
@@ -200,6 +239,9 @@ final class LocalScratchStager
         if ($this->ownsBudgetPool) {
             $this->budgetPool->shutdown();
         }
+        if ($this->ownsBudget) {
+            $this->budget->close();
+        }
     }
 
     private function writeBlock(
@@ -207,11 +249,32 @@ final class LocalScratchStager
         StorageTempReservation $reservation,
         ChecksumCalculator|\HashContext $hash,
         string $block,
+        int &$reservedBytes,
         ?Cancellation $cancellation,
     ): int {
         $bytes = strlen($block);
-        $this->reserveBytes($reservation, $bytes, $cancellation);
+        if ($bytes > $reservedBytes) {
+            $needed = $bytes - $reservedBytes;
+            $admitted = max($needed, min($this->budgetBytes, self::RESERVATION_QUANTUM_BYTES));
+            try {
+                $this->reserveBytes($reservation, $admitted, $cancellation);
+            } catch (SlowDownException $error) {
+                if ($admitted === $needed) {
+                    throw $error;
+                }
+                $admitted = $needed;
+                $this->reserveBytes($reservation, $admitted, $cancellation);
+            } catch (TaskFailureThrowable $error) {
+                if ($error->getOriginalClassName() !== SlowDownException::class || $admitted === $needed) {
+                    throw $error;
+                }
+                $admitted = $needed;
+                $this->reserveBytes($reservation, $admitted, $cancellation);
+            }
+            $reservedBytes += $admitted;
+        }
         $file->write($block);
+        $reservedBytes -= $bytes;
         if ($hash instanceof ChecksumCalculator) {
             $hash->update($block);
         } else {
@@ -242,24 +305,16 @@ final class LocalScratchStager
             throw new \RuntimeException('Local staging reservation worker checkout was canceled.');
         }
         $reserveFuture = $worker->submit(new LocalStageBudgetReserveTask(
-            $this->scratch,
+            $this->budget->tempDir(),
             $this->budgetBytes,
             $reservation->leasePath,
             $reservation->tempPath,
+            $reservation->nonce,
             $bytes,
+            $this->filesystemReserveBytes,
         ))->getFuture();
         $reserveFuture->ignore();
         $reserveFuture->await($cancellation);
     }
 
-    private function deleteStage(string $path): void
-    {
-        try {
-            if ($this->stageFilesystem->exists($path)) {
-                $this->stageFilesystem->deleteFile($path);
-            }
-        } catch (\Throwable) {
-            @unlink($path);
-        }
-    }
 }

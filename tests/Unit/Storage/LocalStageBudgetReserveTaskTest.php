@@ -18,8 +18,9 @@ final class LocalStageBudgetReserveTaskTest extends TestCase
         self::assertTrue(mkdir($scratch, 0700));
         $coordinator = new StorageTempBudgetCoordinator($scratch, 5);
         $path = $scratch . '/s3fw-put-late';
-        self::assertSame(4, file_put_contents($path, 'data'));
         $reservation = $coordinator->start($path);
+        $coordinator->reserve($reservation, 4);
+        self::assertSame(4, file_put_contents($path, 'data'));
         $leasePath = $reservation->leasePath;
         $tempPath = $reservation->tempPath;
         $pool = new ContextWorkerPool(1);
@@ -28,7 +29,7 @@ final class LocalStageBudgetReserveTaskTest extends TestCase
             self::assertTrue(unlink($path));
             $coordinator->release($reservation);
             try {
-                $pool->submit(new LocalStageBudgetReserveTask($scratch, 5, $leasePath, $tempPath, 4))->await();
+                $pool->submit(new LocalStageBudgetReserveTask($scratch, 5, $leasePath, $tempPath, $reservation->nonce, 4))->await();
                 self::fail('A late worker must not recreate a released reservation.');
             } catch (TaskFailureException $error) {
                 self::assertStringContainsString('released', $error->getMessage());

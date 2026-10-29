@@ -13,6 +13,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteFence;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\StorageTempWorkerLease;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 
 /** @implements Task<LocalObjectWriteTaskResult, never, never> */
 final readonly class LocalObjectWriteTask implements Task
@@ -23,9 +24,16 @@ final readonly class LocalObjectWriteTask implements Task
         private string $key,
         private string $stagePath,
         private string $stageLeasePath,
+        private string $stageNonce,
         private int $expectedSize,
         private string $expectedSha256,
         private ?LocalObjectWriteIo $io = null,
+        private ?string $tempCoordinatorRoot = null,
+        private int $tempBudgetBytes = StorageTempBudgetCoordinator::DEFAULT_BUDGET_BYTES,
+        private int $tempReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        private ?string $publicationLeasePath = null,
+        private ?string $publicationTempPath = null,
+        private ?string $publicationNonce = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): LocalObjectWriteTaskResult
@@ -33,9 +41,19 @@ final readonly class LocalObjectWriteTask implements Task
         $trackingIo = new TrackingLocalObjectWriteIo($this->io ?? new NativeLocalObjectWriteIo());
         $stream = null;
         $stageLease = null;
+        $publicationCapacity = null;
+        $coordinator = null;
         try {
             $cancellation->throwIfRequested();
-            $stageLease = StorageTempWorkerLease::acquire($this->stageLeasePath, $this->stagePath);
+            if ($this->tempCoordinatorRoot === null) {
+                throw new \RuntimeException('Local object worker requires the canonical temporary coordinator root.');
+            }
+            $stageLease = StorageTempWorkerLease::acquire(
+                $this->tempCoordinatorRoot,
+                $this->stageLeasePath,
+                $this->stagePath,
+                $this->stageNonce,
+            );
             clearstatcache(true, $this->stagePath);
             if (@filesize($this->stagePath) !== $this->expectedSize) {
                 throw new \RuntimeException('Local object staging size changed before worker read.');
@@ -45,8 +63,23 @@ final readonly class LocalObjectWriteTask implements Task
                 throw new \RuntimeException('Local object worker could not open staging file.');
             }
             $stream = new ReadableResourceStream($resource);
-            $result = (new LocalObjectWriteFence($this->root, $trackingIo))
-                ->write($this->intent, $this->key, $stream);
+            $coordinator = new StorageTempBudgetCoordinator(
+                $this->tempCoordinatorRoot,
+                $this->tempBudgetBytes,
+                $this->tempReserveBytes,
+            );
+            if ($this->publicationLeasePath !== null || $this->publicationTempPath !== null) {
+                if ($this->publicationLeasePath === null || $this->publicationTempPath === null || $this->publicationNonce === null) {
+                    throw new \RuntimeException('Local object publication capacity is incomplete.');
+                }
+                $publicationCapacity = $coordinator->resumeExisting(
+                    $this->publicationLeasePath,
+                    $this->publicationTempPath,
+                    $this->publicationNonce,
+                );
+            }
+            $result = (new LocalObjectWriteFence($this->root, $trackingIo, $coordinator))
+                ->write($this->intent, $this->key, $stream, $this->expectedSize, $publicationCapacity);
             if ($result->size !== $this->expectedSize
                 || $result->sha256Base64 === null
                 || ! hash_equals(base64_encode($this->expectedSha256), $result->sha256Base64)) {
@@ -65,7 +98,18 @@ final readonly class LocalObjectWriteTask implements Task
             try {
                 $stream?->close();
             } finally {
-                $stageLease?->close();
+                try {
+                    $stageLease?->close();
+                } finally {
+                    if ($publicationCapacity?->isOpen()) {
+                        try {
+                            $coordinator?->cleanup($publicationCapacity);
+                        } catch (\Throwable) {
+                            $publicationCapacity->close();
+                        }
+                    }
+                    $coordinator?->close();
+                }
             }
         }
     }

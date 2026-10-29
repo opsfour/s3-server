@@ -65,7 +65,7 @@ final class PostObjectSpoolBudgetTest extends TestCase
                 self::assertSame($canonicalTempDir, $coordinator->tempDir());
             }
         } finally {
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -95,10 +95,10 @@ final class PostObjectSpoolBudgetTest extends TestCase
         } finally {
             $form?->cleanup();
             umask($oldUmask);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -126,10 +126,10 @@ final class PostObjectSpoolBudgetTest extends TestCase
             self::assertFileDoesNotExist($form->filePath);
         } finally {
             $form?->cleanup();
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -171,16 +171,19 @@ final class PostObjectSpoolBudgetTest extends TestCase
                 $form->cleanup();
                 self::fail('A deleted spool must not be recreated while opening the upload.');
             } catch (\RuntimeException $error) {
-                self::assertSame('Browser POST temporary file changed before writing.', $error->getMessage());
-                self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
+                self::assertSame('Storage temporary file changed while opening.', $error->getMessage());
+                self::assertCount(1, glob($tempDir . '/s3-post-*') ?: [], 'A replacement inode must never be deleted as coordinator-owned cleanup.');
             }
         } finally {
             filesystem(createDefaultDriver());
             umask($oldUmask);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/s3-post-*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -227,10 +230,10 @@ final class PostObjectSpoolBudgetTest extends TestCase
             }
         } finally {
             filesystem(createDefaultDriver());
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -271,10 +274,55 @@ final class PostObjectSpoolBudgetTest extends TestCase
                 }
             }
         } finally {
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
+    public function test_browser_post_read_rejects_a_replacement_inode_without_reading_it(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-read-identity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $coordinator = new PostObjectSpoolCoordinator($tempDir);
+        $parser = new PostObjectFormParser(
+            $this->createMock(CredentialProvider::class),
+            'us-east-1',
+            1_024,
+            new PostObjectTempFileSweeper(tempDir: $tempDir),
+            spoolCoordinator: $coordinator,
+        );
+        $form = null;
+
+        try {
+            $form = $parser->parse($this->formRequest('identity', 'secret body'));
+            self::assertTrue(unlink($form->filePath));
+            self::assertSame(11, file_put_contents($form->filePath, 'replacement'));
+            self::assertTrue(chmod($form->filePath, 0o600));
+
+            try {
+                \Amp\ByteStream\buffer($form->openFile());
+                self::fail('A replacement browser POST spool must not be read.');
+            } catch (\Throwable $error) {
+                self::assertStringContainsString('identity changed', $error->getMessage());
+                self::assertSame('replacement', file_get_contents($form->filePath));
+            }
+
+            $form->cleanup();
+            self::assertSame('replacement', file_get_contents($form->filePath));
+        } finally {
+            $form?->cleanup();
+            if ($form !== null) {
+                @unlink($form->filePath);
+            }
+            $coordinator->recoverAbandoned();
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -296,38 +344,87 @@ final class PostObjectSpoolBudgetTest extends TestCase
 
     public function test_concurrent_forms_share_budget_and_cleanup_releases_it(): void
     {
+        $tempDir = sys_get_temp_dir() . '/s3-post-shared-budget-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
         $parser = new PostObjectFormParser(
             $this->createMock(CredentialProvider::class),
             'us-east-1',
             1_024,
             spoolBudgetBytes: 39,
+            tempDir: $tempDir,
         );
         $otherParser = new PostObjectFormParser(
             $this->createMock(CredentialProvider::class),
             'us-east-1',
             1_024,
             spoolBudgetBytes: 39,
+            tempDir: $tempDir,
         );
-
-        $first = $parser->parse($this->formRequest('first', 'abcd'));
         try {
-            self::assertSame(4, $first->fileSize);
+            $first = $parser->parse($this->formRequest('first', 'abcd'));
             try {
-                $otherParser->parse($this->formRequest('second', 'abcd'));
-                self::fail('A second concurrent form must not exceed the shared spool budget.');
-            } catch (SlowDownException $e) {
-                self::assertSame(503, $e->getHttpStatus());
-                self::assertSame('SlowDown', $e->getErrorCode());
+                self::assertSame(4, $first->fileSize);
+                try {
+                    $otherParser->parse($this->formRequest('second', 'abcd'));
+                    self::fail('A second concurrent form must not exceed the shared spool budget.');
+                } catch (SlowDownException $e) {
+                    self::assertSame(503, $e->getHttpStatus());
+                    self::assertSame('SlowDown', $e->getErrorCode());
+                }
+            } finally {
+                $first->cleanup();
+            }
+
+            $third = $otherParser->parse($this->formRequest('third', 'abcd'));
+            try {
+                self::assertSame(4, $third->fileSize);
+            } finally {
+                $third->cleanup();
             }
         } finally {
-            $first->cleanup();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
         }
+    }
 
-        $third = $otherParser->parse($this->formRequest('third', 'abcd'));
+    public function test_browser_post_without_policy_reserves_declared_request_bound_before_file_write(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-post-content-length-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $coordinator = new PostObjectSpoolCoordinator(
+            $tempDir,
+            runInline: true,
+            budgetBytes: 64,
+            filesystemReserveBytes: 0,
+        );
+        $parser = new PostObjectFormParser(
+            $this->createMock(CredentialProvider::class),
+            'us-east-1',
+            2_048,
+            spoolBudgetBytes: 64,
+            spoolCoordinator: $coordinator,
+        );
+        $request = $this->formRequest('bounded', 'x');
+        $request->setHeader('content-length', '1024');
+
         try {
-            self::assertSame(4, $third->fileSize);
+            try {
+                $parser->parse($request);
+                self::fail('Browser POST accepted a declared request bound larger than temporary capacity.');
+            } catch (SlowDownException) {
+                self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
+                self::assertSame([], glob($tempDir . '/.opsfour-s3-storage-budget/lease-*') ?: []);
+            }
         } finally {
-            $third->cleanup();
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
         }
     }
 

@@ -23,6 +23,7 @@ use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -616,6 +617,71 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame(1, $this->adapter->writeStreamCalls);
     }
 
+    public function test_known_size_object_and_part_writes_reserve_before_reading_source(): void
+    {
+        $budget = new StorageTempBudgetCoordinator($this->tempDir, 4, 0);
+        $backend = new FlysystemBackend(new Filesystem($this->adapter), $this->tempDir, $budget);
+        $generation = bin2hex(random_bytes(16));
+        $attempt = bin2hex(random_bytes(16));
+        $uploadId = bin2hex(random_bytes(16));
+        $partAttempt = bin2hex(random_bytes(16));
+        $plannedObject = $backend->planObjectWritePath('bucket', 'key', $generation, $attempt);
+        $plannedPart = $backend->planMultipartPartPath('bucket', $generation, $uploadId, 1, $partAttempt);
+        $writes = [
+            static fn(ReadableStream $body) => $backend->putObjectKnownSize('bucket', 'key', $body, 5),
+            static fn(ReadableStream $body) => $backend->putObjectAtPathKnownSize('bucket', 'key', $body, $plannedObject, 5),
+            static fn(ReadableStream $body) => $backend->putPartKnownSize('bucket', 'key', $uploadId, 1, $body, 5),
+            static fn(ReadableStream $body) => $backend->putPartAtPathKnownSize('bucket', 'key', $uploadId, 1, $body, $plannedPart, 5),
+        ];
+
+        try {
+            foreach ($writes as $write) {
+                $body = $this->createMock(ReadableStream::class);
+                $body->expects(self::never())->method('read');
+                try {
+                    $write($body);
+                    self::fail('Known-size Flysystem staging exceeded the node budget.');
+                } catch (SlowDownException) {
+                    self::assertSame([], $this->adapter->paths());
+                    self::assertSame([], self::temporaryFiles($this->tempDir));
+                    self::assertSame(0, $budget->snapshot()->reservedBytes);
+                }
+            }
+        } finally {
+            $budget->close();
+            foreach (glob($this->tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($this->tempDir . '/.opsfour-s3-storage-budget');
+        }
+    }
+
+    public function test_known_size_writes_account_for_longer_streams_and_return_shorter_actual_sizes(): void
+    {
+        $budget = new StorageTempBudgetCoordinator($this->tempDir, 16, 0);
+        $backend = new FlysystemBackend(new Filesystem($this->adapter), $this->tempDir, $budget);
+
+        try {
+            self::assertSame(4, $backend->putObjectKnownSize('bucket', 'long', new ReadableBuffer('data'), 3)->size);
+            self::assertSame(4, $backend->putPartKnownSize(
+                'bucket',
+                'short',
+                bin2hex(random_bytes(16)),
+                1,
+                new ReadableBuffer('part'),
+                5,
+            )->size);
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+        } finally {
+            $backend->shutdown();
+            $budget->close();
+            foreach (glob($this->tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($this->tempDir . '/.opsfour-s3-storage-budget');
+        }
+    }
+
     public function test_cancelled_write_is_not_replaced_by_temp_budget_release_failure(): void
     {
         $budget = new StorageTempBudgetCoordinator($this->tempDir, 8);
@@ -691,7 +757,7 @@ final class FlysystemBackendTest extends TestCase
                 'bucket',
                 'object',
                 'upload',
-                [['partNumber' => 1, 'etag' => md5('payload'), 'storagePath' => '.parts/upload/part']],
+                [['partNumber' => 1, 'etag' => md5('payload'), 'size' => 7, 'storagePath' => '.parts/upload/part']],
             );
             self::fail('Multipart part read cancellation must propagate unchanged.');
         } catch (CancelledException $error) {
@@ -718,7 +784,7 @@ final class FlysystemBackendTest extends TestCase
                 'bucket',
                 'object',
                 'upload',
-                [['partNumber' => 1, 'etag' => md5('payload'), 'storagePath' => '.parts/upload/part']],
+                [['partNumber' => 1, 'etag' => md5('payload'), 'size' => 7, 'storagePath' => '.parts/upload/part']],
             );
             self::fail('Multipart assembly cancellation must propagate unchanged.');
         } catch (CancelledException $error) {
@@ -850,6 +916,33 @@ final class FlysystemBackendTest extends TestCase
         )));
     }
 
+    public function test_multipart_assembly_never_writes_bytes_beyond_the_admitted_part_size(): void
+    {
+        $uploadId = bin2hex(random_bytes(8));
+        $part = $this->backend->putPart('bucket', 'object.bin', $uploadId, 1, new ReadableBuffer('original'));
+        $this->adapter->write($part->path, 'original-plus-one', new Config());
+        $writesBeforeAssembly = $this->adapter->writeStreamCalls;
+
+        try {
+            $this->backend->assembleMultipartUpload('bucket', 'object.bin', $uploadId, [[
+                'partNumber' => 1,
+                'etag' => md5('original-plus-one'),
+                'size' => $part->size,
+                'storagePath' => $part->path,
+            ]]);
+            self::fail('A remotely enlarged part exceeded its admitted temporary bytes.');
+        } catch (InternalErrorException $error) {
+            self::assertStringContainsString('exceeded its admitted size', $error->getMessage());
+        }
+
+        self::assertSame($writesBeforeAssembly, $this->adapter->writeStreamCalls);
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+        self::assertSame([], array_values(array_filter(
+            $this->adapter->paths(),
+            static fn(string $path): bool => str_starts_with($path, 'bucket/'),
+        )));
+    }
+
     public function test_failed_part_replacement_can_delete_new_attempt_without_losing_previous_part(): void
     {
         $uploadId = 'upload-' . bin2hex(random_bytes(4));
@@ -905,6 +998,18 @@ final class FlysystemBackendTest extends TestCase
         self::assertSame(4, $copy->size);
         self::assertSame('xxxx', self::readAll($this->backend->getObjectByPath($copy->path)));
         self::assertSame(0, $this->adapter->copyCalls);
+        self::assertSame([], self::temporaryFiles($this->tempDir));
+    }
+
+    public function test_bounded_copy_does_not_treat_its_upper_bound_as_the_exact_source_size(): void
+    {
+        $this->backend->createBucket('bucket');
+        $source = $this->backend->putObject('bucket', 'short.txt', new ReadableBuffer('abc'));
+
+        $copy = $this->backend->copyObjectBounded($source->path, 'bucket', 'short-copy.txt', 4);
+
+        self::assertSame(3, $copy->size);
+        self::assertSame('abc', self::readAll($this->backend->getObjectByPath($copy->path)));
         self::assertSame([], self::temporaryFiles($this->tempDir));
     }
 

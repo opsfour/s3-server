@@ -9,7 +9,12 @@ use OpsFour\S3Server\Parallel\TemporaryFileTask;
 
 use function Amp\Parallel\Worker\workerPool;
 
-/** Reclaims abandoned browser-upload files without scanning temp storage on the event loop. */
+/**
+ * Compatibility sweep trigger.
+ *
+ * Identity-backed abandoned-file recovery belongs to the unified coordinator;
+ * the worker scan deliberately leaves unaccounted browser-upload files alone.
+ */
 final class PostObjectTempFileSweeper
 {
     private const int STALE_AFTER_SECONDS = 86_400;

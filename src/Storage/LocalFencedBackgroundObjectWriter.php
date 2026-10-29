@@ -42,6 +42,7 @@ final readonly class LocalFencedBackgroundObjectWriter
         string $tier,
         ReadableStream $body,
         string $purpose,
+        ?int $knownSize = null,
     ): array {
         while ($backend instanceof ObservedStorageBackend) {
             $backend = $backend->innerBackend();
@@ -66,7 +67,7 @@ final readonly class LocalFencedBackgroundObjectWriter
         );
         $lease = $this->leases->reserve($planned);
         try {
-            $outcome = $this->writer->publishWithLease($lease->reservedIntent(), $object->key, $body, $lease);
+            $outcome = $this->writer->publishWithLease($lease->reservedIntent(), $object->key, $body, $lease, knownSize: $knownSize);
             if ($outcome->state !== LocalObjectWriteOutcome::COMPLETED || $outcome->result === null) {
                 throw $outcome->error ?? new \RuntimeException('Background local write did not return a definite result.');
             }

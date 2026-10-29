@@ -38,6 +38,100 @@ use function Amp\Future\await;
 
 final class RequestBodySpoolTest extends TestCase
 {
+    public function test_append_rejects_a_replacement_inode_without_mutating_it(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-append-identity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = new ContextWorkerPool(1);
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, runInline: true, budgetBytes: 100_000, filesystemReserveBytes: 0);
+        $spool = new RequestBodySpool($pool, $tempDir, 100_000, $coordinator);
+        $path = $spool->create('s3-md5-', 65_536);
+
+        try {
+            self::assertTrue(unlink($path));
+            self::assertSame(11, file_put_contents($path, 'replacement'));
+            self::assertTrue(chmod($path, 0o600));
+
+            try {
+                $spool->append($path, str_repeat('x', 65_536));
+                self::fail('A replacement checksum spool must not receive append data.');
+            } catch (\Throwable $error) {
+                self::assertStringContainsString('identity changed', $error->getMessage());
+                self::assertSame('replacement', file_get_contents($path));
+            }
+        } finally {
+            $spool->delete($path);
+            $spool->assertIdle();
+            @unlink($path);
+            $coordinator->recoverAbandoned();
+            $coordinator->close();
+            $pool->shutdown();
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    public function test_read_rejects_a_replacement_inode_without_reading_it(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-read-identity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = new ContextWorkerPool(1);
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, runInline: true, budgetBytes: 100_000, filesystemReserveBytes: 0);
+        $spool = new RequestBodySpool($pool, $tempDir, 100_000, $coordinator);
+        $path = $spool->create('s3-md5-', 4);
+
+        try {
+            $spool->append($path, 'body');
+            $readable = $spool->openReadable($path);
+            self::assertTrue(unlink($path));
+            self::assertSame(11, file_put_contents($path, 'replacement'));
+            self::assertTrue(chmod($path, 0o600));
+
+            try {
+                \Amp\ByteStream\buffer($readable);
+                self::fail('A replacement checksum spool must not be read.');
+            } catch (\Throwable $error) {
+                self::assertStringContainsString('identity changed', $error->getMessage());
+                self::assertSame('replacement', file_get_contents($path));
+            }
+        } finally {
+            $spool->delete($path);
+            $spool->assertIdle();
+            @unlink($path);
+            $coordinator->recoverAbandoned();
+            $coordinator->close();
+            $pool->shutdown();
+            self::removeTempDir($tempDir);
+        }
+    }
+
+    public function test_cleanup_never_deletes_a_replacement_inode(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-spool-replacement-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0o700, true));
+        $pool = new ContextWorkerPool(1);
+        $coordinator = new PostObjectSpoolCoordinator(
+            $tempDir,
+            runInline: true,
+            budgetBytes: 1024,
+            filesystemReserveBytes: 0,
+        );
+        $spool = new RequestBodySpool($pool, $tempDir, 1024, $coordinator);
+        $path = $spool->create('s3-md5-');
+
+        try {
+            self::assertTrue(unlink($path));
+            self::assertSame(11, file_put_contents($path, 'replacement'));
+            $spool->delete($path);
+            self::assertSame('replacement', file_get_contents($path));
+        } finally {
+            @unlink($path);
+            $coordinator->recoverAbandoned();
+            $coordinator->close();
+            $pool->shutdown();
+            self::removeTempDir($tempDir);
+        }
+    }
+
     private const string EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
     public function test_stale_sweep_cancellation_is_not_ignored_before_create(): void
@@ -66,20 +160,14 @@ final class RequestBodySpoolTest extends TestCase
 
     /** @param class-string<ContentMd5Middleware|ChecksumValidationMiddleware> $middlewareClass */
     #[\PHPUnit\Framework\Attributes\DataProvider('checksumMiddlewareClasses')]
-    public function test_checksum_consumer_propagates_spool_delete_cancellation(string $middlewareClass): void
+    public function test_checksum_consumer_cleanup_does_not_delegate_identity_deletion_to_file_worker(string $middlewareClass): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0o700, true));
-        $path = $tempDir . '/active.tmp';
-        self::assertSame(0, file_put_contents($path, ''));
-        self::assertTrue(chmod($path, 0o600));
-        $cancellation = new CancelledException();
         $pool = $this->createMock(WorkerPool::class);
-        $pool->expects(self::exactly(4))->method('submit')->willReturnOnConsecutiveCalls(
+        $pool->expects(self::exactly(2))->method('submit')->willReturnOnConsecutiveCalls(
             new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete('0')),
-            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete($path)),
             new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::complete(null)),
-            new Execution($this->createMock(Task::class), $this->createMock(Channel::class), Future::error($cancellation)),
         );
         $middleware = new $middlewareClass(new RequestBodySpool(
             $pool,
@@ -94,14 +182,8 @@ final class RequestBodySpoolTest extends TestCase
         };
 
         try {
-            try {
-                $middleware->handleRequest($this->checksumRequest('abc'), $handler);
-                self::fail('Spool delete cancellation must propagate through its consumer.');
-            } catch (CancelledException $error) {
-                self::assertSame($cancellation, $error);
-            }
+            self::assertSame(204, $middleware->handleRequest($this->checksumRequest('abc'), $handler)->getStatus());
         } finally {
-            @unlink($path);
             self::removeTempDir($tempDir);
         }
     }
@@ -488,30 +570,16 @@ final class RequestBodySpoolTest extends TestCase
         }
     }
 
-    public function test_delete_worker_cancellation_is_not_retried_or_converted_and_releases_state(): void
+    public function test_delete_uses_coordinator_identity_cleanup_instead_of_file_worker(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0o700, true));
-        $path = $tempDir . '/s3-md5-existing.tmp';
-        self::assertSame(0, file_put_contents($path, ''));
-        self::assertTrue(chmod($path, 0o600));
-        $cancellation = new CancelledException();
         $pool = $this->createMock(WorkerPool::class);
-        $pool->expects(self::exactly(3))->method('submit')->willReturnOnConsecutiveCalls(
+        $pool->expects(self::once())->method('submit')->willReturn(
             new Execution(
                 $this->createMock(Task::class),
                 $this->createMock(Channel::class),
                 Future::complete('0'),
-            ),
-            new Execution(
-                $this->createMock(Task::class),
-                $this->createMock(Channel::class),
-                Future::complete($path),
-            ),
-            new Execution(
-                $this->createMock(Task::class),
-                $this->createMock(Channel::class),
-                Future::error($cancellation),
             ),
         );
         $spool = new RequestBodySpool(
@@ -519,15 +587,12 @@ final class RequestBodySpoolTest extends TestCase
             $tempDir,
             coordinator: new PostObjectSpoolCoordinator($tempDir, runInline: true),
         );
-        self::assertSame($path, $spool->create('s3-md5-'));
+        $path = $spool->create('s3-md5-');
 
         try {
             $spool->delete($path);
-            self::fail('Cancellation must not be retried or converted.');
-        } catch (CancelledException $error) {
-            self::assertSame($cancellation, $error);
             $spool->assertIdle();
-            self::assertFileExists($path);
+            self::assertFileDoesNotExist($path);
         } finally {
             @unlink($path);
             self::removeTempDir($tempDir);
@@ -539,9 +604,7 @@ final class RequestBodySpoolTest extends TestCase
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0o700, true));
         $pool = new ContextWorkerPool(2);
-        $createdPostPath = tempnam($tempDir, 's3-post-');
-        self::assertIsString($createdPostPath);
-        $postPath = $tempDir . '/' . basename($createdPostPath);
+        $postPath = $tempDir . '/s3-post-' . bin2hex(random_bytes(16)) . '.tmp';
         $postCoordinator = new PostObjectSpoolCoordinator($tempDir);
         $postReservation = $postCoordinator->start($postPath);
         $first = null;
@@ -562,8 +625,10 @@ final class RequestBodySpoolTest extends TestCase
                 $second->append($secondPath, 'z');
                 self::fail('All three live files must count toward the shared physical-byte budget.');
             } catch (SlowDownException) {
-                self::assertSame(34, filesize($secondPath), 'Denied encrypted frame bytes must never be written.');
+                self::assertSame(0, filesize($secondPath), 'Denied encrypted frame bytes must never be written.');
                 self::assertSame('xy', \Amp\ByteStream\buffer($second->openReadable($secondPath)));
+                clearstatcache(true, $secondPath);
+                self::assertSame(34, filesize($secondPath));
             }
 
             $first->delete($firstPath);
@@ -627,6 +692,7 @@ final class RequestBodySpoolTest extends TestCase
                 self::assertSame(0, $handlerCalls);
                 self::assertSame([], glob($tempDir . '/s3-md5-*'));
                 self::assertSame([], glob($tempDir . '/s3-sha256-*'));
+                $spool->assertIdle();
             }
 
             self::assertSame(204, $contentMd5->handleRequest($this->checksumRequest('ab'), $inner)->getStatus());
@@ -647,7 +713,7 @@ final class RequestBodySpoolTest extends TestCase
 
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0o700, true));
-        $readyPath = $tempDir . '/worker-ready';
+        $readyPath = $tempDir . '-worker-ready';
         $process = proc_open(
             [PHP_BINARY, dirname(__DIR__, 2) . '/Support/post-spool-reservation-worker.php', $tempDir, $readyPath, 's3-md5-', '36'],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
@@ -745,9 +811,10 @@ final class RequestBodySpoolTest extends TestCase
                 try {
                     $spool->append($path, 'alpha');
                     $spool->append($path, 'bravo');
+                    $spool->openReadable($path)->close();
                     $bytes = file_get_contents($path);
                     self::assertIsString($bytes);
-                    self::assertSame(74, strlen($bytes));
+                    self::assertSame(42, strlen($bytes));
                     self::assertStringNotContainsString('alpha', $bytes);
                     self::assertStringNotContainsString('bravo', $bytes);
                     $changed = match ($fault) {
@@ -818,7 +885,7 @@ final class RequestBodySpoolTest extends TestCase
         }
     }
 
-    public function test_sweep_preserves_old_active_file_and_reclaims_it_after_owner_crashes(): void
+    public function test_sweep_preserves_unaccounted_old_file_even_after_its_lock_owner_crashes(): void
     {
         if (!function_exists('proc_open') || !function_exists('proc_terminate')) {
             self::markTestSkipped('Process control is unavailable.');
@@ -847,8 +914,11 @@ final class RequestBodySpoolTest extends TestCase
             self::assertTrue(touch($oldPath, time() - 90_000));
 
             $first = new RequestBodySpool($pool, $tempDir);
-            $probe = $first->create('s3-md5-');
-            $first->delete($probe);
+            try {
+                $first->create('s3-md5-');
+                self::fail('An unaccounted live spool file did not close admission.');
+            } catch (SlowDownException) {
+            }
             self::assertFileExists($oldPath, 'A live old spool must survive another process sweep.');
 
             proc_terminate($process, 9);
@@ -859,9 +929,15 @@ final class RequestBodySpoolTest extends TestCase
             self::assertFalse(proc_get_status($process)['running']);
 
             $second = new RequestBodySpool($pool, $tempDir);
-            $probe = $second->create('s3-md5-');
-            $second->delete($probe);
-            self::assertFileDoesNotExist($oldPath, 'A crashed owner must not retain stale data.');
+            try {
+                $second->create('s3-md5-');
+                self::fail('An unaccounted crashed spool file did not close admission.');
+            } catch (SlowDownException) {
+            }
+            self::assertFileExists(
+                $oldPath,
+                'An unaccounted file must not be deleted from age and lock evidence alone.',
+            );
         } finally {
             if (proc_get_status($process)['running']) {
                 proc_terminate($process, 9);
@@ -887,7 +963,7 @@ final class RequestBodySpoolTest extends TestCase
 
         $tempDir = sys_get_temp_dir() . '/s3-spool-crash-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0o700, true));
-        $readyPath = $tempDir . '/ready';
+        $readyPath = $tempDir . '-ready';
         $process = proc_open(
             [PHP_BINARY, dirname(__DIR__, 2) . '/Support/encrypted-request-spool-worker.php', $tempDir, $readyPath],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
@@ -971,7 +1047,7 @@ final class RequestBodySpoolTest extends TestCase
         }
     }
 
-    public function test_first_create_removes_only_stale_owned_spool_files(): void
+    public function test_first_create_preserves_unaccounted_spool_files_and_closes_admission(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-spool-test-' . bin2hex(random_bytes(8));
         mkdir($tempDir, 0o755, true);
@@ -991,14 +1067,19 @@ final class RequestBodySpoolTest extends TestCase
         $spool = new RequestBodySpool($pool, $tempDir);
 
         try {
-            $created = $spool->create('s3-md5-');
-            self::assertFileDoesNotExist($stale);
-            self::assertFileDoesNotExist($stalePost);
+            try {
+                $spool->create('s3-md5-');
+                self::fail('Unaccounted managed spool files did not close admission.');
+            } catch (SlowDownException) {
+            }
+            self::assertFileExists($stale, 'Age alone is not recovery identity.');
+            self::assertFileExists($stalePost, 'Unknown browser spool files must not be deleted.');
             self::assertFileExists($recent);
             self::assertFileExists($foreign);
-            $spool->delete($created);
         } finally {
             $pool->shutdown();
+            @unlink($stale);
+            @unlink($stalePost);
             @unlink($recent);
             @unlink($foreign);
             self::removeTempDir($tempDir);

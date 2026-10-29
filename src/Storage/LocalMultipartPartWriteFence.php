@@ -15,8 +15,14 @@ final readonly class LocalMultipartPartWriteFence
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
         LocalDurableFileIo $durableIo = new NativeLocalObjectWriteIo(),
+        private ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $this->durability = new LocalDurableFilePublisher($root, $durableIo);
+        $canonical = realpath($root);
+        if ($canonical !== false) {
+            $namespace = 'filesystem_' . substr(hash('sha256', rtrim($canonical, '/')), 0, 24);
+            $this->tempBudget?->registerNamespace($namespace, rtrim($canonical, '/') . '/.tmp');
+        }
     }
 
     public function publish(
@@ -29,6 +35,7 @@ final readonly class LocalMultipartPartWriteFence
         string $attemptId,
         int $expectedSize,
         string $expectedSha256,
+        ?StorageTempReservation $capacity = null,
     ): StorageWriteResult {
         $internalScratchPrefix = rtrim($this->root, '/') . '/.tmp/object-writes/';
         if ($target !== StoragePath::forPlannedPart($this->root, $bucket, $generation, $uploadId, $partNumber, $attemptId)
@@ -59,6 +66,8 @@ final readonly class LocalMultipartPartWriteFence
         $temp = null;
         $tempLease = null;
         $tempPath = '';
+        $reservation = null;
+        $ownedTemp = false;
         try {
             $opened = fstat($input);
             if ($opened === false || $opened['dev'] !== $sourceInfo['dev'] || $opened['ino'] !== $sourceInfo['ino']
@@ -68,12 +77,27 @@ final readonly class LocalMultipartPartWriteFence
             $this->ensureDirectory($this->root . '/.tmp');
             $this->ensureDirectory(dirname($target));
             $tempPath = $this->root . '/.tmp/' . bin2hex(random_bytes(16));
-            $temp = @fopen($tempPath, 'x+b');
-            if ($temp === false) {
-                throw new \RuntimeException('Could not create multipart staging inode.');
+            if ($capacity !== null) {
+                if ($this->tempBudget === null) {
+                    throw new \LogicException('Pre-reserved publication capacity requires the canonical temporary coordinator.');
+                }
+                $this->tempBudget->retarget($capacity, $tempPath, 'fenced_part');
+                $reservation = $capacity;
+            } else {
+                $reservation = $this->tempBudget?->start($tempPath, 'fenced_part');
             }
-            if (! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
+            $created = $reservation !== null ? @lstat($tempPath) : null;
+            $temp = @fopen($tempPath, $reservation !== null ? 'r+b' : 'x+b');
+            $ownedTemp = $reservation !== null || is_resource($temp);
+            $openedTemp = is_resource($temp) ? @fstat($temp) : false;
+            if ($temp === false || ($reservation !== null && ($created === false || $openedTemp === false
+                || ! isset($created['dev'], $created['ino'], $openedTemp['dev'], $openedTemp['ino'])
+                || $openedTemp['dev'] !== $created['dev'] || $openedTemp['ino'] !== $created['ino']))
+                || ! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Could not protect multipart staging inode.');
+            }
+            if ($reservation !== null && $capacity === null) {
+                $this->tempBudget?->reserve($reservation, $expectedSize);
             }
             $calculator = new ChecksumCalculator();
             while (! feof($input)) {
@@ -159,7 +183,14 @@ final readonly class LocalMultipartPartWriteFence
                 $writtenInode['dev'],
                 $writtenInode['ino'],
             );
-            $this->durability->delete($tempPath);
+            if ($reservation !== null) {
+                if (! ($this->tempBudget?->cleanup($reservation) ?? false)
+                    || ! $this->io->syncDirectory(dirname($tempPath))) {
+                    throw new \RuntimeException('Could not durably remove multipart staging inode.');
+                }
+            } else {
+                $this->durability->delete($tempPath);
+            }
             $tempPath = '';
 
             return new StorageWriteResult(
@@ -182,7 +213,14 @@ final readonly class LocalMultipartPartWriteFence
             }
             @fclose($input);
             if ($tempPath !== '') {
-                @unlink($tempPath);
+                if ($reservation !== null) {
+                    try {
+                        $this->tempBudget?->cleanup($reservation);
+                    } catch (\Throwable) {
+                    }
+                } elseif ($ownedTemp) {
+                    @unlink($tempPath);
+                }
             }
         }
     }

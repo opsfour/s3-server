@@ -19,11 +19,11 @@ if (!in_array($prefix, ['s3-post-', 's3-md5-'], true)) {
 }
 $tempPath = $tempDir . '/' . $prefix . 'worker.tmp';
 $coordinator = new PostObjectSpoolCoordinator($tempDir);
+$reservation = $coordinator->start($tempPath);
+$coordinator->reserve($reservation, 4, $budgetBytes);
 if (file_put_contents($tempPath, 'abcd') !== 4) {
     exit(2);
 }
-$reservation = $coordinator->start($tempPath);
-$coordinator->reserve($reservation, 4, $budgetBytes);
 if (file_put_contents($readyPath, 'ready') !== 5) {
     exit(2);
 }

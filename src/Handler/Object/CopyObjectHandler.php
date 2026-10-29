@@ -44,11 +44,14 @@ use OpsFour\S3Server\Policy\AdditionalActionAuthorizer;
 use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\BoundedCopyStorageBackend;
+use OpsFour\S3Server\Storage\KnownSizeStorageCapabilities;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\MultipartObjectIntegrityVerifier;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StoragePath;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
@@ -86,6 +89,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
         if (($this->localFencedWriter === null) !== ($this->localLeaseFactory === null)) {
@@ -155,12 +159,25 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         $copyFailure = null;
         $awsStage = null;
         $awsReserved = null;
+        $stageCapacity = null;
+        $publicationCapacity = null;
         try {
             $requiresBufferedTransform = $sourceEncryptionMode !== null || $destinationEncryptionMode !== null;
             if ($requiresBufferedTransform && $source->size > $this->maxEncryptedObjectSize) {
                 throw new EntityTooLargeException(
                     'Object exceeds max size for server-side encryption (' . $this->maxEncryptedObjectSize . ' bytes).',
                 );
+            }
+            if ($this->tempBudget !== null) {
+                // AES-GCM preserves the payload length. Reserve the exact
+                // destination stage before a remote source can dispatch GET.
+                $stageCapacity = $this->tempBudget->reserveCapacity($source->size, 'copy_object');
+                if ($this->localFencedWriter !== null) {
+                    $publicationCapacity = $this->tempBudget->reserveCapacity(
+                        $source->size,
+                        'fenced_object_publish',
+                    );
+                }
             }
             if ($this->awsObjectWriter !== null
                 && $requiresBufferedTransform) {
@@ -265,8 +282,11 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 }
             }
 
+            $knownPhysicalSize = $expectedPhysicalPayload !== null
+                ? strlen($expectedPhysicalPayload)
+                : $source->size;
             if ($awsReserved !== null) {
-                $awsStage = $this->awsObjectWriter?->stage($awsReserved, $body)
+                $awsStage = $this->awsObjectWriter?->stage($awsReserved, $body, $knownPhysicalSize, $stageCapacity)
                     ?? throw new \LogicException('AWS copy writer disappeared.');
                 $write = $awsStage->result;
                 if ($expectedPhysicalPayload !== null && (
@@ -325,7 +345,15 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             $lease = $this->localLeaseFactory->reserve($planned);
             $leaseCancellation = null;
             try {
-                $outcome = $this->localFencedWriter->publishWithLease($lease->reservedIntent(), $destinationKey, $body, $lease);
+                $outcome = $this->localFencedWriter->publishWithLease(
+                    $lease->reservedIntent(),
+                    $destinationKey,
+                    $body,
+                    $lease,
+                    knownSize: $knownPhysicalSize,
+                    capacity: $stageCapacity,
+                    publicationCapacity: $publicationCapacity,
+                );
                 if ($outcome->result === null) {
                     throw $outcome->error ?? new \OpsFour\S3Server\Exception\InternalErrorException('Local copy publication did not complete.');
                 }
@@ -371,6 +399,12 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 },
                 static function () use ($bufferLock): void {
                     $bufferLock?->release();
+                },
+                function () use ($stageCapacity): void {
+                    $this->releaseUnusedCapacity($stageCapacity);
+                },
+                function () use ($publicationCapacity): void {
+                    $this->releaseUnusedCapacity($publicationCapacity);
                 },
             );
         }
@@ -775,13 +809,26 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             // without a bounded same-backend copy capability.
             // One byte past the committed size is enough for the post-write
             // integrity check to reject an oversized physical source.
-            $stream = new LimitedReadableStream($sourceStorage->getObjectByPath($srcPath), $readLimit);
-            if ($multipartVerifier !== null && $sourceEncryptionMode === null) {
-                $stream = new TeeReadableStream($stream, $multipartVerifier->update(...));
-            }
+            $knownSizeDestination = KnownSizeStorageCapabilities::storage($destinationStorage);
+            $copyCapacity = $knownSizeDestination !== null && $this->tempBudget !== null
+                ? $this->tempBudget->reserveCapacity($srcObjectInfo->size, 'copy_object')
+                : null;
+            $stream = null;
             $streamCancellation = null;
             try {
-                $writeResult = $destinationStorage->putObject($dstBucket, $dstKey, $stream);
+                $stream = new LimitedReadableStream($sourceStorage->getObjectByPath($srcPath), $readLimit);
+                if ($multipartVerifier !== null && $sourceEncryptionMode === null) {
+                    $stream = new TeeReadableStream($stream, $multipartVerifier->update(...));
+                }
+                $writeResult = $knownSizeDestination !== null
+                    ? $knownSizeDestination->putObjectKnownSize(
+                        $dstBucket,
+                        $dstKey,
+                        $stream,
+                        $srcObjectInfo->size,
+                        $copyCapacity,
+                    )
+                    : $destinationStorage->putObject($dstBucket, $dstKey, $stream);
             } catch (\Throwable $error) {
                 if ($error instanceof \Amp\CancelledException) {
                     $streamCancellation = $error;
@@ -790,7 +837,12 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             } finally {
                 \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                     $streamCancellation,
-                    $stream->close(...),
+                    static function () use ($stream): void {
+                        $stream?->close();
+                    },
+                    function () use ($copyCapacity): void {
+                        $this->releaseUnusedCapacity($copyCapacity);
+                    },
                 );
             }
         }
@@ -1300,6 +1352,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             );
         }
 
+        $knownSizeDestination = KnownSizeStorageCapabilities::storage($destinationStorage);
+        $copyCapacity = $knownSizeDestination !== null && $this->tempBudget !== null
+            ? $this->tempBudget->reserveCapacity($source->size, 'copy_object')
+            : null;
         $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
         $encryptionCancellation = null;
         try {
@@ -1367,11 +1423,16 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 ];
             }
 
-            $write = $destinationStorage->putObject(
-                $destinationBucket,
-                $destinationKey,
-                new \Amp\ByteStream\ReadableBuffer($encrypted['ciphertext']),
-            );
+            $ciphertextBody = new \Amp\ByteStream\ReadableBuffer($encrypted['ciphertext']);
+            $write = $knownSizeDestination !== null
+                ? $knownSizeDestination->putObjectKnownSize(
+                    $destinationBucket,
+                    $destinationKey,
+                    $ciphertextBody,
+                    strlen($encrypted['ciphertext']),
+                    $copyCapacity,
+                )
+                : $destinationStorage->putObject($destinationBucket, $destinationKey, $ciphertextBody);
             if ($write->size !== strlen($encrypted['ciphertext'])
                 || ! hash_equals(md5($encrypted['ciphertext']), strtolower($write->md5Hex))) {
                 if ($sourceStorage !== $destinationStorage || $write->path !== $sourcePath) {
@@ -1388,6 +1449,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                 $encryptionCancellation,
                 $lock->release(...),
+                function () use ($copyCapacity): void {
+                    $this->releaseUnusedCapacity($copyCapacity);
+                },
             );
         }
     }
@@ -1578,11 +1642,24 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         ?string $protectedSourcePath,
         string $ownerId,
     ): \OpsFour\S3Server\Storage\StorageWriteResult {
-        $replacement = $storage->putObject(
-            $bucket,
-            $key,
-            new \Amp\ByteStream\ReadableBuffer($payload),
-        );
+        $replacementBody = new \Amp\ByteStream\ReadableBuffer($payload);
+        $knownSizeStorage = KnownSizeStorageCapabilities::storage($storage);
+        $replacementCapacity = $knownSizeStorage !== null && $this->tempBudget !== null
+            ? $this->tempBudget->reserveCapacity(strlen($payload), 'copy_object')
+            : null;
+        try {
+            $replacement = $knownSizeStorage !== null
+                ? $knownSizeStorage->putObjectKnownSize(
+                    $bucket,
+                    $key,
+                    $replacementBody,
+                    strlen($payload),
+                    $replacementCapacity,
+                )
+                : $storage->putObject($bucket, $key, $replacementBody);
+        } finally {
+            $this->releaseUnusedCapacity($replacementCapacity);
+        }
 
         if ($replacement->path === $protectedSourcePath) {
             throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy backend reused the source storage path.');
@@ -1609,6 +1686,18 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         }
 
         return $replacement;
+    }
+
+    private function releaseUnusedCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget?->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
+        }
     }
 
     /**

@@ -34,8 +34,12 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
 
     private readonly LocalObjectWriteLeaseAdmission $admission;
 
-    /** @var list<array{LocalScratchStage, Lock, Worker}> */
+    /** @var list<array{LocalScratchStage, Lock, Worker, StorageTempReservation|null}> */
     private array $unknownSubmissions = [];
+
+    private readonly StorageTempBudgetCoordinator $tempBudget;
+
+    private readonly bool $ownsTempBudget;
 
     private bool $shuttingDown = false;
 
@@ -76,10 +80,12 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         string $scratchDirectory,
         private readonly string $storageTier,
         private readonly FencedMultipartPartWriteIntentStore $intents,
-        int $budgetBytes = 10_737_418_240,
+        private readonly int $budgetBytes = 10_737_418_240,
         ?WorkerPool $budgetPool = null,
         private readonly ?LocalObjectWriteIo $workerIo = null,
         ?WorkerPool $writePool = null,
+        private readonly int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
         private readonly float $workerTimeoutSeconds = 300.0,
     ) {
         $root = realpath($storageRoot);
@@ -106,7 +112,9 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             throw new \InvalidArgumentException('Multipart worker timeout must be finite and greater than zero.');
         }
         $this->root = rtrim($root, '/');
-        $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
+        $this->ownsTempBudget = $tempBudget === null;
+        $this->tempBudget = $tempBudget ?? new StorageTempBudgetCoordinator($scratch, $budgetBytes, $filesystemReserveBytes);
+        $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool, $filesystemReserveBytes, $this->tempBudget);
         $this->writePool = $writePool ?? new ContextWorkerPool(2);
         $this->admission = new LocalObjectWriteLeaseAdmission(2, waitForCapacity: true);
     }
@@ -131,6 +139,9 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
         string $partFormat = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT,
         ?int $logicalSize = null,
         ?callable $validateBeforeArm = null,
+        ?int $knownPhysicalSize = null,
+        ?StorageTempReservation $capacity = null,
+        ?StorageTempReservation $publicationCapacity = null,
     ): LocalMultipartPartWriteOutcome {
         $attemptId = bin2hex(random_bytes(16));
         $path = StoragePath::forPlannedPart($this->root, $bucket, $generation, $uploadId, $partNumber, $attemptId);
@@ -151,7 +162,21 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             $worker = $this->checkoutWorker($cancellation);
             $physicalLimit = MultipartPartSize::MAX_BYTES
                 + ($partFormat === EncryptedMultipartPartCodec::FORMAT ? EncryptedMultipartPartCodec::MAX_OVERHEAD : 0);
-            $stage = $this->stager->stage($attemptId, MultipartPartSize::boundedBody($body, $physicalLimit), $cancellation, 's3fw-part-', true);
+            if ($publicationCapacity !== null && $knownPhysicalSize === null) {
+                throw new \InvalidArgumentException('Pre-admitted publication capacity requires a known multipart part size.');
+            }
+            if ($knownPhysicalSize !== null && $publicationCapacity === null) {
+                $publicationCapacity = $this->tempBudget->reserveCapacity($knownPhysicalSize, 'fenced_part_publish');
+            }
+            $stage = $this->stager->stage(
+                $attemptId,
+                MultipartPartSize::boundedBody($body, $physicalLimit),
+                $cancellation,
+                's3fw-part-',
+                true,
+                knownSize: $knownPhysicalSize,
+                capacity: $capacity,
+            );
             if ($partFormat === EncryptedMultipartPartCodec::FORMAT) {
                 if ($stage->size < $logicalSize + EncryptedMultipartPartCodec::MIN_OVERHEAD
                     || $stage->size > $logicalSize + EncryptedMultipartPartCodec::MAX_OVERHEAD) {
@@ -200,6 +225,7 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 // original outcome; corrupt scratch accounting makes later
                 // reservations fail closed independently.
             } finally {
+                $this->releasePublicationCapacity($publicationCapacity);
                 unset($worker);
                 $permit?->release();
             }
@@ -211,6 +237,7 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 $this->root,
                 $stage->path,
                 $stage->reservation->leasePath,
+                $stage->reservation->nonce,
                 $path,
                 $bucket,
                 $generation,
@@ -220,23 +247,30 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
                 $stage->size,
                 $stage->sha256,
                 $this->workerIo,
+                $this->tempBudget->tempDir(),
+                $this->budgetBytes,
+                $this->filesystemReserveBytes,
+                $publicationCapacity?->leasePath,
+                $publicationCapacity?->tempPath,
+                $publicationCapacity?->nonce,
             ))->getFuture();
         } catch (\Throwable $error) {
             // A failed submission may still have reached the worker.
-            $this->unknownSubmissions[] = [$stage, $permit, $worker];
+            $this->unknownSubmissions[] = [$stage, $permit, $worker, $publicationCapacity];
             return new LocalMultipartPartWriteOutcome($path, LocalMultipartPartWriteOutcome::UNCERTAIN, $dispatchId, null, $error);
         }
         // A Future can fail because IPC died while a child process is still
         // alive. Keep scratch, its byte reservation and this worker handle in
         // that case; only a returned task result proves the child finished.
-        $future->catch(function (\Throwable $error) use ($stage, $permit, $worker): null {
-            $this->unknownSubmissions[] = [$stage, $permit, $worker];
+        $future->catch(function (\Throwable $error) use ($stage, $permit, $worker, $publicationCapacity): null {
+            $this->unknownSubmissions[] = [$stage, $permit, $worker, $publicationCapacity];
             return null;
         })->ignore();
-        $completed = $future->map(function (mixed $result) use ($stage, $permit): mixed {
+        $completed = $future->map(function (mixed $result) use ($stage, $permit, $publicationCapacity): mixed {
             try {
                 $this->stager->cleanup($stage);
             } finally {
+                $publicationCapacity?->close();
                 $permit->release();
             }
             return $result;
@@ -320,15 +354,32 @@ final class LocalFencedMultipartPartWriter implements ShutdownAwareStorageBacken
             // rather than let a child read bytes after they are reclaimed.
             throw new \RuntimeException('Multipart worker shutdown is uncertain; staged bytes remain reserved.', 0, $error);
         }
-        foreach ($this->unknownSubmissions as [$stage, $permit, $worker]) {
+        foreach ($this->unknownSubmissions as [$stage, $permit, $worker, $publicationCapacity]) {
             try {
                 $this->stager->cleanup($stage);
             } finally {
+                $publicationCapacity?->close();
                 unset($worker);
                 $permit->release();
             }
         }
         $this->unknownSubmissions = [];
+        $this->tempBudget->snapshot();
         $this->stager->shutdown();
+        if ($this->ownsTempBudget) {
+            $this->tempBudget->close();
+        }
+    }
+
+    private function releasePublicationCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
+        }
     }
 }

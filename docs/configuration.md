@@ -21,23 +21,12 @@ prefixes, and otherwise rejected rather than replaced by a default.
 | `S3_REGION` | `us-east-1` | AWS region identifier (returned in location responses) |
 | `S3_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections |
 | `S3_BODY_SIZE_LIMIT` | `5368709120` | Max request body size in bytes (default 5 GiB) |
-| `S3_POST_SPOOL_BUDGET` | `10737418240` | Maximum concurrent browser POST temporary bytes in the local temp directory (default 10 GiB); further uploads receive 503 SlowDown until space is released |
+| `S3_POST_SPOOL_BUDGET` | unset | Deprecated compatibility alias for `S3_STORAGE_TEMP_BUDGET`; alone it supplies the canonical value, while explicitly setting both requires equality and never creates a separate pool |
 | `S3_BASE_DOMAIN` | - | Base domain for virtual-hosted-style requests (e.g., `s3.example.com`) |
 | `S3_STRICT_BUCKET_NAMING` | `true` | Reject AWS-reserved bucket name prefixes and suffixes |
 
-The browser POST spool budget uses locked lease files under
-`sys_get_temp_dir()/.opsfour-s3-post-budget` to count active spools across API
-and helper processes. Startup recovers leases and files abandoned by a crashed
-process, and the server repeats recovery every five minutes. Every later spool
-reservation also recovers abandoned leases immediately as a fallback. The
-coordinator rejects a different budget while another process has an active
-spool; the value can change after all reservations are released. Provision a
-separate temporary volume or filesystem quota with headroom for other temporary
-writers and crash files between recovery runs. Do not remove the reservation
-directory while the server is running. Separately, the prefix sweep reclaims
-abandoned browser POST files older than 24 hours during later uploads. Sharing
-the directory between API processes belongs to a later deployment profile and
-is not qualified by this accounting mechanism alone.
+Browser POST and checksum spools consume the canonical node-local storage
+temporary contract documented below. They do not have an independent budget.
 
 ## TLS
 
@@ -70,8 +59,9 @@ shared storage, and `memory` belong to experimental or test-only profiles until 
 |----------|---------|-------------|
 | `S3_STORAGE_DRIVER` | `filesystem` | Storage backend: `filesystem`, `aws-s3`, `flysystem`, or `memory`. `aws-s3` is fence-complete with PostgreSQL but is not production-qualified until its release run succeeds. |
 | `S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS` | `false` | **Unsafe test-only override:** permits API startup with Flysystem or unverified custom storage tiers. Never enable in production; a remote late write may recreate an abandoned path after cleanup. Laravel uses `allow_unfenced_storage_for_tests`; Symfony uses `server.allow_unfenced_storage_for_tests`. |
-| `S3_STORAGE_TEMP_DIR` | system temp directory | Local staging directory for Flysystem transfers |
-| `S3_STORAGE_TEMP_BUDGET` | `10737418240` (10 GiB) | Maximum concurrent temporary bytes for direct and worker-backed Flysystem staging, including PUT, UploadPart, CopyObject, and multipart assembly, among processes sharing `S3_STORAGE_TEMP_DIR`; writes that exceed the budget receive 503 SlowDown. GET streams directly from a read worker. Worker mode may need space for both its API and worker copy. |
+| `S3_STORAGE_TEMP_DIR` | `sys_get_temp_dir()/opsfour-s3-server-temp` | Canonical node-local coordinator root shared by request spools and all storage staging |
+| `S3_STORAGE_TEMP_BUDGET` | `10737418240` (10 GiB) | One aggregate logical limit for request, local filesystem, AWS foreground, and direct/worker Flysystem staging among processes sharing `S3_STORAGE_TEMP_DIR`; writes that exceed availability receive 503 SlowDown |
+| `S3_STORAGE_TEMP_RESERVE` | `1073741824` (1 GiB) | Minimum physical free space retained on every involved staging filesystem; effective availability is the smaller of logical availability and physical free space above this reserve |
 | `S3_FLYSYSTEM_WORKERS` | `0` | Workers per Flysystem pool; remote mode creates separate read and write pools, each with this limit (up to twice this many processes). A positive value is required when evaluating non-blocking remote I/O. It does not qualify that profile for production. |
 | `S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS` | `20` | Maximum time for a worker-backed GET to acquire a read worker and produce its first byte; expiry returns 503 SlowDown. At most one extra GET waits per read worker; excess requests receive immediate 503. A third-party adapter blocked in synchronous I/O may retain its worker until that call ends. |
 | `S3_FLYSYSTEM_FACTORY_SERVICE` | none | Laravel service ID of a serializable `FlysystemFilesystemFactory` |
@@ -100,6 +90,17 @@ shared storage, and `memory` belong to experimental or test-only profiles until 
 | `S3_ENFORCE_MIN_PART_SIZE` | `true` | Require every non-final multipart part to be at least 5 MiB |
 
 See [Storage Backends](storage-backends.md) for driver-specific configuration.
+The coordinator stores locked process and reservation records under
+`.opsfour-s3-storage-budget`. Live processes must use identical directory,
+budget, and reserve values. Known worst-case sizes are reserved before source
+ingestion; unknown streams reserve each bounded chunk before writing. Recovery
+deletes only proven abandoned regular files with matching device, inode, and
+owner identity. Unknown, replaced, symlinked, or otherwise unaccounted entries
+are never followed or deleted and close mutation readiness until an operator
+resolves them. The fixed budget is host-local admission capacity, not a
+cluster-wide temporary-storage quota; durable PostgreSQL quotas remain the
+cross-node authority.
+
 The `aws-s3` profile always uses virtual-hosted HTTPS resolution and the AWS SDK
 default credential provider chain. It has no configuration fields for inline
 credentials, custom endpoints, path-style addressing, or retry overrides. AWS

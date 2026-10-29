@@ -15,6 +15,22 @@ final class EncryptedTempFrames
 
     private const string AAD = 'opsfour-s3-temp-frame-v1';
 
+    public static function worstCaseEncodedBytes(int $plaintextBytes): int
+    {
+        if ($plaintextBytes < 0) {
+            throw new \InvalidArgumentException('Temporary spool plaintext size must be non-negative.');
+        }
+        if ($plaintextBytes === 0) {
+            return 0;
+        }
+        $frames = intdiv($plaintextBytes - 1, self::MAX_PLAINTEXT_BYTES) + 1;
+        if ($frames > intdiv(PHP_INT_MAX - $plaintextBytes, self::HEADER_BYTES)) {
+            throw new \OverflowException('Temporary spool encoded size overflowed.');
+        }
+
+        return $plaintextBytes + ($frames * self::HEADER_BYTES);
+    }
+
     public static function encode(string $key, int $index, string $plaintext): string
     {
         $length = strlen($plaintext);

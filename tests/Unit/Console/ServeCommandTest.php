@@ -10,6 +10,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\S3ServerConfig;
+use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
@@ -382,6 +383,120 @@ final class ServeCommandTest extends TestCase
             null,
             new MetricsCollector(),
         ]);
+    }
+
+    public function test_deprecated_post_budget_environment_alone_becomes_the_cli_canonical_budget(): void
+    {
+        $canonical = getenv('S3_STORAGE_TEMP_BUDGET');
+        $alias = getenv('S3_POST_SPOOL_BUDGET');
+        try {
+            putenv('S3_STORAGE_TEMP_BUDGET');
+            putenv('S3_POST_SPOOL_BUDGET=7654321');
+            $command = new ServeCommand();
+            $config = $this->invoke($command, 'configFromInput', [
+                $this->input($command, ['--storage-temp-dir' => $this->tempDir]),
+                null,
+            ]);
+
+            self::assertSame(7_654_321, $config->storageTempBudgetBytes);
+            self::assertSame(7_654_321, $config->postSpoolBudgetBytes);
+        } finally {
+            putenv($canonical === false ? 'S3_STORAGE_TEMP_BUDGET' : "S3_STORAGE_TEMP_BUDGET={$canonical}");
+            putenv($alias === false ? 'S3_POST_SPOOL_BUDGET' : "S3_POST_SPOOL_BUDGET={$alias}");
+        }
+    }
+
+    public function test_deprecated_post_budget_option_alone_becomes_the_cli_canonical_budget(): void
+    {
+        $canonical = getenv('S3_STORAGE_TEMP_BUDGET');
+        $alias = getenv('S3_POST_SPOOL_BUDGET');
+        try {
+            putenv('S3_STORAGE_TEMP_BUDGET');
+            putenv('S3_POST_SPOOL_BUDGET');
+            $command = new ServeCommand();
+            $config = $this->invoke($command, 'configFromInput', [
+                $this->input($command, [
+                    '--storage-temp-dir' => $this->tempDir,
+                    '--post-spool-budget' => '7654321',
+                ]),
+                null,
+            ]);
+
+            self::assertSame(7_654_321, $config->storageTempBudgetBytes);
+            self::assertSame(7_654_321, $config->postSpoolBudgetBytes);
+        } finally {
+            putenv($canonical === false ? 'S3_STORAGE_TEMP_BUDGET' : "S3_STORAGE_TEMP_BUDGET={$canonical}");
+            putenv($alias === false ? 'S3_POST_SPOOL_BUDGET' : "S3_POST_SPOOL_BUDGET={$alias}");
+        }
+    }
+
+    public function test_deprecated_post_budget_option_binds_backend_to_the_same_runtime_contract(): void
+    {
+        $canonical = getenv('S3_STORAGE_TEMP_BUDGET');
+        $alias = getenv('S3_POST_SPOOL_BUDGET');
+        $storageRoot = $this->tempDir . '/storage';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        try {
+            putenv('S3_STORAGE_TEMP_BUDGET');
+            putenv('S3_POST_SPOOL_BUDGET');
+            $command = new ServeCommand();
+            $input = $this->input($command, [
+                '--storage-driver' => 'filesystem',
+                '--storage-path' => $storageRoot,
+                '--storage-temp-dir' => $this->tempDir,
+                '--storage-temp-reserve' => '0',
+                '--post-spool-budget' => '7654321',
+            ]);
+            $config = $this->invoke($command, 'configFromInput', [$input, $storageRoot]);
+            $registry = $this->invoke($command, 'buildStorageTierRegistry', [
+                $input,
+                'filesystem',
+                $storageRoot,
+                new MetricsCollector(),
+            ]);
+            $server = new S3Server($config, storage: $registry->defaultBackend());
+            try {
+                self::assertSame(7_654_321, $config->storageTempBudgetBytes);
+                self::assertSame(7_654_321, $server->storageTempBudgetCoordinator()->budgetBytes());
+                self::assertCount(1, glob($this->tempDir . '/.opsfour-s3-storage-budget/process-lease-*') ?: []);
+            } finally {
+                $server->stop();
+                $registry->defaultBackend()->shutdown();
+            }
+            self::assertSame([], glob($this->tempDir . '/.opsfour-s3-storage-budget/process-lease-*') ?: []);
+            foreach (glob($this->tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($this->tempDir . '/.opsfour-s3-storage-budget');
+        } finally {
+            putenv($canonical === false ? 'S3_STORAGE_TEMP_BUDGET' : "S3_STORAGE_TEMP_BUDGET={$canonical}");
+            putenv($alias === false ? 'S3_POST_SPOOL_BUDGET' : "S3_POST_SPOOL_BUDGET={$alias}");
+            @rmdir($storageRoot);
+        }
+    }
+
+    public function test_cli_rejects_divergent_explicit_canonical_and_post_budget_environments(): void
+    {
+        $canonical = getenv('S3_STORAGE_TEMP_BUDGET');
+        $alias = getenv('S3_POST_SPOOL_BUDGET');
+        try {
+            putenv('S3_STORAGE_TEMP_BUDGET=7654321');
+            putenv('S3_POST_SPOOL_BUDGET=7654322');
+            $command = new ServeCommand();
+
+            try {
+                $this->invoke($command, 'configFromInput', [
+                    $this->input($command, ['--storage-temp-dir' => $this->tempDir]),
+                    null,
+                ]);
+                self::fail('Divergent explicit CLI temporary budgets were accepted.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertStringContainsString('deprecated and must equal', $error->getMessage());
+            }
+        } finally {
+            putenv($canonical === false ? 'S3_STORAGE_TEMP_BUDGET' : "S3_STORAGE_TEMP_BUDGET={$canonical}");
+            putenv($alias === false ? 'S3_POST_SPOOL_BUDGET' : "S3_POST_SPOOL_BUDGET={$alias}");
+        }
     }
 
     public function test_explicit_zero_environment_options_are_not_replaced_by_defaults(): void

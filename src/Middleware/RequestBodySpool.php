@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Middleware;
 
 use Amp\Parallel\Worker\WorkerPool;
+use Amp\Http\Server\Request;
 use OpsFour\S3Server\Auth\EncryptedTempFrames;
 use OpsFour\S3Server\Auth\EncryptedTempReadableStream;
 use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Auth\PostObjectSpoolReservation;
 use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Parallel\TemporaryFileTask;
 
 /**
@@ -21,8 +23,6 @@ use OpsFour\S3Server\Parallel\TemporaryFileTask;
  */
 final class RequestBodySpool
 {
-    private const int DELETE_ATTEMPTS = 3;
-
     private const int STALE_AFTER_SECONDS = 86_400;
 
     private const int SWEEP_INTERVAL_SECONDS = 300;
@@ -36,6 +36,9 @@ final class RequestBodySpool
     /** @var array<string, resource> Keeps active files fenced across worker processes. */
     private array $activeHandles = [];
 
+    /** @var array<string,array{device:int,inode:int,owner:int}> */
+    private array $fileIdentities = [];
+
     /** @var array<string, PostObjectSpoolReservation> */
     private array $reservations = [];
 
@@ -47,6 +50,9 @@ final class RequestBodySpool
 
     /** @var array<string, int> */
     private array $frameIndexes = [];
+
+    /** @var array<string, string> */
+    private array $pendingPlaintext = [];
 
     private readonly PostObjectSpoolCoordinator $coordinator;
 
@@ -70,63 +76,86 @@ final class RequestBodySpool
         if ($permissions === false || (($permissions & 0o022) !== 0 && ($permissions & 0o1000) === 0)) {
             throw new InternalErrorException('Request-body temporary directory must be private or sticky.');
         }
-        $this->coordinator = $coordinator ?? new PostObjectSpoolCoordinator($this->tempDir, $this->pool);
+        $this->coordinator = $coordinator ?? new PostObjectSpoolCoordinator(
+            $this->tempDir,
+            $this->pool,
+            budgetBytes: $this->budgetBytes,
+        );
+        $this->coordinator->bindBudget($this->budgetBytes);
     }
 
     /** @internal Closing the worker pool requires every request spool to drain. */
     public function assertIdle(): void
     {
         if ($this->activeHandles !== [] || $this->reservations !== []
-            || $this->keys !== [] || $this->plainSizes !== [] || $this->frameIndexes !== []) {
+            || $this->keys !== [] || $this->plainSizes !== [] || $this->frameIndexes !== []
+            || $this->pendingPlaintext !== [] || $this->fileIdentities !== []) {
             throw new \RuntimeException('Request-body spool still has active files or keys.');
         }
     }
 
-    public function create(string $prefix): string
+    public function create(string $prefix, ?int $knownPlaintextBytes = null): string
     {
         if (! in_array($prefix, ['s3-md5-', 's3-sha256-'], true)) {
             throw new \InvalidArgumentException('Unsupported request-body temporary file prefix.');
         }
+        $knownEncodedBytes = $knownPlaintextBytes === null
+            ? null
+            : EncryptedTempFrames::worstCaseEncodedBytes($knownPlaintextBytes);
         $this->sweepStaleFilesIfDue();
 
         for ($attempt = 0; $attempt < 3; $attempt++) {
             $path = $this->tempDir . DIRECTORY_SEPARATOR . $prefix . bin2hex(random_bytes(16)) . '.tmp';
             $key = random_bytes(32);
+            $created = $path;
+            $reservation = null;
+            $handle = null;
 
             try {
-                $created = $this->pool->submit(new TemporaryFileTask('create', $path))->await();
-                if (! is_string($created)) {
-                    throw new \RuntimeException('Temporary-file worker did not return a path.');
-                }
+                $reservation = $this->coordinator->start($created);
 
+                $createdStat = @lstat($created);
                 $handle = @fopen($created, 'rb');
                 if ($handle === false) {
-                    $this->delete($created);
+                    $handle = null;
+                    throw new \RuntimeException('Unable to lock request-body temporary file.');
+                }
+                $openedStat = @fstat($handle);
+                if ($createdStat === false || $openedStat === false
+                    || ($createdStat['mode'] & 0o170000) !== 0o100000
+                    || ($createdStat['mode'] & 0o077) !== 0
+                    || $openedStat['dev'] !== $createdStat['dev'] || $openedStat['ino'] !== $createdStat['ino']) {
+                    if (is_resource($handle)) {
+                        fclose($handle);
+                    }
                     throw new \RuntimeException('Unable to lock request-body temporary file.');
                 }
                 if (! flock($handle, LOCK_SH | LOCK_NB)) {
                     fclose($handle);
-                    $this->delete($created);
+                    $handle = null;
                     throw new \RuntimeException('Unable to lock request-body temporary file.');
                 }
-                try {
-                    $reservation = $this->coordinator->start($created);
-                } catch (\Throwable $e) {
-                    flock($handle, LOCK_UN);
-                    fclose($handle);
-                    $this->delete($created);
-                    throw $e;
+                if ($knownEncodedBytes !== null && $knownEncodedBytes > 0) {
+                    $this->coordinator->reserve($reservation, $knownEncodedBytes, $this->budgetBytes);
                 }
                 $this->activeHandles[$created] = $handle;
+                $this->fileIdentities[$created] = [
+                    'device' => $openedStat['dev'],
+                    'inode' => $openedStat['ino'],
+                    'owner' => $openedStat['uid'],
+                ];
                 $this->reservations[$created] = $reservation;
                 $this->keys[$created] = $key;
                 $this->plainSizes[$created] = 0;
                 $this->frameIndexes[$created] = 0;
+                $this->pendingPlaintext[$created] = '';
 
                 return $created;
-            } catch (\Amp\CancelledException $e) {
+            } catch (\Amp\CancelledException|SlowDownException $e) {
+                $this->rollbackCreate($created, $handle, $reservation);
                 throw $e;
             } catch (\Throwable $e) {
+                $this->rollbackCreate($created, $handle, $reservation);
                 if ($attempt === 2) {
                     throw new InternalErrorException('Unable to create request-body temporary file.', $e);
                 }
@@ -150,15 +179,41 @@ final class RequestBodySpool
         if ($key === null) {
             throw new \RuntimeException('Request-body temporary file has no encryption key.');
         }
-        for ($offset = 0, $length = strlen($data); $offset < $length; $offset += EncryptedTempFrames::MAX_PLAINTEXT_BYTES) {
-            $plaintext = substr($data, $offset, EncryptedTempFrames::MAX_PLAINTEXT_BYTES);
-            $index = $this->frameIndexes[$path];
-            $frame = EncryptedTempFrames::encode($key, $index, $plaintext);
-            $this->coordinator->reserve($reservation, strlen($frame), $this->budgetBytes);
-            $this->pool->submit(new TemporaryFileTask('append', $path, data: $frame))->await();
-            $this->frameIndexes[$path] = $index + 1;
-            $this->plainSizes[$path] += strlen($plaintext);
+        if (strlen($data) > PHP_INT_MAX - $this->plainSizes[$path]) {
+            throw new \OverflowException('Request-body temporary size overflowed.');
         }
+        $nextPlainSize = $this->plainSizes[$path] + strlen($data);
+        $requiredBytes = EncryptedTempFrames::worstCaseEncodedBytes($nextPlainSize);
+        if ($requiredBytes > $reservation->bytes()) {
+            $this->coordinator->reserve($reservation, $requiredBytes - $reservation->bytes(), $this->budgetBytes);
+        }
+        $this->plainSizes[$path] = $nextPlainSize;
+        $pending = ($this->pendingPlaintext[$path] ?? '') . $data;
+        while (strlen($pending) >= EncryptedTempFrames::MAX_PLAINTEXT_BYTES) {
+            $this->appendFrame($path, $key, substr($pending, 0, EncryptedTempFrames::MAX_PLAINTEXT_BYTES));
+            $pending = substr($pending, EncryptedTempFrames::MAX_PLAINTEXT_BYTES);
+        }
+        $this->pendingPlaintext[$path] = $pending;
+    }
+
+    public static function declaredPlaintextBytes(Request $request): ?int
+    {
+        $decoded = \OpsFour\S3Server\Auth\AwsChunkedContentLength::fromRequest($request);
+        if ($decoded !== null) {
+            return $decoded;
+        }
+        $value = $request->getHeader('content-length');
+        if ($value === null || $value === '' || ! ctype_digit($value)) {
+            return null;
+        }
+        $normalized = ltrim($value, '0');
+        $maximum = (string) PHP_INT_MAX;
+        if (strlen($normalized) > strlen($maximum)
+            || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+            throw new \OverflowException('Request body size exceeds the local integer range.');
+        }
+
+        return (int) $value;
     }
 
     public function openReadable(string $path): EncryptedTempReadableStream
@@ -167,9 +222,19 @@ final class RequestBodySpool
         if ($key === null) {
             throw new \RuntimeException('Request-body temporary file has no encryption key.');
         }
+        $pending = $this->pendingPlaintext[$path] ?? '';
+        if ($pending !== '') {
+            $this->appendFrame($path, $key, $pending);
+            $this->pendingPlaintext[$path] = '';
+        }
 
         return new EncryptedTempReadableStream(
-            new SpoolReadableStream($this->pool, $path),
+            new SpoolReadableStream(
+                $this->pool,
+                $path,
+                ...($this->fileIdentities[$path]
+                    ?? throw new \RuntimeException('Request-body temporary file has no inode identity.')),
+            ),
             $key,
             $this->plainSizes[$path],
         );
@@ -177,33 +242,59 @@ final class RequestBodySpool
 
     public function delete(string $path): void
     {
-        $deleted = false;
         try {
-            for ($attempt = 1; $attempt <= self::DELETE_ATTEMPTS; $attempt++) {
-                try {
-                    $this->pool->submit(new TemporaryFileTask('delete', $path))->await();
-                    $deleted = true;
-
-                    return;
-                } catch (\Amp\CancelledException $e) {
-                    throw $e;
-                } catch (\Throwable $e) {
-                    if ($attempt === self::DELETE_ATTEMPTS) {
-                        throw $e;
-                    }
-                }
-            }
-        } finally {
             if (isset($this->activeHandles[$path])) {
                 flock($this->activeHandles[$path], LOCK_UN);
                 fclose($this->activeHandles[$path]);
                 unset($this->activeHandles[$path]);
             }
             if (isset($this->reservations[$path])) {
-                $this->coordinator->release($this->reservations[$path], $deleted);
+                $this->coordinator->cleanup($this->reservations[$path]);
                 unset($this->reservations[$path]);
             }
-            unset($this->keys[$path], $this->plainSizes[$path], $this->frameIndexes[$path]);
+        } finally {
+            unset($this->keys[$path], $this->plainSizes[$path], $this->frameIndexes[$path], $this->pendingPlaintext[$path], $this->fileIdentities[$path]);
+        }
+    }
+
+    private function appendFrame(string $path, string $key, string $plaintext): void
+    {
+        $index = $this->frameIndexes[$path];
+        $frame = EncryptedTempFrames::encode($key, $index, $plaintext);
+        $identity = $this->fileIdentities[$path]
+            ?? throw new \RuntimeException('Request-body temporary file has no inode identity.');
+        $this->pool->submit(new TemporaryFileTask(
+            'append',
+            $path,
+            data: $frame,
+            expectedDevice: $identity['device'],
+            expectedInode: $identity['inode'],
+            expectedOwner: $identity['owner'],
+        ))->await();
+        $this->frameIndexes[$path] = $index + 1;
+    }
+
+    /** @param resource|null $handle */
+    private function rollbackCreate(string $path, mixed $handle, ?PostObjectSpoolReservation $reservation): void
+    {
+        if (is_resource($handle)) {
+            @flock($handle, LOCK_UN);
+            @fclose($handle);
+        }
+        unset(
+            $this->activeHandles[$path],
+            $this->fileIdentities[$path],
+            $this->reservations[$path],
+            $this->keys[$path],
+            $this->plainSizes[$path],
+            $this->frameIndexes[$path],
+            $this->pendingPlaintext[$path],
+        );
+        if ($reservation !== null && $reservation->isOpen()) {
+            try {
+                $this->coordinator->cleanup($reservation);
+            } catch (\Throwable) {
+            }
         }
     }
 

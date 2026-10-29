@@ -60,6 +60,7 @@ use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -602,6 +603,61 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertNull($this->metadata->getObjectWriteIntent(basename($copied->systemMetadata['storagePath'])));
     }
 
+    public function test_known_copy_temp_capacity_failure_does_not_read_the_aws_source(): void
+    {
+        $payload = 'copy-body';
+        $sourceBucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($sourceBucket);
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'key',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'application/octet-stream',
+            AwsS3WriteAttemptPath::forObject(
+                'bucket',
+                'key',
+                $sourceBucket->generation,
+                'STANDARD',
+                str_repeat('a', 32),
+                '.opsfour/write-attempts',
+            ),
+        );
+        $scratch = $this->base . '/copy-capacity';
+        self::assertTrue(mkdir($scratch, 0700));
+        $budget = new StorageTempBudgetCoordinator($scratch, 4, 0);
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $scratch,
+            'STANDARD',
+            4,
+            filesystemReserveBytes: 0,
+            tempBudget: $budget,
+        );
+        $providerRequestsBefore = count($this->requests);
+
+        try {
+            try {
+                (new CopyObjectHandler(
+                    $this->metadata,
+                    $this->backend,
+                    awsObjectWriter: $writer,
+                    tempBudget: $budget,
+                ))->handleRequest($this->copyRequest());
+                self::fail('Known copy bytes exceeded node temporary capacity.');
+            } catch (SlowDownException) {
+                self::assertCount($providerRequestsBefore, $this->requests);
+                self::assertSame(0, $this->outstandingIntentCount());
+                self::assertNull($this->metadata->getObjectMetadata('target', 'copied'));
+                self::assertSame(0, $budget->snapshot()->reservedBytes);
+            }
+        } finally {
+            $writer->shutdown();
+            $budget->close();
+        }
+    }
+
     public function test_copy_from_non_aws_source_tier_publishes_selected_bytes_and_discards_replaced_tier_data(): void
     {
         $warm = new InMemoryBackend();
@@ -1106,18 +1162,20 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
 
     public function test_declared_length_mismatch_rejects_before_provider_dispatch(): void
     {
-        try {
-            $this->put()->handleRequest($this->putRequestWithBody(
-                new AwsS3TestReadableStream(['payload'], static function (): void {}),
-                8,
-            ));
-            self::fail('Expected declared-length rejection.');
-        } catch (\OpsFour\S3Server\Exception\IncompleteBodyException) {
-            self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+        foreach ([8, 6] as $declaredLength) {
+            try {
+                $this->put()->handleRequest($this->putRequestWithBody(
+                    new AwsS3TestReadableStream(['payload'], static function (): void {}),
+                    $declaredLength,
+                ));
+                self::fail('Expected declared-length rejection.');
+            } catch (\OpsFour\S3Server\Exception\IncompleteBodyException) {
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+            }
+            self::assertCount(2, $this->requests);
+            self::assertSame(0, $this->outstandingIntentCount());
+            self::assertSame([], glob($this->base . '/scratch/s3fw-put-*'));
         }
-        self::assertCount(2, $this->requests);
-        self::assertSame(0, $this->outstandingIntentCount());
-        self::assertSame([], glob($this->base . '/scratch/s3fw-put-*'));
     }
 
     public function test_unknown_length_uses_exact_staged_size_for_quota_before_provider_dispatch(): void
@@ -1168,8 +1226,13 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
 
         $this->beforeProviderRequest = null;
         $this->mock->append(new Response(200, ['ETag' => '"next-provider-etag"']));
-        self::assertSame(200, $this->put()->handleRequest($this->putRequest('next payload'))->getStatus());
-        self::assertSame('"' . md5('next payload') . '"', $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
+        try {
+            $this->put()->handleRequest($this->putRequest('next payload'));
+            self::fail('Corrupt scratch accounting did not fail later staging closed.');
+        } catch (SlowDownException $error) {
+            self::assertStringContainsString('requires operator attention', $error->getMessage());
+        }
+        self::assertSame('"' . md5('committed payload') . '"', $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
     }
 
     public function test_handlers_reject_simultaneous_local_and_aws_coordinators(): void

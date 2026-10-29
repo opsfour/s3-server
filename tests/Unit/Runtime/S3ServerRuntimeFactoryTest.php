@@ -4,11 +4,17 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
+use Amp\ByteStream\ReadableIterableStream;
+use Amp\Http\Server\Driver\Client;
+use Amp\Http\Server\Request;
+use League\Flysystem\Filesystem;
+use League\Uri\Http;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\SseS3Capability;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Exception\StorageCleanupCapacityException;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
@@ -21,7 +27,9 @@ use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -72,6 +80,57 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::PutObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::RestoreObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::SelectObjectContent));
+    }
+
+    public function test_registered_put_uses_server_temp_budget_before_reading_known_sse_body(): void
+    {
+        $tempDir = $this->storagePath . '/temp';
+        $config = new S3ServerConfig(
+            storagePath: $this->storagePath,
+            storageTempDir: $tempDir,
+            storageTempBudgetBytes: 4,
+            storageTempReserveBytes: 0,
+        );
+        $runtime = $this->createRuntime(
+            encryption: $this->createMock(EncryptionServiceInterface::class),
+            storage: new FlysystemBackend(new Filesystem(new InMemoryFlysystemAdapter()), $tempDir),
+            config: $config,
+        );
+        $this->runtimeMetadata($runtime->server)->createBucket('owner', 'bucket', 'us-east-1');
+        $reads = 0;
+        $body = new ReadableIterableStream((static function () use (&$reads): iterable {
+            ++$reads;
+            yield 'payload!!';
+        })());
+        $request = new Request(
+            $this->createMock(Client::class),
+            'PUT',
+            Http::new('http://localhost/bucket/key'),
+            ['content-length' => '9', 'x-amz-server-side-encryption' => 'AES256'],
+            $body,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('s3.operation', S3Operation::PutObject);
+        $request->setAttribute('ownerId', 'owner');
+
+        try {
+            $handler = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
+            $this->expectException(SlowDownException::class);
+            try {
+                $handler->handleRequest($request);
+            } finally {
+                self::assertSame(0, $reads);
+                self::assertSame(0, $runtime->server->storageTempBudgetCoordinator()->snapshot()->reservedBytes);
+            }
+        } finally {
+            $runtime->stop();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
     }
 
     public function test_create_rejects_metadata_without_object_layout_capability_before_runtime_mutation(): void

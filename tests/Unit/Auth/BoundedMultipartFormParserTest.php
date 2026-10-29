@@ -385,10 +385,10 @@ final class BoundedMultipartFormParserTest extends TestCase
                 self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
             }
         } finally {
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -425,10 +425,10 @@ final class BoundedMultipartFormParserTest extends TestCase
                 self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
             }
         } finally {
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -544,10 +544,10 @@ final class BoundedMultipartFormParserTest extends TestCase
                 self::assertSame([], glob($tempDir . '/s3-post-*') ?: []);
             }
         } finally {
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }

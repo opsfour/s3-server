@@ -8,6 +8,7 @@ use Amp\ByteStream\ReadableResourceStream;
 use Amp\ByteStream\ReadableStream;
 use Amp\CancelledException;
 use League\Flysystem\FilesystemOperator;
+use League\Flysystem\FilesystemException;
 use League\Flysystem\UnableToDeleteFile;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -23,21 +24,72 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
  * Storage layout mirrors FilesystemBackend:
  *   Objects: {bucket}/{hash[0:2]}/{hash[2:4]}/{uuid}
  */
-final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
+final class FlysystemBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend, KnownSizeStorageBackend, KnownSizeRecoverableStorageBackend
 {
-    private readonly string $tempDir;
+    private string $tempDir;
+
+    private ?StorageTempBudgetCoordinator $tempBudget;
+
+    private bool $ownsTempBudget;
+
+    /** @var array<string,array{device:int,inode:int,owner:int}> */
+    private array $tempIdentities = [];
 
     public function __construct(
         private readonly FilesystemOperator $filesystem,
         ?string $tempDir = null,
-        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
+        bool $ownsTempBudget = false,
     ) {
         $this->tempDir = $tempDir ?? sys_get_temp_dir();
+        $this->tempBudget = $tempBudget;
+        $this->ownsTempBudget = $ownsTempBudget;
+    }
+
+    /** Bind compatibility instances to the canonical process-wide node budget. */
+    public function bindTempBudget(StorageTempBudgetCoordinator $tempBudget): void
+    {
+        if ($this->tempBudget !== null) {
+            if ($this->tempBudget->tempDir() !== $tempBudget->tempDir()
+                || $this->tempBudget->budgetBytes() !== $tempBudget->budgetBytes()
+                || $this->tempBudget->filesystemReserveBytes() !== $tempBudget->filesystemReserveBytes()) {
+                throw new \RuntimeException('Flysystem backend temporary capacity differs from the node contract.');
+            }
+            if ($this->tempBudget !== $tempBudget) {
+                if ($this->ownsTempBudget) {
+                    $this->tempBudget->close();
+                }
+                $this->tempBudget = $tempBudget;
+                $this->ownsTempBudget = false;
+                $this->tempDir = $tempBudget->tempDir();
+            }
+            return;
+        }
+        $this->tempDir = $tempBudget->tempDir();
+        $this->tempBudget = $tempBudget;
+    }
+
+    public function shutdown(): void
+    {
+        if ($this->ownsTempBudget) {
+            $this->tempBudget?->close();
+            $this->ownsTempBudget = false;
+        }
+    }
+
+    public function __destruct()
+    {
+        $this->shutdown();
     }
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
     {
         return $this->writeObjectAtPath($body, $this->objectPath($bucket, $key));
+    }
+
+    public function putObjectKnownSize(string $bucket, string $key, ReadableStream $body, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->writeObjectAtPath($body, $this->objectPath($bucket, $key), $knownSize, $capacity);
     }
 
     public function planMultipartCompletionPaths(string $bucket, string $key, string $bucketGeneration, string $attemptId): array
@@ -57,13 +109,20 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         return $this->writeObjectAtPath($body, $path);
     }
 
-    private function writeObjectAtPath(ReadableStream $body, string $storagePath): StorageWriteResult
+    public function putObjectAtPathKnownSize(string $bucket, string $key, ReadableStream $body, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertObjectWritePath('', $path, $bucket, $key);
+
+        return $this->writeObjectAtPath($body, $path, $knownSize, $capacity);
+    }
+
+    private function writeObjectAtPath(ReadableStream $body, string $storagePath, ?int $knownMaximumBytes = null, ?StorageTempReservation $capacity = null): StorageWriteResult
     {
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        [$tmpFile, $reservation] = $this->createBudgetedTempFile('s3put_', 's3fw-put-');
-        $tmpStream = fopen($tmpFile, 'w+b');
+        [$tmpFile, $reservation] = $this->createBudgetedTempFile('s3put_', 's3fw-put-', $capacity);
+        $tmpStream = $this->openBudgetedTempStream($tmpFile, $reservation, 'w+b');
         if ($tmpStream === false) {
             $this->releaseBudgetedTempFile($tmpFile, $reservation);
             throw new InternalErrorException('Failed to open temp stream.');
@@ -71,10 +130,18 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
         $cancellation = null;
         try {
+            if ($knownMaximumBytes !== null && $capacity === null) {
+                $this->reserveTempBytes($reservation, $knownMaximumBytes);
+            }
+            $reservedBytes = $knownMaximumBytes ?? 0;
             while (($chunk = $body->read()) !== null) {
-                $this->reserveTempBytes($reservation, strlen($chunk));
+                $nextSize = $size + strlen($chunk);
+                if ($nextSize > $reservedBytes) {
+                    $this->reserveTempBytes($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $calculator->update($chunk);
-                $size += strlen($chunk);
+                $size = $nextSize;
                 self::writeAll($tmpStream, $chunk);
             }
 
@@ -192,6 +259,14 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         return $this->writePartAtPath($data, $path);
     }
 
+    public function putPartKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertSafeUploadIdSegment($uploadId);
+        $path = sprintf('.parts/%s/%d-%s', $uploadId, $partNumber, bin2hex(random_bytes(16)));
+
+        return $this->writePartAtPath($data, $path, $knownSize, $capacity);
+    }
+
     public function planMultipartPartPath(string $bucket, string $bucketGeneration, string $uploadId, int $partNumber, string $attemptId): string
     {
         return StoragePath::forPlannedPart('', $bucket, $bucketGeneration, $uploadId, $partNumber, $attemptId);
@@ -204,13 +279,20 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         return $this->writePartAtPath($data, $path);
     }
 
-    private function writePartAtPath(ReadableStream $data, string $partPath): StorageWriteResult
+    public function putPartAtPathKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertPlannedPartPath('', $path, $uploadId, $partNumber);
+
+        return $this->writePartAtPath($data, $path, $knownSize, $capacity);
+    }
+
+    private function writePartAtPath(ReadableStream $data, string $partPath, ?int $knownSize = null, ?StorageTempReservation $capacity = null): StorageWriteResult
     {
         $calculator = new ChecksumCalculator();
         $size = 0;
 
-        [$tmpFile, $reservation] = $this->createBudgetedTempFile('s3part_', 's3fw-part-');
-        $tmpStream = fopen($tmpFile, 'w+b');
+        [$tmpFile, $reservation] = $this->createBudgetedTempFile('s3part_', 's3fw-part-', $capacity);
+        $tmpStream = $this->openBudgetedTempStream($tmpFile, $reservation, 'w+b');
         if ($tmpStream === false) {
             $this->releaseBudgetedTempFile($tmpFile, $reservation);
             throw new InternalErrorException('Failed to open temp stream.');
@@ -218,10 +300,21 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
         $cancellation = null;
         try {
+            if ($knownSize !== null && $capacity === null) {
+                if ($knownSize < 0) {
+                    throw new \InvalidArgumentException('Known multipart part size must be non-negative.');
+                }
+                $this->reserveTempBytes($reservation, $knownSize);
+            }
+            $reservedBytes = $knownSize ?? 0;
             while (($chunk = $data->read()) !== null) {
-                $this->reserveTempBytes($reservation, strlen($chunk));
+                $nextSize = $size + strlen($chunk);
+                if ($nextSize > $reservedBytes) {
+                    $this->reserveTempBytes($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $calculator->update($chunk);
-                $size += strlen($chunk);
+                $size = $nextSize;
                 self::writeAll($tmpStream, $chunk);
             }
 
@@ -276,7 +369,7 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
     {
         [$tmpFile, $reservation] = $this->createBudgetedTempFile('s3mpu_', 's3fw-mpu-');
 
-        $outHandle = fopen($tmpFile, 'w');
+        $outHandle = $this->openBudgetedTempStream($tmpFile, $reservation, 'w');
         if ($outHandle === false) {
             $this->releaseBudgetedTempFile($tmpFile, $reservation);
             throw new InternalErrorException('Failed to open temp file for multipart assembly.');
@@ -288,10 +381,23 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
         $cancellation = null;
         try {
-            foreach ($parts as $part) {
+            $knownBytes = 0;
+            $knownPartSizes = [];
+            foreach ($parts as $index => $part) {
+                $partSize = $part['size'] ?? $this->filesystem->fileSize($part['storagePath']);
+                if (! is_int($partSize) || $partSize < 0 || $partSize > PHP_INT_MAX - $knownBytes) {
+                    throw new InternalErrorException('Multipart assembly size exceeds node accounting range.');
+                }
+                $knownBytes += $partSize;
+                $knownPartSizes[$index] = $partSize;
+            }
+            $this->reserveTempBytes($reservation, $knownBytes);
+            foreach ($parts as $index => $part) {
                 $partNumber = $part['partNumber'];
                 $partPath = $part['storagePath'];
                 FlysystemPathScope::assertStoredPath($partPath);
+                $remainingPartBytes = $knownPartSizes[$index]
+                    ?? throw new \LogicException('Multipart part size admission disappeared.');
 
                 try {
                     $partStream = $this->filesystem->readStream($partPath);
@@ -309,17 +415,24 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
                         $calculator,
                         $partMd5Context,
                         $outHandle,
-                        $reservation,
                         &$size,
+                        &$remainingPartBytes,
                     ): void {
-                        $this->reserveTempBytes($reservation, strlen($chunk));
+                        $chunkBytes = strlen($chunk);
+                        if ($chunkBytes > $remainingPartBytes) {
+                            throw new InternalErrorException('Multipart part exceeded its admitted size.');
+                        }
                         $calculator->update($chunk);
                         hash_update($partMd5Context, $chunk);
-                        $size += strlen($chunk);
+                        $size += $chunkBytes;
+                        $remainingPartBytes -= $chunkBytes;
                         self::writeAll($outHandle, $chunk);
                     });
                 } finally {
                     fclose($partStream);
+                }
+                if ($remainingPartBytes !== 0) {
+                    throw new InternalErrorException('Multipart part was shorter than its admitted size.');
                 }
 
                 $partMd5 = hash_final($partMd5Context);
@@ -334,7 +447,7 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
 
             $checksums = $calculator->finalize();
             $compositeMd5 = hash('md5', $partMd5s);
-            $resource = fopen($tmpFile, 'r');
+            $resource = $this->openBudgetedTempStream($tmpFile, $reservation, 'rb');
             if ($resource === false) {
                 throw new InternalErrorException('Failed to read assembled file.');
             }
@@ -501,8 +614,19 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         }
 
         $source = new LimitedReadableStream($this->getObjectByPath($srcPath), $maxBytes);
+        $knownCopiedBytes = null;
         try {
-            return $this->putObject($dstBucket, $dstKey, $source);
+            $knownCopiedBytes = min($maxBytes, $this->filesystem->fileSize($srcPath));
+        } catch (FilesystemException) {
+            // Metadata is an optimization only. The bounded stream remains
+            // authoritative when an adapter cannot provide a stable size.
+        }
+        try {
+            return $this->writeObjectAtPath(
+                $source,
+                $this->objectPath($dstBucket, $dstKey),
+                $knownCopiedBytes,
+            );
         } finally {
             $source->close();
         }
@@ -610,25 +734,50 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
             @unlink($tmpFile);
             throw new InternalErrorException('Failed to protect Flysystem temporary file.');
         }
+        $opened = @fstat($handle);
+        if ($opened === false || ($opened['mode'] & 0o170000) !== 0o100000
+            || ($opened['mode'] & 0o077) !== 0) {
+            fclose($handle);
+            @unlink($tmpFile);
+            throw new InternalErrorException('Failed to identify Flysystem temporary file.');
+        }
+        $this->tempIdentities[$tmpFile] = [
+            'device' => $opened['dev'],
+            'inode' => $opened['ino'],
+            'owner' => $opened['uid'],
+        ];
         fclose($handle);
 
         return $tmpFile;
     }
 
     /** @return array{string, StorageTempReservation|null} */
-    private function createBudgetedTempFile(string $directPrefix, string $workerPrefix): array
+    private function createBudgetedTempFile(string $directPrefix, string $workerPrefix, ?StorageTempReservation $capacity = null): array
     {
-        $path = $this->createTempFile($this->tempBudget === null ? $directPrefix : $workerPrefix);
+        if ($capacity !== null && $this->tempBudget === null) {
+            throw new \LogicException('Pre-reserved capacity requires the canonical temporary coordinator.');
+        }
         if ($this->tempBudget === null) {
+            $path = $this->createTempFile($directPrefix);
             return [$path, null];
         }
 
-        try {
-            return [$path, $this->tempBudget->start($path)];
-        } catch (\Throwable $error) {
-            @unlink($path);
-            throw $error;
+        $directory = realpath($this->tempDir);
+        if ($directory === false || ! is_dir($directory) || ! is_writable($directory)) {
+            throw new InternalErrorException('Failed to allocate Flysystem temporary path.');
         }
+        $path = $directory . DIRECTORY_SEPARATOR . $workerPrefix . bin2hex(random_bytes(16));
+
+        if ($capacity !== null) {
+            $this->tempBudget->retarget($capacity, $path, 'storage');
+            $this->tempIdentities[$path] = $capacity->identity();
+            return [$path, $capacity];
+        }
+
+        $reservation = $this->tempBudget->start($path);
+        $this->tempIdentities[$path] = $reservation->identity();
+
+        return [$path, $reservation];
     }
 
     private function reserveTempBytes(?StorageTempReservation $reservation, int $bytes): void
@@ -638,20 +787,68 @@ final class FlysystemBackend implements RecoverableMultipartAssemblyBackend, Rec
         }
     }
 
+    /** @return resource|false */
+    private function openBudgetedTempStream(
+        string $path,
+        ?StorageTempReservation $reservation,
+        string $mode,
+    ): mixed {
+        $truncate = str_starts_with($mode, 'w');
+        $identity = $this->tempIdentities[$path] ?? null;
+        $created = @lstat($path);
+        $stream = @fopen($path, $truncate ? 'r+b' : $mode);
+        if ($stream === false) {
+            return $stream;
+        }
+        $opened = @fstat($stream);
+        if ($created === false || $opened === false || $identity === null
+            || ! isset($created['mode'], $created['dev'], $created['ino'], $created['uid'], $opened['mode'], $opened['dev'], $opened['ino'], $opened['uid'])
+            || ($created['mode'] & 0o170000) !== 0o100000
+            || ($created['mode'] & 0o077) !== 0
+            || ($opened['mode'] & 0o170000) !== 0o100000
+            || ($opened['mode'] & 0o077) !== 0
+            || $created['dev'] !== $identity['device'] || $created['ino'] !== $identity['inode'] || $created['uid'] !== $identity['owner']
+            || $opened['dev'] !== $identity['device'] || $opened['ino'] !== $identity['inode'] || $opened['uid'] !== $identity['owner']
+            || ! @flock($stream, LOCK_SH | LOCK_NB)) {
+            @fclose($stream);
+            $this->releaseBudgetedTempFile($path, $reservation);
+            throw new InternalErrorException('Flysystem temporary file changed before writing.');
+        }
+        if ($truncate && ! @ftruncate($stream, 0)) {
+            @fclose($stream);
+            $this->releaseBudgetedTempFile($path, $reservation);
+            throw new InternalErrorException('Failed to truncate Flysystem temporary file.');
+        }
+
+        return $stream;
+    }
+
     private function releaseBudgetedTempFile(
         string $path,
         ?StorageTempReservation $reservation,
         ?CancelledException $cancellation = null,
     ): void {
-        @unlink($path);
-        if ($reservation !== null) {
-            try {
-                $this->tempBudget?->release($reservation);
-            } catch (\Throwable $releaseError) {
-                if ($cancellation === null) {
-                    throw $releaseError;
+        try {
+            if ($reservation === null) {
+                $identity = $this->tempIdentities[$path] ?? null;
+                clearstatcache(true, $path);
+                $entry = @lstat($path);
+                if ($identity !== null && $entry !== false
+                    && ($entry['mode'] & 0o170000) === 0o100000
+                    && $entry['dev'] === $identity['device']
+                    && $entry['ino'] === $identity['inode']
+                    && $entry['uid'] === $identity['owner']) {
+                    @unlink($path);
                 }
+            } else {
+                $this->tempBudget?->cleanup($reservation);
             }
+        } catch (\Throwable $releaseError) {
+            if ($cancellation === null) {
+                throw $releaseError;
+            }
+        } finally {
+            unset($this->tempIdentities[$path]);
         }
     }
 

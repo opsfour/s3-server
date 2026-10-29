@@ -16,6 +16,7 @@ use Amp\File\Filesystem;
 use Amp\File\FilesystemDriver;
 use Amp\TimeoutCancellation;
 use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Multipart\MultipartCleanup;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -23,6 +24,7 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageTempFileLease;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Process\Process;
 
@@ -83,6 +85,71 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         self::assertSame($path, $write->path);
         self::assertSame('planned', buffer($backend->getObjectByPath($path)));
         self::assertFileDoesNotExist($this->basePath . '/escape');
+    }
+
+    public function test_known_size_object_and_part_writes_reserve_before_reading_source(): void
+    {
+        $storageRoot = $this->basePath . '/storage';
+        $budgetRoot = $this->basePath . '/temp-budget';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        self::assertTrue(mkdir($budgetRoot, 0700));
+        $budget = new StorageTempBudgetCoordinator($budgetRoot, 4, 0);
+        $backend = new FilesystemBackend($storageRoot, tempBudget: $budget);
+        $backend->createBucket('bucket');
+        $generation = bin2hex(random_bytes(16));
+        $uploadId = bin2hex(random_bytes(16));
+        $plannedObject = $backend->planObjectWritePath('bucket', 'key', $generation, bin2hex(random_bytes(16)));
+        $plannedPart = $backend->planMultipartPartPath('bucket', $generation, $uploadId, 1, bin2hex(random_bytes(16)));
+        $writes = [
+            static fn(ReadableStream $body) => $backend->putObjectKnownSize('bucket', 'key', $body, 5),
+            static fn(ReadableStream $body) => $backend->putObjectAtPathKnownSize('bucket', 'key', $body, $plannedObject, 5),
+            static fn(ReadableStream $body) => $backend->putPartKnownSize('bucket', 'key', $uploadId, 1, $body, 5),
+            static fn(ReadableStream $body) => $backend->putPartAtPathKnownSize('bucket', 'key', $uploadId, 1, $body, $plannedPart, 5),
+        ];
+
+        try {
+            foreach ($writes as $write) {
+                $body = $this->createMock(ReadableStream::class);
+                $body->expects(self::never())->method('read');
+                try {
+                    $write($body);
+                    self::fail('Known-size filesystem staging exceeded the node budget.');
+                } catch (SlowDownException) {
+                    self::assertSame([], glob($storageRoot . '/.tmp/*') ?: []);
+                    self::assertSame(0, $budget->snapshot()->reservedBytes);
+                }
+            }
+        } finally {
+            $backend->shutdown();
+            $budget->close();
+        }
+    }
+
+    public function test_known_size_writes_account_for_longer_streams_and_return_shorter_actual_sizes(): void
+    {
+        $storageRoot = $this->basePath . '/storage';
+        $budgetRoot = $this->basePath . '/temp-budget';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        self::assertTrue(mkdir($budgetRoot, 0700));
+        $budget = new StorageTempBudgetCoordinator($budgetRoot, 16, 0);
+        $backend = new FilesystemBackend($storageRoot, tempBudget: $budget);
+        $backend->createBucket('bucket');
+
+        try {
+            self::assertSame(4, $backend->putObjectKnownSize('bucket', 'long', new ReadableBuffer('data'), 3)->size);
+            self::assertSame(4, $backend->putPartKnownSize(
+                'bucket',
+                'short',
+                bin2hex(random_bytes(16)),
+                1,
+                new ReadableBuffer('part'),
+                5,
+            )->size);
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+        } finally {
+            $backend->shutdown();
+            $budget->close();
+        }
     }
 
     public function test_normal_planned_publication_never_replaces_an_existing_target(): void
@@ -279,17 +346,112 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         }
     }
 
-    public function test_bounded_copy_stages_only_metadata_size_plus_one_byte(): void
+    public function test_bounded_copy_preserves_the_permitted_size_plus_one_byte(): void
     {
         $backend = new FilesystemBackend($this->basePath);
         $backend->createBucket('bucket');
-        $source = $backend->putObject('bucket', 'source', new ReadableBuffer(str_repeat('x', 1_000_000)));
+        $source = $backend->putObject('bucket', 'source', new ReadableBuffer('abcde'));
 
-        $copy = $backend->copyObjectBounded($source->path, 'bucket', 'copy', 4);
+        $copy = $backend->copyObjectBounded($source->path, 'bucket', 'copy', 5);
 
-        self::assertSame(4, $copy->size);
-        self::assertSame('xxxx', buffer($backend->getObjectByPath($copy->path)));
+        self::assertSame(5, $copy->size);
+        self::assertSame('abcde', buffer($backend->getObjectByPath($copy->path)));
         self::assertSame([], glob($this->basePath . '/.tmp/*'));
+    }
+
+    public function test_bounded_copy_rejects_bound_or_capacity_before_opening_source(): void
+    {
+        $storageRoot = $this->basePath . '/bounded-copy-storage';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        $sourceBackend = new FilesystemBackend($storageRoot);
+        $sourceBackend->createBucket('bucket');
+        $source = $sourceBackend->putObject('bucket', 'source', new ReadableBuffer('abcde'));
+        $sourceBackend->shutdown();
+
+        foreach ([
+            'source exceeds bound' => [4, 10, InternalErrorException::class],
+            'source exceeds budget' => [5, 4, SlowDownException::class],
+        ] as $case => [$maxBytes, $budgetBytes, $exception]) {
+            $budgetRoot = $this->basePath . '/budget-' . str_replace(' ', '-', $case);
+            self::assertTrue(mkdir($budgetRoot, 0700));
+            $budget = new StorageTempBudgetCoordinator($budgetRoot, $budgetBytes, 0);
+            $realDriver = new BlockingFilesystemDriver();
+            $sourceOpens = 0;
+            $driver = $this->createMock(FilesystemDriver::class);
+            $driver->method('openFile')->willReturnCallback(
+                static function (string $path, string $mode) use ($realDriver, $source, &$sourceOpens): File {
+                    if ($path === $source->path) {
+                        ++$sourceOpens;
+                    }
+
+                    return $realDriver->openFile($path, $mode);
+                },
+            );
+            $backend = new FilesystemBackend(
+                $storageRoot,
+                new Filesystem($driver),
+                new Filesystem($realDriver),
+                $budget,
+            );
+
+            try {
+                $backend->copyObjectBounded($source->path, 'bucket', 'copy-' . $maxBytes, $maxBytes);
+                self::fail($case . ' must be rejected before source I/O.');
+            } catch (\Throwable $error) {
+                self::assertInstanceOf($exception, $error, $case);
+                self::assertSame(0, $sourceOpens, $case);
+                self::assertSame(0, $budget->snapshot()->reservedBytes, $case);
+                self::assertSame([], glob($storageRoot . '/.tmp/*') ?: [], $case);
+            } finally {
+                $backend->shutdown();
+                $budget->close();
+            }
+        }
+    }
+
+    public function test_bounded_copy_rejects_source_growth_after_admission(): void
+    {
+        $storageRoot = $this->basePath . '/growing-copy-storage';
+        $budgetRoot = $this->basePath . '/growing-copy-budget';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        self::assertTrue(mkdir($budgetRoot, 0700));
+        $sourceBackend = new FilesystemBackend($storageRoot);
+        $sourceBackend->createBucket('bucket');
+        $source = $sourceBackend->putObject('bucket', 'source', new ReadableBuffer('abcde'));
+        $sourceBackend->shutdown();
+
+        $budget = new StorageTempBudgetCoordinator($budgetRoot, 10, 0);
+        $realDriver = new BlockingFilesystemDriver();
+        $sourceOpens = 0;
+        $driver = $this->createMock(FilesystemDriver::class);
+        $driver->method('openFile')->willReturnCallback(
+            static function (string $path, string $mode) use ($realDriver, $source, &$sourceOpens): File {
+                if ($path === $source->path) {
+                    ++$sourceOpens;
+                    self::assertSame(6, file_put_contents($path, 'abcdef'));
+                }
+
+                return $realDriver->openFile($path, $mode);
+            },
+        );
+        $backend = new FilesystemBackend(
+            $storageRoot,
+            new Filesystem($driver),
+            new Filesystem($realDriver),
+            $budget,
+        );
+
+        try {
+            $backend->copyObjectBounded($source->path, 'bucket', 'copy', 5);
+            self::fail('A source that grew after admission must not be published.');
+        } catch (InternalErrorException) {
+            self::assertSame(1, $sourceOpens);
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+            self::assertSame([], glob($storageRoot . '/.tmp/*') ?: []);
+        } finally {
+            $backend->shutdown();
+            $budget->close();
+        }
     }
 
     public function test_short_amp_file_writes_reject_all_filesystem_publication_paths(): void
@@ -303,10 +465,17 @@ final class FilesystemBackendAmpFileRegressionTest extends TestCase
         $realDriver = new BlockingFilesystemDriver();
         $shortDriver = $this->createMock(FilesystemDriver::class);
         $shortDriver->method('openFile')->willReturnCallback(function (string $path, string $mode) use ($realDriver): File {
-            if ($mode !== 'w') {
+            if ($mode !== 'c') {
                 return $realDriver->openFile($path, $mode);
             }
             $file = $this->createMock(File::class);
+            $file->method('truncate')->willReturnCallback(static function (int $size) use ($path): void {
+                self::assertSame(0, $size);
+                $handle = fopen($path, 'r+b');
+                self::assertIsResource($handle);
+                self::assertTrue(ftruncate($handle, 0));
+                fclose($handle);
+            });
             $file->method('write')->willReturnCallback(static function (string $bytes) use ($path): void {
                 file_put_contents($path, substr($bytes, 0, 2), FILE_APPEND);
             });

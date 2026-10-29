@@ -36,16 +36,19 @@ final class FlysystemStorageTask implements Task
         private readonly string $operation,
         private readonly array $arguments = [],
         private readonly int $tempBudgetBytes = 10_737_418_240,
+        private readonly int $tempReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): StorageWriteResult|bool|null
     {
         try {
-            $backendKey = $this->factory->cacheKey() . ':' . hash('sha256', $this->tempDir) . ':' . $this->tempBudgetBytes;
+            $backendKey = $this->factory->cacheKey() . ':' . hash('sha256', $this->tempDir)
+                . ':' . $this->tempBudgetBytes . ':' . $this->tempReserveBytes;
             $backend = self::$backends[$backendKey] ??= new FlysystemBackend(
                 $this->factory->createFilesystem(),
                 $this->tempDir,
-                new StorageTempBudgetCoordinator($this->tempDir, $this->tempBudgetBytes),
+                new StorageTempBudgetCoordinator($this->tempDir, $this->tempBudgetBytes, $this->tempReserveBytes),
+                true,
             );
 
             return match ($this->operation) {
@@ -54,12 +57,14 @@ final class FlysystemStorageTask implements Task
                     $this->stringArgument(1),
                     self::fileStream($this->stringArgument(2)),
                 ),
+                'putObjectKnownSize' => $this->putObjectKnownSize($backend, false),
                 'putObjectAtPath' => $backend->putObjectAtPath(
                     $this->stringArgument(0),
                     $this->stringArgument(1),
                     self::fileStream($this->stringArgument(2)),
                     $this->stringArgument(3),
                 ),
+                'putObjectAtPathKnownSize' => $this->putObjectKnownSize($backend, true),
                 'streamObject' => $this->streamObject(
                     $backend,
                     $this->stringArgument(0),
@@ -85,6 +90,7 @@ final class FlysystemStorageTask implements Task
                     $this->intArgument(3),
                     self::fileStream($this->stringArgument(4)),
                 ),
+                'putPartKnownSize' => $this->putPartKnownSize($backend, false),
                 'putPartAtPath' => $backend->putPartAtPath(
                     $this->stringArgument(0),
                     $this->stringArgument(1),
@@ -93,6 +99,7 @@ final class FlysystemStorageTask implements Task
                     self::fileStream($this->stringArgument(4)),
                     $this->stringArgument(5),
                 ),
+                'putPartAtPathKnownSize' => $this->putPartKnownSize($backend, true),
                 'assembleMultipartUpload' => $backend->assembleMultipartUpload(
                     $this->stringArgument(0),
                     $this->stringArgument(1),
@@ -137,6 +144,92 @@ final class FlysystemStorageTask implements Task
             // cannot flatten that resource and would crash the worker.
             throw new InternalErrorException('Flysystem worker operation failed.');
         }
+    }
+
+    private function putObjectKnownSize(FlysystemBackend $backend, bool $planned): StorageWriteResult
+    {
+        $coordinator = new StorageTempBudgetCoordinator(
+            $this->tempDir,
+            $this->tempBudgetBytes,
+            $this->tempReserveBytes,
+        );
+        $capacity = $coordinator->resumeExisting(
+            $this->stringArgument($planned ? 5 : 4),
+            $this->stringArgument($planned ? 6 : 5),
+            $this->stringArgument($planned ? 7 : 6),
+        );
+        try {
+            $stream = self::fileStream($this->stringArgument(2));
+            return $planned
+                ? $backend->putObjectAtPathKnownSize(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $stream,
+                    $this->stringArgument(3),
+                    $this->intArgument(4),
+                    $capacity,
+                )
+                : $backend->putObjectKnownSize(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $stream,
+                    $this->intArgument(3),
+                    $capacity,
+                );
+        } finally {
+            $this->releaseCapacity($coordinator, $capacity);
+        }
+    }
+
+    private function putPartKnownSize(FlysystemBackend $backend, bool $planned): StorageWriteResult
+    {
+        $coordinator = new StorageTempBudgetCoordinator(
+            $this->tempDir,
+            $this->tempBudgetBytes,
+            $this->tempReserveBytes,
+        );
+        $capacity = $coordinator->resumeExisting(
+            $this->stringArgument($planned ? 7 : 6),
+            $this->stringArgument($planned ? 8 : 7),
+            $this->stringArgument($planned ? 9 : 8),
+        );
+        try {
+            $stream = self::fileStream($this->stringArgument(4));
+            return $planned
+                ? $backend->putPartAtPathKnownSize(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->intArgument(3),
+                    $stream,
+                    $this->stringArgument(5),
+                    $this->intArgument(6),
+                    $capacity,
+                )
+                : $backend->putPartKnownSize(
+                    $this->stringArgument(0),
+                    $this->stringArgument(1),
+                    $this->stringArgument(2),
+                    $this->intArgument(3),
+                    $stream,
+                    $this->intArgument(5),
+                    $capacity,
+                );
+        } finally {
+            $this->releaseCapacity($coordinator, $capacity);
+        }
+    }
+
+    private function releaseCapacity(StorageTempBudgetCoordinator $coordinator, \OpsFour\S3Server\Storage\StorageTempReservation $capacity): void
+    {
+        if ($capacity->isOpen()) {
+            try {
+                $coordinator->cleanup($capacity);
+            } catch (\Throwable) {
+                $capacity->close();
+            }
+        }
+        $coordinator->close();
     }
 
     /** @param Channel<string, string|null> $channel */

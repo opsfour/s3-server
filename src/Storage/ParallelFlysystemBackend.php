@@ -28,7 +28,7 @@ use function Amp\async;
  * worker process pool. HTTP request fibers only perform asynchronous local
  * staging I/O and wait on worker futures.
  */
-final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, ShutdownAwareStorageBackend, BoundedCopyStorageBackend
+final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, ShutdownAwareStorageBackend, BoundedCopyStorageBackend, KnownSizeStorageBackend, KnownSizeRecoverableStorageBackend
 {
     private readonly WorkerPool $pool;
 
@@ -36,7 +36,9 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
 
     private readonly File\Filesystem $localFilesystem;
 
-    private readonly StorageTempBudgetCoordinator $tempBudget;
+    private StorageTempBudgetCoordinator $tempBudget;
+
+    private bool $ownsTempBudget = true;
 
     private readonly int $readAdmissionLimit;
 
@@ -72,6 +74,7 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         ?File\Filesystem $localFilesystem = null,
         private readonly int $firstByteTimeoutSeconds = 20,
         private readonly int $writeAdmissionTimeoutSeconds = 20,
+        private readonly int $tempReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
     ) {
         if ($workerLimit < 1) {
             throw new \InvalidArgumentException('Flysystem worker limit must be at least 1.');
@@ -94,10 +97,25 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         $this->readAdmissionLimit = $workerLimit;
         $this->writeAdmissionLimit = $workerLimit;
         $this->localFilesystem = $localFilesystem ?? File\filesystem();
-        $this->tempBudget = new StorageTempBudgetCoordinator($tempDir, $tempBudgetBytes);
+        $this->tempBudget = new StorageTempBudgetCoordinator($tempDir, $tempBudgetBytes, $tempReserveBytes);
         $this->activeReadStreams = new \WeakMap();
         $this->metrics?->registerWorkerPool($this->poolName, $workerLimit);
         $this->metrics?->registerWorkerPool($this->poolName . '-reads', $workerLimit);
+    }
+
+    /** Verify worker and API spools use the canonical process-wide contract. */
+    public function bindTempBudget(StorageTempBudgetCoordinator $tempBudget): void
+    {
+        if ($this->tempBudget->tempDir() !== $tempBudget->tempDir()
+            || $this->tempBudget->budgetBytes() !== $tempBudget->budgetBytes()
+            || $this->tempBudget->filesystemReserveBytes() !== $tempBudget->filesystemReserveBytes()) {
+            throw new \RuntimeException('Flysystem worker temporary capacity differs from the node contract.');
+        }
+        if ($this->tempBudget !== $tempBudget && $this->ownsTempBudget) {
+            $this->tempBudget->close();
+            $this->tempBudget = $tempBudget;
+            $this->ownsTempBudget = false;
+        }
     }
 
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
@@ -114,6 +132,31 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             throw $error;
         } finally {
             $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+        }
+    }
+
+    public function putObjectKnownSize(string $bucket, string $key, ReadableStream $body, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertBucketPathSegment($bucket);
+        $workerCapacity = $this->tempBudget->reserveCapacity($knownSize, 'flysystem_worker');
+        try {
+            [$inputPath, $reservation] = $this->spool($body, 's3fw-put-', knownSize: $knownSize, capacity: $capacity);
+        } catch (\Throwable $error) {
+            $this->releaseCapacityPlaceholder($workerCapacity);
+            throw $error;
+        }
+
+        $cancellation = null;
+        try {
+            return $this->writeResult('putObjectKnownSize', [
+                $bucket, $key, $inputPath, $knownSize, $workerCapacity->leasePath, $workerCapacity->tempPath, $workerCapacity->nonce,
+            ]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
+        } finally {
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+            $workerCapacity->close();
         }
     }
 
@@ -157,6 +200,7 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
                             : $this->readIdleTimeoutSeconds,
                     ],
                     tempBudgetBytes: $this->tempBudgetBytes,
+                    tempReserveBytes: $this->tempReserveBytes,
                 ), $cancellation->getCancellation());
             } catch (CancelledException $error) {
                 $this->releaseReadSlot();
@@ -271,6 +315,31 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         }
     }
 
+    public function putPartKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        $workerCapacity = $this->tempBudget->reserveCapacity($knownSize, 'flysystem_worker');
+        try {
+            [$inputPath, $reservation] = $this->spool($data, 's3fw-part-', MultipartPartSize::MAX_BYTES, $knownSize, $capacity);
+        } catch (\Throwable $error) {
+            $this->releaseCapacityPlaceholder($workerCapacity);
+            throw $error;
+        }
+
+        $cancellation = null;
+        try {
+            return $this->writeResult('putPartKnownSize', [
+                $bucket, $key, $uploadId, $partNumber, $inputPath, $knownSize,
+                $workerCapacity->leasePath, $workerCapacity->tempPath, $workerCapacity->nonce,
+            ]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
+        } finally {
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+            $workerCapacity->close();
+        }
+    }
+
     public function planMultipartPartPath(string $bucket, string $bucketGeneration, string $uploadId, int $partNumber, string $attemptId): string
     {
         return StoragePath::forPlannedPart('', $bucket, $bucketGeneration, $uploadId, $partNumber, $attemptId);
@@ -289,6 +358,32 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             throw $error;
         } finally {
             $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+        }
+    }
+
+    public function putPartAtPathKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertPlannedPartPath('', $path, $uploadId, $partNumber);
+        $workerCapacity = $this->tempBudget->reserveCapacity($knownSize, 'flysystem_worker');
+        try {
+            [$inputPath, $reservation] = $this->spool($data, 's3fw-part-', MultipartPartSize::MAX_BYTES, $knownSize, $capacity);
+        } catch (\Throwable $error) {
+            $this->releaseCapacityPlaceholder($workerCapacity);
+            throw $error;
+        }
+
+        $cancellation = null;
+        try {
+            return $this->writeResult('putPartAtPathKnownSize', [
+                $bucket, $key, $uploadId, $partNumber, $inputPath, $path, $knownSize,
+                $workerCapacity->leasePath, $workerCapacity->tempPath, $workerCapacity->nonce,
+            ]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
+        } finally {
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+            $workerCapacity->close();
         }
     }
 
@@ -330,6 +425,32 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             throw $error;
         } finally {
             $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+        }
+    }
+
+    public function putObjectAtPathKnownSize(string $bucket, string $key, ReadableStream $body, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertObjectWritePath('', $path, $bucket, $key);
+        $workerCapacity = $this->tempBudget->reserveCapacity($knownSize, 'flysystem_worker');
+        try {
+            [$inputPath, $reservation] = $this->spool($body, 's3fw-put-', knownSize: $knownSize, capacity: $capacity);
+        } catch (\Throwable $error) {
+            $this->releaseCapacityPlaceholder($workerCapacity);
+            throw $error;
+        }
+
+        $cancellation = null;
+        try {
+            return $this->writeResult('putObjectAtPathKnownSize', [
+                $bucket, $key, $inputPath, $path, $knownSize,
+                $workerCapacity->leasePath, $workerCapacity->tempPath, $workerCapacity->nonce,
+            ]);
+        } catch (CancelledException $error) {
+            $cancellation = $error;
+            throw $error;
+        } finally {
+            $this->releaseSpooledInput($inputPath, $reservation, $cancellation);
+            $workerCapacity->close();
         }
     }
 
@@ -384,6 +505,10 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         }
         if ($failure !== null) {
             throw $failure;
+        }
+        if ($this->ownsTempBudget) {
+            $this->tempBudget->close();
+            $this->ownsTempBudget = false;
         }
     }
 
@@ -497,6 +622,7 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
                 $operation,
                 $arguments,
                 tempBudgetBytes: $this->tempBudgetBytes,
+                tempReserveBytes: $this->tempReserveBytes,
             ))->await();
             $this->metrics?->recordWorkerPoolTask($this->poolName, $operation);
 
@@ -535,29 +661,51 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
     }
 
     /** @return array{string, StorageTempReservation} */
-    private function spool(ReadableStream $stream, string $prefix, ?int $maxBytes = null): array
+    private function spool(ReadableStream $stream, string $prefix, ?int $maxBytes = null, ?int $knownSize = null, ?StorageTempReservation $capacity = null): array
     {
         $path = $this->createTempFile($prefix);
         try {
-            $reservation = $this->tempBudget->start($path);
+            if ($capacity !== null) {
+                $this->tempBudget->retarget($capacity, $path, 'storage');
+                $reservation = $capacity;
+            } else {
+                $reservation = $this->tempBudget->start($path);
+            }
         } catch (\Throwable $error) {
-            $this->deleteTempFile($path);
             throw $error;
         }
 
         $file = null;
+        $fileLease = null;
         $size = 0;
         try {
-            $file = $this->localFilesystem->openFile($path, 'w');
-            while (($chunk = $stream->read()) !== null) {
-                $size += strlen($chunk);
-                if ($maxBytes !== null && $size > $maxBytes) {
+            if ($knownSize !== null && $capacity === null) {
+                if ($knownSize < 0 || ($maxBytes !== null && $knownSize > $maxBytes)) {
                     throw new EntityTooLargeException('Multipart part exceeds the 5 GiB maximum.');
                 }
-                $this->tempBudget->reserve($reservation, strlen($chunk));
+                $this->tempBudget->reserve($reservation, $knownSize);
+            }
+            $reservedBytes = $knownSize ?? 0;
+            $fileLease = StorageTempFileLease::acquireExisting($path);
+            $fileLease->assertIdentity($reservation->identity());
+            $file = $this->localFilesystem->openFile($path, 'c');
+            $fileLease->assertPath($path);
+            $file->truncate(0);
+            while (($chunk = $stream->read()) !== null) {
+                $nextSize = $size + strlen($chunk);
+                if ($maxBytes !== null && $nextSize > $maxBytes) {
+                    throw new EntityTooLargeException('Multipart part exceeds the 5 GiB maximum.');
+                }
+                if ($nextSize > $reservedBytes) {
+                    $this->tempBudget->reserve($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $file->write($chunk);
+                $size = $nextSize;
             }
             $file->close();
+            $fileLease->release();
+            $fileLease = null;
             clearstatcache(true, $path);
             if (@filesize($path) !== $size) {
                 throw new InternalErrorException('Flysystem upload staging file is incomplete.');
@@ -568,13 +716,9 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             } catch (\Throwable) {
                 // Cleanup failures must not replace the staging failure.
             }
+            $fileLease?->release();
             try {
-                $this->deleteTempFile($path);
-            } catch (\Throwable) {
-                // The original failure remains the actionable cause.
-            }
-            try {
-                $this->tempBudget->release($reservation);
+                $this->tempBudget->cleanup($reservation);
             } catch (\Throwable) {
                 // Reservation cleanup must not mask request cancellation.
             }
@@ -594,32 +738,14 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
             throw new InternalErrorException('Failed to create Flysystem worker temporary file.');
         }
 
-        // PHP's tempnam() falls back to the system temp directory when the
-        // configured volume disappears. Never create staging bytes elsewhere.
+        // Allocate only a confined unused name. The coordinator creates and
+        // reserves the inode atomically under its cross-process lock.
         $path = $directory . DIRECTORY_SEPARATOR . $prefix . bin2hex(random_bytes(16));
-        $handle = @fopen($path, 'x+b');
-        if ($handle === false) {
-            throw new InternalErrorException('Failed to create Flysystem worker temporary file.');
+        if (@lstat($path) !== false) {
+            throw new InternalErrorException('Failed to allocate Flysystem worker temporary path.');
         }
-        if (!@chmod($path, 0600)) {
-            fclose($handle);
-            @unlink($path);
-            throw new InternalErrorException('Failed to protect Flysystem worker temporary file.');
-        }
-        fclose($handle);
 
         return $path;
-    }
-
-    private function deleteTempFile(string $path): void
-    {
-        try {
-            if ($this->localFilesystem->exists($path)) {
-                $this->localFilesystem->deleteFile($path);
-            }
-        } catch (\Throwable) {
-            @unlink($path);
-        }
     }
 
     private function releaseSpooledInput(
@@ -627,13 +753,24 @@ final class ParallelFlysystemBackend implements RecoverableMultipartAssemblyBack
         StorageTempReservation $reservation,
         ?CancelledException $cancellation,
     ): void {
-        $this->deleteTempFile($path);
         try {
-            $this->tempBudget->release($reservation);
+            $this->tempBudget->cleanup($reservation);
         } catch (\Throwable $releaseError) {
             if ($cancellation === null) {
                 throw $releaseError;
             }
+        }
+    }
+
+    private function releaseCapacityPlaceholder(StorageTempReservation $capacity): void
+    {
+        if (! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
         }
     }
 }

@@ -11,6 +11,7 @@ use OpsFour\S3Server\Storage\LocalMultipartPartWriteFence;
 use OpsFour\S3Server\Storage\LocalObjectWriteIo;
 use OpsFour\S3Server\Storage\NativeLocalObjectWriteIo;
 use OpsFour\S3Server\Storage\StorageTempWorkerLease;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 
 /** @implements Task<LocalMultipartPartWriteTaskResult, never, never> */
 final readonly class LocalMultipartPartWriteTask implements Task
@@ -19,6 +20,7 @@ final readonly class LocalMultipartPartWriteTask implements Task
         private string $root,
         private string $source,
         private string $leasePath,
+        private string $sourceNonce,
         private string $target,
         private string $bucket,
         private string $generation,
@@ -28,16 +30,47 @@ final readonly class LocalMultipartPartWriteTask implements Task
         private int $expectedSize,
         private string $expectedSha256,
         private ?LocalObjectWriteIo $io = null,
+        private ?string $tempCoordinatorRoot = null,
+        private int $tempBudgetBytes = StorageTempBudgetCoordinator::DEFAULT_BUDGET_BYTES,
+        private int $tempReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        private ?string $publicationLeasePath = null,
+        private ?string $publicationTempPath = null,
+        private ?string $publicationNonce = null,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): LocalMultipartPartWriteTaskResult
     {
         $tracking = new TrackingMultipartPartIo($this->io ?? new NativeLocalObjectWriteIo());
         $lease = null;
+        $publicationCapacity = null;
+        $coordinator = null;
         try {
             $cancellation->throwIfRequested();
-            $lease = StorageTempWorkerLease::acquire($this->leasePath, $this->source);
-            $result = (new LocalMultipartPartWriteFence($this->root, $tracking))->publish(
+            if ($this->tempCoordinatorRoot === null) {
+                throw new \RuntimeException('Local multipart worker requires the canonical temporary coordinator root.');
+            }
+            $lease = StorageTempWorkerLease::acquire(
+                $this->tempCoordinatorRoot,
+                $this->leasePath,
+                $this->source,
+                $this->sourceNonce,
+            );
+            $coordinator = new StorageTempBudgetCoordinator(
+                $this->tempCoordinatorRoot,
+                $this->tempBudgetBytes,
+                $this->tempReserveBytes,
+            );
+            if ($this->publicationLeasePath !== null || $this->publicationTempPath !== null) {
+                if ($this->publicationLeasePath === null || $this->publicationTempPath === null || $this->publicationNonce === null) {
+                    throw new \RuntimeException('Local multipart publication capacity is incomplete.');
+                }
+                $publicationCapacity = $coordinator->resumeExisting(
+                    $this->publicationLeasePath,
+                    $this->publicationTempPath,
+                    $this->publicationNonce,
+                );
+            }
+            $result = (new LocalMultipartPartWriteFence($this->root, $tracking, tempBudget: $coordinator))->publish(
                 $this->source,
                 $this->target,
                 $this->bucket,
@@ -47,6 +80,7 @@ final readonly class LocalMultipartPartWriteTask implements Task
                 $this->attemptId,
                 $this->expectedSize,
                 $this->expectedSha256,
+                $publicationCapacity,
             );
             return new LocalMultipartPartWriteTaskResult($result, true);
         } catch (\Throwable $error) {
@@ -57,7 +91,18 @@ final readonly class LocalMultipartPartWriteTask implements Task
                 $error->getMessage(),
             );
         } finally {
-            $lease?->close();
+            try {
+                $lease?->close();
+            } finally {
+                if ($publicationCapacity?->isOpen()) {
+                    try {
+                        $coordinator?->cleanup($publicationCapacity);
+                    } catch (\Throwable) {
+                        $publicationCapacity->close();
+                    }
+                }
+                $coordinator?->close();
+            }
         }
     }
 }

@@ -85,6 +85,7 @@ use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 
 /**
@@ -146,6 +147,7 @@ final class HandlerRegistrar
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         ?LocalFencedMultipartPartWriter $localPartWriter = null,
         ?\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
     ): void {
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
             throw new \InvalidArgumentException('Local object writes need both writer and lease factory.');
@@ -166,6 +168,7 @@ final class HandlerRegistrar
             $localLeaseFactory,
             $localPartWriter,
             $awsObjectWriter,
+            $tempBudget,
         );
     }
 
@@ -184,6 +187,7 @@ final class HandlerRegistrar
         ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory,
         ?LocalFencedMultipartPartWriter $localPartWriter = null,
         ?\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
     ): void {
         $quotas = QuotaManager::fromGlobalConfig($metadata, $config->quota);
         $storageTiers ??= StorageTierRegistry::single($storage);
@@ -229,6 +233,7 @@ final class HandlerRegistrar
             $localFencedWriter,
             $localLeaseFactory,
             $awsObjectWriter,
+            $tempBudget,
         );
         $registry->register(
             S3Operation::PutObject,
@@ -289,6 +294,7 @@ final class HandlerRegistrar
                 $localFencedWriter,
                 $localLeaseFactory,
                 $awsObjectWriter,
+                $tempBudget,
             ),
         );
 
@@ -307,12 +313,12 @@ final class HandlerRegistrar
 
         $registry->register(
             S3Operation::UploadPart,
-            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter),
+            new UploadPartHandler($metadata, $storage, $quotas, $storageTiers, $encryption, $config->maxEncryptedObjectSize, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter, tempBudget: $tempBudget),
         );
 
         $registry->register(
             S3Operation::UploadPartCopy,
-            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter),
+            new UploadPartCopyHandler($metadata, $storage, $encryption, $config->maxEncryptedObjectSize, $storageTiers, $quotas, localPartWriter: $localPartWriter, awsObjectWriter: $awsObjectWriter, tempBudget: $tempBudget),
         );
 
         $registry->register(
@@ -329,6 +335,7 @@ final class HandlerRegistrar
                 requireLocalFencedCompletion: $requireLocalFencedCompletion,
                 localFencedCompletionTier: $localFencedCompletionTier,
                 awsObjectWriter: $awsObjectWriter,
+                tempBudget: $tempBudget,
             ),
         );
 

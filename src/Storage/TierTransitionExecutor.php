@@ -169,17 +169,16 @@ final class TierTransitionExecutor
             $sourceStream = null;
             $writeFailure = null;
             try {
-                $rawSource = $awsSource
-                    ? $this->awsFencedWriter?->readCommittedSource(
-                        $targetBucket ?? throw new \LogicException('AWS source bucket snapshot is unavailable.'),
-                        $object,
-                        $sourceBackend,
-                        $sourceTier,
-                        $sourcePath,
-                    ) ?? throw new \LogicException('AWS source reader disappeared.')
-                    : $sourceBackend->getObjectByPath($sourcePath);
                 $sourceStream = new TeeReadableStream(
-                    $rawSource,
+                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSource
+                        ? $this->awsFencedWriter?->readCommittedSource(
+                            $targetBucket ?? throw new \LogicException('AWS source bucket snapshot is unavailable.'),
+                            $object,
+                            $sourceBackend,
+                            $sourceTier,
+                            $sourcePath,
+                        ) ?? throw new \LogicException('AWS source reader disappeared.')
+                        : $sourceBackend->getObjectByPath($sourcePath)),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
@@ -191,6 +190,7 @@ final class TierTransitionExecutor
                         $awsReservation,
                         $object,
                         $sourceStream,
+                        $object->size,
                     ) ?? throw new \LogicException('AWS background writer disappeared.');
                 } elseif ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
                     $fencedTarget = true;
@@ -205,9 +205,13 @@ final class TierTransitionExecutor
                         $targetTier,
                         $sourceStream,
                         'tier_transition',
+                        $object->size,
                     );
                 } else {
-                    $writeResult = $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
+                    $knownSizeTarget = KnownSizeStorageCapabilities::storage($targetBackend);
+                    $writeResult = $knownSizeTarget !== null
+                        ? $knownSizeTarget->putObjectKnownSize($object->bucket, $object->key, $sourceStream, $object->size)
+                        : $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
                 }
             } catch (\Throwable $e) {
                 $writeFailure = $e;

@@ -14,6 +14,7 @@ use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 
 final class MetricsHandler implements RequestHandler
 {
@@ -22,6 +23,7 @@ final class MetricsHandler implements RequestHandler
         private readonly ?MetadataStore $metadata = null,
         private readonly ?string $bearerToken = null,
         private readonly ?AwsS3OperationalState $awsOperationalState = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         if ($bearerToken !== null && trim($bearerToken) === '') {
             throw new \InvalidArgumentException('Metrics bearer token must not be empty when configured.');
@@ -81,6 +83,17 @@ final class MetricsHandler implements RequestHandler
         }
         if ($this->awsOperationalState !== null) {
             $this->metrics->setAwsOperationalSnapshot($this->awsOperationalState->snapshot());
+        }
+        if ($this->tempBudget !== null) {
+            try {
+                $this->metrics->setStorageTempCapacity($this->tempBudget->snapshot());
+                $this->metrics->setStorageTempCapacitySnapshotSuccess(true);
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
+            } catch (\Throwable) {
+                $this->metrics->setStorageTempCapacity(null);
+                $this->metrics->setStorageTempCapacitySnapshotSuccess(false);
+            }
         }
 
         return $this->response();

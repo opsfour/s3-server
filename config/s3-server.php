@@ -3,6 +3,18 @@
 use OpsFour\S3Server\Laravel\EnvironmentNumber;
 use OpsFour\S3Server\Laravel\EnvironmentBoolean;
 
+$unsetEnvironmentValue = new stdClass();
+$storageTempBudgetRaw = env('S3_STORAGE_TEMP_BUDGET', $unsetEnvironmentValue);
+$postSpoolBudgetRaw = env('S3_POST_SPOOL_BUDGET', $unsetEnvironmentValue);
+$storageTempBudgetConfigured = $storageTempBudgetRaw !== $unsetEnvironmentValue;
+$postSpoolBudgetConfigured = $postSpoolBudgetRaw !== $unsetEnvironmentValue;
+$postSpoolBudget = $postSpoolBudgetConfigured
+    ? EnvironmentNumber::integerValue('S3_POST_SPOOL_BUDGET', $postSpoolBudgetRaw)
+    : null;
+$storageTempBudget = $storageTempBudgetConfigured
+    ? EnvironmentNumber::integerValue('S3_STORAGE_TEMP_BUDGET', $storageTempBudgetRaw)
+    : ($postSpoolBudget ?? 10_737_418_240);
+
 return [
     /*
     |--------------------------------------------------------------------------
@@ -41,8 +53,8 @@ return [
     // Request body size limit in bytes (default 5 GiB).
     'body_size_limit' => EnvironmentNumber::integer('S3_BODY_SIZE_LIMIT', 5_368_709_120),
 
-    // Concurrent browser POST temporary bytes shared by API processes using one local temp directory (default 10 GiB).
-    'post_spool_budget' => EnvironmentNumber::integer('S3_POST_SPOOL_BUDGET', 10_737_418_240),
+    // Deprecated alias for storage.temp_budget_bytes; alone it supplies the canonical value, otherwise both must match.
+    'post_spool_budget' => $postSpoolBudget,
 
     // Maximum seconds to await a dispatched local object or multipart write worker.
     'local_write_worker_timeout_seconds' => EnvironmentNumber::finiteFloat('S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS', 300.0),
@@ -181,8 +193,9 @@ return [
     'storage' => [
         'driver' => env('S3_STORAGE_DRIVER', 'filesystem'),
         'path' => env('S3_STORAGE_PATH', function_exists('storage_path') ? storage_path('s3') : ''),
-        'temp_dir' => env('S3_STORAGE_TEMP_DIR', sys_get_temp_dir()),
-        'temp_budget_bytes' => env('S3_STORAGE_TEMP_BUDGET', 10_737_418_240),
+        'temp_dir' => env('S3_STORAGE_TEMP_DIR', sys_get_temp_dir() . '/opsfour-s3-server-temp'),
+        'temp_budget_bytes' => $storageTempBudget,
+        'temp_reserve_bytes' => EnvironmentNumber::integer('S3_STORAGE_TEMP_RESERVE', 1_073_741_824),
         // Remote Flysystem adapters should use a serializable factory and workers.
         'worker_pool_size' => EnvironmentNumber::integer('S3_FLYSYSTEM_WORKERS', 0),
         'read_first_byte_timeout_seconds' => EnvironmentNumber::integer('S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS', 20),

@@ -26,6 +26,9 @@ use OpsFour\S3Server\Middleware\PolicyEnforcementMiddleware;
 use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\KnownSizeStorageCapabilities;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
@@ -49,6 +52,7 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         private readonly bool $requireLocalFencedParts = false,
         private readonly ?LocalFencedMultipartPartWriter $localPartWriter = null,
         private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
         if ($localPartWriter !== null && $awsObjectWriter !== null) {
@@ -161,6 +165,10 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         }
         $partIntentStore = MultipartPartWriteCapabilities::metadata($this->metadata);
         $plannedPartStorage = MultipartPartWriteCapabilities::storage($uploadStorage);
+        $knownPlannedPartStorage = $plannedPartStorage === null
+            ? null
+            : KnownSizeStorageCapabilities::recoverable($plannedPartStorage);
+        $knownUploadStorage = KnownSizeStorageCapabilities::storage($uploadStorage);
         $localFencedPart = MultipartPartWriteCapabilities::localFilesystem($uploadStorage);
         $activeLocalPartWriter = $this->localPartWriter !== null
             && $this->localPartWriter->isBoundTo($this->metadata, $uploadStorage, $storageTier)
@@ -195,8 +203,19 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
             }
             $body = MultipartPartSize::boundedBody($request->getBody(), min(MultipartPartSize::MAX_BYTES, $this->maxEncryptedObjectSize));
             $lock = null;
+            $sseCapacity = null;
             $writeCancellation = null;
             try {
+                if ($this->tempBudget !== null && ($activeAwsObjectWriter !== null
+                    || $activeLocalPartWriter !== null
+                    || $knownPlannedPartStorage !== null)) {
+                    $sseCapacity = $this->tempBudget->reserveCapacity(
+                        EncryptedMultipartPartCodec::worstCaseEncodedBytes(
+                            $declaredLength ?? $this->maxEncryptedObjectSize,
+                        ),
+                        'sse_part',
+                    );
+                }
                 $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
                 $awsReservation = $activeAwsObjectWriter?->reserveMultipartPart(
                     $bucketInfo,
@@ -226,7 +245,12 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     : $encode();
                 if ($awsReservation !== null && is_string($ciphertext)) {
                     $awsWriter = $activeAwsObjectWriter ?? throw new \LogicException('AWS multipart writer disappeared.');
-                    $awsStage = $awsWriter->stage($awsReservation, new \Amp\ByteStream\ReadableBuffer($ciphertext));
+                    $awsStage = $awsWriter->stage(
+                        $awsReservation,
+                        new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                        strlen($ciphertext),
+                        $sseCapacity,
+                    );
                     if ($awsStage->result->size !== strlen($ciphertext)
                         || ! hash_equals(md5($ciphertext), strtolower($awsStage->result->md5Hex))) {
                         throw new \OpsFour\S3Server\Exception\InternalErrorException(
@@ -251,6 +275,8 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                             MultipartPartLogicalValidator::assertEncodedBytes($staged, $ciphertext);
                             $validatedPhysical = $staged;
                         },
+                        knownPhysicalSize: strlen($ciphertext),
+                        capacity: $sseCapacity,
                     );
                     if ($outcome->result === null || $outcome->dispatchId === null || $validatedPhysical === null) {
                         throw $outcome->error ?? new \OpsFour\S3Server\Exception\InternalErrorException('Encrypted local multipart dispatch did not complete.');
@@ -280,14 +306,26 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         $localFencedPart,
                     );
                     try {
-                        $physical = $plannedPartStorage->putPartAtPath(
-                            $bucket,
-                            $key,
-                            $uploadId,
-                            $partNumber,
-                            new \Amp\ByteStream\ReadableBuffer($ciphertext),
-                            $plannedPartPath,
-                        );
+                        $ciphertextStream = new \Amp\ByteStream\ReadableBuffer($ciphertext);
+                        $physical = $knownPlannedPartStorage !== null
+                            ? $knownPlannedPartStorage->putPartAtPathKnownSize(
+                                $bucket,
+                                $key,
+                                $uploadId,
+                                $partNumber,
+                                $ciphertextStream,
+                                $plannedPartPath,
+                                strlen($ciphertext),
+                                $sseCapacity,
+                            )
+                            : $plannedPartStorage->putPartAtPath(
+                                $bucket,
+                                $key,
+                                $uploadId,
+                                $partNumber,
+                                $ciphertextStream,
+                                $plannedPartPath,
+                            );
                     } catch (\Throwable $e) {
                         \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                             $e,
@@ -336,6 +374,9 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     static function () use ($lock): void {
                         $lock?->release();
                     },
+                    function () use ($sseCapacity): void {
+                        $this->releaseUnusedCapacity($sseCapacity);
+                    },
                 );
             }
         } else {
@@ -354,6 +395,7 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     $awsStage = $awsWriter->stage(
                         $awsReservation,
                         $awsWriter->renewingStream($awsReservation, $body),
+                        $declaredLength,
                     );
                     $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
                     MultipartPartLogicalValidator::assertValid($clientChecksums, $awsStage->result, $declaredLength);
@@ -374,6 +416,7 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                             MultipartPartLogicalValidator::assertValid($clientChecksums, $checksums, $declaredLength);
                             $validated = $checksums;
                         },
+                        knownPhysicalSize: $declaredLength,
                     );
                     if ($outcome->result === null || $outcome->dispatchId === null || $validated === null) {
                         throw $outcome->error ?? new \OpsFour\S3Server\Exception\InternalErrorException('Local multipart part dispatch did not complete.');
@@ -400,7 +443,17 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         $localFencedPart,
                     );
                     try {
-                        $writeResult = $plannedPartStorage->putPartAtPath($bucket, $key, $uploadId, $partNumber, $body, $plannedPartPath);
+                        $writeResult = $declaredLength !== null && $knownPlannedPartStorage !== null
+                            ? $knownPlannedPartStorage->putPartAtPathKnownSize(
+                                $bucket,
+                                $key,
+                                $uploadId,
+                                $partNumber,
+                                $body,
+                                $plannedPartPath,
+                                $declaredLength,
+                            )
+                            : $plannedPartStorage->putPartAtPath($bucket, $key, $uploadId, $partNumber, $body, $plannedPartPath);
                     } catch (\Throwable $e) {
                         \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
                             $e,
@@ -413,7 +466,9 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         throw new \OpsFour\S3Server\Exception\InternalErrorException('Multipart part write did not use its planned path.');
                     }
                 } else {
-                    $writeResult = $uploadStorage->putPart($bucket, $key, $uploadId, $partNumber, $body);
+                    $writeResult = $declaredLength !== null && $knownUploadStorage !== null
+                        ? $knownUploadStorage->putPartKnownSize($bucket, $key, $uploadId, $partNumber, $body, $declaredLength)
+                        : $uploadStorage->putPart($bucket, $key, $uploadId, $partNumber, $body);
                 }
             } catch (\Amp\CancelledException $error) {
                 $writeCancellation = $error;
@@ -641,6 +696,18 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
     ): void {
         if ($writer !== null && $reservation !== null) {
             $writer->retireBeforeDispatch($reservation);
+        }
+    }
+
+    private function releaseUnusedCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget?->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
         }
     }
 

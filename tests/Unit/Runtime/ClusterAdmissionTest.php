@@ -389,7 +389,7 @@ final class ClusterAdmissionTest extends TestCase
         );
     }
 
-    public function test_host_local_spool_budget_is_excluded_while_shared_size_limits_diverge(): void
+    public function test_host_local_temp_contract_is_excluded_while_shared_size_limits_diverge(): void
     {
         $config = new S3ServerConfig(
             storagePath: '/',
@@ -411,6 +411,20 @@ final class ClusterAdmissionTest extends TestCase
         self::assertSame($digest($config), $digest($config->with([
             'postSpoolBudgetBytes' => $config->postSpoolBudgetBytes + 1,
         ])));
+        self::assertSame($digest($config), $digest($config->with([
+            'storageTempBudgetBytes' => $config->storageTempBudgetBytes + 2,
+        ])));
+        self::assertSame($digest($config), $digest($config->with([
+            'storageTempReserveBytes' => $config->storageTempReserveBytes + 3,
+        ])));
+        $alternateTemp = sys_get_temp_dir() . '/s3-cluster-local-temp-' . bin2hex(random_bytes(8));
+        try {
+            self::assertSame($digest($config), $digest($config->with([
+                'storageTempDir' => $alternateTemp,
+            ])));
+        } finally {
+            @rmdir($alternateTemp);
+        }
         self::assertNotSame($digest($config), $digest($config->with([
             'requestBodySizeLimit' => $config->requestBodySizeLimit + 1,
         ])));

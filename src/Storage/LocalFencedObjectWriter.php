@@ -39,8 +39,12 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
 
     private readonly LocalObjectWriteLeaseAdmission $workerAdmission;
 
-    /** @var list<array{LocalScratchStage, Lock, Worker}> */
+    /** @var list<array{LocalScratchStage, Lock, Worker, StorageTempReservation|null}> */
     private array $unknownSubmissions = [];
+
+    private readonly StorageTempBudgetCoordinator $tempBudget;
+
+    private readonly bool $ownsTempBudget;
 
     private bool $shuttingDown = false;
 
@@ -48,10 +52,12 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         string $storageRoot,
         string $scratchDirectory,
         private readonly string $storageTier,
-        int $budgetBytes = 10_737_418_240,
+        private readonly int $budgetBytes = 10_737_418_240,
         private readonly ?LocalObjectWriteIo $workerIo = null,
         ?WorkerPool $budgetPool = null,
         ?LocalObjectWriteLeaseAdmission $workerAdmission = null,
+        private readonly int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
         private readonly float $workerTimeoutSeconds = 300.0,
     ) {
         $root = realpath($storageRoot);
@@ -94,7 +100,9 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             2,
             waitForCapacity: true,
         );
-        $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool);
+        $this->ownsTempBudget = $tempBudget === null;
+        $this->tempBudget = $tempBudget ?? new StorageTempBudgetCoordinator($scratch, $budgetBytes, $filesystemReserveBytes);
+        $this->stager = new LocalScratchStager($scratch, $budgetBytes, $budgetPool, $filesystemReserveBytes, $this->tempBudget);
         $this->writePool = new ContextWorkerPool(2);
     }
 
@@ -109,8 +117,11 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         ReadableStream $body,
         LocalObjectWriteLeaseGuard $lease,
         ?Cancellation $cancellation = null,
+        ?int $knownSize = null,
+        ?StorageTempReservation $capacity = null,
+        ?StorageTempReservation $publicationCapacity = null,
     ): LocalObjectWriteOutcome {
-        return $this->publishPrepared($reserved, $key, $body, $lease, $cancellation);
+        return $this->publishPrepared($reserved, $key, $body, $lease, $cancellation, $knownSize, $capacity, $publicationCapacity);
     }
 
     public function storageRoot(): string
@@ -129,8 +140,11 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         string $key,
         ReadableStream $body,
         ?Cancellation $cancellation = null,
+        ?int $knownSize = null,
+        ?StorageTempReservation $capacity = null,
+        ?StorageTempReservation $publicationCapacity = null,
     ): LocalObjectWriteOutcome {
-        return $this->publishPrepared($reserved, $key, $body, null, $cancellation);
+        return $this->publishPrepared($reserved, $key, $body, null, $cancellation, $knownSize, $capacity, $publicationCapacity);
     }
 
     private function publishPrepared(
@@ -139,6 +153,9 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
         ReadableStream $body,
         ?LocalObjectWriteLeaseGuard $lease,
         ?Cancellation $cancellation,
+        ?int $knownSize,
+        ?StorageTempReservation $capacity,
+        ?StorageTempReservation $publicationCapacity,
     ): LocalObjectWriteOutcome {
         $permit = null;
         $writeWorker = null;
@@ -163,7 +180,13 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
             // waiting for a filesystem syscall held by another upload.
             $permit = $this->workerAdmission->acquire($cancellation);
             $writeWorker = $this->checkoutWriteWorker($cancellation);
-            $stage = $this->stager->stage($reserved->attemptId, $body, $cancellation);
+            if ($publicationCapacity !== null && $knownSize === null) {
+                throw new \InvalidArgumentException('Pre-admitted publication capacity requires a known object size.');
+            }
+            if ($knownSize !== null && $publicationCapacity === null) {
+                $publicationCapacity = $this->tempBudget->reserveCapacity($knownSize, 'fenced_object_publish');
+            }
+            $stage = $this->stager->stage($reserved->attemptId, $body, $cancellation, knownSize: $knownSize, capacity: $capacity);
             $cancellation?->throwIfRequested();
             $this->assertActive();
             if ($lease !== null) {
@@ -196,6 +219,7 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
                 // original outcome; corrupt scratch accounting makes later
                 // reservations fail closed independently.
             } finally {
+                $this->releasePublicationCapacity($publicationCapacity);
                 unset($writeWorker);
                 $permit?->release();
             }
@@ -211,30 +235,38 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
                 $key,
                 $stage->path,
                 $stage->reservation->leasePath,
+                $stage->reservation->nonce,
                 $stage->size,
                 $stage->sha256,
                 $this->workerIo,
+                $this->tempBudget->tempDir(),
+                $this->budgetBytes,
+                $this->filesystemReserveBytes,
+                $publicationCapacity?->leasePath,
+                $publicationCapacity?->tempPath,
+                $publicationCapacity?->nonce,
             ))->getFuture();
         } catch (\Throwable $error) {
             // A transport error cannot prove the task was never accepted.
             // Retain the worker as well as the slot until shutdown proves it
             // terminal; reusing either could queue a second late task.
-            $this->unknownSubmissions[] = [$stage, $permit, $writeWorker];
+            $this->unknownSubmissions[] = [$stage, $permit, $writeWorker, $publicationCapacity];
             return LocalObjectWriteOutcome::uncertain($reserved, $error);
         }
         // A resolved task result proves the worker has stopped using its
         // scratch input. An IPC error does not: a child process may still
         // hold the file open after Amp has sent it SIGKILL. Keep its byte
         // reservation and worker slot until shutdown joins the worker.
-        $future->map(function (mixed $result) use ($stage, $permit): void {
+        $future->map(function (mixed $result) use ($stage, $permit, $publicationCapacity): void {
             try {
                 $this->stager->cleanup($stage);
             } finally {
+                $publicationCapacity?->close();
                 $permit->release();
             }
         })->ignore();
-        $future->catch(function (\Throwable $error) use ($stage, $permit, $writeWorker): void {
-            $this->unknownSubmissions[] = [$stage, $permit, $writeWorker];
+        $future->catch(function (\Throwable $error) use ($stage, $permit, $writeWorker, $publicationCapacity): void {
+            $this->unknownSubmissions[] = [$stage, $permit, $writeWorker, $publicationCapacity];
         })->ignore();
         unset($writeWorker);
 
@@ -310,15 +342,32 @@ final class LocalFencedObjectWriter implements ShutdownAwareStorageBackend
     {
         $this->shuttingDown = true;
         $this->writePool->shutdown();
-        foreach ($this->unknownSubmissions as [$stage, $permit, $worker]) {
+        foreach ($this->unknownSubmissions as [$stage, $permit, $worker, $publicationCapacity]) {
             try {
                 $this->stager->cleanup($stage);
             } finally {
+                $publicationCapacity?->close();
                 unset($worker);
                 $permit->release();
             }
         }
         $this->unknownSubmissions = [];
+        $this->tempBudget->snapshot();
         $this->stager->shutdown();
+        if ($this->ownsTempBudget) {
+            $this->tempBudget->close();
+        }
+    }
+
+    private function releasePublicationCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
+        }
     }
 }

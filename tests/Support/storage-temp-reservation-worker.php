@@ -14,11 +14,11 @@ if (count($arguments) !== 3) {
 [, $tempDir, $readyPath] = $arguments;
 $tempPath = $tempDir . '/s3fw-put-worker';
 $coordinator = new StorageTempBudgetCoordinator($tempDir, 5);
+$reservation = $coordinator->start($tempPath);
+$coordinator->reserve($reservation, 4);
 if (file_put_contents($tempPath, 'abcd') !== 4) {
     exit(2);
 }
-$reservation = $coordinator->start($tempPath);
-$coordinator->reserve($reservation, 4);
 if (file_put_contents($readyPath, 'ready') !== 5) {
     exit(2);
 }

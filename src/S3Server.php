@@ -81,6 +81,8 @@ use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Runtime\AwsS3ProviderStartupException;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\Storage\FilesystemBackend;
+use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
@@ -97,6 +99,7 @@ use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
 use OpsFour\S3Server\Contracts\CredentialHealthProbe;
 use OpsFour\S3Server\Contracts\CredentialProvider;
@@ -207,6 +210,8 @@ final class S3Server
 
     private ?PostObjectSpoolCoordinator $postObjectSpoolCoordinator = null;
 
+    private readonly StorageTempBudgetCoordinator $tempBudget;
+
     private ?WorkerPool $requestBodySpoolPool = null;
 
     /** @var list<Future<void>> */
@@ -261,6 +266,12 @@ final class S3Server
         $this->metrics = $metrics ?? new MetricsCollector();
         $this->drain = new NodeDrainController();
         $this->localStorageRootLocks = LocalStorageRootLocks::create();
+        $this->tempBudget = new StorageTempBudgetCoordinator(
+            $config->storageTempDir,
+            $config->storageTempBudgetBytes,
+            $config->storageTempReserveBytes,
+        );
+        $this->bindStorageTempBudget($storage);
         $this->accessLogs = $metadata !== null && $storage !== null
             ? new AccessLogWriter(
                 $metadata,
@@ -588,6 +599,7 @@ final class S3Server
                         clusterAdmission: $this->clusterAdmission,
                         clusterRoles: $this->clusterRoles,
                         drain: $this->drain,
+                        tempBudget: $this->tempBudget,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
@@ -597,6 +609,7 @@ final class S3Server
                     $this->metadata,
                     $this->config->metricsBearerToken,
                     $this->awsOperationalState,
+                    $this->tempBudget,
                 ), rateLimited: false));
                 if (in_array('admin', $httpSurfaces, true) && $this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler(
@@ -1044,6 +1057,9 @@ final class S3Server
     public function setStorageTierRegistry(StorageTierRegistry $storageTiers): void
     {
         $this->assertConfigurationMutable('Storage tier registry');
+        foreach ($storageTiers->all() as $tier) {
+            $this->bindStorageTempBudget($tier->backend);
+        }
         $this->storageTiers = $storageTiers;
         if ($this->metadata !== null && $this->storage !== null) {
             $this->accessLogs = new AccessLogWriter(
@@ -1414,6 +1430,9 @@ final class S3Server
         }
 
         $this->shutdownWorkerPools();
+        $this->postObjectSpoolCoordinator?->close();
+        $this->postObjectSpoolCoordinator = null;
+        $this->tempBudget->close();
 
         // Shut down ParallelSqliteMetadataStore if applicable, even when wrapped by decorators.
         $parallelSqlite = $this->parallelSqliteMetadataStore($this->metadata);
@@ -1770,6 +1789,11 @@ final class S3Server
         return $this->handlerRegistry;
     }
 
+    public function storageTempBudgetCoordinator(): StorageTempBudgetCoordinator
+    {
+        return $this->tempBudget;
+    }
+
     /**
      * Get the server configuration.
      */
@@ -1823,7 +1847,12 @@ final class S3Server
         $workers = $this->config->requestBodySpoolWorkerPoolSize;
         $this->requestBodySpoolPool = new ContextWorkerPool($workers);
         $this->registerWorkerPool($this->requestBodySpoolPool, 'request_body_spool', $workers);
-        $this->postObjectSpoolCoordinator = new PostObjectSpoolCoordinator(pool: $this->requestBodySpoolPool);
+        $this->postObjectSpoolCoordinator = new PostObjectSpoolCoordinator(
+            $this->config->storageTempDir,
+            $this->requestBodySpoolPool,
+            budgetBytes: $this->config->storageTempBudgetBytes,
+            filesystemReserveBytes: $this->config->storageTempReserveBytes,
+        );
 
         return $this->postObjectSpoolCoordinator;
     }
@@ -1992,9 +2021,22 @@ final class S3Server
 
         return new RequestBodySpool(
             $this->requestBodySpoolPool ?? throw new \LogicException('Request-body spool pool was not prepared.'),
+            $this->config->storageTempDir,
             budgetBytes: $this->config->postSpoolBudgetBytes,
             coordinator: $coordinator,
         );
+    }
+
+    private function bindStorageTempBudget(?StorageBackend $backend): void
+    {
+        while ($backend instanceof ObservedStorageBackend) {
+            $backend = $backend->innerBackend();
+        }
+        if ($backend instanceof FilesystemBackend
+            || $backend instanceof FlysystemBackend
+            || $backend instanceof ParallelFlysystemBackend) {
+            $backend->bindTempBudget($this->tempBudget);
+        }
     }
 
     /**

@@ -9,7 +9,11 @@ final class EnvironmentNumber
 {
     public static function integer(string $name, int $default): int
     {
-        $raw = env($name, $default);
+        return self::integerValue($name, env($name, $default));
+    }
+
+    public static function integerValue(string $name, mixed $raw): int
+    {
         if (! is_int($raw) && ! is_string($raw)) {
             throw new \InvalidArgumentException("{$name} must be a decimal integer.");
         }

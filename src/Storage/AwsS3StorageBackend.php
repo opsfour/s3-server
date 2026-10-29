@@ -141,6 +141,8 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         float $leaseSeconds = 300.0,
         float $renewIntervalSeconds = 60.0,
         ?MetricsCollector $metrics = null,
+        int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
     ): AwsS3ForegroundObjectWriter {
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
@@ -159,7 +161,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
             $profile,
             $intents,
             $publisher,
-            new LocalScratchStager($scratch, $budgetBytes),
+            new LocalScratchStager($scratch, $budgetBytes, filesystemReserveBytes: $filesystemReserveBytes, tempBudget: $tempBudget),
             $storageTier,
             $renewIntervalSeconds,
             $this->operationalState,

@@ -400,15 +400,15 @@ final class PostObjectTest extends S3FunctionalTestCase
     public function test_unauthenticated_oversized_part_header_returns_http_400_without_a_spool(): void
     {
         $previousMemoryLimit = getenv('S3_TEST_SERVER_MEMORY_LIMIT');
-        $previousTmpDir = getenv('TMPDIR');
+        $previousStorageTempDir = getenv('S3_STORAGE_TEMP_DIR');
         $tempDir = self::$storagePath . '/post-header-temp-' . bin2hex(random_bytes(4));
         self::assertTrue(mkdir($tempDir, 0o700));
         putenv('S3_TEST_SERVER_MEMORY_LIMIT=128M');
-        putenv('TMPDIR=' . $tempDir);
+        putenv('S3_STORAGE_TEMP_DIR=' . $tempDir);
 
         try {
             self::restartServer();
-            self::assertDirectoryExists($tempDir . '/.opsfour-s3-post-budget');
+            self::assertDirectoryExists($tempDir . '/.opsfour-s3-storage-budget');
 
             $boundary = 'post-header-limit';
             $response = (new Client(['http_errors' => false, 'timeout' => 10]))->request(
@@ -429,7 +429,9 @@ final class PostObjectTest extends S3FunctionalTestCase
             putenv($previousMemoryLimit === false
                 ? 'S3_TEST_SERVER_MEMORY_LIMIT'
                 : 'S3_TEST_SERVER_MEMORY_LIMIT=' . $previousMemoryLimit);
-            putenv($previousTmpDir === false ? 'TMPDIR' : 'TMPDIR=' . $previousTmpDir);
+            putenv($previousStorageTempDir === false
+                ? 'S3_STORAGE_TEMP_DIR'
+                : 'S3_STORAGE_TEMP_DIR=' . $previousStorageTempDir);
             self::restartServer();
         }
     }

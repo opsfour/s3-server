@@ -27,6 +27,15 @@ final class EncryptedMultipartPartCodec
 
     public const int MAX_OVERHEAD = 7 + 1 + 2 + self::IV_BYTES + self::TAG_BYTES + self::MAX_WRAPPED_KEY_BYTES + self::CONTEXT_BYTES;
 
+    public static function worstCaseEncodedBytes(int $plaintextBytes): int
+    {
+        if ($plaintextBytes < 0 || $plaintextBytes > PHP_INT_MAX - self::MAX_OVERHEAD) {
+            throw new \OverflowException('Encrypted multipart part size exceeds the supported range.');
+        }
+
+        return $plaintextBytes + self::MAX_OVERHEAD;
+    }
+
     public static function encode(
         EncryptionServiceInterface $encryption,
         string $mode,

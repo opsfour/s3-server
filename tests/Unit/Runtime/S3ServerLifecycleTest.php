@@ -43,6 +43,37 @@ use Revolt\EventLoop;
 
 final class S3ServerLifecycleTest extends TestCase
 {
+    public function test_node_temp_process_leases_close_only_after_shutdown_reaches_owned_resources(): void
+    {
+        $base = sys_get_temp_dir() . '/s3-server-temp-shutdown-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($base, 0700));
+        $server = new S3Server(new S3ServerConfig(
+            storagePath: $base,
+            storageTempDir: $base,
+            storageTempReserveBytes: 0,
+        ));
+        $server->preparePostObjectSpoolCoordinator();
+        $control = $base . '/.opsfour-s3-storage-budget';
+
+        try {
+            self::assertCount(2, glob($control . '/process-lease-*') ?: []);
+            $server->beginDrain();
+            self::assertCount(2, glob($control . '/process-lease-*') ?: []);
+
+            $server->stop();
+
+            self::assertSame([], glob($control . '/process-lease-*') ?: []);
+            self::assertSame([], glob($control . '/process-state-*') ?: []);
+        } finally {
+            $server->stop();
+            foreach (glob($control . '/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($control);
+            @rmdir($base);
+        }
+    }
+
     public function test_server_cannot_start_after_programmatic_drain_begins(): void
     {
         $server = new S3Server(new S3ServerConfig(storagePath: sys_get_temp_dir()));
@@ -1014,6 +1045,57 @@ final class S3ServerLifecycleTest extends TestCase
 
         $stop->await(new \Amp\TimeoutCancellation(3));
         self::assertFalse($this->canConnect($port));
+    }
+
+    public function test_node_temp_capacity_drives_real_readiness_and_metrics_routes(): void
+    {
+        $root = sys_get_temp_dir() . '/s3-node-temp-routes-' . bin2hex(random_bytes(8));
+        $managed = $root . '/managed';
+        self::assertTrue(mkdir($managed, 0700, true));
+        $port = $this->unusedPort();
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $port,
+            storagePath: $root,
+            storageTempDir: $root,
+            storageTempBudgetBytes: 10,
+            storageTempReserveBytes: 0,
+            perClientRateLimit: 0,
+            notificationWorkerEnabled: false,
+        ));
+        $server->storageTempBudgetCoordinator()->registerNamespace('route_test', $managed);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+        $server->start();
+
+        try {
+            self::assertSame(1, file_put_contents($managed . '/unaccounted', 'x'));
+            $client = HttpClientBuilder::buildDefault();
+
+            $health = $client->request(new ClientRequest("http://127.0.0.1:{$port}/.health"));
+            self::assertSame(503, $health->getStatus());
+            self::assertStringContainsString('node_temp_capacity', \Amp\ByteStream\buffer($health->getBody()));
+
+            $metrics = $client->request(new ClientRequest("http://127.0.0.1:{$port}/.metrics"));
+            self::assertSame(200, $metrics->getStatus());
+            $rendered = \Amp\ByteStream\buffer($metrics->getBody());
+            self::assertStringContainsString('s3_server_node_temp_budget_bytes 10', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_reserved_bytes 0', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_active_reservations 0', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_unsafe_entries 1', $rendered);
+            self::assertDoesNotMatchRegularExpression('/^s3_server_node_temp_[^ ]+\{/m', $rendered);
+        } finally {
+            $server->stop();
+            @unlink($managed . '/unaccounted');
+            @rmdir($managed);
+            foreach (glob($root . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($root . '/.opsfour-s3-storage-budget');
+            @rmdir($root);
+        }
     }
 
     public function test_stream_admitted_before_drain_finishes_while_new_work_is_rejected(): void

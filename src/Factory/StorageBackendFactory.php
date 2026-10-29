@@ -41,9 +41,7 @@ final class StorageBackendFactory
         ?AwsS3ProviderValidator $awsS3ProviderValidator = null,
     ): StorageBackend {
         $backend = match ($driver) {
-            'filesystem' => new FilesystemBackend(
-                $config['path'] ?? throw new \InvalidArgumentException('Filesystem requires "path"'),
-            ),
+            'filesystem' => self::createFilesystem($config),
             'flysystem' => self::createFlysystem($config, $metrics),
             'aws-s3' => self::createAwsS3($config, $awsS3ProviderValidator),
             'memory' => new InMemoryBackend(),
@@ -63,6 +61,26 @@ final class StorageBackendFactory
             : new ObservedStorageBackend($backend, $metrics, $metricsDriver ?? $driver);
     }
 
+    /** @param array<string,mixed> $config */
+    private static function createFilesystem(array $config): FilesystemBackend
+    {
+        $tempDir = (string) ($config['temp_dir'] ?? sys_get_temp_dir() . '/opsfour-s3-server-temp');
+        if (! is_dir($tempDir) && ! @mkdir($tempDir, 0o700, true) && ! is_dir($tempDir)) {
+            throw new \RuntimeException('Cannot create canonical node temporary directory.');
+        }
+        $budget = filter_var($config['temp_budget_bytes'] ?? StorageTempBudgetCoordinator::DEFAULT_BUDGET_BYTES, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $reserve = filter_var($config['temp_reserve_bytes'] ?? StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+        if ($budget === false || $reserve === false) {
+            throw new \InvalidArgumentException('Filesystem temporary budget and reserve are invalid.');
+        }
+
+        return new FilesystemBackend(
+            $config['path'] ?? throw new \InvalidArgumentException('Filesystem requires "path"'),
+            tempBudget: new StorageTempBudgetCoordinator($tempDir, $budget, $reserve),
+            ownsTempBudget: true,
+        );
+    }
+
     /** @param array<string, mixed> $config */
     private static function createAwsS3(
         array $config,
@@ -80,7 +98,10 @@ final class StorageBackendFactory
      */
     private static function createFlysystem(array $config, ?MetricsCollector $metrics): StorageBackend
     {
-        $tempDir = $config['temp_dir'] ?? sys_get_temp_dir();
+        $tempDir = $config['temp_dir'] ?? sys_get_temp_dir() . '/opsfour-s3-server-temp';
+        if (! is_dir($tempDir) && ! @mkdir($tempDir, 0o700, true) && ! is_dir($tempDir)) {
+            throw new \RuntimeException('Cannot create canonical node temporary directory.');
+        }
         $tempBudgetBytes = filter_var(
             $config['temp_budget_bytes'] ?? 10_737_418_240,
             FILTER_VALIDATE_INT,
@@ -88,6 +109,14 @@ final class StorageBackendFactory
         );
         if ($tempBudgetBytes === false) {
             throw new \InvalidArgumentException('Flysystem temp_budget_bytes must be a positive decimal integer.');
+        }
+        $tempReserveBytes = filter_var(
+            $config['temp_reserve_bytes'] ?? StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
+            FILTER_VALIDATE_INT,
+            ['options' => ['min_range' => 0]],
+        );
+        if ($tempReserveBytes === false) {
+            throw new \InvalidArgumentException('Flysystem temp_reserve_bytes must be a non-negative decimal integer.');
         }
         $workerPoolSize = filter_var(
             $config['worker_pool_size'] ?? 0,
@@ -116,6 +145,7 @@ final class StorageBackendFactory
                 poolName: (string) ($config['pool_name'] ?? 'flysystem'),
                 tempBudgetBytes: $tempBudgetBytes,
                 firstByteTimeoutSeconds: $firstByteTimeoutSeconds,
+                tempReserveBytes: $tempReserveBytes,
             );
         }
 
@@ -125,7 +155,8 @@ final class StorageBackendFactory
                 . 'Register it in your service provider: $this->app->when(StorageBackendFactory::class)->give(["filesystem" => $operator]);',
             ),
             $tempDir,
-            new StorageTempBudgetCoordinator($tempDir, $tempBudgetBytes),
+            new StorageTempBudgetCoordinator($tempDir, $tempBudgetBytes, $tempReserveBytes),
+            true,
         );
     }
 
@@ -166,7 +197,24 @@ final class StorageBackendFactory
 
                 foreach ($tierPlans as [$tierName, $driver, $tierConfig]) {
                     $tierConfig['pool_name'] ??= 'flysystem_' . strtolower($tierName);
+                    $tierConfig['temp_dir'] ??= $storageConfig['temp_dir'] ?? sys_get_temp_dir() . '/opsfour-s3-server-temp';
                     $tierConfig['temp_budget_bytes'] ??= $storageConfig['temp_budget_bytes'] ?? 10_737_418_240;
+                    $tierConfig['temp_reserve_bytes'] ??= $storageConfig['temp_reserve_bytes']
+                        ?? StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES;
+                    if (in_array($driver, ['filesystem', 'flysystem', 'aws-s3'], true)) {
+                        $nodeTempConfigured = (string) ($storageConfig['temp_dir'] ?? sys_get_temp_dir() . '/opsfour-s3-server-temp');
+                        if (! is_dir($nodeTempConfigured)
+                            && ! @mkdir($nodeTempConfigured, 0o700, true) && ! is_dir($nodeTempConfigured)) {
+                            throw new \RuntimeException('Cannot create canonical node temporary directory.');
+                        }
+                        $nodeTempDir = realpath($nodeTempConfigured);
+                        $tierTempDir = realpath((string) $tierConfig['temp_dir']);
+                        if ($nodeTempDir === false || $tierTempDir === false || $nodeTempDir !== $tierTempDir
+                            || (string) $tierConfig['temp_budget_bytes'] !== (string) ($storageConfig['temp_budget_bytes'] ?? StorageTempBudgetCoordinator::DEFAULT_BUDGET_BYTES)
+                            || (string) $tierConfig['temp_reserve_bytes'] !== (string) ($storageConfig['temp_reserve_bytes'] ?? StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES)) {
+                            throw new \InvalidArgumentException('All temporary-consuming tiers on one node must share the canonical temp directory, budget, and reserve.');
+                        }
+                    }
                     $tierConfig['read_first_byte_timeout_seconds'] ??= $storageConfig['read_first_byte_timeout_seconds'] ?? 20;
                     $backend = self::create($driver, $tierConfig, $metrics, "{$driver}:{$tierName}");
                     $created[] = $backend;

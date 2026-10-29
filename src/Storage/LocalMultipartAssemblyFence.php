@@ -20,6 +20,7 @@ final readonly class LocalMultipartAssemblyFence
         private string $root,
         private LocalObjectWriteIo $io = new NativeLocalObjectWriteIo(),
         LocalDurableFileIo $durableIo = new NativeLocalObjectWriteIo(),
+        private ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $canonical = realpath($root);
         if ($canonical === false || ! is_dir($canonical)) {
@@ -27,6 +28,8 @@ final readonly class LocalMultipartAssemblyFence
         }
         $this->canonicalRoot = rtrim($canonical, '/');
         $this->durability = new LocalDurableFilePublisher($root, $durableIo);
+        $namespace = 'filesystem_' . substr(hash('sha256', $this->canonicalRoot), 0, 24);
+        $this->tempBudget?->registerNamespace($namespace, $this->canonicalRoot . '/.tmp');
     }
 
     /**
@@ -67,10 +70,29 @@ final readonly class LocalMultipartAssemblyFence
         $tempPath = $this->root . '/.tmp/' . bin2hex(random_bytes(16));
         $temp = null;
         $tempLease = null;
+        $reservation = null;
+        $ownedTemp = false;
         try {
-            $temp = @fopen($tempPath, 'x+b');
-            if ($temp === false || ! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
+            $reservation = $this->tempBudget?->start($tempPath, 'fenced_assembly');
+            $created = $reservation !== null ? @lstat($tempPath) : null;
+            $temp = @fopen($tempPath, $reservation !== null ? 'r+b' : 'x+b');
+            $ownedTemp = $reservation !== null || is_resource($temp);
+            $openedTemp = is_resource($temp) ? @fstat($temp) : false;
+            if ($temp === false || ($reservation !== null && ($created === false || $openedTemp === false
+                || ! isset($created['dev'], $created['ino'], $openedTemp['dev'], $openedTemp['ino'])
+                || $openedTemp['dev'] !== $created['dev'] || $openedTemp['ino'] !== $created['ino']))
+                || ! @chmod($tempPath, 0600) || ! @flock($temp, LOCK_SH | LOCK_NB)) {
                 throw new \RuntimeException('Could not create protected multipart assembly inode.');
+            }
+            if ($reservation !== null) {
+                $knownBytes = 0;
+                foreach ($parts as $part) {
+                    if ($part['size'] > PHP_INT_MAX - $knownBytes) {
+                        throw new \RuntimeException('Multipart assembly size exceeds node accounting range.');
+                    }
+                    $knownBytes += $part['size'];
+                }
+                $this->tempBudget?->reserve($reservation, $knownBytes);
             }
             $calculator = new ChecksumCalculator();
             $partMd5s = '';
@@ -173,7 +195,14 @@ final readonly class LocalMultipartAssemblyFence
                 $writtenInode['dev'],
                 $writtenInode['ino'],
             );
-            $this->durability->delete($tempPath);
+            if ($reservation !== null) {
+                if (! ($this->tempBudget?->cleanup($reservation) ?? false)
+                    || ! $this->io->syncDirectory(dirname($tempPath))) {
+                    throw new \RuntimeException('Could not durably remove multipart assembly inode.');
+                }
+            } else {
+                $this->durability->delete($tempPath);
+            }
             $tempPath = '';
 
             return new StorageWriteResult(
@@ -195,7 +224,14 @@ final readonly class LocalMultipartAssemblyFence
                 @fclose($tempLease);
             }
             if ($tempPath !== '') {
-                @unlink($tempPath);
+                if ($reservation !== null) {
+                    try {
+                        $this->tempBudget?->cleanup($reservation);
+                    } catch (\Throwable) {
+                    }
+                } elseif ($ownedTemp) {
+                    @unlink($tempPath);
+                }
             }
         }
     }

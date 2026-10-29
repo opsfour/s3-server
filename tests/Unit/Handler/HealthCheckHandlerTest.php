@@ -24,6 +24,7 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -87,6 +88,29 @@ final class HealthCheckHandlerTest extends TestCase
         self::assertSame('{"status":"degraded"}', $response->getBody()->read());
         self::assertSame('storage:STANDARD', $logger->records[0]['context']['component']);
         self::assertSame(\RuntimeException::class, $logger->records[0]['context']['exception']);
+    }
+
+    public function test_readiness_closes_when_node_temp_contains_unaccounted_managed_bytes(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-health-temp-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $coordinator = new StorageTempBudgetCoordinator($tempDir, 1024, 0);
+        $unknown = $tempDir . '/s3fw-put-unaccounted';
+        self::assertSame(4, file_put_contents($unknown, 'data'));
+
+        try {
+            $response = (new HealthCheckHandler(tempBudget: $coordinator))->handleRequest($this->request());
+            self::assertSame(503, $response->getStatus());
+            self::assertSame('{"status":"degraded","node_temp_capacity":"unsafe_state"}', $response->getBody()->read());
+        } finally {
+            @unlink($unknown);
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
     }
 
     public function test_storage_probe_propagates_the_original_cancellation(): void

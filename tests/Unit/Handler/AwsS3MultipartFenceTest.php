@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Handler;
 
+use Amp\ByteStream\ReadableIterableStream;
 use Amp\Http\Server\Driver\Client as ServerClient;
 use Amp\Http\Server\Request;
 use Amp\Socket\InternetAddress;
@@ -24,12 +25,14 @@ use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
 use OpsFour\S3Server\Exception\OperationAbortedException;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
@@ -171,6 +174,33 @@ final class AwsS3MultipartFenceTest extends TestCase
         self::assertSame('*', $this->providerRequests[5]->getHeaderLine('If-None-Match'));
     }
 
+    public function test_part_declared_length_mismatches_reject_before_provider_dispatch(): void
+    {
+        $created = (new CreateMultipartUploadHandler($this->metadata, storage: $this->backend))
+            ->handleRequest($this->request('POST', '/bucket/key?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+
+        foreach ([8, 6] as $declaredLength) {
+            try {
+                (new UploadPartHandler(
+                    $this->metadata,
+                    $this->backend,
+                    awsObjectWriter: $this->writer,
+                ))->handleRequest($this->request(
+                    'PUT',
+                    '/bucket/key?partNumber=1&uploadId=' . $uploadId,
+                    'payload',
+                    ['content-length' => (string) $declaredLength],
+                ));
+                self::fail('Expected multipart declared-length rejection.');
+            } catch (\OpsFour\S3Server\Exception\IncompleteBodyException) {
+                self::assertSame([], $this->metadata->getParts($uploadId));
+            }
+            self::assertCount(2, $this->providerRequests);
+            self::assertSame([], glob($this->base . '/scratch/s3fw-part-*') ?: []);
+        }
+    }
+
     public function test_abort_queues_exact_aws_part_without_provider_delete(): void
     {
         [$uploadId, , $partPath] = $this->uploadPart('abort payload');
@@ -308,6 +338,136 @@ final class AwsS3MultipartFenceTest extends TestCase
         ));
     }
 
+    public function test_known_part_copy_temp_capacity_failure_does_not_read_the_aws_source(): void
+    {
+        $sourcePayload = 'copy-body';
+        $sourceBucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($sourceBucket);
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source',
+            'owner',
+            strlen($sourcePayload),
+            '"' . md5($sourcePayload) . '"',
+            'application/octet-stream',
+            \OpsFour\S3Server\Storage\AwsS3WriteAttemptPath::forObject(
+                'bucket',
+                'source',
+                $sourceBucket->generation,
+                'STANDARD',
+                str_repeat('a', 32),
+                '.opsfour/write-attempts',
+            ),
+        );
+
+        $created = (new CreateMultipartUploadHandler($this->metadata, storage: $this->backend))
+            ->handleRequest($this->request('POST', '/bucket/key?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $scratch = $this->base . '/part-copy-capacity';
+        self::assertTrue(mkdir($scratch, 0700));
+        $budget = new StorageTempBudgetCoordinator($scratch, 4, 0);
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $scratch,
+            'STANDARD',
+            4,
+            filesystemReserveBytes: 0,
+            tempBudget: $budget,
+        );
+        $providerRequestsBefore = count($this->providerRequests);
+
+        try {
+            try {
+                (new UploadPartCopyHandler(
+                    $this->metadata,
+                    $this->backend,
+                    awsObjectWriter: $writer,
+                    tempBudget: $budget,
+                ))->handleRequest($this->request(
+                    'PUT',
+                    '/bucket/key?partNumber=1&uploadId=' . $uploadId,
+                    headers: ['x-amz-copy-source' => '/bucket/source'],
+                ));
+                self::fail('Known part-copy bytes exceeded node temporary capacity.');
+            } catch (SlowDownException) {
+                self::assertCount($providerRequestsBefore, $this->providerRequests);
+                self::assertSame([], $this->metadata->getParts($uploadId));
+                self::assertSame(0, $budget->snapshot()->reservedBytes);
+            }
+        } finally {
+            $writer->shutdown();
+            $budget->close();
+        }
+    }
+
+    public function test_known_part_copy_accepts_the_exact_node_temp_limit(): void
+    {
+        $sourcePayload = 'copy-body';
+        $sourceAttempt = str_repeat('b', 32);
+        $sourceBucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($sourceBucket);
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'source',
+            'owner',
+            strlen($sourcePayload),
+            '"' . md5($sourcePayload) . '"',
+            'application/octet-stream',
+            \OpsFour\S3Server\Storage\AwsS3WriteAttemptPath::forObject(
+                'bucket',
+                'source',
+                $sourceBucket->generation,
+                'STANDARD',
+                $sourceAttempt,
+                '.opsfour/write-attempts',
+            ),
+        );
+        $created = (new CreateMultipartUploadHandler($this->metadata, storage: $this->backend))
+            ->handleRequest($this->request('POST', '/bucket/key?uploads'));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $scratch = $this->base . '/part-copy-exact-capacity';
+        self::assertTrue(mkdir($scratch, 0700));
+        $budget = new StorageTempBudgetCoordinator($scratch, strlen($sourcePayload), 0);
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $scratch,
+            'STANDARD',
+            strlen($sourcePayload),
+            filesystemReserveBytes: 0,
+            tempBudget: $budget,
+        );
+        $this->mock->append(new Response(200, [
+            'Content-Length' => (string) strlen($sourcePayload),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $sourceAttempt,
+        ], $sourcePayload));
+        $this->mock->append(new Response(200, ['ETag' => '"provider-part-copy"']));
+
+        try {
+            $response = (new UploadPartCopyHandler(
+                $this->metadata,
+                $this->backend,
+                awsObjectWriter: $writer,
+                tempBudget: $budget,
+            ))->handleRequest($this->request(
+                'PUT',
+                '/bucket/key?partNumber=1&uploadId=' . $uploadId,
+                headers: ['x-amz-copy-source' => '/bucket/source'],
+            ));
+
+            self::assertSame(200, $response->getStatus());
+            self::assertCount(1, $this->metadata->getParts($uploadId));
+            self::assertSame(['GET', 'PUT'], array_map(
+                static fn(RequestInterface $request): string => $request->getMethod(),
+                array_slice($this->providerRequests, -2),
+            ));
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+        } finally {
+            $writer->shutdown();
+            $budget->close();
+        }
+    }
+
     public function test_ranged_part_copy_requires_exact_aws_content_range(): void
     {
         $sourcePayload = str_repeat('r', 5 * 1024 * 1024 + 1);
@@ -409,6 +569,133 @@ final class AwsS3MultipartFenceTest extends TestCase
         self::assertSame(200, $response->getStatus());
         self::assertNotSame($plaintext, $this->providerBodies[1]);
         self::assertSame('AES256', $this->metadata->getObjectMetadata('bucket', 'key')?->userMetadata['__sse-algorithm'] ?? null);
+    }
+
+    public function test_sse_part_temp_capacity_failure_does_not_read_request_body(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $created = (new CreateMultipartUploadHandler(
+            $this->metadata,
+            $encryption,
+            storage: $this->backend,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->request(
+            'POST',
+            '/bucket/key?uploads',
+            headers: ['x-amz-server-side-encryption' => 'AES256'],
+        ));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $scratch = $this->base . '/capacity-scratch';
+        self::assertTrue(mkdir($scratch, 0700));
+        $budget = new StorageTempBudgetCoordinator($scratch, 4, 0);
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $scratch,
+            'STANDARD',
+            4,
+            filesystemReserveBytes: 0,
+            tempBudget: $budget,
+        );
+        $reads = 0;
+        $body = new ReadableIterableStream((static function () use (&$reads): iterable {
+            ++$reads;
+            yield 'payload!!';
+        })());
+        $request = new Request(
+            new AwsMultipartTestClient(),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/key?partNumber=1&uploadId=' . $uploadId),
+            ['content-length' => '9'],
+            $body,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+        $request->setAttribute('s3.operation', \OpsFour\S3Server\Routing\S3Operation::PutObject);
+
+        try {
+            try {
+                (new UploadPartHandler(
+                    $this->metadata,
+                    $this->backend,
+                    encryption: $encryption,
+                    awsObjectWriter: $writer,
+                    tempBudget: $budget,
+                ))->handleRequest($request);
+                self::fail('Insufficient temporary capacity accepted an encrypted multipart part.');
+            } catch (SlowDownException) {
+                self::assertSame(0, $reads);
+                self::assertSame(0, $budget->snapshot()->reservedBytes);
+            }
+        } finally {
+            $writer->shutdown();
+            $budget->close();
+        }
+    }
+
+    public function test_encrypted_completion_temp_capacity_failure_does_not_read_remote_parts(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $plaintext = 'encrypted completion';
+        $created = (new CreateMultipartUploadHandler(
+            $this->metadata,
+            $encryption,
+            storage: $this->backend,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->request(
+            'POST',
+            '/bucket/key?uploads',
+            headers: ['x-amz-server-side-encryption' => 'AES256'],
+        ));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
+        $this->mock->append(new Response(200, ['ETag' => '"provider-encrypted-part"']));
+        $part = (new UploadPartHandler(
+            $this->metadata,
+            $this->backend,
+            encryption: $encryption,
+            awsObjectWriter: $this->writer,
+        ))->handleRequest($this->request(
+            'PUT',
+            '/bucket/key?partNumber=1&uploadId=' . $uploadId,
+            $plaintext,
+            ['content-length' => (string) strlen($plaintext)],
+        ));
+        $etag = $part->getHeader('ETag') ?? throw new \RuntimeException('Part ETag missing.');
+        $scratch = $this->base . '/completion-capacity';
+        self::assertTrue(mkdir($scratch, 0700));
+        $budget = new StorageTempBudgetCoordinator($scratch, 4, 0);
+        $writer = $this->backend->createForegroundObjectWriter(
+            $this->metadata,
+            $scratch,
+            'STANDARD',
+            4,
+            filesystemReserveBytes: 0,
+            tempBudget: $budget,
+        );
+        $providerRequestsBefore = count($this->providerRequests);
+        $body = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . $etag . '</ETag></Part></CompleteMultipartUpload>';
+
+        try {
+            try {
+                (new CompleteMultipartUploadHandler(
+                    $this->metadata,
+                    $this->backend,
+                    encryption: $encryption,
+                    awsObjectWriter: $writer,
+                    tempBudget: $budget,
+                ))->handleRequest($this->request('POST', '/bucket/key?uploadId=' . $uploadId, $body));
+                self::fail('Known completion bytes exceeded node temporary capacity.');
+            } catch (SlowDownException) {
+                self::assertCount($providerRequestsBefore, $this->providerRequests);
+                self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+                self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+                self::assertSame(0, $budget->snapshot()->reservedBytes);
+            }
+        } finally {
+            $writer->shutdown();
+            $budget->close();
+        }
     }
 
     public function test_completion_commit_guard_failure_keeps_dispatch_evidence_without_visibility(): void

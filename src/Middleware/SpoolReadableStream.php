@@ -31,6 +31,9 @@ final class SpoolReadableStream implements \IteratorAggregate, ReadableStream
     public function __construct(
         private readonly WorkerPool $pool,
         private readonly string $path,
+        private readonly int $device,
+        private readonly int $inode,
+        private readonly int $owner,
     ) {}
 
     public function read(?Cancellation $cancellation = null): ?string
@@ -40,7 +43,15 @@ final class SpoolReadableStream implements \IteratorAggregate, ReadableStream
         }
 
         $chunk = $this->pool->submit(
-            new TemporaryFileTask('read', $this->path, offset: $this->offset, length: self::CHUNK_SIZE),
+            new TemporaryFileTask(
+                'read',
+                $this->path,
+                offset: $this->offset,
+                length: self::CHUNK_SIZE,
+                expectedDevice: $this->device,
+                expectedInode: $this->inode,
+                expectedOwner: $this->owner,
+            ),
             $cancellation,
         )->await($cancellation);
 

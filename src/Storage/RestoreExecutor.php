@@ -163,17 +163,16 @@ final class RestoreExecutor
             $sourceStream = null;
             $writeFailure = null;
             try {
-                $rawSource = $awsSource
-                    ? $this->awsFencedWriter?->readCommittedSource(
-                        $targetBucket,
-                        $object,
-                        $sourceBackend,
-                        $sourceTier,
-                        $sourceStoragePath,
-                    ) ?? throw new \LogicException('AWS source reader disappeared.')
-                    : $sourceBackend->getObjectByPath($sourceStoragePath);
                 $sourceStream = new TeeReadableStream(
-                    $rawSource,
+                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSource
+                        ? $this->awsFencedWriter?->readCommittedSource(
+                            $targetBucket,
+                            $object,
+                            $sourceBackend,
+                            $sourceTier,
+                            $sourceStoragePath,
+                        ) ?? throw new \LogicException('AWS source reader disappeared.')
+                        : $sourceBackend->getObjectByPath($sourceStoragePath)),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
                         hash_update($sourceMd5, $chunk);
@@ -185,6 +184,7 @@ final class RestoreExecutor
                         $awsReservation,
                         $object,
                         $sourceStream,
+                        $object->size,
                     ) ?? throw new \LogicException('AWS background writer disappeared.');
                 } elseif ($this->localFencedWriter !== null && $this->localFencedWriter->isFilesystemTarget($targetBackend)) {
                     $fencedTarget = true;
@@ -195,9 +195,13 @@ final class RestoreExecutor
                         $targetTierName,
                         $sourceStream,
                         'restore_copy',
+                        $object->size,
                     );
                 } else {
-                    $write = $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
+                    $knownSizeTarget = KnownSizeStorageCapabilities::storage($targetBackend);
+                    $write = $knownSizeTarget !== null
+                        ? $knownSizeTarget->putObjectKnownSize($object->bucket, $object->key, $sourceStream, $object->size)
+                        : $targetBackend->putObject($object->bucket, $object->key, $sourceStream);
                 }
             } catch (\Throwable $e) {
                 $writeFailure = $e;

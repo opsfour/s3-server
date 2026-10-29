@@ -55,6 +55,8 @@ use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\RecoverableMultipartPartBackend;
+use OpsFour\S3Server\Storage\KnownSizeRecoverableStorageBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
@@ -2810,6 +2812,57 @@ final class MultipartCompletionRetryTest extends TestCase
         )->getStatus());
     }
 
+    public function test_non_aws_encrypted_completion_rejects_temp_capacity_before_opening_parts(): void
+    {
+        $headers = ['x-amz-server-side-encryption' => 'AES256'];
+        $create = (new CreateMultipartUploadHandler($this->metadata, $this->encryption))
+            ->handleRequest($this->request('POST', '/bucket/retry.bin?uploads', '', $headers));
+        $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($create->getBody())))->UploadId;
+        $part = (new UploadPartHandler($this->metadata, $this->storage, encryption: $this->encryption))
+            ->handleRequest($this->request('PUT', '/bucket/retry.bin?partNumber=1&uploadId=' . $uploadId, 'payload'));
+        $etag = (string) $part->getHeader('ETag');
+        $completeBody = '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>'
+            . htmlspecialchars($etag, ENT_XML1) . '</ETag></Part></CompleteMultipartUpload>';
+
+        $tempDir = sys_get_temp_dir() . '/s3-completion-capacity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $budget = new StorageTempBudgetCoordinator($tempDir, 6, 0);
+        $storage = $this->createMock(NonAwsKnownSizeRecoverableAssemblyBackend::class);
+        $storage->method('planMultipartCompletionPaths')
+            ->willReturnCallback($this->storage->planMultipartCompletionPaths(...));
+        $storage->expects(self::never())->method('getObjectByPath');
+        $storage->expects(self::never())->method('putObjectAtPathKnownSize');
+
+        try {
+            $this->expectException(SlowDownException::class);
+            try {
+                (new CompleteMultipartUploadHandler(
+                    $this->metadata,
+                    $storage,
+                    $this->encryption,
+                    tempBudget: $budget,
+                ))->handleRequest($this->request(
+                    'POST',
+                    '/bucket/retry.bin?uploadId=' . $uploadId,
+                    $completeBody,
+                ));
+            } finally {
+                $snapshot = $budget->snapshot();
+                self::assertSame(0, $snapshot->reservedBytes);
+                self::assertSame(0, $snapshot->activeReservations);
+                self::assertNotNull($this->metadata->getMultipartUpload($uploadId));
+                self::assertCount(1, $this->metadata->getParts($uploadId));
+            }
+        } finally {
+            $budget->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_multipart_completion_enforces_expected_object_size_before_assembly(): void
     {
         $created = (new CreateMultipartUploadHandler($this->metadata))
@@ -3712,6 +3765,8 @@ final class MultipartCompletionRetryTest extends TestCase
         return $request;
     }
 }
+
+interface NonAwsKnownSizeRecoverableAssemblyBackend extends RecoverableMultipartAssemblyBackend, KnownSizeRecoverableStorageBackend {}
 
 final class MultipartRetryTestClient implements Client
 {

@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
+use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -18,7 +19,10 @@ use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -65,6 +69,36 @@ final class RestoreExecutorTest extends TestCase
         @unlink($this->path);
         @unlink($this->path . '-wal');
         @unlink($this->path . '-shm');
+    }
+
+    public function test_known_size_restore_rejects_temp_capacity_before_reading_source(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-restore-capacity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $budget = new StorageTempBudgetCoordinator($tempDir, 4, 0);
+        $target = new FlysystemBackend(new Filesystem(new InMemoryFlysystemAdapter()), $tempDir, $budget);
+        $source = $this->createMock(StorageBackend::class);
+        $source->expects(self::never())->method('getObjectByPath');
+        $this->metadata->putObjectMetadata('bucket', 'key', 'owner', 5, '"etag"', 'application/octet-stream', 'source-path');
+        $this->metadata->updateObjectPlacement('bucket', 'key', null, 'GLACIER', 'GLACIER', 'source-path');
+        $this->metadata->enqueueRestoreJob('bucket', 'key', null, 'GLACIER', 'source-path', 1);
+
+        try {
+            $stats = (new RestoreExecutor($this->metadata, new StorageTierRegistry([
+                new StorageTier('STANDARD', $target, defaultWriteTier: true),
+                new StorageTier('GLACIER', $source, restoreRequired: true),
+            ])))->processNext(1);
+            self::assertSame(1, $stats['retried']);
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+        } finally {
+            $target->shutdown();
+            $budget->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
     }
 
     public function test_same_object_snapshot_includes_part_layout_digest(): void

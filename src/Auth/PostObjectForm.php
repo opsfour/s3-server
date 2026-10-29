@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Auth;
 
 use Amp\ByteStream\ReadableStream;
+use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Middleware\SpoolReadableStream;
 use OpsFour\S3Server\Storage\FileReadableStream;
+
+use function Amp\Parallel\Worker\workerPool;
 
 /**
  * Parsed POST Object form data with the uploaded file spooled to disk.
@@ -31,6 +35,9 @@ final class PostObjectForm
         public readonly ?Credential $credential,
         public readonly ?array $policy,
         private readonly ?\Closure $onCleanup = null,
+        /** @var array{device:int,inode:int,owner:int}|null */
+        private readonly ?array $fileIdentity = null,
+        private readonly ?WorkerPool $workerPool = null,
     ) {}
 
     public function value(string $name): ?string
@@ -47,11 +54,14 @@ final class PostObjectForm
 
     public function openFile(): ReadableStream
     {
-        $stream = new EncryptedTempReadableStream(
-            new FileReadableStream(\Amp\File\openFile($this->filePath, 'r')),
-            $this->spoolKey,
-            $this->fileSize,
-        );
+        $ciphertext = $this->fileIdentity === null
+            ? new FileReadableStream(\Amp\File\openFile($this->filePath, 'r'))
+            : new SpoolReadableStream(
+                $this->workerPool ?? workerPool(),
+                $this->filePath,
+                ...$this->fileIdentity,
+            );
+        $stream = new EncryptedTempReadableStream($ciphertext, $this->spoolKey, $this->fileSize);
         $this->openStreams[] = $stream;
 
         return $stream;
@@ -74,7 +84,9 @@ final class PostObjectForm
                 }
             }
             $this->openStreams = [];
-            \Amp\File\deleteFile($this->filePath);
+            if ($this->onCleanup === null) {
+                \Amp\File\deleteFile($this->filePath);
+            }
         } catch (\Throwable) {
         } finally {
             ($this->onCleanup)?->__invoke();

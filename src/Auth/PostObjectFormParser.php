@@ -19,6 +19,7 @@ use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Http\ObjectKeyValidator;
 use OpsFour\S3Server\Exception\SignatureDoesNotMatchException;
 use OpsFour\S3Server\Http\Iso8601Timestamp;
+use OpsFour\S3Server\Storage\StorageTempFileLease;
 use OpsFour\S3Server\Xml\XmlRequestParser;
 
 /**
@@ -36,8 +37,6 @@ final class PostObjectFormParser
 
     private PostObjectSpoolCoordinator $spoolCoordinator;
 
-    private readonly bool $serverCoordinatorBindable;
-
     public function __construct(
         private readonly CredentialProvider $credentialProvider,
         private readonly string $region,
@@ -54,22 +53,20 @@ final class PostObjectFormParser
         if ($tempDir !== null && ($tempFileSweeper !== null || $spoolCoordinator !== null)) {
             throw new \InvalidArgumentException('Explicit browser POST temp directory cannot be mixed with injected spool components.');
         }
-        $this->spoolCoordinator = $spoolCoordinator ?? new PostObjectSpoolCoordinator($tempDir);
+        $this->spoolCoordinator = $spoolCoordinator ?? new PostObjectSpoolCoordinator(
+            $tempDir,
+            budgetBytes: $spoolBudgetBytes,
+        );
+        $this->spoolCoordinator->bindBudget($spoolBudgetBytes);
         $this->tempFileSweeper = $tempFileSweeper ?? new PostObjectTempFileSweeper(
             $this->spoolCoordinator->workerPool(),
             $this->spoolCoordinator->tempDir(),
         );
-        $this->serverCoordinatorBindable = $spoolCoordinator === null
-            && $tempFileSweeper === null
-            && $tempDir === null;
     }
 
-    /** @internal Bind default parser dependencies to the S3Server-owned worker pool before serving. */
+    /** @internal Bind parser dependencies to the S3Server-owned coordinator before serving. */
     public function bindServerSpoolCoordinator(PostObjectSpoolCoordinator $coordinator): void
     {
-        if (! $this->serverCoordinatorBindable) {
-            return;
-        }
         $this->spoolCoordinator = $coordinator;
         $this->tempFileSweeper = new PostObjectTempFileSweeper(
             $coordinator->workerPool(),
@@ -130,8 +127,10 @@ final class PostObjectFormParser
         $credential = null;
         $policy = null;
         $policyMaxFileSize = null;
+        $fileLease = null;
         $reservation = null;
         $spoolKey = null;
+        $fileIdentity = null;
         $activeField = null;
 
         try {
@@ -177,12 +176,28 @@ final class PostObjectFormParser
                     $seenFile = true;
                     $spoolKey = random_bytes(32);
                     $filePath = $this->createTempPath();
+                    $reservation = $this->spoolCoordinator->start($filePath);
                     $createdStat = @lstat($filePath);
                     if ($createdStat === false) {
                         throw new \RuntimeException('Browser POST temporary file disappeared before writing.');
                     }
-                    $reservation = $this->spoolCoordinator->start($filePath);
+                    $fileIdentity = [
+                        'device' => $createdStat['dev'],
+                        'inode' => $createdStat['ino'],
+                        'owner' => $createdStat['uid'],
+                    ];
+                    $reservedFileBytes = 0;
+                    $requestUpperBound = self::declaredRequestBodyLength($request);
+                    $knownFileUpperBound = $policyMaxFileSize === null
+                        ? $requestUpperBound
+                        : ($requestUpperBound === null ? $policyMaxFileSize : min($policyMaxFileSize, $requestUpperBound));
+                    if ($knownFileUpperBound !== null && $knownFileUpperBound > 0) {
+                        $reservedFileBytes = EncryptedTempFrames::worstCaseEncodedBytes($knownFileUpperBound);
+                        $this->spoolCoordinator->reserve($reservation, $reservedFileBytes, $this->spoolBudgetBytes);
+                    }
+                    $fileLease = StorageTempFileLease::acquireExisting($filePath);
                     $file = \Amp\File\openFile($filePath, 'c');
+                    $fileLease->assertPath($filePath);
                     // Amp's writable modes create a missing file. Detect a
                     // replacement before any upload bytes reach that handle.
                     clearstatcache(true, $filePath);
@@ -199,20 +214,46 @@ final class PostObjectFormParser
                     try {
                         $frameIndex = 0;
                         $fileBytes = 0;
+                        $pendingPlaintext = '';
+                        $writeFrame = function (string $plaintext) use (
+                            $spoolKey,
+                            &$frameIndex,
+                            &$fileBytes,
+                            &$reservedFileBytes,
+                            $reservation,
+                            $file,
+                        ): void {
+                            $frame = EncryptedTempFrames::encode($spoolKey, $frameIndex++, $plaintext);
+                            $frameBytes = strlen($frame);
+                            if ($frameBytes > PHP_INT_MAX - $fileBytes) {
+                                throw new \OverflowException('Browser POST temporary size overflowed.');
+                            }
+                            $nextFileBytes = $fileBytes + $frameBytes;
+                            if ($nextFileBytes > $reservedFileBytes) {
+                                $this->spoolCoordinator->reserve(
+                                    $reservation,
+                                    $nextFileBytes - $reservedFileBytes,
+                                    $this->spoolBudgetBytes,
+                                );
+                                $reservedFileBytes = $nextFileBytes;
+                            }
+                            $file->write($frame);
+                            $fileBytes = $nextFileBytes;
+                        };
                         while (($chunk = $field->read()) !== null) {
                             $chunkBytes = strlen($chunk);
                             $fileSize += $chunkBytes;
                             if ($policyMaxFileSize !== null && $fileSize > $policyMaxFileSize) {
                                 throw new EntityTooLargeException('Upload exceeds the policy maximum.');
                             }
-                            for ($offset = 0; $offset < $chunkBytes; $offset += EncryptedTempFrames::MAX_PLAINTEXT_BYTES) {
-                                $plaintext = substr($chunk, $offset, EncryptedTempFrames::MAX_PLAINTEXT_BYTES);
-                                $frame = EncryptedTempFrames::encode($spoolKey, $frameIndex++, $plaintext);
-                                $frameBytes = strlen($frame);
-                                $this->spoolCoordinator->reserve($reservation, $frameBytes, $this->spoolBudgetBytes);
-                                $file->write($frame);
-                                $fileBytes += $frameBytes;
+                            $pendingPlaintext .= $chunk;
+                            while (strlen($pendingPlaintext) >= EncryptedTempFrames::MAX_PLAINTEXT_BYTES) {
+                                $writeFrame(substr($pendingPlaintext, 0, EncryptedTempFrames::MAX_PLAINTEXT_BYTES));
+                                $pendingPlaintext = substr($pendingPlaintext, EncryptedTempFrames::MAX_PLAINTEXT_BYTES);
                             }
+                        }
+                        if ($pendingPlaintext !== '') {
+                            $writeFrame($pendingPlaintext);
                         }
                     } catch (\Amp\CancelledException $error) {
                         $writeCancellation = $error;
@@ -222,9 +263,18 @@ final class PostObjectFormParser
                             $writeCancellation,
                             $file->close(...),
                         );
+                        $fileLease->release();
+                        $fileLease = null;
                     }
                     clearstatcache(true, $filePath);
-                    if (@filesize($filePath) !== $fileBytes) {
+                    $completedStat = @lstat($filePath);
+                    if ($completedStat === false
+                        || ($completedStat['mode'] & 0o170000) !== 0o100000
+                        || ($completedStat['mode'] & 0o077) !== 0
+                        || $completedStat['dev'] !== $fileIdentity['device']
+                        || $completedStat['ino'] !== $fileIdentity['inode']
+                        || $completedStat['uid'] !== $fileIdentity['owner']
+                        || $completedStat['size'] !== $fileBytes) {
                         throw new \RuntimeException('Browser POST temporary file is incomplete.');
                     }
 
@@ -245,7 +295,7 @@ final class PostObjectFormParser
                 $activeField = null;
             }
 
-            if ($filePath === null || $filename === null || $key === null || $spoolKey === null) {
+            if ($filePath === null || $filename === null || $key === null || $spoolKey === null || $fileIdentity === null) {
                 throw new InvalidArgumentException('POST Object requires a file field.');
             }
 
@@ -258,11 +308,13 @@ final class PostObjectFormParser
                 spoolKey: $spoolKey,
                 credential: $credential,
                 policy: $policy,
-                onCleanup: function () use ($reservation, $filePath): void {
+                onCleanup: function () use ($reservation): void {
                     if ($reservation !== null) {
-                        $this->spoolCoordinator->release($reservation, !file_exists($filePath));
+                        $this->spoolCoordinator->cleanup($reservation);
                     }
                 },
+                fileIdentity: $fileIdentity,
+                workerPool: $this->spoolCoordinator->workerPool(),
             );
 
             $this->prepareRequestForAuthorizationAndWrite($request, $form);
@@ -274,17 +326,13 @@ final class PostObjectFormParser
                 static function () use ($activeField): void {
                     $activeField?->close();
                 },
-                static function () use ($filePath): void {
-                    try {
-                        if ($filePath !== null) {
-                            \Amp\File\deleteFile($filePath);
-                        }
-                    } catch (\Throwable) {
-                    }
+                static function () use (&$fileLease): void {
+                    $fileLease?->release();
+                    $fileLease = null;
                 },
-                function () use ($reservation, $filePath): void {
+                function () use ($reservation): void {
                     if ($reservation !== null) {
-                        $this->spoolCoordinator->release($reservation, $filePath === null || !file_exists($filePath));
+                        $this->spoolCoordinator->cleanup($reservation);
                     }
                 },
             );
@@ -636,22 +684,33 @@ final class PostObjectFormParser
     private function createTempPath(): string
     {
         $directory = $this->spoolCoordinator->tempDir();
-        $path = @tempnam($directory, 's3-post-' . bin2hex(random_bytes(16)) . '-');
-        if ($path === false) {
-            throw new \RuntimeException('Cannot create browser POST temporary file.');
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $path = $directory . DIRECTORY_SEPARATOR . 's3-post-' . bin2hex(random_bytes(24)) . '.tmp';
+            if (@lstat($path) === false) {
+                return $path;
+            }
         }
 
-        // Create the ciphertext spool privately before any bytes are
-        // accepted, even with umask 0.
-        clearstatcache(true, $path);
-        $permissions = @fileperms($path);
-        if (realpath(dirname($path)) !== realpath($directory)
-            || $permissions === false || ($permissions & 0077) !== 0) {
-            @unlink($path);
-            throw new \RuntimeException('Cannot create private browser POST temporary file.');
+        throw new \RuntimeException('Cannot allocate browser POST temporary path.');
+    }
+
+    private static function declaredRequestBodyLength(Request $request): ?int
+    {
+        $value = RequestHeaderValues::singleton($request, 'content-length');
+        if ($value === null) {
+            return null;
+        }
+        if ($value === '' || ! ctype_digit($value)) {
+            throw new InvalidArgumentException('Content-Length must be a non-negative decimal integer.');
+        }
+        $normalized = ltrim($value, '0');
+        $maximum = (string) PHP_INT_MAX;
+        if (strlen($normalized) > strlen($maximum)
+            || (strlen($normalized) === strlen($maximum) && strcmp($normalized, $maximum) > 0)) {
+            throw new InvalidArgumentException('Content-Length exceeds the local integer range.');
         }
 
-        return $directory . DIRECTORY_SEPARATOR . basename($path);
+        return (int) $value;
     }
 
     private static function safeFilename(StreamedField $field): string

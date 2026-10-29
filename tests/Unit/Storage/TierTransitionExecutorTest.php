@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
+use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Metadata\Schema\SchemaManager;
 use OpsFour\S3Server\Metadata\Schema\SqliteSchema;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -19,6 +20,9 @@ use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
+use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -66,6 +70,36 @@ final class TierTransitionExecutorTest extends TestCase
         @unlink($this->path);
         @unlink($this->path . '-wal');
         @unlink($this->path . '-shm');
+    }
+
+    public function test_known_size_transition_rejects_temp_capacity_before_reading_source(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-transition-capacity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $budget = new StorageTempBudgetCoordinator($tempDir, 4, 0);
+        $target = new FlysystemBackend(new Filesystem(new InMemoryFlysystemAdapter()), $tempDir, $budget);
+        $source = $this->createMock(StorageBackend::class);
+        $source->expects(self::never())->method('getObjectByPath');
+        $this->metadata->putObjectMetadata('bucket', 'key', 'owner', 5, '"etag"', 'application/octet-stream', 'source-path');
+        $this->metadata->updateObjectPlacement('bucket', 'key', null, 'STANDARD', 'STANDARD', 'source-path');
+        $this->metadata->enqueueTierTransitionJob('bucket', 'key', null, 'STANDARD', 'GLACIER', 'GLACIER', 'source-path');
+
+        try {
+            $stats = (new TierTransitionExecutor($this->metadata, new StorageTierRegistry([
+                new StorageTier('STANDARD', $source, defaultWriteTier: true),
+                new StorageTier('GLACIER', $target, restoreRequired: true),
+            ])))->processNext(1);
+            self::assertSame(1, $stats['retried']);
+            self::assertSame(0, $budget->snapshot()->reservedBytes);
+        } finally {
+            $target->shutdown();
+            $budget->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
     }
 
     public function test_same_object_snapshot_includes_part_layout_digest(): void
@@ -157,7 +191,7 @@ final class TierTransitionExecutorTest extends TestCase
         $source = new ReadableBuffer('abc');
         $retainedStream = null;
         $hot = $this->createMock(StorageBackend::class);
-        $hot->expects(self::once())->method('getObjectByPath')->willReturn($source);
+        $hot->expects(self::never())->method('getObjectByPath');
         $archive = $this->createMock(StorageBackend::class);
         $archive->expects(self::once())->method('putObject')->willReturnCallback(
             static function (string $bucket, string $key, ReadableStream $body) use (&$retainedStream): never {
@@ -175,7 +209,7 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertSame(['processed' => 1, 'completed' => 0, 'retried' => 0, 'deadLetter' => 1], $executor->processNext(1));
         self::assertInstanceOf(ReadableStream::class, $retainedStream);
         self::assertTrue($retainedStream->isClosed());
-        self::assertTrue($source->isClosed());
+        self::assertFalse($source->isClosed());
     }
 
     public function test_encrypted_source_size_mismatch_does_not_publish_tier_copy(): void
@@ -209,12 +243,16 @@ final class TierTransitionExecutorTest extends TestCase
     public function test_early_write_error_keeps_its_exception_when_source_close_also_fails(): void
     {
         $source = $this->createMock(ReadableStream::class);
+        $source->expects(self::once())->method('read')->willReturn('abc');
         $source->expects(self::once())->method('close')->willThrowException(new \LogicException('close failed'));
         $hot = $this->createMock(StorageBackend::class);
         $hot->expects(self::once())->method('getObjectByPath')->willReturn($source);
         $archive = $this->createMock(StorageBackend::class);
         $archive->expects(self::once())->method('putObject')
-            ->willThrowException(new \UnexpectedValueException('target write failed'));
+            ->willReturnCallback(static function (string $bucket, string $key, ReadableStream $body): never {
+                $body->read();
+                throw new \UnexpectedValueException('target write failed');
+            });
         $this->metadata->putObjectMetadata('bucket', 'archive.bin', 'owner', 3, '"' . md5('abc') . '"', 'application/octet-stream', 'source-path');
         $this->metadata->enqueueTierTransitionJob('bucket', 'archive.bin', null, 'STANDARD', 'GLACIER', 'GLACIER', 'source-path', maxAttempts: 1);
         $logger = new class extends AbstractLogger {

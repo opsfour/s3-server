@@ -82,10 +82,11 @@ final readonly class AwsS3FencedBackgroundObjectWriter
         AwsS3ForegroundObjectReservation $reservation,
         ObjectInfo $object,
         ReadableStream $body,
+        ?int $knownSize = null,
     ): array {
         $stage = null;
         try {
-            $stage = $this->writer->stage($reservation, $this->writer->renewingStream($reservation, $body));
+            $stage = $this->writer->stage($reservation, $this->writer->renewingStream($reservation, $body), $knownSize);
             $outcome = $this->writer->dispatch($reservation, $object->key, $stage);
 
             return [$outcome->result, $outcome->dispatch];

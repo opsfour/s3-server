@@ -350,6 +350,8 @@ final readonly class AwsS3ForegroundObjectWriter
     public function stage(
         AwsS3ForegroundObjectReservation $reservation,
         ReadableStream $body,
+        ?int $knownSize = null,
+        ?StorageTempReservation $capacity = null,
     ): AwsS3ForegroundObjectStage {
         $current = $reservation->current($this->authority);
         $scratch = $this->stager->stage(
@@ -360,6 +362,8 @@ final readonly class AwsS3ForegroundObjectWriter
                 $this->heartbeat($reservation);
             },
             heartbeatIntervalSeconds: $this->renewIntervalSeconds,
+            knownSize: $knownSize,
+            capacity: $capacity,
         );
         $checksums = $scratch->checksums;
         if ($checksums === null || $checksums->size !== $scratch->size) {

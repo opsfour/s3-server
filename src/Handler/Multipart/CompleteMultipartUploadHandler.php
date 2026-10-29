@@ -40,9 +40,12 @@ use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\ObjectLock\ObjectLockConfigurationSnapshot;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\KnownSizeStorageCapabilities;
 use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Xml\XmlRequestParser;
@@ -72,6 +75,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         private readonly bool $requireLocalFencedCompletion = false,
         private readonly ?string $localFencedCompletionTier = null,
         private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         if (! is_finite($this->intentLeaseSeconds) || ! is_finite($this->intentRenewalSeconds)
             || $this->intentLeaseSeconds <= 0.0 || $this->intentRenewalSeconds <= 0.0
@@ -1099,6 +1103,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         if ($mode === null || $this->encryption === null || $this->awsObjectWriter === null) {
             throw new InternalErrorException('Encrypted AWS multipart completion is unavailable.');
         }
+        $completionCapacity = $this->tempBudget?->reserveCapacity($expectedSize, 'complete_multipart');
         $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
         $stage = null;
         $dispatch = null;
@@ -1193,7 +1198,12 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             if (strlen($ciphertext) !== $expectedSize) {
                 throw new InternalErrorException('Encrypted AWS multipart final payload size is invalid.');
             }
-            $stage = $this->awsObjectWriter->stage($reservation, new \Amp\ByteStream\ReadableBuffer($ciphertext));
+            $stage = $this->awsObjectWriter->stage(
+                $reservation,
+                new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                strlen($ciphertext),
+                $completionCapacity,
+            );
             if ($stage->result->size !== strlen($ciphertext)
                 || ! hash_equals(md5($ciphertext), strtolower($stage->result->md5Hex))) {
                 throw new InternalErrorException('Encrypted AWS multipart stage does not match its ciphertext.');
@@ -1219,7 +1229,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             }
             throw $error;
         } finally {
-            $lock->release();
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                null,
+                $lock->release(...),
+                function () use ($completionCapacity): void {
+                    $this->releaseUnusedCapacity($completionCapacity);
+                },
+            );
         }
     }
 
@@ -1244,6 +1260,10 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         if ($mode === null || $this->encryption === null) {
             throw new InternalErrorException('Encrypted multipart completion is unavailable.');
         }
+        $knownSizeStorage = KnownSizeStorageCapabilities::recoverable($storage);
+        $completionCapacity = $knownSizeStorage !== null && $this->tempBudget !== null
+            ? $this->tempBudget->reserveCapacity($expectedSize, 'complete_multipart')
+            : null;
         $lock = \OpsFour\S3Server\Runtime\BufferedWorkLimiter::acquire();
         $completionCancellation = null;
         try {
@@ -1316,12 +1336,17 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             if (strlen($ciphertext) !== $expectedSize) {
                 throw new InternalErrorException('Encrypted multipart final payload size is invalid.');
             }
-            $physical = $storage->putObjectAtPath(
-                $bucket,
-                $key,
-                new \Amp\ByteStream\ReadableBuffer($ciphertext),
-                $finalPath,
-            );
+            $ciphertextBody = new \Amp\ByteStream\ReadableBuffer($ciphertext);
+            $physical = $knownSizeStorage !== null
+                ? $knownSizeStorage->putObjectAtPathKnownSize(
+                    $bucket,
+                    $key,
+                    $ciphertextBody,
+                    $finalPath,
+                    strlen($ciphertext),
+                    $completionCapacity,
+                )
+                : $storage->putObjectAtPath($bucket, $key, $ciphertextBody, $finalPath);
             if ($physical->path !== $finalPath || $physical->size !== strlen($ciphertext)
                 || ! hash_equals(md5($ciphertext), strtolower($physical->md5Hex))) {
                 throw new InternalErrorException('Encrypted multipart final write does not match its planned payload.');
@@ -1335,6 +1360,9 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
                 $completionCancellation,
                 $lock->release(...),
+                function () use ($completionCapacity): void {
+                    $this->releaseUnusedCapacity($completionCapacity);
+                },
             );
         }
     }
@@ -1677,6 +1705,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             throw new \OpsFour\S3Server\Exception\AccessDeniedException(
                 'Public ACLs are blocked by the bucket Public Access Block configuration.',
             );
+        }
+    }
+
+    private function releaseUnusedCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget?->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
         }
     }
 

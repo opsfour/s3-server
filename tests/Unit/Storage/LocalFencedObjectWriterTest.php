@@ -571,11 +571,11 @@ final class LocalFencedObjectWriterTest extends TestCase
 
     public function test_budget_reservations_cover_all_chunks_without_exceeding_limit(): void
     {
-        $writer = $this->writer(5);
+        $writer = $this->writer(10);
         $first = $this->intent();
         $second = $this->intent();
         try {
-            $success = $writer->publish($first, 'key', new ReadableIterableStream(['ab', 'cd', 'e']));
+            $success = $writer->publish($first, 'key', new ReadableIterableStream(['ab', 'cd', 'e']), knownSize: 5);
             self::assertSame(LocalObjectWriteOutcome::COMPLETED, $success->state, $success->error?->getMessage() ?? '');
             self::assertSame('abcde', file_get_contents($first->storagePath));
             $deadline = microtime(true) + 5.0;
@@ -584,8 +584,11 @@ final class LocalFencedObjectWriterTest extends TestCase
             }
             self::assertSame([], glob($this->scratch . '/s3fw-put-*'));
 
-            $denied = $writer->publish($second, 'key', new ReadableIterableStream(['ab', 'cd', 'ef']));
+            $body = $this->createMock(\Amp\ByteStream\ReadableStream::class);
+            $body->expects(self::never())->method('read');
+            $denied = $writer->publish($second, 'key', $body, knownSize: 6);
             self::assertSame(LocalObjectWriteOutcome::BEFORE_DISPATCH, $denied->state);
+            self::assertNotNull($denied->error);
             self::assertFileDoesNotExist($second->storagePath);
         } finally {
             $writer->shutdown();

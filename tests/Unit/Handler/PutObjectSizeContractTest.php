@@ -6,17 +6,26 @@ namespace OpsFour\S3Server\Tests\Unit\Handler;
 
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
+use Amp\ByteStream\ReadableIterableStream;
+use League\Flysystem\Filesystem;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\PreconditionFailedException;
+use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Multipart\MultipartPartSize;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Storage\InMemoryBackend;
+use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Observability\ObservedStorageBackend;
+use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -132,6 +141,56 @@ final class PutObjectSizeContractTest extends TestCase
             ]));
         } finally {
             self::assertSame($etag, $this->metadata->getObjectMetadata('bucket', 'key')?->etag);
+        }
+    }
+
+    public function test_sse_temp_capacity_failure_does_not_read_request_body(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-put-capacity-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $budget = new StorageTempBudgetCoordinator($tempDir, 4, 0);
+        $storage = new ObservedStorageBackend(
+            new FlysystemBackend(new Filesystem(new InMemoryFlysystemAdapter()), $tempDir, $budget),
+            new MetricsCollector(),
+            'flysystem',
+        );
+        $reads = 0;
+        $body = new ReadableIterableStream((static function () use (&$reads): iterable {
+            $reads++;
+            yield 'payload!!';
+        })());
+        $request = new Request(
+            $this->createMock(Client::class),
+            'PUT',
+            Http::new('http://localhost/bucket/key'),
+            ['content-length' => '9', 'x-amz-server-side-encryption' => 'AES256'],
+            $body,
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('s3.operation', S3Operation::PutObject);
+        $request->setAttribute('ownerId', 'owner');
+
+        try {
+            $this->expectException(SlowDownException::class);
+            try {
+                (new PutObjectHandler(
+                    $this->metadata,
+                    $storage,
+                    $this->createMock(EncryptionServiceInterface::class),
+                    tempBudget: $budget,
+                ))->handleRequest($request);
+            } finally {
+                self::assertSame(0, $reads);
+                self::assertSame(0, $budget->snapshot()->reservedBytes);
+            }
+        } finally {
+            $budget->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
         }
     }
 

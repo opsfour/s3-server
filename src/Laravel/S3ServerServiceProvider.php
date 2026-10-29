@@ -38,6 +38,10 @@ class S3ServerServiceProvider extends ServiceProvider
 
         $this->app->singleton(S3ServerConfig::class, function ($app) {
             $config = $app['config']['s3-server'];
+            $postSpoolBudget = $config['post_spool_budget'] ?? null;
+            $storageTempBudget = array_key_exists('temp_budget_bytes', $config['storage'] ?? [])
+                ? $config['storage']['temp_budget_bytes']
+                : null;
 
             return new S3ServerConfig(
                 host: $config['host'] ?? '0.0.0.0',
@@ -58,7 +62,10 @@ class S3ServerServiceProvider extends ServiceProvider
                 maxConcurrentConnections: $config['max_connections'] ?? 10000,
                 connectionIdleTimeout: $config['connection_idle_timeout'] ?? 60,
                 requestBodySizeLimit: $config['body_size_limit'] ?? 5_368_709_120,
-                postSpoolBudgetBytes: $config['post_spool_budget'] ?? 10_737_418_240,
+                postSpoolBudgetBytes: $postSpoolBudget,
+                storageTempDir: $config['storage']['temp_dir'] ?? sys_get_temp_dir() . '/opsfour-s3-server-temp',
+                storageTempBudgetBytes: $storageTempBudget,
+                storageTempReserveBytes: $config['storage']['temp_reserve_bytes'] ?? 1_073_741_824,
                 localWriteWorkerTimeoutSeconds: $config['local_write_worker_timeout_seconds'] ?? 300.0,
                 readTimeout: $config['read_timeout'] ?? 300,
                 writeTimeout: $config['write_timeout'] ?? 300,

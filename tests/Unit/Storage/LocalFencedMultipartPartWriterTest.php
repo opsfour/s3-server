@@ -51,8 +51,15 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         $backend = new FilesystemBackend($root);
         $writer = new LocalFencedMultipartPartWriter($root, $scratch, 'STANDARD', $metadata);
         try {
-            $outcome = $writer->publish('bucket', $bucket->generation, $uploadId, 1, new ReadableBuffer('part-body'));
-            self::assertSame(LocalMultipartPartWriteOutcome::COMPLETED, $outcome->state);
+            $outcome = $writer->publish(
+                'bucket',
+                $bucket->generation,
+                $uploadId,
+                1,
+                new ReadableBuffer('part-body'),
+                knownPhysicalSize: 9,
+            );
+            self::assertSame(LocalMultipartPartWriteOutcome::COMPLETED, $outcome->state, $outcome->error?->getMessage() ?? '');
             self::assertNotNull($outcome->dispatchId);
             self::assertNull($outcome->error);
             self::assertNotNull($outcome->result);
@@ -107,6 +114,42 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         }
     }
 
+    public function test_known_size_reserves_scratch_and_publish_capacity_before_reading(): void
+    {
+        $directory = sys_get_temp_dir() . '/s3-part-capacity-' . bin2hex(random_bytes(8));
+        $root = $directory . '/storage';
+        $scratch = $directory . '/scratch';
+        self::assertTrue(mkdir($directory, 0700));
+        self::assertTrue(mkdir($root, 0700));
+        self::assertTrue(mkdir($scratch, 0700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $bucket = $metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $writer = new LocalFencedMultipartPartWriter($root, $scratch, 'STANDARD', $metadata, budgetBytes: 10);
+        $body = $this->createMock(\Amp\ByteStream\ReadableStream::class);
+        $body->expects(self::never())->method('read');
+
+        try {
+            $outcome = $writer->publish(
+                'bucket',
+                $bucket->generation,
+                bin2hex(random_bytes(16)),
+                1,
+                $body,
+                knownPhysicalSize: 6,
+            );
+            self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $outcome->state);
+            self::assertNotNull($outcome->error);
+            self::assertStringContainsString('Storage staging budget is full', $outcome->error->getMessage());
+            self::assertFileDoesNotExist($outcome->path);
+        } finally {
+            $writer->shutdown();
+            $this->removeDirectory($directory);
+        }
+    }
+
     public function test_logical_validation_rejects_before_sql_arm_and_releases_scratch_budget(): void
     {
         $directory = sys_get_temp_dir() . '/s3-part-worker-' . bin2hex(random_bytes(8));
@@ -124,7 +167,7 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
         self::assertNotNull($bucket);
         $uploadId = bin2hex(random_bytes(16));
         $metadata->createMultipartUpload($uploadId, 'bucket', 'key', 'owner');
-        $writer = new LocalFencedMultipartPartWriter($root, $scratch, 'STANDARD', $metadata, budgetBytes: 9);
+        $writer = new LocalFencedMultipartPartWriter($root, $scratch, 'STANDARD', $metadata, budgetBytes: 16);
         try {
             $seen = false;
             $rejected = $writer->publish(
@@ -173,7 +216,11 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
             self::assertSame(0, (int) $query->fetchColumn());
 
             $accepted = $writer->publish('bucket', $bucket->generation, $uploadId, 1, new ReadableBuffer('accepted'));
-            self::assertSame(LocalMultipartPartWriteOutcome::COMPLETED, $accepted->state);
+            self::assertSame(
+                LocalMultipartPartWriteOutcome::COMPLETED,
+                $accepted->state,
+                $accepted->error?->getMessage() ?? 'worker did not complete',
+            );
             self::assertSame('accepted', file_get_contents($accepted->path));
         } finally {
             $writer->shutdown();
@@ -274,9 +321,9 @@ final class LocalFencedMultipartPartWriterTest extends TestCase
             self::assertSame(0, (int) $query->fetchColumn());
 
             $later = $writer->publish('bucket', $generation, $uploadId, 1, new ReadableBuffer('later'));
-            self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $later->state);
-            self::assertInstanceOf(\RuntimeException::class, $later->error);
-            self::assertSame('Storage staging reservation is corrupt.', $later->error->getMessage());
+            self::assertSame(LocalMultipartPartWriteOutcome::BEFORE_DISPATCH, $later->state, $later->error?->getMessage() ?? '');
+            self::assertInstanceOf(SlowDownException::class, $later->error);
+            self::assertStringContainsString('requires operator attention', $later->error->getMessage());
             self::assertFileDoesNotExist($later->path);
         } finally {
             $writer->shutdown();

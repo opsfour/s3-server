@@ -41,6 +41,7 @@ use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3ProviderWorkerProbe;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
@@ -242,7 +243,14 @@ final readonly class S3ServerRuntimeFactory
                     $metadata,
                     $this->awsObjectScratchPath(),
                     $awsTier->name,
+                    budgetBytes: $config->storageTempBudgetBytes,
                     metrics: $metrics,
+                    filesystemReserveBytes: $config->storageTempReserveBytes,
+                    tempBudget: new StorageTempBudgetCoordinator(
+                        $config->storageTempDir,
+                        $config->storageTempBudgetBytes,
+                        $config->storageTempReserveBytes,
+                    ),
                 );
                 $server->setAwsObjectWriteIntentCollector($awsStorage->createObjectWriteIntentCollector(
                     $metadata,
@@ -292,6 +300,7 @@ final readonly class S3ServerRuntimeFactory
                 localLeaseFactory: $localLeaseFactory,
                 localPartWriter: $localPartWriter,
                 awsObjectWriter: $awsObjectWriter,
+                tempBudget: $server->storageTempBudgetCoordinator(),
             );
 
             if ($config->clusterEnabled()) {
@@ -445,14 +454,22 @@ final readonly class S3ServerRuntimeFactory
         $renewer = null;
         $writer = null;
         $partWriter = null;
+        $tempBudget = new StorageTempBudgetCoordinator(
+            $config->storageTempDir,
+            $config->storageTempBudgetBytes,
+            $config->storageTempReserveBytes,
+        );
         try {
             $writer = new LocalFencedObjectWriter(
                 $backend->getBasePath(),
                 $scratch,
                 $tiers->defaultTier()->name,
+                budgetBytes: $config->storageTempBudgetBytes,
                 workerIo: $faultProfile && getenv('S3_LOCAL_OBJECT_TEST_PAUSE_BEFORE_LINK') === '1'
                     ? new LocalObjectTestPublishPauseIo($scratch)
                     : null,
+                filesystemReserveBytes: $config->storageTempReserveBytes,
+                tempBudget: $tempBudget,
                 workerTimeoutSeconds: $config->localWriteWorkerTimeoutSeconds,
             );
             $partWriter = new LocalFencedMultipartPartWriter(
@@ -460,6 +477,9 @@ final readonly class S3ServerRuntimeFactory
                 $scratch,
                 $tiers->defaultTier()->name,
                 $metadata,
+                budgetBytes: $config->storageTempBudgetBytes,
+                filesystemReserveBytes: $config->storageTempReserveBytes,
+                tempBudget: $tempBudget,
                 workerTimeoutSeconds: $config->localWriteWorkerTimeoutSeconds,
             );
 

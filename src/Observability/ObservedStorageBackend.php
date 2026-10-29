@@ -8,13 +8,15 @@ use Amp\ByteStream\ReadableStream;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\BoundedCopyStorageBackend;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
+use OpsFour\S3Server\Storage\KnownSizeRecoverableStorageBackend;
+use OpsFour\S3Server\Storage\KnownSizeStorageBackend;
 use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\RecoverableMultipartPartBackend;
 use OpsFour\S3Server\Storage\RecoverableObjectWriteBackend;
 use OpsFour\S3Server\Storage\ShutdownAwareStorageBackend;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 
-readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
+readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend, KnownSizeStorageBackend, KnownSizeRecoverableStorageBackend
 {
     public function __construct(
         private StorageBackend $inner,
@@ -26,6 +28,15 @@ readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, Re
     public function putObject(string $bucket, string $key, ReadableStream $body): StorageWriteResult
     {
         return $this->observe('putObject', fn() => $this->inner->putObject($bucket, $key, $body));
+    }
+
+    public function putObjectKnownSize(string $bucket, string $key, ReadableStream $body, int $knownSize, ?\OpsFour\S3Server\Storage\StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->observe('putObject', fn() => $this->inner instanceof KnownSizeStorageBackend
+            ? $this->inner->putObjectKnownSize($bucket, $key, $body, $knownSize, $capacity)
+            : ($capacity === null
+                ? $this->inner->putObject($bucket, $key, $body)
+                : throw new \LogicException('Observed storage backend cannot consume pre-reserved capacity.')));
     }
 
     public function getObjectByPath(string $storagePath, ?int $offset = null, ?int $length = null): ReadableStream
@@ -58,6 +69,15 @@ readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, Re
         return $this->observe('putPart', fn() => $this->inner->putPart($bucket, $key, $uploadId, $partNumber, $data));
     }
 
+    public function putPartKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, int $knownSize, ?\OpsFour\S3Server\Storage\StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->observe('putPart', fn() => $this->inner instanceof KnownSizeStorageBackend
+            ? $this->inner->putPartKnownSize($bucket, $key, $uploadId, $partNumber, $data, $knownSize, $capacity)
+            : ($capacity === null
+                ? $this->inner->putPart($bucket, $key, $uploadId, $partNumber, $data)
+                : throw new \LogicException('Observed storage backend cannot consume pre-reserved capacity.')));
+    }
+
     public function planMultipartPartPath(string $bucket, string $bucketGeneration, string $uploadId, int $partNumber, string $attemptId): string
     {
         return $this->partWriteInner()->planMultipartPartPath($bucket, $bucketGeneration, $uploadId, $partNumber, $attemptId);
@@ -66,6 +86,15 @@ readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, Re
     public function putPartAtPath(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $path): StorageWriteResult
     {
         return $this->observe('putPartAtPath', fn() => $this->partWriteInner()->putPartAtPath($bucket, $key, $uploadId, $partNumber, $data, $path));
+    }
+
+    public function putPartAtPathKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $path, int $knownSize, ?\OpsFour\S3Server\Storage\StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->observe('putPartAtPath', fn() => $this->inner instanceof KnownSizeRecoverableStorageBackend
+            ? $this->inner->putPartAtPathKnownSize($bucket, $key, $uploadId, $partNumber, $data, $path, $knownSize, $capacity)
+            : ($capacity === null
+                ? $this->partWriteInner()->putPartAtPath($bucket, $key, $uploadId, $partNumber, $data, $path)
+                : throw new \LogicException('Observed storage backend cannot consume pre-reserved capacity.')));
     }
 
     private function partWriteInner(): RecoverableMultipartPartBackend
@@ -101,6 +130,16 @@ readonly class ObservedStorageBackend implements ShutdownAwareStorageBackend, Re
     {
         return $this->observe('putObjectAtPath', fn() => ($this->inner instanceof RecoverableObjectWriteBackend
             ? $this->inner : $this->recoverableInner())->putObjectAtPath($bucket, $key, $body, $path));
+    }
+
+    public function putObjectAtPathKnownSize(string $bucket, string $key, ReadableStream $body, string $path, int $knownSize, ?\OpsFour\S3Server\Storage\StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->observe('putObjectAtPath', fn() => $this->inner instanceof KnownSizeRecoverableStorageBackend
+            ? $this->inner->putObjectAtPathKnownSize($bucket, $key, $body, $path, $knownSize, $capacity)
+            : ($capacity === null
+                ? ($this->inner instanceof RecoverableObjectWriteBackend
+                    ? $this->inner : $this->recoverableInner())->putObjectAtPath($bucket, $key, $body, $path)
+                : throw new \LogicException('Observed storage backend cannot consume pre-reserved capacity.')));
     }
 
     private function objectWriteInner(): RecoverableObjectWriteBackend

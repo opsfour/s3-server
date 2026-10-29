@@ -45,8 +45,9 @@ final class ServeCommand extends Command
             ->addOption('storage-path', null, InputOption::VALUE_REQUIRED, 'Root directory for object storage', self::envOption('S3_STORAGE_PATH'))
             ->addOption('storage-driver', null, InputOption::VALUE_REQUIRED, 'Storage backend: filesystem|flysystem|aws-s3|memory', self::envOption('S3_STORAGE_DRIVER', 'filesystem'))
             ->addOption('allow-unfenced-storage-for-tests', null, InputOption::VALUE_REQUIRED, 'UNSAFE TEST ONLY: allow storage without a verified late-write fence (true|false)', self::envOption('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', 'false'))
-            ->addOption('storage-temp-dir', null, InputOption::VALUE_REQUIRED, 'Local staging directory for remote storage transfers', self::envOption('S3_STORAGE_TEMP_DIR', sys_get_temp_dir()))
-            ->addOption('storage-temp-budget', null, InputOption::VALUE_REQUIRED, 'Shared local Flysystem staging budget in bytes', self::envOption('S3_STORAGE_TEMP_BUDGET', '10737418240'))
+            ->addOption('storage-temp-dir', null, InputOption::VALUE_REQUIRED, 'Canonical node-local directory for every temporary consumer', self::envOption('S3_STORAGE_TEMP_DIR', sys_get_temp_dir() . '/opsfour-s3-server-temp'))
+            ->addOption('storage-temp-budget', null, InputOption::VALUE_REQUIRED, 'Aggregate node-local temporary budget in bytes', self::envOption('S3_STORAGE_TEMP_BUDGET', self::envOption('S3_POST_SPOOL_BUDGET', '10737418240')))
+            ->addOption('storage-temp-reserve', null, InputOption::VALUE_REQUIRED, 'Physical filesystem safety reserve in bytes', self::envOption('S3_STORAGE_TEMP_RESERVE', '1073741824'))
             ->addOption('flysystem-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for remote Flysystem operations', self::envOption('S3_FLYSYSTEM_WORKERS', '0'))
             ->addOption('flysystem-first-byte-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to wait for the first remote read byte', self::envOption('S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS', '20'))
             ->addOption('backing-bucket', null, InputOption::VALUE_REQUIRED, 'Backing S3 bucket for standalone Flysystem mode', self::envOption('S3_BACKING_BUCKET'))
@@ -84,7 +85,7 @@ final class ServeCommand extends Command
             ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum concurrent connections', self::envOption('S3_MAX_CONNECTIONS', '10000'))
             ->addOption('connection-idle-timeout', null, InputOption::VALUE_REQUIRED, 'HTTP/2 idle connection timeout in seconds; HTTP/1 uses the stream timeout', self::envOption('S3_CONNECTION_IDLE_TIMEOUT', '60'))
             ->addOption('body-size-limit', null, InputOption::VALUE_REQUIRED, 'Maximum request body size in bytes', self::envOption('S3_BODY_SIZE_LIMIT', '5368709120'))
-            ->addOption('post-spool-budget', null, InputOption::VALUE_REQUIRED, 'Concurrent browser POST temporary bytes shared by processes using one local temp directory', self::envOption('S3_POST_SPOOL_BUDGET', '10737418240'))
+            ->addOption('post-spool-budget', null, InputOption::VALUE_REQUIRED, 'Deprecated alias for --storage-temp-budget; alone it supplies the value, and when both are set they must match', self::envOption('S3_POST_SPOOL_BUDGET'))
             ->addOption('local-write-worker-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to await a dispatched local object write worker', self::envOption('S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS', '300'))
             ->addOption('read-timeout', null, InputOption::VALUE_REQUIRED, 'Request stream inactivity timeout in seconds', self::envOption('S3_READ_TIMEOUT', '300'))
             ->addOption('write-timeout', null, InputOption::VALUE_REQUIRED, 'Response stream inactivity timeout in seconds', self::envOption('S3_WRITE_TIMEOUT', '300'))
@@ -290,6 +291,11 @@ final class ServeCommand extends Command
             );
         }
 
+        $postSpoolBudget = $input->getOption('post-spool-budget') === null
+            ? null
+            : $this->integerOption($input, 'post-spool-budget');
+        $storageTempBudget = $this->resolvedStorageTempBudget($input, $postSpoolBudget);
+
         return new S3ServerConfig(
             host: (string) $input->getOption('host'),
             port: $this->integerOption($input, 'port'),
@@ -309,7 +315,10 @@ final class ServeCommand extends Command
             maxConcurrentConnections: $this->integerOption($input, 'max-connections'),
             connectionIdleTimeout: $this->integerOption($input, 'connection-idle-timeout'),
             requestBodySizeLimit: $this->integerOption($input, 'body-size-limit'),
-            postSpoolBudgetBytes: $this->integerOption($input, 'post-spool-budget'),
+            postSpoolBudgetBytes: $postSpoolBudget,
+            storageTempDir: (string) $input->getOption('storage-temp-dir'),
+            storageTempBudgetBytes: $storageTempBudget,
+            storageTempReserveBytes: $this->integerOption($input, 'storage-temp-reserve'),
             localWriteWorkerTimeoutSeconds: $this->floatOption($input, 'local-write-worker-timeout'),
             readTimeout: $this->integerOption($input, 'read-timeout'),
             writeTimeout: $this->integerOption($input, 'write-timeout'),
@@ -390,6 +399,9 @@ final class ServeCommand extends Command
         $storageConfig = [
             'driver' => $storageDriver,
             'path' => $storagePath,
+            'temp_dir' => (string) $input->getOption('storage-temp-dir'),
+            'temp_budget_bytes' => $this->resolvedStorageTempBudget($input),
+            'temp_reserve_bytes' => $this->integerOption($input, 'storage-temp-reserve'),
         ];
 
         if ($storageDriver === 'flysystem') {
@@ -420,7 +432,6 @@ final class ServeCommand extends Command
                 'worker_pool_size' => $workers,
                 'read_first_byte_timeout_seconds' => $this->integerOption($input, 'flysystem-first-byte-timeout'),
                 'temp_dir' => $tempDir,
-                'temp_budget_bytes' => $this->integerOption($input, 'storage-temp-budget'),
             ];
         }
         if ($storageDriver === 'aws-s3') {
@@ -437,6 +448,21 @@ final class ServeCommand extends Command
         }
 
         return StorageBackendFactory::createTierRegistry($storageConfig, $metrics);
+    }
+
+    private function resolvedStorageTempBudget(InputInterface $input, ?int $postSpoolBudget = null): int
+    {
+        $postSpoolBudget ??= $input->getOption('post-spool-budget') === null
+            ? null
+            : $this->integerOption($input, 'post-spool-budget');
+        $storageTempBudget = $this->integerOption($input, 'storage-temp-budget');
+        if ($postSpoolBudget !== null
+            && ! $input->hasParameterOption('--storage-temp-budget', true)
+            && getenv('S3_STORAGE_TEMP_BUDGET') === false) {
+            return $postSpoolBudget;
+        }
+
+        return $storageTempBudget;
     }
 
     private function buildMetadataStore(

@@ -8,6 +8,7 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
+use OpsFour\S3Server\Storage\StorageTempBudgetSnapshot;
 
 final class MetricsCollector
 {
@@ -135,9 +136,23 @@ final class MetricsCollector
 
     private int $startedAt;
 
+    private ?StorageTempBudgetSnapshot $tempCapacity = null;
+
+    private ?bool $tempCapacitySnapshotSuccess = null;
+
     public function __construct()
     {
         $this->startedAt = time();
+    }
+
+    public function setStorageTempCapacity(?StorageTempBudgetSnapshot $snapshot): void
+    {
+        $this->tempCapacity = $snapshot;
+    }
+
+    public function setStorageTempCapacitySnapshotSuccess(bool $success): void
+    {
+        $this->tempCapacitySnapshotSuccess = $success;
     }
 
     public function recordRequest(string $method, ?string $operation, int $status, int $durationNs): void
@@ -471,6 +486,38 @@ final class MetricsCollector
             '# HELP s3_server_requests_total Total S3 HTTP requests by method, operation, and status.',
             '# TYPE s3_server_requests_total counter',
         ];
+
+        if ($this->tempCapacity !== null) {
+            $lines[] = '# HELP s3_server_node_temp_budget_bytes Configured node-local temporary byte budget.';
+            $lines[] = '# TYPE s3_server_node_temp_budget_bytes gauge';
+            $lines[] = 's3_server_node_temp_budget_bytes ' . $this->tempCapacity->budgetBytes;
+            $lines[] = '# HELP s3_server_node_temp_reserved_bytes Reserved node-local temporary bytes.';
+            $lines[] = '# TYPE s3_server_node_temp_reserved_bytes gauge';
+            $lines[] = 's3_server_node_temp_reserved_bytes ' . $this->tempCapacity->reservedBytes;
+            $lines[] = '# HELP s3_server_node_temp_available_bytes Effective node-local temporary bytes after logical and physical limits.';
+            $lines[] = '# TYPE s3_server_node_temp_available_bytes gauge';
+            $lines[] = 's3_server_node_temp_available_bytes ' . $this->tempCapacity->effectiveAvailableBytes;
+            $lines[] = '# HELP s3_server_node_temp_filesystem_free_bytes Physical free bytes across involved node filesystems.';
+            $lines[] = '# TYPE s3_server_node_temp_filesystem_free_bytes gauge';
+            $lines[] = 's3_server_node_temp_filesystem_free_bytes ' . $this->tempCapacity->filesystemFreeBytes;
+            $lines[] = '# HELP s3_server_node_temp_filesystem_reserve_bytes Configured physical safety reserve.';
+            $lines[] = '# TYPE s3_server_node_temp_filesystem_reserve_bytes gauge';
+            $lines[] = 's3_server_node_temp_filesystem_reserve_bytes ' . $this->tempCapacity->filesystemReserveBytes;
+            $lines[] = '# HELP s3_server_node_temp_active_reservations Active node-local temporary reservations.';
+            $lines[] = '# TYPE s3_server_node_temp_active_reservations gauge';
+            $lines[] = 's3_server_node_temp_active_reservations ' . $this->tempCapacity->activeReservations;
+            $lines[] = '# HELP s3_server_node_temp_unsafe_entries Unsafe or unaccounted managed temporary entries.';
+            $lines[] = '# TYPE s3_server_node_temp_unsafe_entries gauge';
+            $lines[] = 's3_server_node_temp_unsafe_entries ' . $this->tempCapacity->unsafeEntries;
+            $lines[] = '# HELP s3_server_node_temp_orphaned_bytes Safely measured or conservatively bounded unaccounted temporary bytes.';
+            $lines[] = '# TYPE s3_server_node_temp_orphaned_bytes gauge';
+            $lines[] = 's3_server_node_temp_orphaned_bytes ' . $this->tempCapacity->orphanedBytes;
+        }
+        if ($this->tempCapacitySnapshotSuccess !== null) {
+            $lines[] = '# HELP s3_server_node_temp_snapshot_success Whether the current temporary-capacity snapshot succeeded.';
+            $lines[] = '# TYPE s3_server_node_temp_snapshot_success gauge';
+            $lines[] = 's3_server_node_temp_snapshot_success ' . ($this->tempCapacitySnapshotSuccess ? '1' : '0');
+        }
 
         foreach ($this->requestTotals as $key => $value) {
             $lines[] = 's3_server_requests_total{' . $key . '} ' . $value;

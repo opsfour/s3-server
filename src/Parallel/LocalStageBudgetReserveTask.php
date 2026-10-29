@@ -17,14 +17,16 @@ final readonly class LocalStageBudgetReserveTask implements Task
         private int $budgetBytes,
         private string $leasePath,
         private string $tempPath,
+        private string $nonce,
         private int $bytes,
+        private int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
     ) {}
 
     public function run(Channel $channel, Cancellation $cancellation): null
     {
         $cancellation->throwIfRequested();
-        (new StorageTempBudgetCoordinator($this->scratch, $this->budgetBytes))
-            ->reserveExisting($this->leasePath, $this->tempPath, $this->bytes);
+        (new StorageTempBudgetCoordinator($this->scratch, $this->budgetBytes, $this->filesystemReserveBytes))
+            ->reserveExisting($this->leasePath, $this->tempPath, $this->nonce, $this->bytes);
 
         return null;
     }

@@ -16,12 +16,56 @@ use Amp\Parallel\Worker\Task;
 use Amp\Parallel\Worker\TaskFailureException;
 use Amp\Parallel\Worker\Worker;
 use Amp\Parallel\Worker\WorkerPool;
+use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Storage\LocalScratchStage;
 use OpsFour\S3Server\Storage\LocalScratchStager;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use PHPUnit\Framework\TestCase;
 
 final class LocalScratchStagerTest extends TestCase
 {
+    public function test_reserve_ahead_retries_exact_bytes_after_direct_slowdown(): void
+    {
+        $inner = new ContextWorkerPool(1);
+        $pool = new DirectSlowDownScratchBudgetPool($inner);
+        $stager = new LocalScratchStager($this->scratch, 16, $pool, filesystemReserveBytes: 0);
+        try {
+            $stage = $stager->stage(str_repeat('8', 32), new ReadableBuffer('abc'));
+            self::assertSame('abc', file_get_contents($stage->path));
+            self::assertSame(2, $pool->checkoutCount);
+            self::assertSame('3', file_get_contents($this->scratch . '/.opsfour-s3-storage-budget/total'));
+            $stager->cleanup($stage);
+        } finally {
+            $stager->shutdown();
+            $pool->shutdown();
+        }
+    }
+
+    public function test_cleanup_never_deletes_a_replacement_stage_inode(): void
+    {
+        $coordinator = new StorageTempBudgetCoordinator($this->scratch, 1024, 0);
+        $stager = new LocalScratchStager(
+            $this->scratch,
+            1024,
+            filesystemReserveBytes: 0,
+            tempBudget: $coordinator,
+        );
+        $stage = $stager->stage(str_repeat('a', 32), new ReadableBuffer('payload'));
+
+        try {
+            self::assertTrue(unlink($stage->path));
+            self::assertSame(11, file_put_contents($stage->path, 'replacement'));
+            $stager->cleanup($stage);
+            self::assertSame('replacement', file_get_contents($stage->path));
+            self::assertFalse($coordinator->snapshot()->mutationReady());
+        } finally {
+            @unlink($stage->path);
+            $coordinator->snapshot();
+            $stager->shutdown();
+            $coordinator->close();
+        }
+    }
+
     private string $scratch;
 
     protected function setUp(): void
@@ -67,6 +111,44 @@ final class LocalScratchStagerTest extends TestCase
         }
     }
 
+    public function test_separate_scratch_namespace_uses_the_canonical_node_budget(): void
+    {
+        $nodeTemp = $this->scratch . '-node';
+        self::assertTrue(mkdir($nodeTemp, 0700));
+        $coordinator = new StorageTempBudgetCoordinator($nodeTemp, 2, 0);
+        $requestPath = $nodeTemp . '/s3-post-shared.tmp';
+        $request = $coordinator->start($requestPath, 'request');
+        $coordinator->reserve($request, 1);
+        self::assertSame(1, file_put_contents($requestPath, 'x'));
+        $stager = new LocalScratchStager(
+            $this->scratch,
+            2,
+            filesystemReserveBytes: 0,
+            tempBudget: $coordinator,
+        );
+
+        try {
+            try {
+                $stager->stage(str_repeat('f', 32), new ReadableBuffer('12'));
+                self::fail('Scratch staging escaped the shared node budget.');
+            } catch (TaskFailureException $error) {
+                self::assertStringContainsString('Storage staging budget is full.', $error->getMessage());
+            }
+            self::assertSame([], glob($this->scratch . '/s3fw-put-*') ?: []);
+            self::assertSame(1, $coordinator->snapshot()->reservedBytes);
+        } finally {
+            $stager->shutdown();
+            @unlink($requestPath);
+            $coordinator->release($request);
+            $coordinator->close();
+            foreach (glob($nodeTemp . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
+                @unlink($path);
+            }
+            @rmdir($nodeTemp . '/.opsfour-s3-storage-budget');
+            @rmdir($nodeTemp);
+        }
+    }
+
     public function test_budget_rejection_removes_partial_file_and_reservation(): void
     {
         $stager = new LocalScratchStager($this->scratch, 4);
@@ -80,6 +162,22 @@ final class LocalScratchStagerTest extends TestCase
                 self::assertSame([], glob($this->scratch . '/.opsfour-s3-storage-budget/lease-*'));
                 self::assertSame('0', file_get_contents($this->scratch . '/.opsfour-s3-storage-budget/total'));
             }
+        } finally {
+            $stager->shutdown();
+        }
+    }
+
+    public function test_known_size_is_rejected_before_the_source_is_read(): void
+    {
+        $stager = new LocalScratchStager($this->scratch, 4, filesystemReserveBytes: 0);
+        $body = $this->createMock(ReadableStream::class);
+        $body->expects(self::never())->method('read');
+        try {
+            $stager->stage(str_repeat('9', 32), $body, knownSize: 5);
+            self::fail('Known oversized stage read its source.');
+        } catch (TaskFailureException $error) {
+            self::assertStringContainsString('Storage staging budget is full', $error->getMessage());
+            self::assertSame([], glob($this->scratch . '/s3fw-put-*') ?: []);
         } finally {
             $stager->shutdown();
         }
@@ -101,7 +199,7 @@ final class LocalScratchStagerTest extends TestCase
             self::assertSame($expected, file_get_contents($stage->path));
             self::assertSame(strlen($expected), $stage->size);
             self::assertSame(hash('sha256', $expected, true), $stage->sha256);
-            self::assertSame(2, $pool->checkoutCount);
+            self::assertSame(1, $pool->checkoutCount);
             $stager->cleanup($stage);
         } finally {
             $stager->shutdown();
@@ -175,8 +273,8 @@ final class LocalScratchStagerTest extends TestCase
     {
         $stager = new LocalScratchStager($this->scratch, 8);
         $foreign = $this->scratch . '/s3fw-put-' . str_repeat('f', 64);
-        self::assertSame(7, file_put_contents($foreign, 'foreign'));
         $stage = $stager->stage(str_repeat('a', 32), new ReadableBuffer('payload'));
+        self::assertSame(7, file_put_contents($foreign, 'foreign'));
         try {
             $forged = new LocalScratchStage($foreign, $stage->reservation, $stage->size, $stage->sha256);
             try {
@@ -253,9 +351,12 @@ final class LocalScratchStagerTest extends TestCase
             self::fail('Temp-budget cleanup failure must not replace cancellation.');
         } catch (CancelledException $error) {
             self::assertSame($cancellation, $error);
-            self::assertSame([], glob($this->scratch . '/s3fw-put-*'));
+            self::assertCount(1, glob($this->scratch . '/s3fw-put-*') ?: [], 'Corrupt identity state must retain rather than guess-delete the staged inode.');
         } finally {
             $stager->shutdown();
+            foreach (glob($this->scratch . '/s3fw-put-*') ?: [] as $path) {
+                @unlink($path);
+            }
         }
     }
 
@@ -355,6 +456,94 @@ final class CountingScratchBudgetPool implements WorkerPool
     public function submit(Task $task, ?Cancellation $cancellation = null): Execution
     {
         return $this->inner->submit($task, $cancellation);
+    }
+
+    public function shutdown(): void
+    {
+        $this->inner->shutdown();
+    }
+
+    public function kill(): void
+    {
+        $this->inner->kill();
+    }
+}
+
+final class DirectSlowDownScratchBudgetPool implements WorkerPool
+{
+    public int $checkoutCount = 0;
+
+    private readonly Worker $worker;
+
+    public function __construct(private readonly WorkerPool $inner)
+    {
+        $this->worker = new class ($inner->getWorker()) implements Worker {
+            private bool $rejectNext = true;
+
+            public function __construct(private readonly Worker $inner) {}
+
+            public function isRunning(): bool
+            {
+                return $this->inner->isRunning();
+            }
+
+            public function isIdle(): bool
+            {
+                return $this->inner->isIdle();
+            }
+
+            public function submit(Task $task, ?Cancellation $cancellation = null): Execution
+            {
+                if ($this->rejectNext) {
+                    $this->rejectNext = false;
+                    throw new SlowDownException('simulated reserve-ahead rejection');
+                }
+
+                return $this->inner->submit($task, $cancellation);
+            }
+
+            public function shutdown(): void
+            {
+                $this->inner->shutdown();
+            }
+
+            public function kill(): void
+            {
+                $this->inner->kill();
+            }
+        };
+    }
+
+    public function getWorker(): Worker
+    {
+        ++$this->checkoutCount;
+
+        return $this->worker;
+    }
+
+    public function getWorkerCount(): int
+    {
+        return $this->inner->getWorkerCount();
+    }
+
+    public function getIdleWorkerCount(): int
+    {
+        return $this->inner->getIdleWorkerCount();
+    }
+
+    public function isRunning(): bool
+    {
+        return $this->inner->isRunning();
+    }
+
+    public function isIdle(): bool
+    {
+        return $this->inner->isIdle();
+    }
+
+    public function submit(Task $task, ?Cancellation $cancellation = null): Execution
+    {
+        return $this->worker->submit($task, $cancellation);
     }
 
     public function shutdown(): void

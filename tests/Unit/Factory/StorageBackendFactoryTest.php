@@ -7,14 +7,19 @@ namespace OpsFour\S3Server\Tests\Unit\Factory;
 use Amp\ByteStream\ReadableBuffer;
 use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Exception\SlowDownException;
+use OpsFour\S3Server\Auth\PostObjectSpoolCoordinator;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
+use OpsFour\S3Server\S3Server;
+use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\AwsS3ProviderAdmissionCapability;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class StorageBackendFactoryTest extends TestCase
@@ -68,6 +73,122 @@ final class StorageBackendFactoryTest extends TestCase
         self::assertSame([], glob($this->tempDir . '/s3fw-put-*') ?: []);
         self::assertSame([], glob($this->tempDir . '/.opsfour-s3-storage-budget/lease-*') ?: []);
         self::assertSame([], glob($this->tempDir . '/.opsfour-s3-storage-budget/state-*') ?: []);
+    }
+
+    public function test_filesystem_and_request_spools_consume_one_shared_node_budget(): void
+    {
+        $storageRoot = $this->tempDir . '-shared-storage';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        $backend = StorageBackendFactory::create('filesystem', [
+            'path' => $storageRoot,
+            'temp_dir' => $this->tempDir,
+            'temp_budget_bytes' => 2,
+            'temp_reserve_bytes' => 0,
+        ]);
+        self::assertInstanceOf(FilesystemBackend::class, $backend);
+        $spoolPath = $this->tempDir . '/s3-post-shared.tmp';
+        $spools = new PostObjectSpoolCoordinator(
+            $this->tempDir,
+            runInline: true,
+            budgetBytes: 2,
+            filesystemReserveBytes: 0,
+        );
+        $spool = $spools->start($spoolPath);
+        $spools->reserve($spool, 1, 2);
+        self::assertSame(1, file_put_contents($spoolPath, 'x'));
+
+        try {
+            try {
+                $backend->putObject('bucket', 'blocked', new ReadableBuffer('12'));
+                self::fail('Request and filesystem staging escaped the shared two-byte node budget.');
+            } catch (SlowDownException) {
+                self::assertSame([], glob($storageRoot . '/.tmp/*') ?: []);
+            }
+
+            self::assertTrue(unlink($spoolPath));
+            $spools->release($spool, true);
+            self::assertSame(2, $backend->putObject('bucket', 'fits', new ReadableBuffer('12'))->size);
+        } finally {
+            @unlink($spoolPath);
+            $spools->release($spool, ! file_exists($spoolPath));
+            $spools->close();
+            $backend->shutdown();
+            $entries = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($storageRoot, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::CHILD_FIRST,
+            );
+            foreach ($entries as $entry) {
+                $entry->isDir() && ! $entry->isLink()
+                    ? @rmdir($entry->getPathname())
+                    : @unlink($entry->getPathname());
+            }
+            @rmdir($storageRoot);
+        }
+    }
+
+    public function test_programmatic_filesystem_factory_defaults_bind_to_default_server_config(): void
+    {
+        $storageRoot = $this->tempDir . '/programmatic-storage';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        $backend = StorageBackendFactory::create('filesystem', ['path' => $storageRoot]);
+        self::assertInstanceOf(FilesystemBackend::class, $backend);
+        $server = new S3Server(new S3ServerConfig(storagePath: $storageRoot), storage: $backend);
+
+        try {
+            self::assertSame(1, $backend->putObject('bucket', 'key', new ReadableBuffer('x'))->size);
+        } finally {
+            $server->stop();
+            $backend->shutdown();
+            $entries = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($storageRoot, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::CHILD_FIRST,
+            );
+            foreach ($entries as $entry) {
+                $entry->isDir() && ! $entry->isLink()
+                    ? @rmdir($entry->getPathname())
+                    : @unlink($entry->getPathname());
+            }
+            @rmdir($storageRoot);
+        }
+    }
+
+    #[DataProvider('divergentFilesystemTempContractProvider')]
+    public function test_filesystem_tier_rejects_a_divergent_node_temp_contract(string $field, mixed $value): void
+    {
+        $storageRoot = $this->tempDir . '/tier-storage';
+        $otherTemp = $this->tempDir . '/other-temp';
+        self::assertTrue(mkdir($storageRoot, 0700));
+        self::assertTrue(mkdir($otherTemp, 0700));
+        $tier = [
+            'driver' => 'filesystem',
+            'path' => $storageRoot,
+            'default' => true,
+            $field => $field === 'temp_dir' ? $otherTemp : $value,
+        ];
+
+        try {
+            StorageBackendFactory::createTierRegistry([
+                'driver' => 'filesystem',
+                'temp_dir' => $this->tempDir,
+                'temp_budget_bytes' => 100,
+                'temp_reserve_bytes' => 10,
+                'tiers' => ['STANDARD' => $tier],
+            ]);
+            self::fail('A filesystem tier escaped the canonical node temporary contract.');
+        } catch (\InvalidArgumentException $error) {
+            self::assertStringContainsString('canonical temp directory, budget, and reserve', $error->getMessage());
+        } finally {
+            @rmdir($otherTemp);
+            @rmdir($storageRoot);
+        }
+    }
+
+    /** @return iterable<string, array{string, mixed}> */
+    public static function divergentFilesystemTempContractProvider(): iterable
+    {
+        yield 'directory' => ['temp_dir', null];
+        yield 'budget' => ['temp_budget_bytes', 101];
+        yield 'reserve' => ['temp_reserve_bytes', 11];
     }
 
     public function test_negative_flysystem_worker_count_is_not_treated_as_synchronous_mode(): void

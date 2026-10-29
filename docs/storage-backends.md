@@ -204,9 +204,10 @@ The primitive never deletes, aborts, retries, consumes, or retires the armed int
 
 The ordinary PUT and delegated browser POST handlers reserve capacity before
 final physical-body staging after authenticated POST spooling, then stage those
-bytes in private budgeted scratch.
-The scratch budget is private to this capability and does not reuse the public
-browser POST spool budget. Long staging renews only the exact undispatched
+bytes in private scratch charged to the node contract.
+The scratch consumes the same canonical node-local temporary budget as browser
+POST, checksum, local-filesystem, and Flysystem staging; it does not create a
+private AWS pool. Long staging renews only the exact undispatched
 reservation on a bounded cadence and aborts before provider dispatch if renewal
 authority is lost. That same renewable reservation covers SSE body ingestion,
 encryption, and encrypted Copy source acquisition and transforms, including an
@@ -328,6 +329,8 @@ factory directly from environment variables:
 ```bash
 S3_STORAGE_DRIVER=flysystem
 S3_STORAGE_TEMP_DIR=/var/lib/opsfour-s3/tmp
+S3_STORAGE_TEMP_BUDGET=10737418240
+S3_STORAGE_TEMP_RESERVE=1073741824
 S3_FLYSYSTEM_WORKERS=8
 S3_FLYSYSTEM_FIRST_BYTE_TIMEOUT_SECONDS=20
 S3_BACKING_BUCKET=backing-bucket
@@ -341,6 +344,14 @@ S3_BACKING_CONNECT_TIMEOUT_SECONDS=5
 S3_BACKING_READ_TIMEOUT_SECONDS=15
 S3_BACKING_REQUEST_TIMEOUT_SECONDS=0
 ```
+
+`S3_STORAGE_TEMP_DIR`, `S3_STORAGE_TEMP_BUDGET`, and
+`S3_STORAGE_TEMP_RESERVE` define one host-local contract shared by encrypted
+request spools, every local filesystem tier, and direct/worker Flysystem
+staging. Known object, copy, part, and assembly sizes are reserved before
+writing; unknown streams grow their reservation before each chunk. A worker
+configuration that differs from the live node contract fails closed. The
+contract is deliberately not a distributed global quota.
 
 Flysystem remains available for development and integration testing. A remote
 provider can move beyond this status only after a provider-side write fence

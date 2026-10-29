@@ -18,10 +18,73 @@ use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use PHPUnit\Framework\TestCase;
 
 final class MetricsHandlerTest extends TestCase
 {
+    public function test_temp_snapshot_failure_preserves_prometheus_scrape(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-metrics-temp-' . bin2hex(random_bytes(8));
+        $moved = $tempDir . '-moved';
+        self::assertTrue(mkdir($tempDir, 0700));
+        $coordinator = new StorageTempBudgetCoordinator($tempDir, 10, 0);
+        try {
+            self::assertTrue(rename($tempDir, $moved));
+            self::assertTrue(mkdir($tempDir, 0700));
+            $body = \Amp\ByteStream\buffer((new MetricsHandler(
+                new MetricsCollector(),
+                tempBudget: $coordinator,
+            ))->handleRequest($this->request())->getBody());
+            self::assertStringContainsString('s3_server_up 1', $body);
+            self::assertStringContainsString('s3_server_node_temp_snapshot_success 0', $body);
+            self::assertDoesNotMatchRegularExpression('/^s3_server_node_temp_budget_bytes /m', $body);
+        } finally {
+            @rmdir($tempDir);
+            @rename($moved, $tempDir);
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
+    public function test_node_temp_capacity_scrape_exposes_fixed_cardinality_gauges(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-metrics-temp-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $coordinator = new StorageTempBudgetCoordinator($tempDir, 10, 0);
+        $path = $tempDir . '/s3fw-put-metric';
+        $reservation = $coordinator->start($path);
+        $coordinator->reserve($reservation, 3);
+        self::assertSame(3, file_put_contents($path, 'abc'));
+
+        try {
+            $rendered = \Amp\ByteStream\buffer((new MetricsHandler(
+                new MetricsCollector(),
+                tempBudget: $coordinator,
+            ))->handleRequest($this->request())->getBody());
+            self::assertStringContainsString('s3_server_node_temp_budget_bytes 10', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_reserved_bytes 3', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_active_reservations 1', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_unsafe_entries 0', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_orphaned_bytes 0', $rendered);
+            self::assertStringContainsString('s3_server_node_temp_snapshot_success 1', $rendered);
+            self::assertDoesNotMatchRegularExpression('/^s3_server_node_temp_[^ ]+\{/m', $rendered);
+        } finally {
+            @unlink($path);
+            $coordinator->release($reservation);
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_cached_observed_store_records_each_scrape_read_once_with_the_real_driver(): void
     {
         $path = sys_get_temp_dir() . '/s3-metrics-wrapper-order-' . bin2hex(random_bytes(6)) . '.sqlite';

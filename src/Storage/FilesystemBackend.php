@@ -36,7 +36,7 @@ use OpsFour\S3Server\Exception\SlowDownException;
  * linked create-only to its final path. This prevents partial reads and
  * replacement of an already published path.
  */
-final class FilesystemBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend
+final class FilesystemBackend implements ShutdownAwareStorageBackend, RecoverableMultipartAssemblyBackend, RecoverableMultipartPartBackend, RecoverableObjectWriteBackend, BoundedCopyStorageBackend, KnownSizeStorageBackend, KnownSizeRecoverableStorageBackend
 {
     private const int IO_CHUNK_SIZE = 1_048_576;
 
@@ -45,6 +45,16 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
     private readonly File\Filesystem $fileFilesystem;
 
     private readonly File\Filesystem $metadataFilesystem;
+
+    private ?StorageTempBudgetCoordinator $tempBudget = null;
+
+    private bool $ownsTempBudget = false;
+
+    private string $tempNamespace = '';
+
+    private bool $tempNamespaceRegistered = false;
+
+    private bool $constructed = false;
 
     private readonly LocalMutex $dataFileOpenMutex;
 
@@ -68,6 +78,8 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         string $basePath,
         ?File\Filesystem $fileFilesystem = null,
         ?File\Filesystem $metadataFilesystem = null,
+        ?StorageTempBudgetCoordinator $tempBudget = null,
+        bool $ownsTempBudget = false,
     ) {
         $root = rtrim($basePath, '/');
         if ($root === '' || ! str_starts_with($root, '/') || str_contains($basePath, '//')) {
@@ -88,6 +100,41 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $metadataFilesystem = new File\Filesystem(new ParallelFilesystemDriver($metadataPool));
         }
         $this->metadataFilesystem = $metadataFilesystem;
+        if ($tempBudget !== null) {
+            $this->ownsTempBudget = $ownsTempBudget;
+            $this->bindTempBudget($tempBudget);
+        }
+        $this->constructed = true;
+    }
+
+    /** Bind local object, part, copy and assembly staging to the node budget. */
+    public function bindTempBudget(StorageTempBudgetCoordinator $tempBudget): void
+    {
+        if ($this->tempBudget !== null) {
+            if ($this->tempBudget->tempDir() !== $tempBudget->tempDir()
+                || $this->tempBudget->budgetBytes() !== $tempBudget->budgetBytes()
+                || $this->tempBudget->filesystemReserveBytes() !== $tempBudget->filesystemReserveBytes()) {
+                throw new \RuntimeException('Filesystem backend temporary capacity differs from the node contract.');
+            }
+            if ($this->tempBudget !== $tempBudget) {
+                if ($this->ownsTempBudget) {
+                    $this->tempBudget->close();
+                }
+                $this->tempBudget = $tempBudget;
+                $this->ownsTempBudget = false;
+                $this->tempNamespaceRegistered = false;
+            }
+            if ($this->constructed) {
+                $this->registerTempNamespace();
+            }
+
+            return;
+        }
+        $this->tempNamespace = 'filesystem_' . substr(hash('sha256', $this->basePath), 0, 24);
+        $this->tempBudget = $tempBudget;
+        if ($this->constructed) {
+            $this->registerTempNamespace();
+        }
     }
 
     public function shutdown(): void
@@ -101,6 +148,10 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         $this->multipartFencePool = null;
         $this->durabilityPool = null;
         $this->multipartFenceAdmissions = 0;
+        if ($this->ownsTempBudget) {
+            $this->tempBudget?->close();
+            $this->ownsTempBudget = false;
+        }
     }
 
     public function __destruct()
@@ -124,6 +175,11 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         return $this->writeObjectAtPath($body, StoragePath::forObject($this->basePath, $bucket, $key));
     }
 
+    public function putObjectKnownSize(string $bucket, string $key, ReadableStream $body, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        return $this->writeObjectAtPath($body, StoragePath::forObject($this->basePath, $bucket, $key), knownSize: $knownSize, capacity: $capacity);
+    }
+
     public function planMultipartCompletionPaths(string $bucket, string $key, string $bucketGeneration, string $attemptId): array
     {
         return StoragePath::forMultipartCompletion($this->basePath, $bucket, $key, $bucketGeneration, $attemptId);
@@ -145,45 +201,86 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         );
     }
 
-    private function writeObjectAtPath(ReadableStream $body, string $finalPath, bool $fencedMultipart = false): StorageWriteResult
+    public function putObjectAtPathKnownSize(string $bucket, string $key, ReadableStream $body, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertObjectWritePath($this->basePath, $path, $bucket, $key);
+
+        return $this->writeObjectAtPath(
+            $body,
+            $path,
+            str_starts_with($path, rtrim($this->basePath, '/') . '/.assemblies/'),
+            $knownSize,
+            $capacity,
+        );
+    }
+
+    private function writeObjectAtPath(ReadableStream $body, string $finalPath, bool $fencedMultipart = false, ?int $knownSize = null, ?StorageTempReservation $capacity = null): StorageWriteResult
     {
         $tempPath = StoragePath::forTemp($this->basePath);
 
         // Ensure temp directory exists
         $tempDir = dirname($tempPath);
         $this->ensureDirectory($tempDir);
-        $tempLease = StorageTempFileLease::acquire($tempPath);
+        [$tempLease, $reservation] = $this->acquireBudgetedTempFile($tempPath, 'object', $capacity);
 
         try {
-            return $this->writeLeasedObjectAtPath($body, $finalPath, $tempPath, $fencedMultipart);
+            return $this->writeLeasedObjectAtPath($body, $finalPath, $tempPath, $fencedMultipart, $tempLease, $reservation, $knownSize, $capacity !== null);
         } finally {
             $tempLease->release();
+            $this->releaseTempReservation($reservation);
         }
     }
 
-    private function writeLeasedObjectAtPath(ReadableStream $body, string $finalPath, string $tempPath, bool $fencedMultipart): StorageWriteResult
-    {
+    private function writeLeasedObjectAtPath(
+        ReadableStream $body,
+        string $finalPath,
+        string $tempPath,
+        bool $fencedMultipart,
+        StorageTempFileLease $tempLease,
+        ?StorageTempReservation $reservation,
+        ?int $knownSize,
+        bool $preReserved,
+    ): StorageWriteResult {
         $calculator = new ChecksumCalculator();
         $size = 0;
 
         // Write to temp file, computing checksums as data streams in
         $tempFile = null;
         try {
-            $tempFile = $this->openDataFile($tempPath, 'w');
-            $this->copyStreamToFile($body, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
+            if ($knownSize !== null && ! $preReserved) {
+                if ($knownSize < 0) {
+                    throw new \InvalidArgumentException('Known object size must be non-negative.');
+                }
+                $this->reserveTempBytes($reservation, $knownSize);
+            }
+            $reservedBytes = $knownSize ?? 0;
+            $tempFile = $this->openDataFile($tempPath, 'c');
+            $tempLease->assertPath($tempPath);
+            $tempFile->truncate(0);
+            $this->copyStreamToFile($body, $tempFile, function (string $chunk) use ($calculator, &$size, &$reservedBytes, $reservation): void {
+                $nextSize = $size + strlen($chunk);
+                if ($nextSize > $reservedBytes) {
+                    $this->reserveTempBytes($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $calculator->update($chunk);
-                $size += strlen($chunk);
+                $size = $nextSize;
             });
 
             self::closeAndRelease($tempFile);
             $this->assertTempFileSize($tempPath, $size);
         } catch (CancelledException $e) {
             self::safeCloseAndRelease($tempFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
+            throw $e;
+        } catch (SlowDownException $e) {
+            self::safeCloseAndRelease($tempFile);
+            $this->safeDelete($tempPath, $reservation);
             throw $e;
         } catch (\Throwable $e) {
             self::safeCloseAndRelease($tempFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
             throw new InternalErrorException('Failed to write object to filesystem backend.', $e);
         }
 
@@ -203,12 +300,12 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             }
         } catch (CancelledException $e) {
             if (! $durablePublicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
             throw $e;
         } catch (\Throwable $e) {
             if (! $durablePublicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
             throw new InternalErrorException('Failed to finalize object in filesystem backend.', $e);
         }
@@ -333,6 +430,27 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         return $this->writePartAtPath($bucket, $key, $uploadId, $partNumber, $data, $partPath);
     }
 
+    public function putPartKnownSize(
+        string $bucket,
+        string $key,
+        string $uploadId,
+        int $partNumber,
+        ReadableStream $data,
+        int $knownSize,
+        ?StorageTempReservation $capacity = null,
+    ): StorageWriteResult {
+        return $this->writePartAtPath(
+            $bucket,
+            $key,
+            $uploadId,
+            $partNumber,
+            $data,
+            StoragePath::forPart($this->basePath, $uploadId, $partNumber),
+            knownSize: $knownSize,
+            capacity: $capacity,
+        );
+    }
+
     public function planMultipartPartPath(string $bucket, string $bucketGeneration, string $uploadId, int $partNumber, string $attemptId): string
     {
         return StoragePath::forPlannedPart($this->basePath, $bucket, $bucketGeneration, $uploadId, $partNumber, $attemptId);
@@ -345,7 +463,14 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         return $this->writePartAtPath($bucket, $key, $uploadId, $partNumber, $data, $path, true);
     }
 
-    private function writePartAtPath(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $partPath, bool $planned = false): StorageWriteResult
+    public function putPartAtPathKnownSize(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $path, int $knownSize, ?StorageTempReservation $capacity = null): StorageWriteResult
+    {
+        StoragePath::assertPlannedPartPath($this->basePath, $path, $uploadId, $partNumber);
+
+        return $this->writePartAtPath($bucket, $key, $uploadId, $partNumber, $data, $path, true, $knownSize, $capacity);
+    }
+
+    private function writePartAtPath(string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $data, string $partPath, bool $planned = false, ?int $knownSize = null, ?StorageTempReservation $capacity = null): StorageWriteResult
     {
         $tempPath = StoragePath::forTemp($this->basePath);
 
@@ -355,7 +480,7 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
 
         $this->ensureDirectory($tempDir);
         $this->ensureDirectory($partDir);
-        $tempLease = StorageTempFileLease::acquire($tempPath);
+        [$tempLease, $reservation] = $this->acquireBudgetedTempFile($tempPath, 'multipart_part', $capacity);
 
         $calculator = new ChecksumCalculator();
         $size = 0;
@@ -363,21 +488,42 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Write to temp first
         $tempFile = null;
         try {
-            $tempFile = $this->openDataFile($tempPath, 'w');
-            $this->copyStreamToFile($data, $tempFile, static function (string $chunk) use ($calculator, &$size): void {
+            if ($knownSize !== null && $capacity === null) {
+                if ($knownSize < 0) {
+                    throw new \InvalidArgumentException('Known multipart part size must be non-negative.');
+                }
+                $this->reserveTempBytes($reservation, $knownSize);
+            }
+            $reservedBytes = $knownSize ?? 0;
+            $tempFile = $this->openDataFile($tempPath, 'c');
+            $tempLease->assertPath($tempPath);
+            $tempFile->truncate(0);
+            $this->copyStreamToFile($data, $tempFile, function (string $chunk) use ($calculator, &$size, &$reservedBytes, $reservation): void {
+                $nextSize = $size + strlen($chunk);
+                if ($nextSize > $reservedBytes) {
+                    $this->reserveTempBytes($reservation, $nextSize - $reservedBytes);
+                    $reservedBytes = $nextSize;
+                }
                 $calculator->update($chunk);
-                $size += strlen($chunk);
+                $size = $nextSize;
             });
 
             self::closeAndRelease($tempFile);
             $this->assertTempFileSize($tempPath, $size);
         } catch (CancelledException $e) {
             self::safeCloseAndRelease($tempFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
+            throw $e;
+        } catch (SlowDownException $e) {
+            self::safeCloseAndRelease($tempFile);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             self::safeCloseAndRelease($tempFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
             throw new InternalErrorException('Failed to write multipart part to filesystem backend.', $e);
         }
 
@@ -393,17 +539,20 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             }
         } catch (CancelledException $e) {
             if ($planned) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             if ($planned) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw new InternalErrorException('Failed to finalize multipart part in filesystem backend.', $e);
         }
 
         $tempLease->release();
+        $this->releaseTempReservation($reservation);
 
         return new StorageWriteResult(
             path: $partPath,
@@ -490,6 +639,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
                 $uploadId,
                 $parts,
                 $path,
+                $this->tempBudget?->tempDir(),
+                $this->tempBudget?->budgetBytes() ?? StorageTempBudgetCoordinator::DEFAULT_BUDGET_BYTES,
+                $this->tempBudget?->filesystemReserveBytes() ?? StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
             ),
         )->getFuture()->await());
 
@@ -519,7 +671,24 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Ensure temp directory exists
         $tempDir = dirname($tempPath);
         $this->ensureDirectory($tempDir);
-        $tempLease = StorageTempFileLease::acquire($tempPath);
+        [$tempLease, $reservation] = $this->acquireBudgetedTempFile($tempPath, 'multipart_assembly');
+        try {
+            $knownAssemblyBytes = 0;
+            foreach ($parts as $part) {
+                $partInfo = @lstat($part['storagePath']);
+                if ($partInfo === false || ($partInfo['mode'] & 0o170000) !== 0o100000
+                    || $partInfo['size'] > PHP_INT_MAX - $knownAssemblyBytes) {
+                    throw new InternalErrorException('Multipart part cannot be admitted to node temporary capacity.');
+                }
+                $knownAssemblyBytes += $partInfo['size'];
+            }
+            $this->reserveTempBytes($reservation, $knownAssemblyBytes);
+        } catch (\Throwable $error) {
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
+            $tempLease->release();
+            throw $error;
+        }
 
         $calculator = new ChecksumCalculator();
         $size = 0;
@@ -528,7 +697,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Concatenate all parts into the temp file
         $outFile = null;
         try {
-            $outFile = $this->openDataFile($tempPath, 'w');
+            $outFile = $this->openDataFile($tempPath, 'c');
+            $tempLease->assertPath($tempPath);
+            $outFile->truncate(0);
             foreach ($parts as $part) {
                 $partNumber = $part['partNumber'];
                 $partPath = $part['storagePath'];
@@ -566,11 +737,13 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $this->assertTempFileSize($tempPath, $size);
         } catch (CancelledException $e) {
             self::safeCloseAndRelease($outFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             self::safeCloseAndRelease($outFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
 
             if ($e instanceof InternalErrorException) {
                 throw $e;
@@ -598,17 +771,20 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             }
         } catch (CancelledException $e) {
             if (! $durablePublicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             if (! $durablePublicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw new InternalErrorException('Failed to finalize assembled object in filesystem backend.', $e);
         }
 
         $tempLease->release();
+        $this->releaseTempReservation($reservation);
 
         return new StorageWriteResult(
             path: $finalPath,
@@ -658,7 +834,19 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         // Ensure temp directory
         $tempDir = dirname($tempPath);
         $this->ensureDirectory($tempDir);
-        $tempLease = StorageTempFileLease::acquire($tempPath);
+        [$tempLease, $reservation] = $this->acquireBudgetedTempFile($tempPath, 'copy');
+        try {
+            $sourceInfo = @lstat($srcPath);
+            if ($sourceInfo === false || ($sourceInfo['mode'] & 0o170000) !== 0o100000) {
+                throw new InternalErrorException('Copy source cannot be admitted to node temporary capacity.');
+            }
+            $this->reserveTempBytes($reservation, $sourceInfo['size']);
+        } catch (\Throwable $error) {
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
+            $tempLease->release();
+            throw $error;
+        }
 
         $calculator = new ChecksumCalculator();
         $size = 0;
@@ -668,7 +856,9 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         try {
             $srcFile = $this->openDataFile($srcPath, 'r');
             $readStream = new FileReadableStream($srcFile, self::IO_CHUNK_SIZE);
-            $dstFile = $this->openDataFile($tempPath, 'w');
+            $dstFile = $this->openDataFile($tempPath, 'c');
+            $tempLease->assertPath($tempPath);
+            $dstFile->truncate(0);
             $this->copyStreamToFile($readStream, $dstFile, static function (string $chunk) use ($calculator, &$size): void {
                 $calculator->update($chunk);
                 $size += strlen($chunk);
@@ -680,12 +870,14 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
         } catch (CancelledException $e) {
             self::safeCloseAndRelease($srcFile);
             self::safeCloseAndRelease($dstFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             self::safeCloseAndRelease($srcFile);
             self::safeCloseAndRelease($dstFile);
-            $this->safeDelete($tempPath);
+            $this->safeDelete($tempPath, $reservation);
+            $this->releaseTempReservation($reservation);
             throw new InternalErrorException('Failed to copy object in filesystem backend.', $e);
         }
 
@@ -701,17 +893,20 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             $this->publishDurably($tempPath, $finalPath);
         } catch (CancelledException $e) {
             if (! $publicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw $e;
         } catch (\Throwable $e) {
             if (! $publicationStarted) {
-                $this->safeDelete($tempPath);
+                $this->safeDelete($tempPath, $reservation);
             }
+            $this->releaseTempReservation($reservation);
             throw new InternalErrorException('Failed to finalize copied object in filesystem backend.', $e);
         }
 
         $tempLease->release();
+        $this->releaseTempReservation($reservation);
 
         return new StorageWriteResult(
             path: $finalPath,
@@ -730,9 +925,27 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
             throw new \InvalidArgumentException('Maximum copied bytes must be non-negative.');
         }
 
-        $source = new LimitedReadableStream($this->getObjectByPath($srcPath), $maxBytes);
+        $srcPath = $this->storedPathForAccess($srcPath);
+        if (! $this->assertStoredPathConfined($srcPath)) {
+            throw new NoSuchKeyException();
+        }
+        $sourceInfo = @lstat($srcPath);
+        if ($sourceInfo === false || ($sourceInfo['mode'] & 0o170000) !== 0o100000) {
+            throw new InternalErrorException('Copy source cannot be admitted to node temporary capacity.');
+        }
+        $sourceSize = (int) $sourceInfo['size'];
+        if ($sourceSize > $maxBytes) {
+            throw new InternalErrorException('Stored object size does not match metadata.');
+        }
+
+        $source = new LimitedReadableStream(
+            new LazyReadableStream(fn(): ReadableStream => $this->getObjectByPath($srcPath)),
+            $sourceSize,
+            requireExactLength: true,
+            rejectExcess: true,
+        );
         try {
-            return $this->putObject($dstBucket, $dstKey, $source);
+            return $this->putObjectKnownSize($dstBucket, $dstKey, $source, $sourceSize);
         } finally {
             $source->close();
         }
@@ -951,14 +1164,89 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
      *
      * Used for cleanup in error paths where we must not mask the original exception.
      */
-    private function safeDelete(string $path): void
+    private function safeDelete(string $path, ?StorageTempReservation $reservation = null): void
     {
+        if ($this->tempBudget !== null) {
+            try {
+                if ($reservation !== null) {
+                    $this->tempBudget->cleanup($reservation);
+                }
+            } catch (\Throwable) {
+                // Retain ambiguous bytes and their lease for readiness.
+            }
+
+            return;
+        }
         try {
             if ($this->metadataFilesystem->exists($path)) {
                 $this->metadataFilesystem->deleteFile($path);
             }
         } catch (\Throwable) {
             // Intentionally swallowed: cleanup failure should not mask the original error.
+        }
+    }
+
+    private function startTempReservation(string $path, string $purpose): ?StorageTempReservation
+    {
+        $this->registerTempNamespace();
+
+        return $this->tempBudget?->start($path, $purpose);
+    }
+
+    /** @return array{StorageTempFileLease, StorageTempReservation|null} */
+    private function acquireBudgetedTempFile(string $path, string $purpose, ?StorageTempReservation $capacity = null): array
+    {
+        if ($capacity !== null) {
+            $this->registerTempNamespace();
+            if ($this->tempBudget === null) {
+                throw new \LogicException('Pre-reserved capacity requires the canonical temporary coordinator.');
+            }
+            $this->tempBudget->retarget($capacity, $path, $purpose);
+            $reservation = $capacity;
+        } else {
+            $reservation = $this->startTempReservation($path, $purpose);
+        }
+        try {
+            $lease = $reservation === null
+                ? StorageTempFileLease::acquire($path)
+                : StorageTempFileLease::acquireExisting($path);
+            if ($reservation !== null) {
+                $lease->assertIdentity($reservation->identity());
+            }
+        } catch (\Throwable $error) {
+            $this->safeDelete($path, $reservation);
+            $this->releaseTempReservation($reservation);
+            throw $error;
+        }
+
+        return [$lease, $reservation];
+    }
+
+    private function registerTempNamespace(): void
+    {
+        if ($this->tempBudget === null || $this->tempNamespaceRegistered) {
+            return;
+        }
+        $this->tempBudget->registerNamespace($this->tempNamespace, $this->basePath . '/.tmp');
+        $this->tempNamespaceRegistered = true;
+    }
+
+    private function reserveTempBytes(?StorageTempReservation $reservation, int $bytes): void
+    {
+        if ($reservation !== null) {
+            $this->tempBudget?->reserve($reservation, $bytes);
+        }
+    }
+
+    private function releaseTempReservation(?StorageTempReservation $reservation): void
+    {
+        if ($reservation === null) {
+            return;
+        }
+        try {
+            $this->tempBudget?->release($reservation);
+        } catch (\Throwable) {
+            // A retained lease keeps ambiguous bytes charged and closes readiness.
         }
     }
 
@@ -1012,6 +1300,13 @@ final class FilesystemBackend implements ShutdownAwareStorageBackend, Recoverabl
      */
     public function cleanupStaleTempFiles(int $maxAgeSeconds = 3600): int
     {
+        if ($this->tempBudget !== null) {
+            // Coordinator recovery uses reservation identity; age alone is
+            // never authority to delete a managed path.
+            $this->tempBudget->snapshot();
+
+            return 0;
+        }
         $tmpDir = $this->basePath . '/.tmp';
 
         if (! $this->metadataFilesystem->isDirectory($tmpDir)) {

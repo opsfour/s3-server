@@ -44,7 +44,7 @@ final class S3ServerAuthenticationTest extends TestCase
         self::assertInstanceOf(AuthenticationMiddleware::class, $middleware);
     }
 
-    public function test_default_auth_spooling_binds_to_server_pool_without_replacing_explicit_components(): void
+    public function test_auth_spooling_always_binds_to_server_owned_coordinator(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-auth-spool-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0700));
@@ -63,7 +63,7 @@ final class S3ServerAuthenticationTest extends TestCase
             $explicitAuth->bindServerSpoolCoordinator($owned);
 
             self::assertSame($owned, $this->authSpoolCoordinator($defaultAuth));
-            self::assertSame($explicit, $this->authSpoolCoordinator($explicitAuth));
+            self::assertSame($owned, $this->authSpoolCoordinator($explicitAuth));
         } finally {
             @rmdir($tempDir . '/.opsfour-s3-post-budget');
             @rmdir($tempDir);

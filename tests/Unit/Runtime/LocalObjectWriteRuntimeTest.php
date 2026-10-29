@@ -326,6 +326,7 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             metadataDsn: self::MYSQL_DSN,
             allowUnfencedStorageForTests: true,
             localObjectWriteTestScratchPath: $this->scratch,
+            storageTempDir: $this->scratch,
         );
     }
 

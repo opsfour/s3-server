@@ -26,6 +26,12 @@ final readonly class S3ServerConfig
 
     public string $storagePath;
 
+    public string $storageTempDir;
+
+    public int $storageTempBudgetBytes;
+
+    public int $storageTempReserveBytes;
+
     /** @var array<string, mixed> */
     public array $storageTiers;
 
@@ -133,7 +139,10 @@ final readonly class S3ServerConfig
      * @param  int  $maxConcurrentConnections  Maximum simultaneous connections.
      * @param  int  $connectionIdleTimeout  HTTP/2 idle timeout in seconds; Amp HTTP/1 uses the stream inactivity timeout.
      * @param  int  $requestBodySizeLimit  Maximum request body size in bytes (default 5 GiB).
-     * @param  int  $postSpoolBudgetBytes  Concurrent browser POST temporary bytes per node sharing a local temp directory (default 10 GiB).
+     * @param  int|null  $postSpoolBudgetBytes  Deprecated alias for the canonical node temporary budget; when both are explicit they must match.
+     * @param  string|null  $storageTempDir  Canonical node-local coordinator root shared by every temporary consumer.
+     * @param  int|null  $storageTempBudgetBytes  Aggregate node-local temporary byte budget (default 10 GiB).
+     * @param  int  $storageTempReserveBytes  Physical free-space reserve retained on every involved staging filesystem (default 1 GiB).
      * @param  float  $localWriteWorkerTimeoutSeconds  Maximum seconds to await a dispatched local object or multipart write worker.
      * @param  int  $readTimeout  Read timeout in seconds.
      * @param  int  $writeTimeout  Write timeout in seconds.
@@ -204,7 +213,7 @@ final readonly class S3ServerConfig
         ?string $metricsBearerToken = null,
         ?int $selectWorkerPoolSize = null,
         bool $notificationWorkerEnabled = true,
-        int $postSpoolBudgetBytes = 10_737_418_240,
+        ?int $postSpoolBudgetBytes = null,
         array $trustedProxyCidrs = [],
         bool $allowUnfencedStorageForTests = false,
         ?string $localObjectWriteTestScratchPath = null,
@@ -214,6 +223,9 @@ final readonly class S3ServerConfig
         ?string $clusterDatabaseId = null,
         array|string|null $clusterRoles = null,
         array|string|null $clusterRequiredRoles = null,
+        ?string $storageTempDir = null,
+        ?int $storageTempBudgetBytes = null,
+        int $storageTempReserveBytes = 1_073_741_824,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
@@ -266,8 +278,15 @@ final readonly class S3ServerConfig
             );
         }
 
-        if ($postSpoolBudgetBytes < 1) {
-            throw new \InvalidArgumentException('postSpoolBudgetBytes must be positive.');
+        $resolvedTempBudget = $storageTempBudgetBytes ?? $postSpoolBudgetBytes ?? 10_737_418_240;
+        if ($resolvedTempBudget < 1) {
+            throw new \InvalidArgumentException('storageTempBudgetBytes must be positive.');
+        }
+        if ($postSpoolBudgetBytes !== null && $postSpoolBudgetBytes !== $resolvedTempBudget) {
+            throw new \InvalidArgumentException('S3_POST_SPOOL_BUDGET is deprecated and must equal S3_STORAGE_TEMP_BUDGET.');
+        }
+        if ($storageTempReserveBytes < 0) {
+            throw new \InvalidArgumentException('storageTempReserveBytes must be non-negative.');
         }
 
         if ($localObjectWriteTestScratchPath !== null && (
@@ -422,6 +441,19 @@ final readonly class S3ServerConfig
         $this->port = $port;
         $this->region = $region;
         $this->storagePath = rtrim($storagePath, '/') ?: '/';
+        $configuredTempDir = $storageTempDir ?? sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'opsfour-s3-server-temp';
+        if (! is_dir($configuredTempDir)
+            && ! @mkdir($configuredTempDir, 0o700, true)
+            && ! is_dir($configuredTempDir)) {
+            throw new \InvalidArgumentException('storageTempDir could not be created.');
+        }
+        $resolvedTempDir = realpath($configuredTempDir);
+        if ($resolvedTempDir === false || ! is_dir($resolvedTempDir) || ! is_writable($resolvedTempDir)) {
+            throw new \InvalidArgumentException('storageTempDir must exist and be writable.');
+        }
+        $this->storageTempDir = rtrim($resolvedTempDir, DIRECTORY_SEPARATOR) ?: DIRECTORY_SEPARATOR;
+        $this->storageTempBudgetBytes = $resolvedTempBudget;
+        $this->storageTempReserveBytes = $storageTempReserveBytes;
         $this->storageTiers = $storageTiers;
         $this->allowUnfencedStorageForTests = $allowUnfencedStorageForTests;
         $this->localObjectWriteTestScratchPath = $localObjectWriteTestScratchPath;
@@ -440,7 +472,7 @@ final readonly class S3ServerConfig
         $this->maxConcurrentConnections = $maxConcurrentConnections;
         $this->connectionIdleTimeout = $connectionIdleTimeout;
         $this->requestBodySizeLimit = $requestBodySizeLimit;
-        $this->postSpoolBudgetBytes = $postSpoolBudgetBytes;
+        $this->postSpoolBudgetBytes = $resolvedTempBudget;
         $this->localWriteWorkerTimeoutSeconds = $localWriteWorkerTimeoutSeconds;
         $this->readTimeout = $readTimeout;
         $this->writeTimeout = $writeTimeout;
@@ -505,6 +537,9 @@ final readonly class S3ServerConfig
             'port' => $this->port,
             'region' => $this->region,
             'storagePath' => $this->storagePath,
+            'storageTempDir' => $this->storageTempDir,
+            'storageTempBudgetBytes' => $this->storageTempBudgetBytes,
+            'storageTempReserveBytes' => $this->storageTempReserveBytes,
             'storageTiers' => $this->storageTiers,
             'allowUnfencedStorageForTests' => $this->allowUnfencedStorageForTests,
             'localObjectWriteTestScratchPath' => $this->localObjectWriteTestScratchPath,
@@ -552,6 +587,14 @@ final readonly class S3ServerConfig
         ];
 
         $merged = array_merge($defaults, $overrides);
+
+        if (array_key_exists('storageTempBudgetBytes', $overrides)
+            && ! array_key_exists('postSpoolBudgetBytes', $overrides)) {
+            $merged['postSpoolBudgetBytes'] = null;
+        } elseif (array_key_exists('postSpoolBudgetBytes', $overrides)
+            && ! array_key_exists('storageTempBudgetBytes', $overrides)) {
+            $merged['storageTempBudgetBytes'] = null;
+        }
 
         return new self(...$merged);
     }

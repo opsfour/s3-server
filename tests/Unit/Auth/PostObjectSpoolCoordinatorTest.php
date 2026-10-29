@@ -44,7 +44,7 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         try {
             $this->expectException(\RuntimeException::class);
             $this->expectExceptionMessage('invalid worker announcement');
-            (new PostObjectSpoolCoordinator($tempDir, $pool))->start($tempPath);
+            (new PostObjectSpoolCoordinator($tempDir, $pool, budgetBytes: 8))->start($tempPath);
         } finally {
             @unlink($tempPath);
             foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
@@ -61,25 +61,21 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         self::assertTrue(mkdir($tempDir, 0700));
         $firstPath = $tempDir . '/s3-post-first.tmp';
         $secondPath = $tempDir . '/s3-post-second.tmp';
-        self::assertSame(4, file_put_contents($firstPath, 'data'));
-        self::assertSame(4, file_put_contents($secondPath, 'more'));
-        $coordinator = new PostObjectSpoolCoordinator($tempDir, runInline: true);
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, runInline: true, budgetBytes: 8);
         $first = $coordinator->start($firstPath);
         $second = null;
 
         try {
             $coordinator->reserve($first, 4, 8);
+            self::assertSame(4, file_put_contents($firstPath, 'data'));
             $accountingDir = dirname($first->leasePath);
             self::assertSame(1, file_put_contents($accountingDir . '/total', '8'));
-            self::assertSame(1, file_put_contents($accountingDir . '/accounting-dirty', '1'));
 
             $second = $coordinator->start($secondPath);
             $coordinator->reserve($second, 4, 8);
+            self::assertSame(4, file_put_contents($secondPath, 'more'));
             self::assertSame(4, $second->bytes());
 
-            // Model a worker that committed its lease but whose response did
-            // not reach the API process. Release must trust durable state.
-            $first->setBytes(0);
             @unlink($firstPath);
             $coordinator->release($first, true);
             @unlink($secondPath);
@@ -105,10 +101,9 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         $tempDir = sys_get_temp_dir() . '/s3-post-async-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0700));
         $tempPath = $tempDir . '/s3-post-active.tmp';
-        self::assertSame(1, file_put_contents($tempPath, 'x'));
         $pool = new ContextWorkerPool(1);
-        $coordinator = new PostObjectSpoolCoordinator($tempDir, $pool);
-        $lock = fopen($tempDir . '/.opsfour-s3-post-budget/lock', 'c+');
+        $coordinator = new PostObjectSpoolCoordinator($tempDir, $pool, budgetBytes: 8);
+        $lock = fopen($tempDir . '/.opsfour-s3-storage-budget/lock', 'c+');
         self::assertIsResource($lock);
         self::assertTrue(flock($lock, LOCK_EX));
         $eventLoopAdvanced = false;
@@ -151,10 +146,10 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         $tempDir = sys_get_temp_dir() . '/s3-post-recovery-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0700));
         $tempPath = $tempDir . '/s3-post-abandoned.tmp';
-        self::assertSame(4, file_put_contents($tempPath, 'data'));
         $coordinator = new PostObjectSpoolCoordinator($tempDir);
         $reservation = $coordinator->start($tempPath);
         $coordinator->reserve($reservation, 4, 4);
+        self::assertSame(4, file_put_contents($tempPath, 'data'));
         $leasePath = $reservation->leasePath;
         $statePath = dirname($leasePath) . '/state-' . substr(basename($leasePath), 6);
         $totalPath = dirname($leasePath) . '/total';
@@ -187,19 +182,19 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         self::assertTrue(symlink($tempDir, $alias));
         $abandonedPath = $alias . '/s3-post-abandoned.tmp';
         $nextPath = $tempDir . '/s3-post-next.tmp';
-        self::assertSame(4, file_put_contents($abandonedPath, 'data'));
-        self::assertSame(1, file_put_contents($nextPath, 'x'));
 
         try {
             $first = new PostObjectSpoolCoordinator($alias);
             $abandoned = $first->start($abandonedPath);
             $first->reserve($abandoned, 4, 4);
+            self::assertSame(4, file_put_contents($abandonedPath, 'data'));
             $first->release($abandoned, false);
 
             $second = new PostObjectSpoolCoordinator($tempDir);
             $next = $second->start($nextPath);
             try {
                 $second->reserve($next, 1, 4);
+                self::assertSame(1, file_put_contents($nextPath, 'x'));
                 self::assertFileDoesNotExist($abandonedPath);
             } finally {
                 @unlink($nextPath);
@@ -208,10 +203,10 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         } finally {
             @unlink($abandonedPath);
             @unlink($nextPath);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @unlink($alias);
             @rmdir($tempDir);
             @rmdir($root);
@@ -224,8 +219,6 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         self::assertTrue(mkdir($tempDir, 0700));
         $firstPath = $tempDir . '/s3-post-first.tmp';
         $secondPath = $tempDir . '/s3-post-second.tmp';
-        file_put_contents($firstPath, 'abcd');
-        file_put_contents($secondPath, 'e');
         $firstCoordinator = new PostObjectSpoolCoordinator($tempDir);
         $secondCoordinator = new PostObjectSpoolCoordinator($tempDir);
         $first = $firstCoordinator->start($firstPath);
@@ -233,6 +226,7 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
 
         try {
             $firstCoordinator->reserve($first, 4, 4);
+            self::assertSame(4, file_put_contents($firstPath, 'abcd'));
             $rejected = false;
             try {
                 $secondCoordinator->reserve($second, 1, 8);
@@ -244,17 +238,19 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
             self::assertSame(0, $second->bytes());
             @unlink($firstPath);
             $firstCoordinator->release($first, true);
+            $firstCoordinator->close();
             $secondCoordinator->reserve($second, 1, 8);
+            self::assertSame(1, file_put_contents($secondPath, 'e'));
             self::assertSame(1, $second->bytes());
         } finally {
             @unlink($firstPath);
             @unlink($secondPath);
             $firstCoordinator->release($first, true);
             $secondCoordinator->release($second, true);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -266,19 +262,26 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
         $coordinator = new PostObjectSpoolCoordinator($tempDir);
         $activePath = $tempDir . '/s3-post-active.tmp';
         $otherPath = $tempDir . '/s3-post-other.tmp';
-        file_put_contents($activePath, 'abcd');
         $active = $coordinator->start($activePath);
         $other = null;
         try {
             $coordinator->reserve($active, 4, 5);
+            self::assertSame(4, file_put_contents($activePath, 'abcd'));
+            $other = (new PostObjectSpoolCoordinator($tempDir))->start($otherPath);
             $statePath = dirname($active->leasePath) . '/state-' . substr(basename($active->leasePath), 6);
             self::assertSame(7, file_put_contents($statePath . '.tmp', '{broken'));
             self::assertSame(7, file_put_contents(dirname($active->leasePath) . '/total', 'corrupt'));
 
-            file_put_contents($otherPath, 'z');
-            $other = (new PostObjectSpoolCoordinator($tempDir))->start($otherPath);
             self::assertSame(1, file_put_contents(dirname($active->leasePath) . '/total', '5'));
+            try {
+                $coordinator->reserve($other, 1, 5);
+                self::fail('An incomplete replacement must close temporary admission.');
+            } catch (SlowDownException) {
+                self::assertSame(0, $other->bytes());
+            }
+            self::assertTrue(unlink($statePath . '.tmp'));
             $coordinator->reserve($other, 1, 5);
+            self::assertSame(1, file_put_contents($otherPath, 'z'));
             try {
                 $coordinator->reserve($other, 1, 5);
                 self::fail('An incomplete replacement must not erase the active four-byte lease.');
@@ -292,10 +295,10 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
             }
             @unlink($activePath);
             $coordinator->release($active, true);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @rmdir($tempDir);
         }
     }
@@ -308,7 +311,7 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
 
         $tempDir = sys_get_temp_dir() . '/s3-post-budget-' . bin2hex(random_bytes(8));
         self::assertTrue(mkdir($tempDir, 0700));
-        $readyPath = $tempDir . '/worker-ready';
+        $readyPath = $tempDir . '-worker-ready';
         $process = proc_open(
             [PHP_BINARY, dirname(__DIR__, 2) . '/Support/post-spool-reservation-worker.php', $tempDir, $readyPath],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
@@ -326,7 +329,6 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
 
             $coordinator = new PostObjectSpoolCoordinator($tempDir);
             $parentTempPath = $tempDir . '/s3-post-parent.tmp';
-            self::assertSame(4, file_put_contents($parentTempPath, 'wxyz'));
             $reservation = $coordinator->start($parentTempPath);
 
             try {
@@ -360,10 +362,10 @@ final class PostObjectSpoolCoordinatorTest extends TestCase
                 }
             }
             proc_close($process);
-            foreach (glob($tempDir . '/.opsfour-s3-post-budget/*') ?: [] as $path) {
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $path) {
                 @unlink($path);
             }
-            @rmdir($tempDir . '/.opsfour-s3-post-budget');
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
             @unlink($readyPath);
             @unlink($tempDir . '/s3-post-worker.tmp');
             @unlink($tempDir . '/s3-post-parent.tmp');

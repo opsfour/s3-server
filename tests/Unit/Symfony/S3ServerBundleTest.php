@@ -405,6 +405,7 @@ final class S3ServerBundleTest extends TestCase
         self::assertSame(123, $config->maxConcurrentConnections);
         self::assertSame(456789, $config->requestBodySizeLimit);
         self::assertSame(987654, $config->postSpoolBudgetBytes);
+        self::assertSame(987654, $config->storageTempBudgetBytes);
         self::assertSame(12.5, $config->localWriteWorkerTimeoutSeconds);
         self::assertFalse($config->enforceMinPartSize);
         self::assertTrue($config->allowUnfencedStorageForTests);
@@ -412,6 +413,20 @@ final class S3ServerBundleTest extends TestCase
         self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
+    }
+
+    public function test_configuration_rejects_divergent_explicit_post_and_storage_budgets(): void
+    {
+        $container = new ContainerBuilder();
+        (new S3ServerExtension())->load([[
+            'server' => ['post_spool_budget' => 987654],
+            'storage' => ['temp_budget_bytes' => 987655],
+        ]], $container);
+        $container->compile();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('deprecated and must equal');
+        $this->service($container, S3ServerConfig::class);
     }
 
     #[DataProvider('invalidPositiveServerLimits')]

@@ -418,22 +418,29 @@ fails. Set `S3_RATE_LIMIT=0` only when rate limiting is deliberately disabled.
 
 ### Temporary Upload Storage
 
-Browser POST uploads use `sys_get_temp_dir()`. The default
-`S3_POST_SPOOL_BUDGET=10737418240` caps concurrent browser POST and request-body
-checksum spool bytes for the server and its helper processes in that local
-directory, and returns S3 `SlowDown` (503) when full. Locked lease files recover
-a crashed process's reservations at server startup and every five minutes;
-every later spool reservation also recovers them immediately as a fallback. A
-request carrying both Content-MD5 and literal SigV4 SHA-256 can occupy two
-spools; a full 5-GiB body slightly exceeds the default 10-GiB budget after
-ciphertext-frame overhead and is rejected with 503. Raise the configured budget
-or lower the accepted body size for that case. Set a filesystem quota or use an
-isolated temporary volume with headroom for storage staging and crash files
-before recovery. Do not remove `.opsfour-s3-post-budget` while the server is
-running. Sharing this temporary directory between API processes belongs to a
-later profile and needs its own acceptance evidence. Separately, the prefix
-sweep reclaims abandoned browser POST files older than 24 hours on a later
-upload.
+`S3_STORAGE_TEMP_DIR`, `S3_STORAGE_TEMP_BUDGET` (10 GiB by default), and
+`S3_STORAGE_TEMP_RESERVE` (1 GiB by default) define one node-local contract for
+browser POST/checksum spools and every local, AWS foreground, or Flysystem
+staging writer. `S3_POST_SPOOL_BUDGET` is a deprecated alias: alone it supplies
+the canonical budget, and when both variables are present they must be equal;
+it cannot create a second pool. Processes
+sharing the coordinator root must use identical values. A request carrying
+both Content-MD5 and literal SigV4 SHA-256 can occupy two encrypted spools, so a
+full 5-GiB body slightly exceeds the default logical budget after frame
+overhead and is rejected with S3 `SlowDown` (503). Raise the node budget or
+lower the accepted body size for that case.
+
+Known worst-case sizes are reserved before source ingestion. Unknown streams
+reserve each bounded chunk before writing. Effective availability also shrinks
+immediately when free space on any involved filesystem approaches the physical
+reserve. Startup and later reservations recover only proven abandoned regular
+files whose device, inode, and owner still match the reservation. Unknown,
+replaced, symlinked, wrong-owner, and unaccounted entries are never followed or
+deleted; mutation readiness remains 503 until an operator resolves them. Keep
+`.opsfour-s3-storage-budget` private and do not remove it while the server or
+workers run. This is host-local admission capacity, not a distributed global
+temporary-storage ceiling; PostgreSQL quotas remain authoritative across
+nodes.
 
 Browser POST and request-body checksum spools now write authenticated encrypted
 frames, including for SSE requests. Their files are created with `0600` mode;
@@ -460,18 +467,12 @@ The following limits apply only when evaluating the experimental Flysystem
 profile. They are not configuration guidance for the current local-filesystem
 release target.
 
-Worker-backed Flysystem transfers use `S3_STORAGE_TEMP_DIR` and a separate
-`S3_STORAGE_TEMP_BUDGET=10737418240` reservation limit for API and worker
-staging within the server's worker pools, including copies and multipart
-assembly.
+Worker-backed Flysystem transfers use the same `S3_STORAGE_TEMP_DIR` and
+`S3_STORAGE_TEMP_BUDGET=10737418240` node contract as request and filesystem
+staging, including copies and multipart assembly.
 A multipart assembly larger than this budget returns 503 until the budget is
-raised. The storage lease directory is
-`.opsfour-s3-storage-budget`; keep it private and do not remove it while the
-server or its Flysystem workers run. Abandoned reservations are recovered when
-a later transfer starts. The browser POST and Flysystem budgets
-are separate, so a shared temporary volume must accommodate both limits plus
-other temporary writers,
-or enforce a smaller volume quota and suitable admission limits.
+raised. API and worker processes consume the same aggregate total; capacity is
+not multiplied by worker pool or storage tier.
 Worker-backed Flysystem GETs stream 64-KiB blocks directly through a separate
 read-worker pool, so the staging budget does not cap download size. Each active
 GET occupies a read worker until completion or cancellation; a worker waiting

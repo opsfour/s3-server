@@ -63,7 +63,10 @@ final class ChecksumValidationMiddleware implements Middleware
             throw new BadDigestException('x-amz-content-sha256 must be a 64-character hexadecimal SHA-256 digest.');
         }
 
-        $tempPath = $this->spool->create('s3-sha256-');
+        $tempPath = $this->spool->create(
+            's3-sha256-',
+            RequestBodySpool::declaredPlaintextBytes($request),
+        );
         $reader = null;
         $primaryFailure = null;
 

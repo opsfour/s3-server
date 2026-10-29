@@ -121,7 +121,10 @@ final class ContentMd5Middleware implements Middleware
             return $requestHandler->handleRequest($request);
         }
 
-        $tempPath = $this->spool->create('s3-md5-');
+        $tempPath = $this->spool->create(
+            's3-md5-',
+            RequestBodySpool::declaredPlaintextBytes($request),
+        );
         $reader = null;
         $primaryFailure = null;
 

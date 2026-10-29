@@ -35,8 +35,20 @@ final class S3ServerExtension extends Extension
      */
     public function load(array $configs, ContainerBuilder $container): void
     {
+        $canonicalTempBudgetConfigured = false;
+        foreach ($configs as $rawConfig) {
+            if (is_array($rawConfig)
+                && is_array($rawConfig['storage'] ?? null)
+                && array_key_exists('temp_budget_bytes', $rawConfig['storage'])) {
+                $canonicalTempBudgetConfigured = true;
+                break;
+            }
+        }
         $configuration = new Configuration();
         $config = $this->processConfiguration($configuration, $configs);
+        if (($config['server']['post_spool_budget'] ?? null) !== null && ! $canonicalTempBudgetConfigured) {
+            $config['storage']['temp_budget_bytes'] = $config['server']['post_spool_budget'];
+        }
         if ($config['metadata']['driver'] === 'sqlite' && $config['metadata']['path'] === ':memory:') {
             $config['parallel']['sqlite_workers'] = 0;
         }

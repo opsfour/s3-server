@@ -40,6 +40,9 @@ use OpsFour\S3Server\Event\S3Event;
 use OpsFour\S3Server\ObjectLock\ObjectLockRequestApplier;
 use OpsFour\S3Server\Quota\QuotaManager;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\KnownSizeStorageCapabilities;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -81,6 +84,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
         private readonly ?LocalFencedObjectWriter $localFencedWriter = null,
         private readonly ?LocalObjectWriteLeaseGuardFactory $localLeaseFactory = null,
         private readonly ?AwsS3ForegroundObjectWriter $awsObjectWriter = null,
+        private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
     ) {
         $this->storageTiers = $storageTiers ?? StorageTierRegistry::single($storage);
         if (($localFencedWriter === null) !== ($localLeaseFactory === null)) {
@@ -194,6 +198,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
         $awsStage = null;
         $awsDispatchToken = null;
         $bufferedWorkLock = null;
+        $sseCapacity = null;
         $requestFailure = null;
         $publicationCommitted = false;
         try {
@@ -212,6 +217,14 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                     $key,
                     $ownershipDecision,
                     $declaredLength,
+                );
+            }
+            if ($encryptionMode !== null && $this->tempBudget !== null
+                && ($this->awsObjectWriter !== null || $this->localFencedWriter !== null
+                    || KnownSizeStorageCapabilities::storage($this->storage) !== null)) {
+                $sseCapacity = $this->tempBudget->reserveCapacity(
+                    $declaredLength ?? $this->maxEncryptedObjectSize,
+                    'sse_object',
                 );
             }
             if ($encryptionMode !== null && $this->awsObjectWriter !== null) {
@@ -236,6 +249,8 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                     $awsReserved,
                     $awsStage,
                     $awsDispatchToken,
+                    $declaredLength,
+                    null,
                 );
             } else {
                 $nonAwsBufferedWorkLock = $this->awsObjectWriter === null
@@ -258,7 +273,18 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                     } else {
                         [$encMeta, $ciphertext] = $this->encryptPayload($request, $plaintext, $encryptionMode);
                     }
-                    $encryptedWrite = $this->writeObject($bucketInfo, $key, $objectOwnerId, new \Amp\ByteStream\ReadableBuffer($ciphertext), $localLease, $awsReserved, $awsStage, $awsDispatchToken);
+                    $encryptedWrite = $this->writeObject(
+                        $bucketInfo,
+                        $key,
+                        $objectOwnerId,
+                        new \Amp\ByteStream\ReadableBuffer($ciphertext),
+                        $localLease,
+                        $awsReserved,
+                        $awsStage,
+                        $awsDispatchToken,
+                        strlen($ciphertext),
+                        $sseCapacity,
+                    );
                     if ($encryptedWrite->size !== strlen($ciphertext)
                         || ! hash_equals(md5($ciphertext), strtolower($encryptedWrite->md5Hex))) {
                         $this->deleteUncommittedPath($bucket, $encryptedWrite->path, $objectOwnerId);
@@ -745,6 +771,9 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                 static function () use ($localLease): void {
                     $localLease?->close();
                 },
+                function () use ($sseCapacity): void {
+                    $this->releaseUnusedCapacity($sseCapacity);
+                },
             );
         }
     }
@@ -989,13 +1018,19 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
         ?AwsS3ForegroundObjectReservation &$awsReserved,
         ?AwsS3ForegroundObjectStage &$awsStage,
         ?LocalObjectWriteDispatchToken &$awsDispatchToken,
+        ?int $knownSize,
+        ?StorageTempReservation $capacity,
     ): StorageWriteResult {
         if ($this->awsObjectWriter !== null) {
             $awsReserved ??= $this->awsObjectWriter->reserve($bucket, $key, $ownerId);
-            $awsStage = $this->awsObjectWriter->stage($awsReserved, $body);
+            $awsStage = $this->awsObjectWriter->stage($awsReserved, $body, $knownSize, $capacity);
             return $awsStage->result;
         }
         if ($this->localFencedWriter === null || $this->localLeaseFactory === null) {
+            $knownSizeStorage = KnownSizeStorageCapabilities::storage($this->storage);
+            if ($knownSize !== null && $knownSizeStorage !== null) {
+                return $knownSizeStorage->putObjectKnownSize($bucket->name, $key, $body, $knownSize, $capacity);
+            }
             return $this->storage->putObject($bucket->name, $key, $body);
         }
         $tierName = $this->storageTiers->defaultTier()->name;
@@ -1019,7 +1054,14 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
             purpose: 'put_object',
         );
         $localLease = $this->localLeaseFactory->reserve($planned);
-        $outcome = $this->localFencedWriter->publishWithLease($localLease->reservedIntent(), $key, $body, $localLease);
+        $outcome = $this->localFencedWriter->publishWithLease(
+            $localLease->reservedIntent(),
+            $key,
+            $body,
+            $localLease,
+            knownSize: $knownSize,
+            capacity: $capacity,
+        );
         if ($outcome->state !== LocalObjectWriteOutcome::COMPLETED || $outcome->result === null) {
             throw $outcome->error ?? new \RuntimeException('Local object publication did not return a definite result.');
         }
@@ -1037,6 +1079,18 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                 'The object write lost its publication authority before metadata publication.',
             );
+        }
+    }
+
+    private function releaseUnusedCapacity(?StorageTempReservation $capacity): void
+    {
+        if ($capacity === null || ! $capacity->isOpen()) {
+            return;
+        }
+        try {
+            $this->tempBudget?->cleanup($capacity);
+        } catch (\Throwable) {
+            $capacity->close();
         }
     }
 

@@ -54,7 +54,10 @@ it through shell history or process listings.
 | `--port` | `9000` | Listen port |
 | `--storage-path` | (required) | Root directory for object data |
 | `--storage-driver` | `filesystem` | `filesystem`, `aws-s3`, `flysystem`, or `memory` |
-| `--storage-temp-dir` | system temp | Local Flysystem staging directory |
+| `--storage-temp-dir` | `sys_get_temp_dir()/opsfour-s3-server-temp` | Canonical node-local coordinator root shared by request spools and every storage staging writer |
+| `--storage-temp-budget` | `10737418240` | Aggregate node-local temporary byte budget shared by all API and worker processes |
+| `--storage-temp-reserve` | `1073741824` | Physical free-space safety reserve retained on every involved staging filesystem |
+| `--post-spool-budget` | unset | Deprecated alias for `--storage-temp-budget`; alone it supplies the canonical value, and when both are set they must match |
 | `--flysystem-workers` | `0` | Bounded remote-storage workers; standalone Flysystem requires at least 1 |
 | `--backing-bucket` | - | Backing S3 bucket for standalone Flysystem |
 | `--backing-endpoint` | AWS default | HTTPS backing S3-compatible endpoint |
