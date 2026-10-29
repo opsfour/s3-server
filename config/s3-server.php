@@ -23,6 +23,8 @@ return [
     'cluster_id' => env('S3_CLUSTER_ID'),
     'cluster_node_id' => env('S3_CLUSTER_NODE_ID'),
     'cluster_database_id' => env('S3_CLUSTER_DATABASE_ID'),
+    'cluster_roles' => env('S3_CLUSTER_ROLES'),
+    'cluster_required_roles' => env('S3_CLUSTER_REQUIRED_ROLES'),
 
     // UNSAFE TEST ONLY: bypass the storage late-write fence startup gate.
     'allow_unfenced_storage_for_tests' => EnvironmentBoolean::boolean('S3_ALLOW_UNFENCED_STORAGE_FOR_TESTS', false),

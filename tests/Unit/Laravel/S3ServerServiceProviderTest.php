@@ -58,11 +58,15 @@ final class S3ServerServiceProviderTest extends TestCase
             'cluster_id' => 'cluster-a',
             'cluster_node_id' => 'node-a',
             'cluster_database_id' => str_repeat('d', 32),
+            'cluster_roles' => 'api,reconcile',
+            'cluster_required_roles' => 'webhook,reconcile,api',
         ])->make(S3ServerConfig::class);
 
         self::assertSame('cluster-a', $config->clusterId);
         self::assertSame('node-a', $config->clusterNodeId);
         self::assertSame(str_repeat('d', 32), $config->clusterDatabaseId);
+        self::assertSame(['api', 'reconcile'], $config->clusterRoles);
+        self::assertSame(['api', 'reconcile', 'webhook'], $config->clusterRequiredRoles);
     }
 
     public function test_artisan_serve_checks_postgres_driver_before_resolving_metadata(): void

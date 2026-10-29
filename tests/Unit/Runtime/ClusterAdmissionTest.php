@@ -29,6 +29,8 @@ use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
 use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
+use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
@@ -208,7 +210,7 @@ final class ClusterAdmissionTest extends TestCase
         $this->expectExceptionMessage('explicit qualified cluster capability');
 
         ClusterCapabilityFingerprint::fromRuntime(
-            new S3ServerConfig(storagePath: '/', clusterId: 'cluster-a', clusterNodeId: 'node-a', clusterDatabaseId: str_repeat('d', 32)),
+            new S3ServerConfig(storagePath: '/', clusterId: 'cluster-a', clusterNodeId: 'node-a', clusterDatabaseId: str_repeat('d', 32), clusterRoles: 'api,reconcile'),
             StorageTierRegistry::single(new InMemoryBackend()),
             null,
             'public',
@@ -236,6 +238,7 @@ final class ClusterAdmissionTest extends TestCase
                 clusterId: 'cluster-a',
                 clusterNodeId: 'node-a',
                 clusterDatabaseId: str_repeat('e', 32),
+                clusterRoles: 'api,reconcile',
             ),
             StorageTierRegistry::single(new ClusterAdmissionStorageBackend()),
             null,
@@ -256,6 +259,7 @@ final class ClusterAdmissionTest extends TestCase
                 clusterId: 'cluster-a',
                 clusterNodeId: 'node-a',
                 clusterDatabaseId: str_repeat('d', 32),
+                clusterRoles: 'api,reconcile',
             ),
             StorageTierRegistry::single(new ClusterAdmissionStorageBackend()),
             null,
@@ -295,6 +299,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
         );
         $first = new StorageTierRegistry([
             new StorageTier('z-cold', new ClusterAdmissionStorageBackend()),
@@ -311,6 +316,21 @@ final class ClusterAdmissionTest extends TestCase
         );
     }
 
+    public function test_assigned_roles_are_process_local_while_required_role_policy_is_shared(): void
+    {
+        $api = $this->fingerprint('cluster-a', 'node-a', roles: 'api');
+        $worker = $this->fingerprint('cluster-a', 'node-b', roles: 'transition');
+        $differentPolicy = $this->fingerprint(
+            'cluster-a',
+            'node-c',
+            roles: 'transition',
+            requiredRoles: 'api,reconcile',
+        );
+
+        self::assertSame($api->digest('roles'), $worker->digest('roles'));
+        self::assertNotSame($api->digest('roles'), $differentPolicy->digest('roles'));
+    }
+
     public function test_database_identity_and_exact_compatibility_values_affect_their_categories(): void
     {
         $base = new S3ServerConfig(
@@ -318,6 +338,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             baseDomain: 's3.example.test',
             websiteHostPattern: '*.website.example.test',
         );
@@ -326,6 +347,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('e', 32),
+            clusterRoles: 'api,reconcile',
             baseDomain: 'objects.example.test',
             websiteHostPattern: '*.alternate.example.test',
             quota: new QuotaConfig(1, 2, 3, 4, 5, 6, 7, 8),
@@ -361,7 +383,7 @@ final class ClusterAdmissionTest extends TestCase
 
         self::assertNotSame($baseFingerprint->digest('database'), $changedFingerprint->digest('database'));
         self::assertNotSame($baseFingerprint->digest('compatibility'), $changedFingerprint->digest('compatibility'));
-        self::assertNotSame(
+        self::assertSame(
             $baseFingerprint->digest('compatibility'),
             $notificationDisabledFingerprint->digest('compatibility'),
         );
@@ -374,6 +396,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
         );
         $tiers = StorageTierRegistry::single(new ClusterAdmissionStorageBackend());
         $digest = static fn(S3ServerConfig $candidate): string => ClusterCapabilityFingerprint::fromRuntime(
@@ -416,6 +439,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
         );
         foreach (['', str_repeat('x', 1025)] as $identity) {
             try {
@@ -515,6 +539,14 @@ final class ClusterAdmissionTest extends TestCase
         // normal health revalidation interval remains fresh.
         $controller = new ClusterAdmissionController($store, $this->fingerprint('cluster-a', 'node-a'), 60.0);
         $controller->admitInitial();
+        $roleController = new ClusterRoleController($store, new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
+        ));
+        $roleController->registerReady();
         $store->unavailable = true;
         $calls = new ClusterAdmissionCallState();
         $handler = new class ($calls) implements RequestHandler {
@@ -527,11 +559,13 @@ final class ClusterAdmissionTest extends TestCase
         };
 
         try {
-            (new ClusterAdmissionMiddleware($controller))->handleRequest($this->request(), $handler);
+            (new ClusterAdmissionMiddleware($controller, $roleController))->handleRequest($this->request(), $handler);
             self::fail('Expected closed cluster admission.');
         } catch (SlowDownException) {
         }
         self::assertFalse($calls->called);
+        self::assertSame(1, $store->membershipWithdrawals);
+        self::assertFalse($store->membershipReady);
 
         $health = (new HealthCheckHandler(clusterAdmission: $controller))->handleRequest($this->request());
         self::assertSame(503, $health->getStatus());
@@ -544,7 +578,7 @@ final class ClusterAdmissionTest extends TestCase
         self::assertSame('node-a', $payload['cluster']['node_id']);
         self::assertMatchesRegularExpression('/^[a-f0-9]{32}$/D', $payload['cluster']['incarnation_id']);
         self::assertSame(ClusterCapabilityFingerprint::PROTOCOL, $payload['cluster']['protocol']);
-        self::assertSame([ClusterCapabilityFingerprint::ROLES], $payload['cluster']['roles']);
+        self::assertSame(['api', 'reconcile'], $payload['cluster']['roles']);
         self::assertArrayNotHasKey('category', $payload['cluster']);
     }
 
@@ -569,6 +603,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             perClientRateLimit: 0,
         ));
         $server->addMiddleware(new ClusterAdmissionCustomAuthenticationMiddleware());
@@ -585,6 +620,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             perClientRateLimit: 0,
         ));
         $store = new ClusterAdmissionMemoryStore();
@@ -605,6 +641,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             perClientRateLimit: 0,
         );
 
@@ -631,6 +668,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             metadataDriver: 'postgres',
             metadataDsn: $dsn,
             perClientRateLimit: 0,
@@ -652,6 +690,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-b',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             metadataDriver: 'postgres',
             metadataDsn: $dsn,
             perClientRateLimit: 0,
@@ -682,6 +721,7 @@ final class ClusterAdmissionTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
             perClientRateLimit: 0,
         );
         $backend = new ClusterAdmissionStorageBackend();
@@ -762,6 +802,8 @@ final class ClusterAdmissionTest extends TestCase
         bool $strictBucketNaming = true,
         ?EncryptionServiceInterface $encryption = null,
         string $databaseIdentity = 'dddddddddddddddddddddddddddddddd',
+        string $roles = 'api,reconcile',
+        ?string $requiredRoles = null,
     ): ClusterCapabilityFingerprint {
         return ClusterCapabilityFingerprint::fromRuntime(
             new S3ServerConfig(
@@ -769,6 +811,8 @@ final class ClusterAdmissionTest extends TestCase
                 clusterId: $clusterId,
                 clusterNodeId: $nodeId,
                 clusterDatabaseId: $databaseIdentity,
+                clusterRoles: $roles,
+                clusterRequiredRoles: $requiredRoles,
                 strictBucketNaming: $strictBucketNaming,
             ),
             StorageTierRegistry::single(new ClusterAdmissionStorageBackend()),
@@ -786,7 +830,7 @@ final class ClusterAdmissionTest extends TestCase
     }
 }
 
-final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore
+final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore, ClusterMembershipStore
 {
     /** @var array<string, string>|null */
     private ?array $digests = null;
@@ -796,6 +840,10 @@ final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore
     public bool $delayInitialization = false;
     public float $comparisonDelaySeconds = 0.0;
     public int $compareCalls = 0;
+    public int $membershipWithdrawals = 0;
+    public bool $membershipReady = false;
+    /** @var list<string> */
+    private array $membershipRoles = [];
 
     public function clusterDatabaseSchema(): string
     {
@@ -840,6 +888,35 @@ final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore
         }
 
         return ClusterAdmissionResult::matched('database-id');
+    }
+
+    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, float $ttlSeconds): void
+    {
+        $this->membershipRoles = $roles;
+        $this->membershipReady = $ready;
+    }
+
+    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, float $ttlSeconds): bool
+    {
+        $this->membershipReady = $ready;
+
+        return true;
+    }
+
+    public function withdrawClusterMember(string $clusterId, string $nodeId, string $incarnationId): void
+    {
+        ++$this->membershipWithdrawals;
+        $this->membershipReady = false;
+    }
+
+    public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
+    {
+        return $this->membershipReady;
+    }
+
+    public function liveClusterRoles(string $clusterId): array
+    {
+        return $this->membershipReady ? $this->membershipRoles : [];
     }
 }
 

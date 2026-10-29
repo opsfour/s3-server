@@ -217,8 +217,9 @@ The DML-only serving role does not need trigger-creation rights.
 | 42 (SQLite) / 45 (PostgreSQL) / 50 (MySQL) | Add nullable legacy-safe object size/SHA-256 evidence, immutable AWS seal reservations, separate open-attempt and permanent-seal counters, and trigger-enforced atomic open-to-seal transitions. |
 | 46 (PostgreSQL) | Add a stable singleton database identity plus the separately replaceable immutable cluster-admission contract with secret-free per-category digests. |
 | 47 (PostgreSQL) | Bind lifecycle, notification, transition, restore, storage-garbage, multipart-intent, and object-intent claims to a process-derived worker ID, database-time heartbeat/expiry, and monotonically increasing generation. The migration expires and increments every pre-owner active generation. |
+| 48 (PostgreSQL) | Add per-process cluster membership with canonical roles, ready state, database-time heartbeat, and authoritative expiry plus a bounded live-coverage index. |
 
-SQLite currently uses schema version `42`; PostgreSQL uses `47`, and MySQL
+SQLite currently uses schema version `42`; PostgreSQL uses `48`, and MySQL
 uses `50`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
@@ -236,7 +237,10 @@ only during `metadata:migrate`. The migrator prints that non-secret value for
 `S3_CLUSTER_DATABASE_ID`. A cluster serving role needs only `SELECT` on the
 identity row and `SELECT, INSERT` on `s3_cluster_admission`; it does not need
 `UPDATE` or `DELETE` on either table. Contract replacement is a stopped-cluster
-maintenance operation performed by the DDL-capable role. The credential
+maintenance operation performed by the DDL-capable role. PostgreSQL v48 also
+requires `SELECT, INSERT, UPDATE` on `s3_cluster_membership` so serving
+processes can register, heartbeat, withdraw readiness, and evaluate live role
+coverage; it does not require `DELETE`. The credential
 migrator similarly creates `s3_credential_store_identity`; serving reads it but
 never changes it, while normal credential CRUD retains its existing grants on
 `s3_credentials`.
@@ -249,6 +253,11 @@ Completion, retry, and cleanup require the same work ID, worker ID, and
 generation; zero affected rows means ownership was lost. Metadata-only claim
 and renewal transactions retry SQLSTATE `40001` and `40P01` at most three times
 from fresh transactions. Provider I/O is never included in that retry loop.
+PostgreSQL v48 records one membership row per cluster/node/incarnation. Serving
+processes renew it using `clock_timestamp()` and advertise their entire
+canonical assigned-role set atomically. Only ready rows whose database-time
+expiry remains in the future contribute live role coverage; host clocks and
+cached coverage never authorize claims or reconciliation-dependent writes.
 MySQL v31 changes three indexed identifier columns and may wait for metadata
 locks or rebuild their indexes on a populated database. The v32 dispatch-token
 column also needs a migration-time and lock check on a representative copy.

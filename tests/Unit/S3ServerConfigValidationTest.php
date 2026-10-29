@@ -47,6 +47,7 @@ final class S3ServerConfigValidationTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: 'node-a',
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
         );
         $copy = $config->with(['port' => 9001]);
 

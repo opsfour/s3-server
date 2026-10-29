@@ -329,8 +329,9 @@ final class PostgresClusterWorkFencingTest extends TestCase
             $this->firstPool->execute("ALTER TABLE {$table} DROP COLUMN claim_worker_id, DROP COLUMN claim_heartbeat_at");
         }
         $migration = PostgresSchema::getMigrationStatements(46);
-        self::assertCount(1, $migration);
-        $this->firstPool->execute($migration[0]);
+        $v47 = array_values(array_filter($migration, static fn(string $sql): bool => str_contains($sql, 'ALTER TABLE s3_locks ADD COLUMN')));
+        self::assertCount(1, $v47);
+        $this->firstPool->execute($v47[0]);
         $this->firstPool->execute("INSERT INTO s3_schema_version (version, description) VALUES (47, 'Schema version 47')");
 
         foreach (['s3_locks' => ['heartbeat_at', 'lease_generation'], 's3_notification_queue' => ['claim_worker_id', 'claim_heartbeat_at'], 's3_tier_transition_jobs' => ['claim_worker_id', 'claim_heartbeat_at'], 's3_restore_jobs' => ['claim_worker_id', 'claim_heartbeat_at'], 's3_storage_garbage' => ['claim_worker_id', 'claim_heartbeat_at'], 's3_multipart_write_intents' => ['claim_worker_id', 'claim_heartbeat_at'], 's3_object_write_intents' => ['claim_worker_id', 'claim_heartbeat_at']] as $table => $columns) {

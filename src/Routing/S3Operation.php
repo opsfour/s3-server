@@ -89,6 +89,20 @@ enum S3Operation: string
     case AbortMultipartUpload = 'AbortMultipartUpload';
     case ListParts = 'ListParts';
 
+    /** Whether accepting this operation requires a live intent reconciler. */
+    public function requiresReconciliationCoverage(): bool
+    {
+        return match ($this) {
+            self::PutObject,
+            self::CopyObject,
+            self::PostObject,
+            self::UploadPart,
+            self::UploadPartCopy,
+            self::CompleteMultipartUpload => true,
+            default => false,
+        };
+    }
+
     public function usesExistingObjectOwner(): bool
     {
         return match ($this) {

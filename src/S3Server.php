@@ -42,6 +42,7 @@ use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
 use OpsFour\S3Server\Middleware\ChecksumValidationMiddleware;
 use OpsFour\S3Server\Middleware\ClusterAdmissionMiddleware;
+use OpsFour\S3Server\Middleware\ClusterRoleAdmissionMiddleware;
 use OpsFour\S3Server\Middleware\ContentMd5Middleware;
 use OpsFour\S3Server\Middleware\CorsMiddleware;
 use OpsFour\S3Server\Middleware\CurrentObjectReadAuthorizationMiddleware;
@@ -69,6 +70,8 @@ use OpsFour\S3Server\Routing\S3DispatchHandler;
 use OpsFour\S3Server\Routing\S3Router;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
 use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\LocalStorageRootLocks;
 use OpsFour\S3Server\Runtime\PostgresApiDriverGuard;
@@ -179,6 +182,9 @@ final class S3Server
 
     private bool $localObjectCollectionRunning = false;
 
+    /** Latches an unexpected assigned durable-role loop exit until process shutdown. */
+    private bool $durableRoleLoopFailed = false;
+
     private ?LocalObjectWriteIntentCollector $localObjectIntentCollector = null;
 
     private ?AwsS3ObjectWriteIntentCollector $awsObjectIntentCollector = null;
@@ -207,6 +213,8 @@ final class S3Server
     private ?StorageTierRegistry $storageTiers = null;
 
     private ?ClusterAdmissionController $clusterAdmission = null;
+
+    private ?ClusterRoleController $clusterRoles = null;
 
     private ?ClusterWorkFencingStore $clusterWorkFencing = null;
 
@@ -304,6 +312,22 @@ final class S3Server
         if ($this->config->clusterEnabled()
             && ($this->clusterWorkFencing === null || $this->clusterWorkerIdentity === null)) {
             throw new \LogicException('Refusing to start cluster mode without PostgreSQL work fencing.');
+        }
+        if ($this->config->clusterEnabled() && $this->clusterRoles === null) {
+            throw new \LogicException('Refusing to start cluster mode without PostgreSQL role membership.');
+        }
+        if ($this->config->clusterEnabled()) {
+            $this->clusterRoles?->assertBoundToConfig($this->config);
+            $this->clusterRoles?->assertStore(MetadataDriverStartupGuard::clusterPostgresStore(
+                $this->metadata,
+                $this->config->metadataDriver,
+                $this->config->metadataDsn,
+            ));
+        }
+        if ($this->config->clusterEnabled()
+            && ! $this->config->hasClusterRole(ClusterRoleSet::API)
+            && $this->config->metricsBearerToken === null) {
+            throw new \LogicException('Worker-only cluster processes require an authenticated metrics bearer token.');
         }
 
         if ($this->config->perClientRateLimit > 0 && $this->metadata === null) {
@@ -522,16 +546,10 @@ final class S3Server
 
                 // 2. Build the S3 dispatch handler (innermost layer).
                 // Reads s3.operation attribute (set by S3AttributeMiddleware) and dispatches.
-                $dispatchHandler = new S3DispatchHandler(
-                    handlerRegistry: $this->handlerRegistry,
+                $httpSurfaces = $this->runtimeHttpSurfaces();
+                $stack = $this->roleAwareS3Fallback(
+                    new S3DispatchHandler(handlerRegistry: $this->handlerRegistry),
                 );
-
-                // 3. Stack middleware (outermost first).
-                // Order: RequestId -> Metrics -> ErrorHandling -> Logging ->
-                //        ExpectContinue -> RateLimit -> WebsiteHosting ->
-                //        S3Attribute -> Cors -> [Auth] ->
-                //        Policy -> ACL -> ContentMd5 -> ChecksumValidation -> S3Dispatch
-                $stack = $this->buildMiddlewareStack($dispatchHandler);
 
                 // 4. Wire Amp Router for reserved management paths. All other
                 // paths use the S3 fallback so arbitrary HTTP methods reach the
@@ -559,6 +577,7 @@ final class S3Server
                             : null,
                         awsOperationalState: $this->awsOperationalState,
                         clusterAdmission: $this->clusterAdmission,
+                        clusterRoles: $this->clusterRoles,
                     ),
                     rateLimited: false,
                     bypassForwardedForValidation: true,
@@ -569,7 +588,7 @@ final class S3Server
                     $this->config->metricsBearerToken,
                     $this->awsOperationalState,
                 )));
-                if ($this->adminCredentialApiHandler !== null) {
+                if (in_array('admin', $httpSurfaces, true) && $this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler(
                         $this->adminCredentialApiHandler,
                         clusterGated: true,
@@ -577,7 +596,7 @@ final class S3Server
                     $router->addRoute('POST', '/.admin/credentials', $adminCredentials);
                     $router->addRoute('DELETE', '/.admin/credentials/{accessKeyId}', $adminCredentials);
                 }
-                if ($this->adminQuotaApiHandler !== null) {
+                if (in_array('admin', $httpSurfaces, true) && $this->adminQuotaApiHandler !== null) {
                     $adminQuotas = $this->managementHandler(
                         $this->adminQuotaApiHandler,
                         clusterGated: true,
@@ -704,6 +723,7 @@ final class S3Server
             }
         } catch (\Throwable $error) {
             $this->starting = false;
+            $this->clusterRoles?->withdraw();
             $this->awsOperationalState?->invalidateStartupValidation();
             if (! $this->shutdown) {
                 $this->handlerRegistry->rollbackFreeze($registryFreezeToken);
@@ -737,6 +757,30 @@ final class S3Server
             // 9. Start background cleanup fiber for rate limit + notification queue.
             $this->backgroundCancellation = $preparedBackgroundCancellation;
             $backgroundCancellation = $this->backgroundCancellation->getCancellation();
+            if ($this->clusterRoles !== null) {
+                $this->backgroundFutures[] = \Amp\async(function () use ($backgroundCancellation): void {
+                    try {
+                        while (! $backgroundCancellation->isRequested()) {
+                            \Amp\delay(5.0, cancellation: $backgroundCancellation);
+                            $backgroundCancellation->throwIfRequested();
+                            if ($this->durableRoleLoopFailed
+                                || ($this->config->hasClusterRole(ClusterRoleSet::LIFECYCLE)
+                                    && ! ($this->lifecycleRunner?->isRunning() ?? false))
+                                || ($this->config->hasClusterRole(ClusterRoleSet::WEBHOOK)
+                                    && ! ($this->notificationProcessor?->isRunning() ?? false))) {
+                                $this->clusterRoles?->withdraw();
+                                continue;
+                            }
+                            if (! $this->backgroundWorkAdmitted()) {
+                                continue;
+                            }
+                            $this->clusterRoles?->maintainReady();
+                        }
+                    } catch (\Amp\CancelledException) {
+                        // Normal shutdown; the row is withdrawn or expires by database time.
+                    }
+                });
+            }
             $spoolCoordinator = $this->postObjectSpoolCoordinator;
             if ($this->metadata !== null || $spoolCoordinator !== null) {
                 $metadata = $this->metadata;
@@ -748,7 +792,7 @@ final class S3Server
                             \Amp\delay(300, cancellation: $backgroundCancellation);
                             $backgroundCancellation->throwIfRequested();
 
-                            if ($spoolCoordinator !== null) {
+                            if ($spoolCoordinator !== null && $this->config->hasClusterRole(ClusterRoleSet::API)) {
                                 try {
                                     $spoolCoordinator->recoverAbandoned();
                                 } catch (\Throwable $e) {
@@ -760,13 +804,15 @@ final class S3Server
                             }
                             if ($metadata !== null) {
                                 try {
-                                    if ($this->backgroundWorkAdmitted()) {
+                                    if ($this->roleWorkAdmitted(ClusterRoleSet::API)) {
                                         $metadata->rateLimitCleanup(3600);
                                     }
-                                    if ($this->backgroundWorkAdmitted()) {
+                                    if ($this->roleWorkAdmitted(ClusterRoleSet::WEBHOOK)) {
                                         $metadata->cleanupOldNotifications(86400);
                                     }
-                                    $this->flushAccessLogsIfAdmitted();
+                                    if ($this->config->hasClusterRole(ClusterRoleSet::API)) {
+                                        $this->flushAccessLogsIfAdmitted();
+                                    }
                                 } catch (\Throwable $e) {
                                     $this->logger->warning('Background cleanup failed.', [
                                         'component' => 'metadata_cleanup',
@@ -796,12 +842,12 @@ final class S3Server
                                         \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
                                         continue;
                                     }
-                                    if (! $this->backgroundWorkAdmitted()) {
+                                    if (! $this->roleWorkAdmitted(ClusterRoleSet::RECONCILE)) {
                                         \Amp\delay(min(5.0, $this->config->lifecycleIntervalSeconds), cancellation: $backgroundCancellation);
                                         continue;
                                     }
                                     for ($claim = 0; $claim < 100; ++$claim) {
-                                        if (! $this->backgroundWorkAdmitted()) {
+                                        if (! $this->roleWorkAdmitted(ClusterRoleSet::RECONCILE)) {
                                             break;
                                         }
                                         if ($collector->collect(1, $backgroundCancellation) === 0) {
@@ -820,13 +866,16 @@ final class S3Server
                             }
                         } catch (\Amp\CancelledException) {
                             // Normal shutdown; unresolved attempts remain in SQL.
+                        } finally {
+                            $this->handleAssignedRoleLoopExit('object_intent_reconciler', $backgroundCancellation);
                         }
                     });
                 }
             }
 
-            // 10. Start physical tier transition / restore background processing.
-            if ($transitionExecutor !== null && $restoreExecutor !== null && $restoreGc !== null && $storageGc !== null) {
+            // 10. Start only the physical worker roles assigned to this process.
+            if ($transitionExecutor !== null || $restoreExecutor !== null || $restoreGc !== null
+                || $storageGc !== null || $multipartIntentGc !== null) {
                 $this->tieringRunning = true;
                 $this->backgroundFutures[] = \Amp\async(function () use (
                     $transitionExecutor,
@@ -840,56 +889,70 @@ final class S3Server
                         while ($this->tieringRunning) {
                             try {
                                 if ($this->clusterAdmission === null) {
-                                    $transitionStats = $transitionExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
-                                    $restoreStats = $restoreExecutor->processNext($this->config->lifecycleBatchSize, $backgroundCancellation);
+                                    \assert($transitionExecutor !== null);
+                                    \assert($restoreExecutor !== null);
+                                    \assert($restoreGc !== null);
+                                    \assert($storageGc !== null);
+                                    $transitionStats = $transitionExecutor->processNext(
+                                        $this->config->lifecycleBatchSize,
+                                        $backgroundCancellation,
+                                    );
+                                    $restoreStats = $restoreExecutor->processNext(
+                                        $this->config->lifecycleBatchSize,
+                                        $backgroundCancellation,
+                                    );
                                     $gcStats = $restoreGc->collect($this->config->lifecycleBatchSize);
                                     $storageGc->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
                                     $multipartIntentGc?->collect($this->config->lifecycleBatchSize, $backgroundCancellation);
                                 } else {
-                                    if (! $this->backgroundWorkAdmitted()) {
-                                        \Amp\delay($this->config->lifecycleIntervalSeconds, cancellation: $backgroundCancellation);
-                                        continue;
-                                    }
                                     $transitionStats = ['processed' => 0, 'completed' => 0, 'retried' => 0, 'deadLetter' => 0];
                                     $restoreStats = ['processed' => 0, 'completed' => 0, 'retried' => 0, 'deadLetter' => 0];
                                     $gcStats = ['scanned' => 0, 'expired' => 0, 'failed' => 0];
-                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
-                                        if (! $this->backgroundWorkAdmitted()) {
-                                            break;
-                                        }
-                                        $result = $transitionExecutor->processNext(1, $backgroundCancellation);
-                                        foreach ($result as $name => $count) {
-                                            $transitionStats[$name] += $count;
-                                        }
-                                        if ($result['processed'] === 0) {
-                                            break;
-                                        }
-                                    }
-                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
-                                        if (! $this->backgroundWorkAdmitted()) {
-                                            break;
-                                        }
-                                        $result = $restoreExecutor->processNext(1, $backgroundCancellation);
-                                        foreach ($result as $name => $count) {
-                                            $restoreStats[$name] += $count;
-                                        }
-                                        if ($result['processed'] === 0) {
-                                            break;
+                                    if ($transitionExecutor !== null) {
+                                        for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                            if (! $this->roleWorkAdmitted(ClusterRoleSet::TRANSITION)) {
+                                                break;
+                                            }
+                                            $result = $transitionExecutor->processNext(1, $backgroundCancellation);
+                                            foreach ($result as $name => $count) {
+                                                $transitionStats[$name] += $count;
+                                            }
+                                            if ($result['processed'] === 0) {
+                                                break;
+                                            }
                                         }
                                     }
-                                    $gcStats = $restoreGc->collect(
-                                        $this->config->lifecycleBatchSize,
-                                        beforeEach: fn(): bool => $this->backgroundWorkAdmitted(),
-                                    );
-                                    for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
-                                        if (! $this->backgroundWorkAdmitted()
-                                            || $storageGc->collect(1, $backgroundCancellation) === 0) {
-                                            break;
+                                    if ($restoreExecutor !== null) {
+                                        for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                            if (! $this->roleWorkAdmitted(ClusterRoleSet::RESTORE)) {
+                                                break;
+                                            }
+                                            $result = $restoreExecutor->processNext(1, $backgroundCancellation);
+                                            foreach ($result as $name => $count) {
+                                                $restoreStats[$name] += $count;
+                                            }
+                                            if ($result['processed'] === 0) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if ($restoreGc !== null && $this->roleWorkAdmitted(ClusterRoleSet::GARBAGE)) {
+                                        $gcStats = $restoreGc->collect(
+                                            $this->config->lifecycleBatchSize,
+                                            beforeEach: fn(): bool => $this->roleWorkAdmitted(ClusterRoleSet::GARBAGE),
+                                        );
+                                    }
+                                    if ($storageGc !== null) {
+                                        for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
+                                            if (! $this->roleWorkAdmitted(ClusterRoleSet::GARBAGE)
+                                                || $storageGc->collect(1, $backgroundCancellation) === 0) {
+                                                break;
+                                            }
                                         }
                                     }
                                     if ($multipartIntentGc !== null) {
                                         for ($claim = 0; $claim < $this->config->lifecycleBatchSize; ++$claim) {
-                                            if (! $this->backgroundWorkAdmitted()
+                                            if (! $this->roleWorkAdmitted(ClusterRoleSet::RECONCILE)
                                                 || $multipartIntentGc->collect(1, $backgroundCancellation) === 0) {
                                                 break;
                                             }
@@ -919,10 +982,24 @@ final class S3Server
                         }
                     } catch (\Amp\CancelledException) {
                         // Normal shutdown.
+                    } finally {
+                        $this->handleAssignedRoleLoopExit('physical_role_worker', $backgroundCancellation);
                     }
                 });
-                $this->logger->info('Tiering background processor started.');
+                $this->logger->info('Assigned physical worker roles started.');
             }
+
+            $this->lifecycleRunner?->assertRunning();
+            if ($this->notificationProcessor !== null && ! $this->notificationProcessor->isRunning()) {
+                throw new \RuntimeException('Notification processor exited before role membership became ready.');
+            }
+            if ($this->durableRoleLoopFailed) {
+                throw new \RuntimeException('Assigned durable role loop exited before role membership became ready.');
+            }
+            if (! $this->backgroundWorkAdmitted()) {
+                throw new \RuntimeException('Cluster admission changed before role membership became ready.');
+            }
+            $this->clusterRoles?->registerReady();
 
             $this->commitAwsOperationalAttachments();
             $this->logger->info('S3 server listening on {host}:{port}', [
@@ -1072,6 +1149,24 @@ final class S3Server
         $this->clusterAdmission = $admission;
     }
 
+    public function setClusterRoleController(ClusterRoleController $roles): void
+    {
+        $this->assertConfigurationMutable('Cluster role membership');
+        if (! $this->config->clusterEnabled()) {
+            throw new \LogicException('Cluster role membership requires enabled cluster mode.');
+        }
+        if ($this->clusterRoles !== null) {
+            throw new \LogicException('Cluster role membership is already configured.');
+        }
+        $roles->assertBoundToConfig($this->config);
+        $roles->assertStore(MetadataDriverStartupGuard::clusterPostgresStore(
+            $this->metadata,
+            $this->config->metadataDriver,
+            $this->config->metadataDsn,
+        ));
+        $this->clusterRoles = $roles;
+    }
+
     public function setClusterWorkFencing(ClusterWorkFencingStore $fencing, ClusterWorkerIdentity $identity): void
     {
         $this->assertConfigurationMutable('Cluster work fencing');
@@ -1147,6 +1242,7 @@ final class S3Server
         $this->cleanupRunning = false;
         $this->tieringRunning = false;
         $this->localObjectCollectionRunning = false;
+        $this->clusterRoles?->withdraw();
         $this->backgroundCancellation?->cancel();
         // Stop accepting new connections and drain in-flight requests before
         // shutting down worker pools or metadata services they may still use.
@@ -1573,7 +1669,15 @@ final class S3Server
     private function flushAccessLogsIfAdmitted(): void
     {
         $accessLogs = $this->accessLogs;
-        if ($accessLogs === null || ! $this->backgroundWorkAdmitted()) {
+        if ($accessLogs === null) {
+            return;
+        }
+        if ($this->config->clusterEnabled()) {
+            if (! $this->roleWorkAdmitted(ClusterRoleSet::API)
+                || ! ($this->clusterRoles?->hasLiveRole(ClusterRoleSet::RECONCILE) ?? false)) {
+                return;
+            }
+        } elseif (! $this->backgroundWorkAdmitted()) {
             return;
         }
         $accessLogs->flush();
@@ -1769,7 +1873,7 @@ final class S3Server
             new ErrorHandlingMiddleware(logger: $this->logger),
         ];
         if ($this->clusterAdmission !== null) {
-            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission);
+            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission, $this->clusterRoles);
         }
         array_push(
             $middlewares,
@@ -1794,6 +1898,11 @@ final class S3Server
 
         // API requests still set attributes before CORS, auth, and policy checks.
         $middlewares[] = new S3AttributeMiddleware($this->config->baseDomain);
+        if ($this->clusterRoles !== null) {
+            // Operation resolution reads only the request target and headers;
+            // reject reconciliation-dependent writes before auth/body work.
+            $middlewares[] = new ClusterRoleAdmissionMiddleware($this->clusterRoles);
+        }
 
         $middlewares[] = new CorsMiddleware($this->metadata);
 
@@ -1867,56 +1976,66 @@ final class S3Server
         if ($this->metadata !== null && $this->storage !== null) {
             $storage = $this->storage;
             $tiers = $this->storageTiers ?? StorageTierRegistry::single($storage);
-            $executor = new LifecycleExecutor(
-                $this->metadata,
-                $storage,
-                $this->logger,
-                $this->config->lifecycleBatchSize,
-                $this->config->lifecycleMaxActionsPerRun,
-                $this->config->lifecycleLockTtlSeconds,
-                metrics: $this->metrics,
-                notifications: $this->notifications,
-                storageTiers: $tiers,
-                multipartMaxAgeSeconds: $this->config->multipartMaxAgeSeconds,
-                clusterAdmission: $this->clusterAdmission,
-                clusterFencing: $this->clusterWorkFencing,
-                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('lifecycle'),
-            );
-            $lifecycleRunner = new LifecycleRunner(
-                $executor,
-                $this->config->lifecycleIntervalSeconds,
-                $this->logger,
-                $this->clusterAdmission,
-            );
-            $transitionExecutor = new TierTransitionExecutor(
-                $this->metadata,
-                $tiers,
-                $this->logger,
-                localFencedWriter: $this->localBackgroundWriter,
-                awsFencedWriter: $this->awsBackgroundWriter,
-                clusterFencing: $this->clusterWorkFencing,
-                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('transition'),
-            );
-            $restoreExecutor = new RestoreExecutor(
-                $this->metadata,
-                $tiers,
-                $this->logger,
-                $this->notifications,
-                localFencedWriter: $this->localBackgroundWriter,
-                awsFencedWriter: $this->awsBackgroundWriter,
-                clusterFencing: $this->clusterWorkFencing,
-                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('restore'),
-            );
-            $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
-            $storageGc = new StorageGarbageCollector(
-                $this->metadata,
-                $tiers,
-                $this->logger,
-                awsOperationalState: $this->awsOperationalState,
-                clusterFencing: $this->clusterWorkFencing,
-                clusterWorkerId: $this->clusterWorkerIdentity?->forKind('garbage'),
-            );
-            $multipartIntentGc = $this->metadata instanceof MultipartWriteIntentStore
+            if ($this->config->hasClusterRole(ClusterRoleSet::LIFECYCLE)) {
+                $executor = new LifecycleExecutor(
+                    $this->metadata,
+                    $storage,
+                    $this->logger,
+                    $this->config->lifecycleBatchSize,
+                    $this->config->lifecycleMaxActionsPerRun,
+                    $this->config->lifecycleLockTtlSeconds,
+                    metrics: $this->metrics,
+                    notifications: $this->notifications,
+                    storageTiers: $tiers,
+                    multipartMaxAgeSeconds: $this->config->multipartMaxAgeSeconds,
+                    clusterAdmission: $this->clusterAdmission,
+                    clusterFencing: $this->clusterWorkFencing,
+                    clusterWorkerId: $this->clusterWorkerIdentity?->forKind('lifecycle'),
+                );
+                $lifecycleRunner = new LifecycleRunner(
+                    $executor,
+                    $this->config->lifecycleIntervalSeconds,
+                    $this->logger,
+                    $this->clusterAdmission,
+                    $this->clusterRoles,
+                );
+            }
+            $transitionExecutor = $this->config->hasClusterRole(ClusterRoleSet::TRANSITION)
+                ? new TierTransitionExecutor(
+                    $this->metadata,
+                    $tiers,
+                    $this->logger,
+                    localFencedWriter: $this->localBackgroundWriter,
+                    awsFencedWriter: $this->awsBackgroundWriter,
+                    clusterFencing: $this->clusterWorkFencing,
+                    clusterWorkerId: $this->clusterWorkerIdentity?->forKind('transition'),
+                )
+                : null;
+            $restoreExecutor = $this->config->hasClusterRole(ClusterRoleSet::RESTORE)
+                ? new RestoreExecutor(
+                    $this->metadata,
+                    $tiers,
+                    $this->logger,
+                    $this->notifications,
+                    localFencedWriter: $this->localBackgroundWriter,
+                    awsFencedWriter: $this->awsBackgroundWriter,
+                    clusterFencing: $this->clusterWorkFencing,
+                    clusterWorkerId: $this->clusterWorkerIdentity?->forKind('restore'),
+                )
+                : null;
+            if ($this->config->hasClusterRole(ClusterRoleSet::GARBAGE)) {
+                $restoreGc = new RestoreGarbageCollector($this->metadata, $tiers, $this->logger);
+                $storageGc = new StorageGarbageCollector(
+                    $this->metadata,
+                    $tiers,
+                    $this->logger,
+                    awsOperationalState: $this->awsOperationalState,
+                    clusterFencing: $this->clusterWorkFencing,
+                    clusterWorkerId: $this->clusterWorkerIdentity?->forKind('garbage'),
+                );
+            }
+            $multipartIntentGc = $this->config->hasClusterRole(ClusterRoleSet::RECONCILE)
+                && $this->metadata instanceof MultipartWriteIntentStore
                 ? new MultipartWriteIntentCollector(
                     $this->metadata,
                     $tiers,
@@ -1927,7 +2046,10 @@ final class S3Server
                 )
                 : null;
         }
-        if ($this->metadata !== null && $this->config->notificationWorkerEnabled) {
+        $webhookEnabled = $this->config->clusterEnabled()
+            ? $this->config->hasClusterRole(ClusterRoleSet::WEBHOOK)
+            : $this->config->notificationWorkerEnabled;
+        if ($this->metadata !== null && $webhookEnabled) {
             $notificationProcessor = new NotificationProcessor(
                 $this->metadata,
                 $this->logger,
@@ -1936,16 +2058,16 @@ final class S3Server
                 clusterAdmission: $this->clusterAdmission,
                 clusterFencing: $this->clusterWorkFencing,
                 clusterWorkerId: $this->clusterWorkerIdentity?->forKind('notification'),
+                clusterRoles: $this->clusterRoles,
             );
         }
 
         return [
             'lifecycleRunner' => $lifecycleRunner,
             'notificationProcessor' => $notificationProcessor,
-            'objectCollectors' => array_values(array_filter([
-                $this->localObjectIntentCollector,
-                $this->awsObjectIntentCollector,
-            ])),
+            'objectCollectors' => $this->config->hasClusterRole(ClusterRoleSet::RECONCILE)
+                ? array_values(array_filter([$this->localObjectIntentCollector, $this->awsObjectIntentCollector]))
+                : [],
             'transitionExecutor' => $transitionExecutor,
             'restoreExecutor' => $restoreExecutor,
             'restoreGarbageCollector' => $restoreGc,
@@ -1954,10 +2076,61 @@ final class S3Server
         ];
     }
 
+    /** @return list<'live'|'health'|'metrics'|'s3'|'admin'> */
+    private function runtimeHttpSurfaces(): array
+    {
+        $surfaces = ['live', 'health', 'metrics'];
+        if ($this->config->hasClusterRole(ClusterRoleSet::API)) {
+            $surfaces[] = 's3';
+            $surfaces[] = 'admin';
+        }
+
+        return $surfaces;
+    }
+
+    private function roleAwareS3Fallback(RequestHandler $apiHandler): RequestHandler
+    {
+        if ($this->config->hasClusterRole(ClusterRoleSet::API)) {
+            return $this->buildMiddlewareStack($apiHandler);
+        }
+
+        return new class implements RequestHandler {
+            public function handleRequest(\Amp\Http\Server\Request $request): \Amp\Http\Server\Response
+            {
+                return new \Amp\Http\Server\Response(404, ['Cache-Control' => 'no-store']);
+            }
+        };
+    }
+
     /** @phpstan-impure Revalidates live shared state and may change between claims. */
     private function backgroundWorkAdmitted(): bool
     {
-        return $this->clusterAdmission?->admitNewClaim() ?? true;
+        $admitted = $this->clusterAdmission?->admitNewClaim() ?? true;
+        if (! $admitted) {
+            $this->clusterRoles?->withdraw();
+        }
+
+        return $admitted;
+    }
+
+    /** @phpstan-impure Revalidates membership and admission before each durable claim. */
+    private function roleWorkAdmitted(string $role): bool
+    {
+        return $this->backgroundWorkAdmitted() && ($this->clusterRoles?->canClaim($role) ?? true);
+    }
+
+    /** Withdraw every advertised role when one assigned durable loop dies. */
+    private function handleAssignedRoleLoopExit(string $component, \Amp\Cancellation $cancellation): void
+    {
+        if ($this->shutdown || $cancellation->isRequested()) {
+            return;
+        }
+
+        $this->durableRoleLoopFailed = true;
+        $this->clusterRoles?->withdraw();
+        $this->logger->error('Assigned durable role loop exited unexpectedly; cluster membership withdrawn.', [
+            'component' => $component,
+        ]);
     }
 
     private function assertClusterHandlerStorageBindings(?StorageTierRegistry $configuredTiers): void
@@ -1988,7 +2161,7 @@ final class S3Server
             new ErrorHandlingMiddleware($this->logger),
         ];
         if ($clusterGated && $this->clusterAdmission !== null) {
-            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission);
+            $middlewares[] = new ClusterAdmissionMiddleware($this->clusterAdmission, $this->clusterRoles);
         }
         $middlewares[] = new TrustedProxyMiddleware(
             $this->config->trustedProxyCidrs,

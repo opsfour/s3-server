@@ -24,6 +24,8 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -69,6 +71,7 @@ final class NotificationProcessor
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
         private readonly ?ClusterWorkFencingStore $clusterFencing = null,
         private readonly ?string $clusterWorkerId = null,
+        private readonly ?ClusterRoleController $clusterRoles = null,
     ) {
         if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
             throw new \InvalidArgumentException('Cluster notification fencing requires both store and worker identity.');
@@ -155,6 +158,11 @@ final class NotificationProcessor
             while ($this->running) {
                 $cancellation->throwIfRequested();
                 if (! ($this->clusterAdmission?->admitNewClaim($cancellation) ?? true)) {
+                    $this->clusterRoles?->withdraw();
+                    \Amp\delay($this->pollInterval, cancellation: $cancellation);
+                    continue;
+                }
+                if (! ($this->clusterRoles?->canClaim(ClusterRoleSet::WEBHOOK) ?? true)) {
                     \Amp\delay($this->pollInterval, cancellation: $cancellation);
                     continue;
                 }

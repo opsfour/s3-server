@@ -887,6 +887,7 @@ final class NotificationClusterAdmissionStore implements ClusterAdmissionStore
                 clusterId: 'notification-test-cluster',
                 clusterNodeId: 'notification-test-node',
                 clusterDatabaseId: str_repeat('d', 32),
+                clusterRoles: 'webhook',
             ),
             StorageTierRegistry::single(new NotificationClusterStorageBackend()),
             null,

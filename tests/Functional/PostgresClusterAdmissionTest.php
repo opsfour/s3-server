@@ -18,6 +18,7 @@ use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\ClusterSafeStorageBackend;
@@ -53,6 +54,7 @@ final class PostgresClusterAdmissionTest extends TestCase
         $this->second = new PostgresMetadataStore($this->secondPool);
         $this->first->initialize();
         $this->firstPool->execute('DELETE FROM s3_cluster_admission');
+        $this->firstPool->execute('DELETE FROM s3_cluster_membership');
     }
 
     protected function tearDown(): void
@@ -62,6 +64,7 @@ final class PostgresClusterAdmissionTest extends TestCase
         }
         if (isset($this->firstPool)) {
             $this->firstPool->execute('DELETE FROM s3_cluster_admission');
+            $this->firstPool->execute('DELETE FROM s3_cluster_membership');
             if (isset($this->servingRole)) {
                 $role = $this->identifier($this->servingRole);
                 $this->firstPool->execute("DROP OWNED BY {$role}");
@@ -110,17 +113,17 @@ final class PostgresClusterAdmissionTest extends TestCase
             },
         );
         $live->admitInitial();
-        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES (48, $1)', ['drift-test']);
+        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES (49, $1)', ['drift-test']);
         try {
             self::assertFalse($live->revalidate(true));
             self::assertFalse($live->isAdmitted());
         } finally {
-            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = 48');
+            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = 49');
         }
         self::assertTrue($live->revalidate(true));
     }
 
-    public function test_select_insert_only_serving_role_can_bootstrap_but_cannot_mutate_contract(): void
+    public function test_serving_role_can_manage_membership_but_cannot_mutate_contract(): void
     {
         $identity = $this->first->clusterDatabaseIdentity();
         $this->createServingRole();
@@ -144,6 +147,58 @@ final class PostgresClusterAdmissionTest extends TestCase
         $this->assertServingStatementDenied(
             "UPDATE s3_cluster_database_identity SET database_identity = '00000000000000000000000000000000' WHERE singleton_id = 1",
         );
+
+        $this->serving->registerClusterMember(
+            'cluster-functional',
+            'restricted-node',
+            'restricted-incarnation',
+            ['reconcile'],
+            true,
+            30.0,
+        );
+        self::assertTrue($this->serving->isClusterMemberLive(
+            'cluster-functional',
+            'restricted-node',
+            'restricted-incarnation',
+        ));
+        self::assertTrue($this->serving->heartbeatClusterMember(
+            'cluster-functional',
+            'restricted-node',
+            'restricted-incarnation',
+            true,
+            30.0,
+        ));
+        $this->serving->withdrawClusterMember('cluster-functional', 'restricted-node', 'restricted-incarnation');
+        self::assertFalse($this->serving->isClusterMemberLive(
+            'cluster-functional',
+            'restricted-node',
+            'restricted-incarnation',
+        ));
+        $this->assertServingStatementDenied('DELETE FROM s3_cluster_membership');
+    }
+
+    public function test_membership_uses_database_time_and_advertises_complete_canonical_role_sets(): void
+    {
+        $this->first->registerClusterMember('cluster-functional', 'node-a', 'incarnation-a', ['reconcile', 'transition'], true, 30.0);
+        $this->second->registerClusterMember('cluster-functional', 'node-b', 'incarnation-b', ['api'], true, 30.0);
+
+        self::assertSame(['api', 'reconcile', 'transition'], $this->first->liveClusterRoles('cluster-functional'));
+        $row = $this->firstPool->query(
+            "SELECT cluster_id, node_id, incarnation_id, roles::text AS roles, ready, heartbeat_at < expires_at AS current FROM s3_cluster_membership WHERE node_id = 'node-a'",
+        )->fetchRow();
+        self::assertSame('cluster-functional', $row['cluster_id'] ?? null);
+        self::assertSame('node-a', $row['node_id'] ?? null);
+        self::assertSame('incarnation-a', $row['incarnation_id'] ?? null);
+        self::assertSame('["reconcile", "transition"]', $row['roles'] ?? null);
+        self::assertTrue($row['ready'] ?? false);
+        self::assertTrue($row['current'] ?? false);
+
+        $this->first->withdrawClusterMember('cluster-functional', 'node-a', 'incarnation-a');
+        self::assertSame(['api'], $this->second->liveClusterRoles('cluster-functional'));
+
+        $this->second->registerClusterMember('cluster-functional', 'node-c', 'incarnation-c', ['garbage'], true, 0.001);
+        \Amp\delay(0.01);
+        self::assertSame(['api'], $this->first->liveClusterRoles('cluster-functional'));
     }
 
     public function test_runtime_factory_attaches_admission_and_registered_http_routes_fail_closed(): void
@@ -180,6 +235,7 @@ final class PostgresClusterAdmissionTest extends TestCase
                 clusterId: 'cluster-functional-factory',
                 clusterNodeId: 'factory-node',
                 clusterDatabaseId: $identity,
+                clusterRoles: 'api,reconcile',
                 notificationWorkerEnabled: false,
             ),
             $metadata,
@@ -192,6 +248,7 @@ final class PostgresClusterAdmissionTest extends TestCase
         $runtime->server->setAdminCredentialApiHandler($admin);
         $runtime->server->setAdminQuotaApiHandler($admin);
         $originalDigest = null;
+        $started = false;
 
         try {
             $property = new \ReflectionProperty($runtime->server, 'clusterAdmission');
@@ -202,6 +259,26 @@ final class PostgresClusterAdmissionTest extends TestCase
             self::assertSame('cluster-functional-factory', $controller->diagnostics()['cluster_id']);
 
             $runtime->server->start();
+            $started = true;
+            $membership = $this->firstPool->query(
+                "SELECT incarnation_id, roles::text AS roles, ready FROM s3_cluster_membership WHERE cluster_id = 'cluster-functional-factory' AND node_id = 'factory-node'",
+            )->fetchRow();
+            self::assertIsString($membership['incarnation_id'] ?? null);
+            self::assertIsString($membership['roles'] ?? null);
+            self::assertSame(['api', 'reconcile'], json_decode($membership['roles'], true, 8, JSON_THROW_ON_ERROR));
+            self::assertTrue($membership['ready'] ?? false);
+
+            $this->firstPool->execute(
+                "UPDATE s3_cluster_membership SET ready = FALSE, expires_at = clock_timestamp() WHERE cluster_id = 'cluster-functional-factory' AND node_id = 'factory-node'",
+            );
+            $client = (new HttpClientBuilder())->retry(0)->build();
+            $endpoint = "http://127.0.0.1:{$port}";
+            self::assertSame(503, $client->request(new ClientRequest($endpoint . '/bucket/object', 'PUT'))->getStatus());
+            self::assertNotSame(503, $client->request(new ClientRequest($endpoint . '/bucket/object', 'GET'))->getStatus());
+            $roleController = (new \ReflectionProperty($runtime->server, 'clusterRoles'))->getValue($runtime->server);
+            self::assertInstanceOf(ClusterRoleController::class, $roleController);
+            self::assertTrue($roleController->maintainReady());
+
             $row = $this->firstPool->query(
                 'SELECT compatibility_digest FROM s3_cluster_admission WHERE singleton_id = 1',
             )->fetchRow();
@@ -211,8 +288,6 @@ final class PostgresClusterAdmissionTest extends TestCase
                 "UPDATE s3_cluster_admission SET compatibility_digest = 'forced-mismatch' WHERE singleton_id = 1",
             );
 
-            $client = (new HttpClientBuilder())->retry(0)->build();
-            $endpoint = "http://127.0.0.1:{$port}";
             foreach ([
                 ['POST', '/.admin/credentials'],
                 ['GET', '/.admin/quotas'],
@@ -222,6 +297,10 @@ final class PostgresClusterAdmissionTest extends TestCase
                 self::assertSame(503, $response->getStatus(), "{$method} {$path}");
             }
             self::assertSame(0, $admin->calls);
+            $mismatchedMembership = $this->firstPool->query(
+                "SELECT ready FROM s3_cluster_membership WHERE cluster_id = 'cluster-functional-factory' AND node_id = 'factory-node'",
+            )->fetchRow();
+            self::assertFalse($mismatchedMembership['ready'] ?? true);
         } finally {
             if (is_string($originalDigest)) {
                 $this->firstPool->execute(
@@ -229,6 +308,78 @@ final class PostgresClusterAdmissionTest extends TestCase
                     [$originalDigest],
                 );
             }
+            if ($started) {
+                $admission = (new \ReflectionProperty($runtime->server, 'clusterAdmission'))->getValue($runtime->server);
+                $roles = (new \ReflectionProperty($runtime->server, 'clusterRoles'))->getValue($runtime->server);
+                if ($admission instanceof ClusterAdmissionController && $roles instanceof ClusterRoleController) {
+                    $admission->revalidate(true);
+                    self::assertTrue($roles->maintainReady());
+                }
+            }
+            $runtime->stop();
+            if ($started) {
+                $withdrawn = $this->firstPool->query(
+                    "SELECT ready FROM s3_cluster_membership WHERE cluster_id = 'cluster-functional-factory' AND node_id = 'factory-node'",
+                )->fetchRow();
+                self::assertFalse($withdrawn['ready'] ?? true);
+            }
+        }
+    }
+
+    public function test_worker_only_listener_exposes_only_probes_and_authenticated_metrics(): void
+    {
+        $dsn = trim((string) getenv('S3_TEST_POSTGRES_METADATA_DSN'));
+        $metadata = PostgresMetadataStore::fromDsn($dsn);
+        $identity = $metadata->clusterDatabaseIdentity();
+        $postgres = PostgresConfig::fromString($dsn);
+        $credentialProvider = DatabaseCredentialProvider::fromDsn(
+            sprintf('pgsql:host=%s;port=%d;dbname=%s', $postgres->getHost(), $postgres->getPort(), $postgres->getDatabase()),
+            $postgres->getUser(),
+            $postgres->getPassword(),
+            bootstrap: true,
+        );
+        $reservation = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($reservation);
+        $address = stream_socket_get_name($reservation, false);
+        self::assertIsString($address);
+        $port = (int) substr($address, strrpos($address, ':') + 1);
+        fclose($reservation);
+        $runtime = (new S3ServerRuntimeFactory())->create(
+            new S3ServerConfig(
+                host: '127.0.0.1',
+                port: $port,
+                storagePath: '/',
+                metadataDriver: 'postgres',
+                metadataDsn: $dsn,
+                clusterId: 'cluster-functional-worker',
+                clusterNodeId: 'worker-node',
+                clusterDatabaseId: $identity,
+                clusterRoles: 'reconcile',
+                metricsBearerToken: 'worker-metrics-token',
+            ),
+            $metadata,
+            new FunctionalClusterStorage(),
+            $credentialProvider,
+            new NullLogger(),
+            new MetricsCollector(),
+        );
+        $admin = new FunctionalClusterAdminHandler();
+        $runtime->server->setAdminCredentialApiHandler($admin);
+
+        try {
+            $runtime->server->start();
+            $client = (new HttpClientBuilder())->retry(0)->build();
+            $endpoint = "http://127.0.0.1:{$port}";
+            self::assertSame(200, $client->request(new ClientRequest($endpoint . '/.live'))->getStatus());
+            self::assertSame(200, $client->request(new ClientRequest($endpoint . '/.health'))->getStatus());
+            self::assertSame(401, $client->request(new ClientRequest($endpoint . '/.metrics'))->getStatus());
+            $metrics = new ClientRequest($endpoint . '/.metrics');
+            $metrics->setHeader('Authorization', 'Bearer worker-metrics-token');
+            self::assertSame(200, $client->request($metrics)->getStatus());
+            self::assertSame(404, $client->request(new ClientRequest($endpoint . '/bucket/object'))->getStatus());
+            self::assertSame(404, $client->request(new ClientRequest($endpoint . '/.admin/credentials', 'POST'))->getStatus());
+            self::assertSame(0, $admin->calls);
+        } finally {
             $runtime->stop();
         }
     }
@@ -246,6 +397,7 @@ final class PostgresClusterAdmissionTest extends TestCase
         $this->firstPool->execute("GRANT USAGE ON SCHEMA {$schema} TO {$role}");
         $this->firstPool->execute("GRANT SELECT ON {$schema}.s3_cluster_database_identity TO {$role}");
         $this->firstPool->execute("GRANT SELECT, INSERT ON {$schema}.s3_cluster_admission TO {$role}");
+        $this->firstPool->execute("GRANT SELECT, INSERT, UPDATE ON {$schema}.s3_cluster_membership TO {$role}");
 
         $config = PostgresConfig::fromString(trim((string) getenv('S3_TEST_POSTGRES_METADATA_DSN')))
             ->withUser($this->servingRole)
@@ -279,6 +431,7 @@ final class PostgresClusterAdmissionTest extends TestCase
                 clusterId: 'cluster-functional',
                 clusterNodeId: $node,
                 clusterDatabaseId: $identity,
+                clusterRoles: 'api,reconcile',
                 strictBucketNaming: $strict,
             ),
             StorageTierRegistry::single(new FunctionalClusterStorage()),

@@ -46,6 +46,8 @@ class S3ServerServiceProvider extends ServiceProvider
                 clusterId: $config['cluster_id'] ?? null,
                 clusterNodeId: $config['cluster_node_id'] ?? null,
                 clusterDatabaseId: $config['cluster_database_id'] ?? null,
+                clusterRoles: $config['cluster_roles'] ?? null,
+                clusterRequiredRoles: $config['cluster_required_roles'] ?? null,
                 storagePath: $config['storage']['path'] ?? storage_path('s3'),
                 storageTiers: $config['storage']['tiers'] ?? [],
                 allowUnfencedStorageForTests: $config['allow_unfenced_storage_for_tests'] ?? false,

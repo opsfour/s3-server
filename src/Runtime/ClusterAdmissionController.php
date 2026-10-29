@@ -107,7 +107,9 @@ final class ClusterAdmissionController
             || ! hash_equals($this->fingerprint->clusterId, $config->clusterId)
             || ! hash_equals($this->fingerprint->nodeId, $config->clusterNodeId)
             || ! hash_equals($this->fingerprint->incarnationId, $config->clusterIncarnationId)
-            || ! hash_equals($this->fingerprint->databaseIdentity, $config->clusterDatabaseId)) {
+            || ! hash_equals($this->fingerprint->databaseIdentity, $config->clusterDatabaseId)
+            || $this->fingerprint->roles !== $config->clusterRoles
+            || $this->fingerprint->requiredRoles !== $config->clusterRequiredRoles) {
             throw new \LogicException('Cluster admission controller is not bound to this server configuration.');
         }
     }
@@ -120,7 +122,7 @@ final class ClusterAdmissionController
             'node_id' => $this->fingerprint->nodeId,
             'incarnation_id' => $this->fingerprint->incarnationId,
             'protocol' => ClusterCapabilityFingerprint::PROTOCOL,
-            'roles' => [ClusterCapabilityFingerprint::ROLES],
+            'roles' => $this->fingerprint->roles,
             'admission' => $this->status,
         ];
         if ($this->status === 'mismatched' && $this->category !== null) {

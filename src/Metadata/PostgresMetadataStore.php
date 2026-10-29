@@ -25,6 +25,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
 use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
+use OpsFour\S3Server\Runtime\ClusterMembershipStore;
 
 /**
  * PostgreSQL-backed implementation of the S3 metadata store.
@@ -32,7 +33,7 @@ use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore, ClusterMembershipStore
 {
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
@@ -179,6 +180,107 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
 
         return ClusterAdmissionResult::matched($fingerprint->databaseIdentity);
+    }
+
+    public function registerClusterMember(
+        string $clusterId,
+        string $nodeId,
+        string $incarnationId,
+        array $roles,
+        bool $ready,
+        float $ttlSeconds,
+    ): void {
+        $this->conn()->execute(
+            <<<'SQL'
+            INSERT INTO s3_cluster_membership (
+                cluster_id, node_id, incarnation_id, roles, ready, heartbeat_at, expires_at
+            ) VALUES ($1, $2, $3, $4::jsonb, $5, clock_timestamp(), clock_timestamp() + $6 * INTERVAL '1 second')
+            ON CONFLICT (cluster_id, node_id, incarnation_id) DO UPDATE SET
+                roles = EXCLUDED.roles,
+                ready = EXCLUDED.ready,
+                heartbeat_at = clock_timestamp(),
+                expires_at = clock_timestamp() + $6 * INTERVAL '1 second'
+            SQL,
+            [$clusterId, $nodeId, $incarnationId, json_encode($roles, JSON_THROW_ON_ERROR), $ready, $ttlSeconds],
+        );
+    }
+
+    public function heartbeatClusterMember(
+        string $clusterId,
+        string $nodeId,
+        string $incarnationId,
+        bool $ready,
+        float $ttlSeconds,
+    ): bool {
+        $result = $this->conn()->execute(
+            <<<'SQL'
+            UPDATE s3_cluster_membership
+            SET ready = $1,
+                heartbeat_at = clock_timestamp(),
+                expires_at = clock_timestamp() + $2 * INTERVAL '1 second'
+            WHERE cluster_id = $3 AND node_id = $4 AND incarnation_id = $5
+            SQL,
+            [$ready, $ttlSeconds, $clusterId, $nodeId, $incarnationId],
+        );
+
+        return ($result->getRowCount() ?? 0) === 1;
+    }
+
+    public function withdrawClusterMember(string $clusterId, string $nodeId, string $incarnationId): void
+    {
+        $this->conn()->execute(
+            <<<'SQL'
+            UPDATE s3_cluster_membership
+            SET ready = FALSE, heartbeat_at = clock_timestamp(), expires_at = clock_timestamp()
+            WHERE cluster_id = $1 AND node_id = $2 AND incarnation_id = $3
+            SQL,
+            [$clusterId, $nodeId, $incarnationId],
+        );
+    }
+
+    public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
+    {
+        $row = $this->conn()->execute(
+            <<<'SQL'
+            SELECT EXISTS (
+                SELECT 1
+                FROM s3_cluster_membership
+                WHERE cluster_id = $1
+                  AND node_id = $2
+                  AND incarnation_id = $3
+                  AND ready = TRUE
+                  AND expires_at > clock_timestamp()
+            ) AS live
+            SQL,
+            [$clusterId, $nodeId, $incarnationId],
+        )->fetchRow();
+
+        return ($row['live'] ?? false) === true;
+    }
+
+    public function liveClusterRoles(string $clusterId): array
+    {
+        $result = $this->conn()->execute(
+            <<<'SQL'
+            SELECT role
+            FROM (
+                SELECT DISTINCT member_role.role AS role
+                FROM s3_cluster_membership
+                CROSS JOIN LATERAL jsonb_array_elements_text(roles) AS member_role(role)
+                WHERE cluster_id = $1 AND ready = TRUE AND expires_at > clock_timestamp()
+            ) AS live_roles
+            ORDER BY role COLLATE "C"
+            SQL,
+            [$clusterId],
+        );
+        $roles = [];
+        while (($row = $result->fetchRow()) !== null) {
+            if (is_string($row['role'] ?? null)) {
+                $roles[] = $row['role'];
+            }
+        }
+
+        return $roles;
     }
 
     public function initialize(): void

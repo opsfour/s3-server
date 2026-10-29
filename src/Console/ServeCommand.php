@@ -74,6 +74,8 @@ final class ServeCommand extends Command
             ->addOption('cluster-id', null, InputOption::VALUE_REQUIRED, 'Shared cluster identity (enables cluster mode)', self::envOption('S3_CLUSTER_ID'))
             ->addOption('cluster-node-id', null, InputOption::VALUE_REQUIRED, 'Stable node identity required in cluster mode', self::envOption('S3_CLUSTER_NODE_ID'))
             ->addOption('cluster-database-id', null, InputOption::VALUE_REQUIRED, 'Pinned identity printed by metadata:migrate', self::envOption('S3_CLUSTER_DATABASE_ID'))
+            ->addOption('cluster-roles', null, InputOption::VALUE_REQUIRED, 'Comma-separated process roles: api,lifecycle,webhook,transition,restore,garbage,reconcile', self::envOption('S3_CLUSTER_ROLES'))
+            ->addOption('cluster-required-roles', null, InputOption::VALUE_REQUIRED, 'Comma-separated required cluster role policy (default: all roles)', self::envOption('S3_CLUSTER_REQUIRED_ROLES'))
             ->addOption('metadata-path', null, InputOption::VALUE_REQUIRED, 'SQLite metadata database path', self::envOption('S3_METADATA_PATH'))
             ->addOption('metadata-cache-ttl', null, InputOption::VALUE_REQUIRED, 'Metadata read cache TTL in seconds (0 disables)', self::envOption('S3_METADATA_CACHE_TTL', '5'))
             ->addOption('tls-cert', null, InputOption::VALUE_REQUIRED, 'Path to TLS certificate file', self::envOption('S3_TLS_CERT'))
@@ -298,6 +300,8 @@ final class ServeCommand extends Command
             clusterId: $this->strictOptionalString($input->getOption('cluster-id'), 'cluster-id'),
             clusterNodeId: $this->strictOptionalString($input->getOption('cluster-node-id'), 'cluster-node-id'),
             clusterDatabaseId: $this->strictOptionalString($input->getOption('cluster-database-id'), 'cluster-database-id'),
+            clusterRoles: $this->strictOptionalString($input->getOption('cluster-roles'), 'cluster-roles'),
+            clusterRequiredRoles: $this->strictOptionalString($input->getOption('cluster-required-roles'), 'cluster-required-roles'),
             tlsCertPath: $this->nullableString($input->getOption('tls-cert')),
             tlsKeyPath: $this->nullableString($input->getOption('tls-key')),
             trustedProxyCidrs: TrustedProxyMiddleware::parseCidrs((string) $input->getOption('trusted-proxy-cidrs')),

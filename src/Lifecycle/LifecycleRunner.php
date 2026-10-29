@@ -7,6 +7,8 @@ namespace OpsFour\S3Server\Lifecycle;
 use Amp\Future;
 use OpsFour\S3Server\Logging\FailureIsolatingLogger;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Revolt\EventLoop;
@@ -30,6 +32,7 @@ final class LifecycleRunner
         private readonly float $intervalSeconds = 60.0,
         LoggerInterface $logger = new NullLogger(),
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
+        private readonly ?ClusterRoleController $clusterRoles = null,
     ) {
         if (! is_finite($this->intervalSeconds) || $this->intervalSeconds <= 0.0) {
             throw new \InvalidArgumentException('Lifecycle interval must be a finite number greater than zero.');
@@ -52,6 +55,11 @@ final class LifecycleRunner
         $this->executor->resumeRunnerAfterStop();
         $this->callbackId = EventLoop::repeat($this->intervalSeconds, function (): void {
             if (! ($this->clusterAdmission?->revalidate() ?? true)) {
+                $this->clusterRoles?->withdraw();
+
+                return;
+            }
+            if (! ($this->clusterRoles?->canClaim(ClusterRoleSet::LIFECYCLE) ?? true)) {
                 return;
             }
             if ($this->executionFuture !== null && ! $this->executionFuture->isComplete()) {

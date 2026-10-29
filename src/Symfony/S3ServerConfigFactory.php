@@ -39,6 +39,8 @@ final class S3ServerConfigFactory
             clusterId: $server['cluster_id'],
             clusterNodeId: $server['cluster_node_id'],
             clusterDatabaseId: $server['cluster_database_id'],
+            clusterRoles: $server['cluster_roles'],
+            clusterRequiredRoles: $server['cluster_required_roles'],
             storagePath: $storage['path'],
             storageTiers: $storage['tiers'],
             allowUnfencedStorageForTests: $server['allow_unfenced_storage_for_tests'],

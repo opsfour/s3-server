@@ -43,6 +43,13 @@ S3_RATE_LIMIT=1000
 
 See [Configuration Reference](configuration.md) for all variables.
 
+For a qualified PostgreSQL cluster process, also set `S3_CLUSTER_ID`,
+`S3_CLUSTER_NODE_ID`, `S3_CLUSTER_DATABASE_ID`, and the comma-separated
+`S3_CLUSTER_ROLES`. Processes may use different assigned roles, but every
+process must share `S3_CLUSTER_REQUIRED_ROLES`. Worker-only processes also
+require `S3_METRICS_BEARER_TOKEN`; their listener exposes probes and metrics,
+not Laravel-backed S3 or admin routes.
+
 ## Start the Server
 
 ```bash

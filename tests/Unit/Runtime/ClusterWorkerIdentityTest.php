@@ -17,6 +17,7 @@ final class ClusterWorkerIdentityTest extends TestCase
             clusterId: 'cluster-a',
             clusterNodeId: str_repeat('n', 128),
             clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'reconcile',
         );
         $identity = ClusterWorkerIdentity::fromConfig($config);
         $notification = $identity->forKind('notification');

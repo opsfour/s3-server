@@ -122,7 +122,9 @@ final readonly class S3ServerRuntimeFactory
                 );
             }
 
-            $postObjectSpoolCoordinator = $server->preparePostObjectSpoolCoordinator();
+            $postObjectSpoolCoordinator = $config->hasClusterRole(ClusterRoleSet::API)
+                ? $server->preparePostObjectSpoolCoordinator()
+                : null;
 
             $server->addMiddleware(new AuthMiddleware(
                 credentialProvider: $credentialProvider,
@@ -146,7 +148,7 @@ final readonly class S3ServerRuntimeFactory
             $server->setEncryptionService($encryption);
 
             $selectWorkerPool = null;
-            if ($config->selectWorkerPoolSize > 0) {
+            if ($config->hasClusterRole(ClusterRoleSet::API) && $config->selectWorkerPoolSize > 0) {
                 $selectWorkerPool = new ContextWorkerPool($config->selectWorkerPoolSize);
                 $server->addWorkerPool($selectWorkerPool, 'select', $config->selectWorkerPoolSize);
             }
@@ -350,6 +352,7 @@ final readonly class S3ServerRuntimeFactory
                     $clusterStore,
                     ClusterWorkerIdentity::fromConfig($config),
                 );
+                $server->setClusterRoleController(new ClusterRoleController($clusterStore, $config));
             }
 
             return $runtime;

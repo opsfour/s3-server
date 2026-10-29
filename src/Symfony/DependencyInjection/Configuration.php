@@ -25,6 +25,8 @@ final class Configuration implements ConfigurationInterface
                         ->scalarNode('cluster_id')->defaultNull()->end()
                         ->scalarNode('cluster_node_id')->defaultNull()->end()
                         ->scalarNode('cluster_database_id')->defaultNull()->end()
+                        ->variableNode('cluster_roles')->defaultNull()->end()
+                        ->variableNode('cluster_required_roles')->defaultNull()->end()
                         ->scalarNode('tls_cert_path')->defaultNull()->end()
                         ->scalarNode('tls_key_path')->defaultNull()->end()
                         ->integerNode('max_connections')->defaultValue(10000)->min(1)->end()

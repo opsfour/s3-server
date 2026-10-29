@@ -103,12 +103,16 @@ final class ServeCommandTest extends TestCase
             '--cluster-id' => 'cluster-a',
             '--cluster-node-id' => 'node-a',
             '--cluster-database-id' => str_repeat('d', 32),
+            '--cluster-roles' => 'api,reconcile',
+            '--cluster-required-roles' => 'webhook,reconcile,api',
         ]);
         $config = $this->invoke($command, 'configFromInput', [$input, null]);
 
         self::assertSame('cluster-a', $config->clusterId);
         self::assertSame('node-a', $config->clusterNodeId);
         self::assertSame(str_repeat('d', 32), $config->clusterDatabaseId);
+        self::assertSame(['api', 'reconcile'], $config->clusterRoles);
+        self::assertSame(['api', 'reconcile', 'webhook'], $config->clusterRequiredRoles);
 
         $blank = $this->input($command, [
             '--storage-temp-dir' => $this->tempDir,

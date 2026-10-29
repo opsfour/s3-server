@@ -177,6 +177,13 @@ php bin/console opsfour:s3:quotas delete account-a
 The command operates on the metadata store configured in
 `opsfour_s3_server.metadata`.
 
+Qualified PostgreSQL cluster processes configure `server.cluster_id`,
+`server.cluster_node_id`, `server.cluster_database_id`, `server.cluster_roles`,
+and the shared `server.cluster_required_roles`. Role values may be YAML lists
+or comma-separated strings. Worker-only processes require
+`server.metrics_bearer_token`; their listener exposes probes and authenticated
+metrics but no S3, website, or admin routes.
+
 ## Production Configuration
 
 SQLite, PostgreSQL, and MySQL are supported for the current single-host,
@@ -401,10 +408,9 @@ Supported event patterns match the core dispatcher:
 - wildcard suffixes, for example `s3:ObjectCreated:*`
 - global wildcard `s3:*`
 
-For the current one-process profile, keep `notifications.worker_enabled: true`
-so queued webhooks are drained. Disabling it in favor of a separate consumer
-belongs to a later multi-process profile and requires that profile's own
-qualification.
+Standalone deployments keep `notifications.worker_enabled: true` so queued
+webhooks are drained. In cluster mode the explicit `webhook` process role is
+authoritative and this compatibility switch is ignored.
 
 You can also bridge every matching S3 event into Symfony's EventDispatcher:
 

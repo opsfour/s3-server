@@ -942,6 +942,25 @@ or zero-row compare-and-set stops further effects. Webhook delivery remains at
 least once, and ambiguous provider outcomes remain in their durable intent for
 reconciliation rather than being retried without a fence.
 
+Each cluster process must set `S3_CLUSTER_ROLES` to a canonical subset of
+`api,lifecycle,webhook,transition,restore,garbage,reconcile`. The roles start
+only their named durable claim loops; `reconcile` owns object- and multipart-
+intent recovery. Worker-only listeners expose `/.live`, `/.health`, and
+authenticated `/.metrics`, but no S3, website, or admin routes. Set
+`S3_METRICS_BEARER_TOKEN` for every worker-only process.
+
+Membership is one PostgreSQL v48 row per process incarnation. Registration,
+heartbeat, readiness, and expiry use `clock_timestamp()`; an expired row never
+contributes role coverage. `S3_CLUSTER_REQUIRED_ROLES` is shared fingerprinted
+policy (all roles by default), while `S3_CLUSTER_ROLES` may differ per process.
+Start worker providers before an API-only process: API startup requires live
+`reconcile` coverage. Loss of reconciliation rejects PutObject, CopyObject,
+PostObject, UploadPart, UploadPartCopy, and CompleteMultipartUpload before body
+processing while reads and unrelated bucket configuration mutations remain
+available. Other missing required roles appear as bounded degraded coverage
+without removing API readiness. In cluster mode the `webhook` role is authoritative and
+`S3_NOTIFICATION_WORKER` is ignored; that switch remains standalone-only.
+
 Cluster bootstrap is maintenance-only. Run `metadata:migrate` with its
 DDL-capable role and record the printed `Cluster database identity` as
 `S3_CLUSTER_DATABASE_ID` on every node. Run `credentials:migrate` against one
@@ -967,7 +986,7 @@ same storage root. Drain traffic, stop the existing process, deploy the new
 package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
-For a **schema upgrade** to the current SQLite v42, PostgreSQL v47, or MySQL
+For a **schema upgrade** to the current SQLite v42, PostgreSQL v48, or MySQL
 v50 schema, drain and stop the
 API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a

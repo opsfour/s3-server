@@ -72,6 +72,8 @@ it through shell history or process listings.
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
 | `--metadata-dsn` | (auto) | Database DSN for postgres/mysql |
 | `--metadata-path` | (auto for filesystem storage) | Standalone SQLite database path; required with non-filesystem storage (`:memory:` is an explicit test-only choice) |
+| `--cluster-roles` | - | Required cluster process roles, comma-separated |
+| `--cluster-required-roles` | all roles | Shared required-role coverage policy, comma-separated |
 | `--credentials-driver` | `memory` | `memory`, `database`, `file` |
 | `--access-key` | - | Access key (memory driver) |
 | `--secret-key` | - | Secret key override for isolated local use; prefer a protected environment or secret store |

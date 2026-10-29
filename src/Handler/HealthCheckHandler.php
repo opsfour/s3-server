@@ -24,6 +24,8 @@ use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -72,6 +74,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly float $readinessCheckTimeoutSeconds = 5.0,
         private readonly ?AwsS3OperationalState $awsOperationalState = null,
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
+        private readonly ?ClusterRoleController $clusterRoles = null,
     ) {
         if ($readinessCheckIntervalSeconds < 0) {
             throw new \InvalidArgumentException('Readiness check interval must be non-negative.');
@@ -303,14 +306,23 @@ final class HealthCheckHandler implements RequestHandler
 
     private function readinessResponse(): Response
     {
+        $roleDiagnostics = $this->clusterRoles?->diagnostics();
+        $reconcileRequired = $this->clusterRoles?->hasAssignedRole(ClusterRoleSet::API) === true
+            || ($roleDiagnostics !== null
+                && in_array(ClusterRoleSet::RECONCILE, $roleDiagnostics['required_roles'], true));
+        $reconcileReady = ! $reconcileRequired
+            || ($roleDiagnostics !== null
+                && in_array(ClusterRoleSet::RECONCILE, $roleDiagnostics['live_roles'], true));
+        $roleCoverageDegraded = $roleDiagnostics !== null && $roleDiagnostics['missing_roles'] !== [];
         if ($this->awsOperationalState !== null) {
             $snapshot = $this->awsOperationalState->snapshot();
             $ready = $this->readinessHealthy
                 && $snapshot['mutation_ready'] === true
                 && $snapshot['reason'] === AwsS3OperationalState::REASON_HEALTHY
-                && ($this->clusterAdmission?->isAdmitted() ?? true);
+                && ($this->clusterAdmission?->isAdmitted() ?? true)
+                && $reconcileReady;
             $payload = [
-                'status' => $ready ? 'ok' : 'degraded',
+                'status' => $ready && ! $roleCoverageDegraded ? 'ok' : 'degraded',
                 'aws' => [
                     'provider_type' => $snapshot['provider_type'],
                     'fingerprint' => $snapshot['fingerprint'],
@@ -328,17 +340,23 @@ final class HealthCheckHandler implements RequestHandler
                     'reason' => $snapshot['reason'],
                 ],
             ];
-            if ($this->clusterAdmission !== null) {
-                $payload['cluster'] = $this->clusterAdmission->diagnostics();
+            if ($this->clusterAdmission !== null || $roleDiagnostics !== null) {
+                $payload['cluster'] = [
+                    ...($this->clusterAdmission?->diagnostics() ?? []),
+                    ...($roleDiagnostics ?? []),
+                ];
             }
             $body = json_encode($payload, JSON_THROW_ON_ERROR);
         } else {
-            $ready = $this->readinessHealthy && ($this->clusterAdmission?->isAdmitted() ?? true);
-            $body = $this->clusterAdmission === null
+            $ready = $this->readinessHealthy && ($this->clusterAdmission?->isAdmitted() ?? true) && $reconcileReady;
+            $body = $this->clusterAdmission === null && $roleDiagnostics === null
                 ? ($this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}')
                 : json_encode([
-                    'status' => $ready ? 'ok' : 'degraded',
-                    'cluster' => $this->clusterAdmission->diagnostics(),
+                    'status' => $ready && ! $roleCoverageDegraded ? 'ok' : 'degraded',
+                    'cluster' => [
+                        ...($this->clusterAdmission?->diagnostics() ?? []),
+                        ...($roleDiagnostics ?? []),
+                    ],
                 ], JSON_THROW_ON_ERROR);
         }
 

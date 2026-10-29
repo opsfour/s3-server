@@ -119,6 +119,8 @@ YAML, because each tier needs a named backend and optional service references.
 | `S3_CLUSTER_ID` | - | Enables cluster mode and names the shared admission contract. Requires PostgreSQL, qualified storage, `S3_CLUSTER_NODE_ID`, and `S3_CLUSTER_DATABASE_ID`. |
 | `S3_CLUSTER_NODE_ID` | - | Stable operator-assigned node identity. It is diagnostic only and is excluded from shared equivalence. |
 | `S3_CLUSTER_DATABASE_ID` | - | Exact 32-character identity printed by `metadata:migrate`; pins the process to the intended PostgreSQL metadata database and is never inferred from its DSN. |
+| `S3_CLUSTER_ROLES` | - | Required in cluster mode. Comma-separated non-empty subset of `api,lifecycle,webhook,transition,restore,garbage,reconcile`; duplicates, blanks, and unknown values fail startup. |
+| `S3_CLUSTER_REQUIRED_ROLES` | all roles | Shared comma-separated coverage policy. Every process must use the same canonical policy even though its assigned roles may differ. |
 
 See [Metadata Backends](metadata-backends.md) for driver-specific configuration.
 
@@ -126,12 +128,13 @@ Cluster mode creates one random process incarnation and admits a canonical,
 secret-free fingerprint covering protocol, stable database identity/schema,
 qualified storage and fence, a canonical name-sorted tier map, encryption, the database credential
 store and credential-cache TTL, normalized OIDC public-key/issuer/audience,
-owner mapping and clock skew, compatibility settings,
-and the fixed `all-in-one-v1` role set. Cluster/node/incarnation IDs, connection strings,
+owner mapping and clock skew, compatibility settings, the explicit-role protocol,
+and the canonical required-role policy. Assigned process roles are membership data,
+not equality-fingerprint data. Cluster/node/incarnation IDs, connection strings,
 credentials, host/port, timeouts, worker counts, and customer identifiers do
 not enter the shared category digests. Cluster health exposes only the
-configured cluster/node identity, random process incarnation, protocol, fixed
-roles, admission state, and at most one bounded mismatch category. A persisted
+configured cluster/node identity, random process incarnation, protocol, assigned
+roles, live/missing required-role coverage, admission state, and at most one bounded mismatch category. A persisted
 category mismatch keeps `/.live` at 200, makes `/.health` unready, rejects S3
 work before body ingestion, blocks credential/quota admin APIs, and pauses background
 claims until a complete authoritative comparison matches again. Database
@@ -312,7 +315,7 @@ routing.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `S3_NOTIFICATION_REQUIRE_HTTPS` | `true` | Reject plaintext HTTP webhook configurations and redirects; the worker also blocks legacy stored HTTP destinations |
-| `S3_NOTIFICATION_WORKER` | `true` | Process queued webhooks in the current server; disabling it for a separate consumer belongs to a later multi-process profile |
+| `S3_NOTIFICATION_WORKER` | `true` | Standalone-only compatibility switch for queued webhook processing. Cluster mode uses the explicit `webhook` role. |
 
 The standalone command reads this environment variable directly. Laravel
 reads it through the published `s3-server.php` config. For Symfony, set

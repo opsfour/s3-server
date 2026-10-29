@@ -6,6 +6,7 @@ namespace OpsFour\S3Server;
 
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\Middleware\TrustedProxyMiddleware;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
 
 /**
  * Immutable configuration DTO for the S3 server.
@@ -41,7 +42,11 @@ final readonly class S3ServerConfig
 
     public ?string $clusterIncarnationId;
 
+    /** @var list<string> */
+    public array $clusterRoles;
 
+    /** @var list<string> */
+    public array $clusterRequiredRoles;
     public string $metadataDriver;
 
     public string $metadataDsn;
@@ -154,6 +159,8 @@ final readonly class S3ServerConfig
      * @param  bool  $notificationWorkerEnabled  Process queued webhook deliveries on this server instance.
      * @param  bool  $allowUnfencedStorageForTests  Unsafe opt-in for storage fault tests; never enable in production.
      * @param  string|null  $localObjectWriteTestScratchPath  Private node-local scratch for the isolated PUT/Copy fence test profile.
+     * @param  array<array-key, mixed>|string|null  $clusterRoles  Explicit process role names in cluster mode.
+     * @param  array<array-key, mixed>|string|null  $clusterRequiredRoles  Shared required-role policy in cluster mode.
      */
     public function __construct(
         string $host = '0.0.0.0',
@@ -201,6 +208,8 @@ final readonly class S3ServerConfig
         ?string $clusterId = null,
         ?string $clusterNodeId = null,
         ?string $clusterDatabaseId = null,
+        array|string|null $clusterRoles = null,
+        array|string|null $clusterRequiredRoles = null,
     ) {
         if ($storagePath === '') {
             throw new \InvalidArgumentException('storagePath is required and cannot be empty.');
@@ -279,6 +288,15 @@ final readonly class S3ServerConfig
         }
         if ($clusterId === null && $clusterDatabaseId !== null) {
             throw new \InvalidArgumentException('clusterDatabaseId requires clusterId.');
+        }
+
+        $clusterRoles = ClusterRoleSet::parse($clusterRoles, 'clusterRoles');
+        $clusterRequiredRoles = ClusterRoleSet::parse($clusterRequiredRoles, 'clusterRequiredRoles');
+        if ($clusterId === null && ($clusterRoles !== null || $clusterRequiredRoles !== null)) {
+            throw new \InvalidArgumentException('Explicit cluster roles require clusterId.');
+        }
+        if ($clusterId !== null && $clusterRoles === null) {
+            throw new \InvalidArgumentException('clusterRoles is required when clusterId enables cluster mode.');
         }
 
 
@@ -403,6 +421,8 @@ final readonly class S3ServerConfig
         $this->clusterIncarnationId = $clusterId === null
             ? null
             : self::processIncarnationId($clusterId, $clusterNodeId ?? throw new \LogicException('Cluster node identity is missing.'));
+        $this->clusterRoles = $clusterRoles ?? ClusterRoleSet::ALL;
+        $this->clusterRequiredRoles = $clusterRequiredRoles ?? ClusterRoleSet::ALL;
         $this->metadataDriver = $metadataDriver;
         $this->metadataDsn = $metadataDsn;
         $this->tlsCertPath = $tlsCertPath;
@@ -480,6 +500,8 @@ final readonly class S3ServerConfig
             'clusterId' => $this->clusterId,
             'clusterNodeId' => $this->clusterNodeId,
             'clusterDatabaseId' => $this->clusterDatabaseId,
+            'clusterRoles' => $this->clusterEnabled() ? $this->clusterRoles : null,
+            'clusterRequiredRoles' => $this->clusterEnabled() ? $this->clusterRequiredRoles : null,
             'metadataDriver' => $this->metadataDriver,
             'metadataDsn' => $this->metadataDsn,
             'tlsCertPath' => $this->tlsCertPath,
@@ -532,6 +554,11 @@ final readonly class S3ServerConfig
         }
 
         return $value;
+    }
+
+    public function hasClusterRole(string $role): bool
+    {
+        return ! $this->clusterEnabled() || ClusterRoleSet::contains($this->clusterRoles, $role);
     }
 
     private static function processIncarnationId(string $clusterId, string $nodeId): string

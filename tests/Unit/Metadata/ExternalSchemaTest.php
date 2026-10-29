@@ -173,11 +173,16 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(47, PostgresSchema::VERSION);
+        self::assertSame(48, PostgresSchema::VERSION);
         $clusterStatements = PostgresSchema::getMigrationStatements(45);
         $clusterAdmissionMigration = implode("\n", $clusterStatements);
         self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_database_identity', $clusterAdmissionMigration);
         self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_admission', $clusterAdmissionMigration);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_membership', $clusterAdmissionMigration);
+        self::assertStringContainsString('roles JSONB NOT NULL', $clusterAdmissionMigration);
+        self::assertStringContainsString('heartbeat_at TIMESTAMPTZ NOT NULL', $clusterAdmissionMigration);
+        self::assertStringContainsString('expires_at TIMESTAMPTZ NOT NULL', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_cluster_membership_live', $clusterAdmissionMigration);
         self::assertStringContainsString('singleton_id SMALLINT PRIMARY KEY', $clusterAdmissionMigration);
         self::assertStringNotContainsString('dsn', $clusterAdmissionMigration);
         $admissionStatement = '';

@@ -20,14 +20,16 @@ final readonly class ClusterCapabilityFingerprint
 
     public const string PROTOCOL = 'opsfour-s3-cluster-v1';
 
-    public const string ROLES = 'all-in-one-v1';
-
     /** @param array<string, string> $digests */
     private function __construct(
         public string $clusterId,
         public string $nodeId,
         public string $incarnationId,
         public string $databaseIdentity,
+        /** @var list<string> */
+        public array $roles,
+        /** @var list<string> */
+        public array $requiredRoles,
         private array $digests,
     ) {}
 
@@ -114,7 +116,6 @@ final readonly class ClusterCapabilityFingerprint
                 'max_encrypted_object_size' => $config->maxEncryptedObjectSize,
                 'max_select_object_size' => $config->maxSelectObjectSize,
                 'notification_https' => $config->notificationRequireHttps,
-                'notification_worker_enabled' => $config->notificationWorkerEnabled,
                 'multipart_max_age_seconds' => $config->multipartMaxAgeSeconds,
                 'lifecycle_lock_ttl_seconds' => $config->lifecycleLockTtlSeconds,
                 'quota' => [
@@ -128,7 +129,10 @@ final readonly class ClusterCapabilityFingerprint
                     'max_multipart_bytes_per_owner' => $config->quota->maxMultipartBytesPerOwner,
                 ],
             ],
-            'roles' => ['roles' => self::ROLES],
+            'roles' => [
+                'protocol' => ClusterRoleSet::PROTOCOL,
+                'required_roles' => $config->clusterRequiredRoles,
+            ],
         ];
 
         $digests = [];
@@ -141,6 +145,8 @@ final readonly class ClusterCapabilityFingerprint
             $config->clusterNodeId,
             $config->clusterIncarnationId,
             $databaseIdentity,
+            $config->clusterRoles,
+            $config->clusterRequiredRoles,
             $digests,
         );
     }

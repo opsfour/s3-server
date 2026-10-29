@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 47;
+    public const int VERSION = 48;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -57,6 +57,20 @@ final class PostgresSchema
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             SQL,
+
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_cluster_membership (
+                cluster_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                incarnation_id TEXT NOT NULL,
+                roles JSONB NOT NULL CHECK (jsonb_typeof(roles) = 'array'),
+                ready BOOLEAN NOT NULL,
+                heartbeat_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (cluster_id, node_id, incarnation_id)
+            )
+            SQL,
+            'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at) WHERE ready = TRUE',
 
             // Buckets
             <<<'SQL'
@@ -1123,6 +1137,21 @@ final class PostgresSchema
                 END
                 $$
                 SQL;
+        }
+        if ($fromVersion < 48) {
+            $statements[] = <<<'SQL'
+                CREATE TABLE IF NOT EXISTS s3_cluster_membership (
+                    cluster_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    incarnation_id TEXT NOT NULL,
+                    roles JSONB NOT NULL CHECK (jsonb_typeof(roles) = 'array'),
+                    ready BOOLEAN NOT NULL,
+                    heartbeat_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (cluster_id, node_id, incarnation_id)
+                )
+                SQL;
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at) WHERE ready = TRUE';
         }
 
         return $statements;
