@@ -29,7 +29,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * Uses amphp/mysql for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class MysqlMetadataStore implements MetadataStore, Crc64NvmeObjectMetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, ObjectWriteIntentStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     /** Preserve S3 Last-Modified while changing version-list bookkeeping. */
     private const string VERSION_DEMOTION_UPDATE_SQL = <<<'SQL'
@@ -581,6 +581,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void {
         $now = gmdate('Y-m-d H:i:s');
         $userMetadataJson = json_encode($userMetadata, JSON_THROW_ON_ERROR);
@@ -602,6 +603,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             $checksumCrc32c,
             $checksumSha1,
             $checksumSha256,
+            $checksumCrc64Nvme,
             $now,
         ): void {
             // A suspended write replaces the null version but retains any
@@ -617,13 +619,13 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 owner_id, etag, size, content_type, content_encoding,
                 content_disposition, cache_control, storage_class, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, created_at, updated_at
             ) VALUES (
                 ?, ?, 'null', 1, 0,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
-                ?, ?, ?
+                ?, ?, ?, ?
             )
             ON DUPLICATE KEY UPDATE
                 is_latest = VALUES(is_latest),
@@ -651,6 +653,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 checksum_crc32c = VALUES(checksum_crc32c),
                 checksum_sha1 = VALUES(checksum_sha1),
                 checksum_sha256 = VALUES(checksum_sha256),
+                checksum_crc64nvme = VALUES(checksum_crc64nvme),
                 created_at = VALUES(created_at),
                 updated_at = VALUES(updated_at)
             SQL,
@@ -659,7 +662,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                     $ownerId, $etag, $size, $contentType, $contentEncoding,
                     $contentDisposition, $cacheControl, $storageClass, $storagePath,
                     $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                    $checksumSha256, $now, $now,
+                    $checksumSha256, $checksumCrc64Nvme, $now, $now,
                 ],
             );
             $objectRow = $this->conn()->execute("SELECT id FROM s3_objects WHERE bucket = ? AND key_name = ? AND version_id = 'null'", [$bucket, $key])->fetchRow();
@@ -710,7 +713,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1 AND is_delete_marker = 0
             SQL,
@@ -732,7 +735,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1
             SQL,
@@ -1215,7 +1218,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
             . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
@@ -2195,6 +2198,11 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         return true;
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return true;
+    }
+
     public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
     {
         $upload = $this->getMultipartUpload($uploadId);
@@ -2327,6 +2335,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         $versionId = bin2hex(random_bytes(16));
         $now = gmdate('Y-m-d H:i:s');
@@ -2346,13 +2355,13 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                     owner_id, etag, size, content_type, content_encoding,
                     content_disposition, cache_control, storage_class, storage_path,
                     user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                    checksum_sha256, created_at, updated_at
+                    checksum_sha256, checksum_crc64nvme, created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, 1, 0,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?
+                    ?, ?, ?, ?
                 )
                 SQL,
                 [
@@ -2360,7 +2369,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                     $ownerId, $etag, $size, $contentType, $contentEncoding,
                     $contentDisposition, $cacheControl, $storageClass, $storagePath,
                     $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                    $checksumSha256, $now, $now,
+                    $checksumSha256, $checksumCrc64Nvme, $now, $now,
                 ],
             );
             $layout = ObjectPartLayout::knownSingle($size);
@@ -2442,6 +2451,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                         checksum_crc32c = NULL,
                         checksum_sha1 = NULL,
                         checksum_sha256 = NULL,
+                        checksum_crc64nvme = NULL,
                         created_at = VALUES(created_at),
                         updated_at = VALUES(updated_at)
                     SQL,
@@ -2488,7 +2498,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND version_id = ?
             SQL,
@@ -2581,7 +2591,7 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
@@ -4572,6 +4582,9 @@ final class MysqlMetadataStore implements MetadataStore, MetadataWriteReadinessP
         }
         if (isset($row['checksum_sha256'])) {
             $systemMetadata['checksum-sha256'] = (string) $row['checksum_sha256'];
+        }
+        if (isset($row['checksum_crc64nvme'])) {
+            $systemMetadata['checksum-crc64nvme'] = (string) $row['checksum_crc64nvme'];
         }
         if (isset($row['is_latest'])) {
             $systemMetadata['isLatest'] = (bool) (int) $row['is_latest'] ? '1' : '0';

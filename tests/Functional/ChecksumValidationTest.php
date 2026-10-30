@@ -5,7 +5,13 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
+use Aws\Credentials\Credentials;
+use Aws\Signature\S3SignatureV4;
 use GuzzleHttp\Client;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Utils;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
+use OpsFour\S3Server\Auth\SigningKey;
 
 /**
  * Functional tests for checksum validation: Content-MD5, CRC32, CRC32C,
@@ -271,6 +277,130 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
         $this->assertSame(200, $result['@metadata']['statusCode']);
 
         self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => 'crc32-test.txt']);
+    }
+
+    public function test_crc64nvme_put_read_copy_and_bad_digest_contract(): void
+    {
+        $body = 'CRC64NVME logical plaintext';
+        $sourceKey = 'crc64nvme-source-' . bin2hex(random_bytes(4));
+        $copyKey = 'crc64nvme-copy-' . bin2hex(random_bytes(4));
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+
+        try {
+            $put = self::$s3->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'Body' => $body,
+                'ChecksumAlgorithm' => 'CRC64NVME',
+                'ChecksumCRC64NVME' => $checksum,
+            ]);
+            self::assertSame($checksum, $put['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $put['ChecksumType'] ?? null);
+
+            $head = self::$s3->headObject([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'ChecksumMode' => 'ENABLED',
+            ]);
+            self::assertSame($checksum, $head['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $head['ChecksumType'] ?? null);
+
+            $attributes = self::$s3->getObjectAttributes([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'ObjectAttributes' => ['Checksum'],
+            ]);
+            self::assertSame($checksum, $attributes['Checksum']['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $attributes['Checksum']['ChecksumType'] ?? null);
+
+            $copy = self::$s3->copyObject([
+                'Bucket' => self::$bucket,
+                'Key' => $copyKey,
+                'CopySource' => self::$bucket . '/' . $sourceKey,
+            ]);
+            self::assertSame($checksum, $copy['CopyObjectResult']['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $copy['CopyObjectResult']['ChecksumType'] ?? null);
+
+            $badKey = 'crc64nvme-bad-' . bin2hex(random_bytes(4));
+            $wrong = $this->signedPutWithChecksum(
+                self::$bucket,
+                $badKey,
+                $body,
+                'x-amz-checksum-crc64nvme',
+                'AAAAAAAAAAA=',
+            );
+            self::assertSame(400, $wrong->getStatusCode());
+            self::assertStringContainsString('BadDigest', (string) $wrong->getBody());
+            try {
+                self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $badKey]);
+                self::fail('A failed CRC64NVME upload published an object.');
+            } catch (S3Exception $error) {
+                self::assertSame(404, $error->getStatusCode());
+            }
+        } finally {
+            foreach ([$sourceKey, $copyKey] as $key) {
+                try {
+                    self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+                } catch (\Throwable) {
+                }
+            }
+        }
+    }
+
+    public function test_version_specific_crc64nvme_read_preserves_persisted_checksum(): void
+    {
+        $bucket = 'checksum-versioned-' . bin2hex(random_bytes(4));
+        $key = 'crc64nvme-versioned-' . bin2hex(random_bytes(4));
+        $body = 'versioned CRC64NVME payload';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+        self::$s3->createBucket(['Bucket' => $bucket]);
+        self::$s3->putBucketVersioning([
+            'Bucket' => $bucket,
+            'VersioningConfiguration' => ['Status' => 'Enabled'],
+        ]);
+        $put = self::$s3->putObject([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'Body' => $body,
+            'ChecksumAlgorithm' => 'CRC64NVME',
+            'ChecksumCRC64NVME' => $checksum,
+        ]);
+        $versionId = $put['VersionId'] ?? null;
+        self::assertIsString($versionId);
+
+        try {
+            $head = self::$s3->headObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'VersionId' => $versionId,
+                'ChecksumMode' => 'ENABLED',
+            ]);
+            self::assertSame($checksum, $head['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $head['ChecksumType'] ?? null);
+        } finally {
+            self::$s3->deleteObject(['Bucket' => $bucket, 'Key' => $key, 'VersionId' => $versionId]);
+            self::$s3->deleteBucket(['Bucket' => $bucket]);
+        }
+    }
+
+    public function test_signed_and_unsigned_crc64nvme_trailer_mismatch_publish_nothing(): void
+    {
+        foreach ([false => 'unsigned', true => 'signed'] as $signed => $label) {
+            $key = 'crc64nvme-' . $label . '-trailer-' . bin2hex(random_bytes(4));
+            $response = $this->putWithCrc64NvmeTrailer($key, 'trailer payload', 'AAAAAAAAAAA=', (bool) $signed);
+            self::assertSame(400, $response->getStatusCode(), $label . ': ' . (string) $response->getBody());
+            self::assertStringContainsString('<Code>BadDigest</Code>', (string) $response->getBody(), $label);
+            try {
+                self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+                self::fail("{$label} CRC64NVME trailer mismatch published an object.");
+            } catch (S3Exception $error) {
+                self::assertSame(404, $error->getStatusCode(), $label);
+            }
+        }
     }
 
     public function test_get_and_head_checksums_require_enabled_mode_and_are_absent_for_ranges(): void
@@ -680,6 +810,95 @@ final class ChecksumValidationTest extends S3FunctionalTestCase
      * Send a PUT request with a manually computed SigV4 signature and a custom checksum header.
      * Uses UNSIGNED-PAYLOAD so the checksum header doesn't affect the signature.
      */
+    private function putWithCrc64NvmeTrailer(
+        string $key,
+        string $payload,
+        string $checksum,
+        bool $signedChunks,
+    ): \Psr\Http\Message\ResponseInterface {
+        $timestamp = gmdate('Ymd\THis\Z');
+        $date = substr($timestamp, 0, 8);
+        $scope = $date . '/us-east-1/s3/aws4_request';
+        $payloadHash = $signedChunks
+            ? 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER'
+            : 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
+        $headers = [
+            'content-encoding' => 'aws-chunked',
+            'x-amz-content-sha256' => $payloadHash,
+            'x-amz-date' => $timestamp,
+            'x-amz-decoded-content-length' => (string) strlen($payload),
+            'x-amz-sdk-checksum-algorithm' => 'CRC64NVME',
+            'x-amz-trailer' => 'x-amz-checksum-crc64nvme',
+        ];
+        $encoded = $signedChunks
+            ? $this->signedTrailerBody($payload, $checksum, str_repeat('0', 64), $timestamp, $scope)
+            : dechex(strlen($payload)) . "\r\n{$payload}\r\n0\r\nx-amz-checksum-crc64nvme:{$checksum}\r\n\r\n";
+        $uri = sprintf(
+            'http://%s:%d/%s/%s',
+            self::$host,
+            self::$port,
+            self::$bucket,
+            rawurlencode($key),
+        );
+        $request = new Request('PUT', $uri, $headers, $encoded);
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $signed = $signer->signRequest($request, new Credentials(self::$accessKey, self::$secretKey));
+
+        if ($signedChunks) {
+            $authorization = $signed->getHeaderLine('Authorization');
+            if (preg_match('/Signature=([a-f0-9]{64})\z/', $authorization, $matches) !== 1) {
+                throw new \RuntimeException('Could not resolve the streaming seed signature.');
+            }
+            $encoded = $this->signedTrailerBody($payload, $checksum, $matches[1], $timestamp, $scope);
+            $signed = $signed
+                ->withBody(Utils::streamFor($encoded))
+                ->withHeader('Content-Length', (string) strlen($encoded));
+        }
+
+        return (new Client(['http_errors' => false]))->send($signed);
+    }
+
+    private function signedTrailerBody(
+        string $payload,
+        string $checksum,
+        string $seedSignature,
+        string $timestamp,
+        string $scope,
+    ): string {
+        $signingKey = SigningKey::derive(self::$secretKey, substr($timestamp, 0, 8), 'us-east-1', 's3');
+        $emptyHash = hash('sha256', '');
+        $dataSignature = hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-PAYLOAD',
+            $timestamp,
+            $scope,
+            $seedSignature,
+            $emptyHash,
+            hash('sha256', $payload),
+        ]), $signingKey);
+        $finalSignature = hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-PAYLOAD',
+            $timestamp,
+            $scope,
+            $dataSignature,
+            $emptyHash,
+            $emptyHash,
+        ]), $signingKey);
+        $canonicalTrailer = "x-amz-checksum-crc64nvme:{$checksum}\n";
+        $trailerSignature = hash_hmac('sha256', implode("\n", [
+            'AWS4-HMAC-SHA256-TRAILER',
+            $timestamp,
+            $scope,
+            $finalSignature,
+            hash('sha256', $canonicalTrailer),
+        ]), $signingKey);
+
+        return dechex(strlen($payload)) . ";chunk-signature={$dataSignature}\r\n"
+            . $payload . "\r\n"
+            . "0;chunk-signature={$finalSignature}\r\n"
+            . "x-amz-checksum-crc64nvme:{$checksum}\r\n"
+            . "x-amz-trailer-signature:{$trailerSignature}\r\n\r\n";
+    }
+
     private function signedPutWithChecksum(string $bucket, string $key, string $body, string $checksumHeader, string $checksumValue): \Psr\Http\Message\ResponseInterface
     {
         $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));

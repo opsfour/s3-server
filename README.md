@@ -1,6 +1,6 @@
 # opsfour S3 Server
 
-An S3-compatible object storage server built as a PHP 8.4+ Composer package.
+An S3-compatible object storage server built as a 64-bit PHP 8.4+ Composer package.
 Powered by [Amp v3](https://amphp.org/) for async I/O with PHP Fibers.
 
 ## Features
@@ -15,6 +15,7 @@ Powered by [Amp v3](https://amphp.org/) for async I/O with PHP Fibers.
   and in-memory drivers for experimental and test profiles
 - **Optional server-side encryption** — SSE-S3 with key rotation support and SSE-C (customer-provided keys), using AES-256-GCM when configured
 - **Authentication** — AWS Signature V4, presigned URLs, signed and unsigned `aws-chunked` checksum trailers
+- **Checksums** — CRC32, CRC32C, CRC64NVME, SHA-1, and SHA-256 request integrity; CRC64NVME multipart uploads use AWS `FULL_OBJECT` semantics
 - **Multi-tenant** — Owner IDs isolate buckets by default; explicit grants can allow cross-account object access. Credential providers include memory, database, file, and chain.
 - **Framework integrations** — Standalone CLI, Laravel service provider, and Symfony Bundle
 - **Quotas and tiering** — Per-owner/per-bucket object and multipart-staging quotas, physical storage tiers, cold-tier restore workflow
@@ -80,7 +81,7 @@ experimental until each exact profile completes its own qualification gates. See
 
 ## Requirements
 
-- PHP 8.4+
+- 64-bit PHP 8.4+
 - Composer 2.x
 - `proc_open` enabled for the package's local helper worker processes
 - ext-dom, ext-libxml, and ext-simplexml for S3 XML requests and responses

@@ -88,13 +88,14 @@ final class XmlResponseBuilder
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         $writer = self::createWriter();
 
         $writer->startElementNs(null, 'CopyObjectResult', self::S3_NAMESPACE);
         $writer->writeElement('ETag', $etag);
         $writer->writeElement('LastModified', $lastModified);
-        if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumSha1 !== null || $checksumSha256 !== null) {
+        if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumSha1 !== null || $checksumSha256 !== null || $checksumCrc64Nvme !== null) {
             $writer->writeElement('ChecksumType', 'FULL_OBJECT');
         }
         if ($checksumCrc32 !== null) {
@@ -109,6 +110,9 @@ final class XmlResponseBuilder
         if ($checksumSha256 !== null) {
             $writer->writeElement('ChecksumSHA256', $checksumSha256);
         }
+        if ($checksumCrc64Nvme !== null) {
+            $writer->writeElement('ChecksumCRC64NVME', $checksumCrc64Nvme);
+        }
         $writer->endElement();
 
         $writer->endDocument();
@@ -117,13 +121,16 @@ final class XmlResponseBuilder
     }
 
     /** Build a CopyPartResult XML response. */
-    public static function copyPartResult(string $etag, string $lastModified): string
+    public static function copyPartResult(string $etag, string $lastModified, ?string $checksumCrc64Nvme = null): string
     {
         $writer = self::createWriter();
 
         $writer->startElementNs(null, 'CopyPartResult', self::S3_NAMESPACE);
         $writer->writeElement('ETag', $etag);
         $writer->writeElement('LastModified', $lastModified);
+        if ($checksumCrc64Nvme !== null) {
+            $writer->writeElement('ChecksumCRC64NVME', $checksumCrc64Nvme);
+        }
         $writer->endElement();
 
         return $writer->outputMemory();
@@ -155,6 +162,7 @@ final class XmlResponseBuilder
         string $bucket,
         string $key,
         string $etag,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         $writer = self::createWriter();
 
@@ -163,6 +171,10 @@ final class XmlResponseBuilder
         $writer->writeElement('Bucket', $bucket);
         $writer->writeElement('Key', self::safeXmlValue($key, false));
         $writer->writeElement('ETag', $etag);
+        if ($checksumCrc64Nvme !== null) {
+            $writer->writeElement('ChecksumCRC64NVME', $checksumCrc64Nvme);
+            $writer->writeElement('ChecksumType', 'FULL_OBJECT');
+        }
         $writer->endElement();
 
         $writer->endDocument();
@@ -345,6 +357,8 @@ final class XmlResponseBuilder
      *     initiatorId?: string,
      *     ownerId?: string,
      *     displayName?: string,
+     *     checksumAlgorithm?: ?string,
+     *     checksumType?: ?string,
      *     parts: list<array{partNumber: int, lastModified: string, etag: string, size: int, checksumAlgorithm?: ?string, checksumValue?: ?string}>,
      * } $params
      */
@@ -357,6 +371,12 @@ final class XmlResponseBuilder
         $writer->writeElement('Bucket', $params['bucket']);
         $writer->writeElement('Key', self::safeXmlValue($params['key'], false));
         $writer->writeElement('UploadId', $params['uploadId']);
+        if (isset($params['checksumAlgorithm'])) {
+            $writer->writeElement('ChecksumAlgorithm', $params['checksumAlgorithm']);
+        }
+        if (isset($params['checksumType'])) {
+            $writer->writeElement('ChecksumType', $params['checksumType']);
+        }
 
         // Initiator and Owner
         $initiatorId = $params['initiatorId'] ?? $params['ownerId'] ?? null;

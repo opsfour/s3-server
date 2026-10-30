@@ -219,9 +219,10 @@ The DML-only serving role does not need trigger-creation rights.
 | 47 (PostgreSQL) | Bind lifecycle, notification, transition, restore, storage-garbage, multipart-intent, and object-intent claims to a process-derived worker ID, database-time heartbeat/expiry, and monotonically increasing generation. The migration expires and increments every pre-owner active generation. |
 | 48 (PostgreSQL) | Add per-process cluster membership with canonical roles, ready state, database-time heartbeat, and authoritative expiry plus a bounded live-coverage index. |
 | 49 (PostgreSQL) | Record intentional drain explicitly, add fixed durable-work takeover/outcome aggregates, and add the bounded membership and work indexes used by cluster health and metrics. |
+| 43 (SQLite) / 50 (PostgreSQL) / 51 (MySQL) | Add nullable `checksum_crc64nvme` object state. Existing rows remain null; the migration reads no object payload and performs no checksum backfill. |
 
-SQLite currently uses schema version `42`; PostgreSQL uses `49`, and MySQL
-uses `50`. SQLite normally applies each migration version in a transaction. The
+SQLite currently uses schema version `43`; PostgreSQL uses `50`, and MySQL
+uses `51`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
 schema version only after the final batch. Rows beyond that target abort schema
@@ -328,7 +329,12 @@ their package-provided decorators implement this contract.
 Custom metadata stores that accept checksummed UploadPart requests must
 implement `MultipartPartChecksumStore`. Its capability method may return
 `true` only when `putPartWithChecksum()` persists the verified algorithm and
-value atomically with the part row. A missing or disabled capability returns
+value atomically with the part row. Implementations must also adopt the
+extended nullable object-checksum arguments on `MetadataStore`; startup must
+fail rather than silently drop CRC64NVME state. This is a public-interface
+source break: custom stores must implement `Crc64NvmeObjectMetadataStore` and
+return `true` only after both null-version and versioned writes durably round-trip
+the value. Missing or disabled capability prevents API startup. A missing or disabled multipart-part capability returns
 HTTP 501 before metadata or storage access. Cached and observed decorators
 delegate this decision to their wrapped store instead of advertising it on the
 store's behalf.

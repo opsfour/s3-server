@@ -31,6 +31,7 @@ final class MultipartObjectIntegrityVerifier
     public function __construct(
         private readonly ObjectPartLayout $layout,
         string $expectedEtag,
+        private readonly bool $cooperativeCrc64Nvme = false,
     ) {
         if ($layout->kind !== ObjectPartLayout::KNOWN_MULTIPART) {
             throw new \InvalidArgumentException('Multipart integrity verification requires a known multipart layout.');
@@ -115,7 +116,10 @@ final class MultipartObjectIntegrityVerifier
     {
         $this->partMd5 = hash_init('md5');
         $part = $this->currentPart();
-        $this->partChecksum = $part?->checksumAlgorithm === null ? null : new ChecksumCalculator();
+        $this->partChecksum = $part?->checksumAlgorithm === null ? null : new ChecksumCalculator(
+            strtolower($part->checksumAlgorithm) === 'crc64nvme',
+            cooperativeCrc64Nvme: $this->cooperativeCrc64Nvme,
+        );
     }
 
     private function finishPart(ObjectPart $part): void
@@ -127,6 +131,8 @@ final class MultipartObjectIntegrityVerifier
             $actual = match (strtolower($part->checksumAlgorithm)) {
                 'crc32' => $checksums->crc32Base64(),
                 'crc32c' => $checksums->crc32cBase64(),
+                'crc64nvme' => $checksums->crc64NvmeBase64()
+                    ?? throw new InternalErrorException('CRC64NVME part checksum was not captured.'),
                 'sha1' => $checksums->sha1Base64(),
                 'sha256' => $checksums->sha256Base64(),
                 default => throw new InternalErrorException(

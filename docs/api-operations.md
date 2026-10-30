@@ -91,7 +91,7 @@ For authenticated DeleteObject and DeleteObjects requests, `ObjectWriter` and
 are always bucket-owned. Markers store no object ACL and do not count toward
 object or byte quotas.
 
-PutObject accepts one CRC32, CRC32C, SHA1, or SHA256 checksum header. The
+PutObject accepts one CRC32, CRC32C, CRC64NVME, SHA1, or SHA256 checksum header. The
 optional `x-amz-sdk-checksum-algorithm` selector must identify that same
 header or the single verified `aws-chunked` checksum trailer. Duplicate
 digest, selector, and trailer-declaration headers are rejected. Unknown
@@ -131,7 +131,7 @@ modification time before reading its immutable layout. Recognized legacy
 objects without authoritative boundaries return HTTP 501 without object-byte
 I/O. Part responses omit complete-object checksum headers even when checksum
 mode is enabled. When checksum mode is enabled and the selected authoritative
-part row contains a verified CRC32, CRC32C, SHA1, or SHA256 checksum, GET and
+part row contains a verified CRC32, CRC32C, CRC64NVME, SHA1, or SHA256 checksum, GET and
 HEAD emit only that algorithm-specific `x-amz-checksum-*` header. They do not
 recompute a missing checksum, substitute an object checksum, or emit
 `x-amz-checksum-type` for a selected part. Successful and `304 Not Modified`
@@ -232,7 +232,7 @@ object limit (50,000 GiB, about 48.8 TiB) before creating a durable write
 attempt or invoking assembly. When `x-amz-mp-object-size` is supplied, it must
 be a non-negative decimal value within that limit and must equal the selected
 parts' total size; a mismatch returns `InvalidRequest` before assembly.
-UploadPart accepts one CRC32, CRC32C, SHA1, or SHA256 checksum. It validates
+UploadPart accepts one CRC32, CRC32C, CRC64NVME, SHA1, or SHA256 checksum. It validates
 the digest against the complete logical part, returns the matching checksum
 response header, persists it with the part, and includes it in ListParts.
 `x-amz-sdk-checksum-algorithm` must match the normal checksum header or the
@@ -258,13 +258,15 @@ UploadPart requests carrying a supported checksum return HTTP 501 before
 metadata or storage access when that capability is unavailable. Metadata
 decorators must delegate the capability to their wrapped store.
 
-Composite multipart checksums are not yet supported through completion.
-CreateMultipartUpload therefore returns HTTP 501 when
-`x-amz-checksum-algorithm` or `x-amz-checksum-type` is supplied.
-CompleteMultipartUpload likewise returns HTTP 501 for additional-checksum
-headers before reading or changing multipart metadata. This applies to every
-`x-amz-checksum-*` header, including algorithms newer than the supported
-UploadPart subset, and to `x-amz-sdk-checksum-algorithm`.
+CRC64NVME multipart uploads are supported only with `FULL_OBJECT` semantics.
+CreateMultipartUpload accepts `CRC64NVME` with an omitted or explicit
+`FULL_OBJECT` type and rejects `COMPOSITE`. UploadPart and UploadPartCopy
+calculate and persist the logical part checksum, and ListParts returns both the
+upload contract and part values. CompleteMultipartUpload validates optional
+part and final values, directly streams the assembled logical plaintext for the
+final checksum, and leaves the upload retryable after validation failure.
+Other multipart additional-checksum algorithms and checksum conversion remain
+unsupported.
 
 ListParts and ListMultipartUploads report the identity that created the upload
 as `Initiator`. For new uploads, `Owner` is the intended final object owner

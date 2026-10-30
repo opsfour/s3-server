@@ -13,6 +13,8 @@ use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
+use OpsFour\S3Server\Exception\InternalErrorException;
+use OpsFour\S3Server\Http\S3ResponseHeaders;
 use OpsFour\S3Server\Handler\Object\GetObjectHandler;
 use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Metadata\MetadataStore;
@@ -142,6 +144,31 @@ final class ObjectChecksumModeTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
         ($method === 'GET' ? new GetObjectHandler($metadata, $storage) : new HeadObjectHandler($metadata))
             ->handleRequest($request);
+    }
+
+    public function test_selected_part_crc64nvme_response_requires_canonical_padded_value(): void
+    {
+        self::assertSame(
+            ['x-amz-checksum-crc64nvme' => 'rosUhgp5mIg='],
+            S3ResponseHeaders::withPartChecksum([], true, 'crc64nvme', 'rosUhgp5mIg='),
+        );
+
+        $this->expectException(InternalErrorException::class);
+        S3ResponseHeaders::withPartChecksum([], true, 'crc64nvme', 'rosUhgp5mIg');
+    }
+
+    public function test_full_object_crc64nvme_response_rejects_noncanonical_stored_value(): void
+    {
+        $object = new ObjectInfo(
+            'bucket',
+            'key',
+            7,
+            '"etag"',
+            systemMetadata: ['checksum-crc64nvme' => 'rosUhgp5mIg'],
+        );
+
+        $this->expectException(InternalErrorException::class);
+        S3ResponseHeaders::build($object, 7, includeChecksums: true);
     }
 
     /** @param 'GET'|'HEAD' $method */

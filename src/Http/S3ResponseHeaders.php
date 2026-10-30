@@ -7,6 +7,7 @@ namespace OpsFour\S3Server\Http;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Checksum\StoredCrc64Nvme;
 
 /**
  * Builds the standard S3 response headers for an object.
@@ -60,12 +61,14 @@ final class S3ResponseHeaders
         [$header, $decodedLength] = match (strtolower($algorithm)) {
             'crc32' => ['x-amz-checksum-crc32', 4],
             'crc32c' => ['x-amz-checksum-crc32c', 4],
+            'crc64nvme' => ['x-amz-checksum-crc64nvme', 8],
             'sha1' => ['x-amz-checksum-sha1', 20],
             'sha256' => ['x-amz-checksum-sha256', 32],
             default => throw new InternalErrorException('Stored object part checksum algorithm is invalid.'),
         };
         $decoded = base64_decode($value, true);
-        if ($decoded === false || strlen($decoded) !== $decodedLength) {
+        if ($decoded === false || strlen($decoded) !== $decodedLength
+            || (strtolower($algorithm) === 'crc64nvme' && base64_encode($decoded) !== $value)) {
             throw new InternalErrorException('Stored object part checksum value is invalid.');
         }
         $headers[$header] = $value;
@@ -140,6 +143,13 @@ final class S3ResponseHeaders
 
         if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-crc32c']) && $objectInfo->systemMetadata['checksum-crc32c'] !== '') {
             $headers['x-amz-checksum-crc32c'] = $objectInfo->systemMetadata['checksum-crc32c'];
+            $hasFullObjectChecksum = true;
+        }
+
+        if ($includeChecksums && isset($objectInfo->systemMetadata['checksum-crc64nvme']) && $objectInfo->systemMetadata['checksum-crc64nvme'] !== '') {
+            $headers['x-amz-checksum-crc64nvme'] = StoredCrc64Nvme::requireCanonical(
+                $objectInfo->systemMetadata['checksum-crc64nvme'],
+            );
             $hasFullObjectChecksum = true;
         }
 

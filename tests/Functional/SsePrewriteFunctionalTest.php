@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 
 final class SsePrewriteFunctionalTest extends S3FunctionalTestCase
 {
@@ -70,6 +71,34 @@ final class SsePrewriteFunctionalTest extends S3FunctionalTestCase
 
         self::assertSame('"' . md5('') . '"', $put['ETag']);
         self::assertSame('', (string) self::$s3->getObject(['Bucket' => self::$bucket, 'Key' => 'empty'])['Body']);
+    }
+
+    public function test_sse_s3_crc64nvme_is_calculated_over_plaintext(): void
+    {
+        $body = 'crc64sse';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+        $put = self::$s3->putObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'crc64-sse-s3',
+            'Body' => $body,
+            'ServerSideEncryption' => 'AES256',
+            'ChecksumAlgorithm' => 'CRC64NVME',
+            'ChecksumCRC64NVME' => $checksum,
+        ]);
+        self::assertSame($checksum, $put['ChecksumCRC64NVME'] ?? null);
+
+        $head = self::$s3->headObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'crc64-sse-s3',
+            'ChecksumMode' => 'ENABLED',
+        ]);
+        self::assertSame($checksum, $head['ChecksumCRC64NVME'] ?? null);
+        self::assertSame($body, (string) self::$s3->getObject([
+            'Bucket' => self::$bucket,
+            'Key' => 'crc64-sse-s3',
+        ])['Body']);
     }
 
     public function test_signed_oversize_sse_put_and_copy_fail_without_destination_object(): void

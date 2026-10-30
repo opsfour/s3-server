@@ -20,11 +20,11 @@ final class BufferedSsePayload
      * @param (callable(): float)|null $now Monotonic clock override for deterministic progress tests.
      * @return array{string, ChecksumResult}
      */
-    public static function read(ReadableStream $stream, int $maxBytes, ?callable $now = null, ?int $expectedBytes = null): array
+    public static function read(ReadableStream $stream, int $maxBytes, ?callable $now = null, ?int $expectedBytes = null, bool $captureCrc64Nvme = false): array
     {
         $now ??= static fn(): float => hrtime(true) / 1_000_000_000;
         $plaintext = '';
-        $checksums = new ChecksumCalculator();
+        $checksums = new ChecksumCalculator($captureCrc64Nvme, cooperativeCrc64Nvme: true);
         $emptySince = null;
 
         while (($chunk = $stream->read()) !== null) {

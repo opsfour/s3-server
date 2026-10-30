@@ -66,7 +66,12 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_mysql_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(50, MysqlSchema::VERSION);
+        self::assertSame(51, MysqlSchema::VERSION);
+        self::assertContains(
+            'ALTER TABLE s3_objects ADD COLUMN checksum_crc64nvme VARCHAR(64) NULL',
+            MysqlSchema::getMigrationStatements(50),
+        );
+        self::assertStringContainsString('checksum_crc64nvme VARCHAR(64)', implode("\n", MysqlSchema::getCreateStatements()));
         $layoutMigration = implode("\n", MysqlSchema::getMigrationStatements(48));
         self::assertStringContainsString('s3_object_parts', $layoutMigration);
         self::assertStringContainsString('s3_migration_checkpoints', $layoutMigration);
@@ -198,7 +203,12 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(49, PostgresSchema::VERSION);
+        self::assertSame(50, PostgresSchema::VERSION);
+        self::assertContains(
+            'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS checksum_crc64nvme TEXT',
+            PostgresSchema::getMigrationStatements(49),
+        );
+        self::assertStringContainsString('checksum_crc64nvme TEXT', implode("\n", PostgresSchema::getCreateStatements()));
         $clusterStatements = PostgresSchema::getMigrationStatements(45);
         $clusterAdmissionMigration = implode("\n", $clusterStatements);
         self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_database_identity', $clusterAdmissionMigration);

@@ -7,6 +7,8 @@ namespace OpsFour\S3Server\Tests\Unit\Handler;
 use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use Amp\ByteStream\ReadableIterableStream;
+use Amp\ByteStream\ReadableStream;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use League\Flysystem\Filesystem;
 use League\Uri\Http;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
@@ -112,6 +114,60 @@ final class PutObjectSizeContractTest extends TestCase
         }
     }
 
+    public function test_custom_backend_full_read_uses_package_crc64_capture(): void
+    {
+        $payload = 'custom backend logical payload';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($payload);
+        $checksum = $digest->finalizeBase64();
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('putObject')->willReturnCallback(
+            static function (string $bucket, string $key, ReadableStream $body) use ($payload): StorageWriteResult {
+                self::assertSame($payload, \Amp\ByteStream\buffer($body));
+
+                return new StorageWriteResult('/custom/full', strlen($payload), md5($payload));
+            },
+        );
+
+        $response = (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request($payload, [
+            'x-amz-checksum-crc64nvme' => $checksum,
+        ]));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame($checksum, $response->getHeader('x-amz-checksum-crc64nvme'));
+        self::assertSame(
+            $checksum,
+            $this->metadata->getObjectMetadata('bucket', 'key')?->systemMetadata['checksum-crc64nvme'] ?? null,
+        );
+    }
+
+    public function test_custom_backend_early_eof_crc64_failure_deletes_returned_path(): void
+    {
+        $payload = 'first-second';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($payload);
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->expects(self::once())->method('putObject')->willReturnCallback(
+            static function (string $bucket, string $key, ReadableStream $body): StorageWriteResult {
+                $first = $body->read();
+                self::assertSame('first-', $first);
+
+                return new StorageWriteResult('/custom/partial', strlen((string) $first), md5((string) $first));
+            },
+        );
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('/custom/partial', 'bucket');
+        $body = new ReadableIterableStream(['first-', 'second']);
+
+        try {
+            (new PutObjectHandler($this->metadata, $storage))->handleRequest($this->request($body, [
+                'x-amz-checksum-crc64nvme' => $digest->finalizeBase64(),
+            ]));
+            self::fail('A partial custom-backend read finalized CRC64NVME.');
+        } catch (\LogicException) {
+            self::assertNull($this->metadata->getObjectMetadata('bucket', 'key'));
+        }
+    }
+
     public function test_repeated_if_match_lines_are_evaluated_as_one_entity_tag_list(): void
     {
         $storage = new InMemoryBackend();
@@ -195,7 +251,7 @@ final class PutObjectSizeContractTest extends TestCase
     }
 
     /** @param array<non-empty-string, string|list<string>> $headers */
-    private function request(string $body, array $headers = []): Request
+    private function request(string|ReadableStream $body, array $headers = []): Request
     {
         $request = new Request(
             $this->createMock(Client::class),

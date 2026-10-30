@@ -12,6 +12,7 @@ use Amp\Socket\SocketAddress;
 use Amp\Socket\TlsInfo;
 use League\Uri\Http;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Encryption\EncryptedMultipartPartCodec;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
@@ -67,16 +68,22 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertNotNull($bucket);
             $uploadId = bin2hex(random_bytes(16));
             $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+            $crc64Contract = $encrypted && ! $versioned;
+            $userMetadata = $encrypted ? [
+                ...self::currentPolicyContext(),
+                '__sse-algorithm' => EncryptionRequestResolver::SSE_S3,
+                '__mpu-part-format' => EncryptedMultipartPartCodec::FORMAT,
+            ] : self::currentPolicyContext();
+            if ($crc64Contract) {
+                $userMetadata['__mpu-checksum-algorithm'] = 'crc64nvme';
+                $userMetadata['__mpu-checksum-type'] = 'FULL_OBJECT';
+            }
             $metadata->createMultipartUpload(
                 $uploadId,
                 'bucket',
                 'key',
                 'owner',
-                userMetadata: $encrypted ? [
-                    ...self::currentPolicyContext(),
-                    '__sse-algorithm' => EncryptionRequestResolver::SSE_S3,
-                    '__mpu-part-format' => EncryptedMultipartPartCodec::FORMAT,
-                ] : self::currentPolicyContext(),
+                userMetadata: $userMetadata,
             );
             $plaintextParts = [
                 3 => 'local multipart first payload',
@@ -98,14 +105,16 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
                     ) : $plaintext;
                 $part = $storage->putPart('bucket', 'key', $uploadId, $partNumber, new ReadableBuffer($partBody));
                 $partEtags[$partNumber] = md5($plaintext);
-                $partChecksums[$partNumber] = base64_encode(hash('sha256', $plaintext, true));
+                $partChecksums[$partNumber] = $crc64Contract
+                    ? self::crc64Nvme($plaintext)
+                    : base64_encode(hash('sha256', $plaintext, true));
                 $metadata->putPartWithChecksum(
                     $uploadId,
                     $partNumber,
                     $partEtags[$partNumber],
                     strlen($plaintext),
                     $part->path,
-                    'SHA256',
+                    $crc64Contract ? 'crc64nvme' : 'SHA256',
                     $partChecksums[$partNumber],
                 );
             }
@@ -128,13 +137,13 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
             self::assertSame(3, $layout->parts[0]->uploadPartNumber);
             self::assertSame(0, $layout->parts[0]->offset);
             self::assertSame(strlen($plaintextParts[3]), $layout->parts[0]->size);
-            self::assertSame('SHA256', $layout->parts[0]->checksumAlgorithm);
+            self::assertSame($crc64Contract ? 'crc64nvme' : 'SHA256', $layout->parts[0]->checksumAlgorithm);
             self::assertSame($partChecksums[3], $layout->parts[0]->checksumValue);
             self::assertSame(2, $layout->parts[1]->ordinal);
             self::assertSame(8, $layout->parts[1]->uploadPartNumber);
             self::assertSame(strlen($plaintextParts[3]), $layout->parts[1]->offset);
             self::assertSame(strlen($plaintextParts[8]), $layout->parts[1]->size);
-            self::assertSame('SHA256', $layout->parts[1]->checksumAlgorithm);
+            self::assertSame($crc64Contract ? 'crc64nvme' : 'SHA256', $layout->parts[1]->checksumAlgorithm);
             self::assertSame($partChecksums[8], $layout->parts[1]->checksumValue);
             $attributesRequest = new Request(
                 $request->getClient(),
@@ -163,6 +172,12 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
                 self::assertNotSame(implode('', $plaintextParts), $physical);
             } else {
                 self::assertSame(implode('', $plaintextParts), $physical);
+            }
+            if ($crc64Contract) {
+                self::assertSame(
+                    self::crc64Nvme(implode('', $plaintextParts)),
+                    $object->systemMetadata['checksum-crc64nvme'] ?? null,
+                );
             }
             self::assertNull($metadata->getMultipartUpload($uploadId));
             $intentCount = (new \PDO('sqlite:' . $databasePath))->query('SELECT COUNT(*) FROM s3_multipart_write_intents');
@@ -483,6 +498,14 @@ final class LocalMultipartCompletionHandlerTest extends TestCase
                 'permission' => 'FULL_CONTROL',
             ]], JSON_THROW_ON_ERROR),
         ];
+    }
+
+    private static function crc64Nvme(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        $digest->update($bytes);
+
+        return $digest->finalizeBase64();
     }
 
     private function removeDirectory(string $directory): void

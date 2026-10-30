@@ -27,6 +27,7 @@ final readonly class ChecksumResult
         public string $crc32cHex,
         public string $sha1Hex,
         public int $size,
+        public ?string $crc64NvmeBase64 = null,
     ) {}
 
     /**
@@ -67,6 +68,11 @@ final readonly class ChecksumResult
     public function sha1Base64(): string
     {
         return base64_encode((string) hex2bin($this->sha1Hex));
+    }
+
+    public function crc64NvmeBase64(): ?string
+    {
+        return $this->crc64NvmeBase64;
     }
 
     /**

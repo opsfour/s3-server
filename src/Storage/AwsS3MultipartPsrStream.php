@@ -45,8 +45,11 @@ final class AwsS3MultipartPsrStream implements StreamInterface
             || ! is_finite($intervalSeconds) || $intervalSeconds <= 0.0) {
             throw new \LogicException('AWS multipart stream cannot begin armed dispatch.');
         }
-        if ($this->source instanceof AwsS3MultipartPartsStream) {
-            $this->source->stopUndispatchedRenewal();
+        $source = $this->source instanceof \OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream
+            ? $this->source->source()
+            : $this->source;
+        if ($source instanceof AwsS3MultipartPartsStream) {
+            $source->stopUndispatchedRenewal();
         }
         $this->armedHeartbeat = $heartbeat;
         $this->heartbeatIntervalNanos = (int) min(PHP_INT_MAX, ceil($intervalSeconds * 1_000_000_000));
@@ -164,6 +167,17 @@ final class AwsS3MultipartPsrStream implements StreamInterface
         }
 
         return $contents;
+    }
+
+    /** Prove that the provider consumed exactly the declared payload. */
+    public function requireExactEnd(): void
+    {
+        if ($this->closed || $this->position !== $this->size || $this->buffer !== '') {
+            throw new \RuntimeException('AWS multipart stream did not consume its declared size exactly.');
+        }
+        if ($this->read(1) !== '') {
+            throw new \RuntimeException('AWS multipart stream exceeded its declared size.');
+        }
     }
 
     public function getMetadata($key = null): mixed

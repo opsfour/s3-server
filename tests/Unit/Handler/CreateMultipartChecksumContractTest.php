@@ -12,10 +12,12 @@ use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Multipart\CompleteMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\CreateMultipartUploadHandler;
 use OpsFour\S3Server\Handler\Multipart\UploadPartHandler;
 use OpsFour\S3Server\Handler\Multipart\MultipartPartLogicalValidator;
+use OpsFour\S3Server\Handler\Multipart\MultipartChecksumContract;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
@@ -30,6 +32,24 @@ use PHPUnit\Framework\TestCase;
 
 final class CreateMultipartChecksumContractTest extends TestCase
 {
+    /** @return iterable<string, array{array<string, string>}> */
+    public static function malformedStoredMultipartChecksumContracts(): iterable
+    {
+        yield 'missing type' => [['__mpu-checksum-algorithm' => 'crc64nvme']];
+        yield 'type only' => [['__mpu-checksum-type' => 'FULL_OBJECT']];
+        yield 'wrong type' => [[
+            '__mpu-checksum-algorithm' => 'crc64nvme',
+            '__mpu-checksum-type' => 'COMPOSITE',
+        ]];
+    }
+
+    /** @param array<string, string> $metadata */
+    #[DataProvider('malformedStoredMultipartChecksumContracts')]
+    public function test_malformed_stored_multipart_checksum_contract_is_rejected(array $metadata): void
+    {
+        $this->expectException(InternalErrorException::class);
+        MultipartChecksumContract::fromStored($metadata);
+    }
     /** @return iterable<string, array{float, float}> */
     public static function invalidIntentLeaseIntervals(): iterable
     {
@@ -51,30 +71,36 @@ final class CreateMultipartChecksumContractTest extends TestCase
         );
     }
 
-    /** @return iterable<string, array{non-empty-string}> */
+    /** @return iterable<string, array{non-empty-string, string, class-string<\Throwable>}> */
     public static function unsupportedHeaders(): iterable
     {
-        yield 'algorithm' => ['x-amz-checksum-algorithm'];
-        yield 'checksum type' => ['x-amz-checksum-type'];
+        yield 'algorithm' => ['x-amz-checksum-algorithm', 'CRC32', NotImplementedException::class];
+        yield 'type only' => ['x-amz-checksum-type', 'FULL_OBJECT', InvalidRequestException::class];
     }
 
-    /** @param non-empty-string $header */
+    /**
+     * @param non-empty-string          $header
+     * @param class-string<\Throwable> $exception
+     */
     #[DataProvider('unsupportedHeaders')]
-    public function test_additional_checksum_contract_is_rejected_before_upload_creation(string $header): void
-    {
+    public function test_additional_checksum_contract_is_rejected_before_upload_creation(
+        string $header,
+        string $value,
+        string $exception,
+    ): void {
         $metadata = $this->createMock(MetadataStore::class);
         $metadata->expects(self::never())->method('getBucket');
         $request = new Request(
             $this->createMock(Client::class),
             'POST',
             Http::new('http://127.0.0.1/bucket/key?uploads'),
-            [$header => 'CRC32'],
+            [$header => $value],
         );
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');
         $request->setAttribute('ownerId', 'owner');
 
-        $this->expectException(NotImplementedException::class);
+        $this->expectException($exception);
         (new CreateMultipartUploadHandler($metadata))->handleRequest($request);
     }
 
@@ -159,10 +185,10 @@ final class CreateMultipartChecksumContractTest extends TestCase
         (new UploadPartHandler($metadata, $storage))->handleRequest($request);
     }
 
-    public function test_unsupported_part_checksum_header_is_rejected_before_metadata_or_storage_access(): void
+    public function test_crc64_part_checksum_header_is_admitted_to_resource_lookup(): void
     {
-        $metadata = $this->createMock(MetadataStore::class);
-        $metadata->expects(self::never())->method('getBucket');
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
         $storage = $this->createMock(StorageBackend::class);
         $storage->expects(self::never())->method('putPart');
         $request = new Request(
@@ -174,9 +200,31 @@ final class CreateMultipartChecksumContractTest extends TestCase
         );
         $request->setAttribute('s3.bucket', 'bucket');
         $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
 
-        $this->expectException(NotImplementedException::class);
+        $this->expectException(NoSuchBucketException::class);
         (new UploadPartHandler($metadata, $storage))->handleRequest($request);
+    }
+
+    public function test_crc64_composite_initiation_is_rejected_before_upload_creation(): void
+    {
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->expects(self::never())->method('getBucket');
+        $request = new Request(
+            $this->createMock(Client::class),
+            'POST',
+            Http::new('http://127.0.0.1/bucket/key?uploads'),
+            [
+                'x-amz-checksum-algorithm' => 'CRC64NVME',
+                'x-amz-checksum-type' => 'COMPOSITE',
+            ],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        $this->expectException(InvalidRequestException::class);
+        (new CreateMultipartUploadHandler($metadata))->handleRequest($request);
     }
 
     public function test_normal_sdk_part_checksum_header_is_admitted_to_resource_lookup(): void
@@ -201,6 +249,22 @@ final class CreateMultipartChecksumContractTest extends TestCase
 
         $this->expectException(NoSuchBucketException::class);
         (new UploadPartHandler($metadata, $storage))->handleRequest($request);
+    }
+
+    public function test_legacy_checksum_algorithms_keep_accepting_valid_unpadded_base64(): void
+    {
+        $request = new Request(
+            $this->createMock(Client::class),
+            'PUT',
+            Http::new('http://127.0.0.1/bucket/key?uploadId=upload&partNumber=1'),
+            ['x-amz-checksum-crc32' => rtrim(base64_encode("\x01\x02\x03\x04"), '=')],
+            'payload',
+        );
+
+        self::assertSame(
+            ['crc32' => 'AQIDBA'],
+            MultipartPartLogicalValidator::clientChecksums($request),
+        );
     }
 
     /** @return iterable<string, array{array<non-empty-string, string>}> */
@@ -303,13 +367,11 @@ final class CreateMultipartChecksumContractTest extends TestCase
     {
         foreach ([
             'x-amz-checksum-algorithm',
-            'x-amz-checksum-type',
             'x-amz-sdk-checksum-algorithm',
             'x-amz-checksum-crc32',
             'x-amz-checksum-crc32c',
             'x-amz-checksum-sha1',
             'x-amz-checksum-sha256',
-            'x-amz-checksum-crc64nvme',
             'x-amz-checksum-sha512',
             'x-amz-checksum-md5',
             'x-amz-checksum-xxhash64',

@@ -19,6 +19,7 @@ use OpsFour\S3Server\Encryption\BufferedSsePayload;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Dto\BucketInfo;
 use OpsFour\S3Server\Exception\BadDigestException;
+use OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream;
 use OpsFour\S3Server\Exception\EntityTooLargeException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
@@ -236,15 +237,21 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                 $awsReserved = $this->awsObjectWriter->reserve($bucketInfo, $key, $objectOwnerId);
             }
             $partLayouts = \OpsFour\S3Server\Metadata\ObjectPartLayoutCapability::require($this->metadata);
+            $crc64Capture = null;
             // 3. SSE payloads are encrypted before the first object-storage write.
             // Other payloads retain the storage backend's streaming checksum path.
             $encMeta = [];
             if ($encryptionMode === null) {
+                $logicalBody = MultipartPartSize::boundedBody($request->getBody());
+                if ($expectedChecksumAlgorithm === 'crc64nvme') {
+                    $crc64Capture = new Crc64NvmeCapturingStream($logicalBody);
+                    $logicalBody = $crc64Capture;
+                }
                 $result = $this->writeObject(
                     $bucketInfo,
                     $key,
                     $objectOwnerId,
-                    MultipartPartSize::boundedBody($request->getBody()),
+                    $logicalBody,
                     $localLease,
                     $awsReserved,
                     $awsStage,
@@ -263,7 +270,11 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                         $body = $this->awsObjectWriter->renewingStream($awsReserved, $body);
                         $this->awsObjectWriter->heartbeat($awsReserved);
                     }
-                    [$plaintext, $plainChecksums] = BufferedSsePayload::read($body, $this->maxEncryptedObjectSize);
+                    [$plaintext, $plainChecksums] = BufferedSsePayload::read(
+                        $body,
+                        $this->maxEncryptedObjectSize,
+                        captureCrc64Nvme: $expectedChecksumAlgorithm === 'crc64nvme',
+                    );
                     if ($awsReserved !== null) {
                         $this->awsObjectWriter->heartbeat($awsReserved);
                         [$encMeta, $ciphertext] = $this->awsObjectWriter->transform(
@@ -303,6 +314,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                         crc32cBase64: $plainChecksums->crc32cBase64(),
                         sha1Base64: $plainChecksums->sha1Base64(),
                         sha256Base64: $plainChecksums->sha256Base64(),
+                        crc64NvmeBase64: $plainChecksums->crc64NvmeBase64(),
                     );
                 } catch (\Amp\CancelledException $error) {
                     $encryptionCancellation = $error;
@@ -317,6 +329,19 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                 }
             }
 
+            if ($crc64Capture !== null) {
+                try {
+                    $crc64Nvme = $crc64Capture->finalizeBase64();
+                } catch (\Throwable $error) {
+                    \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                        $error,
+                        fn() => $this->deleteUncommittedPath($bucket, $result->path, $objectOwnerId),
+                    );
+                    throw $error;
+                }
+                $result = self::withCrc64Nvme($result, $crc64Nvme);
+            }
+
             // Trailer checksums are attached to the mutable request only after the
             // verified aws-chunked body reaches its signed trailer block.
             $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums(
@@ -325,6 +350,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
             );
             $checksumCrc32 = $clientChecksums['crc32'] ?? null;
             $checksumCrc32c = $clientChecksums['crc32c'] ?? null;
+            $checksumCrc64Nvme = $clientChecksums['crc64nvme'] ?? null;
             $checksumSha1 = $clientChecksums['sha1'] ?? null;
             $checksumSha256 = $clientChecksums['sha256'] ?? null;
 
@@ -350,6 +376,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                 match ($algo) {
                     'crc32' => $checksumCrc32 = $computedValue,
                     'crc32c' => $checksumCrc32c = $computedValue,
+                    'crc64nvme' => $checksumCrc64Nvme = $computedValue,
                     'sha1' => $checksumSha1 = $computedValue,
                     'sha256' => $checksumSha256 = $computedValue,
                     default => throw new \OpsFour\S3Server\Exception\InternalErrorException(
@@ -443,6 +470,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                         $userMetadata,
                         $checksumCrc32,
                         $checksumCrc32c,
+                        $checksumCrc64Nvme,
                         $checksumSha1,
                         $checksumSha256,
                         $ownershipDecision,
@@ -507,6 +535,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                             userMetadata: $userMetadata,
                             checksumCrc32: $checksumCrc32,
                             checksumCrc32c: $checksumCrc32c,
+                            checksumCrc64Nvme: $checksumCrc64Nvme,
                             checksumSha1: $checksumSha1,
                             checksumSha256: $checksumSha256,
                         );
@@ -557,6 +586,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                         $userMetadata,
                         $checksumCrc32,
                         $checksumCrc32c,
+                        $checksumCrc64Nvme,
                         $checksumSha1,
                         $checksumSha256,
                         $ownershipDecision,
@@ -646,6 +676,7 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                             userMetadata: $userMetadata,
                             checksumCrc32: $checksumCrc32,
                             checksumCrc32c: $checksumCrc32c,
+                            checksumCrc64Nvme: $checksumCrc64Nvme,
                             checksumSha1: $checksumSha1,
                             checksumSha256: $checksumSha256,
                         );
@@ -728,13 +759,16 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
             if ($checksumCrc32c !== null) {
                 $headers['x-amz-checksum-crc32c'] = $checksumCrc32c;
             }
+            if ($checksumCrc64Nvme !== null) {
+                $headers['x-amz-checksum-crc64nvme'] = $checksumCrc64Nvme;
+            }
             if ($checksumSha1 !== null) {
                 $headers['x-amz-checksum-sha1'] = $checksumSha1;
             }
             if ($checksumSha256 !== null) {
                 $headers['x-amz-checksum-sha256'] = $checksumSha256;
             }
-            if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumSha1 !== null || $checksumSha256 !== null) {
+            if ($checksumCrc32 !== null || $checksumCrc32c !== null || $checksumCrc64Nvme !== null || $checksumSha1 !== null || $checksumSha256 !== null) {
                 $headers['x-amz-checksum-type'] = 'FULL_OBJECT';
             }
 
@@ -776,6 +810,20 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
                 },
             );
         }
+    }
+
+    private static function withCrc64Nvme(StorageWriteResult $result, string $crc64Nvme): StorageWriteResult
+    {
+        return new StorageWriteResult(
+            path: $result->path,
+            size: $result->size,
+            md5Hex: $result->md5Hex,
+            crc32Base64: $result->crc32Base64,
+            crc32cBase64: $result->crc32cBase64,
+            sha1Base64: $result->sha1Base64,
+            sha256Base64: $result->sha256Base64,
+            crc64NvmeBase64: $crc64Nvme,
+        );
     }
 
     /** @return list<array{tier: string, path: string}> */

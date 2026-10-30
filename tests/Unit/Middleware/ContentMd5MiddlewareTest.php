@@ -11,6 +11,7 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Parallel\Worker\ContextWorkerPool;
 use League\Uri\Http;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use OpsFour\S3Server\Exception\InvalidRequestException;
@@ -253,6 +254,53 @@ final class ContentMd5MiddlewareTest extends TestCase
                 self::fail('A bad checksum value unexpectedly reached the delete handler.');
             } catch (BadDigestException) {
                 self::assertSame(1, $calls);
+            }
+        } finally {
+            $pool->shutdown();
+            @rmdir($tempDir);
+        }
+    }
+
+    public function test_delete_objects_accepts_crc64nvme_and_rejects_noncanonical_or_mismatched_values(): void
+    {
+        $tempDir = sys_get_temp_dir() . '/s3-sdk-checksum-' . bin2hex(random_bytes(6));
+        self::assertTrue(mkdir($tempDir, 0o700));
+        $pool = new ContextWorkerPool(1);
+        $middleware = new ContentMd5Middleware(new RequestBodySpool($pool, $tempDir));
+        $calls = 0;
+        $handler = new class (static function () use (&$calls): void {
+            ++$calls;
+        }) implements RequestHandler {
+            public function __construct(private readonly \Closure $onCall) {}
+
+            public function handleRequest(Request $request): Response
+            {
+                ($this->onCall)();
+                return new Response(204);
+            }
+        };
+        $body = '<Delete><Object><Key>crc64</Key></Object></Delete>';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+        $request = function (string $value) use ($body): Request {
+            $request = new Request($this->createMock(Client::class), 'POST', Http::new('http://127.0.0.1/bucket?delete'), [], new ReadableBuffer($body));
+            $request->setAttribute('s3.operation', S3Operation::DeleteObjects);
+            $request->setHeader('x-amz-sdk-checksum-algorithm', 'CRC64NVME');
+            $request->setHeader('x-amz-checksum-crc64nvme', $value);
+            return $request;
+        };
+
+        try {
+            self::assertSame(204, $middleware->handleRequest($request($checksum), $handler)->getStatus());
+            self::assertSame(1, $calls);
+            foreach (['AAAAAAAAAAA=', rtrim($checksum, '=')] as $invalid) {
+                try {
+                    $middleware->handleRequest($request($invalid), $handler);
+                    self::fail('An invalid CRC64NVME value unexpectedly reached the delete handler.');
+                } catch (BadDigestException) {
+                    self::assertSame(1, $calls);
+                }
             }
         } finally {
             $pool->shutdown();

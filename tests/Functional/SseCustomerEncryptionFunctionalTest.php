@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Aws\S3\Exception\S3Exception;
 use OpsFour\S3Server\Storage\StoragePath;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 
 final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
 {
@@ -45,6 +46,9 @@ final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
         $plaintext = 'sse-c-plaintext-marker-' . bin2hex(random_bytes(24));
         $customerKey = hash('sha256', 'functional-sse-c-customer-key', true);
         $wrongKey = hash('sha256', 'functional-sse-c-wrong-key', true);
+        $crc64 = new Crc64NvmeDigest();
+        $crc64->update($plaintext);
+        $checksum = $crc64->finalizeBase64();
 
         self::$s3->createBucket(['Bucket' => $bucket]);
 
@@ -54,11 +58,21 @@ final class SseCustomerEncryptionFunctionalTest extends S3FunctionalTestCase
                 'Key' => $key,
                 'Body' => $plaintext,
                 'ContentType' => 'text/plain',
+                'ChecksumAlgorithm' => 'CRC64NVME',
+                'ChecksumCRC64NVME' => $checksum,
             ] + self::sseCHeaders($customerKey));
 
             self::assertSame(200, $put['@metadata']['statusCode']);
             self::assertSame('AES256', $put['SSECustomerAlgorithm']);
             self::assertSame(base64_encode(md5($customerKey, true)), $put['SSECustomerKeyMD5']);
+            self::assertSame($checksum, $put['ChecksumCRC64NVME'] ?? null);
+
+            $checksumHead = self::$s3->headObject([
+                'Bucket' => $bucket,
+                'Key' => $key,
+                'ChecksumMode' => 'ENABLED',
+            ] + self::sseCHeaders($customerKey));
+            self::assertSame($checksum, $checksumHead['ChecksumCRC64NVME'] ?? null);
 
             self::assertSseCRoundTrip($bucket, $key, $plaintext, $customerKey);
             self::assertSseCReadRejected($bucket, $key, []);

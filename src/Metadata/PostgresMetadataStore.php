@@ -38,7 +38,7 @@ use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore, ClusterWorkOutcomeRecorder, ClusterMembershipStore, ClusterOperationalSnapshotStore
+final class PostgresMetadataStore implements MetadataStore, Crc64NvmeObjectMetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore, ClusterWorkOutcomeRecorder, ClusterMembershipStore, ClusterOperationalSnapshotStore
 {
     private const int CLUSTER_SNAPSHOT_COUNT_LIMIT = 10_000;
 
@@ -978,6 +978,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void {
         $now = gmdate('Y-m-d\TH:i:s\Z');
         $userMetadataJson = json_encode($userMetadata, JSON_THROW_ON_ERROR);
@@ -999,6 +1000,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             $checksumCrc32c,
             $checksumSha1,
             $checksumSha256,
+            $checksumCrc64Nvme,
             $now,
         ): void {
             // Preserve the numbered latest version when a suspended bucket
@@ -1017,13 +1019,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 owner_id, etag, size, content_type, content_encoding,
                 content_disposition, cache_control, storage_class, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, created_at, updated_at
             ) VALUES (
                 $1, $2, 'null', TRUE, FALSE,
                 $3, $4, $5, $6, $7,
                 $8, $9, $10, $11,
                 $12::jsonb, $13, $14, $15,
-                $16, $17::timestamptz, $18::timestamptz
+                $16, $17, $18::timestamptz, $19::timestamptz
             )
             ON CONFLICT(bucket, key_name, version_id) DO UPDATE SET
                 is_latest = TRUE,
@@ -1051,6 +1053,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 checksum_crc32c = EXCLUDED.checksum_crc32c,
                 checksum_sha1 = EXCLUDED.checksum_sha1,
                 checksum_sha256 = EXCLUDED.checksum_sha256,
+                checksum_crc64nvme = EXCLUDED.checksum_crc64nvme,
                 created_at = EXCLUDED.created_at,
                 updated_at = EXCLUDED.updated_at
             SQL,
@@ -1059,7 +1062,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     $ownerId, $etag, $size, $contentType, $contentEncoding,
                     $contentDisposition, $cacheControl, $storageClass, $storagePath,
                     $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                    $checksumSha256, $now, $now,
+                    $checksumSha256, $checksumCrc64Nvme, $now, $now,
                 ],
             );
             $objectRow = $this->conn()->execute("SELECT id FROM s3_objects WHERE bucket = $1 AND key_name = $2 AND version_id = 'null'", [$bucket, $key])->fetchRow();
@@ -1110,7 +1113,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND is_latest = TRUE AND is_delete_marker = FALSE
             SQL,
@@ -1132,7 +1135,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND is_latest = TRUE
             SQL,
@@ -1641,7 +1644,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, updated_at '
             . 'FROM s3_objects WHERE bucket = $1 AND is_latest = TRUE AND is_delete_marker = FALSE';
 
         $params = [$bucket];
@@ -2623,6 +2626,11 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return true;
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return true;
+    }
+
     public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
     {
         $upload = $this->getMultipartUpload($uploadId);
@@ -2755,6 +2763,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         $versionId = bin2hex(random_bytes(16));
         $now = gmdate('Y-m-d\TH:i:s\Z');
@@ -2777,13 +2786,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     owner_id, etag, size, content_type, content_encoding,
                     content_disposition, cache_control, storage_class, storage_path,
                     user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                    checksum_sha256, created_at, updated_at
+                    checksum_sha256, checksum_crc64nvme, created_at, updated_at
                 ) VALUES (
                     $1, $2, $3, TRUE, FALSE,
                     $4, $5, $6, $7, $8,
                     $9, $10, $11, $12,
                     $13::jsonb, $14, $15, $16,
-                    $17, $18::timestamptz, $19::timestamptz
+                    $17, $18, $19::timestamptz, $20::timestamptz
                 )
                 SQL,
                 [
@@ -2791,7 +2800,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     $ownerId, $etag, $size, $contentType, $contentEncoding,
                     $contentDisposition, $cacheControl, $storageClass, $storagePath,
                     $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                    $checksumSha256, $now, $now,
+                    $checksumSha256, $checksumCrc64Nvme, $now, $now,
                 ],
             );
             $layout = ObjectPartLayout::knownSingle($size);
@@ -2876,6 +2885,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                         checksum_crc32c = NULL,
                         checksum_sha1 = NULL,
                         checksum_sha256 = NULL,
+                        checksum_crc64nvme = NULL,
                         created_at = EXCLUDED.created_at,
                         updated_at = EXCLUDED.updated_at
                     SQL,
@@ -2922,7 +2932,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = $1 AND key_name = $2 AND version_id = $3
             SQL,
@@ -3026,7 +3036,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = $1';
 
         $params = [$bucket];
@@ -5693,6 +5703,9 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
         if (isset($row['checksum_sha256'])) {
             $systemMetadata['checksum-sha256'] = self::str($row['checksum_sha256']);
+        }
+        if (isset($row['checksum_crc64nvme'])) {
+            $systemMetadata['checksum-crc64nvme'] = self::str($row['checksum_crc64nvme']);
         }
         if (isset($row['is_latest'])) {
             $systemMetadata['isLatest'] = (bool) $row['is_latest'] ? '1' : '0';

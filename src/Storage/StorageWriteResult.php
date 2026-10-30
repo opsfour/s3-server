@@ -17,5 +17,6 @@ final readonly class StorageWriteResult
         public ?string $crc32cBase64 = null,
         public ?string $sha1Base64 = null,
         public ?string $sha256Base64 = null,
+        public ?string $crc64NvmeBase64 = null,
     ) {}
 }

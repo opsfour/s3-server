@@ -37,6 +37,7 @@ use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ClusterWorkFencingStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
+use OpsFour\S3Server\Metadata\Crc64NvmeObjectMetadataCapability;
 use OpsFour\S3Server\Middleware\AclEnforcementMiddleware;
 use OpsFour\S3Server\Middleware\BufferedReadAuthorizationMiddleware;
 use OpsFour\S3Server\Middleware\BucketOwnershipMiddleware;
@@ -299,6 +300,8 @@ final class S3Server
      */
     public function start(): void
     {
+        \OpsFour\S3Server\Runtime\RuntimePlatform::assertSupported();
+
         if ($this->shutdown) {
             throw new \LogicException('S3 server cannot be restarted after shutdown.');
         }
@@ -500,6 +503,7 @@ final class S3Server
 
             if ($this->metadata !== null) {
                 ObjectPartLayoutCapability::require($this->metadata);
+                Crc64NvmeObjectMetadataCapability::require($this->metadata);
             }
 
             // Storage admission above is side-effect free. Take exclusive

@@ -15,7 +15,7 @@ final class StoredObjectChecksumVerifier
             return false;
         }
 
-        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-sha1', 'checksum-sha256'] as $key) {
+        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-crc64nvme', 'checksum-sha1', 'checksum-sha256'] as $key) {
             if (isset($object->systemMetadata[$key])) {
                 return true;
             }
@@ -35,18 +35,20 @@ final class StoredObjectChecksumVerifier
         $expected = [
             'crc32' => $object->systemMetadata['checksum-crc32'] ?? null,
             'crc32c' => $object->systemMetadata['checksum-crc32c'] ?? null,
+            'crc64nvme' => $object->systemMetadata['checksum-crc64nvme'] ?? null,
             'sha1' => $object->systemMetadata['checksum-sha1'] ?? null,
             'sha256' => $object->systemMetadata['checksum-sha256'] ?? null,
         ];
         $actual = [
             'crc32' => $checksums->crc32Base64(),
             'crc32c' => $checksums->crc32cBase64(),
+            'crc64nvme' => $checksums->crc64NvmeBase64(),
             'sha1' => $checksums->sha1Base64(),
             'sha256' => $checksums->sha256Base64(),
         ];
 
         foreach ($expected as $algorithm => $value) {
-            if ($value !== null && ! hash_equals($value, $actual[$algorithm])) {
+            if ($value !== null && ($actual[$algorithm] === null || ! hash_equals($value, $actual[$algorithm]))) {
                 throw new \RuntimeException($failureMessage);
             }
         }

@@ -21,6 +21,30 @@ use PHPUnit\Framework\MockObject\MockObject;
 
 final class GetObjectAttributesResponseTest extends TestCase
 {
+    public function test_checksum_attribute_rejects_noncanonical_stored_crc64nvme(): void
+    {
+        $metadata = $this->capableMetadataMock();
+        $metadata->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $metadata->method('getObjectMetadata')->willReturn(new ObjectInfo(
+            'bucket',
+            'key',
+            3,
+            '"etag"',
+            systemMetadata: ['checksum-crc64nvme' => 'rosUhgp5mIg'],
+        ));
+        $request = new Request(
+            $this->createMock(Client::class),
+            'GET',
+            Http::new('http://127.0.0.1/bucket/key?attributes'),
+            ['x-amz-object-attributes' => 'Checksum'],
+        );
+        $request->setAttribute('s3.bucket', 'bucket');
+        $request->setAttribute('s3.key', 'key');
+        $request->setAttribute('ownerId', 'owner');
+
+        $this->expectException(InternalErrorException::class);
+        (new GetObjectAttributesHandler($metadata))->handleRequest($request);
+    }
     public function test_suspended_null_version_uses_response_headers_without_undeclared_xml_field(): void
     {
         $lastModified = new \DateTimeImmutable('2026-01-02T07:04:05+04:00');

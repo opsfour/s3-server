@@ -28,7 +28,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * WAL mode is enabled for concurrent read performance. All writes
  * are serialized by SQLite's internal locking.
  */
-final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbageStore, FencedMultipartWriteIntentStore, StorageGarbageLeaseStore, MetadataStore, Crc64NvmeObjectMetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartPartWriteIntentInventoryStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, MultipartWriteIntentStore, LocalMultipartCompletionIntentStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     private ?\PDO $pdo = null;
 
@@ -309,6 +309,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void {
         $now = gmdate('Y-m-d\TH:i:s\Z');
         $userMetadataJson = json_encode($userMetadata, JSON_THROW_ON_ERROR);
@@ -330,6 +331,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             $checksumCrc32c,
             $checksumSha1,
             $checksumSha256,
+            $checksumCrc64Nvme,
             $now,
         ): void {
             // A suspended bucket may have a numbered latest version. Keep its
@@ -350,13 +352,13 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 owner_id, etag, size, content_type, content_encoding,
                 content_disposition, cache_control, storage_class, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, created_at, updated_at
+                checksum_sha256, checksum_crc64nvme, created_at, updated_at
             ) VALUES (
                 ?, ?, 'null', 1, 0,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
-                ?, ?, ?
+                ?, ?, ?, ?
             )
             ON CONFLICT(bucket, key_name, version_id) DO UPDATE SET
                 is_latest = 1,
@@ -384,6 +386,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 checksum_crc32c = excluded.checksum_crc32c,
                 checksum_sha1 = excluded.checksum_sha1,
                 checksum_sha256 = excluded.checksum_sha256,
+                checksum_crc64nvme = excluded.checksum_crc64nvme,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at
             SQL,
@@ -394,7 +397,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 $ownerId, $etag, $size, $contentType, $contentEncoding,
                 $contentDisposition, $cacheControl, $storageClass, $storagePath,
                 $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                $checksumSha256, $now, $now,
+                $checksumSha256, $checksumCrc64Nvme, $now, $now,
             ]);
             $this->authorizeObjectPartLayoutPublication($bucket, $key, 'null');
             $this->putObjectPartLayout($bucket, $key, 'null', ObjectPartLayout::knownSingle($size));
@@ -436,7 +439,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1 AND is_delete_marker = 0
             SQL,
@@ -462,7 +465,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND is_latest = 1
             SQL,
@@ -996,7 +999,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at '
             . 'FROM s3_objects WHERE bucket = ? AND is_latest = 1 AND is_delete_marker = 0';
 
         $params = [$bucket];
@@ -2002,6 +2005,11 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         return true;
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return true;
+    }
+
     public function putPartWithChecksum(
         string $uploadId,
         int $partNumber,
@@ -2154,6 +2162,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         $pdo = $this->connection();
         $versionId = bin2hex(random_bytes(16));
@@ -2180,13 +2189,13 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                     owner_id, etag, size, content_type, content_encoding,
                     content_disposition, cache_control, storage_class, storage_path,
                     user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                    checksum_sha256, created_at, updated_at
+                    checksum_sha256, checksum_crc64nvme, created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, 1, 0,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?
+                    ?, ?, ?, ?
                 )
                 SQL,
             );
@@ -2196,7 +2205,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 $ownerId, $etag, $size, $contentType, $contentEncoding,
                 $contentDisposition, $cacheControl, $storageClass, $storagePath,
                 $userMetadataJson, $checksumCrc32, $checksumCrc32c, $checksumSha1,
-                $checksumSha256, $now, $now,
+                $checksumSha256, $checksumCrc64Nvme, $now, $now,
             ]);
             $this->authorizeObjectPartLayoutPublication($bucket, $key, $versionId);
             $this->putObjectPartLayout($bucket, $key, $versionId, ObjectPartLayout::knownSingle($size));
@@ -2282,6 +2291,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                         checksum_crc32c = NULL,
                         checksum_sha1 = NULL,
                         checksum_sha256 = NULL,
+                        checksum_crc64nvme = NULL,
                         created_at = excluded.created_at,
                         updated_at = excluded.updated_at
                     SQL,
@@ -2329,7 +2339,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
                 transition_status, transition_target_tier, transition_error,
                 restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path,
                 user_metadata, checksum_crc32, checksum_crc32c, checksum_sha1,
-                checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
+                checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at
             FROM s3_objects
             WHERE bucket = ? AND key_name = ? AND version_id = ?
             SQL,
@@ -2445,7 +2455,7 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
             . 'content_type, content_encoding, content_disposition, cache_control, '
             . 'storage_class, storage_tier, transition_status, transition_target_tier, transition_error, '
             . 'restore_status, restored_storage_path, restored_storage_tier, restore_expires_at, storage_path, user_metadata, checksum_crc32, checksum_crc32c, '
-            . 'checksum_sha1, checksum_sha256, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
+            . 'checksum_sha1, checksum_sha256, checksum_crc64nvme, part_layout_kind, part_layout_count, part_layout_compat_count, part_layout_digest, created_at, noncurrent_at, updated_at, id '
             . 'FROM s3_objects WHERE bucket = ?';
 
         $params = [$bucket];
@@ -4997,6 +5007,10 @@ final class SqliteMetadataStore implements FencedQueueStore, FencedStorageGarbag
 
         if (isset($row['checksum_sha256'])) {
             $systemMetadata['checksum-sha256'] = (string) $row['checksum_sha256'];
+        }
+
+        if (isset($row['checksum_crc64nvme'])) {
+            $systemMetadata['checksum-crc64nvme'] = (string) $row['checksum_crc64nvme'];
         }
 
         // Track is_latest for version listing responses.

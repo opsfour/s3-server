@@ -20,7 +20,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * The CORS cache is per-process and can remain stale for up to the TTL after
  * a change on another server.
  */
-final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
+final class CachedMetadataStoreDecorator implements MetadataStore, Crc64NvmeObjectMetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
 {
     /** @var array<string, array{value: mixed, expires: float}> */
     private array $cache = [];
@@ -289,8 +289,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void {
-        $this->inner->putObjectMetadata($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256);
+        $this->inner->putObjectMetadata($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme);
     }
 
     public function getObjectMetadata(string $bucket, string $key): ?ObjectInfo
@@ -634,6 +635,12 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
             && $this->inner->supportsMultipartPartChecksums();
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return $this->inner instanceof Crc64NvmeObjectMetadataStore
+            && $this->inner->supportsCrc64NvmeObjectMetadata();
+    }
+
     public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
     {
         $inner = $this->inner;
@@ -697,8 +704,9 @@ final class CachedMetadataStoreDecorator implements MetadataStore, SharedAuthori
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
-        return $this->inner->putObjectVersioned($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256);
+        return $this->inner->putObjectVersioned($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme);
     }
 
     public function deleteObjectVersioned(string $bucket, string $key, string $ownerId, bool $suspended = false): string

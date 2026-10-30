@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 49;
+    public const int VERSION = 50;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -255,6 +255,7 @@ final class PostgresSchema
                 checksum_crc32c TEXT,
                 checksum_sha1 TEXT,
                 checksum_sha256 TEXT,
+                checksum_crc64nvme TEXT,
                 part_layout_kind TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown')),
                 part_layout_count INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000),
                 part_layout_compat_count INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000),
@@ -1175,6 +1176,10 @@ final class PostgresSchema
             $statements[] = 'DROP INDEX IF EXISTS idx_s3_cluster_membership_live';
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at, node_id, incarnation_id) INCLUDE (roles, ready, draining)';
             array_push($statements, ...self::clusterObservabilityStatements());
+        }
+
+        if ($fromVersion < 50) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN IF NOT EXISTS checksum_crc64nvme TEXT';
         }
 
         return $statements;

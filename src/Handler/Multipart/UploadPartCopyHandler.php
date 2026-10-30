@@ -8,6 +8,7 @@ use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
+use OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream;
 use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
@@ -119,6 +120,14 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
         }
         if (($upload['bucket_generation'] ?? '') !== $bucketInfo->generation) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
+        $checksumContract = MultipartChecksumContract::fromStored($upload['user_metadata']);
+        $initiatedChecksumAlgorithm = $checksumContract?->algorithm;
+        if ($initiatedChecksumAlgorithm !== null && (
+            ! $this->metadata instanceof \OpsFour\S3Server\Metadata\MultipartPartChecksumStore
+            || ! $this->metadata->supportsMultipartPartChecksums()
+        )) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('Multipart part checksum persistence is unavailable.');
         }
         $objectLockConfig = $this->assertObjectLockConfiguration($bucket, $upload['user_metadata']);
         ObjectLockConfigurationSnapshot::capture($request, $objectLockConfig);
@@ -413,9 +422,23 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                 );
             }
 
+            $needsCrc64Capture = $initiatedChecksumAlgorithm === 'crc64nvme'
+                || ($offset === null && isset($srcObject->systemMetadata['checksum-crc64nvme']));
+            $crc64Capture = null;
+            $crc64Value = null;
+            if (! $encryptedV2 && $needsCrc64Capture) {
+                $crc64Capture = new Crc64NvmeCapturingStream($stream);
+                $stream = $crc64Capture;
+            }
+
             if ($encryptedV2 && $this->encryption !== null && $uploadSseAlgorithm !== null) {
                 $expectedSize = $length ?? $srcObject->size;
-                [$plaintext, $checksums] = BufferedSsePayload::read($stream, $this->maxEncryptedObjectSize, expectedBytes: $expectedSize);
+                [$plaintext, $checksums] = BufferedSsePayload::read(
+                    $stream,
+                    $this->maxEncryptedObjectSize,
+                    expectedBytes: $expectedSize,
+                    captureCrc64Nvme: $needsCrc64Capture,
+                );
                 $sourceMd5 = [];
                 if ($offset === null && preg_match('/\A"([0-9a-fA-F]{32})"\z/', $srcObject->etag, $sourceMd5) === 1
                     && ! hash_equals(strtolower($sourceMd5[1]), $checksums->md5Hex)) {
@@ -430,6 +453,7 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                         $checksums->crc32cBase64(),
                         $checksums->sha1Base64(),
                         $checksums->sha256Base64(),
+                        $checksums->crc64NvmeBase64(),
                     ), $sourceStorage);
                 }
                 $encode = fn(): string => EncryptedMultipartPartCodec::encode(
@@ -551,11 +575,17 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                     $checksums->crc32cBase64(),
                     $checksums->sha1Base64(),
                     $checksums->sha256Base64(),
+                    $checksums->crc64NvmeBase64(),
                 );
             } else {
                 $expectedSize = $length ?? $srcObject->size;
                 if ($awsReservation !== null) {
                     $awsStage = $activeAwsObjectWriter->stage($awsReservation, $stream, $expectedSize, $copyCapacity);
+                    $logicalStage = $awsStage->result;
+                    if ($crc64Capture !== null) {
+                        $crc64Value = $crc64Capture->finalizeBase64();
+                        $logicalStage = self::withCrc64Nvme($logicalStage, $crc64Value);
+                    }
                     $sourceMd5 = [];
                     if ($awsStage->result->size !== $expectedSize
                         || ($offset === null
@@ -564,7 +594,7 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                         throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
                     }
                     if ($offset === null) {
-                        $this->assertSourceChecksums($srcObject, $awsStage->result, $uploadStorage);
+                        $this->assertSourceChecksums($srcObject, $logicalStage, $uploadStorage);
                     }
                     $outcome = $activeAwsObjectWriter->dispatchMultipartPart($awsReservation, $key, $uploadId, $partNumber, $awsStage);
                     $plannedPartPath = $outcome->result->path;
@@ -579,7 +609,7 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                         $uploadId,
                         $partNumber,
                         $stream,
-                        validateBeforeArm: function (\OpsFour\S3Server\Checksum\ChecksumResult $checksums) use ($expectedSize, $offset, $srcObject, $sourceStorage, &$validated): void {
+                        validateBeforeArm: function (\OpsFour\S3Server\Checksum\ChecksumResult $checksums) use ($expectedSize, $offset, $srcObject, $sourceStorage, $crc64Capture, &$crc64Value, &$validated): void {
                             if ($checksums->size !== $expectedSize) {
                                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
                             }
@@ -589,7 +619,12 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                                     && ! hash_equals(strtolower($sourceMd5[1]), $checksums->md5Hex)) {
                                     throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source payload does not match its metadata.');
                                 }
-                                $this->assertSourceChecksums($srcObject, MultipartPartLogicalValidator::stagedResult($checksums), $sourceStorage);
+                                $logicalStage = MultipartPartLogicalValidator::stagedResult($checksums);
+                                if ($crc64Capture !== null) {
+                                    $crc64Value = $crc64Capture->finalizeBase64();
+                                    $logicalStage = self::withCrc64Nvme($logicalStage, $crc64Value);
+                                }
+                                $this->assertSourceChecksums($srcObject, $logicalStage, $sourceStorage);
                             }
                             $validated = $checksums;
                         },
@@ -659,6 +694,34 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                         : $uploadStorage->putPart($bucket, $key, $uploadId, $partNumber, $stream);
                 }
             }
+            if ($crc64Capture !== null) {
+                try {
+                    $crc64Value ??= $crc64Capture->finalizeBase64();
+                } catch (\Throwable $error) {
+                    \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                        $error,
+                        fn() => $this->deleteUncommittedPart(
+                            $uploadStorage,
+                            $storageTier,
+                            $bucket,
+                            $writeResult->path,
+                            $plannedPartPath !== null ? $uploadId : null,
+                            $ownerId,
+                        ),
+                    );
+                    throw $error;
+                }
+                $writeResult = new StorageWriteResult(
+                    path: $writeResult->path,
+                    size: $writeResult->size,
+                    md5Hex: $writeResult->md5Hex,
+                    crc32Base64: $writeResult->crc32Base64,
+                    crc32cBase64: $writeResult->crc32cBase64,
+                    sha1Base64: $writeResult->sha1Base64,
+                    sha256Base64: $writeResult->sha256Base64,
+                    crc64NvmeBase64: $crc64Value,
+                );
+            }
         } catch (\Amp\CancelledException $error) {
             $copyCancellation = $error;
             $this->retireAwsReservation($awsReservation);
@@ -720,11 +783,15 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
         $request->setAttribute('s3.copySourceBytesTransferred', $expectedSize);
 
         $etag = '"' . strtolower($writeResult->md5Hex) . '"';
+        $partChecksumCrc64Nvme = $initiatedChecksumAlgorithm === 'crc64nvme'
+            ? ($writeResult->crc64NvmeBase64
+                ?? throw new \OpsFour\S3Server\Exception\InternalErrorException('CRC64NVME part-copy calculation did not complete.'))
+            : null;
 
         $previousPartPath = null;
         $commitCallbackCompleted = false;
         try {
-            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $srcBucketInfo, $srcObject, $srcVersionId, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $plannedPartPath, $dispatchId, $awsDispatchToken, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
+            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $srcBucketInfo, $srcObject, $srcVersionId, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $checksumContract, $partChecksumCrc64Nvme, $plannedPartPath, $dispatchId, $awsDispatchToken, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
                 \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId, $srcBucketInfo->ownerId);
                 \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                 $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
@@ -750,6 +817,11 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                 if (($activeUpload['storage_tier'] ?? null) !== $storageTier) {
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload storage tier changed during part copy.');
                 }
+                $activeChecksumContract = MultipartChecksumContract::fromStored($activeUpload['user_metadata']);
+                if (($checksumContract === null) !== ($activeChecksumContract === null)
+                    || ($checksumContract !== null && ! $checksumContract->sameAs($activeChecksumContract))) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart checksum contract changed during part copy.');
+                }
                 $activeObjectLockConfig = $this->assertObjectLockConfiguration(
                     $bucket,
                     $activeUpload['user_metadata'],
@@ -768,7 +840,20 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                     $partNumber,
                     $writeResult->size,
                 );
-                $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+                if ($partChecksumCrc64Nvme !== null
+                    && $this->metadata instanceof \OpsFour\S3Server\Metadata\MultipartPartChecksumStore) {
+                    $this->metadata->putPartWithChecksum(
+                        $uploadId,
+                        $partNumber,
+                        $etag,
+                        $writeResult->size,
+                        $writeResult->path,
+                        'crc64nvme',
+                        $partChecksumCrc64Nvme,
+                    );
+                } else {
+                    $this->metadata->putPart($uploadId, $partNumber, $etag, $writeResult->size, $writeResult->path);
+                }
                 if ($plannedPartPath !== null && ($dispatchId !== null
                     ? ! $this->consumeFencedIntent($bucket, $uploadId, $plannedPartPath, $dispatchId)
                     : ($awsDispatchToken !== null
@@ -814,7 +899,7 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
         $lastModified = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
             ->format('Y-m-d\TH:i:s.000\Z');
 
-        $xml = XmlResponseBuilder::copyPartResult($etag, $lastModified);
+        $xml = XmlResponseBuilder::copyPartResult($etag, $lastModified, $partChecksumCrc64Nvme);
 
         $responseHeaders = ['Content-Type' => 'application/xml'];
         if ($srcObject->versionId !== null || $srcVersioning !== '') {
@@ -999,16 +1084,18 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
         $expected = [
             'crc32' => $source->systemMetadata['checksum-crc32'] ?? null,
             'crc32c' => $source->systemMetadata['checksum-crc32c'] ?? null,
+            'crc64nvme' => $source->systemMetadata['checksum-crc64nvme'] ?? null,
             'sha1' => $source->systemMetadata['checksum-sha1'] ?? null,
             'sha256' => $source->systemMetadata['checksum-sha256'] ?? null,
         ];
-        if ($expected === ['crc32' => null, 'crc32c' => null, 'sha1' => null, 'sha256' => null]) {
+        if ($expected === ['crc32' => null, 'crc32c' => null, 'crc64nvme' => null, 'sha1' => null, 'sha256' => null]) {
             return;
         }
 
         $actual = [
             'crc32' => $write->crc32Base64,
             'crc32c' => $write->crc32cBase64,
+            'crc64nvme' => $write->crc64NvmeBase64,
             'sha1' => $write->sha1Base64,
             'sha256' => $write->sha256Base64,
         ];
@@ -1018,7 +1105,10 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
             }
             // Custom storage backends may report only size and MD5. Rehash
             // their bounded staged part before accepting the source bytes.
-            $calculator = new ChecksumCalculator();
+            $calculator = new ChecksumCalculator(
+                isset($source->systemMetadata['checksum-crc64nvme']),
+                cooperativeCrc64Nvme: true,
+            );
             $readLimit = $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX;
             $stream = new LimitedReadableStream($storage->getObjectByPath($write->path), $readLimit);
             $readCancellation = null;
@@ -1044,6 +1134,7 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
             $actual = [
                 'crc32' => $checksums->crc32Base64(),
                 'crc32c' => $checksums->crc32cBase64(),
+                'crc64nvme' => $checksums->crc64NvmeBase64(),
                 'sha1' => $checksums->sha1Base64(),
                 'sha256' => $checksums->sha256Base64(),
             ];
@@ -1055,6 +1146,20 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
                 throw new \OpsFour\S3Server\Exception\InternalErrorException('Copy source checksum does not match its payload.');
             }
         }
+    }
+
+    private static function withCrc64Nvme(StorageWriteResult $result, string $crc64Nvme): StorageWriteResult
+    {
+        return new StorageWriteResult(
+            path: $result->path,
+            size: $result->size,
+            md5Hex: $result->md5Hex,
+            crc32Base64: $result->crc32Base64,
+            crc32cBase64: $result->crc32cBase64,
+            sha1Base64: $result->sha1Base64,
+            sha256Base64: $result->sha256Base64,
+            crc64NvmeBase64: $crc64Nvme,
+        );
     }
 
 }

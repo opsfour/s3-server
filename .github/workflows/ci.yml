@@ -243,6 +243,16 @@ jobs:
       - name: Metadata backend parity and concurrency
         run: vendor/bin/phpunit tests/Functional/MetadataBackendIntegrationTest.php
 
+      - name: CRC64NVME metadata prior-schema migration
+        env:
+          S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS: "1"
+          S3_TEST_MYSQL_METADATA_DSN: "host=127.0.0.1;port=3306;dbname=s3audit_package;user=s3;password=s3audit"
+          S3_TEST_POSTGRES_METADATA_DSN: host=127.0.0.1 port=5432 dbname=s3audit_package user=s3 password=s3audit
+        run: >-
+          vendor/bin/phpunit --fail-on-skipped
+          tests/Functional/MetadataBackendIntegrationTest.php
+          --filter test_external_crc64nvme_prior_schema_migration_preserves_legacy_null_and_round_trips
+
       - name: Storage cleanup capacity concurrency
         run: vendor/bin/phpunit --fail-on-skipped tests/Functional/ExternalStorageCleanupCapacityTest.php
 

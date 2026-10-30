@@ -37,8 +37,9 @@ use OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore;
 use OpsFour\S3Server\Metadata\SharedAuthorizationLockStore;
 use OpsFour\S3Server\Metadata\AwsS3GarbageClaimStore;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
+use OpsFour\S3Server\Metadata\Crc64NvmeObjectMetadataStore;
 
-final readonly class ObservedMetadataStore implements MetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
+final readonly class ObservedMetadataStore implements MetadataStore, Crc64NvmeObjectMetadataStore, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3GarbageClaimStore, AwsS3OperationalSummaryReader
 {
     public function __construct(
         private MetadataStore $inner,
@@ -200,9 +201,9 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         return $this->observe(__FUNCTION__, fn() => $this->inner->getBucketOwner($bucket));
     }
 
-    public function putObjectMetadata(string $bucket, string $key, string $ownerId, int $size, string $etag, string $contentType, string $storagePath, string $storageClass = 'STANDARD', ?string $contentEncoding = null, ?string $contentDisposition = null, ?string $cacheControl = null, array $userMetadata = [], ?string $checksumCrc32 = null, ?string $checksumCrc32c = null, ?string $checksumSha1 = null, ?string $checksumSha256 = null): void
+    public function putObjectMetadata(string $bucket, string $key, string $ownerId, int $size, string $etag, string $contentType, string $storagePath, string $storageClass = 'STANDARD', ?string $contentEncoding = null, ?string $contentDisposition = null, ?string $cacheControl = null, array $userMetadata = [], ?string $checksumCrc32 = null, ?string $checksumCrc32c = null, ?string $checksumSha1 = null, ?string $checksumSha256 = null, ?string $checksumCrc64Nvme = null): void
     {
-        $this->observe(__FUNCTION__, fn() => $this->inner->putObjectMetadata($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256));
+        $this->observe(__FUNCTION__, fn() => $this->inner->putObjectMetadata($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme));
     }
 
     public function getObjectMetadata(string $bucket, string $key): ?\OpsFour\S3Server\Dto\ObjectInfo
@@ -519,6 +520,12 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
             && $this->inner->supportsMultipartPartChecksums();
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return $this->inner instanceof Crc64NvmeObjectMetadataStore
+            && $this->inner->supportsCrc64NvmeObjectMetadata();
+    }
+
     public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
     {
         $this->observe(__FUNCTION__, function () use ($uploadId, $partNumber, $etag, $size, $storagePath, $checksumAlgorithm, $checksumValue): void {
@@ -569,9 +576,9 @@ final readonly class ObservedMetadataStore implements MetadataStore, SharedAutho
         $this->observe(__FUNCTION__, fn() => $this->inner->setBucketVersioning($bucket, $status));
     }
 
-    public function putObjectVersioned(string $bucket, string $key, string $ownerId, int $size, string $etag, string $contentType, string $storagePath, string $storageClass = 'STANDARD', ?string $contentEncoding = null, ?string $contentDisposition = null, ?string $cacheControl = null, array $userMetadata = [], ?string $checksumCrc32 = null, ?string $checksumCrc32c = null, ?string $checksumSha1 = null, ?string $checksumSha256 = null): string
+    public function putObjectVersioned(string $bucket, string $key, string $ownerId, int $size, string $etag, string $contentType, string $storagePath, string $storageClass = 'STANDARD', ?string $contentEncoding = null, ?string $contentDisposition = null, ?string $cacheControl = null, array $userMetadata = [], ?string $checksumCrc32 = null, ?string $checksumCrc32c = null, ?string $checksumSha1 = null, ?string $checksumSha256 = null, ?string $checksumCrc64Nvme = null): string
     {
-        return $this->observe(__FUNCTION__, fn() => $this->inner->putObjectVersioned($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256));
+        return $this->observe(__FUNCTION__, fn() => $this->inner->putObjectVersioned($bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme));
     }
 
     public function deleteObjectVersioned(string $bucket, string $key, string $ownerId, bool $suspended = false): string

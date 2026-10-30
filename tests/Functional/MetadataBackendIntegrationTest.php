@@ -66,6 +66,217 @@ use Symfony\Component\Process\Process;
 
 final class MetadataBackendIntegrationTest extends TestCase
 {
+    private const string CRC64NVME = 'rosUhgp5mIg=';
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_fresh_schema_round_trips_crc64nvme_metadata(string $driver, string $dsnEnv): void
+    {
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} CRC64NVME fresh-schema tests.");
+        }
+
+        $dsn = trim($dsn);
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        $pool = self::externalPool($driver, $dsn);
+        $suffix = bin2hex(random_bytes(8));
+        $bucket = 'crc64-fresh-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $created = false;
+
+        try {
+            $version = $pool->execute('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
+            self::assertNotNull($version);
+            self::assertSame(
+                $driver === 'mysql' ? MysqlSchema::VERSION : PostgresSchema::VERSION,
+                (int) ($version['version'] ?? 0),
+            );
+
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            $created = true;
+            $metadata->putObjectMetadata(
+                $bucket,
+                'null-version',
+                $owner,
+                9,
+                'etag-null',
+                'text/plain',
+                'objects/null-version',
+                checksumCrc64Nvme: self::CRC64NVME,
+            );
+            $metadata->putObjectMetadata(
+                $bucket,
+                'legacy-null',
+                $owner,
+                1,
+                'etag-legacy',
+                'text/plain',
+                'objects/legacy-null',
+            );
+            $metadata->setBucketVersioning($bucket, 'Enabled');
+            $versionId = $metadata->putObjectVersioned(
+                $bucket,
+                'versioned',
+                $owner,
+                9,
+                'etag-versioned',
+                'text/plain',
+                'objects/versioned',
+                checksumCrc64Nvme: self::CRC64NVME,
+            );
+
+            self::assertSame(
+                self::CRC64NVME,
+                $metadata->getObjectMetadata($bucket, 'null-version')?->systemMetadata['checksum-crc64nvme'] ?? null,
+            );
+            self::assertSame(
+                self::CRC64NVME,
+                $metadata->getObjectMetadataByVersion($bucket, 'versioned', $versionId)?->systemMetadata['checksum-crc64nvme'] ?? null,
+            );
+            $legacy = $metadata->getObjectMetadata($bucket, 'legacy-null');
+            self::assertNotNull($legacy);
+            self::assertArrayNotHasKey('checksum-crc64nvme', $legacy->systemMetadata);
+
+            $rows = $pool->execute(
+                $driver === 'mysql'
+                    ? 'SELECT key_name, checksum_crc64nvme FROM s3_objects WHERE bucket = ? ORDER BY key_name'
+                    : 'SELECT key_name, checksum_crc64nvme FROM s3_objects WHERE bucket = $1 ORDER BY key_name',
+                [$bucket],
+            );
+            $persisted = [];
+            while (($row = $rows->fetchRow()) !== null) {
+                $keyName = $row['key_name'] ?? null;
+                $checksum = $row['checksum_crc64nvme'] ?? null;
+                if (! is_string($keyName) || ($checksum !== null && ! is_string($checksum))) {
+                    throw new \RuntimeException('External CRC64NVME metadata row is invalid.');
+                }
+                $persisted[$keyName] = $checksum;
+            }
+            self::assertSame([
+                'legacy-null' => null,
+                'null-version' => self::CRC64NVME,
+                'versioned' => self::CRC64NVME,
+            ], $persisted);
+        } finally {
+            $pool->close();
+            if ($created) {
+                foreach ($metadata->listObjectVersions($bucket)['entries'] ?? [] as $entry) {
+                    $metadata->deleteObjectVersion($bucket, $entry->key, $entry->versionId ?? 'null');
+                }
+                $metadata->deleteBucket($owner, $bucket);
+            }
+        }
+    }
+
+    #[DataProvider('externalMetadataDrivers')]
+    public function test_external_crc64nvme_prior_schema_migration_preserves_legacy_null_and_round_trips(
+        string $driver,
+        string $dsnEnv,
+    ): void {
+        if (getenv('S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS') !== '1') {
+            self::markTestSkipped('Set S3_TEST_DESTRUCTIVE_METADATA_MIGRATIONS=1 only for a disposable metadata database.');
+        }
+        $dsn = getenv($dsnEnv);
+        if ($dsn === false || trim($dsn) === '') {
+            self::markTestSkipped("Set {$dsnEnv} to run {$driver} CRC64NVME migration tests.");
+        }
+
+        $dsn = trim($dsn);
+        $metadata = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+        $pool = self::externalPool($driver, $dsn);
+        $currentVersion = $driver === 'mysql' ? MysqlSchema::VERSION : PostgresSchema::VERSION;
+        $previousVersion = $currentVersion - 1;
+        $suffix = bin2hex(random_bytes(8));
+        $bucket = 'crc64-migration-' . $suffix;
+        $owner = 'owner-' . $suffix;
+        $created = false;
+
+        try {
+            $metadata->createBucket($owner, $bucket, 'us-east-1');
+            $created = true;
+            $metadata->putObjectMetadata(
+                $bucket,
+                'legacy',
+                $owner,
+                1,
+                'etag-legacy',
+                'text/plain',
+                'objects/legacy',
+            );
+
+            $pool->execute("DELETE FROM s3_migration_checkpoints WHERE migration_name = 'object_part_layouts'");
+            $pool->execute(
+                $driver === 'mysql'
+                    ? 'DELETE FROM s3_schema_version WHERE version >= ?'
+                    : 'DELETE FROM s3_schema_version WHERE version >= $1',
+                [$previousVersion],
+            );
+            $pool->execute(
+                $driver === 'mysql'
+                    ? 'INSERT INTO s3_schema_version (version, description) VALUES (?, ?)'
+                    : 'INSERT INTO s3_schema_version (version, description) VALUES ($1, $2)',
+                [$previousVersion, 'Pre-CRC64NVME integration fixture'],
+            );
+            $pool->execute('ALTER TABLE s3_objects DROP COLUMN checksum_crc64nvme');
+
+            $migrated = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+            $version = $pool->execute('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
+            self::assertNotNull($version);
+            self::assertSame($currentVersion, (int) ($version['version'] ?? 0));
+
+            $legacy = $migrated->getObjectMetadata($bucket, 'legacy');
+            self::assertNotNull($legacy);
+            self::assertArrayNotHasKey('checksum-crc64nvme', $legacy->systemMetadata);
+
+            $migrated->putObjectMetadata(
+                $bucket,
+                'with-checksum',
+                $owner,
+                9,
+                'etag-checksum',
+                'text/plain',
+                'objects/with-checksum',
+                checksumCrc64Nvme: self::CRC64NVME,
+            );
+            self::assertSame(
+                self::CRC64NVME,
+                $migrated->getObjectMetadata($bucket, 'with-checksum')?->systemMetadata['checksum-crc64nvme'] ?? null,
+            );
+
+            $rows = $pool->execute(
+                $driver === 'mysql'
+                    ? 'SELECT key_name, checksum_crc64nvme FROM s3_objects WHERE bucket = ? ORDER BY key_name'
+                    : 'SELECT key_name, checksum_crc64nvme FROM s3_objects WHERE bucket = $1 ORDER BY key_name',
+                [$bucket],
+            );
+            $persisted = [];
+            while (($row = $rows->fetchRow()) !== null) {
+                $keyName = $row['key_name'] ?? null;
+                $checksum = $row['checksum_crc64nvme'] ?? null;
+                if (! is_string($keyName) || ($checksum !== null && ! is_string($checksum))) {
+                    throw new \RuntimeException('External CRC64NVME migration row is invalid.');
+                }
+                $persisted[$keyName] = $checksum;
+            }
+            self::assertSame([
+                'legacy' => null,
+                'with-checksum' => self::CRC64NVME,
+            ], $persisted);
+        } finally {
+            $restored = MetadataStoreFactory::create($driver, ['dsn' => $dsn]);
+            if ($created && $restored->getBucketOwner($bucket) === $owner) {
+                if ($restored->getObjectMetadata($bucket, 'legacy') !== null) {
+                    $restored->deleteObjectMetadata($bucket, 'legacy');
+                }
+                if ($restored->getObjectMetadata($bucket, 'with-checksum') !== null) {
+                    $restored->deleteObjectMetadata($bucket, 'with-checksum');
+                }
+                $restored->deleteBucket($owner, $bucket);
+            }
+            $pool->close();
+        }
+    }
+
     #[DataProvider('externalMetadataDrivers')]
     public function test_external_layout_backfill_resumes_checkpoint_and_rejects_rows_beyond_target(string $driver, string $dsnEnv): void
     {

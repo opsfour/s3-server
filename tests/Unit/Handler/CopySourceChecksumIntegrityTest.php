@@ -9,8 +9,10 @@ use Amp\Http\Server\Driver\Client;
 use Amp\Http\Server\Request;
 use League\Uri\Http;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
+use OpsFour\S3Server\Handler\Object\HeadObjectHandler;
 use OpsFour\S3Server\Metadata\ObjectPart;
 use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -91,6 +93,86 @@ final class CopySourceChecksumIntegrityTest extends TestCase
             base64_encode(hash('sha256', 'payload', true)),
             $this->metadata->getObjectMetadata('target', 'copied')?->systemMetadata['checksum-sha256'],
         );
+    }
+
+    public function test_copy_rejects_corruption_even_when_backend_reports_expected_crc64nvme(): void
+    {
+        $expected = self::crc64Nvme('payload');
+        $this->metadata->putObjectMetadata(
+            'source',
+            'key',
+            'owner',
+            7,
+            '"' . md5('multipart parts') . '-2"',
+            'text/plain',
+            'memory://source/key',
+            checksumCrc64Nvme: $expected,
+        );
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturn(new ReadableBuffer('corrupt'));
+        $storage->method('putObject')->willReturn(new StorageWriteResult(
+            'memory://target/corrupt-copy',
+            7,
+            md5('corrupt'),
+            crc64NvmeBase64: $expected,
+        ));
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://target/corrupt-copy', 'target');
+
+        $this->expectException(InternalErrorException::class);
+        (new CopyObjectHandler($this->metadata, $storage))->handleRequest($this->copyRequest());
+    }
+
+    public function test_crc64nvme_copy_is_visible_on_checksum_enabled_destination_read(): void
+    {
+        $expected = self::crc64Nvme('payload');
+        $this->metadata->putObjectMetadata(
+            'source',
+            'key',
+            'owner',
+            7,
+            '"' . md5('multipart parts') . '-2"',
+            'text/plain',
+            'memory://source/key',
+            checksumCrc64Nvme: $expected,
+        );
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturnCallback(static fn(): ReadableBuffer => new ReadableBuffer('payload'));
+        $storage->method('putObject')->willReturn(new StorageWriteResult('memory://target/copied', 7, md5('payload')));
+        (new CopyObjectHandler($this->metadata, $storage))->handleRequest($this->copyRequest());
+
+        $request = new Request(
+            $this->createMock(Client::class),
+            'HEAD',
+            Http::new('http://127.0.0.1/target/copied'),
+            ['x-amz-checksum-mode' => 'ENABLED'],
+        );
+        $request->setAttribute('s3.bucket', 'target');
+        $request->setAttribute('s3.key', 'copied');
+        $request->setAttribute('ownerId', 'owner');
+        $response = (new HeadObjectHandler($this->metadata))->handleRequest($request);
+
+        self::assertSame($expected, $response->getHeader('x-amz-checksum-crc64nvme'));
+    }
+
+    public function test_copy_rejects_noncanonical_stored_crc64nvme_before_response(): void
+    {
+        $this->metadata->putObjectMetadata(
+            'source',
+            'key',
+            'owner',
+            7,
+            '"' . md5('multipart parts') . '-2"',
+            'text/plain',
+            'memory://source/key',
+            checksumCrc64Nvme: 'rosUhgp5mIg',
+        );
+        $storage = $this->createMock(StorageBackend::class);
+        $storage->method('getObjectByPath')->willReturnCallback(static fn(): ReadableBuffer => new ReadableBuffer('payload'));
+        $storage->method('putObject')->willReturn(new StorageWriteResult('memory://target/copied', 7, md5('payload')));
+        $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://target/copied', 'target');
+
+        $this->expectException(InternalErrorException::class);
+        (new CopyObjectHandler($this->metadata, $storage))->handleRequest($this->copyRequest());
     }
 
     public function test_copy_accepts_verified_known_multipart_source_without_aggregate_checksum(): void
@@ -201,6 +283,14 @@ final class CopySourceChecksumIntegrityTest extends TestCase
         $request->setAttribute('ownerId', 'owner');
 
         return $request;
+    }
+
+    private static function crc64Nvme(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        $digest->update($bytes);
+
+        return $digest->finalizeBase64();
     }
 
     /** @param list<string> $parts */

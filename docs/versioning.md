@@ -134,9 +134,13 @@ $s3->putObjectLockConfiguration([
 
 Object uploads protected by explicit retention, an explicit legal hold, or
 bucket default retention require `Content-MD5` or one supported SDK checksum:
-CRC32, CRC32C, SHA1, or SHA256. This applies to PutObject, browser PostObject,
+CRC32, CRC32C, CRC64NVME, SHA1, or SHA256. This applies to PutObject, browser PostObject,
 and UploadPart. Browser POST accepts a policy-covered `Content-MD5` form field
 as well as the supported `x-amz-checksum-*` form fields.
+
+CRC64NVME values are nullable per object version. New checksummed versions
+retain their logical-plaintext `FULL_OBJECT` value; legacy versions and delete
+markers remain checksum-free and are never backfilled.
 
 CreateMultipartUpload binds the upload to the current Object Lock
 configuration. If that configuration changes before a payload uploaded with

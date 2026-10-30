@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- PHP 8.4+ with extensions: mbstring, openssl, pdo_sqlite, pcntl, posix
+- 64-bit PHP 8.4+ with extensions: mbstring, openssl, pdo_sqlite, pcntl, posix
 - Composer 2.x
 
 ## Setup
@@ -96,7 +96,7 @@ php bin/s3-server \
 src/
 ├── Acl/                  # ACL types, evaluator, parser
 ├── Auth/                 # SigV4 verifier, presigned URLs, chunked sigs
-├── Checksum/             # MD5, CRC32, CRC32C, SHA-1, SHA-256 utilities
+├── Checksum/             # MD5, CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256 utilities
 ├── Console/              # Standalone CLI (Symfony Console)
 ├── Contracts/            # CredentialProvider interface
 ├── Dto/                  # BucketInfo, ObjectInfo, ListObjectsResult

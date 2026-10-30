@@ -24,6 +24,7 @@ use OpsFour\S3Server\Handler\Multipart\UploadPartCopyHandler;
 use OpsFour\S3Server\Handler\Object\PutObjectHandler;
 use OpsFour\S3Server\Encryption\ConfigMasterKeyProvider;
 use OpsFour\S3Server\Encryption\EncryptionService;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
@@ -137,7 +138,7 @@ final class AwsS3MultipartFenceTest extends TestCase
 
     public function test_plain_part_and_completion_consume_both_exact_dispatches(): void
     {
-        [$uploadId, $etag, $partPath, $payload] = $this->uploadPart('multipart payload');
+        [$uploadId, $etag, $partPath, $payload] = $this->uploadPart('multipart payload', crc64Nvme: true);
         $attemptId = substr($partPath, -32);
         self::assertNull($this->metadata->getObjectWriteIntent($attemptId));
 
@@ -163,6 +164,11 @@ final class AwsS3MultipartFenceTest extends TestCase
         self::assertNull($this->metadata->getMultipartUpload($uploadId));
         $object = $this->metadata->getObjectMetadata('bucket', 'key');
         self::assertNotNull($object);
+        self::assertSame(self::crc64Nvme($payload), $object->systemMetadata['checksum-crc64nvme'] ?? null);
+        self::assertStringContainsString(
+            '<ChecksumCRC64NVME>' . self::crc64Nvme($payload) . '</ChecksumCRC64NVME>',
+            \Amp\ByteStream\buffer($response->getBody()),
+        );
         self::assertSame('"' . md5((string) hex2bin(md5($payload))) . '-1"', $object->etag);
         $finalPath = $object->systemMetadata['storagePath'];
         self::assertStringStartsWith('.opsfour/write-attempts/bucket/', $finalPath);
@@ -1223,14 +1229,26 @@ final class AwsS3MultipartFenceTest extends TestCase
     }
 
     /** @return array{string, string, string, string} */
-    private function uploadPart(string $payload): array
+    private function uploadPart(string $payload, bool $crc64Nvme = false): array
     {
         $created = (new CreateMultipartUploadHandler($this->metadata, storage: $this->backend))
-            ->handleRequest($this->request('POST', '/bucket/key?uploads'));
+            ->handleRequest($this->request(
+                'POST',
+                '/bucket/key?uploads',
+                headers: $crc64Nvme ? ['x-amz-checksum-algorithm' => 'CRC64NVME'] : [],
+            ));
         $uploadId = (string) (new \SimpleXMLElement(\Amp\ByteStream\buffer($created->getBody())))->UploadId;
         [$etag, $path] = $this->uploadPartFor($uploadId, $payload);
 
         return [$uploadId, $etag, $path, $payload];
+    }
+
+    private static function crc64Nvme(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        $digest->update($bytes);
+
+        return $digest->finalizeBase64();
     }
 
     /** @return array{string, string} */

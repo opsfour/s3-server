@@ -25,6 +25,8 @@ use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class BucketGenerationWriteRaceTest extends TestCase
@@ -170,7 +172,13 @@ final class BucketGenerationWriteRaceTest extends TestCase
         $this->metadata->createMultipartUpload($uploadId, 'target', 'key', 'owner');
         $storage = $this->createMock(StorageBackend::class);
         $storage->method('getObjectByPath')->willReturn(new \Amp\ByteStream\ReadableBuffer('corrupt'));
-        $storage->method('putPart')->willReturn(new StorageWriteResult('memory://target/corrupt-part', 7, md5('corrupt')));
+        $storage->method('putPart')->willReturnCallback(
+            static function (string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $stream): StorageWriteResult {
+                $payload = \Amp\ByteStream\buffer($stream);
+
+                return new StorageWriteResult('memory://target/corrupt-part', strlen($payload), md5($payload));
+            },
+        );
         $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://target/corrupt-part', 'target');
 
         try {
@@ -185,7 +193,15 @@ final class BucketGenerationWriteRaceTest extends TestCase
         }
     }
 
-    public function test_upload_part_copy_rejects_corrupt_non_md5_source_with_stored_checksum(): void
+    /** @return iterable<string, array{'sha256'|'crc64nvme'}> */
+    public static function storedCopyChecksums(): iterable
+    {
+        yield 'SHA256' => ['sha256'];
+        yield 'CRC64NVME' => ['crc64nvme'];
+    }
+
+    #[DataProvider('storedCopyChecksums')]
+    public function test_upload_part_copy_rejects_corrupt_non_md5_source_with_stored_checksum(string $algorithm): void
     {
         $this->metadata->createBucket('owner', 'source', 'us-east-1');
         $this->metadata->putObjectMetadata(
@@ -196,13 +212,20 @@ final class BucketGenerationWriteRaceTest extends TestCase
             '"multipart-2"',
             'text/plain',
             'memory://source/key',
-            checksumSha256: base64_encode(hash('sha256', 'payload', true)),
+            checksumSha256: $algorithm === 'sha256' ? base64_encode(hash('sha256', 'payload', true)) : null,
+            checksumCrc64Nvme: $algorithm === 'crc64nvme' ? self::crc64Nvme('payload') : null,
         );
         $uploadId = bin2hex(random_bytes(8));
         $this->metadata->createMultipartUpload($uploadId, 'target', 'key', 'owner');
         $storage = $this->createMock(StorageBackend::class);
         $storage->method('getObjectByPath')->willReturn(new \Amp\ByteStream\ReadableBuffer('corrupt'));
-        $storage->method('putPart')->willReturn(new StorageWriteResult('memory://target/corrupt-part', 7, md5('corrupt')));
+        $storage->method('putPart')->willReturnCallback(
+            static function (string $bucket, string $key, string $uploadId, int $partNumber, ReadableStream $stream): StorageWriteResult {
+                $payload = \Amp\ByteStream\buffer($stream);
+
+                return new StorageWriteResult('memory://target/corrupt-part', strlen($payload), md5($payload));
+            },
+        );
         $storage->expects(self::once())->method('deleteObjectByPath')->with('memory://target/corrupt-part', 'target');
 
         try {
@@ -215,6 +238,14 @@ final class BucketGenerationWriteRaceTest extends TestCase
         } catch (InternalErrorException) {
             self::assertSame([], $this->metadata->getParts($uploadId));
         }
+    }
+
+    private static function crc64Nvme(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        $digest->update($bytes);
+
+        return $digest->finalizeBase64();
     }
 
     public function test_multipart_completion_cannot_publish_into_recreated_bucket(): void

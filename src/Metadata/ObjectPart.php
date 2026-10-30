@@ -27,7 +27,7 @@ final readonly class ObjectPart
         if (($checksumAlgorithm === null) !== ($checksumValue === null)) {
             throw new \InvalidArgumentException('Part checksum algorithm and value must be present together.');
         }
-        if ($checksumAlgorithm !== null && ! in_array(strtolower($checksumAlgorithm), ['crc32', 'crc32c', 'sha1', 'sha256'], true)) {
+        if ($checksumAlgorithm !== null && ! in_array(strtolower($checksumAlgorithm), ['crc32', 'crc32c', 'crc64nvme', 'sha1', 'sha256'], true)) {
             throw new \InvalidArgumentException('Unsupported object part checksum algorithm.');
         }
         if ($checksumValue === '') {

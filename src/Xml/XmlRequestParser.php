@@ -123,7 +123,7 @@ final class XmlRequestParser
     /**
      * Parse a CompleteMultipartUpload XML body.
      *
-     * @return list<array{partNumber: int, etag: string}>
+     * @return list<array{partNumber: int, etag: string, checksumCrc64Nvme?: string}>
      *
      * @throws MalformedXmlException
      */
@@ -134,18 +134,34 @@ final class XmlRequestParser
 
         $parts = [];
         foreach ($children['Part'] ?? [] as $part) {
-            $fields = self::assertExactChildren($part, ['PartNumber', 'ETag'], 'CompleteMultipartUpload Part');
-            $partNumber = self::positiveDecimalInt(self::scalarText($fields['PartNumber'], 'PartNumber'));
-            $etag = self::scalarText($fields['ETag'], 'ETag');
+            $fields = self::assertAllowedChildren(
+                $part,
+                ['PartNumber', 'ETag', 'ChecksumCRC64NVME'],
+                'CompleteMultipartUpload Part',
+            );
+            if (! isset($fields['PartNumber'][0], $fields['ETag'][0])
+                || count($fields['PartNumber']) !== 1 || count($fields['ETag']) !== 1
+                || count($fields['ChecksumCRC64NVME'] ?? []) > 1) {
+                throw new MalformedXmlException('Each Part element requires one PartNumber and ETag.');
+            }
+            $partNumber = self::positiveDecimalInt(self::scalarText($fields['PartNumber'][0], 'PartNumber'));
+            $etag = self::scalarText($fields['ETag'][0], 'ETag');
 
             if ($partNumber === null || $partNumber > 10_000 || $etag === '') {
                 throw new MalformedXmlException('Each Part element must contain valid PartNumber and ETag elements.');
             }
 
-            $parts[] = [
+            $parsedPart = [
                 'partNumber' => $partNumber,
                 'etag' => $etag,
             ];
+            if (isset($fields['ChecksumCRC64NVME'][0])) {
+                $parsedPart['checksumCrc64Nvme'] = self::scalarText(
+                    $fields['ChecksumCRC64NVME'][0],
+                    'ChecksumCRC64NVME',
+                );
+            }
+            $parts[] = $parsedPart;
         }
 
         if ($parts === []) {

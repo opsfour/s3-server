@@ -16,7 +16,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class MysqlSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 50;
+    public const int VERSION = 51;
 
     /**
      * Get the complete schema DDL for the current version.
@@ -211,6 +211,7 @@ final class MysqlSchema
                 checksum_crc32c VARCHAR(64),
                 checksum_sha1 VARCHAR(64),
                 checksum_sha256 VARCHAR(128),
+                checksum_crc64nvme VARCHAR(64),
                 part_layout_kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
                 part_layout_count INT NULL,
                 part_layout_compat_count INT NULL,
@@ -1123,6 +1124,10 @@ final class MysqlSchema
             $statements[] = 'ALTER TABLE s3_write_intent_capacity DROP CHECK chk_s3_write_intent_capacity';
             $statements[] = "ALTER TABLE s3_write_intent_capacity ADD CONSTRAINT chk_s3_write_intent_capacity CHECK (kind IN ('object', 'object_seal', 'part') AND retained_count BETWEEN 0 AND 1000000)";
             array_push($statements, ...self::writeIntentCapacityStatements());
+        }
+
+        if ($fromVersion < 51) {
+            $statements[] = 'ALTER TABLE s3_objects ADD COLUMN checksum_crc64nvme VARCHAR(64) NULL';
         }
 
         return $statements;

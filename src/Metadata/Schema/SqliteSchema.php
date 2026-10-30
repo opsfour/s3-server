@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class SqliteSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 42;
+    public const int VERSION = 43;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -179,6 +179,7 @@ final class SqliteSchema
             checksum_crc32c TEXT,
             checksum_sha1 TEXT,
             checksum_sha256 TEXT,
+            checksum_crc64nvme TEXT,
             part_layout_kind TEXT CHECK (part_layout_kind IN ('known_single', 'known_multipart', 'unknown_multipart', 'unknown')),
             part_layout_count INTEGER CHECK (part_layout_count BETWEEN 0 AND 10000),
             part_layout_compat_count INTEGER CHECK (part_layout_compat_count BETWEEN 1 AND 10000),

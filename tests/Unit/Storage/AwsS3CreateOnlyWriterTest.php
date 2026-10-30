@@ -22,10 +22,41 @@ use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
 use OpsFour\S3Server\Storage\AwsS3WriteAttemptArmException;
 use OpsFour\S3Server\Storage\AwsS3WriteAttemptPath;
 use PHPUnit\Framework\TestCase;
+use Amp\ByteStream\ReadableBuffer;
+use OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream;
+use OpsFour\S3Server\Storage\AwsS3MultipartPsrStream;
 use Psr\Http\Message\RequestInterface;
 
 final class AwsS3CreateOnlyWriterTest extends TestCase
 {
+    public function test_multipart_psr_stream_proves_exact_boundary_before_crc_finalization(): void
+    {
+        $capture = new Crc64NvmeCapturingStream(new ReadableBuffer('abc'));
+        $stream = new AwsS3MultipartPsrStream($capture, 3, hash('sha256', 'abc'));
+
+        self::assertSame('abc', $stream->read(3));
+        $stream->requireExactEnd();
+        self::assertSame('BeXKuz/B+us=', $capture->finalizeBase64());
+    }
+
+    public function test_multipart_psr_stream_proves_zero_length_eof(): void
+    {
+        $capture = new Crc64NvmeCapturingStream(new ReadableBuffer(''));
+        $stream = new AwsS3MultipartPsrStream($capture, 0, hash('sha256', ''));
+
+        $stream->requireExactEnd();
+        self::assertSame('AAAAAAAAAAA=', $capture->finalizeBase64());
+    }
+
+    public function test_multipart_psr_stream_rejects_excess_after_declared_boundary(): void
+    {
+        $capture = new Crc64NvmeCapturingStream(new ReadableBuffer('abcd'));
+        $stream = new AwsS3MultipartPsrStream($capture, 3, hash('sha256', 'abc'));
+
+        self::assertSame('abc', $stream->read(3));
+        $this->expectException(\RuntimeException::class);
+        $stream->requireExactEnd();
+    }
     private const int PART_SIZE = 5 * 1024 * 1024;
     private const string ATTEMPT_ID = '0123456789abcdef0123456789abcdef';
 

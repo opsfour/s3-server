@@ -13,10 +13,38 @@ use OpsFour\S3Server\Metadata\CachedMetadataStoreDecorator;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Exception\InternalErrorException;
 use PHPUnit\Framework\TestCase;
 
 final class ListPartsPagingTest extends TestCase
 {
+    public function test_crc64nvme_upload_rejects_noncanonical_listed_part_checksum(): void
+    {
+        $store = $this->createMock(MetadataStore::class);
+        $store->method('getBucket')->willReturn(new BucketInfo('bucket', 'owner'));
+        $store->method('getMultipartUpload')->willReturn([
+            'upload_id' => 'upload',
+            'bucket' => 'bucket',
+            'key_name' => 'key',
+            'owner_id' => 'owner',
+            'user_metadata' => [
+                '__mpu-checksum-algorithm' => 'crc64nvme',
+                '__mpu-checksum-type' => 'FULL_OBJECT',
+            ],
+        ]);
+        $store->method('getParts')->willReturn([[
+            'part_number' => 1,
+            'etag' => 'e1',
+            'size' => 1,
+            'storage_path' => 'p1',
+            'created_at' => '2026-01-01T00:00:00Z',
+            'checksum_algorithm' => 'crc64nvme',
+            'checksum_value' => 'rosUhgp5mIg',
+        ]]);
+
+        $this->expectException(InternalErrorException::class);
+        (new ListPartsHandler($store))->handleRequest($this->request('max-parts=1'));
+    }
     public function test_wrapped_custom_store_keeps_get_parts_fallback_and_zero_page_skips_it(): void
     {
         $store = $this->createMock(MetadataStore::class);

@@ -10,6 +10,7 @@ use Aws\S3\MultipartUploader;
 use Aws\Signature\S3SignatureV4;
 use GuzzleHttp\Client;
 use GuzzleHttp\Psr7\Request;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 
 /**
  * Functional tests for Phase 4: Multipart Upload operations.
@@ -131,6 +132,326 @@ final class MultipartUploadTest extends S3FunctionalTestCase
         self::assertSame('', $body->read(1));
         self::assertTrue($body->eof());
         self::assertSame(strlen($part1Data) + strlen($part2Data) + strlen($part3Data), $get['ContentLength']);
+    }
+
+    public function test_crc64nvme_full_object_completion_is_retryable_after_bad_digest(): void
+    {
+        $key = 'crc64nvme-multipart-' . bin2hex(random_bytes(4));
+        $firstBody = str_repeat('first-part-', 476_626);
+        $firstBody = substr($firstBody, 0, 5 * 1024 * 1024);
+        $secondBody = 'second ordered logical multipart payload';
+        $firstDigest = new Crc64NvmeDigest();
+        $firstDigest->update($firstBody);
+        $firstChecksum = $firstDigest->finalizeBase64();
+        $secondDigest = new Crc64NvmeDigest();
+        $secondDigest->update($secondBody);
+        $secondChecksum = $secondDigest->finalizeBase64();
+        $fullDigest = new Crc64NvmeDigest();
+        $fullDigest->update($firstBody);
+        $fullDigest->update($secondBody);
+        $fullChecksum = $fullDigest->finalizeBase64();
+        $uploadId = null;
+
+        try {
+            $create = self::$s3->createMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'ChecksumAlgorithm' => 'CRC64NVME',
+                'ChecksumType' => 'FULL_OBJECT',
+            ]);
+            $uploadId = $create['UploadId'];
+            self::assertSame('CRC64NVME', $create['ChecksumAlgorithm'] ?? null);
+            self::assertSame('FULL_OBJECT', $create['ChecksumType'] ?? null);
+
+            $signer = new S3SignatureV4('s3', 'us-east-1');
+            $credentials = new Credentials(self::$accessKey, self::$secretKey);
+            $client = new Client(['http_errors' => false]);
+            $partUrl = sprintf(
+                'http://%s:%d/%s/%s?partNumber=1&uploadId=%s',
+                self::$host,
+                self::$port,
+                self::$bucket,
+                rawurlencode($key),
+                rawurlencode($uploadId),
+            );
+            $firstResponse = $client->send($signer->signRequest(new Request('PUT', $partUrl, [], $firstBody), $credentials));
+            self::assertSame(200, $firstResponse->getStatusCode(), (string) $firstResponse->getBody());
+            self::assertSame($firstChecksum, $firstResponse->getHeaderLine('x-amz-checksum-crc64nvme'));
+            $firstEtag = $firstResponse->getHeaderLine('etag');
+
+            $secondPart = self::$s3->uploadPart([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'PartNumber' => 2,
+                'Body' => $secondBody,
+                'ChecksumAlgorithm' => 'CRC64NVME',
+                'ChecksumCRC64NVME' => $secondChecksum,
+            ]);
+            self::assertSame($secondChecksum, $secondPart['ChecksumCRC64NVME'] ?? null);
+
+            $listed = self::$s3->listParts([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ]);
+            self::assertSame('CRC64NVME', $listed['ChecksumAlgorithm'] ?? null);
+            self::assertSame('FULL_OBJECT', $listed['ChecksumType'] ?? null);
+            self::assertSame($firstChecksum, $listed['Parts'][0]['ChecksumCRC64NVME'] ?? null);
+            self::assertSame($secondChecksum, $listed['Parts'][1]['ChecksumCRC64NVME'] ?? null);
+
+            $parts = [[
+                'PartNumber' => 1,
+                'ETag' => $firstEtag,
+                'ChecksumCRC64NVME' => $firstChecksum,
+            ], [
+                'PartNumber' => 2,
+                'ETag' => $secondPart['ETag'],
+                'ChecksumCRC64NVME' => $secondChecksum,
+            ]];
+
+            $assertNotPublished = static function () use ($key): void {
+                try {
+                    self::$s3->headObject(['Bucket' => self::$bucket, 'Key' => $key]);
+                    self::fail('Failed multipart completion published the destination.');
+                } catch (S3Exception $error) {
+                    self::assertSame(404, $error->getStatusCode());
+                }
+            };
+
+            $wrongPart = $parts;
+            $wrongPart[0]['ChecksumCRC64NVME'] = 'AAAAAAAAAAA=';
+            try {
+                self::$s3->completeMultipartUpload([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'MultipartUpload' => ['Parts' => $wrongPart],
+                ]);
+                self::fail('Completion accepted a mismatched part CRC64NVME checksum.');
+            } catch (S3Exception $error) {
+                self::assertSame('BadDigest', $error->getAwsErrorCode());
+            }
+            $assertNotPublished();
+
+            try {
+                self::$s3->completeMultipartUpload([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'ChecksumCRC64NVME' => 'AAAAAAAAAAA=',
+                    'ChecksumType' => 'FULL_OBJECT',
+                    'MultipartUpload' => ['Parts' => $parts],
+                ]);
+                self::fail('Completion accepted a mismatched CRC64NVME checksum.');
+            } catch (S3Exception $error) {
+                self::assertSame('BadDigest', $error->getAwsErrorCode());
+            }
+            $assertNotPublished();
+
+            try {
+                self::$s3->completeMultipartUpload([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                    'ChecksumType' => 'COMPOSITE',
+                    'MultipartUpload' => ['Parts' => $parts],
+                ]);
+                self::fail('Completion accepted COMPOSITE for a FULL_OBJECT upload.');
+            } catch (S3Exception $error) {
+                self::assertSame('BadDigest', $error->getAwsErrorCode());
+            }
+            $assertNotPublished();
+
+            $retryParts = self::$s3->listParts([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ]);
+            self::assertCount(2, $retryParts['Parts']);
+
+            $complete = self::$s3->completeMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'ChecksumType' => 'FULL_OBJECT',
+                'MultipartUpload' => ['Parts' => $parts],
+            ]);
+            self::assertSame($fullChecksum, $complete['ChecksumCRC64NVME'] ?? null);
+            self::assertSame('FULL_OBJECT', $complete['ChecksumType'] ?? null);
+
+            $head = self::$s3->headObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'ChecksumMode' => 'ENABLED',
+            ]);
+            self::assertSame($fullChecksum, $head['ChecksumCRC64NVME'] ?? null);
+
+            $partHead = self::$s3->headObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'PartNumber' => 1,
+                'ChecksumMode' => 'ENABLED',
+            ]);
+            self::assertSame($firstChecksum, $partHead['ChecksumCRC64NVME'] ?? null);
+            self::assertArrayNotHasKey('ChecksumType', $partHead);
+        } finally {
+            if ($uploadId !== null) {
+                try {
+                    self::$s3->abortMultipartUpload([
+                        'Bucket' => self::$bucket,
+                        'Key' => $key,
+                        'UploadId' => $uploadId,
+                    ]);
+                } catch (\Throwable) {
+                }
+            }
+            try {
+                self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            } catch (\Throwable) {
+            }
+        }
+    }
+
+    public function test_crc64nvme_upload_part_copy_persists_and_completes_logical_checksum(): void
+    {
+        $sourceKey = 'crc64nvme-part-copy-source-' . bin2hex(random_bytes(4));
+        $destinationKey = 'crc64nvme-part-copy-destination-' . bin2hex(random_bytes(4));
+        $body = 'copied logical multipart part';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+        $uploadId = null;
+
+        try {
+            self::$s3->putObject([
+                'Bucket' => self::$bucket,
+                'Key' => $sourceKey,
+                'Body' => $body,
+                'ChecksumAlgorithm' => 'CRC64NVME',
+                'ChecksumCRC64NVME' => $checksum,
+            ]);
+            $create = self::$s3->createMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $destinationKey,
+                'ChecksumAlgorithm' => 'CRC64NVME',
+            ]);
+            $uploadId = $create['UploadId'];
+            self::assertSame('CRC64NVME', $create['ChecksumAlgorithm'] ?? null);
+            self::assertSame('FULL_OBJECT', $create['ChecksumType'] ?? null);
+
+            $copy = self::$s3->uploadPartCopy([
+                'Bucket' => self::$bucket,
+                'Key' => $destinationKey,
+                'UploadId' => $uploadId,
+                'PartNumber' => 1,
+                'CopySource' => self::$bucket . '/' . $sourceKey,
+            ]);
+            self::assertSame($checksum, $copy['CopyPartResult']['ChecksumCRC64NVME'] ?? null);
+
+            $listed = self::$s3->listParts([
+                'Bucket' => self::$bucket,
+                'Key' => $destinationKey,
+                'UploadId' => $uploadId,
+            ]);
+            self::assertSame($checksum, $listed['Parts'][0]['ChecksumCRC64NVME'] ?? null);
+
+            $complete = self::$s3->completeMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $destinationKey,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [[
+                    'PartNumber' => 1,
+                    'ETag' => $copy['CopyPartResult']['ETag'],
+                    'ChecksumCRC64NVME' => $checksum,
+                ]]],
+            ]);
+            self::assertSame($checksum, $complete['ChecksumCRC64NVME'] ?? null);
+        } finally {
+            if ($uploadId !== null) {
+                try {
+                    self::$s3->abortMultipartUpload([
+                        'Bucket' => self::$bucket,
+                        'Key' => $destinationKey,
+                        'UploadId' => $uploadId,
+                    ]);
+                } catch (\Throwable) {
+                }
+            }
+            foreach ([$sourceKey, $destinationKey] as $key) {
+                try {
+                    self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+                } catch (\Throwable) {
+                }
+            }
+        }
+    }
+
+    public function test_legacy_multipart_rejects_late_crc64nvme_and_remains_usable(): void
+    {
+        $key = 'legacy-late-crc64-' . bin2hex(random_bytes(4));
+        $body = 'legacy multipart body';
+        $uploadId = self::$s3->createMultipartUpload([
+            'Bucket' => self::$bucket,
+            'Key' => $key,
+        ])['UploadId'];
+        $signer = new S3SignatureV4('s3', 'us-east-1');
+        $credentials = new Credentials(self::$accessKey, self::$secretKey);
+        $client = new Client(['http_errors' => false]);
+        $url = sprintf(
+            'http://%s:%d/%s/%s?partNumber=1&uploadId=%s',
+            self::$host,
+            self::$port,
+            self::$bucket,
+            rawurlencode($key),
+            rawurlencode($uploadId),
+        );
+
+        try {
+            $rejected = $client->send($signer->signRequest(new Request(
+                'PUT',
+                $url,
+                ['x-amz-checksum-crc64nvme' => 'AAAAAAAAAAA='],
+                $body,
+            ), $credentials));
+            self::assertSame(400, $rejected->getStatusCode());
+            self::assertStringContainsString('<Code>InvalidRequest</Code>', (string) $rejected->getBody());
+            self::assertEmpty(self::$s3->listParts([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+            ])['Parts'] ?? []);
+
+            $accepted = $client->send($signer->signRequest(new Request('PUT', $url, [], $body), $credentials));
+            self::assertSame(200, $accepted->getStatusCode(), (string) $accepted->getBody());
+            $complete = self::$s3->completeMultipartUpload([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+                'UploadId' => $uploadId,
+                'MultipartUpload' => ['Parts' => [[
+                    'PartNumber' => 1,
+                    'ETag' => $accepted->getHeaderLine('etag'),
+                ]]],
+            ]);
+            self::assertArrayNotHasKey('ChecksumCRC64NVME', $complete);
+            self::assertSame($body, (string) self::$s3->getObject([
+                'Bucket' => self::$bucket,
+                'Key' => $key,
+            ])['Body']);
+        } finally {
+            try {
+                self::$s3->abortMultipartUpload([
+                    'Bucket' => self::$bucket,
+                    'Key' => $key,
+                    'UploadId' => $uploadId,
+                ]);
+            } catch (\Throwable) {
+            }
+            try {
+                self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+            } catch (\Throwable) {
+            }
+        }
     }
 
     public function test_aws_sdk_multipart_uploader_round_trip(): void

@@ -32,6 +32,7 @@ use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
@@ -122,6 +123,25 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         }
         if (($upload['bucket_generation'] ?? '') !== $bucketInfo->generation) {
             throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload belongs to another bucket generation.');
+        }
+        $checksumContract = MultipartChecksumContract::fromStored($upload['user_metadata']);
+        $initiatedChecksumAlgorithm = $checksumContract?->algorithm;
+        if ($initiatedChecksumAlgorithm === null && $expectedChecksumAlgorithm === 'crc64nvme') {
+            throw new \OpsFour\S3Server\Exception\InvalidRequestException(
+                'CRC64NVME was not selected when this multipart upload was initiated.',
+            );
+        }
+        if ($initiatedChecksumAlgorithm === 'crc64nvme'
+            && $expectedChecksumAlgorithm !== null && $expectedChecksumAlgorithm !== 'crc64nvme') {
+            throw new \OpsFour\S3Server\Exception\BadDigestException(
+                'The part checksum algorithm does not match the initiated multipart upload.',
+            );
+        }
+        if (($initiatedChecksumAlgorithm !== null || $expectedChecksumAlgorithm !== null) && (
+            ! $this->metadata instanceof MultipartPartChecksumStore
+            || ! $this->metadata->supportsMultipartPartChecksums()
+        )) {
+            throw new \OpsFour\S3Server\Exception\NotImplementedException('Multipart part checksum persistence is unavailable.');
         }
         $objectLockConfig = $this->assertObjectLockConfiguration($bucket, $upload['user_metadata']);
         ObjectLockConfigurationSnapshot::assertCurrent($request, $objectLockConfig);
@@ -227,7 +247,11 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 if ($awsReservation !== null) {
                     $body = $activeAwsObjectWriter->renewingStream($awsReservation, $body);
                 }
-                [$plaintext, $checksums] = BufferedSsePayload::read($body, $this->maxEncryptedObjectSize);
+                [$plaintext, $checksums] = BufferedSsePayload::read(
+                    $body,
+                    $this->maxEncryptedObjectSize,
+                    captureCrc64Nvme: $initiatedChecksumAlgorithm === 'crc64nvme',
+                );
                 $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
                 MultipartPartLogicalValidator::assertValid($clientChecksums, $checksums, $declaredLength);
                 $encode = fn(): string => EncryptedMultipartPartCodec::encode(
@@ -348,6 +372,7 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     $checksums->crc32cBase64(),
                     $checksums->sha1Base64(),
                     $checksums->sha256Base64(),
+                    $checksums->crc64NvmeBase64(),
                 );
             } catch (\Amp\CancelledException $error) {
                 $writeCancellation = $error;
@@ -381,6 +406,12 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
             }
         } else {
             $body = MultipartPartSize::boundedBody($request->getBody());
+            $crc64Capture = null;
+            $crc64Value = null;
+            if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+                $crc64Capture = new Crc64NvmeCapturingStream($body);
+                $body = $crc64Capture;
+            }
             $writeCancellation = null;
             try {
                 $awsReservation = $activeAwsObjectWriter?->reserveMultipartPart(
@@ -398,7 +429,12 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         $declaredLength,
                     );
                     $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
-                    MultipartPartLogicalValidator::assertValid($clientChecksums, $awsStage->result, $declaredLength);
+                    $logicalStage = $awsStage->result;
+                    if ($crc64Capture !== null) {
+                        $crc64Value = $crc64Capture->finalizeBase64();
+                        $logicalStage = self::withCrc64Nvme($logicalStage, $crc64Value);
+                    }
+                    MultipartPartLogicalValidator::assertValid($clientChecksums, $logicalStage, $declaredLength);
                     $outcome = $awsWriter->dispatchMultipartPart($awsReservation, $key, $uploadId, $partNumber, $awsStage);
                     $plannedPartPath = $outcome->result->path;
                     $awsDispatchToken = $outcome->dispatch;
@@ -411,9 +447,14 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         $uploadId,
                         $partNumber,
                         $body,
-                        validateBeforeArm: static function (\OpsFour\S3Server\Checksum\ChecksumResult $checksums) use ($request, $expectedChecksumAlgorithm, $declaredLength, &$clientChecksums, &$validated): void {
+                        validateBeforeArm: static function (\OpsFour\S3Server\Checksum\ChecksumResult $checksums) use ($request, $expectedChecksumAlgorithm, $declaredLength, $crc64Capture, &$crc64Value, &$clientChecksums, &$validated): void {
                             $clientChecksums = MultipartPartLogicalValidator::verifiedClientChecksums($request, $expectedChecksumAlgorithm);
-                            MultipartPartLogicalValidator::assertValid($clientChecksums, $checksums, $declaredLength);
+                            $logicalStage = MultipartPartLogicalValidator::stagedResult($checksums);
+                            if ($crc64Capture !== null) {
+                                $crc64Value = $crc64Capture->finalizeBase64();
+                                $logicalStage = self::withCrc64Nvme($logicalStage, $crc64Value);
+                            }
+                            MultipartPartLogicalValidator::assertValid($clientChecksums, $logicalStage, $declaredLength);
                             $validated = $checksums;
                         },
                         knownPhysicalSize: $declaredLength,
@@ -494,6 +535,34 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     },
                 );
             }
+            if ($crc64Capture !== null) {
+                try {
+                    $crc64Value ??= $crc64Capture->finalizeBase64();
+                } catch (\Throwable $error) {
+                    \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::afterFailure(
+                        $error,
+                        fn() => $this->deleteUncommittedPart(
+                            $uploadStorage,
+                            $storageTier,
+                            $bucket,
+                            $writeResult->path,
+                            $plannedPartPath !== null ? $uploadId : null,
+                            $ownerId,
+                        ),
+                    );
+                    throw $error;
+                }
+                $writeResult = new StorageWriteResult(
+                    path: $writeResult->path,
+                    size: $writeResult->size,
+                    md5Hex: $writeResult->md5Hex,
+                    crc32Base64: $writeResult->crc32Base64,
+                    crc32cBase64: $writeResult->crc32cBase64,
+                    sha1Base64: $writeResult->sha1Base64,
+                    sha256Base64: $writeResult->sha256Base64,
+                    crc64NvmeBase64: $crc64Value,
+                );
+            }
         }
         try {
             MultipartPartLogicalValidator::assertValidStorageResult($writeResult);
@@ -516,6 +585,11 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         $responseHeaders = ['ETag' => $etag];
         $checksumAlgorithm = array_key_first($clientChecksums);
         $checksumValue = $checksumAlgorithm === null ? null : $clientChecksums[$checksumAlgorithm];
+        if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+            $checksumAlgorithm = 'crc64nvme';
+            $checksumValue = $writeResult->crc64NvmeBase64
+                ?? throw new \OpsFour\S3Server\Exception\InternalErrorException('CRC64NVME part calculation did not complete.');
+        }
         if ($checksumAlgorithm !== null && $checksumValue !== null) {
             $responseHeaders[MultipartPartLogicalValidator::headerForAlgorithm($checksumAlgorithm)] = $checksumValue;
         }
@@ -531,7 +605,7 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         $previousPartPath = null;
         $commitCallbackCompleted = false;
         try {
-            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $checksumAlgorithm, $checksumValue, $plannedPartPath, $dispatchId, $awsDispatchToken, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
+            $this->metadata->transaction(function () use ($request, $ownerId, $bucketInfo, $bucket, $key, $uploadId, $partNumber, $etag, $writeResult, $partFormat, $uploadSseAlgorithm, $checksumContract, $checksumAlgorithm, $checksumValue, $plannedPartPath, $dispatchId, $awsDispatchToken, $storageTier, &$previousPartPath, &$commitCallbackCompleted): void {
                 \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $bucketInfo->ownerId);
                 \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $bucketInfo, $request);
                 $this->assertPlainUploadAllowed($bucket, $uploadSseAlgorithm);
@@ -554,6 +628,11 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 }
                 if (($activeUpload['storage_tier'] ?? null) !== $storageTier) {
                     throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart upload storage tier changed during part write.');
+                }
+                $activeChecksumContract = MultipartChecksumContract::fromStored($activeUpload['user_metadata']);
+                if (($checksumContract === null) !== ($activeChecksumContract === null)
+                    || ($checksumContract !== null && ! $checksumContract->sameAs($activeChecksumContract))) {
+                    throw new \OpsFour\S3Server\Exception\OperationAbortedException('Multipart checksum contract changed during part write.');
                 }
                 $objectLockConfig = $this->assertObjectLockConfiguration(
                     $bucket,
@@ -697,6 +776,20 @@ final class UploadPartHandler implements RequestHandler, \OpsFour\S3Server\Stora
         if ($writer !== null && $reservation !== null) {
             $writer->retireBeforeDispatch($reservation);
         }
+    }
+
+    private static function withCrc64Nvme(StorageWriteResult $result, string $crc64Nvme): StorageWriteResult
+    {
+        return new StorageWriteResult(
+            path: $result->path,
+            size: $result->size,
+            md5Hex: $result->md5Hex,
+            crc32Base64: $result->crc32Base64,
+            crc32cBase64: $result->crc32cBase64,
+            sha1Base64: $result->sha1Base64,
+            sha256Base64: $result->sha256Base64,
+            crc64NvmeBase64: $crc64Nvme,
+        );
     }
 
     private function releaseUnusedCapacity(?StorageTempReservation $capacity): void

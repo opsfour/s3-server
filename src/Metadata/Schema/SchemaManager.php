@@ -1215,6 +1215,14 @@ final class SchemaManager
         $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (42, 'Reserve AWS seal capacity and immutable content evidence')");
     }
 
+    private function applyVersion43(): void
+    {
+        if (! $this->columnExists('s3_objects', 'checksum_crc64nvme')) {
+            $this->pdo->exec('ALTER TABLE s3_objects ADD COLUMN checksum_crc64nvme TEXT');
+        }
+        $this->pdo->exec("INSERT INTO s3_schema_version (version, description) VALUES (43, 'Persist CRC64NVME object checksums')");
+    }
+
     public function assertWriteIntentCapacityConsistent(): void
     {
         $counts = [

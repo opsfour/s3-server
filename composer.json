@@ -13,6 +13,7 @@
     },
     "require": {
         "php": "^8.4",
+        "php-64bit": "*",
         "ext-dom": "*",
         "ext-libxml": "*",
         "ext-mbstring": "*",

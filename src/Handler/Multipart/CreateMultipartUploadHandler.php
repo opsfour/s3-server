@@ -17,6 +17,7 @@ use OpsFour\S3Server\Encryption\ConfigWorkerKeyringCompatible;
 use OpsFour\S3Server\Exception\AccessDeniedException;
 use OpsFour\S3Server\Exception\NoSuchBucketException;
 use OpsFour\S3Server\Exception\NotImplementedException;
+use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Http\UserMetadataExtractor;
 use OpsFour\S3Server\Http\ObjectTagValidator;
 use OpsFour\S3Server\Http\RequestHeaderValues;
@@ -78,12 +79,9 @@ final class CreateMultipartUploadHandler implements RequestHandler, \OpsFour\S3S
         if ($ownerId === '') {
             throw new AccessDeniedException('Anonymous multipart uploads are not supported.');
         }
-        if ($request->getHeader('x-amz-checksum-algorithm') !== null
-            || $request->getHeader('x-amz-checksum-type') !== null) {
-            throw new NotImplementedException(
-                'Multipart additional checksums are not supported.',
-            );
-        }
+        $checksumAlgorithm = RequestHeaderValues::singleton($request, 'x-amz-checksum-algorithm');
+        $checksumType = RequestHeaderValues::singleton($request, 'x-amz-checksum-type');
+        $checksumContract = MultipartChecksumContract::fromInitiation($checksumAlgorithm, $checksumType);
         $bucket = $request->getAttribute('s3.bucket');
         $key = $request->getAttribute('s3.key');
 
@@ -147,6 +145,10 @@ final class CreateMultipartUploadHandler implements RequestHandler, \OpsFour\S3S
         $contentType = $request->getHeader('content-type') ?? 'application/octet-stream';
         $userMetadata = UserMetadataExtractor::extract($request);
         $userMetadata['__mpu-part-format'] = EncryptedMultipartPartCodec::PLAINTEXT_FORMAT;
+        if ($checksumContract !== null) {
+            $userMetadata['__mpu-checksum-algorithm'] = $checksumContract->algorithm;
+            $userMetadata['__mpu-checksum-type'] = $checksumContract->type;
+        }
         $userMetadata['__mpu-acl-grants'] = json_encode($aclGrants, JSON_THROW_ON_ERROR);
         $userMetadata[MultipartDestinationOwnershipSnapshot::METADATA_KEY]
             = MultipartDestinationOwnershipSnapshot::fromDecision(
@@ -286,6 +288,10 @@ final class CreateMultipartUploadHandler implements RequestHandler, \OpsFour\S3S
         $xml = XmlResponseBuilder::initiateMultipartUploadResult($bucket, $key, $uploadId);
 
         $responseHeaders = ['Content-Type' => 'application/xml'];
+        if ($checksumContract !== null) {
+            $responseHeaders['x-amz-checksum-algorithm'] = 'CRC64NVME';
+            $responseHeaders['x-amz-checksum-type'] = $checksumContract->type;
+        }
 
         // Encryption response headers.
         if ($sseAlgo === 'SSE-C') {

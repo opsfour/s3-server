@@ -44,6 +44,7 @@ use OpsFour\S3Server\Storage\KnownSizeStorageCapabilities;
 use OpsFour\S3Server\Storage\RecoverableMultipartAssemblyBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\StorageTempReservation;
 use OpsFour\S3Server\Storage\FilesystemBackend;
@@ -56,6 +57,9 @@ use OpsFour\S3Server\Storage\AwsS3MultipartPartsStream;
 use OpsFour\S3Server\Storage\AwsS3MultipartPsrStream;
 use OpsFour\S3Server\Storage\LocalObjectWriteDispatchToken;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
+use OpsFour\S3Server\Checksum\CooperativeCrc64Nvme;
+use OpsFour\S3Server\Exception\BadDigestException;
 
 final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
 {
@@ -110,11 +114,15 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
 
     public function handleRequest(Request $request): Response
     {
+        $submittedChecksumCrc64Nvme = RequestHeaderValues::singleton($request, 'x-amz-checksum-crc64nvme');
+        $submittedChecksumType = RequestHeaderValues::singleton($request, 'x-amz-checksum-type');
         foreach (array_keys($request->getHeaders()) as $header) {
             $header = strtolower($header);
-            if ($header === 'x-amz-sdk-checksum-algorithm' || str_starts_with($header, 'x-amz-checksum-')) {
+            if ($header === 'x-amz-sdk-checksum-algorithm'
+                || (str_starts_with($header, 'x-amz-checksum-')
+                    && ! in_array($header, ['x-amz-checksum-crc64nvme', 'x-amz-checksum-type'], true))) {
                 throw new \OpsFour\S3Server\Exception\NotImplementedException(
-                    'Multipart additional checksums are not supported.',
+                    'This multipart completion checksum field is not supported.',
                 );
             }
         }
@@ -145,6 +153,18 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             throw new \OpsFour\S3Server\Exception\OperationAbortedException(
                 'Multipart upload belongs to an unverified bucket generation.',
             );
+        }
+        $checksumContract = MultipartChecksumContract::fromStored($upload['user_metadata']);
+        $initiatedChecksumAlgorithm = $checksumContract?->algorithm;
+        if ($checksumContract === null) {
+            if ($submittedChecksumCrc64Nvme !== null || $submittedChecksumType !== null) {
+                throw new InvalidRequestException('This multipart upload has no CRC64NVME initiation contract.');
+            }
+        } elseif ($submittedChecksumType !== null && strtoupper($submittedChecksumType) !== $checksumContract->type) {
+            throw new BadDigestException('The completion checksum type does not match the initiated FULL_OBJECT contract.');
+        }
+        if ($submittedChecksumCrc64Nvme !== null) {
+            self::decodeCrc64Nvme($submittedChecksumCrc64Nvme);
         }
         $ownershipSnapshot = MultipartDestinationOwnershipSnapshot::decode($upload['user_metadata']);
         if ($ownershipSnapshot !== null) {
@@ -250,6 +270,25 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                 throw new InvalidPartException(
                     'One or more of the specified parts could not be found.',
                 );
+            }
+
+            $storedChecksumAlgorithm = $storedPartsMap[$partNumber]['checksum_algorithm'] ?? null;
+            $storedChecksumValue = $storedPartsMap[$partNumber]['checksum_value'] ?? null;
+            $requestedChecksumValue = $rp['checksumCrc64Nvme'] ?? null;
+            if ($initiatedChecksumAlgorithm === null && $requestedChecksumValue !== null) {
+                throw new InvalidRequestException('CRC64NVME part values require a matching initiation contract.');
+            }
+            if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+                if ($storedChecksumAlgorithm !== 'crc64nvme' || ! is_string($storedChecksumValue)) {
+                    throw new BadDigestException('A selected multipart part has no verified CRC64NVME value.');
+                }
+                self::decodeCrc64Nvme($storedChecksumValue);
+                if ($requestedChecksumValue !== null) {
+                    self::decodeCrc64Nvme($requestedChecksumValue);
+                    if (! hash_equals($storedChecksumValue, $requestedChecksumValue)) {
+                        throw new BadDigestException('A completed-part CRC64NVME value does not match the stored part.');
+                    }
+                }
             }
 
             $validatedParts[] = [
@@ -476,12 +515,13 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         // the final object directly. Legacy uploads retain their assembly path.
         $userMetadata = $upload['user_metadata'];
         $encMeta = [];
+        $checksumCrc64Nvme = null;
         $awsDispatchToken = null;
         $awsStage = null;
         try {
             if ($encryptedV2 && $awsReservation !== null) {
                 $awsProviderDispatch->started = true;
-                [$writeResult, $encMeta, $awsStage, $awsDispatchToken] = $this->completeEncryptedAwsParts(
+                [$writeResult, $encMeta, $awsStage, $awsDispatchToken, $checksumCrc64Nvme] = $this->completeEncryptedAwsParts(
                     $bucketInfo,
                     $key,
                     $uploadId,
@@ -492,10 +532,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     $completionCustomerKey,
                     $request,
                     $awsReservation,
+                    $initiatedChecksumAlgorithm === 'crc64nvme',
                 );
             } elseif ($encryptedV2) {
                 \assert($uploadStorage instanceof RecoverableMultipartAssemblyBackend);
-                [$writeResult, $encMeta] = $this->completeEncryptedParts(
+                [$writeResult, $encMeta, $checksumCrc64Nvme] = $this->completeEncryptedParts(
                     $uploadStorage,
                     $bucket,
                     $key,
@@ -508,6 +549,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     $completionCustomerKey,
                     $intent->finalPath,
                     $request,
+                    $initiatedChecksumAlgorithm === 'crc64nvme',
                 );
             } elseif ($awsReservation !== null) {
                 $awsWriter = $this->awsObjectWriter
@@ -546,6 +588,11 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     (string) $upload['owner_id'],
                     $validatedParts,
                 );
+                $crc64Capture = null;
+                if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+                    $crc64Capture = new \OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream($partsStream);
+                    $partsStream = $crc64Capture;
+                }
                 $providerBody = new AwsS3MultipartPsrStream(
                     $partsStream,
                     $expectedSize,
@@ -565,6 +612,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                         $providerBody,
                         $logicalResult,
                     );
+                    $providerBody->requireExactEnd();
+                    $checksumCrc64Nvme = $crc64Capture?->finalizeBase64();
                 } finally {
                     $providerBody->close();
                 }
@@ -599,6 +648,22 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     || $writeResult->size !== $expectedSize
                     || ! hash_equals(trim($etag, '"'), strtolower($writeResult->md5Hex))) {
                     throw new InternalErrorException('Multipart assembly result does not match selected parts.');
+                }
+                if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+                    $checksumCrc64Nvme = $this->calculateStoredCrc64Nvme(
+                        $uploadStorage,
+                        $writeResult->path,
+                        $expectedSize,
+                    );
+                }
+            }
+            if ($initiatedChecksumAlgorithm === 'crc64nvme') {
+                if ($checksumCrc64Nvme === null) {
+                    throw new InternalErrorException('Multipart CRC64NVME calculation did not complete.');
+                }
+                if ($submittedChecksumCrc64Nvme !== null
+                    && ! hash_equals($checksumCrc64Nvme, $submittedChecksumCrc64Nvme)) {
+                    throw new BadDigestException('The completed object CRC64NVME checksum did not match the submitted value.');
                 }
             }
             $heartbeat->stop();
@@ -681,6 +746,8 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             $userMetadata[PolicyEnforcementMiddleware::MULTIPART_POLICY_CONTEXT_HEADERS_KEY],
             $userMetadata['__mpu-tags'],
             $userMetadata['__mpu-part-format'],
+            $userMetadata['__mpu-checksum-algorithm'],
+            $userMetadata['__mpu-checksum-type'],
             $userMetadata[ObjectLockConfigurationSnapshot::MULTIPART_METADATA_KEY],
             $userMetadata['__object-lock-mode'],
             $userMetadata['__object-lock-retain-until-date'],
@@ -750,6 +817,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     &$versionId,
                     &$cleanupParts,
                     $partLayouts,
+                    $checksumCrc64Nvme,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
@@ -803,6 +871,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                         contentDisposition: $contentDisposition,
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
+                        checksumCrc64Nvme: $checksumCrc64Nvme,
                     );
                     $partLayouts->putObjectPartLayout($bucket, $key, $versionId, \OpsFour\S3Server\Metadata\ObjectPartLayout::completedMultipart($writeResult->size, $validatedParts));
                     $this->metadata->updateObjectPlacement(
@@ -877,6 +946,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     &$oldPathsToClean,
                     &$cleanupParts,
                     $partLayouts,
+                    $checksumCrc64Nvme,
                 ) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
@@ -953,6 +1023,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                         contentDisposition: $contentDisposition,
                         cacheControl: $cacheControl,
                         userMetadata: $userMetadata,
+                        checksumCrc64Nvme: $checksumCrc64Nvme,
                     );
                     $partLayouts->putObjectPartLayout($bucket, $key, 'null', \OpsFour\S3Server\Metadata\ObjectPartLayout::completedMultipart($writeResult->size, $validatedParts));
                     $this->metadata->updateObjectPlacement(
@@ -1017,9 +1088,19 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         // Build response.
         $location = (string) $request->getUri()->withQuery('')->withFragment('');
 
-        $xml = XmlResponseBuilder::completeMultipartUploadResult($location, $bucket, $key, $etag);
+        $xml = XmlResponseBuilder::completeMultipartUploadResult(
+            $location,
+            $bucket,
+            $key,
+            $etag,
+            $checksumCrc64Nvme,
+        );
 
         $responseHeaders = ['Content-Type' => 'application/xml'];
+        if ($checksumCrc64Nvme !== null) {
+            $responseHeaders['x-amz-checksum-crc64nvme'] = $checksumCrc64Nvme;
+            $responseHeaders['x-amz-checksum-type'] = 'FULL_OBJECT';
+        }
 
         if ($versioning === 'Suspended') {
             $responseHeaders['x-amz-version-id'] = 'null';
@@ -1061,6 +1142,49 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         return null;
     }
 
+    private static function decodeCrc64Nvme(string $value): string
+    {
+        try {
+            return Crc64NvmeDigest::decodeBase64($value);
+        } catch (\InvalidArgumentException) {
+            throw new BadDigestException('CRC64NVME must be canonical padded Base64 encoding of eight bytes.');
+        }
+    }
+
+    private function calculateStoredCrc64Nvme(StorageBackend $storage, string $path, int $expectedSize): string
+    {
+        $stream = new LimitedReadableStream(
+            $storage->getObjectByPath($path),
+            $expectedSize,
+            requireExactLength: true,
+            rejectExcess: true,
+        );
+        $capture = new \OpsFour\S3Server\Checksum\Crc64NvmeCapturingStream($stream);
+        $readCancellation = null;
+        try {
+            while ($capture->read() !== null) {
+            }
+
+            return $capture->finalizeBase64();
+        } catch (\Amp\CancelledException $error) {
+            $readCancellation = $error;
+            throw $error;
+        } finally {
+            \OpsFour\S3Server\Runtime\CancellationPreservingCleanup::inFinally(
+                $readCancellation,
+                $capture->close(...),
+            );
+        }
+    }
+
+    private static function crc64NvmeForBytes(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        CooperativeCrc64Nvme::update($digest, $bytes);
+
+        return $digest->finalizeBase64();
+    }
+
     private static function declaredObjectSize(?string $value): ?int
     {
         if ($value === null) {
@@ -1086,7 +1210,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
 
     /**
      * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $parts
-     * @return array{StorageWriteResult, array<string, string>, \OpsFour\S3Server\Storage\AwsS3ForegroundObjectStage, LocalObjectWriteDispatchToken}
+     * @return array{StorageWriteResult, array<string, string>, \OpsFour\S3Server\Storage\AwsS3ForegroundObjectStage, LocalObjectWriteDispatchToken, ?string}
      */
     private function completeEncryptedAwsParts(
         \OpsFour\S3Server\Dto\BucketInfo $bucket,
@@ -1099,6 +1223,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         ?string $customerKey,
         Request $request,
         \OpsFour\S3Server\Storage\AwsS3ForegroundObjectReservation $reservation,
+        bool $captureCrc64Nvme,
     ): array {
         if ($mode === null || $this->encryption === null || $this->awsObjectWriter === null) {
             throw new InternalErrorException('Encrypted AWS multipart completion is unavailable.');
@@ -1111,7 +1236,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         $expectedOwnerId = (string) $request->getAttribute('ownerId');
         try {
             BufferedSsePayload::assertMemoryHeadroom($expectedSize);
-            [$ciphertext, $encMeta] = $writer->transform($reservation, function () use (
+            [$ciphertext, $encMeta, $checksumCrc64Nvme] = $writer->transform($reservation, function () use (
                 $writer,
                 $bucket,
                 $key,
@@ -1123,6 +1248,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                 $request,
                 $reservation,
                 $expectedOwnerId,
+                $captureCrc64Nvme,
             ): array {
                 $plaintext = '';
                 foreach ($parts as $part) {
@@ -1166,6 +1292,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                 if (strlen($plaintext) !== $expectedSize) {
                     throw new InternalErrorException('Encrypted AWS multipart object size does not match its parts.');
                 }
+                $checksumCrc64Nvme = $captureCrc64Nvme ? self::crc64NvmeForBytes($plaintext) : null;
                 if ($mode === EncryptionRequestResolver::SSE_C) {
                     if ($customerKey === null) {
                         throw new InternalErrorException('Multipart customer key is unavailable.');
@@ -1193,7 +1320,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                     throw new InternalErrorException('Unsupported encrypted multipart mode.');
                 }
 
-                return [$encrypted['ciphertext'], $metadata];
+                return [$encrypted['ciphertext'], $metadata, $checksumCrc64Nvme];
             });
             if (strlen($ciphertext) !== $expectedSize) {
                 throw new InternalErrorException('Encrypted AWS multipart final payload size is invalid.');
@@ -1216,6 +1343,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                 $encMeta,
                 $stage,
                 $dispatch,
+                $checksumCrc64Nvme,
             ];
         } catch (\Throwable $error) {
             if ($stage !== null) {
@@ -1241,7 +1369,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
 
     /**
      * @param list<array{partNumber: int, etag: string, size: int, storagePath: string}> $parts
-     * @return array{StorageWriteResult, array<string, string>}
+     * @return array{StorageWriteResult, array<string, string>, ?string}
      */
     private function completeEncryptedParts(
         RecoverableMultipartAssemblyBackend $storage,
@@ -1256,6 +1384,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
         ?string $customerKey,
         string $finalPath,
         Request $request,
+        bool $captureCrc64Nvme,
     ): array {
         if ($mode === null || $this->encryption === null) {
             throw new InternalErrorException('Encrypted multipart completion is unavailable.');
@@ -1305,6 +1434,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
             if (strlen($plaintext) !== $expectedSize) {
                 throw new InternalErrorException('Encrypted multipart object size does not match its parts.');
             }
+            $checksumCrc64Nvme = $captureCrc64Nvme ? self::crc64NvmeForBytes($plaintext) : null;
 
             if ($mode === EncryptionRequestResolver::SSE_C) {
                 if ($customerKey === null) {
@@ -1352,7 +1482,7 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
                 throw new InternalErrorException('Encrypted multipart final write does not match its planned payload.');
             }
 
-            return [new StorageWriteResult($finalPath, $expectedSize, trim($etag, '"')), $encMeta];
+            return [new StorageWriteResult($finalPath, $expectedSize, trim($etag, '"')), $encMeta, $checksumCrc64Nvme];
         } catch (\Amp\CancelledException $error) {
             $completionCancellation = $error;
             throw $error;

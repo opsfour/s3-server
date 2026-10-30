@@ -249,6 +249,7 @@ interface MetadataStore
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void;
 
     /**
@@ -499,6 +500,7 @@ interface MetadataStore
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string;
 
     /**

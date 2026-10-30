@@ -9,6 +9,10 @@ use Amp\ByteStream\ReadableStream;
 use Amp\Pipeline\Queue;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
+use OpsFour\S3Server\Checksum\CooperativeCrc64Nvme;
+use OpsFour\S3Server\Checksum\HashIncrementalDigest;
+use OpsFour\S3Server\Checksum\IncrementalDigest;
 
 /**
  * Decodes STREAMING-UNSIGNED-PAYLOAD-TRAILER bodies and validates their
@@ -62,7 +66,9 @@ final class UnsignedChunkedTrailerDecoder
                         }
 
                         foreach ($checksumContexts as $context) {
-                            hash_update($context, $data);
+                            $context instanceof Crc64NvmeDigest
+                                ? CooperativeCrc64Nvme::update($context, $data)
+                                : $context->update($data);
                         }
                         $queue->push($data);
                     }
@@ -120,20 +126,20 @@ final class UnsignedChunkedTrailerDecoder
 
     /**
      * @param list<string> $trailerNames
-     * @return array<string, \HashContext>
+     * @return array<string, IncrementalDigest>
      */
     private static function checksumContexts(array $trailerNames): array
     {
         $contexts = [];
         foreach ($trailerNames as $name) {
-            $algorithm = match ($name) {
-                'x-amz-checksum-crc32' => 'crc32b',
-                'x-amz-checksum-crc32c' => 'crc32c',
-                'x-amz-checksum-sha1' => 'sha1',
-                'x-amz-checksum-sha256' => 'sha256',
+            $contexts[$name] = match ($name) {
+                'x-amz-checksum-crc32' => new HashIncrementalDigest('crc32b'),
+                'x-amz-checksum-crc32c' => new HashIncrementalDigest('crc32c'),
+                'x-amz-checksum-crc64nvme' => new Crc64NvmeDigest(),
+                'x-amz-checksum-sha1' => new HashIncrementalDigest('sha1'),
+                'x-amz-checksum-sha256' => new HashIncrementalDigest('sha256'),
                 default => throw new InvalidArgumentException("Unsupported unsigned trailer: {$name}."),
             };
-            $contexts[$name] = hash_init($algorithm);
         }
 
         return $contexts;
@@ -141,7 +147,7 @@ final class UnsignedChunkedTrailerDecoder
 
     /**
      * @param list<string> $trailerNames
-     * @param array<string, \HashContext> $checksumContexts
+     * @param array<string, IncrementalDigest> $checksumContexts
      * @return array<string, string>
      */
     private static function readTrailers(
@@ -174,7 +180,8 @@ final class UnsignedChunkedTrailerDecoder
                 throw new InvalidArgumentException('Malformed unsigned trailer header.');
             }
             $name = strtolower(trim(substr($line, 0, $separator)));
-            $value = trim(substr($line, $separator + 1));
+            $rawValue = substr($line, $separator + 1);
+            $value = trim($rawValue, " \t");
             if ($name === '' || isset($trailers[$name])) {
                 throw new InvalidArgumentException('Duplicate or empty unsigned trailer header.');
             }
@@ -188,7 +195,16 @@ final class UnsignedChunkedTrailerDecoder
         }
 
         foreach ($checksumContexts as $name => $context) {
-            $computed = base64_encode(hash_final($context, true));
+            if ($name === 'x-amz-checksum-crc64nvme') {
+                try {
+                    Crc64NvmeDigest::decodeBase64($trailers[$name]);
+                } catch (\InvalidArgumentException) {
+                    throw new BadDigestException(
+                        'CRC64NVME trailer must be canonical padded Base64 encoding of eight bytes.',
+                    );
+                }
+            }
+            $computed = base64_encode($context->finalize());
             if (! hash_equals($computed, $trailers[$name])) {
                 throw new BadDigestException("The {$name} trailer did not match the streamed payload.");
             }

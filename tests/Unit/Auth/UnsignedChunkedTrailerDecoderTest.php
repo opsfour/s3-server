@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use Amp\ByteStream\ReadableBuffer;
 use OpsFour\S3Server\Auth\UnsignedChunkedTrailerDecoder;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -42,6 +43,44 @@ final class UnsignedChunkedTrailerDecoderTest extends TestCase
         $stream = (new UnsignedChunkedTrailerDecoder())->createDecodedStream(
             new ReadableBuffer($body),
             ['x-amz-checksum-sha256'],
+        );
+
+        $this->expectException(BadDigestException::class);
+        \Amp\ByteStream\buffer($stream);
+    }
+
+    public function test_decodes_and_validates_crc64nvme_trailer(): void
+    {
+        $payload = 'unsigned CRC64NVME payload';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($payload);
+        $checksum = $digest->finalizeBase64();
+        $body = dechex(strlen($payload)) . "\r\n{$payload}\r\n"
+            . "0\r\n"
+            . "x-amz-checksum-crc64nvme: {$checksum}\t\r\n\r\n";
+        $trailers = [];
+
+        $stream = (new UnsignedChunkedTrailerDecoder())->createDecodedStream(
+            new ReadableBuffer($body),
+            ['x-amz-checksum-crc64nvme'],
+            static function (array $values) use (&$trailers): void {
+                $trailers = $values;
+            },
+        );
+
+        self::assertSame($payload, \Amp\ByteStream\buffer($stream));
+        self::assertSame(['x-amz-checksum-crc64nvme' => $checksum], $trailers);
+    }
+
+    public function test_rejects_unsigned_crc64nvme_trailer_with_embedded_whitespace(): void
+    {
+        $payload = 'payload';
+        $body = dechex(strlen($payload)) . "\r\n{$payload}\r\n"
+            . "0\r\n"
+            . "x-amz-checksum-crc64nvme:AAAA AAAAAAA=\r\n\r\n";
+        $stream = (new UnsignedChunkedTrailerDecoder())->createDecodedStream(
+            new ReadableBuffer($body),
+            ['x-amz-checksum-crc64nvme'],
         );
 
         $this->expectException(BadDigestException::class);

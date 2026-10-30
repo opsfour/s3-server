@@ -20,6 +20,7 @@ use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Exception\NoSuchVersionException;
 use OpsFour\S3Server\Exception\MethodNotAllowedException;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Checksum\StoredCrc64Nvme;
 
 /**
  * Handles GetObjectAttributes (GET /{bucket}/{key}?attributes).
@@ -178,7 +179,7 @@ final class GetObjectAttributesHandler implements RequestHandler
     private static function writeChecksum(\XMLWriter $writer, \OpsFour\S3Server\Dto\ObjectInfo $obj): void
     {
         $hasChecksum = false;
-        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-sha1', 'checksum-sha256'] as $key) {
+        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-crc64nvme', 'checksum-sha1', 'checksum-sha256'] as $key) {
             if (isset($obj->systemMetadata[$key]) && $obj->systemMetadata[$key] !== '') {
                 $hasChecksum = true;
                 break;
@@ -195,6 +196,12 @@ final class GetObjectAttributesHandler implements RequestHandler
         }
         if (isset($obj->systemMetadata['checksum-crc32c']) && $obj->systemMetadata['checksum-crc32c'] !== '') {
             $writer->writeElement('ChecksumCRC32C', $obj->systemMetadata['checksum-crc32c']);
+        }
+        if (isset($obj->systemMetadata['checksum-crc64nvme']) && $obj->systemMetadata['checksum-crc64nvme'] !== '') {
+            $writer->writeElement(
+                'ChecksumCRC64NVME',
+                StoredCrc64Nvme::requireCanonical($obj->systemMetadata['checksum-crc64nvme']),
+            );
         }
         if (isset($obj->systemMetadata['checksum-sha1']) && $obj->systemMetadata['checksum-sha1'] !== '') {
             $writer->writeElement('ChecksumSHA1', $obj->systemMetadata['checksum-sha1']);

@@ -60,6 +60,11 @@ its next pass or after restart.
 Multipart part uploads and part copies use the same private staging area. They
 reserve and arm their part intent only after the complete part and its
 checksums have been staged, immediately before create-only publication.
+
+CRC64NVME is calculated by the package over logical plaintext only when a
+request selects it or stored metadata requires verification. Provider checksum
+metadata and ciphertext digests are never authoritative, and custom backends
+must consume the complete package-owned capturing stream before publication.
 Completion uses an attempt-bound assembly path, and AbortMultipartUpload
 stages exact committed part paths for durable cleanup.
 

@@ -10,6 +10,7 @@ use GuzzleHttp\Psr7\AppendStream;
 use GuzzleHttp\Psr7\Utils;
 use Aws\S3\Exception\S3Exception;
 use OpsFour\S3Server\Auth\SigningKey;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 
 final class PostObjectTest extends S3FunctionalTestCase
 {
@@ -160,6 +161,52 @@ final class PostObjectTest extends S3FunctionalTestCase
             'Bucket' => $bucket,
             'Key' => 'held.txt',
         ])['LegalHold']['Status']);
+    }
+
+    public function test_browser_post_crc64nvme_validates_plaintext_and_redirect_omits_checksum_headers(): void
+    {
+        $body = 'browser CRC64NVME plaintext';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($body);
+        $checksum = $digest->finalizeBase64();
+        $validKey = 'crc64-valid-' . bin2hex(random_bytes(4));
+        $badKey = 'crc64-bad-' . bin2hex(random_bytes(4));
+        $redirectKey = 'crc64-redirect-' . bin2hex(random_bytes(4));
+
+        try {
+            $valid = $this->postV4($validKey, 'valid.txt', $body, [
+                'success_action_status' => '201',
+                'x-amz-checksum-crc64nvme' => $checksum,
+            ]);
+            self::assertSame(201, $valid->getStatusCode(), (string) $valid->getBody());
+            self::assertSame($checksum, $valid->getHeaderLine('x-amz-checksum-crc64nvme'));
+            self::assertSame('FULL_OBJECT', $valid->getHeaderLine('x-amz-checksum-type'));
+
+            $bad = $this->postV4($badKey, 'bad.txt', $body, [
+                'x-amz-checksum-crc64nvme' => 'AAAAAAAAAAA=',
+            ]);
+            self::assertSame(400, $bad->getStatusCode(), (string) $bad->getBody());
+            self::assertStringContainsString('<Code>BadDigest</Code>', (string) $bad->getBody());
+            self::assertSame([], self::$s3->listObjectsV2([
+                'Bucket' => self::$bucket,
+                'Prefix' => $badKey,
+            ])['Contents'] ?? []);
+
+            $redirect = $this->postV4($redirectKey, 'redirect.txt', $body, [
+                'success_action_redirect' => 'https://example.test/completed',
+                'x-amz-checksum-crc64nvme' => $checksum,
+            ]);
+            self::assertSame(303, $redirect->getStatusCode(), (string) $redirect->getBody());
+            self::assertFalse($redirect->hasHeader('x-amz-checksum-crc64nvme'));
+            self::assertFalse($redirect->hasHeader('x-amz-checksum-type'));
+        } finally {
+            foreach ([$validKey, $redirectKey] as $key) {
+                try {
+                    self::$s3->deleteObject(['Bucket' => self::$bucket, 'Key' => $key]);
+                } catch (\Throwable) {
+                }
+            }
+        }
     }
 
     public function test_signed_browser_form_rejects_unsigned_object_headers(): void

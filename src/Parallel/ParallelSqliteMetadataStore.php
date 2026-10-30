@@ -37,6 +37,7 @@ use OpsFour\S3Server\Metadata\LocalMultipartPartSealGuard;
 use OpsFour\S3Server\Metadata\MultipartUploadTierStore;
 use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Metadata\MultipartPartChecksumStore;
+use OpsFour\S3Server\Metadata\Crc64NvmeObjectMetadataStore;
 use OpsFour\S3Server\Metadata\RestoredCopyTierStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -53,7 +54,7 @@ use OpsFour\S3Server\Quota\QuotaConfig;
  * calling Fiber to a dedicated worker via WeakMap<Fiber, Worker>.
  * A TransactionGuard ensures abandoned fibers trigger a rollback.
  */
-final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
+final class ParallelSqliteMetadataStore implements MetadataStore, Crc64NvmeObjectMetadataStore, MetadataWriteReadinessProbe, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, \OpsFour\S3Server\Metadata\LocalMultipartFenceAdmissionStore, \OpsFour\S3Server\Metadata\RecursiveCleanupAdmissionStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, FencedQueueStore, RestoredCopyTierStore, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore
 {
     private readonly WorkerPool $pool;
 
@@ -306,11 +307,12 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): void {
         $this->submit('putObjectMetadata', [
             $bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath,
             $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-            $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256,
+            $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme,
         ]);
     }
 
@@ -565,6 +567,11 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         return true;
     }
 
+    public function supportsCrc64NvmeObjectMetadata(): bool
+    {
+        return true;
+    }
+
     public function putPartWithChecksum(string $uploadId, int $partNumber, string $etag, int $size, string $storagePath, ?string $checksumAlgorithm, ?string $checksumValue): void
     {
         $this->submit('putPartWithChecksum', [$uploadId, $partNumber, $etag, $size, $storagePath, $checksumAlgorithm, $checksumValue]);
@@ -620,11 +627,12 @@ final class ParallelSqliteMetadataStore implements MetadataStore, MetadataWriteR
         ?string $checksumCrc32c = null,
         ?string $checksumSha1 = null,
         ?string $checksumSha256 = null,
+        ?string $checksumCrc64Nvme = null,
     ): string {
         return $this->submit('putObjectVersioned', [
             $bucket, $key, $ownerId, $size, $etag, $contentType, $storagePath,
             $storageClass, $contentEncoding, $contentDisposition, $cacheControl,
-            $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256,
+            $userMetadata, $checksumCrc32, $checksumCrc32c, $checksumSha1, $checksumSha256, $checksumCrc64Nvme,
         ]);
     }
 

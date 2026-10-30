@@ -159,7 +159,8 @@ final class RestoreExecutor
             $tierStore = $this->metadata;
             $sourceSize = 0;
             $sourceMd5 = hash_init('md5');
-            $sourceChecksums = StoredObjectChecksumVerifier::shouldVerify($object) ? new ChecksumCalculator() : null;
+            $sourceChecksums = StoredObjectChecksumVerifier::shouldVerify($object)
+                ? new ChecksumCalculator(isset($object->systemMetadata['checksum-crc64nvme'])) : null;
             $sourceStream = null;
             $writeFailure = null;
             try {

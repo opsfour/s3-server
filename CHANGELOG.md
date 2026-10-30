@@ -6,7 +6,19 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** The package now requires 64-bit PHP (`php-64bit`). Custom
+  `MetadataStore` implementations must accept the nullable CRC64NVME object
+  checksum arguments and implement `Crc64NvmeObjectMetadataStore`; API startup
+  rejects stores that do not attest durable object/version persistence.
+
 ### Added
+
+- Add streaming CRC64NVME request, response, copy, lifecycle, and
+  `FULL_OBJECT` multipart checksum support with nullable SQLite, PostgreSQL,
+  and MySQL metadata migrations. Require 64-bit PHP and preserve legacy null
+  behavior without backfill or provider-checksum dependence.
 
 - Expose bounded PostgreSQL cluster health and takeover progress on the existing
   `/.health` and `/.metrics` endpoints. Cluster health now distinguishes node

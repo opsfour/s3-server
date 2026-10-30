@@ -12,6 +12,7 @@ use OpsFour\S3Server\Acl\BucketOwnership;
 use OpsFour\S3Server\Acl\ObjectWriteOwnershipDecision;
 use OpsFour\S3Server\Checksum\ChecksumCalculator;
 use OpsFour\S3Server\Checksum\ChecksumResult;
+use OpsFour\S3Server\Checksum\StoredCrc64Nvme;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Encryption\EncryptionRequestResolver;
 use OpsFour\S3Server\Encryption\EncryptionService;
@@ -224,7 +225,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 if ($awsReserved !== null) {
                     $this->awsObjectWriter?->heartbeat($awsReserved);
                 }
-                $calculator = new ChecksumCalculator();
+                $calculator = new ChecksumCalculator(
+                    isset($source->systemMetadata['checksum-crc64nvme']),
+                    cooperativeCrc64Nvme: true,
+                );
                 $calculator->update($plaintext);
                 $plaintextChecksums = $calculator->finalize();
                 if ($plaintextChecksums->size !== $source->size) {
@@ -910,7 +914,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     }
 
                     // Recompute integrity values from decrypted plaintext.
-                    $calculator = new ChecksumCalculator();
+                    $calculator = new ChecksumCalculator(
+                        isset($srcObjectInfo->systemMetadata['checksum-crc64nvme']),
+                        cooperativeCrc64Nvme: true,
+                    );
                     $calculator->update($plaintext);
                     $sourcePlaintextChecksums = $calculator->finalize();
                     $etag = '"' . $sourcePlaintextChecksums->md5Hex . '"';
@@ -1022,6 +1029,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         // MetadataDirective only controls user metadata.
         $dstChecksumCrc32 = $srcObjectInfo->systemMetadata['checksum-crc32'] ?? null;
         $dstChecksumCrc32c = $srcObjectInfo->systemMetadata['checksum-crc32c'] ?? null;
+        $dstChecksumCrc64Nvme = $srcObjectInfo->systemMetadata['checksum-crc64nvme'] ?? null;
         $dstChecksumSha1 = $srcObjectInfo->systemMetadata['checksum-sha1'] ?? null;
         $dstChecksumSha256 = $srcObjectInfo->systemMetadata['checksum-sha256'] ?? null;
 
@@ -1050,7 +1058,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                 }
             }
             if ($dstVersioning === 'Enabled') {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumCrc64Nvme, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, &$event, $dstVersioning, &$versionId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire($this->metadata, $ownerId, $dstBucketInfo->ownerId, $srcBucketInfo->ownerId);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $dstBucketInfo, $request);
                     \OpsFour\S3Server\Metadata\BucketGenerationGuard::assertCurrent($this->metadata, $srcBucketInfo);
@@ -1111,6 +1119,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         userMetadata: $userMetadata,
                         checksumCrc32: $dstChecksumCrc32,
                         checksumCrc32c: $dstChecksumCrc32c,
+                        checksumCrc64Nvme: $dstChecksumCrc64Nvme,
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
@@ -1142,7 +1151,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                     $metadataCallbackCompleted = true;
                 });
             } else {
-                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, $observedReplacementOwnerId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
+                $this->metadata->transaction(function () use ($dstBucketInfo, $srcBucketInfo, $srcObjectInfo, $srcVersionId, $dstBucket, $dstKey, $ownerId, $objectOwnerId, $objectSize, $etag, $contentType, $writeResult, $storageClass, $contentEncoding, $contentDisposition, $cacheControl, $userMetadata, &$oldObjectToClean, $dstChecksumCrc32, $dstChecksumCrc32c, $dstChecksumCrc64Nvme, $dstChecksumSha1, $dstChecksumSha256, $ownershipDecision, $tags, $policyRequestTags, $requiresTagPermission, $request, $destinationEncryptionMode, $event, $dstVersioning, $observedReplacementOwnerId, &$metadataCallbackCompleted, $localDispatchToken, $partLayouts) {
                     \OpsFour\S3Server\Metadata\OwnerWriteLock::acquire(
                         $this->metadata,
                         $ownerId,
@@ -1228,6 +1237,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
                         userMetadata: $userMetadata,
                         checksumCrc32: $dstChecksumCrc32,
                         checksumCrc32c: $dstChecksumCrc32c,
+                        checksumCrc64Nvme: $dstChecksumCrc64Nvme,
                         checksumSha1: $dstChecksumSha1,
                         checksumSha256: $dstChecksumSha256,
                     );
@@ -1296,6 +1306,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             $dstChecksumCrc32c,
             $dstChecksumSha1,
             $dstChecksumSha256,
+            $dstChecksumCrc64Nvme === null ? null : StoredCrc64Nvme::requireCanonical($dstChecksumCrc64Nvme),
         );
 
         // 11. Dispatch event notification.
@@ -1384,7 +1395,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             }
 
             if ($sourceEncryptionMode !== null) {
-                $calculator = new ChecksumCalculator();
+                $calculator = new ChecksumCalculator(
+                    isset($source->systemMetadata['checksum-crc64nvme']),
+                    cooperativeCrc64Nvme: true,
+                );
                 $calculator->update($plaintext);
                 $checksums = $calculator->finalize();
             }
@@ -1466,34 +1480,28 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         $expected = [
             'crc32' => $source->systemMetadata['checksum-crc32'] ?? null,
             'crc32c' => $source->systemMetadata['checksum-crc32c'] ?? null,
+            'crc64nvme' => $source->systemMetadata['checksum-crc64nvme'] ?? null,
             'sha1' => $source->systemMetadata['checksum-sha1'] ?? null,
             'sha256' => $source->systemMetadata['checksum-sha256'] ?? null,
         ];
-        if ($expected === ['crc32' => null, 'crc32c' => null, 'sha1' => null, 'sha256' => null]) {
+        if ($expected === ['crc32' => null, 'crc32c' => null, 'crc64nvme' => null, 'sha1' => null, 'sha256' => null]) {
             return;
         }
 
-        $actual = $plaintextChecksums !== null
-            ? [
+        if ($plaintextChecksums !== null) {
+            $actual = [
                 'crc32' => $plaintextChecksums->crc32Base64(),
                 'crc32c' => $plaintextChecksums->crc32cBase64(),
+                'crc64nvme' => $plaintextChecksums->crc64NvmeBase64(),
                 'sha1' => $plaintextChecksums->sha1Base64(),
                 'sha256' => $plaintextChecksums->sha256Base64(),
-            ]
-            : [
-                'crc32' => $write->crc32Base64,
-                'crc32c' => $write->crc32cBase64,
-                'sha1' => $write->sha1Base64,
-                'sha256' => $write->sha256Base64,
             ];
-
-        // Custom storage backends may report only size and MD5. In that case,
-        // hash the bounded destination copy before preserving source metadata.
-        foreach ($expected as $algorithm => $value) {
-            if ($value === null || $actual[$algorithm] !== null) {
-                continue;
-            }
-            $calculator = new ChecksumCalculator();
+        } else {
+            // Backend/provider checksum fields are not integrity authority.
+            $calculator = new ChecksumCalculator(
+                isset($source->systemMetadata['checksum-crc64nvme']),
+                cooperativeCrc64Nvme: true,
+            );
             $stream = new LimitedReadableStream($destinationStorage->getObjectByPath($write->path), $readLimit);
             $streamCancellation = null;
             try {
@@ -1518,10 +1526,10 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             $actual = [
                 'crc32' => $checksums->crc32Base64(),
                 'crc32c' => $checksums->crc32cBase64(),
+                'crc64nvme' => $checksums->crc64NvmeBase64(),
                 'sha1' => $checksums->sha1Base64(),
                 'sha256' => $checksums->sha256Base64(),
             ];
-            break;
         }
 
         foreach ($expected as $algorithm => $value) {
@@ -1535,7 +1543,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         \OpsFour\S3Server\Metadata\ObjectPartLayoutStore $partLayouts,
         ObjectInfo $source,
     ): ?MultipartObjectIntegrityVerifier {
-        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-sha1', 'checksum-sha256'] as $checksum) {
+        foreach (['checksum-crc32', 'checksum-crc32c', 'checksum-crc64nvme', 'checksum-sha1', 'checksum-sha256'] as $checksum) {
             if (isset($source->systemMetadata[$checksum])) {
                 return null;
             }
@@ -1551,7 +1559,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             return null;
         }
 
-        return new MultipartObjectIntegrityVerifier($layout, $source->etag);
+        return new MultipartObjectIntegrityVerifier($layout, $source->etag, cooperativeCrc64Nvme: true);
     }
 
     private function verifyMultipartDestinationCopy(

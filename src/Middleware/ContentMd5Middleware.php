@@ -13,6 +13,10 @@ use OpsFour\S3Server\Exception\InvalidRequestException;
 use OpsFour\S3Server\Http\RequestHeaderValues;
 use OpsFour\S3Server\Http\RequestBody;
 use OpsFour\S3Server\Routing\S3Operation;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
+use OpsFour\S3Server\Checksum\CooperativeCrc64Nvme;
+use OpsFour\S3Server\Checksum\HashIncrementalDigest;
+use OpsFour\S3Server\Checksum\IncrementalDigest;
 
 /** Validates request-body digests before dispatch without buffering in memory. */
 final class ContentMd5Middleware implements Middleware
@@ -82,6 +86,7 @@ final class ContentMd5Middleware implements Middleware
             foreach ([
                 'x-amz-checksum-crc32' => ['crc32b', 4],
                 'x-amz-checksum-crc32c' => ['crc32c', 4],
+                'x-amz-checksum-crc64nvme' => ['crc64nvme', 8],
                 'x-amz-checksum-sha1' => ['sha1', 20],
                 'x-amz-checksum-sha256' => ['sha256', 32],
             ] as $header => [$algorithm, $length]) {
@@ -99,6 +104,7 @@ final class ContentMd5Middleware implements Middleware
                 $declaredHeader = match ($declaredAlgorithm) {
                     'CRC32' => 'x-amz-checksum-crc32',
                     'CRC32C' => 'x-amz-checksum-crc32c',
+                    'CRC64NVME' => 'x-amz-checksum-crc64nvme',
                     'SHA1' => 'x-amz-checksum-sha1',
                     'SHA256' => 'x-amz-checksum-sha256',
                     default => null,
@@ -129,14 +135,19 @@ final class ContentMd5Middleware implements Middleware
         $primaryFailure = null;
 
         try {
+            /** @var array<string, IncrementalDigest> $hashes */
             $hashes = [];
             foreach ($digests as $header => $digest) {
-                $hashes[$header] = hash_init($digest['algorithm']);
+                $hashes[$header] = $digest['algorithm'] === 'crc64nvme'
+                    ? new Crc64NvmeDigest()
+                    : new HashIncrementalDigest($digest['algorithm']);
             }
 
             while (($chunk = $request->getBody()->read()) !== null) {
                 foreach ($hashes as $hash) {
-                    hash_update($hash, $chunk);
+                    $hash instanceof Crc64NvmeDigest
+                        ? CooperativeCrc64Nvme::update($hash, $chunk)
+                        : $hash->update($chunk);
                 }
                 $this->spool->append($tempPath, $chunk);
             }
@@ -146,7 +157,7 @@ final class ContentMd5Middleware implements Middleware
             }
 
             foreach ($hashes as $header => $hash) {
-                $computed = hash_final($hash, binary: true);
+                $computed = $hash->finalize();
                 if (! hash_equals($digests[$header]['expected'], $computed)) {
                     if ($header === 'Content-MD5') {
                         throw new BadDigestException(
@@ -196,7 +207,8 @@ final class ContentMd5Middleware implements Middleware
     private static function decodeDigest(string $value, string $algorithm, int $length, string $header): array
     {
         $expected = base64_decode($value, strict: true);
-        if ($expected === false || strlen($expected) !== $length) {
+        if ($expected === false || strlen($expected) !== $length
+            || ($algorithm === 'crc64nvme' && base64_encode($expected) !== $value)) {
             if ($header === 'Content-MD5') {
                 throw new BadDigestException('Content-MD5 must be a Base64-encoded 128-bit MD5 digest.');
             }
@@ -214,6 +226,7 @@ final class ContentMd5Middleware implements Middleware
         $expectedHeader = match ($declaredAlgorithm) {
             'CRC32' => 'x-amz-checksum-crc32',
             'CRC32C' => 'x-amz-checksum-crc32c',
+            'CRC64NVME' => 'x-amz-checksum-crc64nvme',
             'SHA1' => 'x-amz-checksum-sha1',
             'SHA256' => 'x-amz-checksum-sha256',
             default => null,
@@ -235,6 +248,7 @@ final class ContentMd5Middleware implements Middleware
         $expectedHeader = match ($declaredAlgorithm) {
             'CRC32' => 'x-amz-checksum-crc32',
             'CRC32C' => 'x-amz-checksum-crc32c',
+            'CRC64NVME' => 'x-amz-checksum-crc64nvme',
             'SHA1' => 'x-amz-checksum-sha1',
             'SHA256' => 'x-amz-checksum-sha256',
             default => null,

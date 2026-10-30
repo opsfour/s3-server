@@ -16,6 +16,8 @@ use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\PagedMultipartPartsStore;
 use OpsFour\S3Server\Multipart\MultipartDestinationOwnershipSnapshot;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
+use OpsFour\S3Server\Checksum\StoredCrc64Nvme;
+use OpsFour\S3Server\Exception\InternalErrorException;
 
 final class ListPartsHandler implements RequestHandler
 {
@@ -84,14 +86,31 @@ final class ListPartsHandler implements RequestHandler
             $nextPartNumberMarker = $parts[count($parts) - 1]['part_number'];
         }
 
-        $xmlParts = array_map(fn($p) => [
-            'partNumber' => $p['part_number'],
-            'lastModified' => rtrim(str_replace(' ', 'T', $p['created_at']), 'Z') . 'Z',
-            'etag' => $p['etag'],
-            'size' => $p['size'],
-            'checksumAlgorithm' => $p['checksum_algorithm'] ?? null,
-            'checksumValue' => $p['checksum_value'] ?? null,
-        ], $parts);
+        $checksumContract = MultipartChecksumContract::fromStored($upload['user_metadata']);
+        $xmlParts = array_map(function (array $part) use ($checksumContract): array {
+            $algorithm = $part['checksum_algorithm'] ?? null;
+            $value = $part['checksum_value'] ?? null;
+            if ($checksumContract !== null && ($algorithm !== $checksumContract->algorithm || ! is_string($value))) {
+                throw new InternalErrorException('Stored CRC64NVME multipart part checksum is incomplete.');
+            }
+            if (is_string($algorithm) && strtolower($algorithm) === 'crc64nvme') {
+                if ($algorithm !== 'crc64nvme' || ! is_string($value)) {
+                    throw new InternalErrorException('Stored CRC64NVME multipart part checksum is incomplete.');
+                }
+                $value = StoredCrc64Nvme::requireCanonical($value);
+            } elseif ($value !== null && $algorithm === null) {
+                throw new InternalErrorException('Stored multipart part checksum is incomplete.');
+            }
+
+            return [
+                'partNumber' => $part['part_number'],
+                'lastModified' => rtrim(str_replace(' ', 'T', $part['created_at']), 'Z') . 'Z',
+                'etag' => $part['etag'],
+                'size' => $part['size'],
+                'checksumAlgorithm' => $algorithm,
+                'checksumValue' => $value,
+            ];
+        }, $parts);
         $ownershipSnapshot = MultipartDestinationOwnershipSnapshot::decode($upload['user_metadata']);
         if ($ownershipSnapshot !== null) {
             $ownershipSnapshot->assertConsistent($upload['owner_id'], $bucketInfo->ownerId);
@@ -112,6 +131,8 @@ final class ListPartsHandler implements RequestHandler
             'initiatorId' => $upload['owner_id'],
             'ownerId' => $listedOwnerId,
             'storageClass' => $upload['user_metadata']['__mpu-storage-class'] ?? 'STANDARD',
+            'checksumAlgorithm' => $checksumContract === null ? null : 'CRC64NVME',
+            'checksumType' => $checksumContract?->type,
             'parts' => $xmlParts,
         ]);
 

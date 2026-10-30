@@ -21,12 +21,14 @@ use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Lifecycle\LifecycleRunner;
 use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
+use OpsFour\S3Server\Metadata\Crc64NvmeObjectMetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Runtime\ClusterMembershipStore;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\NodeDrainController;
 use OpsFour\S3Server\Runtime\S3ServerRuntime;
+use OpsFour\S3Server\Runtime\RuntimePlatform;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -43,6 +45,13 @@ use Revolt\EventLoop;
 
 final class S3ServerLifecycleTest extends TestCase
 {
+    public function test_runtime_admission_rejects_non_64_bit_php_before_startup(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('requires 64-bit PHP');
+        RuntimePlatform::assertSupported(4);
+    }
+
     public function test_node_temp_process_leases_close_only_after_shutdown_reaches_owned_resources(): void
     {
         $base = sys_get_temp_dir() . '/s3-server-temp-shutdown-' . bin2hex(random_bytes(8));
@@ -220,6 +229,49 @@ final class S3ServerLifecycleTest extends TestCase
             self::fail('Startup must reject metadata without authoritative object part layouts.');
         } catch (\LogicException $error) {
             self::assertSame('Metadata store does not support authoritative object part layouts.', $error->getMessage());
+        } finally {
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+            self::assertFalse($this->canConnect($port));
+            $server->stop();
+            @unlink($root . '/.opsfour/runtime.lock');
+            @rmdir($root . '/.opsfour');
+            @rmdir($root);
+        }
+    }
+
+    #[DataProvider('objectPartLayoutCapabilityStates')]
+    public function test_start_rejects_missing_crc64_metadata_capability_before_listener_binding(bool $disabled): void
+    {
+        $interfaces = [MetadataStore::class, ObjectPartLayoutStore::class];
+        if ($disabled) {
+            $interfaces[] = Crc64NvmeObjectMetadataStore::class;
+        }
+        $metadata = $this->createMockForIntersectionOfInterfaces($interfaces);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        self::assertInstanceOf(ObjectPartLayoutStore::class, $metadata);
+        $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+        if ($disabled) {
+            self::assertInstanceOf(Crc64NvmeObjectMetadataStore::class, $metadata);
+            $metadata->method('supportsCrc64NvmeObjectMetadata')->willReturn(false);
+        }
+        $root = sys_get_temp_dir() . '/s3-crc64-capability-start-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($root, 0700));
+        $port = $this->unusedPort();
+        $server = new S3Server(
+            new S3ServerConfig(host: '127.0.0.1', port: $port, storagePath: $root, perClientRateLimit: 0),
+            $metadata,
+            new FilesystemBackend($root),
+        );
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('Startup must reject metadata without durable CRC64NVME object metadata.');
+        } catch (\LogicException $error) {
+            self::assertSame('Metadata store does not support durable CRC64NVME object metadata.', $error->getMessage());
         } finally {
             self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
             self::assertFalse($this->canConnect($port));
@@ -1199,13 +1251,19 @@ final class S3ServerLifecycleTest extends TestCase
         return true;
     }
 
-    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&Crc64NvmeObjectMetadataStore&MockObject
     {
-        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
-        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            ObjectPartLayoutStore::class,
+            Crc64NvmeObjectMetadataStore::class,
+        ]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore
+            || ! $metadata instanceof Crc64NvmeObjectMetadataStore) {
             throw new \LogicException('Intersection mock is missing a requested interface.');
         }
         $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+        $metadata->method('supportsCrc64NvmeObjectMetadata')->willReturn(true);
 
         return $metadata;
     }

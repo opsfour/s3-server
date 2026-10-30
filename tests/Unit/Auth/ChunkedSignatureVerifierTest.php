@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Unit\Auth;
 
 use Amp\ByteStream\ReadableBuffer;
 use OpsFour\S3Server\Auth\ChunkedSignatureVerifier;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -88,6 +89,75 @@ final class ChunkedSignatureVerifierTest extends TestCase
         \Amp\ByteStream\buffer($stream);
     }
 
+    public function test_verifies_signed_crc64nvme_trailer(): void
+    {
+        $key = random_bytes(32);
+        $timestamp = '20260723T120000Z';
+        $scope = '20260723/eu-central-1/s3/aws4_request';
+        $seed = str_repeat('d', 64);
+        $payload = 'signed CRC64NVME payload';
+        $digest = new Crc64NvmeDigest();
+        $digest->update($payload);
+        [$body, $checksum] = $this->signedBody(
+            $payload,
+            $key,
+            $timestamp,
+            $scope,
+            $seed,
+            $digest->finalizeBase64(),
+            'x-amz-checksum-crc64nvme',
+        );
+        $body = str_replace(
+            "x-amz-checksum-crc64nvme:{$checksum}\r\n",
+            "x-amz-checksum-crc64nvme: {$checksum}\t\r\n",
+            $body,
+        );
+        $trailers = [];
+
+        $stream = (new ChunkedSignatureVerifier())->createVerifiedStream(
+            new ReadableBuffer($body),
+            $key,
+            $timestamp,
+            $scope,
+            $seed,
+            ['x-amz-checksum-crc64nvme'],
+            static function (array $values) use (&$trailers): void {
+                $trailers = $values;
+            },
+        );
+
+        self::assertSame($payload, \Amp\ByteStream\buffer($stream));
+        self::assertSame(['x-amz-checksum-crc64nvme' => $checksum], $trailers);
+    }
+
+    public function test_rejects_signed_crc64nvme_trailer_with_embedded_whitespace(): void
+    {
+        $key = random_bytes(32);
+        $timestamp = '20260723T120000Z';
+        $scope = '20260723/eu-central-1/s3/aws4_request';
+        $seed = str_repeat('e', 64);
+        [$body] = $this->signedBody(
+            'payload',
+            $key,
+            $timestamp,
+            $scope,
+            $seed,
+            'AAAA AAAAAAA=',
+            'x-amz-checksum-crc64nvme',
+        );
+        $stream = (new ChunkedSignatureVerifier())->createVerifiedStream(
+            new ReadableBuffer($body),
+            $key,
+            $timestamp,
+            $scope,
+            $seed,
+            ['x-amz-checksum-crc64nvme'],
+        );
+
+        $this->expectException(BadDigestException::class);
+        \Amp\ByteStream\buffer($stream);
+    }
+
     /**
      * @return array{string, string}
      */
@@ -98,11 +168,12 @@ final class ChunkedSignatureVerifierTest extends TestCase
         string $scope,
         string $seed,
         ?string $checksum = null,
+        string $checksumHeader = 'x-amz-checksum-sha256',
     ): array {
         $dataSignature = $this->chunkSignature($payload, $key, $timestamp, $scope, $seed);
         $finalSignature = $this->chunkSignature('', $key, $timestamp, $scope, $dataSignature);
         $checksum ??= base64_encode(hash('sha256', $payload, true));
-        $canonical = "x-amz-checksum-sha256:{$checksum}\n";
+        $canonical = "{$checksumHeader}:{$checksum}\n";
         $trailerStringToSign = implode("\n", [
             'AWS4-HMAC-SHA256-TRAILER',
             $timestamp,
@@ -116,7 +187,7 @@ final class ChunkedSignatureVerifierTest extends TestCase
             dechex(strlen($payload)) . ";chunk-signature={$dataSignature}\r\n"
             . $payload . "\r\n"
             . "0;chunk-signature={$finalSignature}\r\n"
-            . "x-amz-checksum-sha256:{$checksum}\r\n"
+            . "{$checksumHeader}:{$checksum}\r\n"
             . "x-amz-trailer-signature:{$trailerSignature}\r\n\r\n",
             $checksum,
         ];

@@ -26,6 +26,7 @@ use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -33,6 +34,12 @@ use Psr\Log\AbstractLogger;
 
 final class TierTransitionExecutorTest extends TestCase
 {
+    /** @return iterable<string, array{'sha256'|'crc64nvme'}> */
+    public static function persistedChecksumAlgorithms(): iterable
+    {
+        yield 'SHA256' => ['sha256'];
+        yield 'CRC64NVME' => ['crc64nvme'];
+    }
     public function test_takeover_retry_records_failed_takeover_outcome(): void
     {
         $this->metadata->enqueueTierTransitionJob('bucket', 'key', null, 'STANDARD', 'GLACIER', 'GLACIER', 'source');
@@ -946,7 +953,8 @@ final class TierTransitionExecutorTest extends TestCase
         self::assertNotNull($object->transitionError);
     }
 
-    public function test_rejects_corrupt_multipart_source_using_persisted_checksum(): void
+    #[DataProvider('persistedChecksumAlgorithms')]
+    public function test_rejects_corrupt_multipart_source_using_persisted_checksum(string $algorithm): void
     {
         $hot = new InMemoryBackend();
         $archive = new InMemoryBackend();
@@ -962,7 +970,8 @@ final class TierTransitionExecutorTest extends TestCase
             etag: '"0123456789abcdef0123456789abcdef-2"',
             contentType: 'application/octet-stream',
             storagePath: $source->path,
-            checksumSha256: base64_encode(hash('sha256', 'good-data', true)),
+            checksumSha256: $algorithm === 'sha256' ? base64_encode(hash('sha256', 'good-data', true)) : null,
+            checksumCrc64Nvme: $algorithm === 'crc64nvme' ? self::crc64Nvme('good-data') : null,
         );
         $jobId = $this->metadata->enqueueTierTransitionJob(
             bucket: 'bucket',
@@ -1543,5 +1552,13 @@ final class TierTransitionExecutorTest extends TestCase
 
         $this->expectException(\Amp\CancelledException::class);
         $executor->processNext(10, $cancellation->getCancellation());
+    }
+
+    private static function crc64Nvme(string $bytes): string
+    {
+        $digest = new Crc64NvmeDigest();
+        $digest->update($bytes);
+
+        return $digest->finalizeBase64();
     }
 }

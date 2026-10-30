@@ -33,12 +33,17 @@ final class ChecksumCalculator
 
     private bool $finalized = false;
 
-    public function __construct()
-    {
+    private ?Crc64NvmeDigest $crc64Nvme;
+
+    public function __construct(
+        bool $captureCrc64Nvme = false,
+        private readonly bool $cooperativeCrc64Nvme = false,
+    ) {
         $this->md5Context = hash_init('md5');
         $this->sha256Context = hash_init('sha256');
         $this->crc32Context = hash_init('crc32b');
         $this->sha1Context = hash_init('sha1');
+        $this->crc64Nvme = $captureCrc64Nvme ? new Crc64NvmeDigest() : null;
     }
 
     /**
@@ -59,6 +64,11 @@ final class ChecksumCalculator
         hash_update($this->crc32Context, $data);
         hash_update($this->sha1Context, $data);
         $this->crc32cValue = self::crc32cUpdate($this->crc32cValue, $data);
+        if ($this->crc64Nvme !== null) {
+            $this->cooperativeCrc64Nvme
+                ? CooperativeCrc64Nvme::update($this->crc64Nvme, $data)
+                : $this->crc64Nvme->update($data);
+        }
         $this->size += strlen($data);
     }
 
@@ -84,6 +94,7 @@ final class ChecksumCalculator
         $sha256Hex = hash_final($this->sha256Context);
         $crc32Hex = hash_final($this->crc32Context);
         $sha1Hex = hash_final($this->sha1Context);
+        $crc64NvmeBase64 = $this->crc64Nvme?->finalizeBase64();
 
         // CRC32C: convert integer to 4-byte big-endian hex
         $crc32cHex = str_pad(dechex($this->crc32cValue & 0xFFFFFFFF), 8, '0', STR_PAD_LEFT);
@@ -95,6 +106,7 @@ final class ChecksumCalculator
             crc32cHex: $crc32cHex,
             sha1Hex: $sha1Hex,
             size: $this->size,
+            crc64NvmeBase64: $crc64NvmeBase64,
         );
     }
 

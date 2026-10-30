@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Handler\Multipart;
 
 use Amp\Http\Server\Request;
 use OpsFour\S3Server\Checksum\ChecksumResult;
+use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Exception\BadDigestException;
 use OpsFour\S3Server\Exception\IncompleteBodyException;
 use OpsFour\S3Server\Exception\InternalErrorException;
@@ -24,6 +25,7 @@ final class MultipartPartLogicalValidator
         $supportedHeaders = [
             'x-amz-checksum-crc32',
             'x-amz-checksum-crc32c',
+            'x-amz-checksum-crc64nvme',
             'x-amz-checksum-sha1',
             'x-amz-checksum-sha256',
         ];
@@ -41,6 +43,7 @@ final class MultipartPartLogicalValidator
         $checksums = array_filter([
             'crc32' => $request->getHeader('x-amz-checksum-crc32'),
             'crc32c' => $request->getHeader('x-amz-checksum-crc32c'),
+            'crc64nvme' => $request->getHeader('x-amz-checksum-crc64nvme'),
             'sha1' => $request->getHeader('x-amz-checksum-sha1'),
             'sha256' => $request->getHeader('x-amz-checksum-sha256'),
         ], static fn(?string $value): bool => $value !== null);
@@ -53,10 +56,12 @@ final class MultipartPartLogicalValidator
             $decoded = base64_decode($value, strict: true);
             $expectedLength = match ($algorithm) {
                 'crc32', 'crc32c' => 4,
+                'crc64nvme' => 8,
                 'sha1' => 20,
                 'sha256' => 32,
             };
-            if ($decoded === false || strlen($decoded) !== $expectedLength) {
+            if ($decoded === false || strlen($decoded) !== $expectedLength
+                || ($algorithm === 'crc64nvme' && base64_encode($decoded) !== $value)) {
                 throw new BadDigestException('Multipart part checksum is not a valid Base64-encoded digest.');
             }
         }
@@ -143,6 +148,7 @@ final class MultipartPartLogicalValidator
         return match (strtoupper($algorithm)) {
             'CRC32' => 'crc32',
             'CRC32C' => 'crc32c',
+            'CRC64NVME' => 'crc64nvme',
             'SHA1' => 'sha1',
             'SHA256' => 'sha256',
             default => throw new InvalidRequestException('Unsupported multipart checksum algorithm.'),
@@ -162,6 +168,7 @@ final class MultipartPartLogicalValidator
         return match ($header) {
             'x-amz-checksum-crc32' => 'crc32',
             'x-amz-checksum-crc32c' => 'crc32c',
+            'x-amz-checksum-crc64nvme' => 'crc64nvme',
             'x-amz-checksum-sha1' => 'sha1',
             'x-amz-checksum-sha256' => 'sha256',
             default => throw new InvalidRequestException('Unsupported multipart checksum trailer.'),
@@ -199,6 +206,7 @@ final class MultipartPartLogicalValidator
             return match ($algorithm) {
                 'crc32' => $logical->crc32Base64(),
                 'crc32c' => $logical->crc32cBase64(),
+                'crc64nvme' => $logical->crc64NvmeBase64(),
                 'sha1' => $logical->sha1Base64(),
                 'sha256' => $logical->sha256Base64(),
                 default => null,
@@ -208,6 +216,7 @@ final class MultipartPartLogicalValidator
         return match ($algorithm) {
             'crc32' => $logical->crc32Base64,
             'crc32c' => $logical->crc32cBase64,
+            'crc64nvme' => $logical->crc64NvmeBase64,
             'sha1' => $logical->sha1Base64,
             'sha256' => $logical->sha256Base64,
             default => null,
@@ -244,6 +253,7 @@ final class MultipartPartLogicalValidator
             $checksums->crc32cBase64(),
             $checksums->sha1Base64(),
             $checksums->sha256Base64(),
+            $checksums->crc64NvmeBase64(),
         );
     }
 
