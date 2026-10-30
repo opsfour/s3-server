@@ -27,6 +27,8 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
 
     private bool $operationalAttachmentCommitted = false;
 
+    private ?AwsS3ReadExecutor $readExecutor = null;
+
     public function __construct(
         private AwsS3ProviderAdmission $admission,
         private ?AwsS3ProviderValidatedBinding $binding = null,
@@ -99,6 +101,7 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         $this->operationalState = null;
         $this->operationalTier = null;
         $this->operationalAttachmentCommitted = false;
+        $this->readExecutor = null;
         $this->admission = $this->admission->withQualification(false);
     }
 
@@ -110,6 +113,23 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
     public function operationalAttachmentCommitted(): bool
     {
         return $this->operationalAttachmentCommitted;
+    }
+
+    public function attachReadExecutor(AwsS3ReadExecutor $executor): void
+    {
+        if ($this->readExecutor !== null) {
+            throw new \LogicException('AWS payload read executor is already attached.');
+        }
+        if ($this->binding === null || ! $this->admission->providerAdmitted) {
+            throw $this->unavailable();
+        }
+        $this->readExecutor = $executor;
+    }
+
+    public function usesReadPool(\Amp\Parallel\Worker\WorkerPool $pool): bool
+    {
+        return $this->readExecutor instanceof ParallelAwsS3ReadExecutor
+            && $this->readExecutor->usesPool($pool);
     }
 
     public function clusterStorageIdentity(): string
@@ -256,11 +276,10 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         }
         $state->assertRecoveryReady();
         $profile = $this->binding?->profile;
-        $client = $this->binding?->client;
-        if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
+        $executor = $this->readExecutor;
+        if ($profile === null || $executor === null || ! $this->admission->providerAdmitted) {
             throw $this->unavailable();
         }
-        $body = null;
         try {
             $lastSeparator = strrpos($path, '/');
             $attemptId = substr($path, $lastSeparator === false ? 0 : $lastSeparator + 1);
@@ -273,57 +292,28 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 $attemptId,
                 $profile->reservedPrefix,
             );
-            $request = [
-                'Bucket' => $profile->bucket,
-                'Key' => $path,
-                'ExpectedBucketOwner' => $profile->expectedOwnerId,
-                '@retries' => 0,
-                '@http' => ['stream' => true],
-            ];
-            $expectedLength = $source->size;
-            $expectedContentRange = null;
-            $expectedStatusCode = 200;
             if ($offset !== null || $length !== null) {
                 if ($offset === null || $length === null || $offset < 0 || $length < 1
                     || $offset > PHP_INT_MAX - $length || $offset >= $source->size
                     || $offset + $length > $source->size) {
                     throw new \InvalidArgumentException('Invalid AWS committed-object range.');
                 }
-                $request['Range'] = 'bytes=' . $offset . '-' . ($offset + $length - 1);
-                $expectedLength = $length;
-                $expectedContentRange = 'bytes ' . $offset . '-' . ($offset + $length - 1) . '/' . $source->size;
-                $expectedStatusCode = 206;
             }
-            $result = $client->getObject($request);
-            $body = $result->get('Body');
-            $responseLength = $result->get('ContentLength');
-            $contentRange = $result->get('ContentRange');
-            $markers = $result->get('Metadata');
-            $responseMetadata = $result->get('@metadata');
-            $statusCode = is_array($responseMetadata) ? ($responseMetadata['statusCode'] ?? null) : null;
-            if (! $body instanceof StreamInterface || ! is_int($responseLength) || $responseLength !== $expectedLength
-                || $statusCode !== $expectedStatusCode
-                || ($expectedContentRange === null ? $contentRange !== null : $contentRange !== $expectedContentRange)
-                || ! is_array($markers)
-                || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
-                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId
-                || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $source->ownerId)
-                || ($markers['opsfour-content-size'] ?? null) !== (string) $source->size) {
-                throw new \RuntimeException('Unverified AWS committed-object response.');
-            }
-            return new LimitedReadableStream(
-                new AwsS3CopySourceStream($body),
-                $expectedLength,
-                requireExactLength: true,
-                rejectExcess: true,
+            return $executor->readCommittedObject(
+                $profile,
+                $bucket,
+                $source,
+                $key,
+                $path,
+                $storageTier,
+                $offset,
+                $length,
             );
         } catch (\Amp\CancelledException $error) {
             throw $error;
+        } catch (\OpsFour\S3Server\Exception\SlowDownException $error) {
+            throw $error;
         } catch (\Throwable) {
-            try {
-                $body?->close();
-            } catch (\Throwable) {
-            }
             throw new InternalErrorException('AWS committed object could not be verified.');
         }
     }
@@ -353,13 +343,18 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         int $expectedSize,
         int $maximumSize,
     ): ReadableStream {
-        $this->operationalState?->assertRecoveryReady();
-        $profile = $this->binding?->profile;
-        $client = $this->binding?->client;
-        if ($profile === null || $client === null || ! $this->admission->providerAdmitted) {
+        $state = $this->operationalState;
+        if ($state === null || ! $this->operationalAttachmentCommitted) {
             throw $this->unavailable();
         }
-        $body = null;
+        $state->assertRecoveryReady();
+        $profile = $this->binding?->profile;
+        $executor = $this->readExecutor;
+        if ($profile === null || $executor === null || ! $this->admission->providerAdmitted
+            || $logicalScope === '' || $expectedOwnerId === '' || $storageTier === ''
+            || $expectedSize < 0 || $maximumSize < $expectedSize) {
+            throw $this->unavailable();
+        }
         try {
             $lastSeparator = strrpos($path, '/');
             $attemptId = substr($path, $lastSeparator === false ? 0 : $lastSeparator + 1);
@@ -372,38 +367,21 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
                 $attemptId,
                 $profile->reservedPrefix,
             );
-            $result = $client->getObject([
-                'Bucket' => $profile->bucket,
-                'Key' => $path,
-                'ExpectedBucketOwner' => $profile->expectedOwnerId,
-                '@retries' => 0,
-            ]);
-            $body = $result->get('Body');
-            $length = $result->get('ContentLength');
-            $markers = $result->get('Metadata');
-            if (! $body instanceof StreamInterface || ! is_int($length)
-                || $length < $expectedSize || $length > $maximumSize
-                || ! is_array($markers)
-                || ($markers['opsfour-write-attempt'] ?? null) !== 'v2'
-                || ($markers['opsfour-attempt-id'] ?? null) !== $attemptId
-                || ($markers['opsfour-owner-digest'] ?? null) !== hash('sha256', $expectedOwnerId)
-                || ($markers['opsfour-content-size'] ?? null) !== (string) $length) {
-                throw new \RuntimeException('Unverified AWS multipart part response.');
-            }
-
-            return new LimitedReadableStream(
-                new AwsS3CopySourceStream($body),
-                $length,
-                requireExactLength: true,
-                rejectExcess: true,
+            return $executor->readMultipartPart(
+                $profile,
+                $bucket,
+                $logicalScope,
+                $path,
+                $storageTier,
+                $expectedOwnerId,
+                $expectedSize,
+                $maximumSize,
             );
         } catch (\Amp\CancelledException $error) {
             throw $error;
+        } catch (\OpsFour\S3Server\Exception\SlowDownException $error) {
+            throw $error;
         } catch (\Throwable) {
-            try {
-                $body?->close();
-            } catch (\Throwable) {
-            }
             throw new InternalErrorException('AWS multipart part could not be verified.');
         }
     }

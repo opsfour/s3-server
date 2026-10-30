@@ -84,6 +84,10 @@ shared storage, and `memory` belong to experimental or test-only profiles until 
 | `S3_AWS_CONNECT_TIMEOUT_SECONDS` | `5` | Per-request AWS admission connection timeout, constrained to 1–30 seconds. |
 | `S3_AWS_READ_TIMEOUT_SECONDS` | `15` | Per-request AWS admission read timeout, constrained to 1–120 seconds and no longer than the request timeout. |
 | `S3_AWS_REQUEST_TIMEOUT_SECONDS` | `20` | Timeout applied independently to each admission request (HeadBucket and GetBucketVersioning), not to the whole admission sequence; constrained to 1–120 seconds and no shorter than connect/read timeouts. |
+| `S3_AWS_READ_WORKERS` | `2` | Dedicated process workers for qualified AWS committed-object and multipart-part payload reads; constrained to 1–64. |
+| `S3_AWS_READ_WAITERS` | `2` | Maximum queued qualified AWS payload reads per process; excess admission returns `SlowDown`. |
+| `S3_AWS_READ_ADMISSION_TIMEOUT_SECONDS` | `5` | Maximum wait for a dedicated AWS payload-read slot before `SlowDown`; constrained to 1–300 seconds. |
+| `S3_AWS_READ_FIRST_BYTE_TIMEOUT_SECONDS` | `20` | Maximum time to reconstruct the worker client, verify provider evidence, and prime the first chunk before response headers; constrained to 1–300 seconds. |
 | `S3_STORAGE_PATH` | - | Root directory for object data (required for `filesystem`) |
 | `S3_REQUEST_BODY_SPOOL_WORKERS` | `8` | Process workers for checksum validation, request-body replay, and host-wide temporary-budget accounting |
 | `S3_LOCAL_WRITE_WORKER_TIMEOUT_SECONDS` | `300` | Maximum seconds to await a dispatched local PutObject or multipart-part filesystem worker; a timeout returns an uncertain write while the durable intent remains available for recovery |

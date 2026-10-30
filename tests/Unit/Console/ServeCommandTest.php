@@ -71,6 +71,10 @@ final class ServeCommandTest extends TestCase
             '--encryption-workers' => '4',
             '--select-workers' => '6',
             '--request-body-spool-workers' => '5',
+            '--aws-read-workers' => '7',
+            '--aws-read-waiters' => '8',
+            '--aws-read-admission-timeout' => '9',
+            '--aws-read-first-byte-timeout' => '10',
             '--encryption-threshold' => '8192',
             '--metrics-bearer-token' => 'metrics-secret',
             '--shutdown-readiness-delay' => '17',
@@ -93,9 +97,45 @@ final class ServeCommandTest extends TestCase
         self::assertSame(4, $config->encryptionWorkerPoolSize);
         self::assertSame(6, $config->selectWorkerPoolSize);
         self::assertSame(5, $config->requestBodySpoolWorkerPoolSize);
+        self::assertSame(7, $config->awsReadWorkerPoolSize);
+        self::assertSame(8, $config->awsReadWaiterLimit);
+        self::assertSame(9, $config->awsReadAdmissionTimeoutSeconds);
+        self::assertSame(10, $config->awsReadFirstByteTimeoutSeconds);
         self::assertSame(8192, $config->encryptionParallelThreshold);
         self::assertSame('metrics-secret', $config->metricsBearerToken);
         self::assertSame(17, $config->shutdownReadinessDelay);
+    }
+
+    public function test_aws_read_environment_options_forward_distinct_values(): void
+    {
+        $values = [
+            'S3_AWS_READ_WORKERS' => '11',
+            'S3_AWS_READ_WAITERS' => '12',
+            'S3_AWS_READ_ADMISSION_TIMEOUT_SECONDS' => '13',
+            'S3_AWS_READ_FIRST_BYTE_TIMEOUT_SECONDS' => '14',
+        ];
+        $originals = [];
+        foreach ($values as $name => $value) {
+            $originals[$name] = getenv($name);
+            putenv("{$name}={$value}");
+        }
+
+        try {
+            $command = new ServeCommand();
+            $config = $this->invoke($command, 'configFromInput', [
+                $this->input($command, ['--storage-temp-dir' => $this->tempDir]),
+                null,
+            ]);
+
+            self::assertSame(11, $config->awsReadWorkerPoolSize);
+            self::assertSame(12, $config->awsReadWaiterLimit);
+            self::assertSame(13, $config->awsReadAdmissionTimeoutSeconds);
+            self::assertSame(14, $config->awsReadFirstByteTimeoutSeconds);
+        } finally {
+            foreach ($originals as $name => $original) {
+                putenv($original === false ? $name : "{$name}={$original}");
+            }
+        }
     }
 
     public function test_cluster_identity_options_are_forwarded_without_blank_normalization(): void
@@ -540,6 +580,10 @@ final class ServeCommandTest extends TestCase
             'S3_SHUTDOWN_DRAIN_TIMEOUT' => 'shutdown-drain-timeout',
             'S3_SHUTDOWN_READINESS_DELAY' => 'shutdown-readiness-delay',
             'S3_REQUEST_BODY_SPOOL_WORKERS' => 'request-body-spool-workers',
+            'S3_AWS_READ_WORKERS' => 'aws-read-workers',
+            'S3_AWS_READ_WAITERS' => 'aws-read-waiters',
+            'S3_AWS_READ_ADMISSION_TIMEOUT_SECONDS' => 'aws-read-admission-timeout',
+            'S3_AWS_READ_FIRST_BYTE_TIMEOUT_SECONDS' => 'aws-read-first-byte-timeout',
             'S3_SQLITE_WORKERS' => 'sqlite-workers',
             'S3_ENCRYPTION_WORKERS' => 'encryption-workers',
             'S3_SELECT_WORKERS' => 'select-workers',

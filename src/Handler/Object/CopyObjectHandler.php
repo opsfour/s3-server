@@ -162,6 +162,7 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         $awsReserved = null;
         $stageCapacity = null;
         $publicationCapacity = null;
+        $streamingChecksums = null;
         try {
             $requiresBufferedTransform = $sourceEncryptionMode !== null || $destinationEncryptionMode !== null;
             if ($requiresBufferedTransform && $source->size > $this->maxEncryptedObjectSize) {
@@ -281,6 +282,13 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             } else {
                 $readLimit = $source->size < PHP_INT_MAX ? $source->size + 1 : PHP_INT_MAX;
                 $body = new LimitedReadableStream($this->copySourceStream($sourceStorage, $sourceBucketInfo, $source, $sourceKey, $sourcePath, $awsReserved), $readLimit);
+                if ($awsReserved !== null) {
+                    $streamingChecksums = new ChecksumCalculator(
+                        isset($source->systemMetadata['checksum-crc64nvme']),
+                        cooperativeCrc64Nvme: true,
+                    );
+                    $body = new TeeReadableStream($body, $streamingChecksums->update(...));
+                }
                 if ($multipartVerifier !== null) {
                     $body = new TeeReadableStream($body, $multipartVerifier->update(...));
                 }
@@ -292,6 +300,9 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
             if ($awsReserved !== null) {
                 $awsStage = $this->awsObjectWriter?->stage($awsReserved, $body, $knownPhysicalSize, $stageCapacity)
                     ?? throw new \LogicException('AWS copy writer disappeared.');
+                if ($streamingChecksums !== null) {
+                    $plaintextChecksums = $streamingChecksums->finalize();
+                }
                 $write = $awsStage->result;
                 if ($expectedPhysicalPayload !== null && (
                     $write->size !== strlen($expectedPhysicalPayload)
@@ -439,20 +450,18 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
         string $path,
         ?AwsS3ForegroundObjectReservation $reservation = null,
     ): \Amp\ByteStream\ReadableStream {
-        if ($reservation !== null) {
-            $this->awsObjectWriter?->heartbeat($reservation);
-        }
         $backend = $storage;
         while ($backend instanceof ObservedStorageBackend) {
             $backend = $backend->innerBackend();
         }
-        if ($backend instanceof AwsS3StorageBackend) {
-            $stream = $backend->readCopySource($bucket, $source, $key, $path);
-        } else {
-            $stream = $storage->getObjectByPath($path);
-        }
+        $acquire = static fn(): \Amp\ByteStream\ReadableStream => $backend instanceof AwsS3StorageBackend
+            ? $backend->readCopySource($bucket, $source, $key, $path)
+            : $storage->getObjectByPath($path);
+        $stream = $reservation === null
+            ? $acquire()
+            : ($this->awsObjectWriter?->transform($reservation, $acquire)
+                ?? throw new \LogicException('AWS copy writer disappeared.'));
         if ($reservation !== null) {
-            $this->awsObjectWriter?->heartbeat($reservation);
             return $this->awsObjectWriter?->renewingStream($reservation, $stream)
                 ?? throw new \LogicException('AWS copy writer disappeared.');
         }

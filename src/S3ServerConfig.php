@@ -110,6 +110,14 @@ final readonly class S3ServerConfig
 
     public int $requestBodySpoolWorkerPoolSize;
 
+    public int $awsReadWorkerPoolSize;
+
+    public int $awsReadWaiterLimit;
+
+    public int $awsReadAdmissionTimeoutSeconds;
+
+    public int $awsReadFirstByteTimeoutSeconds;
+
     public int $encryptionParallelThreshold;
 
     public QuotaConfig $quota;
@@ -161,6 +169,10 @@ final readonly class S3ServerConfig
      * @param  int  $sqliteWorkerPoolSize  Number of amphp/parallel workers for SQLite (0 = blocking mode).
      * @param  int  $encryptionWorkerPoolSize  Number of amphp/parallel workers for encryption (0 = disable).
      * @param  int  $requestBodySpoolWorkerPoolSize  Number of workers for request-body checksum spooling.
+     * @param  int  $awsReadWorkerPoolSize  Dedicated workers for qualified AWS payload reads.
+     * @param  int  $awsReadWaiterLimit  Maximum queued qualified AWS payload reads per process.
+     * @param  int  $awsReadAdmissionTimeoutSeconds  Maximum seconds to wait for AWS read capacity.
+     * @param  int  $awsReadFirstByteTimeoutSeconds  Maximum seconds to verify and prime an AWS payload read.
      * @param  int  $encryptionParallelThreshold  Payloads below this size run inline (bytes).
      * @param  float  $lifecycleIntervalSeconds  Seconds between lifecycle sweeps.
      * @param  int  $lifecycleBatchSize  Maximum rows fetched per lifecycle query.
@@ -203,6 +215,10 @@ final readonly class S3ServerConfig
         int $sqliteWorkerPoolSize = 4,
         int $encryptionWorkerPoolSize = 0,
         int $requestBodySpoolWorkerPoolSize = 8,
+        int $awsReadWorkerPoolSize = 2,
+        int $awsReadWaiterLimit = 2,
+        int $awsReadAdmissionTimeoutSeconds = 5,
+        int $awsReadFirstByteTimeoutSeconds = 20,
         int $encryptionParallelThreshold = 65_536,
         ?QuotaConfig $quota = null,
         float $lifecycleIntervalSeconds = 60.0,
@@ -357,6 +373,19 @@ final readonly class S3ServerConfig
             );
         }
 
+        if ($awsReadWorkerPoolSize < 1 || $awsReadWorkerPoolSize > 64) {
+            throw new \InvalidArgumentException('awsReadWorkerPoolSize must be between 1 and 64.');
+        }
+        if ($awsReadWaiterLimit < 0 || $awsReadWaiterLimit > 1024) {
+            throw new \InvalidArgumentException('awsReadWaiterLimit must be between 0 and 1024.');
+        }
+        if ($awsReadAdmissionTimeoutSeconds < 1 || $awsReadAdmissionTimeoutSeconds > 300) {
+            throw new \InvalidArgumentException('awsReadAdmissionTimeoutSeconds must be between 1 and 300.');
+        }
+        if ($awsReadFirstByteTimeoutSeconds < 1 || $awsReadFirstByteTimeoutSeconds > 300) {
+            throw new \InvalidArgumentException('awsReadFirstByteTimeoutSeconds must be between 1 and 300.');
+        }
+
         if ($sqliteWorkerPoolSize < 0) {
             throw new \InvalidArgumentException(
                 "sqliteWorkerPoolSize must be >= 0, got {$sqliteWorkerPoolSize}.",
@@ -493,6 +522,10 @@ final readonly class S3ServerConfig
         $this->encryptionWorkerPoolSize = $encryptionWorkerPoolSize;
         $this->selectWorkerPoolSize = $selectWorkerPoolSize ?? 1;
         $this->requestBodySpoolWorkerPoolSize = $requestBodySpoolWorkerPoolSize;
+        $this->awsReadWorkerPoolSize = $awsReadWorkerPoolSize;
+        $this->awsReadWaiterLimit = $awsReadWaiterLimit;
+        $this->awsReadAdmissionTimeoutSeconds = $awsReadAdmissionTimeoutSeconds;
+        $this->awsReadFirstByteTimeoutSeconds = $awsReadFirstByteTimeoutSeconds;
         $this->encryptionParallelThreshold = $encryptionParallelThreshold;
         $this->quota = $quota ?? new QuotaConfig();
         $this->lifecycleIntervalSeconds = $lifecycleIntervalSeconds;
@@ -575,6 +608,10 @@ final readonly class S3ServerConfig
             'encryptionWorkerPoolSize' => $this->encryptionWorkerPoolSize,
             'selectWorkerPoolSize' => $this->selectWorkerPoolSize,
             'requestBodySpoolWorkerPoolSize' => $this->requestBodySpoolWorkerPoolSize,
+            'awsReadWorkerPoolSize' => $this->awsReadWorkerPoolSize,
+            'awsReadWaiterLimit' => $this->awsReadWaiterLimit,
+            'awsReadAdmissionTimeoutSeconds' => $this->awsReadAdmissionTimeoutSeconds,
+            'awsReadFirstByteTimeoutSeconds' => $this->awsReadFirstByteTimeoutSeconds,
             'encryptionParallelThreshold' => $this->encryptionParallelThreshold,
             'quota' => $this->quota,
             'lifecycleIntervalSeconds' => $this->lifecycleIntervalSeconds,

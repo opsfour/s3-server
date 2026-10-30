@@ -92,6 +92,10 @@ final class ServeCommand extends Command
             ->addOption('shutdown-drain-timeout', null, InputOption::VALUE_REQUIRED, 'Maximum seconds to drain in-flight requests during graceful shutdown', self::envOption('S3_SHUTDOWN_DRAIN_TIMEOUT', '30'))
             ->addOption('shutdown-readiness-delay', null, InputOption::VALUE_REQUIRED, 'Seconds to publish unready before listeners close', self::envOption('S3_SHUTDOWN_READINESS_DELAY', '5'))
             ->addOption('request-body-spool-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for request-body checksum spooling', self::envOption('S3_REQUEST_BODY_SPOOL_WORKERS', '8'))
+            ->addOption('aws-read-workers', null, InputOption::VALUE_REQUIRED, 'Dedicated workers for qualified AWS payload reads', self::envOption('S3_AWS_READ_WORKERS', '2'))
+            ->addOption('aws-read-waiters', null, InputOption::VALUE_REQUIRED, 'Queued qualified AWS payload reads per process', self::envOption('S3_AWS_READ_WAITERS', '2'))
+            ->addOption('aws-read-admission-timeout', null, InputOption::VALUE_REQUIRED, 'AWS read admission timeout in seconds', self::envOption('S3_AWS_READ_ADMISSION_TIMEOUT_SECONDS', '5'))
+            ->addOption('aws-read-first-byte-timeout', null, InputOption::VALUE_REQUIRED, 'AWS read first-byte timeout in seconds', self::envOption('S3_AWS_READ_FIRST_BYTE_TIMEOUT_SECONDS', '20'))
             ->addOption('sqlite-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for SQLite metadata operations', self::envOption('S3_SQLITE_WORKERS', '4'))
             ->addOption('encryption-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for encryption', self::envOption('S3_ENCRYPTION_WORKERS', '0'))
             ->addOption('select-workers', null, InputOption::VALUE_REQUIRED, 'Worker processes for S3 Select', self::envOption('S3_SELECT_WORKERS'))
@@ -340,6 +344,10 @@ final class ServeCommand extends Command
                 ? null
                 : $this->integerOption($input, 'select-workers'),
             requestBodySpoolWorkerPoolSize: $this->integerOption($input, 'request-body-spool-workers'),
+            awsReadWorkerPoolSize: $this->integerOption($input, 'aws-read-workers'),
+            awsReadWaiterLimit: $this->integerOption($input, 'aws-read-waiters'),
+            awsReadAdmissionTimeoutSeconds: $this->integerOption($input, 'aws-read-admission-timeout'),
+            awsReadFirstByteTimeoutSeconds: $this->integerOption($input, 'aws-read-first-byte-timeout'),
             encryptionParallelThreshold: $this->integerOption($input, 'encryption-threshold'),
             quota: new QuotaConfig(
                 maxBucketsPerOwner: $this->integerOption($input, 'quota-max-buckets-per-owner'),

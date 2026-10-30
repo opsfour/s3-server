@@ -350,6 +350,29 @@ final class MetricsCollectorTest extends TestCase
         $metrics->recordFlysystemReadFirstByte('object-key', 1);
     }
 
+    public function test_aws_payload_read_metrics_accept_only_bounded_non_secret_labels(): void
+    {
+        $metrics = new MetricsCollector();
+        $metrics->recordAwsReadOutcome('admission', 'ready');
+        $metrics->recordAwsReadOutcome('stream', 'worker_failure');
+        $metrics->setAwsReadPoolState(2, 1);
+
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString(
+            's3_server_aws_payload_read_outcomes_total{outcome="ready",stage="admission"} 1',
+            $rendered,
+        );
+        self::assertStringContainsString(
+            's3_server_aws_payload_read_outcomes_total{outcome="worker_failure",stage="stream"} 1',
+            $rendered,
+        );
+        self::assertStringContainsString('s3_server_aws_payload_read_active 2', $rendered);
+        self::assertStringContainsString('s3_server_aws_payload_read_waiters 1', $rendered);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $metrics->recordAwsReadOutcome('stream', 'bucket/key');
+    }
+
     public function test_flysystem_read_stage_histogram_has_only_fixed_labels(): void
     {
         $metrics = new MetricsCollector();

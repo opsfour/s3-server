@@ -394,6 +394,10 @@ final class S3ServerBundleTest extends TestCase
             'parallel' => [
                 'select_workers' => 4,
                 'request_body_spool_workers' => 3,
+                'aws_read_workers' => 5,
+                'aws_read_waiters' => 6,
+                'aws_read_admission_timeout_seconds' => 7,
+                'aws_read_first_byte_timeout_seconds' => 8,
             ],
         ]], $container);
         $container->compile();
@@ -413,6 +417,10 @@ final class S3ServerBundleTest extends TestCase
         self::assertFalse($config->notificationWorkerEnabled);
         self::assertSame(4, $config->selectWorkerPoolSize);
         self::assertSame(3, $config->requestBodySpoolWorkerPoolSize);
+        self::assertSame(5, $config->awsReadWorkerPoolSize);
+        self::assertSame(6, $config->awsReadWaiterLimit);
+        self::assertSame(7, $config->awsReadAdmissionTimeoutSeconds);
+        self::assertSame(8, $config->awsReadFirstByteTimeoutSeconds);
     }
 
     public function test_configuration_rejects_divergent_explicit_post_and_storage_budgets(): void

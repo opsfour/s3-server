@@ -141,6 +141,12 @@ return [
         // Stateless workers for request-body checksum spooling.
         'request_body_spool_workers' => EnvironmentNumber::integer('S3_REQUEST_BODY_SPOOL_WORKERS', 8),
 
+        // Dedicated workers and bounded admission for qualified AWS payload reads.
+        'aws_read_workers' => EnvironmentNumber::integer('S3_AWS_READ_WORKERS', 2),
+        'aws_read_waiters' => EnvironmentNumber::integer('S3_AWS_READ_WAITERS', 2),
+        'aws_read_admission_timeout_seconds' => EnvironmentNumber::integer('S3_AWS_READ_ADMISSION_TIMEOUT_SECONDS', 5),
+        'aws_read_first_byte_timeout_seconds' => EnvironmentNumber::integer('S3_AWS_READ_FIRST_BYTE_TIMEOUT_SECONDS', 20),
+
         // Objects smaller than this (bytes) are encrypted inline.
         'encryption_threshold' => EnvironmentNumber::integer('S3_ENCRYPTION_THRESHOLD', 65536),
     ],

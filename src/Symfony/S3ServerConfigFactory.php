@@ -76,6 +76,10 @@ final class S3ServerConfigFactory
             encryptionWorkerPoolSize: $parallel['encryption_workers'],
             selectWorkerPoolSize: $parallel['select_workers'],
             requestBodySpoolWorkerPoolSize: $parallel['request_body_spool_workers'],
+            awsReadWorkerPoolSize: $parallel['aws_read_workers'],
+            awsReadWaiterLimit: $parallel['aws_read_waiters'],
+            awsReadAdmissionTimeoutSeconds: $parallel['aws_read_admission_timeout_seconds'],
+            awsReadFirstByteTimeoutSeconds: $parallel['aws_read_first_byte_timeout_seconds'],
             encryptionParallelThreshold: $parallel['encryption_threshold'],
             quota: new QuotaConfig(
                 maxBucketsPerOwner: $quotas['max_buckets_per_owner'],

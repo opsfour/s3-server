@@ -71,6 +71,10 @@ it through shell history or process listings.
 | `--aws-s3-connect-timeout` | `5` | Per-request provider-admission connection timeout in seconds |
 | `--aws-s3-read-timeout` | `15` | Per-request provider-admission read timeout in seconds |
 | `--aws-s3-request-timeout` | `20` | Timeout for each provider-admission request, not the whole admission sequence |
+| `--aws-read-workers` | `2` | Dedicated workers for qualified AWS payload reads |
+| `--aws-read-waiters` | `2` | Maximum queued qualified AWS payload reads per process |
+| `--aws-read-admission-timeout` | `5` | AWS payload-read admission timeout in seconds |
+| `--aws-read-first-byte-timeout` | `20` | AWS payload-read verification and priming timeout in seconds |
 | `--region` | `us-east-1` | AWS region identifier |
 | `--metadata-driver` | `sqlite` | `sqlite`, `postgres`, or `mysql` |
 | `--metadata-dsn` | (auto) | Database DSN for postgres/mysql |

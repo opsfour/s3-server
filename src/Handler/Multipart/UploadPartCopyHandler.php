@@ -1032,9 +1032,13 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
         while ($backend instanceof ObservedStorageBackend) {
             $backend = $backend->innerBackend();
         }
-        $stream = $backend instanceof AwsS3StorageBackend
+        $acquire = static fn(): \Amp\ByteStream\ReadableStream => $backend instanceof AwsS3StorageBackend
             ? $backend->readCopySource($bucket, $source, $key, $path, $offset, $length)
             : $storage->getObjectByPath($path, $offset, $length);
+        $stream = $reservation === null
+            ? $acquire()
+            : ($this->awsObjectWriter?->transform($reservation, $acquire)
+                ?? throw new \LogicException('AWS multipart writer disappeared.'));
 
         return $reservation === null
             ? $stream

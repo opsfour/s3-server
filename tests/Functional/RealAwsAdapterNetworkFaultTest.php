@@ -6,6 +6,7 @@ namespace OpsFour\S3Server\Tests\Functional;
 
 use Amp\DeferredFuture;
 use Amp\Future;
+use Amp\Parallel\Worker\ContextWorkerPool;
 use Amp\Http\Client\HttpClient;
 use Amp\Http\Client\HttpClientBuilder;
 use Amp\Http\Client\Request as ClientRequest;
@@ -27,6 +28,8 @@ use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\AwsS3FlysystemFilesystemFactory;
 use OpsFour\S3Server\Storage\ParallelFlysystemBackend;
+use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
+use OpsFour\S3Server\Tests\Support\QualifiedAwsReadFaultTask;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 
@@ -39,6 +42,94 @@ use function Amp\Socket\listen;
 /** Real AWS SDK/Flysystem workers behind a byte-level TCP fault relay. */
 final class RealAwsAdapterNetworkFaultTest extends TestCase
 {
+    public function test_qualified_payload_task_stalls_off_loop_and_unrelated_worker_progresses(): void
+    {
+        $origin = SocketHttpServer::createForDirectAccess(new NullLogger(), enableCompression: false);
+        $origin->expose('127.0.0.1:0');
+        $origin->start(new QualifiedAwsReadFaultOrigin(), new DefaultErrorHandler());
+        $originAddress = $origin->getServers()[0]->getAddress();
+        self::assertInstanceOf(InternetAddress::class, $originAddress);
+        $proxy = new LocalGetFaultProxy('127.0.0.1:' . $originAddress->getPort());
+        $pool = new ContextWorkerPool(2);
+        $profile = new AwsS3ProviderProfile(
+            'backing-private',
+            'us-east-1',
+            '123456789012',
+            'objects',
+            '.opsfour/write-attempts',
+            1,
+            1,
+            1,
+        );
+
+        try {
+            $stalled = $pool->submit(QualifiedAwsReadFaultTask::create(
+                $profile,
+                $proxy->address(),
+                QualifiedAwsReadFaultTask::BEFORE_ATTEMPT,
+            ));
+            $proxy->waitForQueueStall();
+            $tickStarted = microtime(true);
+            delay(0.05);
+            self::assertLessThan(0.5, microtime(true) - $tickStarted, 'A synchronous SDK stall blocked the event loop.');
+
+            $fast = $pool->submit(QualifiedAwsReadFaultTask::create(
+                $profile,
+                $proxy->address(),
+                QualifiedAwsReadFaultTask::FAST_ATTEMPT,
+            ));
+            self::assertSame('fast-body', $fast->getChannel()->receive(new \Amp\TimeoutCancellation(1)));
+            $fast->getChannel()->send('next');
+            self::assertNull($fast->getChannel()->receive(new \Amp\TimeoutCancellation(1)));
+            $fast->await(new \Amp\TimeoutCancellation(1));
+
+            $receiveError = null;
+            try {
+                $stalled->getChannel()->receive(new \Amp\TimeoutCancellation(3));
+            } catch (\Throwable $error) {
+                $receiveError = $error;
+            }
+            self::assertNotNull($receiveError, 'The pre-header stall was accepted as a payload.');
+
+            $awaitError = null;
+            try {
+                $stalled->await(new \Amp\TimeoutCancellation(3));
+            } catch (\Throwable $error) {
+                $awaitError = $error;
+            }
+            self::assertNotNull($awaitError, 'The pre-header stall completed cleanly.');
+
+            $midstream = $pool->submit(QualifiedAwsReadFaultTask::create(
+                $profile,
+                $proxy->address(),
+                QualifiedAwsReadFaultTask::MIDSTREAM_ATTEMPT,
+            ));
+            $received = '';
+            while (strlen($received) < 65_536) {
+                $chunk = $midstream->getChannel()->receive(new \Amp\TimeoutCancellation(2));
+                self::assertIsString($chunk);
+                $received .= $chunk;
+                $midstream->getChannel()->send('next');
+            }
+            self::assertSame(65_536, strlen($received));
+            self::assertSame(0, substr_count($received, 'n'));
+            $tickStarted = microtime(true);
+            delay(0.05);
+            self::assertLessThan(0.5, microtime(true) - $tickStarted, 'A midstream SDK stall blocked the event loop.');
+            $midstreamError = null;
+            try {
+                $midstream->getChannel()->receive(new \Amp\TimeoutCancellation(3));
+            } catch (\Throwable $error) {
+                $midstreamError = $error;
+            }
+            self::assertNotNull($midstreamError, 'The stalled body was reported as clean EOF.');
+        } finally {
+            $pool->kill();
+            $proxy->close();
+            $origin->stop();
+        }
+    }
+
     public function test_network_stalls_distinguish_headers_first_byte_midstream_and_admission(): void
     {
         $temp = sys_get_temp_dir() . '/s3-network-fault-' . bin2hex(random_bytes(6));
@@ -290,8 +381,10 @@ final class LocalGetFaultProxy
             $upstream = connect($this->upstream);
             $upstream->write($request);
             [$headers, $pending] = self::readHeaders($upstream);
-            if ($key === 'before-header' || $key === 'queue-stall') {
-                if ($key === 'queue-stall' && ! $this->queueStall->isComplete()) {
+            $qualifiedBefore = $key === QualifiedAwsReadFaultTask::BEFORE_ATTEMPT;
+            $qualifiedMidstream = $key === QualifiedAwsReadFaultTask::MIDSTREAM_ATTEMPT;
+            if ($key === 'before-header' || $key === 'queue-stall' || $qualifiedBefore) {
+                if (($key === 'queue-stall' || $qualifiedBefore) && ! $this->queueStall->isComplete()) {
                     $this->queueStall->complete();
                 }
                 delay(2.5);
@@ -301,7 +394,7 @@ final class LocalGetFaultProxy
                 delay(2.5);
             }
             $length = self::contentLength($headers);
-            if ($key === 'midstream') {
+            if ($key === 'midstream' || $qualifiedMidstream) {
                 self::forwardBody($upstream, $client, $pending, 65_536);
                 delay(2.5);
 
@@ -356,5 +449,30 @@ final class LocalGetFaultProxy
             $client->write($chunk);
             $forwarded += strlen($chunk);
         }
+    }
+}
+
+final readonly class QualifiedAwsReadFaultOrigin implements RequestHandler
+{
+    public function handleRequest(Request $request): Response
+    {
+        $attempt = basename($request->getUri()->getPath());
+        $body = match ($attempt) {
+            QualifiedAwsReadFaultTask::BEFORE_ATTEMPT => 'before-body',
+            QualifiedAwsReadFaultTask::MIDSTREAM_ATTEMPT => str_repeat('m', 65_536) . str_repeat('n', 65_536),
+            QualifiedAwsReadFaultTask::FAST_ATTEMPT => 'fast-body',
+            default => null,
+        };
+        if ($request->getMethod() !== 'GET' || $body === null) {
+            return new Response(404, body: '<Error><Code>NoSuchKey</Code></Error>');
+        }
+
+        return new Response(200, [
+            'content-length' => (string) strlen($body),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $attempt,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+            'x-amz-meta-opsfour-content-size' => (string) strlen($body),
+        ], $body);
     }
 }

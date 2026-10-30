@@ -20,6 +20,38 @@ final class S3ServerConfigValidationTest extends TestCase
         self::assertFalse($config->allowUnfencedStorageForTests);
         self::assertSame(300.0, $config->localWriteWorkerTimeoutSeconds);
         self::assertSame(5, $config->shutdownReadinessDelay);
+        self::assertSame(2, $config->awsReadWorkerPoolSize);
+        self::assertSame(2, $config->awsReadWaiterLimit);
+        self::assertSame(5, $config->awsReadAdmissionTimeoutSeconds);
+        self::assertSame(20, $config->awsReadFirstByteTimeoutSeconds);
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('invalidAwsReadSettings')]
+    public function test_aws_read_pool_settings_are_finite_and_bounded(string $setting, int $value): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        match ($setting) {
+            'awsReadWorkerPoolSize' => new S3ServerConfig(storagePath: '/', awsReadWorkerPoolSize: $value),
+            'awsReadWaiterLimit' => new S3ServerConfig(storagePath: '/', awsReadWaiterLimit: $value),
+            'awsReadAdmissionTimeoutSeconds' => new S3ServerConfig(storagePath: '/', awsReadAdmissionTimeoutSeconds: $value),
+            'awsReadFirstByteTimeoutSeconds' => new S3ServerConfig(storagePath: '/', awsReadFirstByteTimeoutSeconds: $value),
+            default => throw new \LogicException('Unknown AWS read setting fixture.'),
+        };
+    }
+
+    /** @return array<string, array{string, int}> */
+    public static function invalidAwsReadSettings(): array
+    {
+        return [
+            'zero workers' => ['awsReadWorkerPoolSize', 0],
+            'too many workers' => ['awsReadWorkerPoolSize', 65],
+            'negative waiters' => ['awsReadWaiterLimit', -1],
+            'too many waiters' => ['awsReadWaiterLimit', 1025],
+            'zero admission timeout' => ['awsReadAdmissionTimeoutSeconds', 0],
+            'excessive admission timeout' => ['awsReadAdmissionTimeoutSeconds', 301],
+            'zero first-byte timeout' => ['awsReadFirstByteTimeoutSeconds', 0],
+            'excessive first-byte timeout' => ['awsReadFirstByteTimeoutSeconds', 301],
+        ];
     }
 
     public function test_deprecated_post_budget_alone_supplies_the_canonical_node_budget(): void

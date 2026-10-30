@@ -39,6 +39,7 @@ use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3ProviderWorkerProbe;
+use OpsFour\S3Server\Storage\ParallelAwsS3ReadExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
@@ -223,6 +224,21 @@ final readonly class S3ServerRuntimeFactory
                 ]);
                 $probePool = new ContextWorkerPool(1);
                 $server->addWorkerPool($probePool, 'aws_provider_probe', 1, forceKillOnShutdown: true);
+                $readPool = new ContextWorkerPool($config->awsReadWorkerPoolSize);
+                $server->addWorkerPool(
+                    $readPool,
+                    'aws_payload_reads',
+                    $config->awsReadWorkerPoolSize,
+                    forceKillOnShutdown: true,
+                );
+                $readExecutor = new ParallelAwsS3ReadExecutor(
+                    $readPool,
+                    $config->awsReadWorkerPoolSize,
+                    $config->awsReadWaiterLimit,
+                    $config->awsReadAdmissionTimeoutSeconds,
+                    $config->awsReadFirstByteTimeoutSeconds,
+                    $metrics,
+                );
                 $awsOperationalState = new AwsS3OperationalState(
                     $binding,
                     new AwsS3ProviderWorkerProbe(
@@ -238,6 +254,7 @@ final readonly class S3ServerRuntimeFactory
                 $attachedAwsState = $awsOperationalState;
                 $attachedAwsTier = $awsTier->name;
                 $attachedAwsMetadata = $metadata;
+                $awsStorage->attachReadExecutor($readExecutor);
                 $server->setAwsOperationalState($awsOperationalState);
                 $awsTierWriter = $awsStorage->createForegroundObjectWriter(
                     $metadata,

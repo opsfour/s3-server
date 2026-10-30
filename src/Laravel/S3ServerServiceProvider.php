@@ -86,6 +86,10 @@ class S3ServerServiceProvider extends ServiceProvider
                 encryptionWorkerPoolSize: $config['parallel']['encryption_workers'] ?? 0,
                 selectWorkerPoolSize: $config['parallel']['select_workers'] ?? null,
                 requestBodySpoolWorkerPoolSize: $config['parallel']['request_body_spool_workers'] ?? 8,
+                awsReadWorkerPoolSize: $config['parallel']['aws_read_workers'] ?? 2,
+                awsReadWaiterLimit: $config['parallel']['aws_read_waiters'] ?? 2,
+                awsReadAdmissionTimeoutSeconds: $config['parallel']['aws_read_admission_timeout_seconds'] ?? 5,
+                awsReadFirstByteTimeoutSeconds: $config['parallel']['aws_read_first_byte_timeout_seconds'] ?? 20,
                 encryptionParallelThreshold: $config['parallel']['encryption_threshold'] ?? 65_536,
                 quota: new QuotaConfig(
                     maxBucketsPerOwner: $config['quotas']['max_buckets_per_owner'] ?? 0,

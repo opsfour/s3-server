@@ -1601,6 +1601,16 @@ final class S3Server
                 || ! $probeEntry['forceKillOnShutdown']) {
                 throw new \LogicException('The AWS provider probe worker is not exactly owned by this runtime.');
             }
+            $boundReadPools = array_filter(
+                $this->workerPools,
+                fn(array $entry): bool => $backend->usesReadPool($entry['pool']),
+            );
+            $readEntry = array_values($boundReadPools)[0] ?? null;
+            if (count($boundReadPools) !== 1 || $readEntry === null
+                || $readEntry['name'] !== 'aws_payload_reads'
+                || ! $readEntry['forceKillOnShutdown']) {
+                throw new \LogicException('The AWS payload read worker pool is not exactly owned by this runtime.');
+            }
         }
     }
 

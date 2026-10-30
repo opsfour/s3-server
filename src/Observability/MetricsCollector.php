@@ -114,6 +114,12 @@ final class MetricsCollector
     private array $workerPoolShutdownFailures = [];
 
     /** @var array<string, int> */
+    private array $awsReadOutcomes = [];
+
+    /** @var array{active: int, waiting: int}|null */
+    private ?array $awsReadPoolState = null;
+
+    /** @var array<string, int> */
     private array $flysystemReadFirstByteTotals = [];
 
     /** @var array<string, int> */
@@ -441,6 +447,27 @@ final class MetricsCollector
             'pool' => $pool,
         ]);
         $this->workerPoolShutdownFailures[$key] = ($this->workerPoolShutdownFailures[$key] ?? 0) + 1;
+    }
+
+    public function recordAwsReadOutcome(string $stage, string $outcome): void
+    {
+        if (! in_array($stage, ['admission', 'worker', 'first_byte', 'stream'], true)
+            || ! in_array($outcome, [
+                'ready', 'timeout', 'rejected', 'start_failure', 'failure', 'complete',
+                'cancelled', 'worker_failure', 'ipc_failure', 'protocol_failure',
+            ], true)) {
+            throw new \InvalidArgumentException('Invalid AWS read metric outcome.');
+        }
+        $key = $this->key(['outcome' => $outcome, 'stage' => $stage]);
+        $this->awsReadOutcomes[$key] = ($this->awsReadOutcomes[$key] ?? 0) + 1;
+    }
+
+    public function setAwsReadPoolState(int $active, int $waiting): void
+    {
+        if ($active < 0 || $waiting < 0) {
+            throw new \InvalidArgumentException('AWS read pool state cannot be negative.');
+        }
+        $this->awsReadPoolState = ['active' => $active, 'waiting' => $waiting];
     }
 
     public function recordFlysystemReadFirstByte(string $result, int $durationNs): void
@@ -833,6 +860,20 @@ final class MetricsCollector
         $lines[] = '# TYPE s3_server_worker_pool_shutdown_failures_total counter';
         foreach ($this->workerPoolShutdownFailures as $key => $value) {
             $lines[] = 's3_server_worker_pool_shutdown_failures_total{' . $key . '} ' . $value;
+        }
+
+        $lines[] = '# HELP s3_server_aws_payload_read_outcomes_total Bounded qualified AWS payload read outcomes.';
+        $lines[] = '# TYPE s3_server_aws_payload_read_outcomes_total counter';
+        foreach ($this->awsReadOutcomes as $key => $value) {
+            $lines[] = 's3_server_aws_payload_read_outcomes_total{' . $key . '} ' . $value;
+        }
+        $lines[] = '# HELP s3_server_aws_payload_read_active Active qualified AWS payload reads.';
+        $lines[] = '# TYPE s3_server_aws_payload_read_active gauge';
+        $lines[] = '# HELP s3_server_aws_payload_read_waiters Queued qualified AWS payload reads.';
+        $lines[] = '# TYPE s3_server_aws_payload_read_waiters gauge';
+        if ($this->awsReadPoolState !== null) {
+            $lines[] = 's3_server_aws_payload_read_active ' . $this->awsReadPoolState['active'];
+            $lines[] = 's3_server_aws_payload_read_waiters ' . $this->awsReadPoolState['waiting'];
         }
 
         $lines[] = '# HELP s3_server_flysystem_read_first_byte_seconds Time from GET storage read request to primed stream, including read worker admission.';
