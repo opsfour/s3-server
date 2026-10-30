@@ -969,9 +969,11 @@ intent recovery. Worker-only listeners expose `/.live`, `/.health`, and
 authenticated `/.metrics`, but no S3, website, or admin routes. Set
 `S3_METRICS_BEARER_TOKEN` for every worker-only process.
 
-Membership is one PostgreSQL v48 row per process incarnation. Registration,
-heartbeat, readiness, and expiry use `clock_timestamp()`; an expired row never
-contributes role coverage. `S3_CLUSTER_REQUIRED_ROLES` is shared fingerprinted
+Membership is one PostgreSQL row per process incarnation. Registration,
+heartbeat, readiness, intentional drain, and expiry use `clock_timestamp()`;
+an expired row never contributes role coverage, and `ready=false` is not
+treated as draining unless the explicit drain flag is set.
+`S3_CLUSTER_REQUIRED_ROLES` is shared fingerprinted
 policy (all roles by default), while `S3_CLUSTER_ROLES` may differ per process.
 Start worker providers before an API-only process: API startup requires live
 `reconcile` coverage. Loss of reconciliation rejects PutObject, CopyObject,
@@ -980,6 +982,52 @@ processing while reads and unrelated bucket configuration mutations remain
 available. Other missing required roles appear as bounded degraded coverage
 without removing API readiness. In cluster mode the `webhook` role is authoritative and
 `S3_NOTIFICATION_WORKER` is ignored; that switch remains standalone-only.
+
+In cluster mode, `/.health` remains this process's load-balancer readiness, not
+a synthetic cluster-wide readiness vote. Its bounded `node`, `dependencies`,
+and `cluster` sections report the process identity and roles, explicit
+ready/draining state, admission, last successful database-time membership
+heartbeat and age, ready/draining live role counts, missing required roles, and
+the current PostgreSQL observation time. A local storage, credential, or
+temporary-capacity failure removes only this process. Admission mismatch,
+PostgreSQL snapshot failure, or loss of safety-critical `reconcile` coverage
+keeps the affected mutation scopes closed. Failed observations are reported as
+unavailable; an earlier successful snapshot is never reused to reopen
+readiness. `/.live` remains process-only.
+
+Authenticated `/.metrics` adds fixed-cardinality `s3_server_cluster_*` samples
+only in cluster mode. The seven queue names are `notification`, `transition`,
+`restore`, `garbage`, `multipart_intent`, `object_intent`, and `lifecycle`.
+Queue samples cover eligible backlog, oldest database-time age, active and
+expired leases, retry pressure where meaningful, highest generation, successful
+and failed takeovers, and rejected stale acknowledgements. Lifecycle omits
+meaningless backlog, oldest-age, and retry samples. A collection failure clears
+the old queue and role samples, sets `s3_server_cluster_snapshot_success` to
+zero, and leaves process-local metrics scrapeable. No cluster metric label
+contains a node, worker, customer, bucket, object, credential, or work ID.
+Exact queue counts are emitted only while an indexed state range contains at
+most 10,000 rows; a larger count is omitted instead of scanning the unbounded
+range or publishing a capped value as exact. Oldest eligible age remains an
+indexed first-row lookup.
+
+Alert and runbook starting points:
+
+- page on admission mismatch, metadata failure, or sustained missing
+  `reconcile` coverage because dependent mutations are closed;
+- route node-local storage or temporary-capacity failure to the affected node,
+  without declaring a shared storage outage from one process observation;
+- investigate oldest eligible backlog that exceeds the service objective or
+  expired leases that remain nonzero across several lease periods;
+- investigate repeated takeover failures or stale acknowledgements as fencing,
+  worker-stall, or database-latency symptoms, not as permission to bypass CAS;
+- compare reconciliation capacity and temporary-space pressure with their hard
+  admission limits before adding work; and
+- investigate a draining member that remains live beyond the configured drain
+  and shutdown windows.
+
+These signals do not qualify a deployment topology. Multi-host failure
+campaigns, soak/load evidence, and production qualification remain separate
+qualification work.
 
 Cluster bootstrap is maintenance-only. Run `metadata:migrate` with its
 DDL-capable role and record the printed `Cluster database identity` as
@@ -1011,7 +1059,7 @@ same storage root. Drain traffic, stop the existing process, deploy the new
 package, and then start exactly one replacement process. Check `/.health`,
 `/.metrics`, and a signed S3 request before restoring traffic.
 
-For a **schema upgrade** to the current SQLite v42, PostgreSQL v48, or MySQL
+For a **schema upgrade** to the current SQLite v42, PostgreSQL v49, or MySQL
 v50 schema, drain and stop the
 API process, including its background workers; back up
 metadata; run exactly one `php bin/s3-server metadata:migrate` with a

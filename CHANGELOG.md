@@ -8,6 +8,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Expose bounded PostgreSQL cluster health and takeover progress on the existing
+  `/.health` and `/.metrics` endpoints. Cluster health now distinguishes node
+  readiness/drain and dependency scope from shared admission and role coverage;
+  fixed durable-work metrics report backlog, lease expiry, generation,
+  takeover outcomes, and stale acknowledgements without customer or work IDs.
+  Failed snapshots clear their samples while process metrics remain available,
+  standalone endpoints remain unchanged, and PostgreSQL schema version is 49.
+
 - Add an explicit `aws-s3` provider profile with strict commercial-region,
   General Purpose Bucket, expected-owner, isolated-prefix, and bounded-timeout
   validation; default-chain read-only admission probes; a secret-free immutable

@@ -5,10 +5,64 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Observability;
 
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
+use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
 use PHPUnit\Framework\TestCase;
 
 final class MetricsCollectorTest extends TestCase
 {
+    public function test_cluster_snapshot_metrics_are_fixed_cardinality_and_clear_after_failure(): void
+    {
+        $roles = [];
+        foreach (ClusterRoleSet::ALL as $role) {
+            $roles[$role] = ['ready' => $role === ClusterRoleSet::API ? 2 : 0, 'draining' => $role === ClusterRoleSet::API ? 1 : 0];
+        }
+        $work = [];
+        foreach (ClusterWorkSnapshot::ALL as $queue) {
+            $work[$queue] = new ClusterWorkSnapshot(
+                $queue,
+                in_array($queue, ['lifecycle', 'transition'], true) ? null : 3,
+                $queue === 'lifecycle' ? null : 12.5,
+                $queue === 'transition' ? null : 1,
+                $queue === 'transition' ? null : 2,
+                in_array($queue, ['lifecycle', 'multipart_intent', 'object_intent', 'transition'], true) ? null : 1,
+                4,
+                5,
+                6,
+                7,
+            );
+        }
+        $metrics = new MetricsCollector();
+        $metrics->setClusterOperationalSnapshot(new ClusterOperationalSnapshot(
+            1000.5,
+            'current',
+            999.5,
+            1.0,
+            $roles,
+            $work,
+        ));
+        $metrics->setClusterSnapshotSuccess(true);
+
+        $rendered = $metrics->renderPrometheus();
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $rendered);
+        self::assertStringContainsString('s3_server_cluster_snapshot_fresh 1', $rendered);
+        self::assertStringContainsString('s3_server_cluster_role_processes{role="api",state="ready"} 2', $rendered);
+        self::assertStringContainsString('s3_server_cluster_work_items{queue="notification",state="expired"} 2', $rendered);
+        self::assertStringNotContainsString('s3_server_cluster_work_items{queue="transition",', $rendered);
+        self::assertStringContainsString('s3_server_cluster_work_takeovers_total{outcome="stale_acknowledgement",queue="notification"} 6', $rendered);
+        self::assertStringNotContainsString('node-a', $rendered);
+        self::assertDoesNotMatchRegularExpression('/(?:bucket|owner|worker|work_id|object|credential)="/', $rendered);
+
+        $metrics->setClusterOperationalSnapshot(null);
+        $metrics->setClusterSnapshotSuccess(false);
+        $failed = $metrics->renderPrometheus();
+        self::assertStringContainsString('s3_server_up 1', $failed);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $failed);
+        self::assertStringContainsString('s3_server_cluster_snapshot_fresh 0', $failed);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_work_items\{/m', $failed);
+    }
+
     public function test_storage_cleanup_metrics_bound_remaining_capacity_and_rejection_labels(): void
     {
         $metrics = new MetricsCollector();

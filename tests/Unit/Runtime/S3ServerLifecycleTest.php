@@ -109,6 +109,7 @@ final class S3ServerLifecycleTest extends TestCase
                 string $incarnationId,
                 array $roles,
                 bool $ready,
+                bool $draining,
                 float $ttlSeconds,
             ): void {
                 $this->ready = $ready;
@@ -119,10 +120,11 @@ final class S3ServerLifecycleTest extends TestCase
                 string $nodeId,
                 string $incarnationId,
                 bool $ready,
+                bool $draining,
                 float $ttlSeconds,
             ): bool {
                 $this->readyUpdates[] = $ready;
-                if (! $ready) {
+                if ($draining) {
                     ($this->onDemotion)();
                 }
                 $this->ready = $ready;

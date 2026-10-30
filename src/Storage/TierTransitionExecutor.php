@@ -947,14 +947,25 @@ final class TierTransitionExecutor
             try {
                 return $this->clusterFencing->transactionWithClusterWork(
                     $token,
-                    fn(): bool => $this->metadata->updateTierTransitionJobStatus(
-                        $id,
-                        $status,
-                        $error,
-                        $nextAttemptAt,
-                        $incrementAttempts,
-                        $targetStoragePath,
-                    ),
+                    function () use ($id, $status, $error, $nextAttemptAt, $incrementAttempts, $targetStoragePath, $token): bool {
+                        $updated = $this->metadata->updateTierTransitionJobStatus(
+                            $id,
+                            $status,
+                            $error,
+                            $nextAttemptAt,
+                            $incrementAttempts,
+                            $targetStoragePath,
+                        );
+                        if ($updated && in_array($status, ['pending', 'dead_letter'], true)
+                            && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
+                            $this->clusterFencing->recordClusterWorkOutcome(
+                                $token,
+                                \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+                            );
+                        }
+
+                        return $updated;
+                    },
                 );
             } catch (\RuntimeException) {
                 return false;

@@ -16,10 +16,15 @@ use League\Uri\Http;
 use OpsFour\S3Server\Exception\SlowDownException;
 use OpsFour\S3Server\Handler\HealthCheckHandler;
 use OpsFour\S3Server\Middleware\ClusterRoleAdmissionMiddleware;
+use OpsFour\S3Server\Metadata\MetadataStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterMembershipSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshotStore;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\ClusterRoleSet;
+use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
@@ -29,6 +34,157 @@ use PHPUnit\Framework\TestCase;
 
 final class ClusterRoleTest extends TestCase
 {
+    public function test_membership_snapshot_rejects_non_integer_or_extra_role_count_fields(): void
+    {
+        $counts = $this->zeroRoleCounts();
+        $counts['api'] = ['ready' => '1', 'draining' => 0, 'extra' => 0];
+
+        $this->expectException(\InvalidArgumentException::class);
+        (new \ReflectionClass(ClusterMembershipSnapshot::class))->newInstanceArgs([
+            1000.0, 'current', 999.0, 1.0, $counts,
+        ]);
+    }
+
+    public function test_operational_snapshot_rejects_incomplete_role_count_fields(): void
+    {
+        $counts = $this->zeroRoleCounts();
+        $counts['api'] = ['ready' => 0];
+        $work = [];
+        foreach (ClusterWorkSnapshot::ALL as $workClass) {
+            $work[$workClass] = new ClusterWorkSnapshot($workClass, null, null, null, null, null, 0, 0, 0, 0);
+        }
+
+        $this->expectException(\InvalidArgumentException::class);
+        (new \ReflectionClass(ClusterOperationalSnapshot::class))->newInstanceArgs([
+            1000.0, 'current', 999.0, 1.0, $counts, $work,
+        ]);
+    }
+
+    public function test_operational_snapshot_reports_db_time_roles_and_health_without_identifiers_in_metrics_shape(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+
+        $response = (new HealthCheckHandler(clusterRoles: $controller))->handleRequest($this->request('GET'));
+        $body = $response->getBody()->read();
+        self::assertNotNull($body);
+        $payload = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('ready', $payload['node']['state']);
+        self::assertSame('cluster-a', $payload['node']['cluster_id']);
+        self::assertSame('node-a', $payload['node']['node_id']);
+        self::assertSame($controller->healthIdentity()['incarnation_id'], $payload['node']['incarnation_id']);
+        self::assertSame('current', $payload['node']['membership']);
+        self::assertSame(990, $payload['node']['last_heartbeat_at']);
+        self::assertSame(1, $payload['cluster']['role_counts']['reconcile']['ready']);
+        self::assertSame(1000, $payload['cluster']['observed_at']);
+        self::assertGreaterThan(0, $store->membershipSnapshotCalls);
+        self::assertSame(0, $store->operationalSnapshotCalls, 'Health must not collect durable-work queues.');
+
+        $store->snapshotUnavailable = true;
+        $failed = (new HealthCheckHandler(clusterRoles: $controller))->handleRequest($this->request('GET'));
+        $failedBody = $failed->getBody()->read();
+        self::assertNotNull($failedBody);
+        $failedPayload = json_decode($failedBody, true, 32, JSON_THROW_ON_ERROR);
+        self::assertSame(503, $failed->getStatus());
+        self::assertSame('unavailable', $failedPayload['cluster']['collection']);
+        self::assertStringNotContainsString('database secret', $failedBody);
+    }
+
+    public function test_local_dependency_failure_is_node_scoped_without_claiming_shared_cluster_failure(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getBucket')->willThrowException(new \RuntimeException('local metadata connection failed'));
+
+        $response = (new HealthCheckHandler(metadata: $metadata, clusterRoles: $controller))
+            ->handleRequest($this->request('GET'));
+        $body = $response->getBody()->read();
+        self::assertNotNull($body);
+        $payload = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('unavailable', $payload['dependencies']['metadata']['state']);
+        self::assertSame('node', $payload['dependencies']['metadata']['scope']);
+        self::assertSame(['all_mutations'], $payload['dependencies']['metadata']['affected_scopes']);
+        self::assertSame('unavailable', $payload['dependencies']['credentials']['state']);
+        self::assertSame('unobserved', $payload['dependencies']['credentials']['observation']);
+        self::assertSame('unavailable', $payload['dependencies']['storage_admission']['state']);
+        self::assertSame('unobserved', $payload['dependencies']['storage_admission']['observation']);
+        self::assertSame('stopped', $payload['node']['state']);
+        self::assertSame('current', $payload['cluster']['collection']);
+        self::assertSame([], $payload['cluster']['missing_roles']);
+    }
+
+    public function test_cluster_drain_short_circuit_reports_full_unobserved_dependency_catalog(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+        $drain = new \OpsFour\S3Server\Runtime\NodeDrainController();
+        $drain->beginDrain();
+
+        $response = (new HealthCheckHandler(clusterRoles: $controller, drain: $drain))
+            ->handleRequest($this->request('GET'));
+        $body = $response->getBody()->read();
+        self::assertNotNull($body);
+        $payload = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame(
+            ['admission', 'metadata', 'storage_admission', 'credentials', 'role_coverage', 'temporary_capacity', 'drain'],
+            array_keys($payload['dependencies']),
+        );
+        self::assertSame('draining', $payload['dependencies']['drain']['reason']);
+        self::assertSame('node', $payload['dependencies']['drain']['scope']);
+        self::assertSame(['all_mutations'], $payload['dependencies']['drain']['affected_scopes']);
+        foreach (array_diff(array_keys($payload['dependencies']), ['drain']) as $dependency) {
+            self::assertSame('unavailable', $payload['dependencies'][$dependency]['state']);
+            self::assertSame('unobserved', $payload['dependencies'][$dependency]['observation']);
+            self::assertArrayNotHasKey('reason', $payload['dependencies'][$dependency]);
+        }
+    }
+
+    public function test_cluster_temp_capacity_short_circuit_keeps_known_failure_distinct_from_unobserved_checks(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+        $tempDir = sys_get_temp_dir() . '/s3-cluster-health-temp-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($tempDir, 0700));
+        $coordinator = new \OpsFour\S3Server\Storage\StorageTempBudgetCoordinator($tempDir, 1024, 0);
+        $unknown = $tempDir . '/s3fw-put-unaccounted';
+        self::assertSame(4, file_put_contents($unknown, 'data'));
+
+        try {
+            $response = (new HealthCheckHandler(clusterRoles: $controller, tempBudget: $coordinator))
+                ->handleRequest($this->request('GET'));
+            $body = $response->getBody()->read();
+            self::assertNotNull($body);
+            $payload = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+
+            self::assertSame(503, $response->getStatus());
+            self::assertSame('unsafe_state', $payload['dependencies']['temporary_capacity']['reason']);
+            self::assertSame('node', $payload['dependencies']['temporary_capacity']['scope']);
+            self::assertSame(['all_mutations'], $payload['dependencies']['temporary_capacity']['affected_scopes']);
+            self::assertSame('unavailable', $payload['dependencies']['metadata']['state']);
+            self::assertSame('unobserved', $payload['dependencies']['metadata']['observation']);
+            self::assertArrayNotHasKey('reason', $payload['dependencies']['metadata']);
+        } finally {
+            @unlink($unknown);
+            $coordinator->close();
+            foreach (glob($tempDir . '/.opsfour-s3-storage-budget/*') ?: [] as $entry) {
+                @unlink($entry);
+            }
+            @rmdir($tempDir . '/.opsfour-s3-storage-budget');
+            @rmdir($tempDir);
+        }
+    }
+
     public function test_config_canonicalizes_roles_and_keeps_standalone_all_in_one(): void
     {
         $cluster = $this->config('webhook, api,reconcile', 'reconcile,api');
@@ -41,6 +197,42 @@ final class ClusterRoleTest extends TestCase
         $standalone = new S3ServerConfig(storagePath: '/');
         self::assertSame(ClusterRoleSet::ALL, $standalone->clusterRoles);
         self::assertTrue($standalone->hasClusterRole(ClusterRoleSet::GARBAGE));
+    }
+
+    public function test_cluster_membership_diagnostics_share_the_readiness_deadline(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $store->snapshotDelaySeconds = 0.05;
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+
+        $response = (new HealthCheckHandler(
+            clusterRoles: $controller,
+            readinessCheckIntervalSeconds: 0,
+            readinessCheckTimeoutSeconds: 0.001,
+        ))->handleRequest($this->request('GET'));
+        $payload = json_decode((string) $response->getBody()->read(), true, 16, JSON_THROW_ON_ERROR);
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('stopped', $payload['node']['state']);
+        self::assertSame('unavailable', $payload['cluster']['collection']);
+        self::assertSame('unavailable', $payload['dependencies']['role_coverage']['state']);
+        self::assertSame('unobserved', $payload['dependencies']['role_coverage']['observation']);
+        self::assertSame(1, $store->membershipSnapshotCalls);
+    }
+
+    public function test_local_membership_withdrawal_cannot_report_ready_from_a_still_live_database_row(): void
+    {
+        $store = new ClusterOperationalRoleStore();
+        $controller = new ClusterRoleController($store, $this->config('api,reconcile', 'reconcile'));
+        $controller->registerReady();
+        $controller->withdraw();
+
+        $response = (new HealthCheckHandler(clusterRoles: $controller))->handleRequest($this->request('GET'));
+        $payload = json_decode((string) $response->getBody()->read(), true, 16, JSON_THROW_ON_ERROR);
+
+        self::assertSame(503, $response->getStatus());
+        self::assertSame('stopped', $payload['node']['state']);
     }
 
     /** @return iterable<string, array{string}> */
@@ -154,6 +346,7 @@ final class ClusterRoleTest extends TestCase
         $controller->beginDrain();
 
         self::assertSame(0, $store->withdrawals);
+        self::assertTrue($store->draining);
         self::assertFalse($controller->hasLiveRole(ClusterRoleSet::API));
         self::assertFalse($controller->canClaim(ClusterRoleSet::RECONCILE));
         self::assertTrue($controller->maintainReady());
@@ -289,6 +482,7 @@ final class ClusterRoleTest extends TestCase
         self::assertSame(200, $response->getStatus());
         self::assertSame('degraded', $payload['status'] ?? null);
         self::assertSame(['webhook'], $payload['cluster']['missing_roles'] ?? null);
+        self::assertSame('degraded', $payload['dependencies']['role_coverage']['state'] ?? null);
     }
 
     public function test_missing_required_reconcile_role_removes_health_readiness(): void
@@ -305,6 +499,7 @@ final class ClusterRoleTest extends TestCase
         $payload = json_decode((string) $response->getBody()->read(), true, 8, JSON_THROW_ON_ERROR);
 
         self::assertSame(503, $response->getStatus());
+        self::assertSame('unavailable', $payload['dependencies']['role_coverage']['state'] ?? null);
         self::assertSame('degraded', $payload['status'] ?? null);
         self::assertSame(['reconcile'], $payload['cluster']['missing_roles'] ?? null);
     }
@@ -416,6 +611,17 @@ final class ClusterRoleTest extends TestCase
         );
     }
 
+    /** @return array<string, array{ready: int, draining: int}> */
+    private function zeroRoleCounts(): array
+    {
+        $counts = [];
+        foreach (ClusterRoleSet::ALL as $role) {
+            $counts[$role] = ['ready' => 0, 'draining' => 0];
+        }
+
+        return $counts;
+    }
+
     /** @return array<string, object|array<array-key, object>|null> */
     private function backgroundComponents(string $roles): array
     {
@@ -441,7 +647,7 @@ final class ClusterRoleTest extends TestCase
     }
 }
 
-final class ClusterRoleMemoryStore implements ClusterMembershipStore
+class ClusterRoleMemoryStore implements ClusterMembershipStore
 {
     /** @var list<string> */
     public array $roles = [];
@@ -457,14 +663,16 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
     /** @var DeferredFuture<void>|null */
     public ?DeferredFuture $releaseHeartbeat = null;
     private bool $ready = false;
+    public bool $draining = false;
 
-    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, float $ttlSeconds): void
+    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, bool $draining, float $ttlSeconds): void
     {
         $this->roles = $roles;
         $this->ready = $ready;
+        $this->draining = $draining;
     }
 
-    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, float $ttlSeconds): bool
+    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, bool $draining, float $ttlSeconds): bool
     {
         ++$this->heartbeats;
         if ($this->unavailable) {
@@ -480,6 +688,7 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
             return false;
         }
         $this->ready = $ready;
+        $this->draining = $draining;
         return true;
     }
 
@@ -487,6 +696,7 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
     {
         ++$this->withdrawals;
         $this->ready = false;
+        $this->draining = false;
     }
 
     public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
@@ -502,6 +712,58 @@ final class ClusterRoleMemoryStore implements ClusterMembershipStore
             throw new \RuntimeException('database unavailable');
         }
         return $this->ready ? ($this->liveRoles ?? $this->roles) : [];
+    }
+}
+
+final class ClusterOperationalRoleStore extends ClusterRoleMemoryStore implements ClusterOperationalSnapshotStore
+{
+    public bool $snapshotUnavailable = false;
+
+    public float $snapshotDelaySeconds = 0.0;
+
+    public int $membershipSnapshotCalls = 0;
+
+    public int $operationalSnapshotCalls = 0;
+
+    public function clusterMembershipSnapshot(string $clusterId, string $nodeId, string $incarnationId): ClusterMembershipSnapshot
+    {
+        ++$this->membershipSnapshotCalls;
+        if ($this->snapshotDelaySeconds > 0.0) {
+            \Amp\delay($this->snapshotDelaySeconds);
+        }
+        if ($this->snapshotUnavailable) {
+            throw new \RuntimeException('database secret must not escape');
+        }
+
+        return new ClusterMembershipSnapshot(1000.0, 'current', 990.0, 10.0, $this->roleCounts());
+    }
+
+    public function clusterOperationalSnapshot(string $clusterId, string $nodeId, string $incarnationId): ClusterOperationalSnapshot
+    {
+        ++$this->operationalSnapshotCalls;
+        if ($this->snapshotUnavailable) {
+            throw new \RuntimeException('database secret must not escape');
+        }
+        $work = [];
+        foreach (ClusterWorkSnapshot::ALL as $queue) {
+            $work[$queue] = new ClusterWorkSnapshot($queue, $queue === 'lifecycle' ? null : 0, null, 0, 0, null, 0, 0, 0, 0);
+        }
+
+        return new ClusterOperationalSnapshot(1000.0, 'current', 990.0, 10.0, $this->roleCounts(), $work);
+    }
+
+    /** @return array<string, array{ready: int, draining: int}> */
+    private function roleCounts(): array
+    {
+        $roles = [];
+        foreach (ClusterRoleSet::ALL as $role) {
+            $roles[$role] = [
+                'ready' => in_array($role, [ClusterRoleSet::API, ClusterRoleSet::RECONCILE], true) ? 1 : 0,
+                'draining' => 0,
+            ];
+        }
+
+        return $roles;
     }
 }
 

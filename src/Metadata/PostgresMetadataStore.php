@@ -26,6 +26,11 @@ use OpsFour\S3Server\Runtime\ClusterAdmissionResult;
 use OpsFour\S3Server\Runtime\ClusterAdmissionStore;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
 use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterMembershipSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshotStore;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
+use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
 
 /**
  * PostgreSQL-backed implementation of the S3 metadata store.
@@ -33,13 +38,18 @@ use OpsFour\S3Server\Runtime\ClusterMembershipStore;
  * Uses amphp/postgres for fully async database access. Suitable for
  * multi-node HA deployments.
  */
-final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore, ClusterMembershipStore
+final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadinessProbe, SharedAuthorizationLockStore, ObjectRetentionDeletionStore, GenerationBoundMultipartListingStore, GenerationBoundBucketMultipartCleanupStore, MultipartWriteIntentStore, FencedMultipartWriteIntentStore, LocalMultipartCompletionIntentStore, FencedMultipartPartWriteIntentStore, LocalMultipartPartSealGuard, LocalMultipartFenceAdmissionStore, RecursiveCleanupAdmissionStore, MultipartPartWriteIntentInventoryStore, MultipartUploadTierStore, ObjectWriteIntentStore, PagedMultipartPartsStore, MultipartPartChecksumStore, FencedStorageGarbageStore, StorageGarbageLeaseStore, AwsS3GarbageClaimStore, FencedQueueStore, RestoredCopyTierStore, MetadataSchemaAdmission, MultipartCompletionCapacityReader, WriteIntentCapacityReader, StorageCleanupCapacityReader, RecoveryStorageGarbageStore, ObjectPartLayoutStore, AwsS3OperationalSummaryReader, ClusterAdmissionStore, ClusterWorkFencingStore, ClusterWorkOutcomeRecorder, ClusterMembershipStore, ClusterOperationalSnapshotStore
 {
+    private const int CLUSTER_SNAPSHOT_COUNT_LIMIT = 10_000;
+
     /** @var \WeakMap<\Fiber<mixed, mixed, mixed, mixed>, PostgresTransaction> */
     private \WeakMap $fiberTxMap;
 
     /** @var \WeakMap<object, array<int, true>> */
     private \WeakMap $objectPartLayoutPublicationIds;
+
+    /** @var \WeakMap<object, list<ClusterWorkToken>> */
+    private \WeakMap $deferredClusterStaleAcknowledgements;
 
     private ?string $creationDsnFingerprint = null;
 
@@ -48,6 +58,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     ) {
         $this->fiberTxMap = new \WeakMap();
         $this->objectPartLayoutPublicationIds = new \WeakMap();
+        $this->deferredClusterStaleAcknowledgements = new \WeakMap();
     }
 
     public static function fromDsn(string $dsn): self
@@ -188,20 +199,25 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         string $incarnationId,
         array $roles,
         bool $ready,
+        bool $draining,
         float $ttlSeconds,
     ): void {
+        if ($ready && $draining) {
+            throw new \InvalidArgumentException('Cluster membership cannot be ready and draining simultaneously.');
+        }
         $this->conn()->execute(
             <<<'SQL'
             INSERT INTO s3_cluster_membership (
-                cluster_id, node_id, incarnation_id, roles, ready, heartbeat_at, expires_at
-            ) VALUES ($1, $2, $3, $4::jsonb, $5, clock_timestamp(), clock_timestamp() + $6 * INTERVAL '1 second')
+                cluster_id, node_id, incarnation_id, roles, ready, draining, heartbeat_at, expires_at
+            ) VALUES ($1, $2, $3, $4::jsonb, $5, $6, clock_timestamp(), clock_timestamp() + $7 * INTERVAL '1 second')
             ON CONFLICT (cluster_id, node_id, incarnation_id) DO UPDATE SET
                 roles = EXCLUDED.roles,
                 ready = EXCLUDED.ready,
+                draining = EXCLUDED.draining,
                 heartbeat_at = clock_timestamp(),
-                expires_at = clock_timestamp() + $6 * INTERVAL '1 second'
+                expires_at = clock_timestamp() + $7 * INTERVAL '1 second'
             SQL,
-            [$clusterId, $nodeId, $incarnationId, json_encode($roles, JSON_THROW_ON_ERROR), $ready, $ttlSeconds],
+            [$clusterId, $nodeId, $incarnationId, json_encode($roles, JSON_THROW_ON_ERROR), $ready, $draining, $ttlSeconds],
         );
     }
 
@@ -210,17 +226,22 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         string $nodeId,
         string $incarnationId,
         bool $ready,
+        bool $draining,
         float $ttlSeconds,
     ): bool {
+        if ($ready && $draining) {
+            throw new \InvalidArgumentException('Cluster membership cannot be ready and draining simultaneously.');
+        }
         $result = $this->conn()->execute(
             <<<'SQL'
             UPDATE s3_cluster_membership
             SET ready = $1,
+                draining = $2,
                 heartbeat_at = clock_timestamp(),
-                expires_at = clock_timestamp() + $2 * INTERVAL '1 second'
-            WHERE cluster_id = $3 AND node_id = $4 AND incarnation_id = $5
+                expires_at = clock_timestamp() + $3 * INTERVAL '1 second'
+            WHERE cluster_id = $4 AND node_id = $5 AND incarnation_id = $6
             SQL,
-            [$ready, $ttlSeconds, $clusterId, $nodeId, $incarnationId],
+            [$ready, $draining, $ttlSeconds, $clusterId, $nodeId, $incarnationId],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -231,7 +252,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         $this->conn()->execute(
             <<<'SQL'
             UPDATE s3_cluster_membership
-            SET ready = FALSE, heartbeat_at = clock_timestamp(), expires_at = clock_timestamp()
+            SET ready = FALSE, draining = FALSE, heartbeat_at = clock_timestamp(), expires_at = clock_timestamp()
             WHERE cluster_id = $1 AND node_id = $2 AND incarnation_id = $3
             SQL,
             [$clusterId, $nodeId, $incarnationId],
@@ -281,6 +302,256 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
 
         return $roles;
+    }
+
+    public function clusterMembershipSnapshot(
+        string $clusterId,
+        string $nodeId,
+        string $incarnationId,
+    ): ClusterMembershipSnapshot {
+        return $this->clusterMetadataRetry(
+            fn(): ClusterMembershipSnapshot => $this->clusterMembershipSnapshotInTransaction($clusterId, $nodeId, $incarnationId),
+        );
+    }
+
+    public function clusterOperationalSnapshot(
+        string $clusterId,
+        string $nodeId,
+        string $incarnationId,
+    ): ClusterOperationalSnapshot {
+        return $this->clusterMetadataRetry(function () use ($clusterId, $nodeId, $incarnationId): ClusterOperationalSnapshot {
+            $membership = $this->clusterMembershipSnapshotInTransaction($clusterId, $nodeId, $incarnationId);
+            $work = [];
+            foreach ($this->clusterQueueSnapshots($membership->observedAt) as $snapshot) {
+                $work[$snapshot->workClass] = $snapshot;
+            }
+
+            return new ClusterOperationalSnapshot(
+                observedAt: $membership->observedAt,
+                membership: $membership->membership,
+                lastHeartbeatAt: $membership->lastHeartbeatAt,
+                heartbeatAgeSeconds: $membership->heartbeatAgeSeconds,
+                roleCounts: $membership->roleCounts,
+                work: $work,
+            );
+        });
+    }
+
+    private function clusterMembershipSnapshotInTransaction(
+        string $clusterId,
+        string $nodeId,
+        string $incarnationId,
+    ): ClusterMembershipSnapshot {
+        $this->conn()->execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+        $member = $this->conn()->execute(
+            <<<'SQL'
+                WITH observation AS (SELECT clock_timestamp() AS observed_at)
+                SELECT EXTRACT(EPOCH FROM observation.observed_at) AS observed_at,
+                       EXTRACT(EPOCH FROM member.heartbeat_at) AS heartbeat_at,
+                       COALESCE(member.expires_at > observation.observed_at, FALSE) AS current
+                FROM observation
+                LEFT JOIN s3_cluster_membership AS member
+                  ON member.cluster_id = $1 AND member.node_id = $2 AND member.incarnation_id = $3
+                SQL,
+            [$clusterId, $nodeId, $incarnationId],
+        )->fetchRow() ?? throw new \RuntimeException('Cluster observation time is unavailable.');
+        $observedAt = (float) $member['observed_at'];
+        $heartbeatAt = $member['heartbeat_at'] === null ? null : (float) $member['heartbeat_at'];
+
+        $roleCounts = [];
+        foreach (ClusterRoleSet::ALL as $role) {
+            $roleCounts[$role] = ['ready' => 0, 'draining' => 0];
+        }
+        $scanLimit = self::CLUSTER_SNAPSHOT_COUNT_LIMIT + 1;
+        $members = $this->conn()->execute(
+            <<<SQL
+                SELECT roles::text AS roles, ready, draining
+                FROM s3_cluster_membership AS membership
+                WHERE membership.cluster_id = \$1 AND membership.expires_at > to_timestamp(\$2)
+                ORDER BY membership.expires_at, membership.node_id, membership.incarnation_id
+                LIMIT {$scanLimit}
+                SQL,
+            [$clusterId, $observedAt],
+        );
+        $memberCount = 0;
+        while (($row = $members->fetchRow()) !== null) {
+            self::assertBoundedClusterMembershipCount(++$memberCount);
+            $memberRoles = json_decode(self::str($row['roles']), true, 16, JSON_THROW_ON_ERROR);
+            if (! is_array($memberRoles)) {
+                throw new \RuntimeException('Cluster membership roles are invalid.');
+            }
+            foreach ($memberRoles as $role) {
+                if (! is_string($role) || ! isset($roleCounts[$role])) {
+                    continue;
+                }
+                if (($row['ready'] ?? false) === true) {
+                    ++$roleCounts[$role]['ready'];
+                } elseif (($row['draining'] ?? false) === true) {
+                    ++$roleCounts[$role]['draining'];
+                }
+            }
+        }
+
+        return new ClusterMembershipSnapshot(
+            observedAt: $observedAt,
+            membership: ($member['current'] ?? false) === true ? 'current' : 'stale',
+            lastHeartbeatAt: $heartbeatAt,
+            heartbeatAgeSeconds: $heartbeatAt === null ? null : max(0.0, $observedAt - $heartbeatAt),
+            roleCounts: $roleCounts,
+        );
+    }
+
+    /** @return list<ClusterWorkSnapshot> */
+    private function clusterQueueSnapshots(float $observedAt): array
+    {
+        $outcomes = [];
+        $result = $this->conn()->query(
+            'SELECT work_class, successful_takeovers, failed_takeovers, stale_acknowledgements, highest_generation '
+            . 'FROM s3_cluster_work_observability ORDER BY work_class COLLATE "C"',
+        );
+        while (($row = $result->fetchRow()) !== null) {
+            $outcomes[self::str($row['work_class'])] = [
+                'successful' => (int) $row['successful_takeovers'],
+                'failed' => (int) $row['failed_takeovers'],
+                'stale' => (int) $row['stale_acknowledgements'],
+                'generation' => (int) $row['highest_generation'],
+            ];
+        }
+        self::assertClusterOutcomeCatalog($outcomes);
+
+        $snapshots = [];
+        $queues = [
+            'notification' => 's3_notification_queue',
+            'transition' => 's3_tier_transition_jobs',
+            'restore' => 's3_restore_jobs',
+            'garbage' => 's3_storage_garbage',
+        ];
+        $scanLimit = self::CLUSTER_SNAPSHOT_COUNT_LIMIT + 1;
+        foreach ($queues as $workClass => $table) {
+            $row = $this->conn()->execute(
+                "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM {$table} WHERE status = 'pending' AND next_attempt_at <= \$1 LIMIT {$scanLimit}) AS bounded_pending) AS pending, "
+                . "(SELECT \$1 - LEAST("
+                . "(SELECT next_attempt_at FROM {$table} WHERE status = 'pending' AND next_attempt_at <= \$1 ORDER BY next_attempt_at, id LIMIT 1), "
+                . "(SELECT next_attempt_at FROM {$table} WHERE status = 'processing' AND next_attempt_at <= \$1 ORDER BY next_attempt_at, id LIMIT 1))) AS oldest_age, "
+                . "(SELECT COUNT(*) FROM (SELECT 1 FROM {$table} WHERE status = 'processing' AND next_attempt_at > \$1 LIMIT {$scanLimit}) AS bounded_active) AS active, "
+                . "(SELECT COUNT(*) FROM (SELECT 1 FROM {$table} WHERE status = 'processing' AND next_attempt_at <= \$1 LIMIT {$scanLimit}) AS bounded_expired) AS expired, "
+                . "(SELECT COUNT(*) FROM (SELECT 1 FROM {$table} WHERE status = 'pending' AND next_attempt_at <= \$1 AND attempts > 0 LIMIT {$scanLimit}) AS bounded_retry) AS retry",
+                [$observedAt],
+            )->fetchRow() ?? [];
+            $telemetry = $outcomes[$workClass];
+            $snapshots[] = new ClusterWorkSnapshot(
+                $workClass,
+                self::boundedClusterCount($row['pending'] ?? 0),
+                $row['oldest_age'] === null ? null : max(0.0, (float) $row['oldest_age']),
+                self::boundedClusterCount($row['active'] ?? 0),
+                self::boundedClusterCount($row['expired'] ?? 0),
+                self::boundedClusterCount($row['retry'] ?? 0),
+                $telemetry['successful'],
+                $telemetry['failed'],
+                $telemetry['stale'],
+                $telemetry['generation'],
+            );
+        }
+
+        $multipart = $this->conn()->execute(
+            <<<SQL
+            SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM s3_multipart_write_intents WHERE dispatch_id IS NOT NULL AND state = 'abandoned' AND claim_worker_id IS NULL AND next_attempt_at <= \$1 LIMIT {$scanLimit}) AS bounded_pending) AS pending,
+                   (SELECT COUNT(*) FROM (SELECT 1 FROM s3_multipart_write_intents WHERE dispatch_id IS NOT NULL AND ((state = 'active' AND lease_until > \$1) OR (state = 'abandoned' AND claim_worker_id IS NOT NULL AND next_attempt_at > \$1)) LIMIT {$scanLimit}) AS bounded_active) AS active,
+                   (SELECT COUNT(*) FROM (SELECT 1 FROM s3_multipart_write_intents WHERE dispatch_id IS NOT NULL AND ((state = 'active' AND lease_until <= \$1) OR (state = 'abandoned' AND claim_worker_id IS NOT NULL AND next_attempt_at <= \$1)) LIMIT {$scanLimit}) AS bounded_expired) AS expired,
+                   LEAST(
+                       (SELECT next_attempt_at FROM s3_multipart_write_intents WHERE dispatch_id IS NOT NULL AND state = 'abandoned' AND next_attempt_at <= \$1 ORDER BY next_attempt_at, attempt_id LIMIT 1),
+                       (SELECT lease_until FROM s3_multipart_write_intents WHERE dispatch_id IS NOT NULL AND state = 'active' AND lease_until <= \$1 ORDER BY lease_until, attempt_id LIMIT 1)
+                   ) AS oldest_at
+            SQL,
+            [$observedAt],
+        )->fetchRow() ?? [];
+        $snapshots[] = $this->intentSnapshot('multipart_intent', $multipart, $observedAt, $outcomes);
+
+        $object = $this->conn()->execute(
+            <<<SQL
+            SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM s3_object_write_intents WHERE dispatch_id IS NOT NULL AND state = 'active' AND lease_until <= \$1 LIMIT {$scanLimit}) AS bounded_pending) AS pending,
+                   (SELECT COUNT(*) FROM (SELECT 1 FROM s3_object_write_intents WHERE dispatch_id IS NOT NULL AND state IN ('active', 'reconciling') AND lease_until > \$1 LIMIT {$scanLimit}) AS bounded_active) AS active,
+                   (SELECT COUNT(*) FROM (SELECT 1 FROM s3_object_write_intents WHERE dispatch_id IS NOT NULL AND state = 'reconciling' AND lease_until <= \$1 LIMIT {$scanLimit}) AS bounded_expired) AS expired,
+                   (SELECT lease_until FROM s3_object_write_intents WHERE dispatch_id IS NOT NULL AND state IN ('active', 'reconciling') AND lease_until <= \$1 ORDER BY lease_until, attempt_id LIMIT 1) AS oldest_at
+            SQL,
+            [$observedAt],
+        )->fetchRow() ?? [];
+        $snapshots[] = $this->intentSnapshot('object_intent', $object, $observedAt, $outcomes);
+
+        $lifecycle = $this->conn()->execute(
+            <<<'SQL'
+            SELECT COUNT(*) FILTER (WHERE expires_at > to_timestamp($1)) AS active,
+                   COUNT(*) FILTER (WHERE expires_at <= to_timestamp($1)) AS expired,
+                   COALESCE(MAX(lease_generation), 0) AS current_generation
+            FROM s3_locks WHERE lock_name = 'lifecycle:global' AND owner_id <> '__released__'
+            SQL,
+            [$observedAt],
+        )->fetchRow() ?? [];
+        $telemetry = $outcomes['lifecycle'];
+        $snapshots[] = new ClusterWorkSnapshot(
+            'lifecycle',
+            null,
+            null,
+            (int) ($lifecycle['active'] ?? 0),
+            (int) ($lifecycle['expired'] ?? 0),
+            null,
+            $telemetry['successful'],
+            $telemetry['failed'],
+            $telemetry['stale'],
+            max($telemetry['generation'], (int) ($lifecycle['current_generation'] ?? 0)),
+        );
+
+        return $snapshots;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     * @param array<string, array{successful: int, failed: int, stale: int, generation: int}> $outcomes
+     */
+    private function intentSnapshot(string $workClass, array $row, float $observedAt, array $outcomes): ClusterWorkSnapshot
+    {
+        $pending = self::boundedClusterCount($row['pending'] ?? 0);
+        $expired = self::boundedClusterCount($row['expired'] ?? 0);
+        $telemetry = $outcomes[$workClass];
+
+        return new ClusterWorkSnapshot(
+            $workClass,
+            $pending,
+            $row['oldest_at'] === null ? null : max(0.0, $observedAt - (float) $row['oldest_at']),
+            self::boundedClusterCount($row['active'] ?? 0),
+            $expired,
+            null,
+            $telemetry['successful'],
+            $telemetry['failed'],
+            $telemetry['stale'],
+            $telemetry['generation'],
+        );
+    }
+
+    private static function boundedClusterCount(mixed $value): ?int
+    {
+        $count = (int) $value;
+
+        return $count > self::CLUSTER_SNAPSHOT_COUNT_LIMIT ? null : $count;
+    }
+
+    /** @param array<string, array{successful: int, failed: int, stale: int, generation: int}> $outcomes */
+    private static function assertClusterOutcomeCatalog(array $outcomes): void
+    {
+        $workClasses = array_keys($outcomes);
+        sort($workClasses, SORT_STRING);
+        $expected = ClusterWorkSnapshot::ALL;
+        sort($expected, SORT_STRING);
+        if ($workClasses !== $expected) {
+            throw new \RuntimeException('Cluster work observability catalog is incomplete.');
+        }
+    }
+
+    private static function assertBoundedClusterMembershipCount(int $count): void
+    {
+        if ($count > self::CLUSTER_SNAPSHOT_COUNT_LIMIT) {
+            throw new \RuntimeException('Cluster membership snapshot exceeds the bounded live-process limit.');
+        }
     }
 
     public function initialize(): void
@@ -1917,7 +2188,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             SET lease_until = $1, next_attempt_at = $1
             WHERE attempt_id = $2 AND state = 'active' AND lease_until = $3
             AND lease_until > EXTRACT(EPOCH FROM clock_timestamp()) AND $1 > lease_until",
-            [$newLeaseUntil, $attemptId, $expectedLeaseUntil],
+            [$newLeaseUntil, $attemptId, sprintf('%.17F', $expectedLeaseUntil)],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -1958,7 +2229,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             "UPDATE s3_multipart_write_intents SET dispatch_id = $1, lease_until = $2, next_attempt_at = $2
              WHERE attempt_id = $3 AND state = 'active' AND dispatch_id IS NULL AND lease_until = $4
                AND lease_until > EXTRACT(EPOCH FROM clock_timestamp()) AND $2 > lease_until",
-            [$dispatchId, $newLeaseUntil, $attemptId, $expectedLeaseUntil],
+            [$dispatchId, $newLeaseUntil, $attemptId, sprintf('%.17F', $expectedLeaseUntil)],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -2045,9 +2316,9 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     public function retryMultipartWriteIntent(string $attemptId, float $expectedLeaseUntil, float $nextAttemptAt): bool
     {
         $result = $this->conn()->execute(
-            "UPDATE s3_multipart_write_intents SET next_attempt_at = $1
+            "UPDATE s3_multipart_write_intents SET next_attempt_at = $1, claim_worker_id = NULL, claim_heartbeat_at = NULL
             WHERE attempt_id = $2 AND state = 'abandoned' AND next_attempt_at = $3",
-            [$nextAttemptAt, $attemptId, $expectedLeaseUntil],
+            [$nextAttemptAt, $attemptId, sprintf('%.17F', $expectedLeaseUntil)],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -2059,7 +2330,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             "UPDATE s3_multipart_write_intents SET next_attempt_at = $1
              WHERE attempt_id = $2 AND state = 'abandoned' AND next_attempt_at = $3 AND claim_generation = $4
                AND next_attempt_at > EXTRACT(EPOCH FROM clock_timestamp()) AND $1 > next_attempt_at",
-            [$newLeaseUntil, $attemptId, $expectedLeaseUntil, $claimGeneration],
+            [$newLeaseUntil, $attemptId, sprintf('%.17F', $expectedLeaseUntil), $claimGeneration],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -2068,10 +2339,10 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
     public function retryMultipartCollectorClaim(string $attemptId, float $nextAttemptAt, float $expectedLeaseUntil, int $claimGeneration): bool
     {
         $result = $this->conn()->execute(
-            "UPDATE s3_multipart_write_intents SET next_attempt_at = $1
+            "UPDATE s3_multipart_write_intents SET next_attempt_at = $1, claim_worker_id = NULL, claim_heartbeat_at = NULL
              WHERE attempt_id = $2 AND state = 'abandoned' AND next_attempt_at = $3 AND claim_generation = $4
                AND next_attempt_at > EXTRACT(EPOCH FROM clock_timestamp())",
-            [$nextAttemptAt, $attemptId, $expectedLeaseUntil, $claimGeneration],
+            [$nextAttemptAt, $attemptId, sprintf('%.17F', $expectedLeaseUntil), $claimGeneration],
         );
 
         return ($result->getRowCount() ?? 0) === 1;
@@ -4671,6 +4942,9 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
 
         return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
             $row = $this->conn()->execute(<<<'SQL'
+                WITH previous AS MATERIALIZED (
+                    SELECT owner_id, expires_at FROM s3_locks WHERE lock_name = 'lifecycle:global'
+                ), claimed AS (
                 INSERT INTO s3_locks (lock_name, owner_id, expires_at, heartbeat_at, lease_generation)
                 VALUES ('lifecycle:global', $1, clock_timestamp() + ($2::double precision * INTERVAL '1 second'),
                         EXTRACT(EPOCH FROM clock_timestamp()), 1)
@@ -4683,10 +4957,18 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 WHERE s3_locks.expires_at <= clock_timestamp()
                 RETURNING owner_id, lease_generation, heartbeat_at,
                           EXTRACT(EPOCH FROM expires_at) AS lease_expires_at
+                )
+                SELECT claimed.*,
+                       COALESCE(previous.owner_id <> '__released__' AND previous.expires_at <= clock_timestamp(), FALSE) AS was_takeover
+                FROM claimed LEFT JOIN previous ON TRUE
                 SQL, [$workerId, $leaseSeconds])->fetchRow();
 
+            if ($row !== null) {
+                $this->recordClusterClaim(ClusterWorkToken::LIFECYCLE, (int) $row['lease_generation'], ($row['was_takeover'] ?? false) === true);
+            }
+
             return $row === null ? null : new ClusterWorkClaim(
-                self::clusterToken(ClusterWorkToken::LIFECYCLE, 'lifecycle:global', $row),
+                self::clusterToken(ClusterWorkToken::LIFECYCLE, 'lifecycle:global', $row, takeover: ($row['was_takeover'] ?? false) === true),
                 null,
             );
         });
@@ -4699,7 +4981,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
             $row = $this->conn()->execute(<<<'SQL'
                 WITH due AS (
-                    SELECT id FROM s3_notification_queue
+                    SELECT id, status = 'processing' AS was_takeover FROM s3_notification_queue
                     WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
                        OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
                     ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -4709,11 +4991,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
                     next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
                 FROM due WHERE queue.id = due.id
-                RETURNING queue.*
+                RETURNING queue.*, due.was_takeover
                 SQL, [$workerId, $leaseSeconds])->fetchRow();
             if ($row === null) {
                 return null;
             }
+            $takeover = ($row['was_takeover'] ?? false) === true;
+            $this->recordClusterClaim(ClusterWorkToken::NOTIFICATION, (int) $row['lease_generation'], $takeover);
             $work = [
                 'id' => (int) $row['id'],
                 'bucket' => self::str($row['bucket']),
@@ -4728,7 +5012,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             ];
 
             return new ClusterWorkClaim(
-                self::clusterToken(ClusterWorkToken::NOTIFICATION, (string) $work['id'], $row, 'next_attempt_at'),
+                self::clusterToken(ClusterWorkToken::NOTIFICATION, (string) $work['id'], $row, 'next_attempt_at', takeover: $takeover),
                 $work,
             );
         });
@@ -4763,7 +5047,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
             $row = $this->conn()->execute(<<<'SQL'
                 WITH due AS (
-                    SELECT id FROM s3_storage_garbage
+                    SELECT id, status = 'processing' AS was_takeover FROM s3_storage_garbage
                     WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
                        OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp()))
                     ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -4773,11 +5057,13 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
                     next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
                 FROM due WHERE garbage.id = due.id
-                RETURNING garbage.*
+                RETURNING garbage.*, due.was_takeover
                 SQL, [$workerId, $leaseSeconds])->fetchRow();
             if ($row === null) {
                 return null;
             }
+            $takeover = ($row['was_takeover'] ?? false) === true;
+            $this->recordClusterClaim(ClusterWorkToken::STORAGE_GARBAGE, (int) $row['lease_generation'], $takeover);
             $work = [
                 'id' => (int) $row['id'],
                 'bucket' => self::str($row['bucket']),
@@ -4794,7 +5080,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             ];
 
             return new ClusterWorkClaim(
-                self::clusterToken(ClusterWorkToken::STORAGE_GARBAGE, (string) $work['id'], $row, 'next_attempt_at'),
+                self::clusterToken(ClusterWorkToken::STORAGE_GARBAGE, (string) $work['id'], $row, 'next_attempt_at', takeover: $takeover),
                 $work,
             );
         });
@@ -4807,11 +5093,14 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return $this->clusterMetadataRetry(function () use ($workerId, $leaseSeconds): ?ClusterWorkClaim {
             $row = $this->conn()->execute(<<<'SQL'
                 WITH due AS (
-                    SELECT attempt_id FROM s3_multipart_write_intents
+                    SELECT attempt_id,
+                           state = 'active' OR (state = 'abandoned' AND claim_worker_id IS NOT NULL) AS was_takeover
+                    FROM s3_multipart_write_intents
                     WHERE dispatch_id IS NOT NULL
                       AND ((state = 'active' AND lease_until <= EXTRACT(EPOCH FROM clock_timestamp()))
                        OR (state = 'abandoned' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())))
-                    ORDER BY next_attempt_at, attempt_id LIMIT 1 FOR UPDATE SKIP LOCKED
+                    ORDER BY CASE WHEN state = 'active' THEN lease_until ELSE next_attempt_at END, attempt_id
+                    LIMIT 1 FOR UPDATE SKIP LOCKED
                 )
                 UPDATE s3_multipart_write_intents AS intent
                 SET state = 'abandoned', active_upload_id = NULL,
@@ -4819,14 +5108,16 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
                     next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision
                 FROM due WHERE intent.attempt_id = due.attempt_id
-                RETURNING intent.*
+                RETURNING intent.*, due.was_takeover
                 SQL, [$workerId, $leaseSeconds])->fetchRow();
             if ($row === null) {
                 return null;
             }
+            $takeover = ($row['was_takeover'] ?? false) === true;
+            $this->recordClusterClaim(ClusterWorkToken::MULTIPART_INTENT, (int) $row['claim_generation'], $takeover);
 
             return new ClusterWorkClaim(
-                self::clusterToken(ClusterWorkToken::MULTIPART_INTENT, self::str($row['attempt_id']), $row, 'next_attempt_at', 'claim_generation'),
+                self::clusterToken(ClusterWorkToken::MULTIPART_INTENT, self::str($row['attempt_id']), $row, 'next_attempt_at', 'claim_generation', $takeover),
                 self::multipartWriteIntentFromRow($row),
             );
         });
@@ -4843,7 +5134,9 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         return $this->clusterMetadataRetry(function () use ($storageTier, $workerId, $leaseSeconds): ?ClusterWorkClaim {
             $row = $this->conn()->execute(<<<'SQL'
                 WITH due AS (
-                    SELECT attempt_id FROM s3_object_write_intents
+                    SELECT attempt_id, TRUE AS was_takeover,
+                           state = 'reconciling' AS failed_previous_takeover
+                    FROM s3_object_write_intents
                     WHERE storage_tier = $1 AND state IN ('active', 'reconciling') AND dispatch_id IS NOT NULL
                       AND lease_until <= EXTRACT(EPOCH FROM clock_timestamp())
                     ORDER BY lease_until, attempt_id LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -4853,14 +5146,19 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                     claim_worker_id = $2, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()),
                     lease_until = EXTRACT(EPOCH FROM clock_timestamp()) + $3::double precision
                 FROM due WHERE intent.attempt_id = due.attempt_id AND intent.storage_tier = $1
-                RETURNING intent.*
+                RETURNING intent.*, due.was_takeover, due.failed_previous_takeover
                 SQL, [$storageTier, $workerId, $leaseSeconds])->fetchRow();
             if ($row === null) {
                 return null;
             }
+            $takeover = ($row['was_takeover'] ?? false) === true;
+            $this->recordClusterClaim(ClusterWorkToken::OBJECT_INTENT, (int) $row['claim_generation'], $takeover);
+            if (($row['failed_previous_takeover'] ?? false) === true) {
+                $this->recordFailedClusterTakeover(ClusterWorkToken::OBJECT_INTENT, (int) $row['claim_generation'] - 1);
+            }
 
             return new ClusterWorkClaim(
-                self::clusterToken(ClusterWorkToken::OBJECT_INTENT, self::str($row['attempt_id']), $row, 'lease_until', 'claim_generation'),
+                self::clusterToken(ClusterWorkToken::OBJECT_INTENT, self::str($row['attempt_id']), $row, 'lease_until', 'claim_generation', $takeover),
                 self::objectWriteIntentFromRow($row),
             );
         });
@@ -4881,6 +5179,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 $token->generation,
                 (float) $row['heartbeat_at'],
                 (float) $row['lease_expires_at'],
+                $token->takeover,
             );
         });
     }
@@ -4892,6 +5191,7 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         }
         [$sql, $params] = $this->clusterAssertionSql($token);
         if ($this->conn()->execute($sql, $params)->fetchRow() === null) {
+            $this->deferClusterStaleAcknowledgement($token);
             throw new \RuntimeException('Cluster work ownership was lost.');
         }
     }
@@ -4905,18 +5205,30 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         });
     }
 
-    public function releaseClusterWork(ClusterWorkToken $token): bool
+    public function releaseClusterWork(ClusterWorkToken $token, bool $failedTakeover = false): bool
     {
         if ($token->kind !== ClusterWorkToken::LIFECYCLE) {
             throw new \InvalidArgumentException('Only the lifecycle lease supports explicit release.');
         }
 
-        return $this->clusterMetadataRetry(fn(): bool => ($this->conn()->execute(
-            'UPDATE s3_locks SET expires_at = clock_timestamp(), heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), '
-            . 'updated_at = clock_timestamp() WHERE lock_name = $1 AND owner_id = $2 AND lease_generation = $3 '
-            . 'AND expires_at > clock_timestamp()',
-            [$token->workId, $token->workerId, $token->generation],
-        )->getRowCount() ?? 0) === 1);
+        $released = $this->clusterMetadataRetry(function () use ($token, $failedTakeover): bool {
+            $updated = ($this->conn()->execute(
+                "UPDATE s3_locks SET owner_id = '__released__', expires_at = clock_timestamp(), heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), "
+                . 'updated_at = clock_timestamp() WHERE lock_name = $1 AND owner_id = $2 AND lease_generation = $3 '
+                . 'AND expires_at > clock_timestamp()',
+                [$token->workId, $token->workerId, $token->generation],
+            )->getRowCount() ?? 0) === 1;
+            if ($updated && $failedTakeover) {
+                $this->recordClusterWorkOutcome($token, ClusterWorkOutcomeRecorder::FAILED_TAKEOVER);
+            }
+
+            return $updated;
+        });
+        if (! $released) {
+            $this->recordClusterWorkOutcome($token, ClusterWorkOutcomeRecorder::STALE_ACKNOWLEDGEMENT);
+        }
+
+        return $released;
     }
 
     /**
@@ -4931,23 +5243,25 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
 
         return $this->clusterMetadataRetry(function () use ($kind, $table, $workerId, $leaseSeconds, $mapper): ?ClusterWorkClaim {
             $row = $this->conn()->execute(
-                "WITH due AS (SELECT id FROM {$table} WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) "
-                . "UPDATE {$table} AS queue SET status = 'processing', lease_generation = queue.lease_generation + 1, claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision, updated_at = clock_timestamp() FROM due WHERE queue.id = due.id RETURNING queue.*",
+                "WITH due AS (SELECT id, status = 'processing' AS was_takeover FROM {$table} WHERE (status = 'pending' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) OR (status = 'processing' AND next_attempt_at <= EXTRACT(EPOCH FROM clock_timestamp())) ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) "
+                . "UPDATE {$table} AS queue SET status = 'processing', lease_generation = queue.lease_generation + 1, claim_worker_id = $1, claim_heartbeat_at = EXTRACT(EPOCH FROM clock_timestamp()), next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) + $2::double precision, updated_at = clock_timestamp() FROM due WHERE queue.id = due.id RETURNING queue.*, due.was_takeover",
                 [$workerId, $leaseSeconds],
             )->fetchRow();
             if ($row === null) {
                 return null;
             }
+            $takeover = ($row['was_takeover'] ?? false) === true;
+            $this->recordClusterClaim($kind, (int) $row['lease_generation'], $takeover);
 
             return new ClusterWorkClaim(
-                self::clusterToken($kind, (string) self::int($row['id']), $row, 'next_attempt_at'),
+                self::clusterToken($kind, (string) self::int($row['id']), $row, 'next_attempt_at', takeover: $takeover),
                 $mapper($row),
             );
         });
     }
 
     /** @param array<string, mixed> $row */
-    private static function clusterToken(string $kind, string $workId, array $row, string $leaseColumn = 'lease_expires_at', string $generationColumn = 'lease_generation'): ClusterWorkToken
+    private static function clusterToken(string $kind, string $workId, array $row, string $leaseColumn = 'lease_expires_at', string $generationColumn = 'lease_generation', bool $takeover = false): ClusterWorkToken
     {
         return new ClusterWorkToken(
             $kind,
@@ -4956,7 +5270,96 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             (int) $row[$generationColumn],
             (float) ($row['claim_heartbeat_at'] ?? $row['heartbeat_at']),
             (float) $row[$leaseColumn],
+            $takeover,
         );
+    }
+
+    public function recordClusterWorkOutcome(ClusterWorkToken $token, string $outcome): void
+    {
+        if (! in_array($outcome, [ClusterWorkOutcomeRecorder::FAILED_TAKEOVER, ClusterWorkOutcomeRecorder::STALE_ACKNOWLEDGEMENT], true)) {
+            throw new \InvalidArgumentException('Cluster work outcome is invalid.');
+        }
+        if ($outcome === ClusterWorkOutcomeRecorder::FAILED_TAKEOVER && ! $token->takeover) {
+            return;
+        }
+        $column = $outcome === ClusterWorkOutcomeRecorder::FAILED_TAKEOVER
+            ? 'failed_takeovers'
+            : 'stale_acknowledgements';
+        $result = $this->conn()->execute(
+            "UPDATE s3_cluster_work_observability SET {$column} = CASE "
+            . "WHEN {$column} < 9223372036854775807 THEN {$column} + 1 ELSE {$column} END, "
+            . 'highest_generation = GREATEST(highest_generation, $1) WHERE work_class = $2',
+            [$token->generation, self::clusterWorkClass($token->kind)],
+        );
+        self::requireClusterOutcomeUpdate($result->getRowCount());
+    }
+
+    private function recordClusterClaim(string $kind, int $generation, bool $takeover): void
+    {
+        $workClass = self::clusterWorkClass($kind);
+        if ($takeover) {
+            $result = $this->conn()->execute(
+                'UPDATE s3_cluster_work_observability SET successful_takeovers = CASE '
+                . 'WHEN successful_takeovers < 9223372036854775807 THEN successful_takeovers + 1 ELSE successful_takeovers END, '
+                . 'highest_generation = GREATEST(highest_generation, $1) WHERE work_class = $2',
+                [$generation, $workClass],
+            );
+            self::requireClusterOutcomeUpdate($result->getRowCount());
+
+            return;
+        }
+
+        $result = $this->conn()->execute(
+            'UPDATE s3_cluster_work_observability SET highest_generation = $1 '
+            . 'WHERE work_class = $2 AND highest_generation < $1',
+            [$generation, $workClass],
+        );
+        if (($result->getRowCount() ?? 0) === 0) {
+            self::requireClusterOutcomeRow($this->conn()->execute(
+                'SELECT 1 FROM s3_cluster_work_observability WHERE work_class = $1',
+                [$workClass],
+            )->fetchRow());
+        }
+    }
+
+    private function recordFailedClusterTakeover(string $kind, int $generation): void
+    {
+        $result = $this->conn()->execute(
+            'UPDATE s3_cluster_work_observability SET failed_takeovers = CASE '
+            . 'WHEN failed_takeovers < 9223372036854775807 THEN failed_takeovers + 1 ELSE failed_takeovers END, '
+            . 'highest_generation = GREATEST(highest_generation, $1) WHERE work_class = $2',
+            [$generation, self::clusterWorkClass($kind)],
+        );
+        self::requireClusterOutcomeUpdate($result->getRowCount());
+    }
+
+    private static function requireClusterOutcomeUpdate(?int $rowCount): void
+    {
+        if ($rowCount !== 1) {
+            throw new \RuntimeException('Cluster work observability row is missing.');
+        }
+    }
+
+    /** @param array<string, mixed>|null $row */
+    private static function requireClusterOutcomeRow(?array $row): void
+    {
+        if ($row === null) {
+            throw new \RuntimeException('Cluster work observability row is missing.');
+        }
+    }
+
+    private static function clusterWorkClass(string $kind): string
+    {
+        return match ($kind) {
+            ClusterWorkToken::NOTIFICATION => 'notification',
+            ClusterWorkToken::TIER_TRANSITION => 'transition',
+            ClusterWorkToken::RESTORE => 'restore',
+            ClusterWorkToken::STORAGE_GARBAGE => 'garbage',
+            ClusterWorkToken::MULTIPART_INTENT => 'multipart_intent',
+            ClusterWorkToken::OBJECT_INTENT => 'object_intent',
+            ClusterWorkToken::LIFECYCLE => 'lifecycle',
+            default => throw new \InvalidArgumentException('Cluster work token kind is invalid.'),
+        };
     }
 
     private static function validateClusterClaim(string $workerId, float $leaseSeconds): void
@@ -5138,6 +5541,8 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             return \Amp\async(fn(): mixed => $this->transaction($callback))->await();
         }
 
+        $fiber = \Fiber::getCurrent();
+
         $existingTx = $this->fiberTransaction();
         $ownTx = ($existingTx === null);
         if ($ownTx) {
@@ -5148,6 +5553,12 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
             $result = $callback();
             if ($ownTx) {
                 $this->commit();
+                try {
+                    $this->flushDeferredClusterStaleAcknowledgements($fiber);
+                } catch (\Throwable) {
+                    // A committed work mutation cannot become a false failure
+                    // because its diagnostic counter could not be persisted.
+                }
             }
 
             return $result;
@@ -5158,6 +5569,14 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
                 } catch (\Throwable) {
                     // Preserve the operation failure; rollback is best-effort
                     // once the transaction connection itself has failed.
+                }
+            }
+            if ($ownTx) {
+                try {
+                    $this->flushDeferredClusterStaleAcknowledgements($fiber);
+                } catch (\Throwable) {
+                    // Ownership loss remains authoritative even when its
+                    // failure-isolated counter cannot be persisted.
                 }
             }
 
@@ -5192,6 +5611,27 @@ final class PostgresMetadataStore implements MetadataStore, MetadataWriteReadine
         $fiber = \Fiber::getCurrent();
 
         return ($fiber !== null && isset($this->fiberTxMap[$fiber])) ? $this->fiberTxMap[$fiber] : null;
+    }
+
+    private function deferClusterStaleAcknowledgement(ClusterWorkToken $token): void
+    {
+        $fiber = \Fiber::getCurrent();
+        if ($fiber === null || $this->fiberTransaction() === null) {
+            throw new \LogicException('Deferred cluster outcomes require an active transaction.');
+        }
+        $pending = $this->deferredClusterStaleAcknowledgements[$fiber] ?? [];
+        $pending[] = $token;
+        $this->deferredClusterStaleAcknowledgements[$fiber] = $pending;
+    }
+
+    /** @param \Fiber<mixed, mixed, mixed, mixed> $fiber */
+    private function flushDeferredClusterStaleAcknowledgements(\Fiber $fiber): void
+    {
+        $pending = $this->deferredClusterStaleAcknowledgements[$fiber] ?? [];
+        unset($this->deferredClusterStaleAcknowledgements[$fiber]);
+        foreach ($pending as $token) {
+            $this->recordClusterWorkOutcome($token, ClusterWorkOutcomeRecorder::STALE_ACKNOWLEDGEMENT);
+        }
     }
 
     private function authorizeObjectPartLayoutPublication(int $objectId): void

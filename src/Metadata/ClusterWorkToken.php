@@ -22,6 +22,7 @@ final readonly class ClusterWorkToken
         public int $generation,
         public float $heartbeatAt,
         public float $leaseExpiresAt,
+        public bool $takeover = false,
     ) {
         if (! in_array($kind, self::kinds(), true)) {
             throw new \InvalidArgumentException('Cluster work token kind is invalid.');

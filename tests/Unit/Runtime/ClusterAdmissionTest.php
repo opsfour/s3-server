@@ -594,6 +594,22 @@ final class ClusterAdmissionTest extends TestCase
         self::assertSame(ClusterCapabilityFingerprint::PROTOCOL, $payload['cluster']['protocol']);
         self::assertSame(['api', 'reconcile'], $payload['cluster']['roles']);
         self::assertArrayNotHasKey('category', $payload['cluster']);
+        self::assertSame('unavailable', $payload['dependencies']['admission']['state']);
+        self::assertSame('current', $payload['dependencies']['admission']['observation']);
+        self::assertSame('unavailable', $payload['dependencies']['admission']['reason']);
+        self::assertSame('cluster', $payload['dependencies']['admission']['scope']);
+        self::assertSame(['all_mutations'], $payload['dependencies']['admission']['affected_scopes']);
+        self::assertSame(
+            ['admission', 'metadata', 'storage_admission', 'credentials', 'role_coverage', 'temporary_capacity', 'drain'],
+            array_keys($payload['dependencies']),
+        );
+        foreach (array_diff(array_keys($payload['dependencies']), ['admission']) as $dependency) {
+            self::assertSame('unavailable', $payload['dependencies'][$dependency]['state']);
+            self::assertSame('unobserved', $payload['dependencies'][$dependency]['observation']);
+            self::assertArrayNotHasKey('reason', $payload['dependencies'][$dependency]);
+            self::assertArrayNotHasKey('scope', $payload['dependencies'][$dependency]);
+            self::assertArrayNotHasKey('affected_scopes', $payload['dependencies'][$dependency]);
+        }
     }
 
     public function test_healthy_cluster_readiness_reports_matched_diagnostics(): void
@@ -904,13 +920,13 @@ final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore, Cluste
         return ClusterAdmissionResult::matched('database-id');
     }
 
-    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, float $ttlSeconds): void
+    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, bool $draining, float $ttlSeconds): void
     {
         $this->membershipRoles = $roles;
         $this->membershipReady = $ready;
     }
 
-    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, float $ttlSeconds): bool
+    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, bool $draining, float $ttlSeconds): bool
     {
         $this->membershipReady = $ready;
 

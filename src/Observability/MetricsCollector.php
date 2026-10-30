@@ -9,6 +9,7 @@ use OpsFour\S3Server\Metadata\MultipartPartWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Storage\StorageTempBudgetSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
 
 final class MetricsCollector
 {
@@ -140,6 +141,10 @@ final class MetricsCollector
 
     private ?bool $tempCapacitySnapshotSuccess = null;
 
+    private ?ClusterOperationalSnapshot $clusterOperationalSnapshot = null;
+
+    private ?bool $clusterSnapshotSuccess = null;
+
     public function __construct()
     {
         $this->startedAt = time();
@@ -153,6 +158,16 @@ final class MetricsCollector
     public function setStorageTempCapacitySnapshotSuccess(bool $success): void
     {
         $this->tempCapacitySnapshotSuccess = $success;
+    }
+
+    public function setClusterOperationalSnapshot(?ClusterOperationalSnapshot $snapshot): void
+    {
+        $this->clusterOperationalSnapshot = $snapshot;
+    }
+
+    public function setClusterSnapshotSuccess(bool $success): void
+    {
+        $this->clusterSnapshotSuccess = $success;
     }
 
     public function recordRequest(string $method, ?string $operation, int $status, int $durationNs): void
@@ -487,6 +502,61 @@ final class MetricsCollector
             '# TYPE s3_server_requests_total counter',
         ];
 
+        if ($this->clusterSnapshotSuccess !== null) {
+            $lines[] = '# HELP s3_server_cluster_snapshot_success Whether the current PostgreSQL cluster snapshot was collected successfully.';
+            $lines[] = '# TYPE s3_server_cluster_snapshot_success gauge';
+            $lines[] = 's3_server_cluster_snapshot_success ' . ($this->clusterSnapshotSuccess ? '1' : '0');
+            $lines[] = '# HELP s3_server_cluster_snapshot_fresh Whether cluster samples belong to the current uncached collection.';
+            $lines[] = '# TYPE s3_server_cluster_snapshot_fresh gauge';
+            $lines[] = 's3_server_cluster_snapshot_fresh ' . ($this->clusterSnapshotSuccess ? '1' : '0');
+        }
+        if ($this->clusterOperationalSnapshot !== null) {
+            $snapshot = $this->clusterOperationalSnapshot;
+            $lines[] = '# HELP s3_server_cluster_observed_at_seconds PostgreSQL time of the current cluster observation.';
+            $lines[] = '# TYPE s3_server_cluster_observed_at_seconds gauge';
+            $lines[] = 's3_server_cluster_observed_at_seconds ' . self::formatFloat($snapshot->observedAt);
+            $lines[] = '# HELP s3_server_cluster_role_processes Live compatible processes by fixed role and state.';
+            $lines[] = '# TYPE s3_server_cluster_role_processes gauge';
+            foreach ($snapshot->roleCounts as $role => $counts) {
+                foreach (['ready', 'draining'] as $state) {
+                    $lines[] = 's3_server_cluster_role_processes{role="' . $role . '",state="' . $state . '"} ' . $counts[$state];
+                }
+            }
+            $lines[] = '# HELP s3_server_cluster_work_items Current durable work by fixed queue and state.';
+            $lines[] = '# TYPE s3_server_cluster_work_items gauge';
+            $lines[] = '# HELP s3_server_cluster_work_oldest_eligible_age_seconds Oldest eligible durable work age using PostgreSQL time.';
+            $lines[] = '# TYPE s3_server_cluster_work_oldest_eligible_age_seconds gauge';
+            $lines[] = '# HELP s3_server_cluster_work_takeovers_total Cumulative takeover and stale-acknowledgement outcomes.';
+            $lines[] = '# TYPE s3_server_cluster_work_takeovers_total counter';
+            $lines[] = '# HELP s3_server_cluster_work_generation Highest observed lease generation by fixed work queue.';
+            $lines[] = '# TYPE s3_server_cluster_work_generation gauge';
+            foreach ($snapshot->work as $work) {
+                $queue = $work->workClass;
+                foreach ([
+                    'pending' => $work->pending,
+                    'active' => $work->activeLeases,
+                    'expired' => $work->expiredLeases,
+                    'retry' => $work->retryPressure,
+                ] as $state => $value) {
+                    if ($value !== null) {
+                        $lines[] = 's3_server_cluster_work_items{queue="' . $queue . '",state="' . $state . '"} ' . $value;
+                    }
+                }
+                if ($work->oldestEligibleAgeSeconds !== null) {
+                    $lines[] = 's3_server_cluster_work_oldest_eligible_age_seconds{queue="' . $queue . '"} '
+                        . self::formatFloat($work->oldestEligibleAgeSeconds);
+                }
+                foreach ([
+                    'success' => $work->successfulTakeovers,
+                    'failure' => $work->failedTakeovers,
+                    'stale_acknowledgement' => $work->staleAcknowledgements,
+                ] as $outcome => $value) {
+                    $lines[] = 's3_server_cluster_work_takeovers_total{outcome="' . $outcome . '",queue="' . $queue . '"} ' . $value;
+                }
+                $lines[] = 's3_server_cluster_work_generation{queue="' . $queue . '"} ' . $work->highestGeneration;
+            }
+        }
+
         if ($this->tempCapacity !== null) {
             $lines[] = '# HELP s3_server_node_temp_budget_bytes Configured node-local temporary byte budget.';
             $lines[] = '# TYPE s3_server_node_temp_budget_bytes gauge';
@@ -693,7 +763,10 @@ final class MetricsCollector
             $snapshot = $this->awsOperationalSnapshot;
             $fingerprint = (string) $snapshot['fingerprint'];
             foreach (['healthy', 'provider', 'credentials', 'configuration', 'capacity', 'collector', 'integrity'] as $reason) {
-                $lines[] = 's3_server_aws_profile_state{fingerprint="' . $fingerprint . '",reason="' . $reason . '"} '
+                $labels = $this->clusterSnapshotSuccess === null
+                    ? 'fingerprint="' . $fingerprint . '",reason="' . $reason . '"'
+                    : 'reason="' . $reason . '"';
+                $lines[] = 's3_server_aws_profile_state{' . $labels . '} '
                     . ($snapshot['reason'] === $reason ? '1' : '0');
             }
             foreach (['configuration_valid', 'owner_check_passed', 'provider_admitted', 'fence_complete', 'writer_coverage_complete', 'production_qualified', 'mutation_ready', 'recovery_ready'] as $state) {

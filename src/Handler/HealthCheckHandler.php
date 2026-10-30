@@ -45,6 +45,16 @@ final class HealthCheckHandler implements RequestHandler
 
     private bool $readinessHealthy = true;
 
+    private ?string $readinessFailureComponent = null;
+
+    private ?string $readinessFailureReason = null;
+
+    /** @var array<string, array<string, mixed>> */
+    private array $readinessDependencies = [];
+
+    /** @var array<string, mixed>|null */
+    private ?array $clusterRoleDiagnostics = null;
+
     /** @var Future<void>|null */
     private ?Future $readinessCheck = null;
 
@@ -91,34 +101,9 @@ final class HealthCheckHandler implements RequestHandler
 
     public function handleRequest(Request $request): Response
     {
-        if ($this->tempBudget !== null) {
-            try {
-                $tempCapacity = $this->tempBudget->snapshot();
-                if (! $tempCapacity->mutationReady()) {
-                    return $this->tempCapacityClosedResponse(
-                        $tempCapacity->unsafeEntries > 0 ? 'unsafe_state' : 'physical_reserve',
-                    );
-                }
-            } catch (\Amp\CancelledException $error) {
-                throw $error;
-            } catch (\Throwable $error) {
-                $this->logDegraded('node_temp_capacity', $error);
-
-                return $this->tempCapacityClosedResponse('snapshot_error');
-            }
-        }
-        if ($this->drain !== null && ! $this->drain->acceptsNewWork()) {
-            return new Response(
-                status: 503,
-                headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-                body: '{"status":"degraded","drain":"draining"}',
-            );
-        }
-        if ($this->clusterAdmission !== null && ! $this->clusterAdmission->revalidate()) {
-            return $this->clusterClosedResponse();
-        }
         $now = hrtime(true) / 1e9;
-        if ($now - $this->lastReadinessCheckAt < $this->readinessCheckIntervalSeconds) {
+        $clusterHealth = $this->clusterAdmission !== null || $this->clusterRoles !== null;
+        if (! $clusterHealth && $now - $this->lastReadinessCheckAt < $this->readinessCheckIntervalSeconds) {
             return $this->readinessResponse();
         }
 
@@ -154,6 +139,8 @@ final class HealthCheckHandler implements RequestHandler
                 $readinessCheck->ignore();
             }
             $this->readinessHealthy = false;
+            $this->readinessFailureComponent = 'readiness';
+            $this->readinessFailureReason = 'timeout';
             $this->lastReadinessCheckAt = hrtime(true) / 1e9;
             if (! $this->readinessTimeoutLogged) {
                 $this->readinessTimeoutLogged = true;
@@ -166,6 +153,105 @@ final class HealthCheckHandler implements RequestHandler
 
     private function runReadinessCheck(int $generation): void
     {
+        if ($this->readinessGeneration !== $generation) {
+            return;
+        }
+        $this->readinessHealthy = false;
+        $this->readinessFailureComponent = null;
+        $this->readinessFailureReason = null;
+        $this->clusterRoleDiagnostics = null;
+        $this->readinessDependencies = $this->unobservedDependencies();
+
+        if ($this->tempBudget !== null) {
+            try {
+                $tempCapacity = $this->tempBudget->snapshot();
+                if (! $tempCapacity->mutationReady()) {
+                    $this->recordDependencyFailure(
+                        $generation,
+                        'temporary_capacity',
+                        $tempCapacity->unsafeEntries > 0 ? 'unsafe_state' : 'physical_reserve',
+                        'node',
+                        ['all_mutations'],
+                    );
+
+                    return;
+                }
+                $this->recordDependencyAvailable($generation, 'temporary_capacity', 'node');
+            } catch (\Amp\CancelledException $error) {
+                throw $error;
+            } catch (\Throwable $error) {
+                $this->recordDependencyFailure(
+                    $generation,
+                    'temporary_capacity',
+                    'snapshot_error',
+                    'node',
+                    ['all_mutations'],
+                    $error,
+                );
+
+                return;
+            }
+        }
+
+        if ($this->drain !== null) {
+            if (! $this->drain->acceptsNewWork()) {
+                $this->recordDependencyFailure($generation, 'drain', 'draining', 'node', ['all_mutations']);
+
+                return;
+            }
+            $this->recordDependencyAvailable($generation, 'drain', 'node');
+        }
+
+        if ($this->clusterAdmission !== null) {
+            if (! $this->clusterAdmission->revalidate()) {
+                $admission = $this->clusterAdmission->diagnostics()['admission'] ?? 'unavailable';
+                $this->recordDependencyFailure(
+                    $generation,
+                    'admission',
+                    $admission === 'unavailable' ? 'unavailable' : 'mismatched',
+                    'cluster',
+                    ['all_mutations'],
+                    state: $admission === 'unavailable' ? 'unavailable' : 'degraded',
+                );
+
+                return;
+            }
+            $this->recordDependencyAvailable($generation, 'admission', 'cluster');
+        }
+
+        if ($this->clusterRoles !== null) {
+            $diagnostics = $this->clusterRoles->diagnostics();
+            if ($this->readinessGeneration !== $generation) {
+                return;
+            }
+            $this->clusterRoleDiagnostics = $diagnostics;
+            $collectionCurrent = ($diagnostics['collection'] ?? null) === 'current'
+                && ($diagnostics['membership'] ?? null) === 'current';
+            $missingRoles = is_array($diagnostics['missing_roles'] ?? null)
+                ? $diagnostics['missing_roles']
+                : $this->clusterRoles->requiredRoles();
+            $reconcileRequired = $this->clusterRoles->hasAssignedRole(ClusterRoleSet::API)
+                || in_array(ClusterRoleSet::RECONCILE, $this->clusterRoles->requiredRoles(), true);
+            $reconcileMissing = $reconcileRequired && in_array(ClusterRoleSet::RECONCILE, $missingRoles, true);
+            if (! $collectionCurrent || $reconcileMissing) {
+                $this->readinessDependencies['role_coverage'] = [
+                    'state' => 'unavailable',
+                    'observation' => 'current',
+                    'scope' => 'cluster',
+                    'affected_scopes' => ['cleanup', 'multipart_writes', 'object_writes', 'restore', 'transition'],
+                ];
+            } elseif ($missingRoles !== []) {
+                $this->readinessDependencies['role_coverage'] = [
+                    'state' => 'degraded',
+                    'observation' => 'current',
+                    'scope' => 'cluster',
+                    'affected_scopes' => ['none'],
+                ];
+            } else {
+                $this->recordDependencyAvailable($generation, 'role_coverage', 'cluster');
+            }
+        }
+
         if ($this->awsOperationalState !== null) {
             try {
                 $this->awsOperationalState->assertMutationReady();
@@ -208,6 +294,7 @@ final class HealthCheckHandler implements RequestHandler
         if ($this->credentialHealthProbe !== null) {
             try {
                 $this->credentialHealthProbe->assertCredentialStoreAvailable();
+                $this->recordDependencyAvailable($generation, 'credentials', 'node');
             } catch (\Amp\CancelledException $e) {
                 throw $e;
             } catch (\Throwable $e) {
@@ -234,6 +321,7 @@ final class HealthCheckHandler implements RequestHandler
             }
             $this->rateLimitHealthy = $rateLimitError === null;
             if ($rateLimitError !== null) {
+                $this->readinessFailureComponent = 'metadata';
                 $this->logDegraded('rate_limit', $rateLimitError);
             }
             $this->lastRateLimitCheckAt = hrtime(true) / 1e9;
@@ -280,6 +368,10 @@ final class HealthCheckHandler implements RequestHandler
             }
         }
 
+        if ($this->metadata !== null) {
+            $this->recordDependencyAvailable($generation, 'metadata', 'node');
+        }
+
         foreach ($this->storageTiers?->all() ?? [] as $tier) {
             try {
                 $backend = $tier->backend;
@@ -309,8 +401,13 @@ final class HealthCheckHandler implements RequestHandler
             }
         }
 
+        if ($this->awsOperationalState !== null || $this->storageTiers !== null) {
+            $this->recordDependencyAvailable($generation, 'storage_admission', 'node');
+        }
+
         if ($this->readinessGeneration === $generation) {
             $this->readinessHealthy = true;
+            $this->readinessFailureComponent = null;
         }
     }
 
@@ -320,7 +417,81 @@ final class HealthCheckHandler implements RequestHandler
             return;
         }
         $this->readinessHealthy = false;
+        $this->readinessFailureComponent = $component;
+        $dependency = match (true) {
+            $component === 'aws', str_starts_with($component, 'storage:') => 'storage_admission',
+            str_starts_with($component, 'metadata') => 'metadata',
+            $component === 'credentials' => 'credentials',
+            default => null,
+        };
+        if ($dependency !== null) {
+            $this->readinessDependencies[$dependency] = [
+                'state' => 'unavailable',
+                'observation' => 'current',
+                'scope' => 'node',
+                'affected_scopes' => $dependency === 'storage_admission'
+                    ? ['cleanup', 'multipart_writes', 'object_writes', 'restore', 'transition']
+                    : ['all_mutations'],
+            ];
+        }
         $this->logDegraded($component, $error);
+    }
+
+    private function recordDependencyAvailable(int $generation, string $dependency, string $scope): void
+    {
+        if ($this->readinessGeneration !== $generation || ! array_key_exists($dependency, $this->readinessDependencies)) {
+            return;
+        }
+        $this->readinessDependencies[$dependency] = [
+            'state' => 'available',
+            'observation' => 'current',
+            'scope' => $scope,
+            'affected_scopes' => ['none'],
+        ];
+    }
+
+    /** @param list<string> $affectedScopes */
+    private function recordDependencyFailure(
+        int $generation,
+        string $dependency,
+        string $reason,
+        string $scope,
+        array $affectedScopes,
+        ?\Throwable $error = null,
+        string $state = 'unavailable',
+    ): void {
+        if ($this->readinessGeneration !== $generation || ! array_key_exists($dependency, $this->readinessDependencies)) {
+            return;
+        }
+        $this->readinessHealthy = false;
+        $this->readinessFailureComponent = $dependency;
+        $this->readinessFailureReason = $reason;
+        $this->readinessDependencies[$dependency] = [
+            'state' => $state,
+            'observation' => 'current',
+            'scope' => $scope,
+            'reason' => $reason,
+            'affected_scopes' => $affectedScopes,
+        ];
+        if ($error !== null) {
+            $this->logDegraded($dependency, $error);
+        }
+    }
+
+    /** @return array<string, array<string, string>> */
+    private function unobservedDependencies(): array
+    {
+        $unobserved = ['state' => 'unavailable', 'observation' => 'unobserved'];
+
+        return [
+            'admission' => $unobserved,
+            'metadata' => $unobserved,
+            'storage_admission' => $unobserved,
+            'credentials' => $unobserved,
+            'role_coverage' => $unobserved,
+            'temporary_capacity' => $unobserved,
+            'drain' => $unobserved,
+        ];
     }
 
     private function logDegraded(string $component, \Throwable $error): void
@@ -333,26 +504,57 @@ final class HealthCheckHandler implements RequestHandler
 
     private function readinessResponse(): Response
     {
-        $roleDiagnostics = $this->clusterRoles?->diagnostics();
+        if ($this->clusterAdmission === null && $this->clusterRoles === null
+            && ! $this->readinessHealthy
+            && in_array($this->readinessFailureComponent, ['temporary_capacity', 'drain'], true)
+            && $this->readinessFailureReason !== null) {
+            $key = $this->readinessFailureComponent === 'temporary_capacity' ? 'node_temp_capacity' : 'drain';
+
+            return new Response(
+                status: 503,
+                headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
+                body: json_encode(['status' => 'degraded', $key => $this->readinessFailureReason], JSON_THROW_ON_ERROR),
+            );
+        }
+
+        $roleDiagnostics = $this->clusterRoleDiagnostics;
+        if ($this->clusterRoles !== null && $roleDiagnostics === null) {
+            $roleDiagnostics = [
+                'membership' => 'unavailable',
+                'last_heartbeat_at' => null,
+                'heartbeat_age_seconds' => null,
+                'required_roles' => $this->clusterRoles->requiredRoles(),
+                'live_roles' => [],
+                'missing_roles' => $this->clusterRoles->requiredRoles(),
+                'collection' => 'unavailable',
+            ];
+        }
         $reconcileRequired = $this->clusterRoles?->hasAssignedRole(ClusterRoleSet::API) === true
             || ($roleDiagnostics !== null
                 && in_array(ClusterRoleSet::RECONCILE, $roleDiagnostics['required_roles'], true));
         $reconcileReady = ! $reconcileRequired
             || ($roleDiagnostics !== null
                 && in_array(ClusterRoleSet::RECONCILE, $roleDiagnostics['live_roles'], true));
-        $roleCoverageDegraded = $roleDiagnostics !== null && $roleDiagnostics['missing_roles'] !== [];
+        $membershipReady = $roleDiagnostics === null
+            || (($roleDiagnostics['membership'] ?? null) === 'current'
+                && ($roleDiagnostics['collection'] ?? null) === 'current');
+        $localRegistrationReady = $this->clusterRoles?->locallyReady() ?? true;
+        $drainReady = $this->drain?->acceptsNewWork() ?? true;
+        $roleCoverageDegraded = ($this->readinessDependencies['role_coverage']['state'] ?? null) === 'degraded';
         if ($this->awsOperationalState !== null) {
             $snapshot = $this->awsOperationalState->snapshot();
             $ready = $this->readinessHealthy
                 && $snapshot['mutation_ready'] === true
                 && $snapshot['reason'] === AwsS3OperationalState::REASON_HEALTHY
                 && ($this->clusterAdmission?->isAdmitted() ?? true)
-                && $reconcileReady;
+                && $reconcileReady
+                && $membershipReady
+                && $localRegistrationReady
+                && $drainReady;
             $payload = [
                 'status' => $ready && ! $roleCoverageDegraded ? 'ok' : 'degraded',
                 'aws' => [
                     'provider_type' => $snapshot['provider_type'],
-                    'fingerprint' => $snapshot['fingerprint'],
                     'configuration_valid' => $snapshot['configuration_valid'],
                     'owner_check_passed' => $snapshot['owner_check_passed'],
                     'versioning_state' => $snapshot['versioning_state'],
@@ -367,19 +569,31 @@ final class HealthCheckHandler implements RequestHandler
                     'reason' => $snapshot['reason'],
                 ],
             ];
+            if ($this->clusterAdmission === null && $roleDiagnostics === null) {
+                $payload['aws']['fingerprint'] = $snapshot['fingerprint'];
+            }
             if ($this->clusterAdmission !== null || $roleDiagnostics !== null) {
                 $payload['cluster'] = [
                     ...($this->clusterAdmission?->diagnostics() ?? []),
                     ...($roleDiagnostics ?? []),
                 ];
+                $payload['node'] = $this->nodeDiagnostics($roleDiagnostics, $ready);
+                $payload['dependencies'] = $this->dependencyDiagnostics();
             }
             $body = json_encode($payload, JSON_THROW_ON_ERROR);
         } else {
-            $ready = $this->readinessHealthy && ($this->clusterAdmission?->isAdmitted() ?? true) && $reconcileReady;
+            $ready = $this->readinessHealthy
+                && ($this->clusterAdmission?->isAdmitted() ?? true)
+                && $reconcileReady
+                && $membershipReady
+                && $localRegistrationReady
+                && $drainReady;
             $body = $this->clusterAdmission === null && $roleDiagnostics === null
                 ? ($this->readinessHealthy ? '{"status":"ok"}' : '{"status":"degraded"}')
                 : json_encode([
                     'status' => $ready && ! $roleCoverageDegraded ? 'ok' : 'degraded',
+                    'node' => $this->nodeDiagnostics($roleDiagnostics, $ready),
+                    'dependencies' => $this->dependencyDiagnostics(),
                     'cluster' => [
                         ...($this->clusterAdmission?->diagnostics() ?? []),
                         ...($roleDiagnostics ?? []),
@@ -394,27 +608,33 @@ final class HealthCheckHandler implements RequestHandler
         );
     }
 
-    private function clusterClosedResponse(): Response
+    /**
+     * @param array<string, mixed>|null $roleDiagnostics
+     * @return array{cluster_id: string|null, node_id: string|null, incarnation_id: string|null, state: string, roles: list<string>, membership: string, last_heartbeat_at: float|int|null, heartbeat_age_seconds: float|int|null}
+     */
+    private function nodeDiagnostics(?array $roleDiagnostics, bool $ready): array
     {
-        return new Response(
-            status: 503,
-            headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-            body: json_encode([
-                'status' => 'degraded',
-                'cluster' => $this->clusterAdmission?->diagnostics() ?? ['admission' => 'unavailable'],
-            ], JSON_THROW_ON_ERROR),
-        );
+        $membership = $roleDiagnostics['membership'] ?? null;
+        $lastHeartbeat = $roleDiagnostics['last_heartbeat_at'] ?? null;
+        $heartbeatAge = $roleDiagnostics['heartbeat_age_seconds'] ?? null;
+        $identity = $this->clusterRoles?->healthIdentity();
+        $draining = $this->drain !== null && ! $this->drain->acceptsNewWork();
+
+        return [
+            'cluster_id' => $identity['cluster_id'] ?? null,
+            'node_id' => $identity['node_id'] ?? null,
+            'incarnation_id' => $identity['incarnation_id'] ?? null,
+            'state' => $draining ? 'draining' : ($ready ? 'ready' : 'stopped'),
+            'roles' => $identity['roles'] ?? [],
+            'membership' => is_string($membership) ? $membership : 'unavailable',
+            'last_heartbeat_at' => is_float($lastHeartbeat) || is_int($lastHeartbeat) ? $lastHeartbeat : null,
+            'heartbeat_age_seconds' => is_float($heartbeatAge) || is_int($heartbeatAge) ? $heartbeatAge : null,
+        ];
     }
 
-    private function tempCapacityClosedResponse(string $reason): Response
+    /** @return array<string, array<string, mixed>> */
+    private function dependencyDiagnostics(): array
     {
-        return new Response(
-            status: 503,
-            headers: ['Content-Type' => 'application/json', 'Cache-Control' => 'no-store'],
-            body: json_encode([
-                'status' => 'degraded',
-                'node_temp_capacity' => $reason,
-            ], JSON_THROW_ON_ERROR),
-        );
+        return $this->readinessDependencies === [] ? $this->unobservedDependencies() : $this->readinessDependencies;
     }
 }

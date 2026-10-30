@@ -12,6 +12,9 @@ use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Exception\OperationAbortedException;
 use OpsFour\S3Server\Lifecycle\LifecycleExecutor;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ClusterWorkClaim;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
@@ -22,6 +25,7 @@ use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -29,6 +33,27 @@ use Revolt\EventLoop;
 
 final class LifecycleExecutorTest extends TestCase
 {
+    public function test_failed_takeover_sweep_records_failed_takeover_outcome(): void
+    {
+        $token = RecordingClusterWorkFencingStore::takeoverToken(ClusterWorkToken::LIFECYCLE, 'lifecycle:global');
+        $fencing = new RecordingClusterWorkFencingStore(new ClusterWorkClaim($token, null));
+        $metadata = $this->createMock(MetadataStore::class);
+        $metadata->method('getLifecycleCheckpoint')->willReturn(null);
+        $metadata->method('listAllBuckets')->willThrowException(new \RuntimeException('metadata failed'));
+
+        (new LifecycleExecutor(
+            $metadata,
+            $this->storage,
+            clusterFencing: $fencing,
+            clusterWorkerId: 'node:worker',
+        ))->execute();
+
+        self::assertSame([[
+            'token' => $token,
+            'outcome' => ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+        ]], $fencing->outcomes);
+    }
+
     private string $path = '';
 
     private SqliteMetadataStore $metadata;

@@ -692,13 +692,24 @@ final class NotificationProcessor
             try {
                 return $this->clusterFencing->transactionWithClusterWork(
                     $token,
-                    fn(): bool => $this->metadata->updateNotificationStatus(
-                        $id,
-                        $status,
-                        $error,
-                        $nextAttemptAt,
-                        $incrementAttempts,
-                    ),
+                    function () use ($id, $status, $error, $nextAttemptAt, $incrementAttempts, $token): bool {
+                        $updated = $this->metadata->updateNotificationStatus(
+                            $id,
+                            $status,
+                            $error,
+                            $nextAttemptAt,
+                            $incrementAttempts,
+                        );
+                        if ($updated && in_array($status, ['pending', 'dead_letter'], true)
+                            && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
+                            $this->clusterFencing->recordClusterWorkOutcome(
+                                $token,
+                                \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+                            );
+                        }
+
+                        return $updated;
+                    },
                 );
             } catch (\RuntimeException) {
                 return false;

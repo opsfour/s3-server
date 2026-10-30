@@ -25,6 +25,8 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
@@ -433,6 +435,18 @@ final class AwsS3OperationalStateTest extends TestCase
         self::assertSame('clear', $body['aws']['drift_state']);
         self::assertSame('healthy', $body['aws']['reconciliation_state']);
         self::assertFalse($body['aws']['production_qualified']);
+        self::assertArrayHasKey('fingerprint', $body['aws']);
+
+        $clusterResponse = (new HealthCheckHandler(
+            storageTiers: StorageTierRegistry::single($backend, 'AWS'),
+            readinessCheckIntervalSeconds: 0,
+            awsOperationalState: $state,
+            clusterRoles: self::clusterRoles(),
+        ))->handleRequest(self::healthRequest());
+        $clusterJson = $clusterResponse->getBody()->read();
+        self::assertIsString($clusterJson);
+        $clusterBody = json_decode($clusterJson, true, flags: JSON_THROW_ON_ERROR);
+        self::assertArrayNotHasKey('fingerprint', $clusterBody['aws']);
     }
 
     public function test_health_handler_reports_provider_drift_as_503(): void
@@ -503,6 +517,65 @@ final class AwsS3OperationalStateTest extends TestCase
             's3_server_aws_recovery_global_capacity_items{kind="multipart"} 12',
             $rendered,
         );
+        self::assertStringContainsString('fingerprint="', $rendered);
+
+        $clusterRendered = (new MetricsHandler(
+            new MetricsCollector(),
+            bearerToken: 'token',
+            awsOperationalState: $state,
+            clusterRoles: self::clusterRoles(),
+        ))->handleRequest(new Request(
+            new AwsS3OperationalStateTestClient(),
+            'GET',
+            Http::new('http://127.0.0.1/.metrics'),
+            ['authorization' => 'Bearer token'],
+        ))->getBody()->read();
+        self::assertIsString($clusterRendered);
+        self::assertStringNotContainsString('fingerprint="', $clusterRendered);
+    }
+
+    private static function clusterRoles(): ClusterRoleController
+    {
+        $store = new class implements ClusterMembershipStore {
+            private bool $ready = false;
+
+            public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, bool $draining, float $ttlSeconds): void
+            {
+                $this->ready = $ready && ! $draining;
+            }
+
+            public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, bool $draining, float $ttlSeconds): bool
+            {
+                $this->ready = $ready && ! $draining;
+
+                return true;
+            }
+
+            public function withdrawClusterMember(string $clusterId, string $nodeId, string $incarnationId): void
+            {
+                $this->ready = false;
+            }
+
+            public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
+            {
+                return $this->ready;
+            }
+
+            public function liveClusterRoles(string $clusterId): array
+            {
+                return $this->ready ? ['api', 'reconcile'] : [];
+            }
+        };
+        $controller = new ClusterRoleController($store, new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
+        ));
+        $controller->registerReady();
+
+        return $controller;
     }
 
     public function test_closed_mutation_admission_stops_reservation_before_body_or_provider_dispatch(): void

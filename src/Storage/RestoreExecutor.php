@@ -700,14 +700,25 @@ final class RestoreExecutor
             try {
                 return $this->clusterFencing->transactionWithClusterWork(
                     $token,
-                    fn(): bool => $this->metadata->updateRestoreJobStatus(
-                        $id,
-                        $status,
-                        $error,
-                        $nextAttemptAt,
-                        $incrementAttempts,
-                        $restoredStoragePath,
-                    ),
+                    function () use ($id, $status, $error, $nextAttemptAt, $incrementAttempts, $restoredStoragePath, $token): bool {
+                        $updated = $this->metadata->updateRestoreJobStatus(
+                            $id,
+                            $status,
+                            $error,
+                            $nextAttemptAt,
+                            $incrementAttempts,
+                            $restoredStoragePath,
+                        );
+                        if ($updated && in_array($status, ['pending', 'dead_letter'], true)
+                            && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
+                            $this->clusterFencing->recordClusterWorkOutcome(
+                                $token,
+                                \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+                            );
+                        }
+
+                        return $updated;
+                    },
                 );
             } catch (\RuntimeException) {
                 return false;

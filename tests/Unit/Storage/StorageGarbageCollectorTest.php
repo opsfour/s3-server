@@ -7,18 +7,49 @@ namespace OpsFour\S3Server\Tests\Unit\Storage;
 use Amp\ByteStream\ReadableBuffer;
 use League\Flysystem\Filesystem;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 use Symfony\Component\Process\Process;
 
 final class StorageGarbageCollectorTest extends TestCase
 {
+    public function test_takeover_retry_records_failed_takeover_outcome(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->enqueueStorageGarbage('bucket', 'STANDARD', 'path');
+        $item = $metadata->dequeueStorageGarbage(1)[0];
+        $token = RecordingClusterWorkFencingStore::takeoverToken(ClusterWorkToken::STORAGE_GARBAGE, (string) $item['id']);
+        $item['cluster_work_token'] = $token;
+        $fencing = new RecordingClusterWorkFencingStore();
+        $collector = new StorageGarbageCollector(
+            $metadata,
+            StorageTierRegistry::single(new InMemoryBackend()),
+            clusterFencing: $fencing,
+            clusterWorkerId: 'node:worker',
+        );
+
+        self::assertTrue((new \ReflectionMethod($collector, 'retryClaim'))->invoke(
+            $collector,
+            $item,
+            'failed',
+            microtime(true) + 60,
+        ));
+        self::assertSame([[
+            'token' => $token,
+            'outcome' => ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+        ]], $fencing->outcomes);
+    }
+
     public function test_direct_discard_cannot_remove_another_connection_claimed_delete_job(): void
     {
         $path = sys_get_temp_dir() . '/s3-garbage-discard-claim-' . bin2hex(random_bytes(6)) . '.sqlite';

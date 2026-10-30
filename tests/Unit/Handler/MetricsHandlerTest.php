@@ -18,11 +18,239 @@ use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
+use OpsFour\S3Server\Runtime\ClusterMembershipStore;
+use OpsFour\S3Server\Runtime\ClusterMembershipSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshotStore;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+use OpsFour\S3Server\Runtime\ClusterRoleSet;
+use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
+use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use PHPUnit\Framework\TestCase;
 
 final class MetricsHandlerTest extends TestCase
 {
+    public function test_authenticated_registered_cluster_endpoint_emits_representative_snapshot_samples(): void
+    {
+        $store = new MetricsClusterOperationalStore();
+        $roles = new ClusterRoleController($store, self::clusterConfig());
+        $roles->registerReady();
+        $handler = new MetricsHandler(new MetricsCollector(), bearerToken: 'token', clusterRoles: $roles);
+
+        self::assertSame(401, $handler->handleRequest($this->request())->getStatus());
+        $response = $handler->handleRequest($this->request('Bearer token'));
+        $rendered = \Amp\ByteStream\buffer($response->getBody());
+
+        self::assertSame(200, $response->getStatus());
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $rendered);
+        self::assertStringContainsString('s3_server_cluster_role_processes{role="reconcile",state="ready"} 1', $rendered);
+        self::assertStringContainsString('s3_server_cluster_work_items{queue="notification",state="pending"} 2', $rendered);
+    }
+
+    public function test_cluster_snapshot_failure_clears_previous_role_and_work_samples(): void
+    {
+        $store = new MetricsClusterOperationalStore();
+        $roles = new ClusterRoleController($store, self::clusterConfig());
+        $roles->registerReady();
+        $handler = new MetricsHandler(new MetricsCollector(), clusterRoles: $roles);
+
+        $first = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $first);
+        self::assertStringContainsString('s3_server_cluster_role_processes{role="reconcile",state="ready"} 1', $first);
+        self::assertStringContainsString('s3_server_cluster_work_items{queue="notification",state="pending"} 2', $first);
+
+        $store->snapshotFailure = true;
+        $second = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_up 1', $second);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_role_processes/m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_work_items/m', $second);
+    }
+
+    public function test_cluster_snapshot_timeout_preserves_process_metrics_and_clears_cluster_samples(): void
+    {
+        $store = new MetricsClusterOperationalStore();
+        $store->snapshotDelaySeconds = 0.05;
+        $roles = new ClusterRoleController($store, self::clusterConfig());
+        $roles->registerReady();
+        $metrics = new MetricsCollector();
+        $handler = new MetricsHandler(
+            $metrics,
+            clusterRoles: $roles,
+            clusterSnapshotTimeoutSeconds: 0.001,
+        );
+
+        $rendered = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+
+        self::assertStringContainsString('s3_server_up 1', $rendered);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $rendered);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_role_processes/m', $rendered);
+
+        $rendered = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $rendered);
+        self::assertSame(1, $store->snapshotCalls);
+
+        \Amp\delay(0.06);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $metrics->renderPrometheus());
+        $rendered = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $rendered);
+        self::assertSame(1, $store->snapshotCalls);
+    }
+
+    public function test_blocking_cluster_capacity_read_is_bounded_and_reuses_single_flight(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            MultipartCompletionCapacityReader::class,
+            WriteIntentCapacityReader::class,
+            StorageCleanupCapacityReader::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $multipartCalls = 0;
+        $gate = new MetricsBlockingCapacityGate();
+        $metadata->method('getMultipartCompletionIntentCount')->willReturnCallback(
+            static function () use (&$multipartCalls, $gate): int {
+                ++$multipartCalls;
+                if ($gate->blocked) {
+                    \Amp\delay(0.05);
+                }
+
+                return 2;
+            },
+        );
+        $metadata->method('getWriteIntentCapacityCounts')->willReturn(['object' => 3, 'object_seal' => 4, 'part' => 5]);
+        $metadata->method('getStorageCleanupCount')->willReturn(6);
+        $store = new MetricsClusterOperationalStore();
+        $roles = new ClusterRoleController($store, self::clusterConfig());
+        $roles->registerReady();
+        $metrics = new MetricsCollector();
+        $handler = new MetricsHandler(
+            $metrics,
+            $metadata,
+            clusterRoles: $roles,
+            clusterSnapshotTimeoutSeconds: 0.001,
+        );
+
+        $first = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_multipart_completion_intents 2', $first);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $first);
+
+        $gate->blocked = true;
+        $startedAt = hrtime(true);
+        $second = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertLessThan(0.04, (hrtime(true) - $startedAt) / 1e9);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_intents /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_role_processes/m', $second);
+
+        $third = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $third);
+        self::assertSame(2, $multipartCalls);
+        self::assertSame(1, $store->snapshotCalls);
+
+        \Amp\delay(0.06);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 0', $metrics->renderPrometheus());
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_intents /m', $metrics->renderPrometheus());
+        $fourth = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_multipart_completion_intents 2', $fourth);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $fourth);
+        self::assertSame(2, $multipartCalls);
+        self::assertSame(2, $store->snapshotCalls);
+    }
+
+    public function test_cluster_capacity_failures_clear_stale_samples_without_aborting_scrape(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            MultipartCompletionCapacityReader::class,
+            WriteIntentCapacityReader::class,
+            StorageCleanupCapacityReader::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $multipartCalls = 0;
+        $writeCalls = 0;
+        $cleanupCalls = 0;
+        $metadata->method('getMultipartCompletionIntentCount')->willReturnCallback(
+            static function () use (&$multipartCalls): int {
+                if (++$multipartCalls > 1) {
+                    throw new \RuntimeException('multipart unavailable');
+                }
+
+                return 2;
+            },
+        );
+        $metadata->method('getWriteIntentCapacityCounts')->willReturnCallback(
+            static function () use (&$writeCalls): array {
+                if (++$writeCalls > 1) {
+                    throw new \RuntimeException('write unavailable');
+                }
+
+                return ['object' => 3, 'object_seal' => 4, 'part' => 5];
+            },
+        );
+        $metadata->method('getStorageCleanupCount')->willReturnCallback(
+            static function () use (&$cleanupCalls): int {
+                if (++$cleanupCalls > 1) {
+                    throw new \RuntimeException('cleanup unavailable');
+                }
+
+                return 6;
+            },
+        );
+        $store = new MetricsClusterOperationalStore();
+        $roles = new ClusterRoleController($store, self::clusterConfig());
+        $roles->registerReady();
+        $handler = new MetricsHandler(new MetricsCollector(), $metadata, clusterRoles: $roles);
+
+        $first = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_multipart_completion_intents 2', $first);
+        self::assertStringContainsString('s3_server_object_write_intents 3', $first);
+        self::assertStringContainsString('s3_server_storage_cleanup_items 6', $first);
+
+        $second = \Amp\ByteStream\buffer($handler->handleRequest($this->request())->getBody());
+        self::assertStringContainsString('s3_server_up 1', $second);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_multipart_completion_intents /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_object_write_intents /m', $second);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_storage_cleanup_items /m', $second);
+    }
+
+    public function test_standalone_scrape_omits_all_cluster_metric_families(): void
+    {
+        $rendered = \Amp\ByteStream\buffer((new MetricsHandler(new MetricsCollector()))
+            ->handleRequest($this->request())->getBody());
+
+        self::assertStringContainsString('s3_server_up 1', $rendered);
+        self::assertDoesNotMatchRegularExpression('/^s3_server_cluster_/m', $rendered);
+    }
+
+    public function test_cluster_scrape_keeps_capacity_samples_without_grouped_notification_stats(): void
+    {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            MultipartCompletionCapacityReader::class,
+            WriteIntentCapacityReader::class,
+            StorageCleanupCapacityReader::class,
+        ]);
+        self::assertInstanceOf(MetadataStore::class, $metadata);
+        $metadata->expects(self::never())->method('getNotificationQueueStats');
+        $metadata->method('getMultipartCompletionIntentCount')->willReturn(2);
+        $metadata->method('getWriteIntentCapacityCounts')->willReturn(['object' => 3, 'object_seal' => 4, 'part' => 5]);
+        $metadata->method('getStorageCleanupCount')->willReturn(6);
+        $roles = new ClusterRoleController(new MetricsClusterOperationalStore(), self::clusterConfig());
+
+        $rendered = \Amp\ByteStream\buffer((new MetricsHandler(new MetricsCollector(), $metadata, clusterRoles: $roles))
+            ->handleRequest($this->request())->getBody());
+
+        self::assertStringContainsString('s3_server_multipart_completion_intents 2', $rendered);
+        self::assertStringContainsString('s3_server_object_write_intents 3', $rendered);
+        self::assertStringContainsString('s3_server_storage_cleanup_items 6', $rendered);
+        self::assertStringContainsString('s3_server_cluster_snapshot_success 1', $rendered);
+    }
+
     public function test_temp_snapshot_failure_preserves_prometheus_scrape(): void
     {
         $tempDir = sys_get_temp_dir() . '/s3-metrics-temp-' . bin2hex(random_bytes(8));
@@ -331,6 +559,94 @@ final class MetricsHandlerTest extends TestCase
             Http::new('http://127.0.0.1/metrics'),
             $authorization !== null ? ['authorization' => $authorization] : [],
         );
+    }
+
+    private static function clusterConfig(): S3ServerConfig
+    {
+        return new S3ServerConfig(
+            storagePath: '/',
+            clusterId: 'cluster-a',
+            clusterNodeId: 'node-a',
+            clusterDatabaseId: str_repeat('d', 32),
+            clusterRoles: 'api,reconcile',
+        );
+    }
+}
+
+final class MetricsBlockingCapacityGate
+{
+    public bool $blocked = false;
+}
+
+final class MetricsClusterOperationalStore implements ClusterMembershipStore, ClusterOperationalSnapshotStore
+{
+    public bool $snapshotFailure = false;
+
+    public float $snapshotDelaySeconds = 0.0;
+
+    public int $snapshotCalls = 0;
+
+    public function registerClusterMember(string $clusterId, string $nodeId, string $incarnationId, array $roles, bool $ready, bool $draining, float $ttlSeconds): void {}
+
+    public function heartbeatClusterMember(string $clusterId, string $nodeId, string $incarnationId, bool $ready, bool $draining, float $ttlSeconds): bool
+    {
+        return true;
+    }
+
+    public function withdrawClusterMember(string $clusterId, string $nodeId, string $incarnationId): void {}
+
+    public function isClusterMemberLive(string $clusterId, string $nodeId, string $incarnationId): bool
+    {
+        return true;
+    }
+
+    public function liveClusterRoles(string $clusterId): array
+    {
+        return [ClusterRoleSet::API, ClusterRoleSet::RECONCILE];
+    }
+
+    public function clusterMembershipSnapshot(string $clusterId, string $nodeId, string $incarnationId): ClusterMembershipSnapshot
+    {
+        return new ClusterMembershipSnapshot(1000.0, 'current', 999.0, 1.0, $this->roleCounts());
+    }
+
+    public function clusterOperationalSnapshot(string $clusterId, string $nodeId, string $incarnationId): ClusterOperationalSnapshot
+    {
+        ++$this->snapshotCalls;
+        if ($this->snapshotDelaySeconds > 0.0) {
+            \Amp\delay($this->snapshotDelaySeconds);
+        }
+        if ($this->snapshotFailure) {
+            throw new \RuntimeException('snapshot failed');
+        }
+        $work = [];
+        foreach (ClusterWorkSnapshot::ALL as $workClass) {
+            $work[$workClass] = new ClusterWorkSnapshot(
+                $workClass,
+                $workClass === 'lifecycle' ? null : ($workClass === 'notification' ? 2 : 0),
+                null,
+                0,
+                0,
+                null,
+                0,
+                0,
+                0,
+                1,
+            );
+        }
+
+        return new ClusterOperationalSnapshot(1000.0, 'current', 999.0, 1.0, $this->roleCounts(), $work);
+    }
+
+    /** @return array<string, array{ready: int, draining: int}> */
+    private function roleCounts(): array
+    {
+        $counts = [];
+        foreach (ClusterRoleSet::ALL as $role) {
+            $counts[$role] = ['ready' => $role === ClusterRoleSet::RECONCILE ? 1 : 0, 'draining' => 0];
+        }
+
+        return $counts;
     }
 }
 

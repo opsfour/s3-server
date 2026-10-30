@@ -12,6 +12,8 @@ use Amp\Http\Client\Request;
 use Amp\Http\Client\Response;
 use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Notification\NotificationProcessor;
@@ -26,11 +28,34 @@ use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageWriteResult;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 
 final class NotificationProcessorTest extends TestCase
 {
+    public function test_takeover_retry_records_failed_takeover_outcome(): void
+    {
+        $this->metadata->enqueueNotification('bucket', 'key', 'event', 'https://93.184.216.34/hook', '{}');
+        $item = $this->metadata->dequeueNotifications(1)[0];
+        $token = RecordingClusterWorkFencingStore::takeoverToken(ClusterWorkToken::NOTIFICATION, (string) $item['id']);
+        $item['cluster_work_token'] = $token;
+        $fencing = new RecordingClusterWorkFencingStore();
+        $processor = new NotificationProcessor(
+            $this->metadata,
+            httpClient: new HttpClient(new FixedStatusHttpClient(500), []),
+            clusterFencing: $fencing,
+            clusterWorkerId: 'node:worker',
+        );
+
+        $this->invokeProcess($processor, $item);
+
+        self::assertSame([[
+            'token' => $token,
+            'outcome' => ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+        ]], $fencing->outcomes);
+    }
+
     private string $path = '';
 
     private SqliteMetadataStore $metadata;

@@ -11,6 +11,31 @@ use PHPUnit\Framework\TestCase;
 
 final class ExternalSchemaTest extends TestCase
 {
+    public function test_postgres_cluster_snapshot_omits_counts_beyond_its_bounded_scan(): void
+    {
+        $bounded = new \ReflectionMethod(\OpsFour\S3Server\Metadata\PostgresMetadataStore::class, 'boundedClusterCount');
+
+        self::assertSame(10_000, $bounded->invoke(null, 10_000));
+        self::assertNull($bounded->invoke(null, 10_001));
+    }
+
+    public function test_postgres_membership_snapshot_fails_closed_at_its_deterministic_row_bound(): void
+    {
+        $bounded = new \ReflectionMethod(\OpsFour\S3Server\Metadata\PostgresMetadataStore::class, 'assertBoundedClusterMembershipCount');
+        $bounded->invoke(null, 10_000);
+
+        $sourceFile = (new \ReflectionClass(\OpsFour\S3Server\Metadata\PostgresMetadataStore::class))->getFileName();
+        self::assertIsString($sourceFile);
+        $source = file_get_contents($sourceFile);
+        self::assertIsString($source);
+        self::assertStringContainsString('ORDER BY membership.expires_at, membership.node_id, membership.incarnation_id', $source);
+        self::assertStringContainsString('LIMIT {$scanLimit}', $source);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('bounded live-process limit');
+        $bounded->invoke(null, 10_001);
+    }
+
     public function test_mysql_operational_metadata_updates_suppress_automatic_object_timestamp_change(): void
     {
         $reflection = new \ReflectionClass(MysqlMetadataStore::class);
@@ -173,7 +198,7 @@ final class ExternalSchemaTest extends TestCase
 
     public function test_postgres_schema_contains_owner_write_lock_migration(): void
     {
-        self::assertSame(48, PostgresSchema::VERSION);
+        self::assertSame(49, PostgresSchema::VERSION);
         $clusterStatements = PostgresSchema::getMigrationStatements(45);
         $clusterAdmissionMigration = implode("\n", $clusterStatements);
         self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_database_identity', $clusterAdmissionMigration);
@@ -183,6 +208,25 @@ final class ExternalSchemaTest extends TestCase
         self::assertStringContainsString('heartbeat_at TIMESTAMPTZ NOT NULL', $clusterAdmissionMigration);
         self::assertStringContainsString('expires_at TIMESTAMPTZ NOT NULL', $clusterAdmissionMigration);
         self::assertStringContainsString('idx_s3_cluster_membership_live', $clusterAdmissionMigration);
+        self::assertStringContainsString(
+            's3_cluster_membership(cluster_id, expires_at, node_id, incarnation_id) INCLUDE (roles, ready, draining)',
+            $clusterAdmissionMigration,
+        );
+        self::assertStringContainsString('draining BOOLEAN NOT NULL', $clusterAdmissionMigration);
+        self::assertStringContainsString('chk_s3_cluster_membership_state', $clusterAdmissionMigration);
+        self::assertStringContainsString('CREATE TABLE IF NOT EXISTS s3_cluster_work_observability', $clusterAdmissionMigration);
+        self::assertStringContainsString('successful_takeovers BIGINT NOT NULL', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_multipart_intents_cluster_due', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_multipart_intents_cluster_lease', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_notification_cluster_order', $clusterAdmissionMigration);
+        self::assertStringContainsString('s3_notification_queue(status, next_attempt_at, id)', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_transition_cluster_order', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_restore_cluster_order', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_garbage_cluster_order', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_notification_cluster_retry', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_transition_cluster_retry', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_restore_cluster_retry', $clusterAdmissionMigration);
+        self::assertStringContainsString('idx_s3_garbage_cluster_retry', $clusterAdmissionMigration);
         self::assertStringContainsString('singleton_id SMALLINT PRIMARY KEY', $clusterAdmissionMigration);
         self::assertStringNotContainsString('dsn', $clusterAdmissionMigration);
         $admissionStatement = '';

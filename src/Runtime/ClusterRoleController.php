@@ -16,6 +16,8 @@ final class ClusterRoleController
 
     private bool $drainPublished = false;
 
+    private ?float $lastSuccessfulHeartbeatAt = null;
+
     private readonly LocalMutex $membershipMutex;
 
     public function __construct(
@@ -148,11 +150,38 @@ final class ClusterRoleController
         }
     }
 
-    /** @return array{membership: string, required_roles: list<string>, live_roles: list<string>, missing_roles: list<string>} */
+    /** @return array<string, mixed> */
     public function diagnostics(): array
     {
         $lock = $this->membershipMutex->acquire();
         try {
+            if ($this->store instanceof ClusterOperationalSnapshotStore) {
+                $snapshot = $this->store->clusterMembershipSnapshot(
+                    $this->clusterId(),
+                    $this->nodeId(),
+                    $this->incarnationId(),
+                );
+                $live = [];
+                foreach ($snapshot->roleCounts as $role => $counts) {
+                    if ($counts['ready'] > 0) {
+                        $live[] = $role;
+                    }
+                }
+                $missing = array_values(array_diff($this->config->clusterRequiredRoles, $live));
+                $this->lastSuccessfulHeartbeatAt = $snapshot->lastHeartbeatAt;
+
+                return [
+                    'membership' => $snapshot->membership,
+                    'last_heartbeat_at' => $snapshot->lastHeartbeatAt,
+                    'heartbeat_age_seconds' => $snapshot->heartbeatAgeSeconds,
+                    'required_roles' => $this->config->clusterRequiredRoles,
+                    'live_roles' => $live,
+                    'missing_roles' => $missing,
+                    'role_counts' => $snapshot->roleCounts,
+                    'observed_at' => $snapshot->observedAt,
+                    'collection' => 'current',
+                ];
+            }
             if (! $this->registered || ! $this->isCurrentMemberLive()) {
                 throw new \RuntimeException('Membership is not current.');
             }
@@ -164,17 +193,65 @@ final class ClusterRoleController
                 'required_roles' => $this->config->clusterRequiredRoles,
                 'live_roles' => $live,
                 'missing_roles' => $missing,
+                'collection' => 'current',
             ];
         } catch (\Throwable) {
             return [
                 'membership' => 'unavailable',
+                'last_heartbeat_at' => $this->lastSuccessfulHeartbeatAt,
+                'heartbeat_age_seconds' => null,
                 'required_roles' => $this->config->clusterRequiredRoles,
                 'live_roles' => [],
                 'missing_roles' => $this->config->clusterRequiredRoles,
+                'collection' => 'unavailable',
             ];
         } finally {
             $lock->release();
         }
+    }
+
+    public function operationalSnapshot(): ClusterOperationalSnapshot
+    {
+        if (! $this->store instanceof ClusterOperationalSnapshotStore) {
+            throw new \LogicException('Cluster operational snapshots require PostgreSQL telemetry.');
+        }
+
+        return $this->store->clusterOperationalSnapshot(
+            $this->clusterId(),
+            $this->nodeId(),
+            $this->incarnationId(),
+        );
+    }
+
+    /** @return array{cluster_id: string, node_id: string, incarnation_id: string, roles: list<string>} */
+    public function healthIdentity(): array
+    {
+        return [
+            'cluster_id' => $this->clusterId(),
+            'node_id' => $this->nodeId(),
+            'incarnation_id' => $this->incarnationId(),
+            'roles' => $this->config->clusterRoles,
+        ];
+    }
+
+    /** @return list<string> */
+    public function requiredRoles(): array
+    {
+        return $this->config->clusterRequiredRoles;
+    }
+
+    public function locallyReady(): bool
+    {
+        return $this->registered && ! $this->draining;
+    }
+
+    public function nodeState(): string
+    {
+        if ($this->draining) {
+            return 'draining';
+        }
+
+        return $this->registered ? 'ready' : 'stopped';
     }
 
     public function withdraw(): void
@@ -206,6 +283,7 @@ final class ClusterRoleController
                     $this->nodeId(),
                     $this->incarnationId(),
                     false,
+                    true,
                     $this->ttlSeconds,
                 );
             } catch (\Throwable) {
@@ -230,6 +308,7 @@ final class ClusterRoleController
             $this->incarnationId(),
             $this->config->clusterRoles,
             true,
+            false,
             $this->ttlSeconds,
         );
         $this->registered = true;
@@ -254,6 +333,7 @@ final class ClusterRoleController
             $this->nodeId(),
             $this->incarnationId(),
             true,
+            false,
             $this->ttlSeconds,
         );
         if (! $renewed) {
@@ -273,6 +353,7 @@ final class ClusterRoleController
             $this->nodeId(),
             $this->incarnationId(),
             false,
+            true,
             $this->ttlSeconds,
         );
         if (! $renewed) {

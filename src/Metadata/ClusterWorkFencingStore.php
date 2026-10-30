@@ -28,5 +28,5 @@ interface ClusterWorkFencingStore
 
     public function transactionWithClusterWork(ClusterWorkToken $token, callable $callback): mixed;
 
-    public function releaseClusterWork(ClusterWorkToken $token): bool;
+    public function releaseClusterWork(ClusterWorkToken $token, bool $failedTakeover = false): bool;
 }

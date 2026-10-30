@@ -610,6 +610,7 @@ final class S3Server
                     $this->config->metricsBearerToken,
                     $this->awsOperationalState,
                     $this->tempBudget,
+                    $this->clusterRoles,
                 ), rateLimited: false));
                 if (in_array('admin', $httpSurfaces, true) && $this->adminCredentialApiHandler !== null) {
                     $adminCredentials = $this->managementHandler(

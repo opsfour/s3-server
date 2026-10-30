@@ -13,6 +13,7 @@ interface ClusterMembershipStore
         string $incarnationId,
         array $roles,
         bool $ready,
+        bool $draining,
         float $ttlSeconds,
     ): void;
 
@@ -21,6 +22,7 @@ interface ClusterMembershipStore
         string $nodeId,
         string $incarnationId,
         bool $ready,
+        bool $draining,
         float $ttlSeconds,
     ): bool;
 

@@ -13,11 +13,13 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
 use OpsFour\S3Server\Metadata\ClusterWorkClaim;
 use OpsFour\S3Server\Metadata\ClusterWorkToken;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use OpsFour\S3Server\Notification\NotificationProcessor;
+use OpsFour\S3Server\Runtime\ClusterWorkSnapshot;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -90,6 +92,68 @@ final class PostgresClusterWorkFencingTest extends TestCase
             $firstClaim->token,
             fn(): bool => $this->first->updateNotificationStatus($id, 'sent'),
         );
+    }
+
+    public function test_operational_snapshot_uses_database_time_and_tracks_drain_takeover_and_stale_ack(): void
+    {
+        $this->first->registerClusterMember('cluster-observe', 'node-api', 'inc-api', ['api'], true, false, 30.0);
+        $this->first->registerClusterMember('cluster-observe', 'node-worker', 'inc-worker', ['reconcile'], true, false, 30.0);
+        self::assertTrue($this->first->heartbeatClusterMember('cluster-observe', 'node-api', 'inc-api', false, false, 30.0));
+        $notReady = $this->first->clusterMembershipSnapshot('cluster-observe', 'node-api', 'inc-api');
+        self::assertSame(['ready' => 0, 'draining' => 0], $notReady->roleCounts['api']);
+        self::assertTrue($this->first->heartbeatClusterMember('cluster-observe', 'node-api', 'inc-api', false, true, 30.0));
+
+        $draining = $this->first->clusterMembershipSnapshot('cluster-observe', 'node-api', 'inc-api');
+        self::assertSame('current', $draining->membership);
+        self::assertNotNull($draining->lastHeartbeatAt);
+        self::assertNotNull($draining->heartbeatAgeSeconds);
+        self::assertGreaterThanOrEqual(0.0, $draining->heartbeatAgeSeconds);
+        self::assertSame(['ready' => 0, 'draining' => 1], $draining->roleCounts['api']);
+        self::assertSame(['ready' => 1, 'draining' => 0], $draining->roleCounts['reconcile']);
+
+        $this->firstPool->execute("INSERT INTO s3_multipart_write_intents (attempt_id, upload_id, bucket, bucket_generation, owner_id, storage_tier, assembly_path, final_path, part_digest, state, lease_until, next_attempt_at, dispatch_id) VALUES ('future-abandoned', 'upload-future-a', 'b', 'generation', 'owner', 'hot', 'assembly-a', 'final-a', 'digest-a', 'abandoned', 0, EXTRACT(EPOCH FROM clock_timestamp()) + 60, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')");
+        $this->firstPool->execute("INSERT INTO s3_multipart_write_intents (attempt_id, upload_id, bucket, bucket_generation, owner_id, storage_tier, assembly_path, final_path, part_digest, state, lease_until, next_attempt_at, dispatch_id) VALUES ('future-active', 'upload-future-b', 'b', 'generation', 'owner', 'hot', 'assembly-b', 'final-b', 'digest-b', 'active', EXTRACT(EPOCH FROM clock_timestamp()) + 60, 0, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')");
+        $multipartState = $this->first->clusterOperationalSnapshot('cluster-observe', 'node-worker', 'inc-worker');
+        self::assertSame(0, $multipartState->work['multipart_intent']->pending);
+        self::assertSame(1, $multipartState->work['multipart_intent']->activeLeases);
+        self::assertSame(0, $multipartState->work['multipart_intent']->expiredLeases);
+
+        $id = $this->first->enqueueNotification('bucket', 'key', 'event', 'https://example.test/hook', '{}');
+        $first = $this->first->claimClusterNotification('node-a:notification', 10.0);
+        self::assertNotNull($first);
+        self::assertFalse($first->token->takeover);
+        $this->firstPool->execute(
+            'UPDATE s3_notification_queue SET next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) - 1 WHERE id = $1',
+            [$id],
+        );
+        $expired = $this->first->clusterOperationalSnapshot('cluster-observe', 'node-worker', 'inc-worker');
+        self::assertSame(1, $expired->work['notification']->expiredLeases);
+
+        $takeover = $this->second->claimClusterNotification('node-b:notification', 10.0);
+        self::assertNotNull($takeover);
+        self::assertTrue($takeover->token->takeover);
+        $afterTakeover = $this->first->clusterOperationalSnapshot('cluster-observe', 'node-worker', 'inc-worker');
+        self::assertSame(1, $afterTakeover->work['notification']->activeLeases);
+        self::assertSame(1, $afterTakeover->work['notification']->successfulTakeovers);
+        self::assertGreaterThanOrEqual(2, $afterTakeover->work['notification']->highestGeneration);
+
+        try {
+            $this->first->transactionWithClusterWork($first->token, static fn(): bool => true);
+            self::fail('The stale acknowledgement unexpectedly retained ownership.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Cluster work ownership was lost.', $error->getMessage());
+        }
+        $this->second->recordClusterWorkOutcome($takeover->token, ClusterWorkOutcomeRecorder::FAILED_TAKEOVER);
+        $outcomes = $this->first->clusterOperationalSnapshot('cluster-observe', 'node-worker', 'inc-worker');
+        self::assertSame(1, $outcomes->work['notification']->staleAcknowledgements);
+        self::assertSame(1, $outcomes->work['notification']->failedTakeovers);
+
+        $this->firstPool->execute(
+            "UPDATE s3_cluster_membership SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE node_id = 'node-api'",
+        );
+        $expiredMember = $this->first->clusterMembershipSnapshot('cluster-observe', 'node-api', 'inc-api');
+        self::assertSame('stale', $expiredMember->membership);
+        self::assertSame(['ready' => 0, 'draining' => 0], $expiredMember->roleCounts['api']);
     }
 
     public function test_current_takeover_token_is_the_only_completion_authority(): void
@@ -194,6 +258,16 @@ final class PostgresClusterWorkFencingTest extends TestCase
             self::assertGreaterThanOrEqual(1, $claim->token->generation);
             self::assertGreaterThan($claim->token->heartbeatAt, $claim->token->leaseExpiresAt);
         }
+        $snapshot = $this->first->clusterOperationalSnapshot('cluster-work-catalog', 'node-a', 'incarnation');
+        self::assertSame(
+            ClusterWorkSnapshot::ALL,
+            array_keys($snapshot->work),
+        );
+        foreach ($snapshot->work as $workClass => $work) {
+            self::assertSame(1, $work->activeLeases, $workClass);
+            self::assertSame(0, $work->expiredLeases, $workClass);
+            self::assertGreaterThanOrEqual(1, $work->highestGeneration, $workClass);
+        }
         self::assertInstanceOf(MultipartWriteIntent::class, $claims[5]?->work);
         self::assertInstanceOf(ObjectWriteIntent::class, $claims[6]?->work);
     }
@@ -218,6 +292,11 @@ final class PostgresClusterWorkFencingTest extends TestCase
         $current = $this->claimWorkKind($this->second, $kind, 'node-b:incarnation:' . $kind, 2.0);
         self::assertNotNull($current);
         self::assertGreaterThan($old->token->generation, $current->token->generation);
+        if ($kind === ClusterWorkToken::OBJECT_INTENT) {
+            $objectOutcomes = $this->first->clusterOperationalSnapshot('cluster-object-outcome', 'node-a', 'incarnation');
+            self::assertSame(2, $objectOutcomes->work['object_intent']->successfulTakeovers);
+            self::assertSame(1, $objectOutcomes->work['object_intent']->failedTakeovers);
+        }
         $staleCallbackRan = false;
         try {
             $this->first->transactionWithClusterWork($old->token, function () use (&$staleCallbackRan): void {
@@ -279,17 +358,31 @@ final class PostgresClusterWorkFencingTest extends TestCase
         self::assertSame(1, (int) ($row['lock_count'] ?? 0));
         self::assertSame($first->token->generation, (int) ($row['generation'] ?? 0));
         self::assertTrue((bool) ($row['expired'] ?? false));
+        $released = $this->first->clusterOperationalSnapshot('cluster-release', 'node-a', 'incarnation');
+        self::assertSame(0, $released->work['lifecycle']->expiredLeases);
+        self::assertSame(0, $released->work['lifecycle']->successfulTakeovers);
         $retry = $this->firstPool->query('SELECT last_value FROM s3_test_cluster_retry_seq')->fetchRow();
         self::assertSame(3, (int) ($retry['last_value'] ?? 0));
 
         $second = $this->second->claimClusterLifecycle('node-a:incarnation:lifecycle', 2.0);
         self::assertNotNull($second);
+        self::assertFalse($second->token->takeover);
         self::assertSame($first->token->generation + 1, $second->token->generation);
         self::assertFalse($this->first->releaseClusterWork($first->token));
         self::assertTrue($this->second->releaseClusterWork($second->token));
         $third = $this->first->claimClusterLifecycle('node-a:incarnation:lifecycle', 2.0);
         self::assertNotNull($third);
+        self::assertFalse($third->token->takeover);
         self::assertSame($second->token->generation + 1, $third->token->generation);
+        $this->firstPool->execute("UPDATE s3_locks SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE lock_name = 'lifecycle:global'");
+        $takeover = $this->second->claimClusterLifecycle('node-b:incarnation:lifecycle', 2.0);
+        self::assertNotNull($takeover);
+        self::assertTrue($takeover->token->takeover);
+        self::assertTrue($this->second->releaseClusterWork($takeover->token, true));
+        $outcomes = $this->first->clusterOperationalSnapshot('cluster-release', 'node-a', 'incarnation');
+        self::assertSame(1, $outcomes->work['lifecycle']->successfulTakeovers);
+        self::assertSame(1, $outcomes->work['lifecycle']->failedTakeovers);
+        self::assertSame(1, $outcomes->work['lifecycle']->staleAcknowledgements);
     }
 
     public function test_cluster_multipart_claim_skips_provably_undispatched_rows(): void
@@ -303,6 +396,105 @@ final class PostgresClusterWorkFencingTest extends TestCase
         $row = $this->firstPool->query("SELECT state, claim_generation FROM s3_multipart_write_intents WHERE attempt_id = 'a-undispatched'")->fetchRow();
         self::assertSame('active', $row['state'] ?? null);
         self::assertSame(0, (int) ($row['claim_generation'] ?? -1));
+    }
+
+    public function test_snapshot_reports_retried_queue_age_and_owned_multipart_claim_state(): void
+    {
+        $id = $this->first->enqueueNotification('b', 'retry', 'event', 'https://example.test/hook', '{}');
+        $this->firstPool->execute(
+            "UPDATE s3_notification_queue SET attempts = 2, next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) - 5 WHERE id = $1",
+            [$id],
+        );
+        $expiredId = $this->first->enqueueNotification('b', 'expired', 'event', 'https://example.test/hook', '{}');
+        $this->firstPool->execute(
+            "UPDATE s3_notification_queue SET status = 'processing', next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) - 10 WHERE id = $1",
+            [$expiredId],
+        );
+        $this->firstPool->execute(<<<'SQL'
+            INSERT INTO s3_multipart_write_intents (
+                attempt_id, upload_id, bucket, bucket_generation, owner_id, storage_tier,
+                assembly_path, final_path, part_digest, state, lease_until, next_attempt_at,
+                dispatch_id, claim_worker_id, claim_heartbeat_at
+            ) VALUES (
+                'owned-abandoned', 'owned-upload', 'b', 'generation', 'owner', 'hot',
+                'assembly', 'final', 'digest', 'abandoned', 0,
+                EXTRACT(EPOCH FROM clock_timestamp()) + 60,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'node-a:multipart', EXTRACT(EPOCH FROM clock_timestamp())
+            )
+            SQL);
+
+        $snapshot = $this->first->clusterOperationalSnapshot('cluster-shape', 'node', 'incarnation');
+        self::assertSame(1, $snapshot->work['notification']->pending);
+        self::assertSame(1, $snapshot->work['notification']->retryPressure);
+        self::assertSame(1, $snapshot->work['notification']->expiredLeases);
+        self::assertNotNull($snapshot->work['notification']->oldestEligibleAgeSeconds);
+        self::assertGreaterThanOrEqual(9.0, $snapshot->work['notification']->oldestEligibleAgeSeconds);
+        self::assertSame(1, $snapshot->work['multipart_intent']->activeLeases);
+        self::assertSame(0, $snapshot->work['multipart_intent']->pending);
+
+        $this->firstPool->execute(
+            "UPDATE s3_multipart_write_intents SET next_attempt_at = EXTRACT(EPOCH FROM clock_timestamp()) - 1 WHERE attempt_id = 'owned-abandoned'",
+        );
+        $expired = $this->first->clusterOperationalSnapshot('cluster-shape', 'node', 'incarnation');
+        self::assertSame(1, $expired->work['multipart_intent']->expiredLeases);
+        $claim = $this->second->claimClusterMultipartIntent('node-b:multipart', 30.0);
+        self::assertNotNull($claim);
+        self::assertTrue($claim->token->takeover);
+        self::assertTrue($this->second->transactionWithClusterWork(
+            $claim->token,
+            fn(): bool => $this->second->renewMultipartCollectorClaim(
+                'owned-abandoned',
+                $claim->token->leaseExpiresAt + 30,
+                $claim->token->leaseExpiresAt,
+                $claim->token->generation,
+            ),
+        ));
+        $renewed = $this->second->getMultipartWriteIntent('owned-abandoned');
+        self::assertNotNull($renewed);
+        self::assertGreaterThan($claim->token->leaseExpiresAt, $renewed->nextAttemptAt);
+        self::assertTrue($this->second->transactionWithClusterWork(
+            $claim->token,
+            fn(): bool => $this->second->retryMultipartCollectorClaim(
+                'owned-abandoned',
+                $this->second->multipartWriteIntentNow() + 60,
+                $renewed->nextAttemptAt,
+                $claim->token->generation,
+            ),
+        ));
+        $released = $this->firstPool->query(
+            "SELECT claim_worker_id, claim_heartbeat_at FROM s3_multipart_write_intents WHERE attempt_id = 'owned-abandoned'",
+        )->fetchRow();
+        self::assertNull($released['claim_worker_id'] ?? null);
+        self::assertNull($released['claim_heartbeat_at'] ?? null);
+    }
+
+    public function test_large_membership_fails_closed_and_large_queue_omits_exact_count(): void
+    {
+        $this->firstPool->execute(<<<'SQL'
+            INSERT INTO s3_cluster_membership (
+                cluster_id, node_id, incarnation_id, roles, ready, draining, heartbeat_at, expires_at
+            )
+            SELECT 'large-cluster', 'node-' || value, 'incarnation', '["api"]'::jsonb,
+                   TRUE, FALSE, clock_timestamp(), clock_timestamp() + INTERVAL '5 minutes'
+            FROM generate_series(1, 10001) AS value
+            SQL);
+        try {
+            $this->first->clusterMembershipSnapshot('large-cluster', 'node-1', 'incarnation');
+            self::fail('Large live membership published a partial exact role count.');
+        } catch (\RuntimeException $error) {
+            self::assertStringContainsString('bounded live-process limit', $error->getMessage());
+        }
+
+        $this->firstPool->execute(<<<'SQL'
+            INSERT INTO s3_notification_queue (
+                bucket, key_name, event_name, destination_url, payload_json, status, next_attempt_at
+            )
+            SELECT 'b', 'key-' || value, 'event', 'https://example.test/hook', '{}', 'pending', 0
+            FROM generate_series(1, 10001) AS value
+            SQL);
+        $snapshot = $this->first->clusterOperationalSnapshot('empty-cluster', 'node', 'incarnation');
+        self::assertNull($snapshot->work['notification']->pending);
+        self::assertNotNull($snapshot->work['notification']->oldestEligibleAgeSeconds);
     }
 
     public function test_cluster_lease_rejects_sub_millisecond_duration(): void
@@ -482,6 +674,7 @@ final class PostgresClusterWorkFencingTest extends TestCase
 
     private function clearWorkRows(): void
     {
+        $this->firstPool->execute('DELETE FROM s3_cluster_membership');
         $this->firstPool->execute('DELETE FROM s3_notification_queue');
         $this->firstPool->execute('DELETE FROM s3_tier_transition_jobs');
         $this->firstPool->execute('DELETE FROM s3_restore_jobs');
@@ -489,6 +682,7 @@ final class PostgresClusterWorkFencingTest extends TestCase
         $this->firstPool->execute('DELETE FROM s3_multipart_write_intents');
         $this->firstPool->execute('DELETE FROM s3_object_write_intents');
         $this->firstPool->execute('DELETE FROM s3_locks');
+        $this->firstPool->execute('UPDATE s3_cluster_work_observability SET successful_takeovers = 0, failed_takeovers = 0, stale_acknowledgements = 0, highest_generation = 0');
     }
 }
 

@@ -167,7 +167,7 @@ final class LifecycleExecutor
             if ($lockAcquired) {
                 try {
                     if ($this->clusterLease !== null && $this->clusterFencing !== null) {
-                        $this->clusterFencing->releaseClusterWork($this->clusterLease);
+                        $this->clusterFencing->releaseClusterWork($this->clusterLease, $status === 'error');
                     } else {
                         $this->metadata->releaseLock('lifecycle:global', $this->lockOwnerId);
                     }

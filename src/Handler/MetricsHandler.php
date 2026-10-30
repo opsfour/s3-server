@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Handler;
 
+use Amp\Future;
+use Amp\TimeoutCancellation;
+use Amp\TimeoutException;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
@@ -15,18 +18,37 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
+use OpsFour\S3Server\Runtime\ClusterRoleController;
+
+use function Amp\async;
 
 final class MetricsHandler implements RequestHandler
 {
+    /**
+     * @var Future<array{
+     *     multipart: ?int,
+     *     write: array{object: int, object_seal: int, part: int}|null,
+     *     cleanup: ?int,
+     *     snapshot: ClusterOperationalSnapshot
+     * }>|null
+     */
+    private ?Future $clusterMetricsInFlight = null;
+
     public function __construct(
         private readonly MetricsCollector $metrics,
         private readonly ?MetadataStore $metadata = null,
         private readonly ?string $bearerToken = null,
         private readonly ?AwsS3OperationalState $awsOperationalState = null,
         private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
+        private readonly ?ClusterRoleController $clusterRoles = null,
+        private readonly float $clusterSnapshotTimeoutSeconds = 5.0,
     ) {
         if ($bearerToken !== null && trim($bearerToken) === '') {
             throw new \InvalidArgumentException('Metrics bearer token must not be empty when configured.');
+        }
+        if (! is_finite($clusterSnapshotTimeoutSeconds) || $clusterSnapshotTimeoutSeconds <= 0.0) {
+            throw new \InvalidArgumentException('Cluster metrics snapshot timeout must be finite and positive.');
         }
     }
 
@@ -52,34 +74,41 @@ final class MetricsHandler implements RequestHandler
         }
 
         if ($this->metadata !== null) {
-            if ($this->metadataIsObserved()) {
-                $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
-            } else {
-                $startedAt = hrtime(true);
-                try {
+            if ($this->clusterRoles === null) {
+                if ($this->metadataIsObserved()) {
                     $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
-                    $this->metrics->recordBackendOperation(
-                        backend: 'metadata',
-                        driver: $this->metadataDriver(),
-                        operation: 'getNotificationQueueStats',
-                        durationNs: hrtime(true) - $startedAt,
-                    );
-                } catch (\Throwable $e) {
-                    $this->metrics->recordBackendOperation(
-                        backend: 'metadata',
-                        driver: $this->metadataDriver(),
-                        operation: 'getNotificationQueueStats',
-                        durationNs: hrtime(true) - $startedAt,
-                        success: false,
-                        exception: $e::class,
-                    );
+                } else {
+                    $startedAt = hrtime(true);
+                    try {
+                        $this->metrics->setNotificationQueueStats($this->metadata->getNotificationQueueStats());
+                        $this->metrics->recordBackendOperation(
+                            backend: 'metadata',
+                            driver: $this->metadataDriver(),
+                            operation: 'getNotificationQueueStats',
+                            durationNs: hrtime(true) - $startedAt,
+                        );
+                    } catch (\Throwable $e) {
+                        $this->metrics->recordBackendOperation(
+                            backend: 'metadata',
+                            driver: $this->metadataDriver(),
+                            operation: 'getNotificationQueueStats',
+                            durationNs: hrtime(true) - $startedAt,
+                            success: false,
+                            exception: $e::class,
+                        );
 
-                    throw $e;
+                        throw $e;
+                    }
                 }
             }
-            $this->refreshMultipartCompletionCapacity();
-            $this->refreshWriteIntentCapacity();
-            $this->refreshStorageCleanupCapacity();
+            if ($this->clusterRoles === null) {
+                $this->refreshMultipartCompletionCapacity();
+                $this->refreshWriteIntentCapacity();
+                $this->refreshStorageCleanupCapacity();
+            }
+        }
+        if ($this->clusterRoles !== null) {
+            $this->refreshClusterMetrics();
         }
         if ($this->awsOperationalState !== null) {
             $this->metrics->setAwsOperationalSnapshot($this->awsOperationalState->snapshot());
@@ -99,6 +128,111 @@ final class MetricsHandler implements RequestHandler
         return $this->response();
     }
 
+    private function refreshClusterMetrics(): void
+    {
+        $future = $this->clusterMetricsInFlight;
+        if ($future === null) {
+            $future = $this->clusterMetricsInFlight = async($this->collectClusterMetrics(...));
+        }
+
+        try {
+            $result = $future->await(new TimeoutCancellation($this->clusterSnapshotTimeoutSeconds));
+        } catch (\Amp\CancelledException $error) {
+            if (! $error->getPrevious() instanceof TimeoutException) {
+                throw $error;
+            }
+            $future->ignore();
+            $this->clearClusterDatabaseSamples();
+
+            return;
+        } catch (\Throwable) {
+            $this->clearClusterDatabaseSamples();
+
+            return;
+        } finally {
+            if ($future->isComplete() && $this->clusterMetricsInFlight === $future) {
+                $this->clusterMetricsInFlight = null;
+            }
+        }
+
+        foreach ([
+            fn() => $this->metrics->setMultipartCompletionIntentCount($result['multipart']),
+            fn() => $this->metrics->setWriteIntentCapacityCounts($result['write']),
+            fn() => $this->metrics->setStorageCleanupCount($result['cleanup']),
+        ] as $index => $apply) {
+            try {
+                $apply();
+            } catch (\Throwable) {
+                match ($index) {
+                    0 => $this->metrics->setMultipartCompletionIntentCount(null),
+                    1 => $this->metrics->setWriteIntentCapacityCounts(null),
+                    2 => $this->metrics->setStorageCleanupCount(null),
+                };
+            }
+        }
+
+        try {
+            $this->metrics->setClusterOperationalSnapshot($result['snapshot']);
+            $this->metrics->setClusterSnapshotSuccess(true);
+        } catch (\Throwable) {
+            $this->clearClusterDatabaseSamples();
+        }
+    }
+
+    /**
+     * @return array{
+     *     multipart: ?int,
+     *     write: array{object: int, object_seal: int, part: int}|null,
+     *     cleanup: ?int,
+     *     snapshot: ClusterOperationalSnapshot
+     * }
+     */
+    private function collectClusterMetrics(): array
+    {
+        $multipart = null;
+        $write = null;
+        $cleanup = null;
+        try {
+            $multipart = $this->readMultipartCompletionCapacity();
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            // An unavailable optional capacity sample must not hide the
+            // remaining capacities or the operational snapshot.
+        }
+        try {
+            $write = $this->readWriteIntentCapacity();
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            // See above.
+        }
+        try {
+            $cleanup = $this->readStorageCleanupCapacity();
+        } catch (\Amp\CancelledException $error) {
+            throw $error;
+        } catch (\Throwable) {
+            // See above.
+        }
+
+        return [
+            'multipart' => $multipart,
+            'write' => $write,
+            'cleanup' => $cleanup,
+            'snapshot' => $this->clusterRoles?->operationalSnapshot()
+                ?? throw new \LogicException('Cluster metrics require a role controller.'),
+        ];
+    }
+
+    private function clearClusterDatabaseSamples(): void
+    {
+        $this->metrics->setMultipartCompletionIntentCount(null);
+        $this->metrics->setWriteIntentCapacityCounts(null);
+        $this->metrics->setStorageCleanupCount(null);
+        $this->metrics->setClusterOperationalSnapshot(null);
+        $this->metrics->setClusterSnapshotSuccess(false);
+    }
+
     private function response(): Response
     {
         return new Response(
@@ -113,8 +247,13 @@ final class MetricsHandler implements RequestHandler
 
     private function refreshMultipartCompletionCapacity(): void
     {
+        $this->metrics->setMultipartCompletionIntentCount($this->readMultipartCompletionCapacity());
+    }
+
+    private function readMultipartCompletionCapacity(): ?int
+    {
         if (! $this->metadata instanceof MultipartCompletionCapacityReader) {
-            return;
+            return null;
         }
         if ($this->metadataIsObserved()) {
             $count = $this->metadata->getMultipartCompletionIntentCount();
@@ -141,15 +280,20 @@ final class MetricsHandler implements RequestHandler
                 throw $e;
             }
         }
-        $this->metrics->setMultipartCompletionIntentCount($count);
+
+        return $count;
     }
 
     private function refreshWriteIntentCapacity(): void
     {
-        if (! $this->metadata instanceof WriteIntentCapacityReader) {
-            $this->metrics->setWriteIntentCapacityCounts(null);
+        $this->metrics->setWriteIntentCapacityCounts($this->readWriteIntentCapacity());
+    }
 
-            return;
+    /** @return array{object: int, object_seal: int, part: int}|null */
+    private function readWriteIntentCapacity(): ?array
+    {
+        if (! $this->metadata instanceof WriteIntentCapacityReader) {
+            return null;
         }
         if ($this->metadataIsObserved()) {
             $counts = $this->metadata->getWriteIntentCapacityCounts();
@@ -176,7 +320,8 @@ final class MetricsHandler implements RequestHandler
                 throw $e;
             }
         }
-        $this->metrics->setWriteIntentCapacityCounts($counts);
+
+        return $counts;
     }
 
     private function metadataDriver(): string
@@ -192,10 +337,13 @@ final class MetricsHandler implements RequestHandler
 
     private function refreshStorageCleanupCapacity(): void
     {
-        if (! $this->metadata instanceof StorageCleanupCapacityReader) {
-            $this->metrics->setStorageCleanupCount(null);
+        $this->metrics->setStorageCleanupCount($this->readStorageCleanupCapacity());
+    }
 
-            return;
+    private function readStorageCleanupCapacity(): ?int
+    {
+        if (! $this->metadata instanceof StorageCleanupCapacityReader) {
+            return null;
         }
         if ($this->metadataIsObserved()) {
             $count = $this->metadata->getStorageCleanupCount();
@@ -209,7 +357,8 @@ final class MetricsHandler implements RequestHandler
                 throw $error;
             }
         }
-        $this->metrics->setStorageCleanupCount($count);
+
+        return $count;
     }
 
     private function metadataIsObserved(): bool

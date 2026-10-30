@@ -11,6 +11,8 @@ use OpsFour\S3Server\Metadata\Schema\SchemaManager;
 use OpsFour\S3Server\Metadata\Schema\SqliteSchema;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Dto\ObjectInfo;
 use OpsFour\S3Server\Storage\InMemoryBackend;
@@ -24,12 +26,40 @@ use OpsFour\S3Server\Storage\FlysystemBackend;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Psr\Log\AbstractLogger;
 
 final class TierTransitionExecutorTest extends TestCase
 {
+    public function test_takeover_retry_records_failed_takeover_outcome(): void
+    {
+        $this->metadata->enqueueTierTransitionJob('bucket', 'key', null, 'STANDARD', 'GLACIER', 'GLACIER', 'source');
+        $job = $this->metadata->dequeueTierTransitionJobs(1)[0];
+        $token = RecordingClusterWorkFencingStore::takeoverToken(ClusterWorkToken::TIER_TRANSITION, (string) $job['id']);
+        $job['cluster_work_token'] = $token;
+        $fencing = new RecordingClusterWorkFencingStore();
+        $executor = new TierTransitionExecutor(
+            $this->metadata,
+            StorageTierRegistry::single(new InMemoryBackend()),
+            clusterFencing: $fencing,
+            clusterWorkerId: 'node:worker',
+        );
+
+        self::assertTrue((new \ReflectionMethod($executor, 'updateOwnedJobStatus'))->invoke(
+            $executor,
+            $job,
+            'pending',
+            'failed',
+            microtime(true) + 60,
+        ));
+        self::assertSame([[
+            'token' => $token,
+            'outcome' => ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+        ]], $fencing->outcomes);
+    }
+
     #[DataProvider('invalidLeaseRenewalIntervals')]
     public function test_invalid_lease_renewal_intervals_are_rejected(float $interval): void
     {

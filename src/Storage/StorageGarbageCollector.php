@@ -374,7 +374,17 @@ final readonly class StorageGarbageCollector
             try {
                 return $this->clusterFencing->transactionWithClusterWork(
                     $token,
-                    fn(): bool => $this->metadata->retryStorageGarbage($item['id'], $error, $nextAttemptAt),
+                    function () use ($item, $error, $nextAttemptAt, $token): bool {
+                        $updated = $this->metadata->retryStorageGarbage($item['id'], $error, $nextAttemptAt);
+                        if ($updated && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
+                            $this->clusterFencing->recordClusterWorkOutcome(
+                                $token,
+                                \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+                            );
+                        }
+
+                        return $updated;
+                    },
                 );
             } catch (\RuntimeException) {
                 return false;

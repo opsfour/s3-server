@@ -15,6 +15,7 @@ use Amp\Postgres\PostgresConnectionPool;
 use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Auth\DatabaseCredentialProvider;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
+use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterCapabilityFingerprint;
@@ -113,12 +114,13 @@ final class PostgresClusterAdmissionTest extends TestCase
             },
         );
         $live->admitInitial();
-        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES (49, $1)', ['drift-test']);
+        $futureVersion = PostgresSchema::VERSION + 1;
+        $this->firstPool->execute('INSERT INTO s3_schema_version (version, description) VALUES ($1, $2)', [$futureVersion, 'drift-test']);
         try {
             self::assertFalse($live->revalidate(true));
             self::assertFalse($live->isAdmitted());
         } finally {
-            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = 49');
+            $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = $1', [$futureVersion]);
         }
         self::assertTrue($live->revalidate(true));
     }
@@ -154,6 +156,7 @@ final class PostgresClusterAdmissionTest extends TestCase
             'restricted-incarnation',
             ['reconcile'],
             true,
+            false,
             30.0,
         );
         self::assertTrue($this->serving->isClusterMemberLive(
@@ -166,8 +169,16 @@ final class PostgresClusterAdmissionTest extends TestCase
             'restricted-node',
             'restricted-incarnation',
             true,
+            false,
             30.0,
         ));
+        $snapshot = $this->serving->clusterOperationalSnapshot(
+            'cluster-functional',
+            'restricted-node',
+            'restricted-incarnation',
+        );
+        self::assertSame('current', $snapshot->membership);
+        self::assertSame(1, $snapshot->roleCounts['reconcile']['ready']);
         $this->serving->withdrawClusterMember('cluster-functional', 'restricted-node', 'restricted-incarnation');
         self::assertFalse($this->serving->isClusterMemberLive(
             'cluster-functional',
@@ -179,8 +190,8 @@ final class PostgresClusterAdmissionTest extends TestCase
 
     public function test_membership_uses_database_time_and_advertises_complete_canonical_role_sets(): void
     {
-        $this->first->registerClusterMember('cluster-functional', 'node-a', 'incarnation-a', ['reconcile', 'transition'], true, 30.0);
-        $this->second->registerClusterMember('cluster-functional', 'node-b', 'incarnation-b', ['api'], true, 30.0);
+        $this->first->registerClusterMember('cluster-functional', 'node-a', 'incarnation-a', ['reconcile', 'transition'], true, false, 30.0);
+        $this->second->registerClusterMember('cluster-functional', 'node-b', 'incarnation-b', ['api'], true, false, 30.0);
 
         self::assertSame(['api', 'reconcile', 'transition'], $this->first->liveClusterRoles('cluster-functional'));
         $row = $this->firstPool->query(
@@ -196,7 +207,7 @@ final class PostgresClusterAdmissionTest extends TestCase
         $this->first->withdrawClusterMember('cluster-functional', 'node-a', 'incarnation-a');
         self::assertSame(['api'], $this->second->liveClusterRoles('cluster-functional'));
 
-        $this->second->registerClusterMember('cluster-functional', 'node-c', 'incarnation-c', ['garbage'], true, 0.001);
+        $this->second->registerClusterMember('cluster-functional', 'node-c', 'incarnation-c', ['garbage'], true, false, 0.001);
         \Amp\delay(0.01);
         self::assertSame(['api'], $this->first->liveClusterRoles('cluster-functional'));
     }
@@ -398,6 +409,8 @@ final class PostgresClusterAdmissionTest extends TestCase
         $this->firstPool->execute("GRANT SELECT ON {$schema}.s3_cluster_database_identity TO {$role}");
         $this->firstPool->execute("GRANT SELECT, INSERT ON {$schema}.s3_cluster_admission TO {$role}");
         $this->firstPool->execute("GRANT SELECT, INSERT, UPDATE ON {$schema}.s3_cluster_membership TO {$role}");
+        $this->firstPool->execute("GRANT SELECT, UPDATE ON {$schema}.s3_cluster_work_observability TO {$role}");
+        $this->firstPool->execute("GRANT SELECT ON {$schema}.s3_locks, {$schema}.s3_notification_queue, {$schema}.s3_tier_transition_jobs, {$schema}.s3_restore_jobs, {$schema}.s3_storage_garbage, {$schema}.s3_multipart_write_intents, {$schema}.s3_object_write_intents TO {$role}");
 
         $config = PostgresConfig::fromString(trim((string) getenv('S3_TEST_POSTGRES_METADATA_DSN')))
             ->withUser($this->servingRole)

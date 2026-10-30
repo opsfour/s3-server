@@ -218,8 +218,9 @@ The DML-only serving role does not need trigger-creation rights.
 | 46 (PostgreSQL) | Add a stable singleton database identity plus the separately replaceable immutable cluster-admission contract with secret-free per-category digests. |
 | 47 (PostgreSQL) | Bind lifecycle, notification, transition, restore, storage-garbage, multipart-intent, and object-intent claims to a process-derived worker ID, database-time heartbeat/expiry, and monotonically increasing generation. The migration expires and increments every pre-owner active generation. |
 | 48 (PostgreSQL) | Add per-process cluster membership with canonical roles, ready state, database-time heartbeat, and authoritative expiry plus a bounded live-coverage index. |
+| 49 (PostgreSQL) | Record intentional drain explicitly, add fixed durable-work takeover/outcome aggregates, and add the bounded membership and work indexes used by cluster health and metrics. |
 
-SQLite currently uses schema version `42`; PostgreSQL uses `48`, and MySQL
+SQLite currently uses schema version `42`; PostgreSQL uses `49`, and MySQL
 uses `50`. SQLite normally applies each migration version in a transaction. The
 object-layout migration commits each 10,000-row keyset batch with a durable
 checkpoint containing its fixed starting high-water ID and publishes the new
@@ -240,7 +241,10 @@ identity row and `SELECT, INSERT` on `s3_cluster_admission`; it does not need
 maintenance operation performed by the DDL-capable role. PostgreSQL v48 also
 requires `SELECT, INSERT, UPDATE` on `s3_cluster_membership` so serving
 processes can register, heartbeat, withdraw readiness, and evaluate live role
-coverage; it does not require `DELETE`. The credential
+coverage; it does not require `DELETE`. PostgreSQL v49 additionally requires
+`SELECT, UPDATE` on `s3_cluster_work_observability`; normal runtime grants on
+the seven durable-work tables provide the bounded backlog and lease snapshot.
+The credential
 migrator similarly creates `s3_credential_store_identity`; serving reads it but
 never changes it, while normal credential CRUD retains its existing grants on
 `s3_credentials`.
@@ -258,6 +262,11 @@ processes renew it using `clock_timestamp()` and advertise their entire
 canonical assigned-role set atomically. Only ready rows whose database-time
 expiry remains in the future contribute live role coverage; host clocks and
 cached coverage never authorize claims or reconciliation-dependent writes.
+PostgreSQL v49 distinguishes an intentional drain from any other not-ready
+state and keeps seven fixed outcome rows for successful/failed takeovers,
+stale acknowledgements, and highest generation. The operational reader uses
+one transaction and one database observation time; it never groups by customer
+or work identity and never reuses a failed observation.
 MySQL v31 changes three indexed identifier columns and may wait for metadata
 locks or rebuild their indexes on a populated database. The v32 dispatch-token
 column also needs a migration-time and lock check on a representative copy.

@@ -9,6 +9,9 @@ use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Psr7\Response;
 use OpsFour\S3Server\Exception\NoSuchKeyException;
 use OpsFour\S3Server\Metadata\MultipartWriteIntent;
+use OpsFour\S3Server\Metadata\ClusterWorkClaim;
+use OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder;
+use OpsFour\S3Server\Metadata\ClusterWorkToken;
 use OpsFour\S3Server\Metadata\MultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\FencedMultipartWriteIntentStore;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
@@ -23,11 +26,60 @@ use OpsFour\S3Server\Storage\MultipartWriteIntentCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 
 final class MultipartWriteIntentCollectorTest extends TestCase
 {
+    public function test_takeover_retry_records_failed_takeover_outcome(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $metadata->createBucket('owner', 'bucket', 'us-east-1');
+        $metadata->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'REMOTE');
+        $bucket = $metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $now = $metadata->multipartWriteIntentNow();
+        $metadata->createMultipartWriteIntent(new MultipartWriteIntent(
+            attemptId: 'attempt',
+            uploadId: 'upload',
+            bucket: 'bucket',
+            bucketGeneration: $bucket->generation,
+            ownerId: 'owner',
+            storageTier: 'REMOTE',
+            assemblyPath: 'assembly',
+            finalPath: 'final',
+            partDigest: 'digest',
+            sseMode: null,
+            leaseUntil: $now + 30,
+            nextAttemptAt: $now + 30,
+        ));
+        self::assertTrue($metadata->armMultipartWriteIntent('attempt', str_repeat('a', 32), $now + 30, $now + 60));
+        $connection = (new \ReflectionMethod($metadata, 'connection'))->invoke($metadata);
+        self::assertInstanceOf(\PDO::class, $connection);
+        $expire = $connection->prepare('UPDATE s3_multipart_write_intents SET lease_until = ?, next_attempt_at = ? WHERE attempt_id = ?');
+        self::assertInstanceOf(\PDOStatement::class, $expire);
+        $expire->execute([$now - 1, $now - 1, 'attempt']);
+        $intent = $metadata->claimDueMultipartWriteIntents(1, $now, $now + 300)[0];
+        $token = RecordingClusterWorkFencingStore::takeoverToken(ClusterWorkToken::MULTIPART_INTENT, $intent->attemptId);
+        $fencing = new RecordingClusterWorkFencingStore(new ClusterWorkClaim($token, $intent));
+        $backend = $this->createMock(StorageBackend::class);
+        $backend->method('deleteObjectByPath')->willThrowException(new \RuntimeException('delete failed'));
+        $collector = new MultipartWriteIntentCollector(
+            $metadata,
+            StorageTierRegistry::single($backend, 'REMOTE'),
+            clusterFencing: $fencing,
+            clusterWorkerId: 'node:worker',
+        );
+
+        self::assertSame(0, $collector->collect(1));
+        self::assertSame([[
+            'token' => $token,
+            'outcome' => ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+        ]], $fencing->outcomes);
+    }
+
     public function test_retained_aws_tombstone_is_backlog_not_a_collector_failure(): void
     {
         $oldKey = getenv('AWS_ACCESS_KEY_ID');

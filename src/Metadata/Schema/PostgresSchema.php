@@ -14,7 +14,7 @@ namespace OpsFour\S3Server\Metadata\Schema;
 final class PostgresSchema
 {
     /** @var int Current schema version. */
-    public const int VERSION = 48;
+    public const int VERSION = 49;
 
     /**
      * Get the complete schema DDL for version 1.
@@ -65,12 +65,14 @@ final class PostgresSchema
                 incarnation_id TEXT NOT NULL,
                 roles JSONB NOT NULL CHECK (jsonb_typeof(roles) = 'array'),
                 ready BOOLEAN NOT NULL,
+                draining BOOLEAN NOT NULL DEFAULT FALSE,
+                CONSTRAINT chk_s3_cluster_membership_state CHECK (NOT (ready AND draining)),
                 heartbeat_at TIMESTAMPTZ NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (cluster_id, node_id, incarnation_id)
             )
             SQL,
-            'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at) WHERE ready = TRUE',
+            'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at, node_id, incarnation_id) INCLUDE (roles, ready, draining)',
 
             // Buckets
             <<<'SQL'
@@ -644,6 +646,7 @@ final class PostgresSchema
             'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_tier ON s3_object_write_intents(storage_tier)',
             'CREATE INDEX IF NOT EXISTS idx_s3_object_write_intents_owner_seal ON s3_object_write_intents(owner_id, seal_reserved)',
 
+            ...self::clusterObservabilityStatements(),
             ...self::completionCapacityStatements(),
             ...self::writeIntentCapacityStatements(),
             ...self::storageCleanupCapacityStatements(),
@@ -1153,8 +1156,73 @@ final class PostgresSchema
                 SQL;
             $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at) WHERE ready = TRUE';
         }
+        if ($fromVersion < 49) {
+            $statements[] = 'ALTER TABLE s3_cluster_membership ADD COLUMN IF NOT EXISTS draining BOOLEAN NOT NULL DEFAULT FALSE';
+            $statements[] = <<<'SQL'
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'chk_s3_cluster_membership_state'
+                          AND conrelid = 's3_cluster_membership'::regclass
+                    ) THEN
+                        ALTER TABLE s3_cluster_membership
+                            ADD CONSTRAINT chk_s3_cluster_membership_state CHECK (NOT (ready AND draining));
+                    END IF;
+                END
+                $$
+                SQL;
+            $statements[] = 'DROP INDEX IF EXISTS idx_s3_cluster_membership_live';
+            $statements[] = 'CREATE INDEX IF NOT EXISTS idx_s3_cluster_membership_live ON s3_cluster_membership(cluster_id, expires_at, node_id, incarnation_id) INCLUDE (roles, ready, draining)';
+            array_push($statements, ...self::clusterObservabilityStatements());
+        }
 
         return $statements;
+    }
+
+    /** @return list<string> */
+    private static function clusterObservabilityStatements(): array
+    {
+        return [
+            <<<'SQL'
+            CREATE TABLE IF NOT EXISTS s3_cluster_work_observability (
+                work_class TEXT PRIMARY KEY CHECK (work_class IN (
+                    'notification', 'transition', 'restore', 'garbage',
+                    'multipart_intent', 'object_intent', 'lifecycle'
+                )),
+                successful_takeovers BIGINT NOT NULL DEFAULT 0 CHECK (successful_takeovers >= 0),
+                failed_takeovers BIGINT NOT NULL DEFAULT 0 CHECK (failed_takeovers >= 0),
+                stale_acknowledgements BIGINT NOT NULL DEFAULT 0 CHECK (stale_acknowledgements >= 0),
+                highest_generation BIGINT NOT NULL DEFAULT 0 CHECK (highest_generation >= 0)
+            )
+            SQL,
+            <<<'SQL'
+            INSERT INTO s3_cluster_work_observability (work_class)
+            SELECT work_class FROM unnest(ARRAY[
+                'notification', 'transition', 'restore', 'garbage',
+                'multipart_intent', 'object_intent', 'lifecycle'
+            ]) AS fixed(work_class)
+            ON CONFLICT (work_class) DO NOTHING
+            SQL,
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(lease_generation) FROM s3_notification_queue), 0)) WHERE work_class = 'notification'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(lease_generation) FROM s3_tier_transition_jobs), 0)) WHERE work_class = 'transition'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(lease_generation) FROM s3_restore_jobs), 0)) WHERE work_class = 'restore'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(lease_generation) FROM s3_storage_garbage), 0)) WHERE work_class = 'garbage'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(claim_generation) FROM s3_multipart_write_intents), 0)) WHERE work_class = 'multipart_intent'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(claim_generation) FROM s3_object_write_intents), 0)) WHERE work_class = 'object_intent'",
+            "UPDATE s3_cluster_work_observability SET highest_generation = GREATEST(highest_generation, COALESCE((SELECT MAX(lease_generation) FROM s3_locks WHERE lock_name = 'lifecycle:global'), 0)) WHERE work_class = 'lifecycle'",
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_cluster_due ON s3_multipart_write_intents(state, next_attempt_at, attempt_id) WHERE dispatch_id IS NOT NULL',
+            'CREATE INDEX IF NOT EXISTS idx_s3_multipart_intents_cluster_lease ON s3_multipart_write_intents(state, lease_until, attempt_id) WHERE dispatch_id IS NOT NULL',
+            'CREATE INDEX IF NOT EXISTS idx_s3_object_intents_cluster_due ON s3_object_write_intents(state, lease_until, attempt_id) WHERE dispatch_id IS NOT NULL',
+            'CREATE INDEX IF NOT EXISTS idx_s3_notification_cluster_order ON s3_notification_queue(status, next_attempt_at, id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_transition_cluster_order ON s3_tier_transition_jobs(status, next_attempt_at, id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_restore_cluster_order ON s3_restore_jobs(status, next_attempt_at, id)',
+            'CREATE INDEX IF NOT EXISTS idx_s3_garbage_cluster_order ON s3_storage_garbage(status, next_attempt_at, id)',
+            "CREATE INDEX IF NOT EXISTS idx_s3_notification_cluster_retry ON s3_notification_queue(next_attempt_at, id) WHERE status = 'pending' AND attempts > 0",
+            "CREATE INDEX IF NOT EXISTS idx_s3_transition_cluster_retry ON s3_tier_transition_jobs(next_attempt_at, id) WHERE status = 'pending' AND attempts > 0",
+            "CREATE INDEX IF NOT EXISTS idx_s3_restore_cluster_retry ON s3_restore_jobs(next_attempt_at, id) WHERE status = 'pending' AND attempts > 0",
+            "CREATE INDEX IF NOT EXISTS idx_s3_garbage_cluster_retry ON s3_storage_garbage(next_attempt_at, id) WHERE status = 'pending' AND attempts > 0",
+        ];
     }
 
     /** @return list<string> */

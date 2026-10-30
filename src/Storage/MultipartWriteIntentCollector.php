@@ -221,12 +221,23 @@ final readonly class MultipartWriteIntentCollector
                 try {
                     $retained = $this->clusterFencing->transactionWithClusterWork(
                         $clusterToken,
-                        fn(): bool => $this->metadata->retryMultipartCollectorClaim(
-                            $intent->attemptId,
-                            $nextAttemptAt,
-                            $leaseUntil,
-                            $intent->claimGeneration,
-                        ),
+                        function () use ($intent, $nextAttemptAt, $leaseUntil, $clusterToken, $failed): bool {
+                            $retained = $this->metadata->retryMultipartCollectorClaim(
+                                $intent->attemptId,
+                                $nextAttemptAt,
+                                $leaseUntil,
+                                $intent->claimGeneration,
+                            );
+                            if ($retained && $failed !== null
+                                && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
+                                $this->clusterFencing->recordClusterWorkOutcome(
+                                    $clusterToken,
+                                    \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder::FAILED_TAKEOVER,
+                                );
+                            }
+
+                            return $retained;
+                        },
                     );
                 } catch (\RuntimeException) {
                     $retained = false;
