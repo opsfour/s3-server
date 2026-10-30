@@ -29,6 +29,7 @@ use OpsFour\S3Server\Runtime\CancellationPreservingCleanup;
 use OpsFour\S3Server\Policy\PolicyEvaluator;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Security\RequestNetworkContext;
+use OpsFour\S3Server\Storage\CommittedObjectReader;
 use OpsFour\S3Server\Storage\GenerationGuardedReadableStream;
 use OpsFour\S3Server\Storage\LimitedReadableStream;
 use OpsFour\S3Server\Storage\StorageBackend;
@@ -210,7 +211,7 @@ final class WebsiteHostingMiddleware implements Middleware
             }
 
             try {
-                [$storage, $storagePath] = $this->readLocation($objectInfo, $storagePath);
+                [$storage, $storagePath, $physicalStorageTier] = $this->readLocation($objectInfo, $storagePath);
             } catch (\InvalidArgumentException) {
                 return self::htmlError(500, 'InternalError', 'Object storage tier is not configured.');
             }
@@ -219,7 +220,14 @@ final class WebsiteHostingMiddleware implements Middleware
                 return self::htmlError(403, 'InvalidObjectState', 'The archived object must be restored before it can be served.');
             }
 
-            $body = $this->websiteBody($request, $bucketInfo, $storage, $storagePath, $objectInfo);
+            $body = $this->websiteBody(
+                $request,
+                $bucketInfo,
+                $storage,
+                $storagePath,
+                $physicalStorageTier,
+                $objectInfo,
+            );
 
             return new Response(
                 status: 200,
@@ -304,7 +312,7 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         try {
-            [$storage, $storagePath] = $this->readLocation($errorObjectInfo, $storagePath);
+            [$storage, $storagePath, $physicalStorageTier] = $this->readLocation($errorObjectInfo, $storagePath);
         } catch (\InvalidArgumentException) {
             return self::htmlError(500, 'InternalError', 'Error document storage tier is not configured.');
         }
@@ -313,7 +321,14 @@ final class WebsiteHostingMiddleware implements Middleware
             return self::htmlError(403, 'InvalidObjectState', 'The archived error document must be restored before it can be served.');
         }
 
-        $body = $this->websiteBody($request, $bucketInfo, $storage, $storagePath, $errorObjectInfo);
+        $body = $this->websiteBody(
+            $request,
+            $bucketInfo,
+            $storage,
+            $storagePath,
+            $physicalStorageTier,
+            $errorObjectInfo,
+        );
 
         return new Response(
             status: $status,
@@ -327,6 +342,7 @@ final class WebsiteHostingMiddleware implements Middleware
         BucketInfo $bucketInfo,
         StorageBackend $storage,
         string $path,
+        string $physicalStorageTier,
         ObjectInfo $object,
     ): string|GenerationGuardedReadableStream {
         if ($request->getMethod() === 'HEAD') {
@@ -334,10 +350,24 @@ final class WebsiteHostingMiddleware implements Middleware
         }
 
         if (($object->userMetadata['__sse-algorithm'] ?? null) === EncryptionRequestResolver::SSE_S3) {
-            return $this->decryptWebsiteBody($request, $bucketInfo, $storage, $path, $object);
+            return $this->decryptWebsiteBody(
+                $request,
+                $bucketInfo,
+                $storage,
+                $path,
+                $physicalStorageTier,
+                $object,
+            );
         }
 
-        return $this->openWebsiteBody($request, $bucketInfo, $storage, $path, $object->size);
+        return $this->openWebsiteBody(
+            $request,
+            $bucketInfo,
+            $storage,
+            $path,
+            $physicalStorageTier,
+            $object,
+        );
     }
 
     private function decryptWebsiteBody(
@@ -345,6 +375,7 @@ final class WebsiteHostingMiddleware implements Middleware
         BucketInfo $bucketInfo,
         StorageBackend $storage,
         string $path,
+        string $physicalStorageTier,
         ObjectInfo $object,
     ): string {
         EncryptionRequestResolver::requireEncryptionService(
@@ -362,7 +393,13 @@ final class WebsiteHostingMiddleware implements Middleware
         $decryptionCancellation = null;
         try {
             [$ciphertext] = BufferedSsePayload::readExpected(
-                $storage->getObjectByPath($path),
+                CommittedObjectReader::read(
+                    $storage,
+                    $bucketInfo,
+                    $object,
+                    $path,
+                    $physicalStorageTier,
+                ),
                 $object->size,
                 $this->maxEncryptedObjectSize,
             );
@@ -390,9 +427,21 @@ final class WebsiteHostingMiddleware implements Middleware
         }
     }
 
-    private function openWebsiteBody(Request $request, BucketInfo $bucketInfo, StorageBackend $storage, string $path, int $size): GenerationGuardedReadableStream
-    {
-        $source = $storage->getObjectByPath($path);
+    private function openWebsiteBody(
+        Request $request,
+        BucketInfo $bucketInfo,
+        StorageBackend $storage,
+        string $path,
+        string $physicalStorageTier,
+        ObjectInfo $object,
+    ): GenerationGuardedReadableStream {
+        $source = CommittedObjectReader::read(
+            $storage,
+            $bucketInfo,
+            $object,
+            $path,
+            $physicalStorageTier,
+        );
         try {
             // Opening a remote source can yield. Close it if this bucket name
             // changed while the backend was opening the old physical path.
@@ -400,7 +449,7 @@ final class WebsiteHostingMiddleware implements Middleware
             return new GenerationGuardedReadableStream(
                 new LimitedReadableStream(
                     $source,
-                    $size,
+                    $object->size,
                     requireExactLength: true,
                     rejectExcess: true,
                 ),
@@ -576,13 +625,13 @@ final class WebsiteHostingMiddleware implements Middleware
     }
 
     /**
-     * @return array{0: \OpsFour\S3Server\Storage\StorageBackend|null, 1: string}
+     * @return array{0: \OpsFour\S3Server\Storage\StorageBackend|null, 1: string, 2: string}
      */
     private function readLocation(\OpsFour\S3Server\Dto\ObjectInfo $object, string $storagePath): array
     {
         $tier = $this->storageTiers->tier($object->storageTier);
         if (! $tier->restoreRequired) {
-            return [$tier->backend, $storagePath];
+            return [$tier->backend, $storagePath, $tier->name];
         }
 
         if (
@@ -592,10 +641,12 @@ final class WebsiteHostingMiddleware implements Middleware
             || $object->restoreExpiresAt === null
             || $object->restoreExpiresAt <= new \DateTimeImmutable('now', new \DateTimeZone('UTC'))
         ) {
-            return [null, $storagePath];
+            return [null, $storagePath, $tier->name];
         }
 
-        return [\OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($object, $this->storageTiers)->backend, $object->restoredStoragePath];
+        $restoreTier = \OpsFour\S3Server\Storage\RestoredCopyTierResolver::resolve($object, $this->storageTiers);
+
+        return [$restoreTier->backend, $object->restoredStoragePath, $restoreTier->name];
     }
 
     private static function htmlError(int $status, string $code, string $message): Response

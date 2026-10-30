@@ -39,6 +39,7 @@ use OpsFour\S3Server\Factory\StorageBackendFactory;
 use OpsFour\S3Server\Metadata\ObjectPart;
 use OpsFour\S3Server\Metadata\ObjectPartLayout;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
+use OpsFour\S3Server\Middleware\WebsiteHostingMiddleware;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Quota\QuotaConfig;
@@ -233,6 +234,78 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         self::assertSame('', $this->lastProviderRequest()->getHeaderLine('Range'));
     }
 
+    public function test_website_get_and_head_use_the_committed_aws_read_path(): void
+    {
+        $payload = 'public AWS website payload';
+        $path = $this->putCommittedAwsMetadata('key', $payload);
+        $object = $this->metadata->getObjectMetadata('bucket', 'key');
+        self::assertNotNull($object);
+        $this->publishWebsite('key');
+        $middleware = new WebsiteHostingMiddleware(
+            $this->metadata,
+            StorageTierRegistry::single($this->backend),
+            '*.s3-website.test',
+        );
+        $providerRequestCount = count($this->requests);
+
+        $head = $middleware->handleRequest(
+            $this->websiteRequest('HEAD', '/'),
+            $this->websiteTerminal(),
+        );
+
+        self::assertSame(200, $head->getStatus());
+        self::assertSame('', \Amp\ByteStream\buffer($head->getBody()));
+        self::assertCount($providerRequestCount, $this->requests);
+
+        $this->mock->append($this->objectReadResponse(
+            $payload,
+            basename($path),
+        ));
+        $get = $middleware->handleRequest(
+            $this->websiteRequest('GET', '/'),
+            $this->websiteTerminal(),
+        );
+
+        self::assertSame(200, $get->getStatus());
+        self::assertSame($payload, \Amp\ByteStream\buffer($get->getBody()));
+        self::assertSame($object->systemMetadata['storagePath'], ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
+    }
+
+    public function test_website_error_document_decrypts_the_committed_aws_object(): void
+    {
+        $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
+        $plaintext = 'qualified AWS error page';
+        $encrypted = $encryption->encryptSseS3($plaintext);
+        $path = $this->putCommittedAwsMetadata('error.html', $plaintext, [
+            '__sse-algorithm' => 'AES256',
+            '__sse-key' => $encrypted['encryptedDataKey'],
+            '__sse-iv' => $encrypted['iv'],
+            '__sse-tag' => $encrypted['tag'],
+        ]);
+        $object = $this->metadata->getObjectMetadata('bucket', 'error.html');
+        self::assertNotNull($object);
+        $this->metadata->putBucketWebsite('bucket', 'index.html', 'error.html');
+        $this->allowPublicWebsiteRead();
+        $this->mock->append($this->objectReadResponse(
+            $encrypted['ciphertext'],
+            basename($path),
+        ));
+
+        $response = (new WebsiteHostingMiddleware(
+            $this->metadata,
+            StorageTierRegistry::single($this->backend),
+            '*.s3-website.test',
+            $encryption,
+        ))->handleRequest(
+            $this->websiteRequest('GET', '/missing'),
+            $this->websiteTerminal(),
+        );
+
+        self::assertSame(404, $response->getStatus());
+        self::assertSame($plaintext, \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame($object->systemMetadata['storagePath'], ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
+    }
+
     public function test_sse_c_aws_get_reads_verified_full_ciphertext_with_customer_key(): void
     {
         $encryption = new EncryptionService(new ConfigMasterKeyProvider(base64_encode(random_bytes(32))));
@@ -424,6 +497,56 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $response = (new GetObjectHandler($this->metadata, $cold, storageTiers: $tiers))
             ->handleRequest($this->getRequest(key: 'restored'));
 
+        self::assertSame($payload, \Amp\ByteStream\buffer($response->getBody()));
+        self::assertSame($restoredPath, ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
+    }
+
+    public function test_website_restored_copy_uses_its_exact_aws_tier_reference(): void
+    {
+        $payload = 'restored AWS website payload';
+        $cold = new InMemoryBackend();
+        $coldWrite = $cold->putObject('bucket', 'restored', new ReadableBuffer('cold'));
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            'restored',
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/plain',
+            $coldWrite->path,
+        );
+        $this->metadata->updateObjectPlacement('bucket', 'restored', null, 'GLACIER', 'COLD', $coldWrite->path);
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $attempt = bin2hex(random_bytes(16));
+        $restoredPath = AwsS3WriteAttemptPath::forObject(
+            'bucket',
+            'restored',
+            $bucket->generation,
+            'STANDARD',
+            $attempt,
+            '.opsfour/write-attempts',
+        );
+        $this->metadata->updateObjectRestoreStateWithTier(
+            'bucket',
+            'restored',
+            null,
+            'restored',
+            $restoredPath,
+            new \DateTimeImmutable('+1 hour'),
+            'STANDARD',
+        );
+        $this->publishWebsite('restored');
+        $this->mock->append($this->objectReadResponse($payload, $attempt));
+        $tiers = new StorageTierRegistry([
+            new StorageTier('COLD', $cold, restoreRequired: true, defaultWriteTier: true),
+            new StorageTier('STANDARD', $this->backend),
+        ]);
+
+        $response = (new WebsiteHostingMiddleware($this->metadata, $tiers, '*.s3-website.test'))
+            ->handleRequest($this->websiteRequest('GET', '/'), $this->websiteTerminal());
+
+        self::assertSame(200, $response->getStatus());
         self::assertSame($payload, \Amp\ByteStream\buffer($response->getBody()));
         self::assertSame($restoredPath, ltrim($this->lastProviderRequest()->getUri()->getPath(), '/'));
     }
@@ -2163,6 +2286,74 @@ final class AwsS3OrdinaryObjectFenceTest extends TestCase
         $request->setAttribute('ownerId', 'owner');
         $request->setAttribute('s3.operation', S3Operation::PutObject);
         return $request;
+    }
+
+    private function publishWebsite(string $indexDocument): void
+    {
+        $this->metadata->putBucketWebsite('bucket', $indexDocument);
+        $this->allowPublicWebsiteRead();
+    }
+
+    /** @param array<string, string> $userMetadata */
+    private function putCommittedAwsMetadata(string $key, string $payload, array $userMetadata = []): string
+    {
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $path = AwsS3WriteAttemptPath::forObject(
+            'bucket',
+            $key,
+            $bucket->generation,
+            'STANDARD',
+            bin2hex(random_bytes(16)),
+            '.opsfour/write-attempts',
+        );
+        $this->metadata->putObjectMetadata(
+            'bucket',
+            $key,
+            'owner',
+            strlen($payload),
+            '"' . md5($payload) . '"',
+            'text/html',
+            $path,
+            userMetadata: $userMetadata,
+        );
+        $this->metadata->updateObjectPlacement('bucket', $key, null, 'STANDARD', 'STANDARD', $path);
+
+        return $path;
+    }
+
+    private function allowPublicWebsiteRead(): void
+    {
+        $this->metadata->putBucketPolicy('bucket', json_encode([
+            'Version' => '2012-10-17',
+            'Statement' => [[
+                'Effect' => 'Allow',
+                'Principal' => '*',
+                'Action' => 's3:GetObject',
+                'Resource' => 'arn:aws:s3:::bucket/*',
+            ]],
+        ], JSON_THROW_ON_ERROR));
+    }
+
+    /** @param non-empty-string $method */
+    private function websiteRequest(string $method, string $path): Request
+    {
+        return new Request(
+            $this->createMock(ServerClient::class),
+            $method,
+            Http::new('http://bucket.s3-website.test' . $path),
+            ['host' => 'bucket.s3-website.test'],
+        );
+    }
+
+    private function websiteTerminal(): \Amp\Http\Server\RequestHandler
+    {
+        return new class implements \Amp\Http\Server\RequestHandler {
+            public function handleRequest(Request $request): \Amp\Http\Server\Response
+            {
+                return new \Amp\Http\Server\Response(599);
+            }
+        };
     }
 
     private function putRequestWithBody(ReadableStream $body, int $length): Request
