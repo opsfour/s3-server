@@ -35,7 +35,11 @@ final readonly class StorageGarbageCollector
         private ?AwsS3OperationalState $awsOperationalState = null,
         private ?ClusterWorkFencingStore $clusterFencing = null,
         private ?string $clusterWorkerId = null,
+        private ?AwsS3TierRuntimeRegistry $awsTierRuntimes = null,
     ) {
+        if ($this->awsOperationalState !== null && $this->awsTierRuntimes !== null) {
+            throw new \InvalidArgumentException('Storage garbage collection accepts either one legacy AWS state or one exact tier registry, not both.');
+        }
         if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
             throw new \InvalidArgumentException('Cluster garbage fencing requires both store and worker identity.');
         }
@@ -53,8 +57,10 @@ final readonly class StorageGarbageCollector
         $leases = $this->metadata;
         $completed = 0;
         $processed = 0;
-        $awsFailure = false;
-        $awsObserved = false;
+        /** @var array<int, AwsS3OperationalState> $awsObservedStates */
+        $awsObservedStates = [];
+        /** @var array<int, AwsS3OperationalState> $awsFailedStates */
+        $awsFailedStates = [];
         $queueExhausted = false;
         $hasAwsTier = $this->hasAwsTier();
         $limit = max(1, $limit);
@@ -74,9 +80,7 @@ final readonly class StorageGarbageCollector
                     } catch (CancelledException $error) {
                         throw $error;
                     } catch (\Throwable $error) {
-                        if ($hasAwsTier) {
-                            $this->awsOperationalState?->markCollectorFailure('storage_garbage');
-                        }
+                        $this->markAllAwsCollectorFailure('storage_garbage');
                         throw $error;
                     }
                     $processed += $retired;
@@ -100,9 +104,7 @@ final readonly class StorageGarbageCollector
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
-                if ($hasAwsTier) {
-                    $this->awsOperationalState?->markCollectorFailure('storage_garbage');
-                }
+                $this->markAllAwsCollectorFailure('storage_garbage');
                 throw $error;
             }
             if ($items === []) {
@@ -143,6 +145,7 @@ final readonly class StorageGarbageCollector
             $awsCleanup = false;
             $awsClaimCompleted = false;
             $awsBackend = false;
+            $awsState = null;
             try {
                 $backend = $this->tiers->tier($item['storage_tier'])->backend;
                 $physicalBackend = $backend;
@@ -150,7 +153,10 @@ final readonly class StorageGarbageCollector
                     $physicalBackend = $physicalBackend->innerBackend();
                 }
                 $awsBackend = $physicalBackend instanceof AwsS3StorageBackend;
-                $awsObserved = $awsObserved || $awsBackend;
+                if ($awsBackend) {
+                    $awsState = $this->awsStateFor($backend, (string) $item['storage_tier']);
+                    $awsObservedStates[spl_object_id($awsState)] = $awsState;
+                }
                 if ($awsBackend && $item['operation'] !== 'delete_path') {
                     throw new \RuntimeException('AWS garbage operation has no registered cleanup capability.');
                 }
@@ -244,8 +250,10 @@ final readonly class StorageGarbageCollector
                 $heartbeat->stop();
             } catch (\Throwable $e) {
                 if ($awsBackend) {
-                    $awsFailure = true;
-                    $this->awsOperationalState?->markCollectorFailure('storage_garbage');
+                    if ($awsState !== null) {
+                        $awsFailedStates[spl_object_id($awsState)] = $awsState;
+                        $awsState->markCollectorFailure('storage_garbage');
+                    }
                 }
                 $this->logger->warning('Storage garbage claim was lost during physical cleanup.', [
                     'component' => 'storage_gc',
@@ -257,7 +265,9 @@ final readonly class StorageGarbageCollector
             $item['lease_expires_at'] = $leaseUntil;
             if ($failed !== null) {
                 if ($awsBackend) {
-                    $awsFailure = true;
+                    if ($awsState !== null) {
+                        $awsFailedStates[spl_object_id($awsState)] = $awsState;
+                    }
                 }
                 $attempts = $item['attempts'] + 1;
                 $retryScheduled = $this->retryClaim(
@@ -304,10 +314,17 @@ final readonly class StorageGarbageCollector
             $cancellation?->throwIfRequested();
         }
 
-        if ($awsFailure) {
-            $this->awsOperationalState?->markCollectorFailure('storage_garbage');
-        } elseif ($awsObserved || ($hasAwsTier && $queueExhausted)) {
-            $this->awsOperationalState?->markCollectorHealthy('storage_garbage');
+        if ($queueExhausted && $hasAwsTier) {
+            foreach ($this->allAwsStates() as $state) {
+                $awsObservedStates[spl_object_id($state)] = $state;
+            }
+        }
+        foreach ($awsObservedStates as $id => $state) {
+            if (isset($awsFailedStates[$id])) {
+                $state->markCollectorFailure('storage_garbage');
+            } else {
+                $state->markCollectorHealthy('storage_garbage');
+            }
         }
 
         return $completed;
@@ -326,6 +343,74 @@ final readonly class StorageGarbageCollector
         }
 
         return false;
+    }
+
+    private function awsStateFor(StorageBackend $backend, string $storageTier): AwsS3OperationalState
+    {
+        if ($this->awsTierRuntimes !== null) {
+            try {
+                return $this->awsTierRuntimes->operationalStateFor($backend, $storageTier);
+            } catch (\Throwable $error) {
+                $this->awsTierRuntimes->markAllCollectorFailure('storage_garbage');
+                throw $error;
+            }
+        }
+        $physicalBackend = $backend;
+        while ($physicalBackend instanceof ObservedStorageBackend) {
+            $physicalBackend = $physicalBackend->innerBackend();
+        }
+        if (! $physicalBackend instanceof AwsS3StorageBackend) {
+            throw new \LogicException('AWS garbage collector received a non-AWS claimed tier.');
+        }
+        $state = $this->awsOperationalState ?? $physicalBackend->operationalState()
+            ?? throw new \LogicException('AWS garbage collector requires an exact operational state.');
+        if ($physicalBackend->operationalState() !== $state) {
+            throw new \LogicException('AWS garbage collector operational state does not match the claimed tier.');
+        }
+        $binding = $physicalBackend->validatedBinding()
+            ?? throw new \LogicException('AWS garbage collector lost its validated binding.');
+        $state->assertExecutionBinding($binding, $storageTier, $this->metadata);
+
+        return $state;
+    }
+
+    /** @return list<AwsS3OperationalState> */
+    private function allAwsStates(): array
+    {
+        if ($this->awsTierRuntimes !== null) {
+            $states = [];
+            foreach ($this->awsTierRuntimes->all() as $binding) {
+                $states[spl_object_id($binding->operationalState)] = $binding->operationalState;
+            }
+
+            return array_values($states);
+        }
+
+        if ($this->awsOperationalState !== null) {
+            return [$this->awsOperationalState];
+        }
+        $states = [];
+        foreach ($this->tiers->all() as $tier) {
+            $backend = $tier->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if ($backend instanceof AwsS3StorageBackend && $backend->operationalState() !== null) {
+                $states[spl_object_id($backend->operationalState())] = $backend->operationalState();
+            }
+        }
+        if (count($states) > 1) {
+            throw new \LogicException('Multiple AWS collector states require an exact tier runtime registry.');
+        }
+
+        return array_values($states);
+    }
+
+    private function markAllAwsCollectorFailure(string $collector): void
+    {
+        foreach ($this->allAwsStates() as $state) {
+            $state->markCollectorFailure($collector);
+        }
     }
 
     private function sealLocalPart(FilesystemBackend $backend, string $path, ?string $uploadId): void

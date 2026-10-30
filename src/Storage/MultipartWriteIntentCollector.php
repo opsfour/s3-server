@@ -34,7 +34,11 @@ final readonly class MultipartWriteIntentCollector
         private ?AwsS3OperationalState $awsOperationalState = null,
         private ?ClusterWorkFencingStore $clusterFencing = null,
         private ?string $clusterWorkerId = null,
+        private ?AwsS3TierRuntimeRegistry $awsTierRuntimes = null,
     ) {
+        if ($this->awsOperationalState !== null && $this->awsTierRuntimes !== null) {
+            throw new \InvalidArgumentException('Multipart collection accepts either one legacy AWS state or one exact tier registry, not both.');
+        }
         if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
             throw new \InvalidArgumentException('Cluster multipart fencing requires both store and worker identity.');
         }
@@ -55,8 +59,10 @@ final readonly class MultipartWriteIntentCollector
         $claims = $this->metadata;
         $cleaned = 0;
         $processed = 0;
-        $awsFailure = false;
-        $awsObserved = false;
+        /** @var array<int, AwsS3OperationalState> $awsObservedStates */
+        $awsObservedStates = [];
+        /** @var array<int, AwsS3OperationalState> $awsFailedStates */
+        $awsFailedStates = [];
         $queueExhausted = false;
         $hasAwsTier = $this->hasAwsTier();
         $limit = max(1, $limit);
@@ -79,9 +85,7 @@ final readonly class MultipartWriteIntentCollector
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
-                if ($hasAwsTier) {
-                    $this->awsOperationalState?->markCollectorFailure('multipart');
-                }
+                $this->markAllAwsCollectorFailure('multipart');
                 throw $error;
             }
             $processed += $retired;
@@ -93,7 +97,7 @@ final readonly class MultipartWriteIntentCollector
 
         for (; $processed < $limit; $processed++) {
             $cancellation?->throwIfRequested();
-            $now = $this->metadata->multipartWriteIntentNow();
+            $now = $this->metadataNow();
             try {
                 if ($this->clusterFencing !== null && $this->clusterWorkerId !== null) {
                     $clusterClaim = $this->clusterFencing->claimClusterMultipartIntent($this->clusterWorkerId, $this->claimLeaseSeconds);
@@ -105,9 +109,7 @@ final readonly class MultipartWriteIntentCollector
             } catch (CancelledException $error) {
                 throw $error;
             } catch (\Throwable $error) {
-                if ($hasAwsTier) {
-                    $this->awsOperationalState?->markCollectorFailure('multipart');
-                }
+                $this->markAllAwsCollectorFailure('multipart');
                 throw $error;
             }
             if ($claimed === []) {
@@ -131,14 +133,21 @@ final readonly class MultipartWriteIntentCollector
 
                     return true;
                 }
-                $next = $this->metadata->multipartWriteIntentNow() + $this->claimLeaseSeconds;
-                if (! $claims->renewMultipartCollectorClaim(
-                    $intent->attemptId,
-                    $next,
-                    $leaseUntil,
-                    $intent->claimGeneration,
-                )) {
-                    return false;
+                try {
+                    $next = $this->metadataNow() + $this->claimLeaseSeconds;
+                    if (! $claims->renewMultipartCollectorClaim(
+                        $intent->attemptId,
+                        $next,
+                        $leaseUntil,
+                        $intent->claimGeneration,
+                    )) {
+                        return false;
+                    }
+                } catch (CancelledException $error) {
+                    throw $error;
+                } catch (\Throwable $error) {
+                    $this->markAllAwsCollectorFailure('multipart');
+                    throw $error;
                 }
                 $leaseUntil = $next;
 
@@ -146,6 +155,7 @@ final readonly class MultipartWriteIntentCollector
             }, $this->renewIntervalSeconds);
             $failed = null;
             $localBackend = null;
+            $awsState = null;
             try {
                 $backend = $this->tiers->tier($intent->storageTier)->backend;
                 $localBackend = $backend;
@@ -161,14 +171,11 @@ final readonly class MultipartWriteIntentCollector
                         $localBackend->sealFencedMultipartPath($path, $intent->attemptId);
                     }
                 } elseif ($localBackend instanceof AwsS3StorageBackend) {
-                    $awsObserved = true;
+                    $awsState = $this->awsStateFor($backend, $intent->storageTier);
+                    $awsObservedStates[spl_object_id($awsState)] = $awsState;
                     $binding = $localBackend->validatedBinding()
                         ?? throw new \LogicException('AWS multipart collector lost its validated binding.');
-                    if ($localBackend->operationalState() !== $this->awsOperationalState
-                        || $this->awsOperationalState === null) {
-                        throw new \LogicException('AWS multipart collector requires the shared operational state.');
-                    }
-                    $this->awsOperationalState->assertExecutionBinding(
+                    $awsState->assertExecutionBinding(
                         $binding,
                         $intent->storageTier,
                         $this->metadata,
@@ -202,8 +209,10 @@ final readonly class MultipartWriteIntentCollector
                 $heartbeat->stop();
             } catch (\Throwable $error) {
                 if ($localBackend instanceof AwsS3StorageBackend) {
-                    $awsFailure = true;
-                    $this->awsOperationalState?->markCollectorFailure('multipart');
+                    if ($awsState !== null) {
+                        $awsFailedStates[spl_object_id($awsState)] = $awsState;
+                        $awsState->markCollectorFailure('multipart');
+                    }
                 }
                 $this->logger->warning('Multipart completion claim was lost during physical cleanup.', [
                     'component' => 'multipart_intent_gc',
@@ -212,22 +221,33 @@ final readonly class MultipartWriteIntentCollector
                 ]);
                 continue;
             }
+            if ($failed !== null && $localBackend instanceof AwsS3StorageBackend && $awsState !== null) {
+                $awsFailedStates[spl_object_id($awsState)] = $awsState;
+                $awsState->markCollectorFailure('multipart');
+            }
             // Generic remote adapters cannot prove a late worker has ended.
             // Keep the tombstone and revisit it periodically.
             $nextAttemptAt = $failed === null && $localBackend instanceof FilesystemBackend
                 ? 1.0e300
-                : $this->metadata->multipartWriteIntentNow() + ($failed === null ? 3600 : 60);
+                : $this->metadataNow() + ($failed === null ? 3600 : 60);
             if ($clusterToken instanceof ClusterWorkToken && $this->clusterFencing !== null) {
+                /** @var array{error: ?\Throwable} $metadataFailure */
+                $metadataFailure = ['error' => null];
                 try {
                     $retained = $this->clusterFencing->transactionWithClusterWork(
                         $clusterToken,
-                        function () use ($intent, $nextAttemptAt, $leaseUntil, $clusterToken, $failed): bool {
-                            $retained = $this->metadata->retryMultipartCollectorClaim(
-                                $intent->attemptId,
-                                $nextAttemptAt,
-                                $leaseUntil,
-                                $intent->claimGeneration,
-                            );
+                        function () use ($intent, $nextAttemptAt, $leaseUntil, $clusterToken, $failed, &$metadataFailure): bool {
+                            try {
+                                $retained = $this->metadata->retryMultipartCollectorClaim(
+                                    $intent->attemptId,
+                                    $nextAttemptAt,
+                                    $leaseUntil,
+                                    $intent->claimGeneration,
+                                );
+                            } catch (\Throwable $error) {
+                                $metadataFailure['error'] = $error;
+                                throw $error;
+                            }
                             if ($retained && $failed !== null
                                 && $this->clusterFencing instanceof \OpsFour\S3Server\Metadata\ClusterWorkOutcomeRecorder) {
                                 $this->clusterFencing->recordClusterWorkOutcome(
@@ -239,16 +259,30 @@ final readonly class MultipartWriteIntentCollector
                             return $retained;
                         },
                     );
-                } catch (\RuntimeException) {
+                } catch (\Throwable $error) {
+                    if ($metadataFailure['error'] !== null) {
+                        $this->markAllAwsCollectorFailure('multipart');
+                        throw $metadataFailure['error'];
+                    }
+                    if (! $error instanceof \RuntimeException) {
+                        throw $error;
+                    }
                     $retained = false;
                 }
             } else {
-                $retained = $this->metadata->retryMultipartCollectorClaim(
-                    $intent->attemptId,
-                    $nextAttemptAt,
-                    $leaseUntil,
-                    $intent->claimGeneration,
-                );
+                try {
+                    $retained = $this->metadata->retryMultipartCollectorClaim(
+                        $intent->attemptId,
+                        $nextAttemptAt,
+                        $leaseUntil,
+                        $intent->claimGeneration,
+                    );
+                } catch (CancelledException $error) {
+                    throw $error;
+                } catch (\Throwable $error) {
+                    $this->markAllAwsCollectorFailure('multipart');
+                    throw $error;
+                }
             }
             if ($failed === null) {
                 if ($retained) {
@@ -256,7 +290,9 @@ final readonly class MultipartWriteIntentCollector
                 }
             } elseif ($retained) {
                 if ($localBackend instanceof AwsS3StorageBackend) {
-                    $awsFailure = true;
+                    if ($awsState !== null) {
+                        $awsFailedStates[spl_object_id($awsState)] = $awsState;
+                    }
                 }
                 $this->logger->warning('Multipart completion path reconciliation failed.', [
                     'component' => 'multipart_intent_gc',
@@ -268,10 +304,17 @@ final readonly class MultipartWriteIntentCollector
             }
         }
 
-        if ($awsFailure) {
-            $this->awsOperationalState?->markCollectorFailure('multipart');
-        } elseif ($awsObserved || ($hasAwsTier && $queueExhausted)) {
-            $this->awsOperationalState?->markCollectorHealthy('multipart');
+        if ($queueExhausted && $hasAwsTier) {
+            foreach ($this->allAwsStates() as $state) {
+                $awsObservedStates[spl_object_id($state)] = $state;
+            }
+        }
+        foreach ($awsObservedStates as $id => $state) {
+            if (isset($awsFailedStates[$id])) {
+                $state->markCollectorFailure('multipart');
+            } else {
+                $state->markCollectorHealthy('multipart');
+            }
         }
 
         return $cleaned;
@@ -290,6 +333,86 @@ final readonly class MultipartWriteIntentCollector
         }
 
         return false;
+    }
+
+    private function awsStateFor(StorageBackend $backend, string $storageTier): AwsS3OperationalState
+    {
+        if ($this->awsTierRuntimes !== null) {
+            try {
+                return $this->awsTierRuntimes->operationalStateFor($backend, $storageTier);
+            } catch (\Throwable $error) {
+                $this->awsTierRuntimes->markAllCollectorFailure('multipart');
+                throw $error;
+            }
+        }
+        $physicalBackend = $backend;
+        while ($physicalBackend instanceof ObservedStorageBackend) {
+            $physicalBackend = $physicalBackend->innerBackend();
+        }
+        if (! $physicalBackend instanceof AwsS3StorageBackend) {
+            throw new \LogicException('AWS multipart collector received a non-AWS claimed tier.');
+        }
+        $state = $this->awsOperationalState ?? $physicalBackend->operationalState()
+            ?? throw new \LogicException('AWS multipart collector requires an exact operational state.');
+        if ($physicalBackend->operationalState() !== $state) {
+            throw new \LogicException('AWS multipart collector operational state does not match the claimed tier.');
+        }
+        $binding = $physicalBackend->validatedBinding()
+            ?? throw new \LogicException('AWS multipart collector lost its validated binding.');
+        $state->assertExecutionBinding($binding, $storageTier, $this->metadata);
+
+        return $state;
+    }
+
+    /** @return list<AwsS3OperationalState> */
+    private function allAwsStates(): array
+    {
+        if ($this->awsTierRuntimes !== null) {
+            $states = [];
+            foreach ($this->awsTierRuntimes->all() as $binding) {
+                $states[spl_object_id($binding->operationalState)] = $binding->operationalState;
+            }
+
+            return array_values($states);
+        }
+
+        if ($this->awsOperationalState !== null) {
+            return [$this->awsOperationalState];
+        }
+        $states = [];
+        foreach ($this->tiers->all() as $tier) {
+            $backend = $tier->backend;
+            while ($backend instanceof ObservedStorageBackend) {
+                $backend = $backend->innerBackend();
+            }
+            if ($backend instanceof AwsS3StorageBackend && $backend->operationalState() !== null) {
+                $states[spl_object_id($backend->operationalState())] = $backend->operationalState();
+            }
+        }
+        if (count($states) > 1) {
+            throw new \LogicException('Multiple AWS collector states require an exact tier runtime registry.');
+        }
+
+        return array_values($states);
+    }
+
+    private function markAllAwsCollectorFailure(string $collector): void
+    {
+        foreach ($this->allAwsStates() as $state) {
+            $state->markCollectorFailure($collector);
+        }
+    }
+
+    private function metadataNow(): float
+    {
+        try {
+            return $this->metadata->multipartWriteIntentNow();
+        } catch (CancelledException $error) {
+            throw $error;
+        } catch (\Throwable $error) {
+            $this->markAllAwsCollectorFailure('multipart');
+            throw $error;
+        }
     }
 
     private function assertLocalCompletionPaths(FilesystemBackend $backend, \OpsFour\S3Server\Metadata\MultipartWriteIntent $intent): void

@@ -39,6 +39,8 @@ use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3ProviderWorkerProbe;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeBinding;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
 use OpsFour\S3Server\Storage\ParallelAwsS3ReadExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
@@ -101,10 +103,8 @@ final readonly class S3ServerRuntimeFactory
         );
         $server->setStorageTierRegistry($storageTiers);
         $runtime = null;
-        $attachedAwsStorage = null;
-        $attachedAwsState = null;
-        $attachedAwsTier = null;
-        $attachedAwsMetadata = null;
+        /** @var list<array{AwsS3StorageBackend, AwsS3OperationalState, string, object}> $attachedAws */
+        $attachedAws = [];
         $localStorageRootLocks = $server->transferLocalStorageRootLockOwnership();
 
         try {
@@ -207,84 +207,87 @@ final readonly class S3ServerRuntimeFactory
                 $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory, $localPartWriter);
             }
 
-            $awsBinding = $this->admittedAwsTier($storageTiers);
-            if ($awsBinding !== null) {
-                [$awsTier, $awsStorage] = $awsBinding;
+            $awsBindings = $this->admittedAwsTiers($storageTiers);
+            if ($awsBindings !== []) {
                 if ($config->metadataDriver !== 'postgres' || ! $metadata instanceof AwsS3OperationalSummaryReader) {
                     throw new \RuntimeException('The qualified AWS S3 profile requires PostgreSQL metadata.');
                 }
-                $binding = $awsStorage->validatedBinding()
-                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its validated binding.');
-                $profile = $binding->profile
-                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its provider profile.');
                 $inventory = StorageMutatorInventory::forEnabledRuntime([
                     ...HandlerRegistrar::storageMutatorRegistrations(),
                     ...S3Server::storageMutatorRegistrations(),
                     ...\OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler::storageMutatorRegistrations(),
                 ]);
-                $probePool = new ContextWorkerPool(1);
-                $server->addWorkerPool($probePool, 'aws_provider_probe', 1, forceKillOnShutdown: true);
-                $readPool = new ContextWorkerPool($config->awsReadWorkerPoolSize);
-                $server->addWorkerPool(
-                    $readPool,
-                    'aws_payload_reads',
-                    $config->awsReadWorkerPoolSize,
-                    forceKillOnShutdown: true,
-                );
-                $readExecutor = new ParallelAwsS3ReadExecutor(
-                    $readPool,
-                    $config->awsReadWorkerPoolSize,
-                    $config->awsReadWaiterLimit,
-                    $config->awsReadAdmissionTimeoutSeconds,
-                    $config->awsReadFirstByteTimeoutSeconds,
-                    $metrics,
-                );
-                $awsOperationalState = new AwsS3OperationalState(
-                    $binding,
-                    new AwsS3ProviderWorkerProbe(
-                        $probePool,
-                        $profile->requestTimeoutSeconds * 2 + 5.0,
-                    ),
-                    $inventory,
-                    $metadata,
-                    $awsTier->name,
-                );
-                $awsStorage->attachOperationalState($awsOperationalState, $awsTier->name, $metadata);
-                $attachedAwsStorage = $awsStorage;
-                $attachedAwsState = $awsOperationalState;
-                $attachedAwsTier = $awsTier->name;
-                $attachedAwsMetadata = $metadata;
-                $awsStorage->attachReadExecutor($readExecutor);
-                $server->setAwsOperationalState($awsOperationalState);
-                $awsTierWriter = $awsStorage->createForegroundObjectWriter(
-                    $metadata,
-                    $this->awsObjectScratchPath(),
-                    $awsTier->name,
-                    budgetBytes: $config->storageTempBudgetBytes,
-                    metrics: $metrics,
-                    filesystemReserveBytes: $config->storageTempReserveBytes,
-                    tempBudget: new StorageTempBudgetCoordinator(
-                        $config->storageTempDir,
-                        $config->storageTempBudgetBytes,
-                        $config->storageTempReserveBytes,
-                    ),
-                );
-                $server->setAwsObjectWriteIntentCollector($awsStorage->createObjectWriteIntentCollector(
-                    $metadata,
-                    $awsTier->name,
-                    $logger,
-                    $metrics,
-                ));
-                $server->setAwsBackgroundObjectWriter(new AwsS3FencedBackgroundObjectWriter(
-                    $awsTierWriter,
-                    $awsStorage,
-                    $awsTier->name,
-                ));
-                $runtime->attachAwsObjectWriter($awsTierWriter);
-                if ($awsTier->name === $storageTiers->defaultTier()->name) {
-                    $awsObjectWriter = $awsTierWriter;
-                    $server->setAwsAccessLogWriter($awsTierWriter);
+                $firstBinding = $awsBindings[0][1]->validatedBinding()
+                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its validated binding.');
+                $firstProfile = $firstBinding->profile
+                    ?? throw new \RuntimeException('The admitted AWS S3 profile lost its provider profile.');
+                $shared = $this->awsSharedResources($server, $config, $metrics, $firstProfile);
+                $providerProbe = $shared['providerProbe'];
+                $readExecutor = $shared['readExecutor'];
+                $stagePool = $shared['stagePool'];
+                $budgetPool = $shared['budgetPool'];
+                $tempBudget = $shared['tempBudget'];
+                $tierRuntimes = [];
+                foreach ($awsBindings as [$awsTier, $awsStorage]) {
+                    $binding = $awsStorage->validatedBinding()
+                        ?? throw new \RuntimeException('The admitted AWS S3 profile lost its validated binding.');
+                    $profile = $binding->profile
+                        ?? throw new \RuntimeException('The admitted AWS S3 profile lost its provider profile.');
+                    $awsOperationalState = new AwsS3OperationalState(
+                        $binding,
+                        $providerProbe,
+                        $inventory,
+                        $metadata,
+                        $awsTier->name,
+                    );
+                    $awsStorage->attachOperationalState($awsOperationalState, $awsTier->name, $metadata);
+                    $attachedAws[] = [$awsStorage, $awsOperationalState, $awsTier->name, $metadata];
+                    $awsStorage->attachReadExecutor($readExecutor);
+                    $awsTierWriter = $awsStorage->createForegroundObjectWriter(
+                        $metadata,
+                        $this->awsObjectScratchPath(),
+                        $awsTier->name,
+                        budgetBytes: $config->storageTempBudgetBytes,
+                        metrics: $metrics,
+                        filesystemReserveBytes: $config->storageTempReserveBytes,
+                        tempBudget: $tempBudget,
+                        stagePool: $stagePool,
+                        budgetPool: $budgetPool,
+                    );
+                    $runtime->attachAwsObjectWriter($awsTierWriter);
+                    $collector = $awsStorage->createObjectWriteIntentCollector(
+                        $metadata,
+                        $awsTier->name,
+                        $logger,
+                        $metrics,
+                    );
+                    $backgroundWriter = new AwsS3FencedBackgroundObjectWriter(
+                        $awsTierWriter,
+                        $awsStorage,
+                        $awsTier->name,
+                    );
+                    $tierRuntimes[] = new AwsS3TierRuntimeBinding(
+                        $awsTier->name,
+                        $awsStorage,
+                        $metadata,
+                        $awsOperationalState,
+                        $awsTierWriter,
+                        $backgroundWriter,
+                        $collector,
+                    );
+                    if ($awsTier->name === $storageTiers->defaultTier()->name) {
+                        $awsObjectWriter = $awsTierWriter;
+                        $server->setAwsAccessLogWriter($awsTierWriter);
+                    }
                 }
+                $awsDefaultRuntimeTier = $awsObjectWriter !== null
+                    ? $storageTiers->defaultTier()->name
+                    : $tierRuntimes[0]->tier;
+                $server->setAwsTierRuntimeRegistry(new AwsS3TierRuntimeRegistry(
+                    $tierRuntimes,
+                    $awsDefaultRuntimeTier,
+                    $metadata,
+                ));
             }
 
             foreach ($notificationListeners as $listenerConfig) {
@@ -421,20 +424,8 @@ final readonly class S3ServerRuntimeFactory
                 }
             }
 
-            if ($cleanupComplete && $attachedAwsStorage instanceof AwsS3StorageBackend
-                && $attachedAwsState instanceof AwsS3OperationalState
-                && is_string($attachedAwsTier) && is_object($attachedAwsMetadata)
-                && $attachedAwsStorage->operationalState() === $attachedAwsState
-                && ! $attachedAwsStorage->operationalAttachmentCommitted()) {
-                try {
-                    $attachedAwsStorage->rollbackOperationalStateAttachment(
-                        $attachedAwsState,
-                        $attachedAwsTier,
-                        $attachedAwsMetadata,
-                    );
-                } catch (\Throwable $cleanupError) {
-                    self::logCleanupFailure($logger, 'Runtime factory AWS state rollback failed.', $cleanupError);
-                }
+            if ($cleanupComplete) {
+                self::rollbackAwsOperationalAttachments($attachedAws, $logger);
             }
 
             throw $e;
@@ -448,6 +439,75 @@ final readonly class S3ServerRuntimeFactory
         } catch (\Throwable) {
             // A broken logger must not replace the original bootstrap error.
         }
+    }
+
+    /**
+     * @param list<array{AwsS3StorageBackend, AwsS3OperationalState, string, object}> $attachments
+     */
+    private static function rollbackAwsOperationalAttachments(array $attachments, LoggerInterface $logger): void
+    {
+        foreach (array_reverse($attachments) as [$storage, $state, $tier, $metadata]) {
+            if ($storage->operationalState() !== $state || $storage->operationalAttachmentCommitted()) {
+                continue;
+            }
+            try {
+                $storage->rollbackOperationalStateAttachment($state, $tier, $metadata);
+            } catch (\Throwable $cleanupError) {
+                self::logCleanupFailure($logger, 'Runtime factory AWS state rollback failed.', $cleanupError);
+            }
+        }
+    }
+
+    /**
+     * @return array{
+     *     providerProbe: AwsS3ProviderWorkerProbe,
+     *     probePool: ContextWorkerPool,
+     *     readExecutor: ParallelAwsS3ReadExecutor,
+     *     readPool: ContextWorkerPool,
+     *     stagePool: ContextWorkerPool,
+     *     budgetPool: ContextWorkerPool,
+     *     tempBudget: StorageTempBudgetCoordinator
+     * }
+     */
+    private function awsSharedResources(
+        S3Server $server,
+        S3ServerConfig $config,
+        MetricsCollector $metrics,
+        \OpsFour\S3Server\Storage\AwsS3ProviderProfile $profile,
+    ): array {
+        $probePool = new ContextWorkerPool(1);
+        $server->addWorkerPool($probePool, 'aws_provider_probe', 1, forceKillOnShutdown: true);
+        $readPool = new ContextWorkerPool($config->awsReadWorkerPoolSize);
+        $server->addWorkerPool(
+            $readPool,
+            'aws_payload_reads',
+            $config->awsReadWorkerPoolSize,
+            forceKillOnShutdown: true,
+        );
+        $stagePool = new ContextWorkerPool(2);
+        $server->addWorkerPool($stagePool, 'aws_payload_staging', 2, forceKillOnShutdown: true);
+        $budgetPool = new ContextWorkerPool(2);
+        $server->addWorkerPool($budgetPool, 'aws_temp_budget', 2, forceKillOnShutdown: true);
+
+        return [
+            'providerProbe' => new AwsS3ProviderWorkerProbe(
+                $probePool,
+                $profile->requestTimeoutSeconds * 2 + 5.0,
+            ),
+            'probePool' => $probePool,
+            'readExecutor' => new ParallelAwsS3ReadExecutor(
+                $readPool,
+                $config->awsReadWorkerPoolSize,
+                $config->awsReadWaiterLimit,
+                $config->awsReadAdmissionTimeoutSeconds,
+                $config->awsReadFirstByteTimeoutSeconds,
+                $metrics,
+            ),
+            'readPool' => $readPool,
+            'stagePool' => $stagePool,
+            'budgetPool' => $budgetPool,
+            'tempBudget' => $server->storageTempBudgetCoordinator(),
+        ];
     }
 
     /**
@@ -560,8 +620,8 @@ final readonly class S3ServerRuntimeFactory
             : null;
     }
 
-    /** @return array{StorageTier, AwsS3StorageBackend}|null */
-    private function admittedAwsTier(StorageTierRegistry $tiers): ?array
+    /** @return list<array{StorageTier, AwsS3StorageBackend}> */
+    private function admittedAwsTiers(StorageTierRegistry $tiers): array
     {
         $bindings = [];
         foreach ($tiers->all() as $tier) {
@@ -574,11 +634,7 @@ final readonly class S3ServerRuntimeFactory
                 $bindings[] = [$tier, $backend];
             }
         }
-        if (count($bindings) > 1) {
-            throw new \RuntimeException('Multiple admitted AWS S3 tier bindings are unsupported.');
-        }
-
-        return $bindings[0] ?? null;
+        return $bindings;
     }
 
     private function productionScratchPath(StorageTierRegistry $tiers): string

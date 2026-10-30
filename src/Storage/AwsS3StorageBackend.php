@@ -132,6 +132,11 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
             && $this->readExecutor->usesPool($pool);
     }
 
+    public function readExecutor(): ?AwsS3ReadExecutor
+    {
+        return $this->readExecutor;
+    }
+
     public function clusterStorageIdentity(): string
     {
         $profile = $this->binding?->profile;
@@ -163,6 +168,8 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
         ?MetricsCollector $metrics = null,
         int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
         ?StorageTempBudgetCoordinator $tempBudget = null,
+        ?\Amp\Parallel\Worker\WorkerPool $stagePool = null,
+        ?\Amp\Parallel\Worker\WorkerPool $budgetPool = null,
     ): AwsS3ForegroundObjectWriter {
         $profile = $this->binding?->profile;
         $client = $this->binding?->client;
@@ -181,7 +188,14 @@ final class AwsS3StorageBackend implements StorageBackend, AwsS3ProviderAdmissio
             $profile,
             $intents,
             $publisher,
-            new LocalScratchStager($scratch, $budgetBytes, filesystemReserveBytes: $filesystemReserveBytes, tempBudget: $tempBudget),
+            new LocalScratchStager(
+                $scratch,
+                $budgetBytes,
+                budgetPool: $budgetPool,
+                filesystemReserveBytes: $filesystemReserveBytes,
+                tempBudget: $tempBudget,
+                stagePool: $stagePool,
+            ),
             $storageTier,
             $renewIntervalSeconds,
             $this->operationalState,

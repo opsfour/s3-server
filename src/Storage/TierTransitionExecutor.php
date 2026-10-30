@@ -39,7 +39,11 @@ final class TierTransitionExecutor
         private readonly ?AwsS3FencedBackgroundObjectWriter $awsFencedWriter = null,
         private readonly ?ClusterWorkFencingStore $clusterFencing = null,
         private readonly ?string $clusterWorkerId = null,
+        private readonly ?AwsS3TierRuntimeRegistry $awsTierRuntimes = null,
     ) {
+        if ($this->awsFencedWriter !== null && $this->awsTierRuntimes !== null) {
+            throw new \InvalidArgumentException('Tier transition accepts either one legacy AWS writer or one exact tier registry, not both.');
+        }
         if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
             throw new \InvalidArgumentException('Cluster transition fencing requires both store and worker identity.');
         }
@@ -49,7 +53,7 @@ final class TierTransitionExecutor
             || $this->leaseRenewalIntervalSeconds >= QueueLease::DURATION_SECONDS / 2) {
             throw new \InvalidArgumentException('Tier transition lease renewal interval must fit within its lease.');
         }
-        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null)
+        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null || $this->awsTierRuntimes !== null)
             && ! $this->metadata instanceof ObjectWriteIntentStore) {
             throw new \InvalidArgumentException('Fenced tier transition requires an object write intent metadata store.');
         }
@@ -145,17 +149,17 @@ final class TierTransitionExecutor
             );
             $sourceBackend = $this->tiers->tier($sourceTier)->backend;
             $targetBackend = $this->tiers->tier($targetTier)->backend;
-            $awsSource = $this->awsFencedWriter?->isBoundTier($sourceBackend, $sourceTier) ?? false;
-            $awsTarget = $this->awsFencedWriter?->isBoundTier($targetBackend, $targetTier) ?? false;
-            if ($awsSource || $awsTarget) {
+            $awsSourceWriter = $this->awsWriterFor($sourceBackend, $sourceTier);
+            $awsTargetWriter = $this->awsWriterFor($targetBackend, $targetTier);
+            if ($awsSourceWriter !== null || $awsTargetWriter !== null) {
                 $targetBucket = $this->metadata->getBucket($object->bucket);
                 if ($targetBucket === null) {
                     throw new \RuntimeException('Transition bucket disappeared before AWS publication or source read.');
                 }
             }
-            if ($awsTarget) {
+            if ($awsTargetWriter !== null) {
                 $fencedTarget = true;
-                $awsReservation = $this->awsFencedWriter?->reserve(
+                $awsReservation = $awsTargetWriter->reserve(
                     $object,
                     $targetBucket ?? throw new \LogicException('AWS target bucket snapshot is unavailable.'),
                     $targetBackend,
@@ -171,14 +175,14 @@ final class TierTransitionExecutor
             $writeFailure = null;
             try {
                 $sourceStream = new TeeReadableStream(
-                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSource
-                        ? $this->awsFencedWriter?->readCommittedSource(
+                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSourceWriter !== null
+                        ? $awsSourceWriter->readCommittedSource(
                             $targetBucket ?? throw new \LogicException('AWS source bucket snapshot is unavailable.'),
                             $object,
                             $sourceBackend,
                             $sourceTier,
                             $sourcePath,
-                        ) ?? throw new \LogicException('AWS source reader disappeared.')
+                        )
                         : $sourceBackend->getObjectByPath($sourcePath)),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
@@ -187,7 +191,7 @@ final class TierTransitionExecutor
                     },
                 );
                 if ($awsReservation !== null) {
-                    [$writeResult, $dispatchToken] = $this->awsFencedWriter?->publishReserved(
+                    [$writeResult, $dispatchToken] = $awsTargetWriter?->publishReserved(
                         $awsReservation,
                         $object,
                         $sourceStream,
@@ -235,7 +239,7 @@ final class TierTransitionExecutor
             if ($writeFailure !== null) {
                 if ($awsReservation !== null && $dispatchToken === null) {
                     try {
-                        $this->awsFencedWriter?->retireBeforeDispatch($awsReservation);
+                        $awsTargetWriter?->retireBeforeDispatch($awsReservation);
                     } catch (\Throwable) {
                         // Armed or uncertain attempts remain durable for reconciliation.
                     }
@@ -344,7 +348,7 @@ final class TierTransitionExecutor
 
             if (
                 $this->deleteSourceAfterCommit
-                && ! $awsSource
+                && $awsSourceWriter === null
                 && ($this->stringJobValue($job, 'sourceTier') !== $targetTier || $sourcePath !== $writeResult->path)
             ) {
                 try {
@@ -391,6 +395,25 @@ final class TierTransitionExecutor
 
             return $this->retryOrDeadLetter($job, $e, $leaseExpiresAt);
         }
+    }
+
+    private function awsWriterFor(StorageBackend $backend, string $storageTier): ?AwsS3FencedBackgroundObjectWriter
+    {
+        $physicalBackend = $backend;
+        while ($physicalBackend instanceof \OpsFour\S3Server\Observability\ObservedStorageBackend) {
+            $physicalBackend = $physicalBackend->innerBackend();
+        }
+        if (! $physicalBackend instanceof AwsS3StorageBackend) {
+            return null;
+        }
+        if ($this->awsTierRuntimes !== null) {
+            return $this->awsTierRuntimes->backgroundWriterFor($backend, $storageTier);
+        }
+        if ($this->awsFencedWriter?->isBoundTier($backend, $storageTier)) {
+            return $this->awsFencedWriter;
+        }
+
+        throw new \RuntimeException("AWS storage tier {$storageTier} has no exact qualified background writer.");
     }
 
     /** @param array<string, mixed> $job */

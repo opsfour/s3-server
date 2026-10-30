@@ -33,11 +33,14 @@ final class AwsS3OperationalStateFixture
         AwsS3ProviderValidatedBinding $binding,
         string $storageTier,
         ?AwsS3OperationalSummaryReader $metadata = null,
+        ?AwsS3ProviderProbe $probe = null,
+        ?AwsS3ReadExecutor $readExecutor = null,
+        bool $commit = true,
     ): AwsS3OperationalState {
         $metadata ??= new FixtureAwsS3OperationalSummary();
         $state = new AwsS3OperationalState(
             $binding,
-            new FixtureAwsS3ProviderProbe($binding->admission),
+            $probe ?? new FixtureAwsS3ProviderProbe($binding->admission),
             StorageMutatorInventory::forEnabledRuntime([
                 ...HandlerRegistrar::storageMutatorRegistrations(),
                 ...S3Server::storageMutatorRegistrations(),
@@ -48,13 +51,14 @@ final class AwsS3OperationalStateFixture
         );
         $backend->attachOperationalState($state, $storageTier, $metadata);
         $client = $binding->client ?? throw new \LogicException('Fixture AWS client is unavailable.');
-        $backend->attachReadExecutor(new FixtureAwsS3ReadExecutor($client));
-        $backend->commitOperationalStateAttachment($state, $storageTier, $metadata);
+        $backend->attachReadExecutor($readExecutor ?? new FixtureAwsS3ReadExecutor($client));
+        if ($commit) {
+            $backend->commitOperationalStateAttachment($state, $storageTier, $metadata);
+        }
 
         return $state;
     }
 }
-
 /** Test-only inline equivalent; production wiring always uses the worker executor. */
 final readonly class FixtureAwsS3ReadExecutor implements AwsS3ReadExecutor
 {
@@ -195,36 +199,5 @@ final readonly class FixtureAwsS3ProviderProbe implements AwsS3ProviderProbe
         }
 
         return $this->admission;
-    }
-}
-
-final class FixtureAwsS3OperationalSummary implements AwsS3OperationalSummaryReader
-{
-    public function getAwsS3OperationalSummary(string $storageTier): array
-    {
-        if ($storageTier === '') {
-            throw new \LogicException('Fixture AWS storage tier is empty.');
-        }
-
-        return [
-            'open' => 0,
-            'ambiguous' => 0,
-            'seal_reserved' => 0,
-            'sealed' => 0,
-            'multipart' => 0,
-            'part' => 0,
-            'cleanup' => 0,
-            'failures' => 0,
-            'oldest_age_seconds' => 0.0,
-            'max_owner_open' => 0,
-            'max_owner_sealed' => 0,
-            'max_owner_multipart' => 0,
-            'max_owner_part' => 0,
-            'global_open' => 0,
-            'global_seal_reserved' => 0,
-            'global_multipart' => 0,
-            'global_part' => 0,
-            'global_cleanup' => 0,
-        ];
     }
 }

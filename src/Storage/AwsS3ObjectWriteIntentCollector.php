@@ -51,7 +51,11 @@ final class AwsS3ObjectWriteIntentCollector
         } catch (\Throwable $error) {
             $this->metrics?->recordAwsWriteReconciliation('retry');
             $this->operationalState?->markCollectorFailure();
-            throw $error;
+            throw new AwsS3ObjectIntentMetadataException(
+                $error->getMessage(),
+                (int) $error->getCode(),
+                previous: $error,
+            );
         }
         $sealed = 0;
         $failed = false;
@@ -70,7 +74,11 @@ final class AwsS3ObjectWriteIntentCollector
             } catch (\Throwable $error) {
                 $this->metrics?->recordAwsWriteReconciliation('retry');
                 $this->operationalState?->markCollectorFailure();
-                throw $error;
+                throw new AwsS3ObjectIntentMetadataException(
+                    $error->getMessage(),
+                    (int) $error->getCode(),
+                    previous: $error,
+                );
             }
             if ($claims === []) {
                 break;

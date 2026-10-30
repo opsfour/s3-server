@@ -9,7 +9,7 @@ use OpsFour\S3Server\Encryption\EncryptionServiceInterface;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\Storage\DedicatedAmpObjectWriteLeaseRenewer;
-use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3ObjectWriterShutdown;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use Psr\Log\LoggerInterface;
@@ -30,7 +30,8 @@ final class S3ServerRuntime
 
     private ?LocalFencedObjectWriter $localObjectWriter = null;
 
-    private ?AwsS3ForegroundObjectWriter $awsObjectWriter = null;
+    /** @var array<int, AwsS3ObjectWriterShutdown> */
+    private array $awsObjectWriters = [];
 
     private ?LocalFencedMultipartPartWriter $localMultipartPartWriter = null;
 
@@ -71,12 +72,13 @@ final class S3ServerRuntime
         $this->localObjectRenewer = $renewer;
     }
 
-    public function attachAwsObjectWriter(AwsS3ForegroundObjectWriter $writer): void
+    public function attachAwsObjectWriter(AwsS3ObjectWriterShutdown $writer): void
     {
-        if ($this->stopped || $this->stopInProgress || $this->awsObjectWriter !== null) {
+        $id = spl_object_id($writer);
+        if ($this->stopped || $this->stopInProgress || isset($this->awsObjectWriters[$id])) {
             throw new \LogicException('AWS object writer was already attached or runtime stopped.');
         }
-        $this->awsObjectWriter = $writer;
+        $this->awsObjectWriters[$id] = $writer;
     }
 
     public function stop(): void
@@ -117,12 +119,14 @@ final class S3ServerRuntime
             $this->abortIncompleteShutdown();
         }
 
-        try {
-            $this->awsObjectWriter?->shutdown();
-            $this->awsObjectWriter = null;
-        } catch (\Throwable $e) {
-            $this->logShutdownWarning('AWS object staging shutdown failed.', ['exception' => $e::class]);
-            $this->abortIncompleteShutdown();
+        foreach (array_reverse($this->awsObjectWriters, true) as $id => $writer) {
+            try {
+                $writer->shutdown();
+                unset($this->awsObjectWriters[$id]);
+            } catch (\Throwable $e) {
+                $this->logShutdownWarning('AWS object staging shutdown failed.', ['exception' => $e::class]);
+                $this->abortIncompleteShutdown();
+            }
         }
 
         try {

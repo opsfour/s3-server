@@ -17,6 +17,7 @@ use OpsFour\S3Server\Metadata\StorageCleanupCapacityReader;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Observability\ObservedMetadataStore;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Runtime\ClusterOperationalSnapshot;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
@@ -39,7 +40,7 @@ final class MetricsHandler implements RequestHandler
         private readonly MetricsCollector $metrics,
         private readonly ?MetadataStore $metadata = null,
         private readonly ?string $bearerToken = null,
-        private readonly ?AwsS3OperationalState $awsOperationalState = null,
+        private readonly AwsS3OperationalState|AwsS3TierRuntimeRegistry|null $awsOperationalState = null,
         private readonly ?StorageTempBudgetCoordinator $tempBudget = null,
         private readonly ?ClusterRoleController $clusterRoles = null,
         private readonly float $clusterSnapshotTimeoutSeconds = 5.0,

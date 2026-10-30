@@ -28,6 +28,7 @@ use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\FlysystemBackend;
+use OpsFour\S3Server\Storage\AwsS3ProviderProfile;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
 use OpsFour\S3Server\Tests\Support\InMemoryFlysystemAdapter;
 use PHPUnit\Framework\TestCase;
@@ -80,6 +81,57 @@ final class S3ServerRuntimeFactoryTest extends TestCase
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::PutObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::RestoreObject));
         self::assertTrue($runtime->server->getHandlerRegistry()->has(S3Operation::SelectObjectContent));
+    }
+
+    public function test_aws_graph_factory_allocates_one_shared_node_resource_set(): void
+    {
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $config = new S3ServerConfig(
+            storagePath: $this->storagePath,
+            storageTempDir: $this->storagePath,
+            awsReadWorkerPoolSize: 3,
+            awsReadWaiterLimit: 4,
+        );
+        $server = new S3Server($config, $metadata, new InMemoryBackend());
+        $factory = new S3ServerRuntimeFactory();
+        $method = new \ReflectionMethod($factory, 'awsSharedResources');
+        $resources = $method->invoke(
+            $factory,
+            $server,
+            $config,
+            new MetricsCollector(),
+            new AwsS3ProviderProfile(
+                'backing-private',
+                'us-east-1',
+                '123456789012',
+                'data/hot',
+                '.opsfour/hot',
+            ),
+        );
+
+        try {
+            self::assertIsArray($resources);
+            self::assertSame($server->storageTempBudgetCoordinator(), $resources['tempBudget']);
+            self::assertTrue($resources['providerProbe']->usesPool($resources['probePool']));
+            $workerPools = (new \ReflectionProperty($server, 'workerPools'))->getValue($server);
+            self::assertIsArray($workerPools);
+            self::assertSame(
+                ['aws_provider_probe', 'aws_payload_reads', 'aws_payload_staging', 'aws_temp_budget'],
+                array_column($workerPools, 'name'),
+            );
+            self::assertCount(4, array_unique(array_map(
+                static fn(array $entry): int => spl_object_id($entry['pool']),
+                $workerPools,
+            )));
+            self::assertSame($resources['probePool'], $workerPools[0]['pool']);
+            self::assertSame($resources['readPool'], $workerPools[1]['pool']);
+            self::assertSame($resources['stagePool'], $workerPools[2]['pool']);
+            self::assertSame($resources['budgetPool'], $workerPools[3]['pool']);
+            self::assertSame([true, true, true, true], array_column($workerPools, 'forceKillOnShutdown'));
+        } finally {
+            $server->stop();
+        }
     }
 
     public function test_registered_put_uses_server_temp_budget_before_reading_known_sse_body(): void

@@ -158,6 +158,11 @@ final class AwsS3OperationalState
         return $this->probe instanceof AwsS3ProviderWorkerProbe && $this->probe->usesPool($pool);
     }
 
+    public function providerProbe(): AwsS3ProviderProbe
+    {
+        return $this->probe;
+    }
+
     public function commitRuntimeAttachment(
         AwsS3ProviderValidatedBinding $binding,
         string $storageTier,

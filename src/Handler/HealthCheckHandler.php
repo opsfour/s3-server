@@ -23,6 +23,7 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Runtime\ClusterAdmissionController;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
@@ -84,7 +85,7 @@ final class HealthCheckHandler implements RequestHandler
         private readonly ?CredentialHealthProbe $credentialHealthProbe = null,
         private readonly int $readinessCheckIntervalSeconds = 30,
         private readonly float $readinessCheckTimeoutSeconds = 5.0,
-        private readonly ?AwsS3OperationalState $awsOperationalState = null,
+        private readonly AwsS3OperationalState|AwsS3TierRuntimeRegistry|null $awsOperationalState = null,
         private readonly ?ClusterAdmissionController $clusterAdmission = null,
         private readonly ?ClusterRoleController $clusterRoles = null,
         private readonly ?NodeDrainController $drain = null,

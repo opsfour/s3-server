@@ -17,8 +17,10 @@ use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Metadata\SqliteMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentCollector;
+use OpsFour\S3Server\Storage\AwsS3ObjectIntentMetadataException;
 use OpsFour\S3Server\Storage\AwsS3ObjectWriteIntentReconciler;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
+use OpsFour\S3Server\Storage\AwsS3ProviderAdmission;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3SameKeySealWriter;
@@ -190,6 +192,7 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
             $collector->collect();
             self::fail('Transient collector failure was swallowed.');
         } catch (\RuntimeException $error) {
+            self::assertInstanceOf(AwsS3ObjectIntentMetadataException::class, $error);
             self::assertSame('transient SQL failure', $error->getMessage());
         }
         self::assertSame('collector', $state->snapshot()['reason']);
@@ -218,6 +221,35 @@ final class AwsS3ObjectWriteIntentCollectorTest extends TestCase
 
         $this->expectException(\Amp\CancelledException::class);
         $collector->collect(cancellation: $cancel->getCancellation());
+    }
+
+    public function test_tier_local_recovery_admission_failure_is_not_classified_as_global_metadata_failure(): void
+    {
+        $metadata = $this->createMock(ObjectWriteIntentStore::class);
+        $metadata->expects(self::never())->method('retireExpiredUndispatchedObjectWriteIntents');
+        $state = self::operationalState();
+        (new \ReflectionProperty($state, 'admission'))->setValue($state, AwsS3ProviderAdmission::denied(
+            'us-east-1',
+            true,
+            false,
+            AwsS3ProviderAdmission::VERSIONING_NOT_CHECKED,
+            AwsS3ProviderAdmission::REASON_OWNER_OR_ACCESS_CHECK_FAILED,
+        ));
+        $requests = [];
+        $collector = new AwsS3ObjectWriteIntentCollector(
+            $metadata,
+            'AWS',
+            new AwsS3SameKeySealWriter(self::client([], $requests), 'backing', '123456789012'),
+            operationalState: $state,
+        );
+
+        try {
+            $collector->collect();
+            self::fail('Closed tier recovery admission was accepted.');
+        } catch (\RuntimeException $error) {
+            self::assertNotInstanceOf(AwsS3ObjectIntentMetadataException::class, $error);
+            self::assertStringContainsString('recovery admission is closed', $error->getMessage());
+        }
     }
 
     private function store(): SqliteMetadataStore

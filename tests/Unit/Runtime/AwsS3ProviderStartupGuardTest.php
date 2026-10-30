@@ -98,17 +98,17 @@ final class AwsS3ProviderStartupGuardTest extends TestCase
         }
     }
 
-    public function test_runtime_binding_rejects_multiple_admitted_aws_tiers(): void
+    public function test_runtime_binding_discovers_multiple_admitted_aws_tiers_for_graph_validation(): void
     {
         $tiers = new StorageTierRegistry([
             new StorageTier('PRIMARY', new AwsS3StorageBackend(AwsS3ProviderAdmission::admitted('us-east-1')), defaultWriteTier: true),
             new StorageTier('ARCHIVE', new AwsS3StorageBackend(AwsS3ProviderAdmission::admitted('us-west-2'))),
         ]);
-        $method = new \ReflectionMethod(S3ServerRuntimeFactory::class, 'admittedAwsTier');
+        $method = new \ReflectionMethod(S3ServerRuntimeFactory::class, 'admittedAwsTiers');
 
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('Multiple admitted AWS S3 tier bindings are unsupported.');
-        $method->invoke(new S3ServerRuntimeFactory(), $tiers);
+        $bindings = $method->invoke(new S3ServerRuntimeFactory(), $tiers);
+        self::assertIsArray($bindings);
+        self::assertCount(2, $bindings);
     }
 
     public function test_mixed_local_default_and_aws_archive_rejects_non_postgres_metadata(): void

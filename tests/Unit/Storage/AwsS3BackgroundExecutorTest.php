@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OpsFour\S3Server\Tests\Unit\Storage;
 
 use Amp\ByteStream\ReadableBuffer;
+use Amp\Parallel\Worker\ContextWorkerPool;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\Psr7\Request;
@@ -23,16 +24,25 @@ use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeBinding;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
 use OpsFour\S3Server\Storage\AwsS3WriteAttemptPath;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageGarbageCollector;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
 use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3ProviderProbe;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3ReadExecutor;
 use OpsFour\S3Server\Tests\Support\CallbackStorageBackend;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3IntentSummaryStore;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3OperationalSummary;
+use OpsFour\S3Server\Observability\MetricsCollector;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\NullLogger;
 use Psr\Http\Message\RequestInterface;
 
 final class AwsS3BackgroundExecutorTest extends TestCase
@@ -50,6 +60,8 @@ final class AwsS3BackgroundExecutorTest extends TestCase
     private AwsS3ForegroundObjectWriter $writer;
 
     private AwsS3FencedBackgroundObjectWriter $background;
+
+    private ?FixtureAwsS3IntentSummaryStore $runtimeMetadata = null;
 
     /** @var list<RequestInterface> */
     private array $requests = [];
@@ -494,6 +506,257 @@ final class AwsS3BackgroundExecutorTest extends TestCase
         self::assertSame(['PUT'], $this->mutationMethods());
     }
 
+    public function test_exact_two_tier_registry_routes_transition_and_restore_through_distinct_aws_writers(): void
+    {
+        $this->mock->append(
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+        );
+        $coldBinding = AwsS3ProviderValidatedBinding::fromConfiguration([
+            'bucket' => 'backing-private',
+            'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'archive',
+            'reserved_prefix' => '.opsfour/archive-attempts',
+        ], new AwsS3ProviderValidator(function (RequestInterface $request, array $options) {
+            $this->requests[] = $request;
+            if ($request->getMethod() === 'PUT') {
+                $body = $request->getBody();
+                $this->putBodies[] = (string) $body;
+                $body->rewind();
+            }
+
+            return ($this->mock)($request, $options);
+        }));
+        $cold = new AwsS3StorageBackend($coldBinding->admission, $coldBinding);
+        $summary = new FixtureAwsS3OperationalSummary();
+        $runtimeMetadata = new FixtureAwsS3IntentSummaryStore(
+            $this->metadata,
+            static fn(string $tier): array => $summary->getAwsS3OperationalSummary($tier),
+        );
+        $metrics = new MetricsCollector();
+        class_exists(AwsS3OperationalStateFixture::class);
+        $probe = new FixtureAwsS3ProviderProbe($this->binding->admission);
+        $readExecutor = new FixtureAwsS3ReadExecutor(
+            $this->binding->client ?? throw new \LogicException('Fixture AWS client is unavailable.'),
+        );
+        self::assertTrue(mkdir($this->base . '/temp-budget', 0700));
+        $tempBudget = new StorageTempBudgetCoordinator($this->base . '/temp-budget', 16 * 1024 * 1024, 0);
+        $stagePool = new ContextWorkerPool(2);
+        $budgetPool = new ContextWorkerPool(2);
+        $hotState = AwsS3OperationalStateFixture::attach(
+            $this->aws,
+            $this->binding,
+            'HOT',
+            $runtimeMetadata,
+            $probe,
+            $readExecutor,
+        );
+        $coldState = AwsS3OperationalStateFixture::attach(
+            $cold,
+            $coldBinding,
+            'COLD',
+            $runtimeMetadata,
+            $probe,
+            $readExecutor,
+        );
+        self::assertTrue(mkdir($this->base . '/scratch/hot', 0700));
+        self::assertTrue(mkdir($this->base . '/scratch/cold', 0700));
+        $hotWriter = $this->aws->createForegroundObjectWriter(
+            $runtimeMetadata,
+            $this->base . '/scratch/hot',
+            'HOT',
+            16 * 1024 * 1024,
+            filesystemReserveBytes: 0,
+            tempBudget: $tempBudget,
+            stagePool: $stagePool,
+            budgetPool: $budgetPool,
+        );
+        $coldWriter = $cold->createForegroundObjectWriter(
+            $runtimeMetadata,
+            $this->base . '/scratch/cold',
+            'COLD',
+            16 * 1024 * 1024,
+            filesystemReserveBytes: 0,
+            tempBudget: $tempBudget,
+            stagePool: $stagePool,
+            budgetPool: $budgetPool,
+        );
+        $hotRuntime = new AwsS3TierRuntimeBinding(
+            'HOT',
+            $this->aws,
+            $runtimeMetadata,
+            $hotState,
+            $hotWriter,
+            new AwsS3FencedBackgroundObjectWriter($hotWriter, $this->aws, 'HOT'),
+            $this->aws->createObjectWriteIntentCollector(
+                $runtimeMetadata,
+                'HOT',
+                new NullLogger(),
+                $metrics,
+            ),
+        );
+        $coldRuntime = new AwsS3TierRuntimeBinding(
+            'COLD',
+            $cold,
+            $runtimeMetadata,
+            $coldState,
+            $coldWriter,
+            new AwsS3FencedBackgroundObjectWriter($coldWriter, $cold, 'COLD'),
+            $cold->createObjectWriteIntentCollector(
+                $runtimeMetadata,
+                'COLD',
+                new NullLogger(),
+                $metrics,
+            ),
+        );
+        $registry = new AwsS3TierRuntimeRegistry([$hotRuntime, $coldRuntime], 'HOT', $runtimeMetadata);
+        $tiers = new StorageTierRegistry([
+            new StorageTier('HOT', $this->aws, defaultWriteTier: true),
+            new StorageTier('COLD', $cold, restoreRequired: true),
+        ]);
+        $payload = 'two exact AWS tiers';
+        $bucket = $this->metadata->getBucket('bucket');
+        self::assertNotNull($bucket);
+        $hotAttemptId = str_repeat('a', 32);
+        $hotPath = AwsS3WriteAttemptPath::forProfileObject(
+            $hotWriter->profile(),
+            'bucket',
+            'tiered',
+            $bucket->generation,
+            'HOT',
+            $hotAttemptId,
+        );
+        $this->putObject('tiered', 'HOT', $hotPath, $payload);
+        $transitionId = $this->metadata->enqueueTierTransitionJob(
+            'bucket',
+            'tiered',
+            null,
+            'HOT',
+            'COLD',
+            'GLACIER',
+            $hotPath,
+        );
+        $this->mock->append(new Response(200, [
+            'Content-Length' => (string) strlen($payload),
+            'x-amz-meta-opsfour-write-attempt' => 'v2',
+            'x-amz-meta-opsfour-attempt-id' => $hotAttemptId,
+            'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+            'x-amz-meta-opsfour-content-size' => (string) strlen($payload),
+        ], $payload));
+        $this->mock->append(new Response(200, ['ETag' => '"cold"']));
+
+        try {
+            $transitionStats = (new TierTransitionExecutor(
+                $this->metadata,
+                $tiers,
+                deleteSourceAfterCommit: false,
+                awsTierRuntimes: $registry,
+            ))->processNext(1);
+            self::assertSame(
+                ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+                $transitionStats,
+                json_encode($this->metadata->getTierTransitionJob($transitionId), JSON_THROW_ON_ERROR),
+            );
+            $archived = $this->metadata->getObjectMetadata('bucket', 'tiered');
+            self::assertNotNull($archived);
+            self::assertSame('COLD', $archived->storageTier);
+            $coldPath = (string) $archived->systemMetadata['storagePath'];
+            self::assertStringStartsWith('.opsfour/archive-attempts/', $coldPath);
+
+            $this->metadata->updateObjectRestoreState('bucket', 'tiered', 'null', 'pending');
+            $this->metadata->enqueueRestoreJob('bucket', 'tiered', null, 'COLD', $coldPath, 1);
+            $coldAttemptId = basename($coldPath);
+            $this->mock->append(new Response(200, [
+                'Content-Length' => (string) strlen($payload),
+                'x-amz-meta-opsfour-write-attempt' => 'v2',
+                'x-amz-meta-opsfour-attempt-id' => $coldAttemptId,
+                'x-amz-meta-opsfour-owner-digest' => hash('sha256', 'owner'),
+                'x-amz-meta-opsfour-content-size' => (string) strlen($payload),
+            ], $payload));
+            $this->mock->append(new Response(200, ['ETag' => '"hot"']));
+
+            self::assertSame(
+                ['processed' => 1, 'completed' => 1, 'retried' => 0, 'deadLetter' => 0],
+                (new RestoreExecutor(
+                    $this->metadata,
+                    $tiers,
+                    awsTierRuntimes: $registry,
+                ))->processNext(1),
+            );
+            $restored = $this->metadata->getObjectMetadata('bucket', 'tiered');
+            self::assertNotNull($restored);
+            self::assertSame('restored', $restored->restoreStatus);
+            self::assertStringStartsWith('.opsfour/write-attempts/', $restored->restoredStoragePath ?? '');
+
+            self::assertTrue($hotState->mutationReady());
+            self::assertTrue($coldState->mutationReady());
+            $this->metadata->enqueueStorageGarbage('bucket', 'COLD', 'invalid-cold-garbage-path');
+            self::assertSame(0, (new StorageGarbageCollector(
+                $this->metadata,
+                $tiers,
+                awsTierRuntimes: $registry,
+            ))->collect(1));
+            self::assertTrue($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+            $closedSnapshot = $registry->snapshot();
+            self::assertFalse($closedSnapshot['mutation_ready']);
+            self::assertSame('collector', $closedSnapshot['reason']);
+
+            $failedMetadata = $this->createMockForIntersectionOfInterfaces([
+                MetadataStore::class,
+                FencedStorageGarbageStore::class,
+                StorageGarbageLeaseStore::class,
+            ]);
+            self::assertInstanceOf(MetadataStore::class, $failedMetadata);
+            $failedMetadata->method('dequeueStorageGarbage')->willThrowException(
+                new \RuntimeException('metadata unavailable'),
+            );
+            try {
+                (new StorageGarbageCollector(
+                    $failedMetadata,
+                    $tiers,
+                    awsTierRuntimes: $registry,
+                ))->collect(1);
+                self::fail('A global garbage queue failure was not reported.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('metadata unavailable', $error->getMessage());
+            }
+            self::assertFalse($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+
+            self::assertSame(0, (new StorageGarbageCollector(
+                $this->metadata,
+                $tiers,
+                awsTierRuntimes: $registry,
+            ))->collect(1));
+            self::assertTrue($hotState->mutationReady());
+            self::assertTrue($coldState->mutationReady());
+            self::assertFalse($registry->hasBoundTier($this->aws, 'COLD'));
+            try {
+                $registry->backgroundWriterFor($this->aws, 'COLD');
+                self::fail('Wrong AWS backend/tier lookup was accepted.');
+            } catch (\RuntimeException $error) {
+                self::assertStringContainsString('exact admitted backend and tier', $error->getMessage());
+            }
+
+            $this->metadata->enqueueStorageGarbage('bucket', 'COLD', 'wrong-exact-runtime-path');
+            self::assertSame(0, (new StorageGarbageCollector(
+                $this->metadata,
+                StorageTierRegistry::single($this->aws, 'COLD'),
+                awsTierRuntimes: $registry,
+            ))->collect(1));
+            self::assertFalse($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+        } finally {
+            $hotWriter->shutdown();
+            $coldWriter->shutdown();
+            $stagePool->shutdown();
+            $budgetPool->shutdown();
+            $tempBudget->close();
+        }
+    }
+
     public function test_restore_into_aws_consumes_dispatch_with_restored_copy_metadata(): void
     {
         $this->bind('STANDARD');
@@ -522,6 +785,101 @@ final class AwsS3BackgroundExecutorTest extends TestCase
         self::assertStringStartsWith('.opsfour/write-attempts/', $object->restoredStoragePath ?? '');
         self::assertSame([], $this->activeAttemptIds());
         self::assertSame(['PUT'], $this->mutationMethods());
+    }
+
+    public function test_ambiguous_aws_restore_preserves_pending_source_and_durable_recovery_attempt(): void
+    {
+        $this->bind('STANDARD');
+        $state = $this->aws->operationalState();
+        self::assertNotNull($state);
+        $metrics = new MetricsCollector();
+        $runtimeMetadata = $this->runtimeMetadata
+            ?? throw new \LogicException('AWS runtime metadata fixture is unavailable.');
+        $registry = new AwsS3TierRuntimeRegistry([
+            new AwsS3TierRuntimeBinding(
+                'STANDARD',
+                $this->aws,
+                $runtimeMetadata,
+                $state,
+                $this->writer,
+                $this->background,
+                $this->aws->createObjectWriteIntentCollector(
+                    $runtimeMetadata,
+                    'STANDARD',
+                    new NullLogger(),
+                    $metrics,
+                ),
+            ),
+        ], 'STANDARD', $runtimeMetadata);
+        $cold = new InMemoryBackend();
+        $cold->createBucket('bucket');
+        $payload = 'ambiguous restore bytes';
+        $stored = $cold->putObject('bucket', 'ambiguous-restore', new ReadableBuffer($payload));
+        $this->putObject('ambiguous-restore', 'GLACIER', $stored->path, $payload);
+        $this->metadata->updateObjectRestoreState('bucket', 'ambiguous-restore', 'null', 'pending');
+        $jobId = $this->metadata->enqueueRestoreJob(
+            'bucket',
+            'ambiguous-restore',
+            null,
+            'GLACIER',
+            $stored->path,
+            1,
+            maxAttempts: 3,
+        );
+        $this->mock->append(new ConnectException(
+            'provider acknowledgement lost',
+            new Request('PUT', 'https://s3.mock.invalid/private'),
+        ));
+
+        self::assertSame(
+            ['processed' => 1, 'completed' => 0, 'retried' => 1, 'deadLetter' => 0],
+            (new RestoreExecutor(
+                $this->metadata,
+                new StorageTierRegistry([
+                    new StorageTier('STANDARD', $this->aws, defaultWriteTier: true),
+                    new StorageTier('GLACIER', $cold, restoreRequired: true),
+                ]),
+                awsTierRuntimes: $registry,
+            ))->processNext(1),
+        );
+
+        $unrestored = $this->metadata->getObjectMetadata('bucket', 'ambiguous-restore');
+        self::assertNotNull($unrestored);
+        self::assertSame('pending', $unrestored->restoreStatus);
+        self::assertSame('GLACIER', $unrestored->storageTier);
+        self::assertSame($stored->path, $unrestored->systemMetadata['storagePath']);
+        self::assertNull($unrestored->restoredStorageTier);
+        self::assertNull($unrestored->restoredStoragePath);
+        $job = $this->metadata->getRestoreJob($jobId);
+        self::assertNotNull($job);
+        self::assertSame('pending', $job['status']);
+        self::assertSame(1, $job['attempts']);
+        self::assertNull($job['restoredStoragePath']);
+
+        $attemptIds = $this->activeAttemptIds();
+        self::assertCount(1, $attemptIds, json_encode([
+            'requests' => array_map(
+                static fn(RequestInterface $request): string => $request->getMethod(),
+                array_slice($this->requests, 2),
+            ),
+            'state' => $state->snapshot(),
+            'job' => $job,
+        ], JSON_THROW_ON_ERROR));
+        $attempt = $this->metadata->getObjectWriteIntent($attemptIds[0]);
+        self::assertNotNull($attempt);
+        self::assertSame('STANDARD', $attempt->storageTier);
+        self::assertSame('restore_copy', $attempt->purpose);
+        self::assertNotNull($attempt->dispatchId);
+        self::assertSame('integrity', $state->snapshot()['reason']);
+        self::assertTrue($state->recoveryReady());
+        $due = $this->metadata->claimDueObjectWriteIntents('STANDARD', 1, 300.0);
+        self::assertCount(1, $due);
+        self::assertSame($attempt->attemptId, $due[0]->attemptId);
+        self::assertSame(['PUT'], $this->mutationMethods());
+        self::assertSame(['PUT'], array_map(
+            static fn(RequestInterface $request): string => $request->getMethod(),
+            array_slice($this->requests, 2),
+        ));
     }
 
     public function test_transition_from_aws_requires_current_v2_evidence_and_never_calls_generic_delete(): void
@@ -906,9 +1264,14 @@ final class AwsS3BackgroundExecutorTest extends TestCase
 
     private function bind(string $tier): void
     {
-        AwsS3OperationalStateFixture::attach($this->aws, $this->binding, $tier);
-        $this->writer = $this->aws->createForegroundObjectWriter(
+        $summary = new FixtureAwsS3OperationalSummary();
+        $this->runtimeMetadata = new FixtureAwsS3IntentSummaryStore(
             $this->metadata,
+            static fn(string $storageTier): array => $summary->getAwsS3OperationalSummary($storageTier),
+        );
+        AwsS3OperationalStateFixture::attach($this->aws, $this->binding, $tier, $this->runtimeMetadata);
+        $this->writer = $this->aws->createForegroundObjectWriter(
+            $this->runtimeMetadata,
             $this->base . '/scratch',
             $tier,
             16 * 1024 * 1024,

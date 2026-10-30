@@ -16,12 +16,14 @@ use OpsFour\S3Server\Logging\AccessLogWriter;
 use OpsFour\S3Server\Handler\HandlerRegistrar;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
 use OpsFour\S3Server\Runtime\StorageMutatorInventory;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
+use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
@@ -31,10 +33,13 @@ use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
 use OpsFour\S3Server\Storage\RestoreExecutor;
 use OpsFour\S3Server\Storage\LocalScratchStager;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
+use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\TierTransitionExecutor;
+use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 use Psr\Log\NullLogger;
@@ -180,6 +185,7 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
 
         $writer = null;
         $probePool = null;
+        $readPool = null;
         $stagePool = null;
         $budgetPool = null;
         try {
@@ -188,6 +194,7 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
             $runtimeMetadata = (new \ReflectionProperty(S3Server::class, 'metadata'))->getValue($runtime->server);
             self::assertInstanceOf(MetadataStore::class, $runtimeMetadata);
             self::assertInstanceOf(AwsS3OperationalSummaryReader::class, $runtimeMetadata);
+            self::assertInstanceOf(ObjectWriteIntentStore::class, $runtimeMetadata);
             self::assertTrue($state->isBoundTo($binding, 'STANDARD', $runtimeMetadata));
             $graphCheck = new \ReflectionMethod(S3Server::class, 'assertAwsOperationalGraph');
             $registry = StorageTierRegistry::single($backend);
@@ -247,21 +254,58 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
             } catch (\LogicException $error) {
                 self::assertStringContainsString('metadata graph', $error->getMessage());
             }
-            foreach (['awsOperationalState', 'awsObjectIntentCollector', 'awsBackgroundWriter', 'awsAccessLogWriter'] as $propertyName) {
-                $property = new \ReflectionProperty(S3Server::class, $propertyName);
-                self::assertNotNull($property->getValue($runtime->server), $propertyName . ' was not wired.');
+            $awsTierRuntimes = (new \ReflectionProperty(S3Server::class, 'awsTierRuntimes'))->getValue($runtime->server);
+            self::assertInstanceOf(AwsS3TierRuntimeRegistry::class, $awsTierRuntimes);
+            $tierRuntime = $awsTierRuntimes->defaultBinding();
+            self::assertSame('STANDARD', $tierRuntime->tier);
+            self::assertSame($backend, $tierRuntime->backend);
+            self::assertSame($backend->operationalState(), $tierRuntime->operationalState);
+            self::assertSame($runtimeMetadata, $tierRuntime->metadata);
+            self::assertTrue($tierRuntime->objectIntentCollector->isBoundTo(
+                $runtimeMetadata,
+                'STANDARD',
+                $tierRuntime->operationalState,
+                $binding,
+            ));
+            foreach (['awsOperationalState', 'awsObjectIntentCollector', 'awsBackgroundWriter'] as $propertyName) {
+                self::assertNull(
+                    (new \ReflectionProperty(S3Server::class, $propertyName))->getValue($runtime->server),
+                    $propertyName . ' retained stale singular wiring.',
+                );
             }
+            self::assertNotNull((new \ReflectionProperty(S3Server::class, 'awsAccessLogWriter'))->getValue($runtime->server));
             $pools = (new \ReflectionProperty(S3Server::class, 'workerPools'))->getValue($runtime->server);
             self::assertIsArray($pools);
-            self::assertContains('aws_provider_probe', array_column($pools, 'name'));
+            foreach (['aws_provider_probe', 'aws_payload_reads', 'aws_payload_staging', 'aws_temp_budget'] as $poolName) {
+                self::assertSame(1, count(array_filter(
+                    $pools,
+                    static fn(array $entry): bool => $entry['name'] === $poolName,
+                )), $poolName . ' was not owned exactly once.');
+            }
             $probeEntry = array_values(array_filter($pools, static fn(array $entry): bool => $entry['name'] === 'aws_provider_probe'))[0] ?? null;
             self::assertIsArray($probeEntry);
             self::assertInstanceOf(WorkerPool::class, $probeEntry['pool'] ?? null);
             self::assertTrue($probeEntry['forceKillOnShutdown'] ?? false);
             $probePool = $probeEntry['pool'];
+            $readEntry = array_values(array_filter($pools, static fn(array $entry): bool => $entry['name'] === 'aws_payload_reads'))[0] ?? null;
+            $stageEntry = array_values(array_filter($pools, static fn(array $entry): bool => $entry['name'] === 'aws_payload_staging'))[0] ?? null;
+            $budgetEntry = array_values(array_filter($pools, static fn(array $entry): bool => $entry['name'] === 'aws_temp_budget'))[0] ?? null;
+            self::assertIsArray($readEntry);
+            self::assertIsArray($stageEntry);
+            self::assertIsArray($budgetEntry);
+            self::assertInstanceOf(WorkerPool::class, $readEntry['pool'] ?? null);
+            self::assertInstanceOf(WorkerPool::class, $stageEntry['pool'] ?? null);
+            self::assertInstanceOf(WorkerPool::class, $budgetEntry['pool'] ?? null);
+            $readPool = $readEntry['pool'];
+            $stagePool = $stageEntry['pool'];
+            $budgetPool = $budgetEntry['pool'];
 
-            $writer = (new \ReflectionProperty($runtime, 'awsObjectWriter'))->getValue($runtime);
+            $ownedWriters = (new \ReflectionProperty($runtime, 'awsObjectWriters'))->getValue($runtime);
+            self::assertIsArray($ownedWriters);
+            self::assertCount(1, $ownedWriters);
+            $writer = array_values($ownedWriters)[0];
             self::assertInstanceOf(AwsS3ForegroundObjectWriter::class, $writer);
+            self::assertSame($writer, $tierRuntime->foregroundWriter);
             $registry = $runtime->server->getHandlerRegistry();
             $put = $registry->get(S3Operation::PutObject);
             self::assertSame($writer, (new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put));
@@ -310,7 +354,7 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
             self::assertSame($writer, (new \ReflectionProperty($accessLogs, 'awsWriter'))->getValue($accessLogs));
             self::assertSame($writer, (new \ReflectionProperty(S3Server::class, 'awsAccessLogWriter'))->getValue($runtime->server));
 
-            $background = (new \ReflectionProperty(S3Server::class, 'awsBackgroundWriter'))->getValue($runtime->server);
+            $background = $tierRuntime->backgroundWriter;
             self::assertInstanceOf(AwsS3FencedBackgroundObjectWriter::class, $background);
             self::assertSame($writer, (new \ReflectionProperty($background, 'writer'))->getValue($background));
             $components = (new \ReflectionMethod(S3Server::class, 'prepareBackgroundComponents'))->invoke($runtime->server);
@@ -319,8 +363,10 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
             $restore = $components['restoreExecutor'] ?? null;
             self::assertInstanceOf(TierTransitionExecutor::class, $transition);
             self::assertInstanceOf(RestoreExecutor::class, $restore);
-            self::assertSame($background, (new \ReflectionProperty($transition, 'awsFencedWriter'))->getValue($transition));
-            self::assertSame($background, (new \ReflectionProperty($restore, 'awsFencedWriter'))->getValue($restore));
+            self::assertNull((new \ReflectionProperty($transition, 'awsFencedWriter'))->getValue($transition));
+            self::assertNull((new \ReflectionProperty($restore, 'awsFencedWriter'))->getValue($restore));
+            self::assertSame($awsTierRuntimes, (new \ReflectionProperty($transition, 'awsTierRuntimes'))->getValue($transition));
+            self::assertSame($awsTierRuntimes, (new \ReflectionProperty($restore, 'awsTierRuntimes'))->getValue($restore));
 
             // The binding already passed the two mocked admission requests.
             // Avoid another external worker probe while exercising the guard's
@@ -336,21 +382,167 @@ final class PostgresAwsS3OperationalSummaryTest extends TestCase
 
             $stager = (new \ReflectionProperty($writer, 'stager'))->getValue($writer);
             self::assertInstanceOf(LocalScratchStager::class, $stager);
-            $stagePool = (new \ReflectionProperty($stager, 'stagePool'))->getValue($stager);
-            $budgetPool = (new \ReflectionProperty($stager, 'budgetPool'))->getValue($stager);
-            self::assertInstanceOf(WorkerPool::class, $stagePool);
-            self::assertInstanceOf(WorkerPool::class, $budgetPool);
+            self::assertSame($stagePool, (new \ReflectionProperty($stager, 'stagePool'))->getValue($stager));
+            self::assertSame($budgetPool, (new \ReflectionProperty($stager, 'budgetPool'))->getValue($stager));
+            self::assertTrue($backend->usesReadPool($readPool));
         } finally {
             $runtime->stop();
             if ($writer instanceof AwsS3ForegroundObjectWriter) {
                 $stager = (new \ReflectionProperty($writer, 'stager'))->getValue($writer);
                 self::assertInstanceOf(LocalScratchStager::class, $stager);
                 self::assertTrue((new \ReflectionProperty($stager, 'shuttingDown'))->getValue($stager));
-                self::assertNull((new \ReflectionProperty($runtime, 'awsObjectWriter'))->getValue($runtime));
+                self::assertSame([], (new \ReflectionProperty($runtime, 'awsObjectWriters'))->getValue($runtime));
             }
             self::assertFalse($probePool?->isRunning() ?? true);
+            self::assertFalse($readPool?->isRunning() ?? true);
             self::assertFalse($stagePool?->isRunning() ?? true);
             self::assertFalse($budgetPool?->isRunning() ?? true);
+        }
+    }
+
+    public function test_postgres_runtime_factory_composes_two_exact_aws_tiers_and_stops_every_shared_resource(): void
+    {
+        $mock = new MockHandler([
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+            new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+            new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+        ]);
+        $validator = new AwsS3ProviderValidator(
+            static fn(RequestInterface $request, array $options) => $mock($request, $options),
+        );
+        $hotBinding = AwsS3ProviderValidatedBinding::fromConfiguration([
+            'bucket' => 'qualified-runtime-private', 'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'data/hot', 'reserved_prefix' => '.opsfour/hot',
+        ], $validator);
+        $coldBinding = AwsS3ProviderValidatedBinding::fromConfiguration([
+            'bucket' => 'qualified-runtime-private', 'region' => 'us-east-1',
+            'expected_owner_id' => '123456789012',
+            'data_prefix' => 'data/cold', 'reserved_prefix' => '.opsfour/cold',
+        ], $validator);
+        $hot = new AwsS3StorageBackend($hotBinding->admission, $hotBinding);
+        $cold = new AwsS3StorageBackend($coldBinding->admission, $coldBinding);
+        $tiers = new StorageTierRegistry([
+            new StorageTier('HOT', $hot, defaultWriteTier: true),
+            new StorageTier('COLD', $cold, restoreRequired: true),
+        ]);
+        $runtime = (new S3ServerRuntimeFactory())->create(
+            config: new S3ServerConfig(
+                storagePath: sys_get_temp_dir(),
+                metadataDriver: 'postgres',
+                selectWorkerPoolSize: 1,
+                requestBodySpoolWorkerPoolSize: 1,
+            ),
+            metadata: new PostgresMetadataStore($this->pool),
+            storage: $hot,
+            storageTiers: $tiers,
+            credentialProvider: new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            logger: new NullLogger(),
+            metrics: new MetricsCollector(),
+            encryption: new EncryptionService(),
+        );
+        $pools = [];
+        $writers = [];
+        try {
+            $registry = (new \ReflectionProperty(S3Server::class, 'awsTierRuntimes'))->getValue($runtime->server);
+            self::assertInstanceOf(AwsS3TierRuntimeRegistry::class, $registry);
+            self::assertCount(2, $registry->all());
+            $hotRuntime = $registry->bindingFor($hot, 'HOT');
+            $coldRuntime = $registry->bindingFor($cold, 'COLD');
+            self::assertSame($hot, $hotRuntime->backend);
+            self::assertSame($cold, $coldRuntime->backend);
+            self::assertSame($registry->providerProbe(), $hotRuntime->operationalState->providerProbe());
+            self::assertSame($registry->providerProbe(), $coldRuntime->operationalState->providerProbe());
+            self::assertSame($registry->readExecutor(), $hot->readExecutor());
+            self::assertSame($registry->readExecutor(), $cold->readExecutor());
+            self::assertSame($registry->tempBudgetCoordinator(), $hotRuntime->foregroundWriter->tempBudgetCoordinator());
+            self::assertSame($registry->tempBudgetCoordinator(), $coldRuntime->foregroundWriter->tempBudgetCoordinator());
+
+            $writers = (new \ReflectionProperty($runtime, 'awsObjectWriters'))->getValue($runtime);
+            self::assertIsArray($writers);
+            self::assertCount(2, $writers);
+            self::assertSame(
+                $hotRuntime->foregroundWriter,
+                (new \ReflectionProperty(S3Server::class, 'awsAccessLogWriter'))->getValue($runtime->server),
+            );
+            $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
+            self::assertSame(
+                $hotRuntime->foregroundWriter,
+                (new \ReflectionProperty($put, 'awsObjectWriter'))->getValue($put),
+            );
+
+            $handlerRegistry = $runtime->server->getHandlerRegistry();
+            $storageRegistrations = new \ReflectionProperty($handlerRegistry, 'storageRegistrations');
+            $savedRegistrations = $storageRegistrations->getValue($handlerRegistry);
+            self::assertIsArray($savedRegistrations);
+            $handlerRegistry->registerStorage($cold, StorageTierRegistry::single($cold, 'COLD'));
+            try {
+                (new \ReflectionMethod(S3Server::class, 'assertAwsOperationalGraph'))->invoke(
+                    $runtime->server,
+                    [$tiers],
+                );
+                self::fail('A handler-specific COLD default without its exact writer was accepted.');
+            } catch (\LogicException $error) {
+                self::assertStringContainsString('PutObject', $error->getMessage());
+            } finally {
+                $storageRegistrations->setValue($handlerRegistry, $savedRegistrations);
+            }
+
+            $fencing = new RecordingClusterWorkFencingStore();
+            $identity = new ClusterWorkerIdentity('node-a', 'incarnation-a');
+            $registryProperty = new \ReflectionProperty(S3Server::class, 'awsTierRuntimes');
+            $fencingProperty = new \ReflectionProperty(S3Server::class, 'clusterWorkFencing');
+            $identityProperty = new \ReflectionProperty(S3Server::class, 'clusterWorkerIdentity');
+            $registryProperty->setValue($runtime->server, null);
+            $fencingProperty->setValue($runtime->server, $fencing);
+            $identityProperty->setValue($runtime->server, $identity);
+            $runtime->server->setAwsTierRuntimeRegistry($registry);
+            foreach ($registry->all() as $binding) {
+                self::assertSame(
+                    $fencing,
+                    (new \ReflectionProperty($binding->objectIntentCollector, 'clusterFencing'))->getValue($binding->objectIntentCollector),
+                );
+                self::assertSame(
+                    $identity->forKind('object-aws-' . substr(hash('sha256', $binding->tier), 0, 16)),
+                    (new \ReflectionProperty($binding->objectIntentCollector, 'clusterWorkerId'))->getValue($binding->objectIntentCollector),
+                );
+            }
+            $fencingProperty->setValue($runtime->server, null);
+            $identityProperty->setValue($runtime->server, null);
+
+            $components = (new \ReflectionMethod(S3Server::class, 'prepareBackgroundComponents'))->invoke($runtime->server);
+            self::assertIsArray($components);
+            foreach (['transitionExecutor', 'restoreExecutor'] as $component) {
+                self::assertSame(
+                    $registry,
+                    (new \ReflectionProperty($components[$component], 'awsTierRuntimes'))->getValue($components[$component]),
+                );
+            }
+            self::assertSame($registry, (new \ReflectionProperty($components['storageGarbageCollector'], 'awsTierRuntimes'))->getValue($components['storageGarbageCollector']));
+            self::assertSame($registry, (new \ReflectionProperty($components['multipartIntentCollector'], 'awsTierRuntimes'))->getValue($components['multipartIntentCollector']));
+
+            $poolEntries = (new \ReflectionProperty(S3Server::class, 'workerPools'))->getValue($runtime->server);
+            self::assertIsArray($poolEntries);
+            foreach (['aws_provider_probe', 'aws_payload_reads', 'aws_payload_staging', 'aws_temp_budget'] as $name) {
+                $entry = array_values(array_filter($poolEntries, static fn(array $item): bool => $item['name'] === $name))[0] ?? null;
+                self::assertIsArray($entry);
+                self::assertInstanceOf(WorkerPool::class, $entry['pool'] ?? null);
+                $pools[] = $entry['pool'];
+            }
+        } finally {
+            $runtime->stop();
+        }
+
+        foreach ($writers as $writer) {
+            self::assertInstanceOf(AwsS3ForegroundObjectWriter::class, $writer);
+            $stager = (new \ReflectionProperty($writer, 'stager'))->getValue($writer);
+            self::assertInstanceOf(LocalScratchStager::class, $stager);
+            self::assertTrue((new \ReflectionProperty($stager, 'shuttingDown'))->getValue($stager));
+        }
+        self::assertSame([], (new \ReflectionProperty($runtime, 'awsObjectWriters'))->getValue($runtime));
+        foreach ($pools as $pool) {
+            self::assertFalse($pool->isRunning());
         }
     }
 

@@ -40,7 +40,11 @@ final class RestoreExecutor
         private readonly ?AwsS3FencedBackgroundObjectWriter $awsFencedWriter = null,
         private readonly ?ClusterWorkFencingStore $clusterFencing = null,
         private readonly ?string $clusterWorkerId = null,
+        private readonly ?AwsS3TierRuntimeRegistry $awsTierRuntimes = null,
     ) {
+        if ($this->awsFencedWriter !== null && $this->awsTierRuntimes !== null) {
+            throw new \InvalidArgumentException('Restore accepts either one legacy AWS writer or one exact tier registry, not both.');
+        }
         if (($clusterFencing === null) !== ($clusterWorkerId === null)) {
             throw new \InvalidArgumentException('Cluster restore fencing requires both store and worker identity.');
         }
@@ -50,7 +54,7 @@ final class RestoreExecutor
             || $this->leaseRenewalIntervalSeconds >= QueueLease::DURATION_SECONDS / 2) {
             throw new \InvalidArgumentException('Restore lease renewal interval must fit within its lease.');
         }
-        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null)
+        if (($this->localFencedWriter !== null || $this->awsFencedWriter !== null || $this->awsTierRuntimes !== null)
             && ! $this->metadata instanceof ObjectWriteIntentStore) {
             throw new \InvalidArgumentException('Fenced restore requires an object write intent metadata store.');
         }
@@ -144,11 +148,11 @@ final class RestoreExecutor
             if (! $this->metadata instanceof RestoredCopyTierStore) {
                 throw new \RuntimeException('Restore requires tier-aware metadata persistence.');
             }
-            $awsSource = $this->awsFencedWriter?->isBoundTier($sourceBackend, $sourceTier) ?? false;
-            $awsTarget = $this->awsFencedWriter?->isBoundTier($targetBackend, $targetTierName) ?? false;
-            if ($awsTarget) {
+            $awsSourceWriter = $this->awsWriterFor($sourceBackend, $sourceTier);
+            $awsTargetWriter = $this->awsWriterFor($targetBackend, $targetTierName);
+            if ($awsTargetWriter !== null) {
                 $fencedTarget = true;
-                $awsReservation = $this->awsFencedWriter?->reserve(
+                $awsReservation = $awsTargetWriter->reserve(
                     $object,
                     $targetBucket,
                     $targetBackend,
@@ -165,14 +169,14 @@ final class RestoreExecutor
             $writeFailure = null;
             try {
                 $sourceStream = new TeeReadableStream(
-                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSource
-                        ? $this->awsFencedWriter?->readCommittedSource(
+                    new LazyReadableStream(fn(): \Amp\ByteStream\ReadableStream => $awsSourceWriter !== null
+                        ? $awsSourceWriter->readCommittedSource(
                             $targetBucket,
                             $object,
                             $sourceBackend,
                             $sourceTier,
                             $sourceStoragePath,
-                        ) ?? throw new \LogicException('AWS source reader disappeared.')
+                        )
                         : $sourceBackend->getObjectByPath($sourceStoragePath)),
                     static function (string $chunk) use (&$sourceSize, $sourceMd5, $sourceChecksums): void {
                         $sourceSize += strlen($chunk);
@@ -181,7 +185,7 @@ final class RestoreExecutor
                     },
                 );
                 if ($awsReservation !== null) {
-                    [$write, $dispatchToken] = $this->awsFencedWriter?->publishReserved(
+                    [$write, $dispatchToken] = $awsTargetWriter?->publishReserved(
                         $awsReservation,
                         $object,
                         $sourceStream,
@@ -225,7 +229,7 @@ final class RestoreExecutor
             if ($writeFailure !== null) {
                 if ($awsReservation !== null && $dispatchToken === null) {
                     try {
-                        $this->awsFencedWriter?->retireBeforeDispatch($awsReservation);
+                        $awsTargetWriter?->retireBeforeDispatch($awsReservation);
                     } catch (\Throwable) {
                         // Armed or uncertain attempts remain durable for reconciliation.
                     }
@@ -378,6 +382,25 @@ final class RestoreExecutor
 
             return $this->retryOrDeadLetter($job, $e, $leaseExpiresAt);
         }
+    }
+
+    private function awsWriterFor(StorageBackend $backend, string $storageTier): ?AwsS3FencedBackgroundObjectWriter
+    {
+        $physicalBackend = $backend;
+        while ($physicalBackend instanceof \OpsFour\S3Server\Observability\ObservedStorageBackend) {
+            $physicalBackend = $physicalBackend->innerBackend();
+        }
+        if (! $physicalBackend instanceof AwsS3StorageBackend) {
+            return null;
+        }
+        if ($this->awsTierRuntimes !== null) {
+            return $this->awsTierRuntimes->backgroundWriterFor($backend, $storageTier);
+        }
+        if ($this->awsFencedWriter?->isBoundTier($backend, $storageTier)) {
+            return $this->awsFencedWriter;
+        }
+
+        throw new \RuntimeException("AWS storage tier {$storageTier} has no exact qualified background writer.");
     }
 
     /** @param array<string, mixed> $job */

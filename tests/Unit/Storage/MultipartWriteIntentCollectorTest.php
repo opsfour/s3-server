@@ -21,11 +21,19 @@ use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidatedBinding;
 use OpsFour\S3Server\Storage\AwsS3ProviderValidator;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
+use OpsFour\S3Server\Storage\AwsS3FencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeBinding;
+use OpsFour\S3Server\Storage\AwsS3TierRuntimeRegistry;
+use OpsFour\S3Server\Storage\StorageTempBudgetCoordinator;
+use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\MultipartWriteIntentCollector;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Tests\Support\AwsS3OperationalStateFixture;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3ProviderProbe;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3ReadExecutor;
+use OpsFour\S3Server\Tests\Support\FixtureAwsS3IntentSummaryStore;
 use OpsFour\S3Server\Tests\Support\RecordingClusterWorkFencingStore;
 use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
@@ -143,6 +151,184 @@ final class MultipartWriteIntentCollectorTest extends TestCase
             self::assertTrue($state->mutationReady());
             self::assertCount(2, $requests);
         } finally {
+            putenv($oldKey === false ? 'AWS_ACCESS_KEY_ID' : 'AWS_ACCESS_KEY_ID=' . $oldKey);
+            putenv($oldSecret === false ? 'AWS_SECRET_ACCESS_KEY' : 'AWS_SECRET_ACCESS_KEY=' . $oldSecret);
+        }
+    }
+
+    public function test_non_default_registry_tier_failure_does_not_poison_default_tier_health(): void
+    {
+        $oldKey = getenv('AWS_ACCESS_KEY_ID');
+        $oldSecret = getenv('AWS_SECRET_ACCESS_KEY');
+        putenv('AWS_ACCESS_KEY_ID=test');
+        putenv('AWS_SECRET_ACCESS_KEY=test');
+        $base = sys_get_temp_dir() . '/s3-multipart-tier-routing-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($base, 0700));
+        self::assertTrue(mkdir($base . '/hot', 0700));
+        self::assertTrue(mkdir($base . '/cold', 0700));
+        self::assertTrue(mkdir($base . '/temp-budget', 0700));
+        $hotWriter = null;
+        $coldWriter = null;
+        $tempBudget = null;
+        try {
+            $mock = new MockHandler([
+                new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+                new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+                new Response(200, ['x-amz-bucket-region' => 'us-east-1']),
+                new Response(200, [], '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'),
+            ]);
+            $validator = new AwsS3ProviderValidator(static fn(RequestInterface $request, array $options) => $mock($request, $options));
+            $hotBinding = AwsS3ProviderValidatedBinding::fromConfiguration([
+                'bucket' => 'backing-private', 'region' => 'us-east-1',
+                'expected_owner_id' => '123456789012',
+                'data_prefix' => 'data/hot', 'reserved_prefix' => '.opsfour/hot',
+            ], $validator);
+            $coldBinding = AwsS3ProviderValidatedBinding::fromConfiguration([
+                'bucket' => 'backing-private', 'region' => 'us-east-1',
+                'expected_owner_id' => '123456789012',
+                'data_prefix' => 'data/cold', 'reserved_prefix' => '.opsfour/cold',
+            ], $validator);
+            $hot = new AwsS3StorageBackend($hotBinding->admission, $hotBinding);
+            $cold = new AwsS3StorageBackend($coldBinding->admission, $coldBinding);
+            $inner = new SqliteMetadataStore(':memory:');
+            $inner->initialize();
+            $runtimeMetadata = new FixtureAwsS3IntentSummaryStore($inner, static fn(string $tier): array => [
+                'open' => 0, 'ambiguous' => 0, 'seal_reserved' => 0, 'sealed' => 0,
+                'multipart' => 1, 'part' => 0, 'cleanup' => 0, 'failures' => 0,
+                'oldest_age_seconds' => 0.0, 'max_owner_open' => 0, 'max_owner_sealed' => 0,
+                'max_owner_multipart' => 1, 'max_owner_part' => 0, 'global_open' => 0,
+                'global_seal_reserved' => 0, 'global_multipart' => 1, 'global_part' => 0,
+                'global_cleanup' => 0,
+            ]);
+            $collectorMetadata = new AwsS3MultipartOperationalMetadataFixture($inner, retainCollectorRetry: false);
+            class_exists(AwsS3OperationalStateFixture::class);
+            $probe = new FixtureAwsS3ProviderProbe($hotBinding->admission);
+            $read = new FixtureAwsS3ReadExecutor(
+                $hotBinding->client ?? throw new \LogicException('Fixture AWS client is unavailable.'),
+            );
+            $hotState = AwsS3OperationalStateFixture::attach($hot, $hotBinding, 'HOT', $runtimeMetadata, $probe, $read);
+            $coldState = AwsS3OperationalStateFixture::attach($cold, $coldBinding, 'COLD', $runtimeMetadata, $probe, $read);
+            $tempBudget = new StorageTempBudgetCoordinator($base . '/temp-budget', 16 * 1024 * 1024, 0);
+            $hotWriter = $hot->createForegroundObjectWriter(
+                $runtimeMetadata,
+                $base . '/hot',
+                'HOT',
+                16 * 1024 * 1024,
+                filesystemReserveBytes: 0,
+                tempBudget: $tempBudget,
+            );
+            $coldWriter = $cold->createForegroundObjectWriter(
+                $runtimeMetadata,
+                $base . '/cold',
+                'COLD',
+                16 * 1024 * 1024,
+                filesystemReserveBytes: 0,
+                tempBudget: $tempBudget,
+            );
+            $registry = new AwsS3TierRuntimeRegistry([
+                new AwsS3TierRuntimeBinding(
+                    'HOT',
+                    $hot,
+                    $runtimeMetadata,
+                    $hotState,
+                    $hotWriter,
+                    new AwsS3FencedBackgroundObjectWriter($hotWriter, $hot, 'HOT'),
+                    $hot->createObjectWriteIntentCollector($runtimeMetadata, 'HOT', new \Psr\Log\NullLogger(), new \OpsFour\S3Server\Observability\MetricsCollector()),
+                ),
+                new AwsS3TierRuntimeBinding(
+                    'COLD',
+                    $cold,
+                    $runtimeMetadata,
+                    $coldState,
+                    $coldWriter,
+                    new AwsS3FencedBackgroundObjectWriter($coldWriter, $cold, 'COLD'),
+                    $cold->createObjectWriteIntentCollector($runtimeMetadata, 'COLD', new \Psr\Log\NullLogger(), new \OpsFour\S3Server\Observability\MetricsCollector()),
+                ),
+            ], 'HOT', $runtimeMetadata);
+            (new \ReflectionProperty($cold, 'binding'))->setValue($cold, null);
+
+            $inner->createBucket('owner', 'bucket', 'us-east-1');
+            $inner->createMultipartUploadWithTier('upload', 'bucket', 'key', 'owner', 'COLD');
+            $bucket = $inner->getBucket('bucket');
+            self::assertNotNull($bucket);
+            $now = $inner->multipartWriteIntentNow();
+            $inner->createMultipartWriteIntent(new MultipartWriteIntent(
+                attemptId: str_repeat('c', 32),
+                uploadId: 'upload',
+                bucket: 'bucket',
+                bucketGeneration: $bucket->generation,
+                ownerId: 'owner',
+                storageTier: 'COLD',
+                assemblyPath: '.opsfour/cold/assembly',
+                finalPath: '.opsfour/cold/final',
+                partDigest: str_repeat('d', 64),
+                sseMode: null,
+                leaseUntil: $now - 1,
+                nextAttemptAt: $now - 1,
+            ));
+
+            self::assertSame(0, (new MultipartWriteIntentCollector(
+                $collectorMetadata,
+                new StorageTierRegistry([
+                    new StorageTier('HOT', $hot, defaultWriteTier: true),
+                    new StorageTier('COLD', $cold),
+                ]),
+                awsTierRuntimes: $registry,
+            ))->collect(1));
+            self::assertTrue($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+            self::assertSame('healthy', $hotState->snapshot()['reason']);
+            self::assertSame('collector', $coldState->snapshot()['reason']);
+
+            $coldState->markCollectorHealthy('multipart');
+            try {
+                (new MultipartWriteIntentCollector(
+                    new AwsS3MultipartOperationalMetadataFixture($inner, failNow: true),
+                    new StorageTierRegistry([
+                        new StorageTier('HOT', $hot, defaultWriteTier: true),
+                        new StorageTier('COLD', $cold),
+                    ]),
+                    awsTierRuntimes: $registry,
+                ))->collect(1);
+                self::fail('A database-time outage was swallowed.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('database time unavailable', $error->getMessage());
+            }
+            self::assertFalse($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+
+            $hotState->markCollectorHealthy('multipart');
+            $coldState->markCollectorHealthy('multipart');
+            $now = $inner->multipartWriteIntentNow();
+            $inner->createMultipartWriteIntent(new MultipartWriteIntent(
+                attemptId: str_repeat('e', 32),
+                uploadId: 'upload',
+                bucket: 'bucket',
+                bucketGeneration: $bucket->generation,
+                ownerId: 'owner',
+                storageTier: 'COLD',
+                assemblyPath: '.opsfour/cold/wrong-assembly',
+                finalPath: '.opsfour/cold/wrong-final',
+                partDigest: str_repeat('f', 64),
+                sseMode: null,
+                leaseUntil: $now - 1,
+                nextAttemptAt: $now - 1,
+            ));
+            self::assertSame(0, (new MultipartWriteIntentCollector(
+                new AwsS3MultipartOperationalMetadataFixture($inner),
+                StorageTierRegistry::single($hot, 'COLD'),
+                awsTierRuntimes: $registry,
+            ))->collect(1));
+            self::assertFalse($hotState->mutationReady());
+            self::assertFalse($coldState->mutationReady());
+        } finally {
+            $hotWriter?->shutdown();
+            $coldWriter?->shutdown();
+            $tempBudget?->close();
+            @rmdir($base . '/hot');
+            @rmdir($base . '/cold');
+            @rmdir($base . '/temp-budget');
+            @rmdir($base);
             putenv($oldKey === false ? 'AWS_ACCESS_KEY_ID' : 'AWS_ACCESS_KEY_ID=' . $oldKey);
             putenv($oldSecret === false ? 'AWS_SECRET_ACCESS_KEY' : 'AWS_SECRET_ACCESS_KEY=' . $oldSecret);
         }
@@ -418,15 +604,23 @@ final class MultipartWriteIntentCollectorTest extends TestCase
         }
         rmdir($path);
     }
+
 }
 
 /** Exact operational identity for the retained AWS multipart collector fixture. */
 final readonly class AwsS3MultipartOperationalMetadataFixture implements MultipartWriteIntentStore, FencedMultipartWriteIntentStore, AwsS3OperationalSummaryReader
 {
-    public function __construct(private SqliteMetadataStore $inner) {}
+    public function __construct(
+        private SqliteMetadataStore $inner,
+        private bool $retainCollectorRetry = true,
+        private bool $failNow = false,
+    ) {}
 
     public function multipartWriteIntentNow(): float
     {
+        if ($this->failNow) {
+            throw new \RuntimeException('database time unavailable');
+        }
         return $this->inner->multipartWriteIntentNow();
     }
     public function createMultipartWriteIntent(MultipartWriteIntent $intent): void
@@ -467,7 +661,8 @@ final readonly class AwsS3MultipartOperationalMetadataFixture implements Multipa
     }
     public function retryMultipartCollectorClaim(string $attemptId, float $nextAttemptAt, float $expectedLeaseUntil, int $claimGeneration): bool
     {
-        return $this->inner->retryMultipartCollectorClaim($attemptId, $nextAttemptAt, $expectedLeaseUntil, $claimGeneration);
+        return $this->retainCollectorRetry
+            && $this->inner->retryMultipartCollectorClaim($attemptId, $nextAttemptAt, $expectedLeaseUntil, $claimGeneration);
     }
 
     public function getAwsS3OperationalSummary(string $storageTier): array

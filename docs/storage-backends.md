@@ -255,17 +255,21 @@ only persist exact garbage paths. Request paths and generic collectors do not
 mutate qualified AWS keys; the qualified, lease-fenced claimed-garbage collector
 is the sole deletion path for exact AWS garbage claims.
 
-Lifecycle transitions and temporary restore copies may use one exact admitted
-AWS tier binding. They reserve capacity before opening any source stream, copy
+Lifecycle transitions and temporary restore copies may use up to two exact
+admitted AWS tier bindings in one bucket and provider identity. Each tier uses
+its own backend instance and pairwise-disjoint data and reserved prefixes while
+sharing the node-bounded provider probe, payload-read, staging, and temporary
+budget resources. They reserve capacity before opening any source stream, copy
 stored ciphertext without transformation, and consume the confirmed dispatch in
 the same transaction as queue completion and placement or restore metadata. A
 stale claim, changed bucket generation, ambiguous provider result, or uncertain
 commit acknowledgement never authorizes AWS deletion. A later logical retry
 allocates a fresh immutable attempt while prior armed evidence remains available
 to reconciliation. AWS sources are read only through exact current-v2 path,
-owner-digest, size, expected-owner, and bounded-EOF verification. Multiple
-admitted AWS tier bindings fail closed; only a default-tier binding is exposed
-to foreground request handlers.
+owner-digest, size, expected-owner, and bounded-EOF verification. Incomplete,
+overlapping, or provider-mismatched tier graphs fail before listener exposure;
+only the default-tier binding is exposed to foreground request handlers and
+access logging.
 
 Access logs now reserve a durable attempt before publication, use a create-only
 provider write, and consume the armed dispatch in the same metadata transaction

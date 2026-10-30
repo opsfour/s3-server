@@ -38,6 +38,8 @@ final class LocalScratchStager
 
     private readonly WorkerPool $stagePool;
 
+    private readonly bool $ownsStagePool;
+
     private readonly WorkerPool $budgetPool;
 
     private readonly bool $ownsBudgetPool;
@@ -55,6 +57,7 @@ final class LocalScratchStager
         ?WorkerPool $budgetPool = null,
         private readonly int $filesystemReserveBytes = StorageTempBudgetCoordinator::DEFAULT_FILESYSTEM_RESERVE_BYTES,
         ?StorageTempBudgetCoordinator $tempBudget = null,
+        ?WorkerPool $stagePool = null,
     ) {
         $scratch = realpath($scratchDirectory);
         if ($scratch === false || ! is_dir($scratch) || ! is_writable($scratch)) {
@@ -76,7 +79,8 @@ final class LocalScratchStager
         if ($this->budget->tempDir() !== $this->scratch) {
             $this->budget->registerNamespace($namespace, $this->scratch);
         }
-        $this->stagePool = new ContextWorkerPool(2);
+        $this->ownsStagePool = $stagePool === null;
+        $this->stagePool = $stagePool ?? new ContextWorkerPool(2);
         $this->ownsBudgetPool = $budgetPool === null;
         $this->budgetPool = $budgetPool ?? new ContextWorkerPool(2);
         $this->stageFilesystem = new File\Filesystem(new ParallelFilesystemDriver($this->stagePool));
@@ -235,13 +239,25 @@ final class LocalScratchStager
         $this->shuttingDown = true;
         // If stage shutdown fails, its pending operations may still reserve
         // bytes. Keep the budget pool available until they are terminal.
-        $this->stagePool->shutdown();
+        if ($this->ownsStagePool) {
+            $this->stagePool->shutdown();
+        }
         if ($this->ownsBudgetPool) {
             $this->budgetPool->shutdown();
         }
         if ($this->ownsBudget) {
             $this->budget->close();
         }
+    }
+
+    public function usesWorkerPools(WorkerPool $stagePool, WorkerPool $budgetPool): bool
+    {
+        return $this->stagePool === $stagePool && $this->budgetPool === $budgetPool;
+    }
+
+    public function tempBudgetCoordinator(): StorageTempBudgetCoordinator
+    {
+        return $this->budget;
     }
 
     private function writeBlock(

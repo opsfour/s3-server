@@ -10,9 +10,10 @@ use OpsFour\S3Server\Exception\InternalErrorException;
 use OpsFour\S3Server\Metadata\ObjectWriteIntent;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Observability\MetricsCollector;
+use Amp\Parallel\Worker\WorkerPool;
 
 /** The sole ordinary-object AWS destination coordinator. */
-final readonly class AwsS3ForegroundObjectWriter
+final readonly class AwsS3ForegroundObjectWriter implements AwsS3ObjectWriterShutdown
 {
     private object $authority;
 
@@ -82,6 +83,16 @@ final readonly class AwsS3ForegroundObjectWriter
     public function shutdown(): void
     {
         $this->stager->shutdown();
+    }
+
+    public function usesStagingWorkerPools(WorkerPool $stagePool, WorkerPool $budgetPool): bool
+    {
+        return $this->stager->usesWorkerPools($stagePool, $budgetPool);
+    }
+
+    public function tempBudgetCoordinator(): StorageTempBudgetCoordinator
+    {
+        return $this->stager->tempBudgetCoordinator();
     }
 
     public function reserve(

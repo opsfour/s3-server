@@ -65,6 +65,44 @@ final class AwsS3ProviderWorkerProbeTest extends TestCase
         (new AwsS3ProviderWorkerProbe($pool, 1.0))->revalidate($this->profile());
     }
 
+    public function test_shared_probe_serializes_two_concurrent_callers_before_observing_pool_idleness(): void
+    {
+        $firstResult = new DeferredFuture();
+        $secondResult = new DeferredFuture();
+        $channel = $this->createMock(Channel::class);
+        $submissions = 0;
+        $pool = $this->createMock(WorkerPool::class);
+        $pool->expects(self::exactly(2))->method('isIdle')->willReturn(true);
+        $pool->expects(self::exactly(2))->method('submit')
+            ->willReturnCallback(static function (Task $task) use (
+                $channel,
+                $firstResult,
+                $secondResult,
+                &$submissions,
+            ): Execution {
+                ++$submissions;
+                return new Execution(
+                    $task,
+                    $channel,
+                    ($submissions === 1 ? $firstResult : $secondResult)->getFuture(),
+                );
+            });
+        $probe = new AwsS3ProviderWorkerProbe($pool, 1.0);
+
+        $first = \Amp\async(fn(): AwsS3ProviderAdmission => $probe->revalidate($this->profile()));
+        \Amp\delay(0);
+        $second = \Amp\async(fn(): AwsS3ProviderAdmission => $probe->revalidate($this->profile()));
+        \Amp\delay(0);
+        self::assertSame(1, $submissions, 'The second caller bypassed the shared probe mutex.');
+
+        $firstResult->complete(AwsS3ProviderAdmission::admitted('us-east-1'));
+        self::assertTrue($first->await()->providerAdmitted);
+        \Amp\delay(0);
+        self::assertSame(2, $submissions);
+        $secondResult->complete(AwsS3ProviderAdmission::admitted('us-east-1'));
+        self::assertTrue($second->await()->providerAdmitted);
+    }
+
     private function profile(): AwsS3ProviderProfile
     {
         return new AwsS3ProviderProfile(
