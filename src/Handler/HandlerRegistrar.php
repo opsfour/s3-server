@@ -95,10 +95,8 @@ use OpsFour\S3Server\Runtime\StorageMutatorInventory;
  * (MetadataStore, StorageBackend, S3ServerConfig) and maps each to
  * its corresponding S3Operation enum case.
  *
- * Usage:
- *     $registry = $server->getHandlerRegistry();
- *     HandlerRegistrar::registerAll($registry, $metadata, $storage, $config);
- *     $server->start();
+ * Complete servers should be composed through S3ServerRuntimeFactory. Direct
+ * registration remains available for guarded low-level custom handler graphs.
  */
 final class HandlerRegistrar
 {

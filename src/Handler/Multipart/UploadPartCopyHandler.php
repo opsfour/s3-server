@@ -47,7 +47,7 @@ use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Observability\ObservedStorageBackend;
 use OpsFour\S3Server\Xml\XmlResponseBuilder;
 
-final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
+final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer, \OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer
 {
     private readonly StorageTierRegistry $storageTiers;
 
@@ -87,6 +87,16 @@ final class UploadPartCopyHandler implements RequestHandler, \OpsFour\S3Server\S
     public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
     {
         return $this->awsObjectWriter === $writer;
+    }
+
+    public function usesLocalFilesystemPublicationGraph(
+        \OpsFour\S3Server\Storage\LocalFencedObjectWriter $objectWriter,
+        \OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): bool {
+        return $this->localPartWriter === $partWriter
+            && hash_equals($partWriter->storageTierName(), $storageTier);
     }
 
     public function handleRequest(Request $request): Response

@@ -11,6 +11,7 @@ use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Metadata\MetadataStore;
+use OpsFour\S3Server\Metadata\Crc64NvmeObjectMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutStore;
 use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
@@ -34,9 +35,105 @@ use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\MockObject\MockObject;
+use Psr\Log\LoggerInterface;
 
 final class StorageWriteFenceStartupGuardTest extends TestCase
 {
+    public function test_documented_raw_filesystem_bootstrap_fails_before_listener_or_storage_ownership(): void
+    {
+        $storageRoot = sys_get_temp_dir() . '/s3-raw-bootstrap-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storageRoot, 0o700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $storage = new FilesystemBackend($storageRoot);
+        $config = new S3ServerConfig(storagePath: $storageRoot, perClientRateLimit: 0);
+        $server = new S3Server($config, $metadata, $storage);
+        HandlerRegistrar::registerAll($server->getHandlerRegistry(), $metadata, $storage, $config);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('Expected unfenced local publication handlers to be rejected.');
+        } catch (\LogicException $exception) {
+            self::assertStringContainsString('Local filesystem publication handler PutObject', $exception->getMessage());
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+            self::assertSame([], (new \ReflectionProperty($server, 'workerPools'))->getValue($server));
+            self::assertDirectoryDoesNotExist($storageRoot . '/.opsfour');
+        } finally {
+            $server->stop();
+            $this->removeDirectory($storageRoot);
+        }
+    }
+
+    public function test_direct_read_only_filesystem_graph_remains_available(): void
+    {
+        $storageRoot = sys_get_temp_dir() . '/s3-read-only-bootstrap-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storageRoot, 0o700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $server = new S3Server(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $this->freePort(),
+            storagePath: $storageRoot,
+            perClientRateLimit: 0,
+        ), $metadata, new FilesystemBackend($storageRoot));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::assertNotNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+        } finally {
+            $server->stop();
+            $this->removeDirectory($storageRoot);
+        }
+    }
+
+    public function test_unsafe_test_override_allows_raw_publication_graph_and_logs_warning(): void
+    {
+        $storageRoot = sys_get_temp_dir() . '/s3-override-bootstrap-' . bin2hex(random_bytes(8));
+        self::assertTrue(mkdir($storageRoot, 0o700));
+        $metadata = new SqliteMetadataStore(':memory:');
+        $metadata->initialize();
+        $storage = new FilesystemBackend($storageRoot);
+        $config = new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $this->freePort(),
+            storagePath: $storageRoot,
+            allowUnfencedStorageForTests: true,
+            perClientRateLimit: 0,
+        );
+        $unsafeWarning = false;
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('log')->willReturnCallback(
+            static function (mixed $level, string|\Stringable $message) use (&$unsafeWarning): void {
+                if (str_contains((string) $message, 'UNSAFE TEST-ONLY local publication graph override')) {
+                    $unsafeWarning = true;
+                }
+            },
+        );
+        $server = new S3Server($config, $metadata, $storage, $logger);
+        HandlerRegistrar::registerAll($server->getHandlerRegistry(), $metadata, $storage, $config);
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::assertTrue($unsafeWarning);
+            self::assertNotNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+        } finally {
+            $server->stop();
+            $this->removeDirectory($storageRoot);
+        }
+    }
+
     public function test_injected_sql_store_cannot_hide_behind_default_sqlite_configuration(): void
     {
         $postgres = (new \ReflectionClass(PostgresMetadataStore::class))->newInstanceWithoutConstructor();
@@ -691,14 +788,50 @@ final class StorageWriteFenceStartupGuardTest extends TestCase
         return $filesystem;
     }
 
-    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&MockObject
+    private function capableMetadataMock(): MetadataStore&ObjectPartLayoutStore&Crc64NvmeObjectMetadataStore&MockObject
     {
-        $metadata = $this->createMockForIntersectionOfInterfaces([MetadataStore::class, ObjectPartLayoutStore::class]);
-        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore) {
+        $metadata = $this->createMockForIntersectionOfInterfaces([
+            MetadataStore::class,
+            ObjectPartLayoutStore::class,
+            Crc64NvmeObjectMetadataStore::class,
+        ]);
+        if (! $metadata instanceof MetadataStore || ! $metadata instanceof ObjectPartLayoutStore
+            || ! $metadata instanceof Crc64NvmeObjectMetadataStore) {
             throw new \LogicException('Intersection mock is missing a requested interface.');
         }
         $metadata->method('supportsObjectPartLayouts')->willReturn(true);
+        $metadata->method('supportsCrc64NvmeObjectMetadata')->willReturn(true);
 
         return $metadata;
+    }
+
+    private function freePort(): int
+    {
+        $socket = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($socket);
+        $address = stream_socket_get_name($socket, false);
+        self::assertIsString($address);
+        fclose($socket);
+
+        return (int) substr($address, strrpos($address, ':') + 1);
+    }
+
+    private function removeDirectory(string $path): void
+    {
+        if (! is_dir($path)) {
+            return;
+        }
+        $entries = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($entries as $entry) {
+            if ($entry->isDir() && ! $entry->isLink()) {
+                @rmdir($entry->getPathname());
+            } else {
+                @unlink($entry->getPathname());
+            }
+        }
+        @rmdir($path);
     }
 }

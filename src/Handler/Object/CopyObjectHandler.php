@@ -73,7 +73,7 @@ use OpsFour\S3Server\Xml\XmlResponseBuilder;
  *   x-amz-copy-source-if-modified-since, x-amz-copy-source-if-unmodified-since
  * - Cross-bucket copies with source read and destination write permission
  */
-final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
+final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer, \OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer
 {
     private const int MAX_SINGLE_COPY_BYTES = 5_368_709_120;
 
@@ -126,6 +126,17 @@ final class CopyObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
     public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
     {
         return $this->awsObjectWriter === $writer;
+    }
+
+    public function usesLocalFilesystemPublicationGraph(
+        LocalFencedObjectWriter $objectWriter,
+        LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        \OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): bool {
+        return $this->localFencedWriter === $objectWriter
+            && $this->localLeaseFactory === $leaseFactory
+            && hash_equals($objectWriter->storageTierName(), $storageTier);
     }
 
     /**

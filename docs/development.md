@@ -157,8 +157,17 @@ final class MyCustomHandler
 2. Register it in `HandlerRegistrar::registerAll()` or programmatically:
 
 ```php
-$server->getHandlerRegistry()->register('MyCustomOperation', $handler->handle(...));
+use OpsFour\S3Server\Routing\S3Operation;
+
+$server->getHandlerRegistry()->register(S3Operation::GetObject, $handler);
 ```
+
+Direct registration is a low-level extension API. A read-only custom graph may
+use `S3Server` directly, but a standard filesystem byte-publication operation
+must attest the exact local publication resources at startup. Use
+`S3ServerRuntimeFactory` when embedding the full server so handler wiring and
+`S3ServerRuntime::stop()` retain the same ownership guarantees as packaged entry
+points.
 
 3. If the operation needs custom routing (not matched by existing query parameters), extend `OperationResolver`.
 

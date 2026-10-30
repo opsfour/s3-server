@@ -203,5 +203,15 @@ for object requests. Keep admin endpoints private in production.
 Handlers are registered in `HandlerRegistrar::registerAll()` and stored in `HandlerRegistry` (a simple map of operation name → handler callable). Custom handlers can be registered before `start()`:
 
 ```php
-$server->getHandlerRegistry()->register('PutObject', new MyCustomPutObjectHandler(...));
+use OpsFour\S3Server\Routing\S3Operation;
+
+$server->getHandlerRegistry()->register(S3Operation::GetObject, new MyCustomGetObjectHandler(...));
 ```
+
+Use `S3ServerRuntimeFactory` for a complete embedded server. Direct `S3Server`
+construction remains a guarded low-level extension point for custom or read-only
+graphs. Registering a standard filesystem publication operation (PUT, browser
+POST, CopyObject, UploadPart, UploadPartCopy, or CompleteMultipartUpload) requires
+the exact factory-owned local writer graph; startup validates the frozen registry
+before taking storage locks or binding a listener. The unsafe storage override is
+test-only and is rejected by cluster-mode composition.

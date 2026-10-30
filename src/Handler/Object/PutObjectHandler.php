@@ -70,7 +70,7 @@ use OpsFour\S3Server\Observability\ObservedStorageBackend;
  *
  * The storage backend is responsible for atomic writes (temp file + rename).
  */
-final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
+final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer, \OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer
 {
     private readonly StorageTierRegistry $storageTiers;
 
@@ -129,6 +129,17 @@ final class PutObjectHandler implements RequestHandler, \OpsFour\S3Server\Storag
     public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
     {
         return $this->awsObjectWriter === $writer;
+    }
+
+    public function usesLocalFilesystemPublicationGraph(
+        LocalFencedObjectWriter $objectWriter,
+        LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        \OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): bool {
+        return $this->localFencedWriter === $objectWriter
+            && $this->localLeaseFactory === $leaseFactory
+            && hash_equals($objectWriter->storageTierName(), $storageTier);
     }
 
     public function handleRequest(Request $request): Response

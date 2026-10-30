@@ -61,7 +61,7 @@ use OpsFour\S3Server\Checksum\Crc64NvmeDigest;
 use OpsFour\S3Server\Checksum\CooperativeCrc64Nvme;
 use OpsFour\S3Server\Exception\BadDigestException;
 
-final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
+final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer, \OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer
 {
     private readonly StorageTierRegistry $storageTiers;
 
@@ -110,6 +110,17 @@ final class CompleteMultipartUploadHandler implements RequestHandler, \OpsFour\S
     public function usesAwsS3ForegroundObjectWriter(AwsS3ForegroundObjectWriter $writer): bool
     {
         return $this->awsObjectWriter === $writer;
+    }
+
+    public function usesLocalFilesystemPublicationGraph(
+        \OpsFour\S3Server\Storage\LocalFencedObjectWriter $objectWriter,
+        \OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        \OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): bool {
+        return $this->requireLocalFencedCompletion
+            && $this->localFencedCompletionTier !== null
+            && hash_equals($this->localFencedCompletionTier, $storageTier);
     }
 
     public function handleRequest(Request $request): Response

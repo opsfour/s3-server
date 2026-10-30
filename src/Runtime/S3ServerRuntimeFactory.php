@@ -204,7 +204,7 @@ final readonly class S3ServerRuntimeFactory
                     $storageTiers->defaultTier()->name,
                     $logger,
                 ));
-                $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory);
+                $server->setLocalObjectWriter($localFencedWriter, $localLeaseFactory, $localPartWriter);
             }
 
             $awsBinding = $this->admittedAwsTier($storageTiers);

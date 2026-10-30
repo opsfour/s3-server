@@ -153,14 +153,14 @@ and production examples.
 Embed the S3 server in your own PHP application:
 
 ```php
-use OpsFour\S3Server\S3Server;
-use OpsFour\S3Server\S3ServerConfig;
-use OpsFour\S3Server\Auth\AuthMiddleware;
+use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Factory\MetadataStoreFactory;
 use OpsFour\S3Server\Factory\StorageBackendFactory;
-use OpsFour\S3Server\Handler\HandlerRegistrar;
-use OpsFour\S3Server\Notification\NotificationDispatcher;
+use OpsFour\S3Server\Observability\MetricsCollector;
+use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
+use OpsFour\S3Server\S3ServerConfig;
+use Psr\Log\NullLogger;
 
 // 1. Configure
 $config = new S3ServerConfig(
@@ -175,44 +175,34 @@ $storage  = StorageBackendFactory::create('filesystem', ['path' => '/var/data/s3
 $metadata = MetadataStoreFactory::create('sqlite', [
     'path' => '/var/data/s3/.opsfour/metadata.sqlite',
 ]);
-$metadata->initialize();
 
-// 3. Create server
-$server = new S3Server($config, $metadata, $storage);
-
-// 4. Add authentication
+// 3. Create the fully wired runtime
 $credentials = new InMemoryCredentialProvider(
-    accessKeyId: 'myAccessKey',
-    secretAccessKey: 'mySecretKey',
-    ownerId: 'owner-1',
-    displayName: 'Admin',
+    new Credential('myAccessKey', 'mySecretKey', 'owner-1', 'Admin'),
 );
-$server->addMiddleware(new AuthMiddleware(
-    credentialProvider: $credentials,
-    region: $config->region,
-    requestBodySizeLimit: $config->requestBodySizeLimit,
+$runtime = (new S3ServerRuntimeFactory())->create(
+    config: $config,
     metadata: $metadata,
-    postSpoolBudgetBytes: $config->postSpoolBudgetBytes,
-    postSpoolCoordinator: $server->preparePostObjectSpoolCoordinator(),
-));
-
-// 5. Register S3 handlers
-$notifications = new NotificationDispatcher($metadata);
-HandlerRegistrar::registerAll(
-    $server->getHandlerRegistry(),
-    $metadata,
-    $storage,
-    $config,
-    notifications: $notifications,
+    storage: $storage,
+    credentialProvider: $credentials,
+    logger: new NullLogger(),
+    metrics: new MetricsCollector(),
 );
 
-// 6. Start
-$server->start();
-
-// Wait for shutdown signal
-\Amp\trapSignal([\SIGINT, \SIGTERM]);
-$server->stop();
+// 4. Start and let the runtime own complete shutdown
+try {
+    $runtime->server->start();
+    \Amp\trapSignal([\SIGINT, \SIGTERM]);
+} finally {
+    $runtime->stop();
+}
 ```
+
+`S3ServerRuntimeFactory` is the supported composition root for an embedded full
+server. It wires the same fenced publication graph used by the standalone,
+Laravel, and Symfony entry points. `S3ServerRuntime::stop()` shuts down the
+server plus its writers, worker pools, notifications, encryption services, and
+storage-root ownership.
 
 ## Verify Installation
 

@@ -10,6 +10,10 @@ use OpsFour\S3Server\Storage\StorageBackend;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer;
+use OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
+use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
+use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 
 /**
  * Maps S3Operation enum cases to Amp RequestHandler instances.
@@ -105,6 +109,85 @@ final class HandlerRegistry
         return isset($this->handlers[$operation->value]);
     }
 
+    public function hasLocalFilesystemPublicationHandlers(): bool
+    {
+        foreach (self::localFilesystemPublicationOperations() as $operation) {
+            if (isset($this->handlers[$operation->value])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** Prove that every local filesystem publication endpoint uses one exact runtime graph. */
+    public function assertLocalFilesystemPublicationCoverage(
+        ?LocalFencedObjectWriter $objectWriter,
+        ?LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        ?LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): void {
+        $this->assertLocalFilesystemPublicationOperations(
+            self::localFilesystemPublicationOperations(),
+            $objectWriter,
+            $leaseFactory,
+            $partWriter,
+            $storageTier,
+        );
+    }
+
+    /** Prove that multipart publication endpoints use the exact writer for one reachable tier. */
+    public function assertLocalFilesystemMultipartPublicationCoverage(
+        ?LocalFencedObjectWriter $objectWriter,
+        ?LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        ?LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): void {
+        $this->assertLocalFilesystemPublicationOperations(
+            [
+                S3Operation::UploadPart,
+                S3Operation::UploadPartCopy,
+                S3Operation::CompleteMultipartUpload,
+            ],
+            $objectWriter,
+            $leaseFactory,
+            $partWriter,
+            $storageTier,
+        );
+    }
+
+    /**
+     * @param list<S3Operation> $operations
+     */
+    private function assertLocalFilesystemPublicationOperations(
+        array $operations,
+        ?LocalFencedObjectWriter $objectWriter,
+        ?LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        ?LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): void {
+        if (! $this->hasLocalFilesystemPublicationHandlers()) {
+            return;
+        }
+
+        foreach ($operations as $operation) {
+            $handler = $this->handlers[$operation->value] ?? null;
+            if ($objectWriter === null || $leaseFactory === null || $partWriter === null
+                || ! $handler instanceof LocalFilesystemPublicationConsumer
+                || ! $handler->usesLocalFilesystemPublicationGraph(
+                    $objectWriter,
+                    $leaseFactory,
+                    $partWriter,
+                    $storageTier,
+                )) {
+                throw new \LogicException(sprintf(
+                    'Local filesystem publication handler %s is missing or does not use the exact fenced runtime graph.',
+                    $operation->value,
+                ));
+            }
+        }
+    }
+
     /** Prove that every registered AWS publication endpoint uses one exact writer. */
     public function assertAwsS3ForegroundWriterCoverage(AwsS3ForegroundObjectWriter $writer): void
     {
@@ -126,5 +209,18 @@ final class HandlerRegistry
                 ));
             }
         }
+    }
+
+    /** @return list<S3Operation> */
+    private static function localFilesystemPublicationOperations(): array
+    {
+        return [
+            S3Operation::PutObject,
+            S3Operation::PostObject,
+            S3Operation::CopyObject,
+            S3Operation::UploadPart,
+            S3Operation::UploadPartCopy,
+            S3Operation::CompleteMultipartUpload,
+        ];
     }
 }

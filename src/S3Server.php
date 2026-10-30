@@ -90,6 +90,7 @@ use OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter;
 use OpsFour\S3Server\Storage\AwsS3OperationalState;
 use OpsFour\S3Server\Storage\AwsS3StorageBackend;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
+use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
@@ -198,6 +199,8 @@ final class S3Server
     private ?LocalFencedObjectWriter $localObjectWriter = null;
 
     private ?LocalObjectWriteLeaseGuardFactory $localObjectLeaseFactory = null;
+
+    private ?LocalFencedMultipartPartWriter $localMultipartPartWriter = null;
 
     private ?LocalFencedBackgroundObjectWriter $localBackgroundWriter = null;
 
@@ -432,6 +435,8 @@ final class S3Server
                     ]);
                 }
             }
+
+            $this->assertLocalFilesystemPublicationGraph($configuredTiers);
 
             if ($this->metadata !== null) {
                 $tierRegistries = $configuredTiers !== null ? [$configuredTiers] : [];
@@ -1140,6 +1145,7 @@ final class S3Server
     public function setLocalObjectWriter(
         LocalFencedObjectWriter $writer,
         LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        ?LocalFencedMultipartPartWriter $multipartPartWriter = null,
     ): void {
         $this->assertConfigurationMutable('Local object write writer');
         if ($this->localObjectWriter !== null || $this->metadata === null || $this->storage === null) {
@@ -1147,6 +1153,7 @@ final class S3Server
         }
         $this->localObjectWriter = $writer;
         $this->localObjectLeaseFactory = $leaseFactory;
+        $this->localMultipartPartWriter = $multipartPartWriter;
         $this->localBackgroundWriter = new LocalFencedBackgroundObjectWriter($writer, $leaseFactory);
         $this->setEncryptionService($this->encryption);
     }
@@ -1610,6 +1617,101 @@ final class S3Server
                 || $readEntry['name'] !== 'aws_payload_reads'
                 || ! $readEntry['forceKillOnShutdown']) {
                 throw new \LogicException('The AWS payload read worker pool is not exactly owned by this runtime.');
+            }
+        }
+    }
+
+    private function assertLocalFilesystemPublicationGraph(?StorageTierRegistry $configuredTiers): void
+    {
+        if (! $this->handlerRegistry->hasLocalFilesystemPublicationHandlers()) {
+            return;
+        }
+
+        /** @var array<string, array{backend: StorageBackend, filesystem: FilesystemBackend, tier: string, full: bool}> $filesystemGraphs */
+        $filesystemGraphs = [];
+        $hasExposedStorageGraph = false;
+        $capture = static function (StorageBackend $backend, string $tier, bool $full) use (&$filesystemGraphs, &$hasExposedStorageGraph): void {
+            $hasExposedStorageGraph = true;
+            $inner = $backend;
+            while ($inner instanceof ObservedStorageBackend) {
+                $inner = $inner->innerBackend();
+            }
+            if ($inner instanceof FilesystemBackend) {
+                $key = spl_object_id($inner) . "\0{$tier}";
+                $filesystemGraphs[$key] = [
+                    'backend' => $backend,
+                    'filesystem' => $inner,
+                    'tier' => $tier,
+                    'full' => $full || ($filesystemGraphs[$key]['full'] ?? false),
+                ];
+            }
+        };
+
+        if ($configuredTiers !== null) {
+            $defaultTierName = $configuredTiers->defaultTier()->name;
+            foreach ($configuredTiers->all() as $tier) {
+                $capture($tier->backend, $tier->name, $tier->name === $defaultTierName);
+            }
+            if ($this->storage !== null && $this->storage !== $configuredTiers->defaultBackend()) {
+                $capture($this->storage, 'STANDARD', true);
+            }
+        } elseif ($this->storage !== null) {
+            $capture($this->storage, 'STANDARD', true);
+        }
+
+        foreach ($this->handlerRegistry->storageRegistrations() as $registration) {
+            $defaultTierName = $registration['tiers']->defaultTier()->name;
+            foreach ($registration['tiers']->all() as $tier) {
+                $capture($tier->backend, $tier->name, $tier->name === $defaultTierName);
+            }
+            if ($registration['storage'] !== $registration['tiers']->defaultBackend()) {
+                $capture($registration['storage'], 'STANDARD', true);
+            }
+        }
+
+        if (! $hasExposedStorageGraph) {
+            if ($this->config->allowUnfencedStorageForTests) {
+                $this->logger->warning('UNSAFE TEST-ONLY local publication graph override active; no storage graph can be attested.');
+
+                return;
+            }
+            throw new \LogicException('Local filesystem publication handlers require an exposed storage graph for startup attestation.');
+        }
+
+        foreach ($filesystemGraphs as $graph) {
+            if ($this->config->allowUnfencedStorageForTests) {
+                $this->logger->warning('UNSAFE TEST-ONLY local publication graph override active; filesystem writes may be unfenced.', [
+                    'tier' => $graph['tier'],
+                ]);
+                continue;
+            }
+
+            $root = realpath($graph['filesystem']->getBasePath());
+            $objectWriter = $this->localObjectWriter;
+            if ($objectWriter === null || $root === false
+                || rtrim($root, '/') !== $objectWriter->storageRoot()
+                || ! hash_equals($objectWriter->storageTierName(), $graph['tier'])) {
+                $objectWriter = null;
+            }
+            $partWriter = $this->localMultipartPartWriter;
+            if ($partWriter === null || $this->metadata === null
+                || ! $partWriter->isBoundTo($this->metadata, $graph['backend'], $graph['tier'])) {
+                $partWriter = null;
+            }
+            if ($graph['full']) {
+                $this->handlerRegistry->assertLocalFilesystemPublicationCoverage(
+                    $objectWriter,
+                    $objectWriter !== null ? $this->localObjectLeaseFactory : null,
+                    $partWriter,
+                    $graph['tier'],
+                );
+            } else {
+                $this->handlerRegistry->assertLocalFilesystemMultipartPublicationCoverage(
+                    $this->localObjectWriter,
+                    $this->localObjectLeaseFactory,
+                    $partWriter,
+                    $graph['tier'],
+                );
             }
         }
     }

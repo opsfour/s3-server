@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace OpsFour\S3Server\Tests\Unit\Runtime;
 
+use Amp\Http\Server\RequestHandler;
+use OpsFour\S3Server\Auth\AuthMiddleware;
 use OpsFour\S3Server\Auth\Credential;
 use OpsFour\S3Server\Auth\InMemoryCredentialProvider;
 use OpsFour\S3Server\Handler\Object\CopyObjectHandler;
@@ -20,17 +22,20 @@ use OpsFour\S3Server\Observability\MetricsCollector;
 use OpsFour\S3Server\Routing\S3Operation;
 use OpsFour\S3Server\Runtime\S3ServerRuntime;
 use OpsFour\S3Server\Runtime\S3ServerRuntimeFactory;
+use OpsFour\S3Server\S3Server;
 use OpsFour\S3Server\S3ServerConfig;
 use OpsFour\S3Server\Storage\FilesystemBackend;
 use OpsFour\S3Server\Storage\InMemoryBackend;
 use OpsFour\S3Server\Storage\LocalFencedBackgroundObjectWriter;
 use OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter;
 use OpsFour\S3Server\Storage\LocalFencedObjectWriter;
+use OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer;
 use OpsFour\S3Server\Storage\LocalObjectWriteIntentCollector;
 use OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory;
 use OpsFour\S3Server\Storage\LocalScratchStager;
 use OpsFour\S3Server\Storage\LocalObjectTestPublishPauseIo;
 use OpsFour\S3Server\Storage\StorageBackend;
+use OpsFour\S3Server\Storage\StorageTier;
 use OpsFour\S3Server\Storage\StorageTierRegistry;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
@@ -216,6 +221,10 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             self::assertNull((new \ReflectionProperty(S3ServerRuntime::class, 'localObjectRenewer'))->getValue($runtime));
             $partWriter = (new \ReflectionProperty(S3ServerRuntime::class, 'localMultipartPartWriter'))->getValue($runtime);
             self::assertInstanceOf(LocalFencedMultipartPartWriter::class, $partWriter);
+            self::assertSame(
+                $partWriter,
+                (new \ReflectionProperty($runtime->server, 'localMultipartPartWriter'))->getValue($runtime->server),
+            );
 
             $put = $runtime->server->getHandlerRegistry()->get(S3Operation::PutObject);
             self::assertInstanceOf(PutObjectHandler::class, $put);
@@ -227,6 +236,271 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             $runtime->stop();
         }
         self::assertTrue((new \ReflectionProperty(LocalFencedMultipartPartWriter::class, 'shuttingDown'))->getValue($partWriter));
+    }
+
+    public function test_factory_runtime_rejects_each_mismatched_local_publication_handler_before_binding(): void
+    {
+        foreach ([
+            S3Operation::PutObject,
+            S3Operation::PostObject,
+            S3Operation::CopyObject,
+            S3Operation::UploadPart,
+            S3Operation::UploadPartCopy,
+            S3Operation::CompleteMultipartUpload,
+        ] as $operation) {
+            $database = $this->base . '/' . $operation->value . '.sqlite';
+            $metadata = new SqliteMetadataStore($database);
+            $metadata->initialize();
+            $runtime = $this->createRuntime(new S3ServerConfig(
+                storagePath: $this->objects,
+                metadataDriver: 'sqlite',
+                metadataDsn: $database,
+                selectWorkerPoolSize: 0,
+                notificationWorkerEnabled: false,
+            ), $metadata);
+            $mismatched = $this->createMockForIntersectionOfInterfaces([
+                RequestHandler::class,
+                LocalFilesystemPublicationConsumer::class,
+            ]);
+            if (! $mismatched instanceof RequestHandler) {
+                throw new \LogicException('Intersection mock is missing the request-handler interface.');
+            }
+            $runtime->server->getHandlerRegistry()->register($operation, $mismatched);
+
+            try {
+                $runtime->server->start();
+                self::fail("Expected {$operation->value} to fail local publication attestation.");
+            } catch (\LogicException $exception) {
+                self::assertStringContainsString("handler {$operation->value}", $exception->getMessage());
+                self::assertNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+            } finally {
+                $runtime->stop();
+            }
+        }
+    }
+
+    public function test_concrete_local_publication_consumers_require_exact_resources_and_tier(): void
+    {
+        $database = $this->base . '/predicate-primary.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $runtime = $this->createRuntime(new S3ServerConfig(
+            storagePath: $this->objects,
+            metadataDriver: 'sqlite',
+            metadataDsn: $database,
+            selectWorkerPoolSize: 0,
+            notificationWorkerEnabled: false,
+        ), $metadata);
+
+        $otherRoot = $this->base . '/predicate-other';
+        self::assertTrue(mkdir($otherRoot, 0700));
+        $otherDatabase = $this->base . '/predicate-other.sqlite';
+        $otherMetadata = new SqliteMetadataStore($otherDatabase);
+        $otherMetadata->initialize();
+        $otherRuntime = $this->createRuntime(new S3ServerConfig(
+            storagePath: $otherRoot,
+            metadataDriver: 'sqlite',
+            metadataDsn: $otherDatabase,
+            selectWorkerPoolSize: 0,
+            notificationWorkerEnabled: false,
+        ), $otherMetadata, new FilesystemBackend($otherRoot));
+
+        try {
+            $writer = (new \ReflectionProperty($runtime->server, 'localObjectWriter'))->getValue($runtime->server);
+            $leases = (new \ReflectionProperty($runtime->server, 'localObjectLeaseFactory'))->getValue($runtime->server);
+            $parts = (new \ReflectionProperty($runtime->server, 'localMultipartPartWriter'))->getValue($runtime->server);
+            $otherWriter = (new \ReflectionProperty($otherRuntime->server, 'localObjectWriter'))->getValue($otherRuntime->server);
+            $otherLeases = (new \ReflectionProperty($otherRuntime->server, 'localObjectLeaseFactory'))->getValue($otherRuntime->server);
+            $otherParts = (new \ReflectionProperty($otherRuntime->server, 'localMultipartPartWriter'))->getValue($otherRuntime->server);
+            self::assertInstanceOf(LocalFencedObjectWriter::class, $writer);
+            self::assertInstanceOf(LocalObjectWriteLeaseGuardFactory::class, $leases);
+            self::assertInstanceOf(LocalFencedMultipartPartWriter::class, $parts);
+            self::assertInstanceOf(LocalFencedObjectWriter::class, $otherWriter);
+            self::assertInstanceOf(LocalObjectWriteLeaseGuardFactory::class, $otherLeases);
+            self::assertInstanceOf(LocalFencedMultipartPartWriter::class, $otherParts);
+
+            foreach ([
+                S3Operation::PutObject,
+                S3Operation::PostObject,
+                S3Operation::CopyObject,
+            ] as $operation) {
+                $handler = $runtime->server->getHandlerRegistry()->get($operation);
+                self::assertInstanceOf(LocalFilesystemPublicationConsumer::class, $handler);
+                self::assertTrue($handler->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'STANDARD'));
+                self::assertFalse($handler->usesLocalFilesystemPublicationGraph($otherWriter, $leases, $parts, 'STANDARD'));
+                self::assertFalse($handler->usesLocalFilesystemPublicationGraph($writer, $otherLeases, $parts, 'STANDARD'));
+                self::assertFalse($handler->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'OTHER'));
+            }
+
+            foreach ([S3Operation::UploadPart, S3Operation::UploadPartCopy] as $operation) {
+                $handler = $runtime->server->getHandlerRegistry()->get($operation);
+                self::assertInstanceOf(LocalFilesystemPublicationConsumer::class, $handler);
+                self::assertTrue($handler->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'STANDARD'));
+                self::assertFalse($handler->usesLocalFilesystemPublicationGraph($writer, $leases, $otherParts, 'STANDARD'));
+                self::assertFalse($handler->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'OTHER'));
+            }
+
+            $completion = $runtime->server->getHandlerRegistry()->get(S3Operation::CompleteMultipartUpload);
+            self::assertInstanceOf(LocalFilesystemPublicationConsumer::class, $completion);
+            self::assertTrue($completion->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'STANDARD'));
+            self::assertTrue($completion->usesLocalFilesystemPublicationGraph($otherWriter, $otherLeases, $otherParts, 'STANDARD'));
+            self::assertFalse($completion->usesLocalFilesystemPublicationGraph($writer, $leases, $parts, 'OTHER'));
+        } finally {
+            $otherRuntime->stop();
+            $runtime->stop();
+        }
+    }
+
+    public function test_publication_handler_without_exposed_storage_graph_is_rejected(): void
+    {
+        $server = new S3Server(new S3ServerConfig(
+            storagePath: $this->objects,
+            perClientRateLimit: 0,
+        ));
+        $server->getHandlerRegistry()->register(S3Operation::PutObject, $this->createMock(RequestHandler::class));
+        $server->addMiddleware(new AuthMiddleware(
+            new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            'us-east-1',
+        ));
+
+        try {
+            $server->start();
+            self::fail('Expected a publication handler without an exposed storage graph to fail.');
+        } catch (\LogicException $exception) {
+            self::assertStringContainsString('require an exposed storage graph', $exception->getMessage());
+            self::assertNull((new \ReflectionProperty($server, 'server'))->getValue($server));
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function test_differing_explicit_handler_filesystem_is_rejected(): void
+    {
+        $database = $this->base . '/explicit-storage.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $runtime = $this->createRuntime(new S3ServerConfig(
+            storagePath: $this->objects,
+            metadataDriver: 'sqlite',
+            metadataDsn: $database,
+            selectWorkerPoolSize: 0,
+            notificationWorkerEnabled: false,
+        ), $metadata);
+        $otherRoot = $this->base . '/explicit-storage-other';
+        self::assertTrue(mkdir($otherRoot, 0700));
+        $tiers = (new \ReflectionProperty($runtime->server, 'storageTiers'))->getValue($runtime->server);
+        self::assertInstanceOf(StorageTierRegistry::class, $tiers);
+        $runtime->server->getHandlerRegistry()->registerStorage(new FilesystemBackend($otherRoot), $tiers);
+
+        try {
+            $runtime->server->start();
+            self::fail('Expected the differing explicit handler filesystem to fail attestation.');
+        } catch (\LogicException $exception) {
+            self::assertStringContainsString('handler PutObject', $exception->getMessage());
+            self::assertNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_nondefault_filesystem_tier_is_rejected_without_its_exact_publication_graph(): void
+    {
+        $archiveRoot = $this->base . '/archive';
+        self::assertTrue(mkdir($archiveRoot, 0700));
+        $database = $this->base . '/nondefault-tier.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $storage = new FilesystemBackend($this->objects);
+        $runtime = (new S3ServerRuntimeFactory())->create(
+            config: new S3ServerConfig(
+                storagePath: $this->objects,
+                metadataDriver: 'sqlite',
+                metadataDsn: $database,
+                selectWorkerPoolSize: 0,
+                notificationWorkerEnabled: false,
+            ),
+            metadata: $metadata,
+            storage: $storage,
+            credentialProvider: new InMemoryCredentialProvider(new Credential('key', 'secret', 'owner')),
+            logger: new NullLogger(),
+            metrics: new MetricsCollector(),
+            storageTiers: new StorageTierRegistry([
+                new StorageTier('STANDARD', $storage, defaultWriteTier: true),
+                new StorageTier('ARCHIVE', new FilesystemBackend($archiveRoot)),
+            ]),
+        );
+
+        try {
+            $runtime->server->start();
+            self::fail('Expected the non-default filesystem tier to fail publication attestation.');
+        } catch (\LogicException $exception) {
+            self::assertStringContainsString('handler UploadPart', $exception->getMessage());
+            self::assertNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_absent_publication_operation_is_rejected_and_retryable(): void
+    {
+        $database = $this->base . '/absent-operation.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $runtime = $this->createRuntime(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $this->freePort(),
+            storagePath: $this->objects,
+            metadataDriver: 'sqlite',
+            metadataDsn: $database,
+            selectWorkerPoolSize: 0,
+            notificationWorkerEnabled: false,
+        ), $metadata);
+        $registry = $runtime->server->getHandlerRegistry();
+        $operation = S3Operation::UploadPartCopy;
+        $handler = $registry->get($operation);
+        $handlersProperty = new \ReflectionProperty($registry, 'handlers');
+        $handlers = $handlersProperty->getValue($registry);
+        unset($handlers[$operation->value]);
+        $handlersProperty->setValue($registry, $handlers);
+
+        try {
+            try {
+                $runtime->server->start();
+                self::fail('Expected the absent publication operation to fail attestation.');
+            } catch (\LogicException $exception) {
+                self::assertStringContainsString('handler UploadPartCopy', $exception->getMessage());
+                self::assertNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+            }
+
+            $registry->register($operation, $handler);
+            $runtime->server->start();
+            self::assertNotNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+        } finally {
+            $runtime->stop();
+        }
+    }
+
+    public function test_factory_runtime_starts_with_the_exact_local_publication_graph(): void
+    {
+        $database = $this->base . '/positive.sqlite';
+        $metadata = new SqliteMetadataStore($database);
+        $metadata->initialize();
+        $runtime = $this->createRuntime(new S3ServerConfig(
+            host: '127.0.0.1',
+            port: $this->freePort(),
+            storagePath: $this->objects,
+            metadataDriver: 'sqlite',
+            metadataDsn: $database,
+            selectWorkerPoolSize: 0,
+            notificationWorkerEnabled: false,
+        ), $metadata);
+
+        try {
+            $runtime->server->start();
+            self::assertNotNull((new \ReflectionProperty($runtime->server, 'server'))->getValue($runtime->server));
+        } finally {
+            $runtime->stop();
+        }
     }
 
     public function test_known_metadata_decorator_is_unwrapped_for_sql_lease_resources(): void
@@ -340,5 +614,16 @@ final class LocalObjectWriteRuntimeTest extends TestCase
             logger: new NullLogger(),
             metrics: new MetricsCollector(),
         );
+    }
+
+    private function freePort(): int
+    {
+        $socket = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertIsResource($socket);
+        $address = stream_socket_get_name($socket, false);
+        self::assertIsString($address);
+        fclose($socket);
+
+        return (int) substr($address, strrpos($address, ':') + 1);
     }
 }

@@ -25,7 +25,7 @@ use OpsFour\S3Server\Security\RequestNetworkContext;
  * the same versioning, quota, encryption, ACL, checksum, cleanup, and
  * notification behavior as regular PutObject requests.
  */
-final class PostObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer
+final class PostObjectHandler implements RequestHandler, \OpsFour\S3Server\Storage\AwsS3ForegroundWriterConsumer, \OpsFour\S3Server\Storage\LocalFilesystemPublicationConsumer
 {
     public function __construct(
         private readonly MetadataStore $metadata,
@@ -35,6 +35,20 @@ final class PostObjectHandler implements RequestHandler, \OpsFour\S3Server\Stora
     public function usesAwsS3ForegroundObjectWriter(\OpsFour\S3Server\Storage\AwsS3ForegroundObjectWriter $writer): bool
     {
         return $this->putObject->usesAwsS3ForegroundObjectWriter($writer);
+    }
+
+    public function usesLocalFilesystemPublicationGraph(
+        \OpsFour\S3Server\Storage\LocalFencedObjectWriter $objectWriter,
+        \OpsFour\S3Server\Storage\LocalObjectWriteLeaseGuardFactory $leaseFactory,
+        \OpsFour\S3Server\Storage\LocalFencedMultipartPartWriter $partWriter,
+        string $storageTier,
+    ): bool {
+        return $this->putObject->usesLocalFilesystemPublicationGraph(
+            $objectWriter,
+            $leaseFactory,
+            $partWriter,
+            $storageTier,
+        );
     }
 
     public function handleRequest(Request $request): Response
