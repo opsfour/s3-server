@@ -25,6 +25,7 @@ use OpsFour\S3Server\Metadata\MysqlMetadataStore;
 use OpsFour\S3Server\Metadata\ObjectWriteIntentStore;
 use OpsFour\S3Server\Metadata\ObjectPartLayoutCapability;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
+use OpsFour\S3Server\Metadata\PostgresClusterAdmissionStore;
 use OpsFour\S3Server\Metadata\AwsS3OperationalSummaryReader;
 use OpsFour\S3Server\Notification\NotificationDispatcher;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -343,17 +344,23 @@ final readonly class S3ServerRuntimeFactory
                 if (! $credentialProvider instanceof ClusterAuthenticationIdentityProvider) {
                     throw new \RuntimeException('Cluster mode requires one PostgreSQL/MySQL database credential store with a stable identity.');
                 }
+                $comparisonTimeoutSeconds = ClusterAdmissionController::DEFAULT_COMPARISON_TIMEOUT_SECONDS;
+                $admissionStore = PostgresClusterAdmissionStore::fromDsn(
+                    $config->metadataDsn
+                        ?? throw new \RuntimeException('Cluster mode requires a PostgreSQL metadata DSN.'),
+                    $comparisonTimeoutSeconds,
+                );
                 $externalAuthenticationIdentity = $adminCredentialApi?->clusterAuthenticationIdentity();
                 $fingerprintFactory = function () use (
-                    $clusterStore,
+                    $admissionStore,
                     $config,
                     $storageTiers,
                     $encryption,
                     $credentialProvider,
                     $externalAuthenticationIdentity,
                 ): ClusterCapabilityFingerprint {
-                    $clusterStore->assertCurrentSchema();
-                    $databaseIdentity = $clusterStore->clusterDatabaseIdentity();
+                    $admissionStore->assertCurrentSchema();
+                    $databaseIdentity = $admissionStore->clusterDatabaseIdentity();
                     if ($config->clusterDatabaseId === null
                         || ! hash_equals($config->clusterDatabaseId, $databaseIdentity)) {
                         throw new \RuntimeException('Configured cluster database identity does not match the migrated PostgreSQL metadata database.');
@@ -363,16 +370,16 @@ final readonly class S3ServerRuntimeFactory
                         $config,
                         $storageTiers,
                         $encryption,
-                        $clusterStore->clusterDatabaseSchema(),
+                        $admissionStore->clusterDatabaseSchema(),
                         $databaseIdentity,
                         $credentialProvider,
                         $externalAuthenticationIdentity,
                     );
                 };
-                $fingerprint = $fingerprintFactory();
                 $clusterAdmission = new ClusterAdmissionController(
-                    $clusterStore,
-                    $fingerprint,
+                    $admissionStore,
+                    null,
+                    comparisonTimeoutSeconds: $comparisonTimeoutSeconds,
                     fingerprintFactory: $fingerprintFactory,
                 );
                 $clusterAdmission->admitInitial();

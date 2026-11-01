@@ -6,8 +6,10 @@ namespace OpsFour\S3Server\Metadata\Schema;
 
 use Amp\Mysql\MysqlConfig;
 use Amp\Mysql\MysqlConnectionPool;
+use Amp\Mysql\MysqlLink;
 use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
+use Amp\Postgres\PostgresLink;
 use OpsFour\S3Server\Encryption\StoredBucketEncryptionConfiguration;
 
 /** Read-only schema admission check for serving nodes. */
@@ -62,7 +64,42 @@ final class MetadataSchemaGuard
         }
     }
 
-    public static function assertMultipartCompletionCapacityConsistent(PostgresConnectionPool|MysqlConnectionPool $pool): void
+    /** Run the complete PostgreSQL serving-schema check on one existing link. */
+    public static function assertCurrentPostgres(PostgresLink $link): void
+    {
+        try {
+            $row = $link->query('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
+            $actual = $row !== null && $row['version'] !== null ? (int) $row['version'] : 0;
+            self::assertCurrentVersion('postgres', $actual);
+            if ($link->query(StoredBucketEncryptionConfiguration::invalidRowQuery('postgres'))->fetchRow() !== null) {
+                throw new \RuntimeException('Stored bucket encryption configuration is unsupported; repair metadata before serving.');
+            }
+            self::assertMultipartCompletionCapacityConsistent($link);
+            self::assertStorageCleanupCapacityConsistent($link);
+            self::assertPostgresWriteIntentTriggers($link);
+            self::assertPostgresSequenceUsage($link);
+            foreach ([
+                'object' => "SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = FALSE OR state <> 'sealed'",
+                'object_seal' => 'SELECT COUNT(*) FROM s3_object_write_intents WHERE seal_reserved = TRUE',
+                'part' => "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation = 'part_write_intent'",
+            ] as $kind => $countSql) {
+                $capacity = $link->execute(
+                    "SELECT retained_count, ({$countSql}) AS actual_count FROM s3_write_intent_capacity WHERE kind = $1",
+                    [$kind],
+                )->fetchRow();
+                if ($capacity === null || (int) $capacity['retained_count'] !== (int) $capacity['actual_count']) {
+                    throw new \RuntimeException('Write intent recovery capacity counter is inconsistent; stop writers and repair metadata before serving.');
+                }
+            }
+        } catch (\Throwable $error) {
+            if ($error instanceof \RuntimeException) {
+                throw $error;
+            }
+            throw new \RuntimeException('Metadata schema cannot be verified. Run metadata:migrate before starting API nodes.', 0, $error);
+        }
+    }
+
+    public static function assertMultipartCompletionCapacityConsistent(PostgresLink|MysqlLink $pool): void
     {
         try {
             $capacity = $pool->query('SELECT retained_count, (SELECT COUNT(*) FROM s3_multipart_write_intents) AS actual_count FROM s3_multipart_completion_capacity WHERE id = 1')->fetchRow();
@@ -86,7 +123,7 @@ final class MetadataSchemaGuard
         }
     }
 
-    public static function assertPostgresWriteIntentTriggers(PostgresConnectionPool $pool): void
+    public static function assertPostgresWriteIntentTriggers(PostgresLink $pool): void
     {
         $expected = self::recoveryCapacityTriggerInventory();
         $rows = $pool->query(<<<'SQL'
@@ -134,7 +171,7 @@ final class MetadataSchemaGuard
         }
     }
 
-    public static function assertPostgresSequenceUsage(PostgresConnectionPool $pool): void
+    public static function assertPostgresSequenceUsage(PostgresLink $pool): void
     {
         try {
             $row = $pool->query(<<<'SQL'
@@ -257,9 +294,9 @@ final class MetadataSchemaGuard
         ];
     }
 
-    public static function assertStorageCleanupCapacityConsistent(PostgresConnectionPool|MysqlConnectionPool $pool): void
+    public static function assertStorageCleanupCapacityConsistent(PostgresLink|MysqlLink $pool): void
     {
-        $actualCount = $pool instanceof MysqlConnectionPool
+        $actualCount = $pool instanceof MysqlLink
             ? "SELECT COUNT(*) FROM s3_storage_garbage WHERE BINARY operation <> BINARY 'part_write_intent'"
             : "SELECT COUNT(*) FROM s3_storage_garbage WHERE operation <> 'part_write_intent'";
         try {

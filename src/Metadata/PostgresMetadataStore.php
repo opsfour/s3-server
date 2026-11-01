@@ -87,20 +87,7 @@ final class PostgresMetadataStore implements MetadataStore, Crc64NvmeObjectMetad
 
     public function assertCurrentSchema(): void
     {
-        try {
-            $row = $this->pool->query('SELECT MAX(version) AS version FROM s3_schema_version')->fetchRow();
-            $actual = $row !== null && $row['version'] !== null ? (int) $row['version'] : 0;
-        } catch (\Throwable $error) {
-            throw new \RuntimeException('Metadata schema cannot be verified. Run metadata:migrate before starting API nodes.', 0, $error);
-        }
-
-        MetadataSchemaGuard::assertCurrentVersion('postgres', $actual);
-        $this->assertSupportedBucketEncryptionInventory();
-        MetadataSchemaGuard::assertMultipartCompletionCapacityConsistent($this->pool);
-        $this->assertWriteIntentCapacityConsistent();
-        MetadataSchemaGuard::assertStorageCleanupCapacityConsistent($this->pool);
-        MetadataSchemaGuard::assertPostgresWriteIntentTriggers($this->pool);
-        MetadataSchemaGuard::assertPostgresSequenceUsage($this->pool);
+        MetadataSchemaGuard::assertCurrentPostgres($this->pool);
     }
 
     public function clusterDatabaseSchema(): string

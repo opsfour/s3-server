@@ -144,7 +144,9 @@ category mismatch keeps `/.live` at 200, makes `/.health` unready, rejects S3
 work before body ingestion, blocks credential/quota admin APIs, and pauses background
 claims until a complete authoritative comparison matches again. Database
 unavailability is reported as `admission=unavailable`, not as a persisted
-mismatch.
+mismatch. Each cluster process also holds one dedicated PostgreSQL admission
+connection in addition to its normal metadata pool; size the database connection
+limit for that extra slot per process.
 
 ### DSN Formats
 

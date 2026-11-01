@@ -33,6 +33,7 @@ use OpsFour\S3Server\Runtime\ClusterMembershipStore;
 use OpsFour\S3Server\Runtime\ClusterRoleController;
 use OpsFour\S3Server\Runtime\ClusterWorkerIdentity;
 use OpsFour\S3Server\Runtime\MetadataDriverStartupGuard;
+use OpsFour\S3Server\Runtime\RecoverableClusterAdmissionStore;
 use OpsFour\S3Server\Runtime\StorageWriteFenceStartupGuard;
 use OpsFour\S3Server\Quota\QuotaConfig;
 use OpsFour\S3Server\S3Server;
@@ -157,6 +158,78 @@ final class ClusterAdmissionTest extends TestCase
         $store->comparisonDelaySeconds = 0.0;
         self::assertTrue($controller->revalidate(true));
         self::assertSame(2, $store->compareCalls);
+    }
+
+    public function test_recoverable_store_retires_one_stuck_flight_before_one_fresh_comparison(): void
+    {
+        $store = new RecoverableClusterAdmissionMemoryStore();
+        $fingerprint = $this->fingerprint('cluster-a', 'node-a');
+        $controller = new ClusterAdmissionController(
+            $store,
+            null,
+            revalidationIntervalSeconds: 0.0,
+            comparisonTimeoutSeconds: 0.005,
+            fingerprintFactory: static fn(): ClusterCapabilityFingerprint => $fingerprint,
+        );
+        $controller->admitInitial();
+        $store->stallNextComparison = true;
+        $store->compareCalls = 0;
+
+        $results = \Amp\Future\await([
+            \Amp\async(fn(): bool => $controller->revalidate(true)),
+            \Amp\async(fn(): bool => $controller->revalidate(true)),
+        ]);
+
+        self::assertSame([false, false], $results);
+        self::assertSame(1, $store->compareCalls);
+        self::assertSame(1, $store->retiredConnections);
+        self::assertFalse($controller->isAdmitted());
+
+        self::assertTrue($controller->revalidate(true));
+        self::assertSame(2, $store->compareCalls);
+        self::assertTrue($controller->isAdmitted());
+
+        $store->stallNextComparison = true;
+        $cancellation = new \Amp\DeferredCancellation();
+        $cancelled = \Amp\async(fn(): bool => $controller->revalidate(true, $cancellation->getCancellation()));
+        \Amp\delay(0.001);
+        $cancellation->cancel();
+        try {
+            $cancelled->await();
+            self::fail('Cancelled recoverable comparison returned normally.');
+        } catch (\Amp\CancelledException) {
+        }
+        self::assertSame(2, $store->retiredConnections);
+        self::assertFalse($controller->isAdmitted());
+        self::assertTrue($controller->revalidate(true));
+        self::assertSame(4, $store->compareCalls);
+
+        $controller->shutdown();
+        self::assertSame(1, $store->closedStores);
+        self::assertFalse($controller->revalidate(true));
+        self::assertFalse($controller->isAdmitted());
+    }
+
+    public function test_initial_timeout_still_fails_startup_after_retiring_the_dedicated_operation(): void
+    {
+        $store = new RecoverableClusterAdmissionMemoryStore();
+        $store->stallNextInitialization = true;
+        $fingerprint = $this->fingerprint('cluster-a', 'node-a');
+        $controller = new ClusterAdmissionController(
+            $store,
+            null,
+            comparisonTimeoutSeconds: 0.005,
+            fingerprintFactory: static fn(): ClusterCapabilityFingerprint => $fingerprint,
+        );
+
+        try {
+            $controller->admitInitial();
+            self::fail('Initial cluster admission timeout did not fail startup.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('Initial cluster admission comparison timed out.', $error->getMessage());
+        }
+        self::assertSame(1, $store->retiredConnections);
+        self::assertFalse($controller->isAdmitted());
     }
 
     public function test_cancelled_comparison_closes_and_never_late_reopens_admission(): void
@@ -690,6 +763,40 @@ final class ClusterAdmissionTest extends TestCase
         }
     }
 
+    public function test_programmatic_cluster_controller_cannot_be_replaced(): void
+    {
+        $server = new S3Server(new S3ServerConfig(storagePath: '/', perClientRateLimit: 0));
+        $first = new ClusterAdmissionController(
+            new ClusterAdmissionMemoryStore(),
+            $this->fingerprint('cluster-a', 'node-a'),
+        );
+        $server->setClusterAdmissionController($first);
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Cluster admission is already configured.');
+        $server->setClusterAdmissionController(new ClusterAdmissionController(
+            new ClusterAdmissionMemoryStore(),
+            $this->fingerprint('cluster-a', 'node-a'),
+        ));
+    }
+
+    public function test_repeated_drain_closes_controller_attached_after_an_earlier_drain(): void
+    {
+        $server = new S3Server(new S3ServerConfig(storagePath: '/', perClientRateLimit: 0));
+        $server->beginDrain();
+        $store = new RecoverableClusterAdmissionMemoryStore();
+        $controller = new ClusterAdmissionController($store, $this->fingerprint('cluster-a', 'node-a'));
+        $controller->admitInitial();
+        $server->setClusterAdmissionController($controller);
+
+        $server->beginDrain();
+        self::assertSame(1, $store->closedStores);
+        self::assertFalse($controller->isAdmitted());
+
+        $server->stop();
+        self::assertSame(1, $store->closedStores);
+    }
+
     public function test_programmatic_cluster_fencing_is_exact_config_bound_and_cannot_be_replaced(): void
     {
         $dsn = 'host=127.0.0.1 user=test db=cluster_fencing';
@@ -947,6 +1054,67 @@ final class ClusterAdmissionMemoryStore implements ClusterAdmissionStore, Cluste
     public function liveClusterRoles(string $clusterId): array
     {
         return $this->membershipReady ? $this->membershipRoles : [];
+    }
+}
+
+final class RecoverableClusterAdmissionMemoryStore implements RecoverableClusterAdmissionStore
+{
+    public bool $stallNextInitialization = false;
+    public bool $stallNextComparison = false;
+    public int $compareCalls = 0;
+    public int $retiredConnections = 0;
+    public int $closedStores = 0;
+    private ?\Amp\DeferredCancellation $operationCancellation = null;
+
+    public function clusterDatabaseSchema(): string
+    {
+        return 'public';
+    }
+
+    public function clusterDatabaseIdentity(): string
+    {
+        return str_repeat('d', 32);
+    }
+
+    public function initializeOrCompareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        if ($this->stallNextInitialization) {
+            $this->stallNextInitialization = false;
+            $this->stallOperation();
+        }
+
+        return ClusterAdmissionResult::matched($fingerprint->databaseIdentity);
+    }
+
+    public function compareClusterAdmission(ClusterCapabilityFingerprint $fingerprint): ClusterAdmissionResult
+    {
+        ++$this->compareCalls;
+        if ($this->stallNextComparison) {
+            $this->stallNextComparison = false;
+            $this->stallOperation();
+        }
+
+        return ClusterAdmissionResult::matched($fingerprint->databaseIdentity);
+    }
+
+    public function retireConnection(): void
+    {
+        ++$this->retiredConnections;
+        $this->operationCancellation?->cancel();
+        $this->operationCancellation = null;
+    }
+
+    public function close(): void
+    {
+        ++$this->closedStores;
+        $this->operationCancellation?->cancel();
+        $this->operationCancellation = null;
+    }
+
+    private function stallOperation(): void
+    {
+        $deferred = $this->operationCancellation = new \Amp\DeferredCancellation();
+        \Amp\delay(3600, cancellation: $deferred->getCancellation());
     }
 }
 

@@ -14,6 +14,7 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnectionPool;
 use OpsFour\S3Server\Auth\ClusterAuthenticationIdentityProvider;
 use OpsFour\S3Server\Auth\DatabaseCredentialProvider;
+use OpsFour\S3Server\Metadata\PostgresClusterAdmissionStore;
 use OpsFour\S3Server\Metadata\PostgresMetadataStore;
 use OpsFour\S3Server\Metadata\Schema\PostgresSchema;
 use OpsFour\S3Server\Observability\MetricsCollector;
@@ -123,6 +124,157 @@ final class PostgresClusterAdmissionTest extends TestCase
             $this->firstPool->execute('DELETE FROM s3_schema_version WHERE version = $1', [$futureVersion]);
         }
         self::assertTrue($live->revalidate(true));
+    }
+
+    public function test_stuck_real_driver_comparison_retires_one_connection_and_recovers_without_orphans(): void
+    {
+        self::assertTrue(extension_loaded('pq'), 'This gate requires the production pecl-pq driver.');
+        $dsn = trim((string) getenv('S3_TEST_POSTGRES_METADATA_DSN'));
+        $postgres = PostgresConfig::fromString($dsn);
+        $proxy = new PostgresAdmissionFaultProxy($postgres->getHost(), $postgres->getPort());
+        $controller = null;
+        $handshakeController = null;
+        $reproductionConnection = null;
+        $blocker = null;
+        try {
+            $applicationName = 's3-admission-recovery-' . bin2hex(random_bytes(6));
+            $proxyConfig = (new PostgresConfig(
+                '127.0.0.1',
+                $proxy->port(),
+                $postgres->getUser(),
+                $postgres->getPassword(),
+                $postgres->getDatabase(),
+            ))->withApplicationName($applicationName);
+            $identity = $this->first->clusterDatabaseIdentity();
+            $makeFingerprintFactory = function (
+                PostgresClusterAdmissionStore $store,
+                string $nodeId,
+            ) use ($identity): \Closure {
+                return function () use ($store, $identity, $nodeId): ClusterCapabilityFingerprint {
+                    $store->assertCurrentSchema();
+                    $databaseIdentity = $store->clusterDatabaseIdentity();
+                    self::assertSame($identity, $databaseIdentity);
+
+                    return ClusterCapabilityFingerprint::fromRuntime(
+                        new S3ServerConfig(
+                            storagePath: '/',
+                            metadataDriver: 'postgres',
+                            clusterId: 'cluster-functional',
+                            clusterNodeId: $nodeId,
+                            clusterDatabaseId: $databaseIdentity,
+                            clusterRoles: 'api,reconcile',
+                        ),
+                        StorageTierRegistry::single(new FunctionalClusterStorage()),
+                        null,
+                        $store->clusterDatabaseSchema(),
+                        $databaseIdentity,
+                        new FunctionalClusterAuthentication(),
+                    );
+                };
+            };
+            $store = new PostgresClusterAdmissionStore($proxyConfig, 0.25);
+            $controller = new ClusterAdmissionController(
+                $store,
+                null,
+                revalidationIntervalSeconds: 0.0,
+                comparisonTimeoutSeconds: 0.25,
+                fingerprintFactory: $makeFingerprintFactory($store, 'recovery-node'),
+            );
+            $controller->admitInitial();
+            self::assertTrue($controller->isAdmitted());
+            self::assertSame(1, (int) ($this->firstPool->query('SELECT COUNT(*) AS count FROM s3_cluster_admission')->fetchRow()['count'] ?? 0));
+            self::assertSame(1, $this->applicationConnectionCount($applicationName));
+
+            $reproductionConnection = \Amp\Postgres\connect(
+                $proxyConfig->withApplicationName($applicationName . '-reproduction'),
+            );
+            $proxy->armAdmissionResponseFault();
+            $originalFuture = \Amp\async(static fn(): ?array => $reproductionConnection->query(
+                'SELECT cluster_id FROM s3_cluster_admission WHERE singleton_id = 1',
+            )->fetchRow());
+            try {
+                $originalFuture->await(new \Amp\TimeoutCancellation(0.25));
+                self::fail('The half-open real-driver admission query unexpectedly completed.');
+            } catch (\Amp\CancelledException) {
+            }
+            self::assertFalse($originalFuture->isComplete());
+            self::assertSame(1, (int) ($this->firstPool->query('SELECT 1 AS reachable')->fetchRow()['reachable'] ?? 0));
+            \Amp\delay(0.25);
+            self::assertFalse($originalFuture->isComplete(), 'The exact original Future settled after independent recovery.');
+            $reproductionConnection->close();
+            $reproductionConnection = null;
+            \Amp\delay(0.01);
+            self::assertTrue($originalFuture->isComplete(), 'Closing the dedicated connection did not retire its pending I/O.');
+            $retiredWithError = false;
+            try {
+                $originalFuture->await();
+            } catch (\Throwable) {
+                $retiredWithError = true;
+            }
+            self::assertTrue($retiredWithError, 'The retired half-open query unexpectedly succeeded.');
+            $proxy->resetAdmissionResponseFault();
+
+            $blocker = $this->firstPool->beginTransaction();
+            $blocker->query('LOCK TABLE s3_cluster_admission IN ACCESS EXCLUSIVE MODE');
+            self::assertFalse($controller->revalidate(true));
+            $this->awaitApplicationConnectionCount($applicationName, 0);
+            $blocker->rollback();
+            $blocker = null;
+            self::assertTrue($controller->revalidate(true));
+            self::assertSame(1, $this->applicationConnectionCount($applicationName));
+
+            $acceptedBeforeHalfOpenRecovery = $proxy->acceptedConnections();
+            $proxy->armAdmissionResponseFault();
+            self::assertFalse($controller->revalidate(true));
+            self::assertFalse($controller->isAdmitted());
+            self::assertGreaterThan(0, $proxy->droppedBytes());
+            self::assertSame(1, (int) ($this->firstPool->query('SELECT 1 AS reachable')->fetchRow()['reachable'] ?? 0));
+            $this->awaitApplicationConnectionCount($applicationName, 0);
+
+            $results = \Amp\Future\await([
+                \Amp\async(fn(): bool => $controller->revalidate(true)),
+                \Amp\async(fn(): bool => $controller->revalidate(true)),
+            ]);
+            self::assertSame([true, true], $results);
+            self::assertTrue($controller->isAdmitted());
+            self::assertSame($acceptedBeforeHalfOpenRecovery + 1, $proxy->acceptedConnections());
+            self::assertSame(1, $this->applicationConnectionCount($applicationName));
+
+            $handshakeName = $applicationName . '-handshake';
+            $handshakeConfig = $proxyConfig->withApplicationName($handshakeName);
+            $handshakeStore = new PostgresClusterAdmissionStore($handshakeConfig, 0.25);
+            $handshakeController = new ClusterAdmissionController(
+                $handshakeStore,
+                null,
+                revalidationIntervalSeconds: 0.0,
+                comparisonTimeoutSeconds: 0.25,
+                fingerprintFactory: $makeFingerprintFactory($handshakeStore, 'handshake-node'),
+            );
+            $proxy->stallNextHandshake();
+            try {
+                $handshakeController->admitInitial();
+                self::fail('Stalled admission connection handshake did not time out.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('Initial cluster admission comparison timed out.', $error->getMessage());
+            }
+            self::assertFalse($handshakeController->isAdmitted());
+            $proxy->releaseStalledHandshake()->await(new \Amp\TimeoutCancellation(1));
+            $this->awaitApplicationConnectionCount($handshakeName, 0);
+            $handshakeController->admitInitial();
+            self::assertTrue($handshakeController->isAdmitted());
+            self::assertSame(1, $this->applicationConnectionCount($handshakeName));
+            $handshakeController->shutdown();
+            $handshakeController = null;
+            $this->awaitApplicationConnectionCount($handshakeName, 0);
+        } finally {
+            if ($blocker?->isActive()) {
+                $blocker->rollback();
+            }
+            $reproductionConnection?->close();
+            $handshakeController?->shutdown();
+            $controller?->shutdown();
+            $proxy->close();
+        }
     }
 
     public function test_serving_role_can_manage_membership_but_cannot_mutate_contract(): void
@@ -435,6 +587,29 @@ final class PostgresClusterAdmissionTest extends TestCase
         return '"' . str_replace('"', '""', $value) . '"';
     }
 
+    private function applicationConnectionCount(string $applicationName): int
+    {
+        $row = $this->firstPool->execute(
+            'SELECT COUNT(*) AS count FROM pg_stat_activity WHERE application_name = $1',
+            [$applicationName],
+        )->fetchRow();
+
+        return (int) ($row['count'] ?? 0);
+    }
+
+    private function awaitApplicationConnectionCount(string $applicationName, int $expected): void
+    {
+        $deadline = microtime(true) + 2.0;
+        do {
+            if ($this->applicationConnectionCount($applicationName) === $expected) {
+                return;
+            }
+            \Amp\delay(0.01);
+        } while (microtime(true) < $deadline);
+
+        self::assertSame($expected, $this->applicationConnectionCount($applicationName));
+    }
+
     private function fingerprint(string $identity, string $node, bool $strict = true): ClusterCapabilityFingerprint
     {
         return ClusterCapabilityFingerprint::fromRuntime(
@@ -453,6 +628,185 @@ final class PostgresClusterAdmissionTest extends TestCase
             $identity,
             new FunctionalClusterAuthentication(),
         );
+    }
+}
+
+final class PostgresAdmissionFaultProxy
+{
+    private readonly \Amp\Socket\ServerSocket $server;
+    private readonly \Amp\DeferredCancellation $cancellation;
+    /** @var \Amp\Future<void> */
+    private readonly \Amp\Future $acceptFuture;
+    /** @var array<int, \Amp\Socket\Socket> */
+    private array $sockets = [];
+    /** @var array<int, \Amp\Future<void>> */
+    private array $connections = [];
+    private bool $armed = false;
+    private bool $faultConsumed = false;
+    private bool $stallHandshake = false;
+    /** @var \Amp\DeferredFuture<void>|null */
+    private ?\Amp\DeferredFuture $handshakeRelease = null;
+    /** @var \Amp\DeferredFuture<void>|null */
+    private ?\Amp\DeferredFuture $handshakeSettled = null;
+    private int $dropped = 0;
+    private int $accepted = 0;
+
+    public function __construct(
+        private readonly string $upstreamHost,
+        private readonly int $upstreamPort,
+    ) {
+        $this->server = \Amp\Socket\listen('127.0.0.1:0');
+        $this->cancellation = new \Amp\DeferredCancellation();
+        $this->acceptFuture = \Amp\async($this->acceptConnections(...));
+        $this->acceptFuture->ignore();
+    }
+
+    public function port(): int
+    {
+        $address = $this->server->getAddress();
+        if (! $address instanceof \Amp\Socket\InternetAddress) {
+            throw new \LogicException('PostgreSQL fault proxy did not bind an internet address.');
+        }
+
+        return $address->getPort();
+    }
+
+    public function armAdmissionResponseFault(): void
+    {
+        $this->armed = true;
+    }
+
+    public function resetAdmissionResponseFault(): void
+    {
+        $this->armed = false;
+        $this->faultConsumed = false;
+    }
+
+    public function stallNextHandshake(): void
+    {
+        $this->stallHandshake = true;
+        $this->handshakeRelease = new \Amp\DeferredFuture();
+        $this->handshakeSettled = new \Amp\DeferredFuture();
+    }
+
+    /** @return \Amp\Future<void> */
+    public function releaseStalledHandshake(): \Amp\Future
+    {
+        $release = $this->handshakeRelease ?? throw new \LogicException('No PostgreSQL handshake is stalled.');
+        $settled = $this->handshakeSettled ?? throw new \LogicException('No PostgreSQL handshake is stalled.');
+        $this->handshakeRelease = null;
+        $this->handshakeSettled = null;
+        $release->complete();
+
+        return $settled->getFuture();
+    }
+
+    public function droppedBytes(): int
+    {
+        return $this->dropped;
+    }
+
+    public function acceptedConnections(): int
+    {
+        return $this->accepted;
+    }
+
+    public function close(): void
+    {
+        $this->cancellation->cancel();
+        $this->server->close();
+        foreach ($this->sockets as $socket) {
+            $socket->close();
+        }
+        foreach ($this->connections as $connection) {
+            try {
+                $connection->await(new \Amp\TimeoutCancellation(1));
+            } catch (\Throwable) {
+                // The test assertions already prove the admission resources closed.
+            }
+        }
+    }
+
+    private function acceptConnections(): void
+    {
+        try {
+            while (($client = $this->server->accept($this->cancellation->getCancellation())) !== null) {
+                ++$this->accepted;
+                $id = spl_object_id($client);
+                $this->sockets[$id] = $client;
+                $stallHandshake = $this->stallHandshake;
+                $this->stallHandshake = false;
+                $handshakeRelease = $stallHandshake ? $this->handshakeRelease : null;
+                $handshakeSettled = $stallHandshake ? $this->handshakeSettled : null;
+                $future = $this->connections[$id] = \Amp\async(
+                    fn() => $this->proxyConnection($client, $handshakeRelease, $handshakeSettled),
+                );
+                $future->ignore();
+            }
+        } catch (\Amp\CancelledException) {
+            // Normal test cleanup.
+        }
+    }
+
+    /**
+     * @param \Amp\DeferredFuture<void>|null $handshakeRelease
+     * @param \Amp\DeferredFuture<void>|null $handshakeSettled
+     */
+    private function proxyConnection(
+        \Amp\Socket\Socket $client,
+        ?\Amp\DeferredFuture $handshakeRelease,
+        ?\Amp\DeferredFuture $handshakeSettled,
+    ): void {
+        $clientId = spl_object_id($client);
+        if ($handshakeRelease !== null) {
+            try {
+                $handshakeRelease->getFuture()->await($this->cancellation->getCancellation());
+            } catch (\Amp\CancelledException) {
+                $client->close();
+                unset($this->sockets[$clientId], $this->connections[$clientId]);
+                $handshakeSettled?->complete();
+
+                return;
+            }
+        }
+        $upstream = \Amp\Socket\connect("{$this->upstreamHost}:{$this->upstreamPort}");
+        $upstreamId = spl_object_id($upstream);
+        $this->sockets[$upstreamId] = $upstream;
+        $faultThisConnection = false;
+        $tail = '';
+        $requestForwarder = \Amp\async(function () use ($client, $upstream, &$faultThisConnection, &$tail): void {
+            try {
+                while (($chunk = $client->read()) !== null) {
+                    $tail = substr($tail . $chunk, -4096);
+                    if ($this->armed && ! $this->faultConsumed
+                        && str_contains($tail, 'FROM s3_cluster_admission WHERE singleton_id = 1')) {
+                        $this->faultConsumed = true;
+                        $faultThisConnection = true;
+                    }
+                    $upstream->write($chunk);
+                }
+            } finally {
+                $upstream->close();
+            }
+        });
+        $requestForwarder->ignore();
+
+        try {
+            while (($chunk = $upstream->read()) !== null) {
+                if ($faultThisConnection) {
+                    $this->dropped += strlen($chunk);
+                    continue;
+                }
+                $client->write($chunk);
+            }
+        } catch (\Throwable) {
+            // Connection retirement intentionally tears down both directions.
+        } finally {
+            $client->close();
+            $upstream->close();
+            unset($this->sockets[$clientId], $this->sockets[$upstreamId], $this->connections[$clientId]);
+            $handshakeSettled?->complete();
+        }
     }
 }
 

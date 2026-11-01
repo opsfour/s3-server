@@ -910,6 +910,11 @@ For production deployments:
 - Enable database TLS if traffic crosses hosts or networks you do not fully
   control.
 
+Each cluster process reserves one additional PostgreSQL connection exclusively
+for bounded admission checks. Include that slot in database connection limits;
+an admission timeout closes only this dedicated connection before reconnecting
+and never closes or consumes a replacement from the shared metadata pool.
+
 ## Rollout and Rollback
 
 Cluster nodes may overlap only when their complete admission fingerprints

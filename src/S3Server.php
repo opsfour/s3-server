@@ -1212,6 +1212,9 @@ final class S3Server
     public function setClusterAdmissionController(ClusterAdmissionController $admission): void
     {
         $this->assertConfigurationMutable('Cluster admission');
+        if ($this->clusterAdmission !== null) {
+            throw new \LogicException('Cluster admission is already configured.');
+        }
         if ($this->config->clusterEnabled()) {
             $admission->assertBoundToConfig($this->config);
         }
@@ -1306,10 +1309,16 @@ final class S3Server
     /** Make readiness and request admission close before transport shutdown. */
     public function beginDrain(): void
     {
+        try {
+            $this->clusterAdmission?->shutdown();
+        } catch (\Throwable $e) {
+            $this->logShutdown('warning', 'Cluster admission shutdown failed during drain.', [
+                'exception' => $e::class,
+            ]);
+        }
         if (! $this->drain->beginDrain()) {
             return;
         }
-
         try {
             $this->clusterRoles?->beginDrain();
         } catch (\Throwable $e) {

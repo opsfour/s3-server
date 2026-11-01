@@ -14,11 +14,14 @@ use OpsFour\S3Server\S3ServerConfig;
 /** Fail-closed single-flight state; only the newest complete live comparison can reopen it. */
 final class ClusterAdmissionController
 {
+    public const float DEFAULT_COMPARISON_TIMEOUT_SECONDS = 5.0;
+
     private bool $admitted = false;
     private ?string $category = 'database';
     private string $status = 'unavailable';
     private float $lastCheckedAt = -INF;
     private int $generation = 0;
+    private bool $shutdown = false;
 
     /** @var Future<array{ClusterCapabilityFingerprint, ClusterAdmissionResult}>|null */
     private ?Future $inFlight = null;
@@ -29,9 +32,9 @@ final class ClusterAdmissionController
 
     public function __construct(
         private readonly ClusterAdmissionStore $store,
-        private ClusterCapabilityFingerprint $fingerprint,
+        private ?ClusterCapabilityFingerprint $fingerprint,
         private readonly float $revalidationIntervalSeconds = 5.0,
-        private readonly float $comparisonTimeoutSeconds = 5.0,
+        private readonly float $comparisonTimeoutSeconds = self::DEFAULT_COMPARISON_TIMEOUT_SECONDS,
         ?\Closure $fingerprintFactory = null,
     ) {
         if (! is_finite($revalidationIntervalSeconds) || $revalidationIntervalSeconds < 0.0) {
@@ -40,28 +43,36 @@ final class ClusterAdmissionController
         if (! is_finite($comparisonTimeoutSeconds) || $comparisonTimeoutSeconds <= 0.0) {
             throw new \InvalidArgumentException('Cluster comparison timeout must be finite and positive.');
         }
-        $this->fingerprintFactory = $fingerprintFactory ?? static fn(): ClusterCapabilityFingerprint => $fingerprint;
+        if ($fingerprintFactory === null) {
+            if ($fingerprint === null) {
+                throw new \InvalidArgumentException('Deferred cluster admission requires a fingerprint factory.');
+            }
+            $fingerprintFactory = static fn(): ClusterCapabilityFingerprint => $fingerprint;
+        }
+        $this->fingerprintFactory = $fingerprintFactory;
     }
 
     public function admitInitial(): void
     {
+        if ($this->shutdown) {
+            throw new \LogicException('Cluster admission controller is shut down.');
+        }
         $this->closeAdmission();
         try {
             $this->compare(initial: true, cancellation: null);
         } catch (\Amp\CancelledException $error) {
-            $this->invalidateInFlight();
             if ($error->getPrevious() instanceof TimeoutException) {
                 throw new \RuntimeException('Initial cluster admission comparison timed out.', 0, $error);
             }
-            throw $error;
-        } catch (\Throwable $error) {
-            $this->invalidateInFlight();
             throw $error;
         }
     }
 
     public function revalidate(bool $force = false, ?Cancellation $cancellation = null): bool
     {
+        if ($this->shutdown) {
+            return false;
+        }
         $now = hrtime(true) / 1e9;
         if (! $force && $now - $this->lastCheckedAt < $this->revalidationIntervalSeconds) {
             return $this->admitted;
@@ -71,12 +82,11 @@ final class ClusterAdmissionController
         try {
             $this->compare(initial: false, cancellation: $cancellation);
         } catch (\Amp\CancelledException $error) {
-            $this->invalidateInFlight();
-            if (! $error->getPrevious() instanceof TimeoutException) {
+            if (! $error->getPrevious() instanceof TimeoutException
+                && $cancellation?->isRequested() === true) {
                 throw $error;
             }
         } catch (\Throwable) {
-            $this->invalidateInFlight();
         }
 
         return $this->admitted;
@@ -97,19 +107,37 @@ final class ClusterAdmissionController
         return $this->category;
     }
 
+    /** Permanently close admission and its lifecycle-owned resources. */
+    public function shutdown(): void
+    {
+        if ($this->shutdown) {
+            return;
+        }
+        $this->shutdown = true;
+        ++$this->generation;
+        $this->inFlight?->ignore();
+        $this->inFlight = null;
+        $this->inFlightGeneration = null;
+        $this->closeAdmission();
+        if ($this->store instanceof RecoverableClusterAdmissionStore) {
+            $this->store->close();
+        }
+    }
+
     public function assertBoundToConfig(S3ServerConfig $config): void
     {
+        $fingerprint = $this->currentFingerprint();
         if (! $config->clusterEnabled()
             || $config->clusterId === null
             || $config->clusterNodeId === null
             || $config->clusterIncarnationId === null
             || $config->clusterDatabaseId === null
-            || ! hash_equals($this->fingerprint->clusterId, $config->clusterId)
-            || ! hash_equals($this->fingerprint->nodeId, $config->clusterNodeId)
-            || ! hash_equals($this->fingerprint->incarnationId, $config->clusterIncarnationId)
-            || ! hash_equals($this->fingerprint->databaseIdentity, $config->clusterDatabaseId)
-            || $this->fingerprint->roles !== $config->clusterRoles
-            || $this->fingerprint->requiredRoles !== $config->clusterRequiredRoles) {
+            || ! hash_equals($fingerprint->clusterId, $config->clusterId)
+            || ! hash_equals($fingerprint->nodeId, $config->clusterNodeId)
+            || ! hash_equals($fingerprint->incarnationId, $config->clusterIncarnationId)
+            || ! hash_equals($fingerprint->databaseIdentity, $config->clusterDatabaseId)
+            || $fingerprint->roles !== $config->clusterRoles
+            || $fingerprint->requiredRoles !== $config->clusterRequiredRoles) {
             throw new \LogicException('Cluster admission controller is not bound to this server configuration.');
         }
     }
@@ -117,12 +145,13 @@ final class ClusterAdmissionController
     /** @return array{cluster_id: string, node_id: string, incarnation_id: string, protocol: string, roles: list<string>, admission: string, category?: string} */
     public function diagnostics(): array
     {
+        $fingerprint = $this->currentFingerprint();
         $diagnostics = [
-            'cluster_id' => $this->fingerprint->clusterId,
-            'node_id' => $this->fingerprint->nodeId,
-            'incarnation_id' => $this->fingerprint->incarnationId,
+            'cluster_id' => $fingerprint->clusterId,
+            'node_id' => $fingerprint->nodeId,
+            'incarnation_id' => $fingerprint->incarnationId,
             'protocol' => ClusterCapabilityFingerprint::PROTOCOL,
-            'roles' => $this->fingerprint->roles,
+            'roles' => $fingerprint->roles,
             'admission' => $this->status,
         ];
         if ($this->status === 'mismatched' && $this->category !== null) {
@@ -134,6 +163,9 @@ final class ClusterAdmissionController
 
     private function compare(bool $initial, ?Cancellation $cancellation): void
     {
+        if ($this->shutdown) {
+            return;
+        }
         $this->clearCompletedInFlight();
         if ($this->inFlight === null) {
             $generation = ++$this->generation;
@@ -157,6 +189,9 @@ final class ClusterAdmissionController
         $bounded = $cancellation === null ? $timeout : new CompositeCancellation($cancellation, $timeout);
         try {
             [$fingerprint, $result] = $future->await($bounded);
+        } catch (\Throwable $error) {
+            $this->invalidateInFlight($future, $generation);
+            throw $error;
         } finally {
             if ($future->isComplete() && $this->inFlight === $future) {
                 $this->inFlight = null;
@@ -164,7 +199,7 @@ final class ClusterAdmissionController
             }
         }
 
-        if ($this->generation !== $generation) {
+        if ($this->shutdown || $this->generation !== $generation) {
             return;
         }
         $this->fingerprint = $fingerprint;
@@ -179,11 +214,21 @@ final class ClusterAdmissionController
         $this->status = 'unavailable';
     }
 
-    private function invalidateInFlight(): void
+    /** @param Future<array{ClusterCapabilityFingerprint, ClusterAdmissionResult}> $future */
+    private function invalidateInFlight(Future $future, int $generation): void
     {
+        if ($this->inFlight !== $future || $this->inFlightGeneration !== $generation) {
+            return;
+        }
         ++$this->generation;
-        $this->inFlight?->ignore();
-        $this->clearCompletedInFlight();
+        $future->ignore();
+        if ($this->store instanceof RecoverableClusterAdmissionStore) {
+            $this->store->retireConnection();
+            $this->inFlight = null;
+            $this->inFlightGeneration = null;
+        } else {
+            $this->clearCompletedInFlight();
+        }
         $this->lastCheckedAt = hrtime(true) / 1e9;
         $this->closeAdmission();
     }
@@ -203,5 +248,11 @@ final class ClusterAdmissionController
         $this->admitted = $result->matched;
         $this->category = $result->category;
         $this->status = $result->matched ? 'matched' : 'mismatched';
+    }
+
+    private function currentFingerprint(): ClusterCapabilityFingerprint
+    {
+        return $this->fingerprint
+            ?? throw new \LogicException('Cluster admission has not completed its initial fingerprint.');
     }
 }
